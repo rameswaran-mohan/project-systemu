@@ -1,0 +1,45 @@
+{
+  "id": "tool_378f77a9",
+  "name": "send_email",
+  "description": "Send an email with an optional file attachment using SMTP",
+  "tool_type": "api_call",
+  "parameters_schema": {
+    "recipient": {
+      "type": "string",
+      "description": "Email address of the recipient"
+    },
+    "subject": {
+      "type": "string",
+      "description": "Subject line of the email"
+    },
+    "body": {
+      "type": "string",
+      "description": "Text content of the email"
+    },
+    "attachment_path": {
+      "type": "string",
+      "description": "Path to the file to attach (optional)",
+      "default": ""
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Use smtplib and email.mime. Use MIMEMultipart to construct the message. If attachment_path is provided, use MIMEBase to encode the file and add it as an attachment. Use SMTP_SSL for secure connection. Catch smtplib.SMTPException and return error.",
+  "dependencies": [
+    "smtplib"
+  ],
+  "implementation_path": "vault\\tools\\implementations\\send_email.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_378f77a9\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-05T19:59:23.289150",
+  "updated_at": "2026-05-05T19:59:23.289150"
+}

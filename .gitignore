@@ -1,0 +1,83 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Personal usage data (sharing_on capture sessions) ────────────────────────
+captures/
+systemu/captures/
+
+# ── Runtime databases and vault data ─────────────────────────────────────────
+data/
+.vault/
+
+# Vault runtime data — keep starter configs (tools/, shadow_army/, skills/)
+# but exclude personal sessions, activity logs, and memory blobs
+systemu/vault/activities/
+systemu/vault/executions/
+systemu/vault/evolutions/
+systemu/vault/notifications/
+systemu/vault/elder/
+systemu/vault/scrolls/*.json
+systemu/vault/shadow_army/shadow_shadow_*/
+
+# ── Database files ────────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ── Log files ─────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Shadow outputs (files generated during shadow execution) ──────────────────
+outputs/*
+!outputs/.gitkeep
+
+# ── Queue persistence ─────────────────────────────────────────────────────────
+supervisor_queue.json
+supervisor_queue.json.bak
+memory_consolidation_meta.json
+
+# ── Process / lock files ──────────────────────────────────────────────────────
+*.pid
+.systemu_daemon.pid
+.systemu_worker.pid
+
+# ── Installer-written runtime markers ─────────────────────────────────────────
+.systemu_mode
+
+# ── Operator-local Compose overrides (keep .example, ignore actual file) ─────
+docker-compose.override.yml
+
+# ── Python artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Test / CI artifacts ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Alembic ───────────────────────────────────────────────────────────────────
+alembic/versions/*.pyc

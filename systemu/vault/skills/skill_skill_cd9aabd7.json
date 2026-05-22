@@ -1,0 +1,28 @@
+{
+  "id": "skill_cd9aabd7",
+  "name": "ci_cd_pipeline_analysis",
+  "description": "Proficiency in analyzing CI/CD pipeline runs on GitHub Actions, including filtering for failures, extracting run metadata, reviewing associated commits, and inspecting workflow definitions",
+  "category": "devops",
+  "proficiency_level": "intermediate",
+  "evidence_scroll_ids": [
+    "scroll_e9749c8e"
+  ],
+  "required_tool_ids": [
+    "tool_a1f69543",
+    "tool_70a65c87",
+    "tool_6b1b3809",
+    "tool_1f0bb1cf",
+    "tool_8c300ad3"
+  ],
+  "required_tool_names": [
+    "fetch_json",
+    "fetch_html",
+    "web_extract_text",
+    "file_list_dir",
+    "file_read"
+  ],
+  "instructions_md": "To analyze failed CI/CD runs: 1) Use the GitHub API (fetch_json) to list workflow runs filtered by status=failure from the repository's actions endpoint. 2) For a specific run ID, fetch the run details and job logs via the API. 3) Retrieve the associated commit details using the commit hash endpoint. 4) List and read workflow YAML files from the .github/workflows directory using file_list_dir and file_read. 5) Compile all findings into a structured summary.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_cd9aabd7\\SKILL.md",
+  "created_at": "2026-05-08T21:59:10.272120",
+  "updated_at": "2026-05-08T21:59:10.272120"
+}

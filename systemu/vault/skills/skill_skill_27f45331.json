@@ -1,0 +1,22 @@
+{
+  "id": "skill_27f45331",
+  "name": "web_search_and_research",
+  "description": "Ability to search the web, evaluate results, and extract relevant information for a research objective",
+  "category": "browser",
+  "proficiency_level": "intermediate",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_30db21be",
+    "tool_6b1b3809",
+    "tool_70a65c87"
+  ],
+  "required_tool_names": [
+    "web_search",
+    "web_extract_text",
+    "fetch_html"
+  ],
+  "instructions_md": "To research a topic: 1) Formulate a specific search query — prefer factual, concise terms over natural language. 2) Call web_search with the query and review the returned results (title, URL, snippet). 3) Navigate to the most relevant result using web_extract_text to get the full page content. 4) If the snippet is sufficient, avoid fetching the full page. 5) Cross-reference from at least 2 sources when accuracy is critical.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_27f45331\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

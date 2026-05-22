@@ -1,0 +1,32 @@
+{
+  "id": "tool_7053c530",
+  "name": "clipboard_write",
+  "description": "Write text to the system clipboard",
+  "tool_type": "cli_command",
+  "parameters_schema": {
+    "text": {
+      "type": "string",
+      "description": "Text to copy to clipboard"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [
+    "pyperclip"
+  ],
+  "implementation_path": "vault/tools/implementations/clipboard_write.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_7053c530\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

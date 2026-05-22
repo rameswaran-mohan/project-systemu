@@ -1,0 +1,40 @@
+{
+  "id": "tool_6b1b3809",
+  "name": "web_extract_text",
+  "description": "Extract visible text content from a web page or a specific element using a CSS selector",
+  "tool_type": "browser_action",
+  "parameters_schema": {
+    "url": {
+      "type": "string",
+      "description": "URL to load"
+    },
+    "selector": {
+      "type": "string",
+      "description": "CSS selector (default body)",
+      "default": "body"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "text": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Use playwright sync_playwright with an existing page. If selector is provided, use page.locator(selector).all_inner_texts() and join with newlines. If attribute is provided, use page.locator(selector).get_attribute(attribute). If no selector, use page.inner_text('body'). Catch playwright errors and return error.",
+  "dependencies": [
+    "playwright"
+  ],
+  "implementation_path": "vault/tools/implementations/web_extract_text.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_6b1b3809\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

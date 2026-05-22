@@ -1,0 +1,38 @@
+{
+  "id": "tool_9b79befb",
+  "name": "browser_navigate",
+  "description": "Navigate a headless browser to a URL and wait for the page to fully load",
+  "tool_type": "browser_action",
+  "parameters_schema": {
+    "url": {
+      "type": "string",
+      "description": "URL to navigate to"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "page_title": {
+      "type": "string"
+    },
+    "final_url": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Use playwright sync_playwright with Chromium headless. Create a browser context and page. Call page.goto(url, wait_until=wait_until, timeout=timeout). Return page.title() and page.url. Catch playwright TimeoutError and return error. Close browser context after navigation.",
+  "dependencies": [
+    "playwright"
+  ],
+  "implementation_path": "vault/tools/implementations/browser_navigate.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_9b79befb\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

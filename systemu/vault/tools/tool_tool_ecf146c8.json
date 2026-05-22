@@ -1,0 +1,53 @@
+{
+  "id": "tool_ecf146c8",
+  "name": "github_list_workflow_files",
+  "description": "List and optionally read workflow YAML files from the .github/workflows directory of a GitHub repository",
+  "tool_type": "api_call",
+  "parameters_schema": {
+    "owner": {
+      "type": "string",
+      "description": "Repository owner"
+    },
+    "repo": {
+      "type": "string",
+      "description": "Repository name"
+    },
+    "branch": {
+      "type": "string",
+      "description": "Branch to list files from",
+      "default": "master"
+    },
+    "read_contents": {
+      "type": "boolean",
+      "description": "If true, fetch the raw content of each YAML file",
+      "default": false
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "description": "List of file objects with name, path, and optionally content (if read_contents=true)"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Use requests.get with URL https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows?ref={branch}. Set Accept header to application/vnd.github.v3+json. Parse JSON response. If read_contents is true, for each file with type 'file', fetch its download_url and store the raw text. Catch requests.RequestException and return error.",
+  "dependencies": [
+    "requests"
+  ],
+  "implementation_path": "",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_ecf146c8\\TOOL.md",
+  "status": "proposed",
+  "forged_by_systemu": true,
+  "enabled": false,
+  "version": 1,
+  "created_at": "2026-05-08T21:59:10.255665",
+  "updated_at": "2026-05-08T21:59:10.255665"
+}

@@ -1,0 +1,17 @@
+# Default owners — assigned reviewers on every PR unless a more specific
+# pattern below matches.
+*                                   @rameswaran-mohan
+
+# Governance / contribution surface — extra care, single approver for now.
+/CONTRIBUTING.md                    @rameswaran-mohan
+/CODE_OF_CONDUCT.md                 @rameswaran-mohan
+/SECURITY.md                        @rameswaran-mohan
+/LICENSE                            @rameswaran-mohan
+/.github/                           @rameswaran-mohan
+
+# Security-sensitive subsystems.
+/systemu/runtime/                   @rameswaran-mohan
+/systemu/queue/                     @rameswaran-mohan
+/systemu/storage/                   @rameswaran-mohan
+/systemu/pipelines/tool_forge.py    @rameswaran-mohan
+/systemu/pipelines/tool_service.py  @rameswaran-mohan

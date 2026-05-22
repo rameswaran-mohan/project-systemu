@@ -1,0 +1,29 @@
+mss>=9.0.0
+psutil>=5.9.0
+watchdog>=3.0.0
+Pillow>=10.0.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+click>=8.0.0
+pynput>=1.7.0
+uiautomation>=2.0.0
+
+# ── Systemu Phase S1 ──────────────────────────────────────────────────────────
+pydantic>=2.0.0          # Data models with runtime validation
+
+# ── Systemu Phase S2 ──────────────────────────────────────────────────────────
+apscheduler>=3.10.0      # Background scheduler (hourly sweep, daily evolution)
+
+# ── Systemu Phase S4 ──────────────────────────────────────────────────────────
+nicegui>=1.4.0           # Web dashboard (localhost:8765)
+
+# ── Systemu Tool Runtime ──────────────────────────────────────────────────────
+playwright>=1.50.0       # Browser automation for browser_navigate and related tools
+                         # After install run: python -m playwright install chromium
+requests>=2.28.0         # HTTP client used by forged tools (e.g. fetch_docker_hub_metadata)
+
+# ── Systemu Phase 1 — SQLite backend (hobbyist docker-compose) ────────────────
+sqlalchemy>=2.0          # ORM for SQLite (local) and PostgreSQL (production)
+alembic>=1.13            # Schema migrations for both backends
+huey>=2.5                # Task queue: SqliteHuey (local) → RedisHuey (production)

@@ -1,0 +1,37 @@
+{
+  "id": "tool_a7b54e36",
+  "name": "type_text",
+  "description": "Type text into the currently focused window using OS-level key events (fallback tool)",
+  "tool_type": "cli_command",
+  "parameters_schema": {
+    "text": {
+      "type": "string",
+      "description": "Text to type"
+    },
+    "delay": {
+      "type": "number",
+      "description": "Seconds between keystrokes",
+      "default": 0.02
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [
+    "pynput"
+  ],
+  "implementation_path": "vault/tools/implementations/type_text.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_a7b54e36\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

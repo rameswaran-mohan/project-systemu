@@ -1,0 +1,24 @@
+{
+  "id": "skill_762f0d3e",
+  "name": "reporting_and_documentation",
+  "description": "Ability to compile collected data into structured Word or text reports with appropriate formatting",
+  "category": "productivity",
+  "proficiency_level": "intermediate",
+  "evidence_scroll_ids": [
+    "scroll_4e6b7667"
+  ],
+  "required_tool_ids": [
+    "tool_6e6e62c0",
+    "tool_3b4a8d90",
+    "tool_bfc76fb8"
+  ],
+  "required_tool_names": [
+    "create_word_doc",
+    "file_write",
+    "image_resize"
+  ],
+  "instructions_md": "For report creation: 1) Determine the output format from the scroll's constraints (docx vs plain text vs both). 2) Use create_word_doc for rich documents — set title as the report heading and body_text for the main content. 3) If embedding images, resize them first with image_resize to a reasonable width (max 1200px) to avoid oversized documents. 4) Follow the naming_pattern from the scroll's observed_preferences exactly (date format, prefix, extension). 5) After writing, use file_read to verify the file exists and is non-empty.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_762f0d3e\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

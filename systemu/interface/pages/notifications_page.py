@@ -1,0 +1,361 @@
+"""NiceGUI Dashboard — Notifications page.
+
+Two-tab layout:
+  • Event Log  — real-time tail of vault/notifications/event_log.jsonl (auto-refreshes every 2s)
+  • Pending    — list of PENDING notifications with Approve/Reject actions
+
+Fixes the 404 that occurred because this route was never registered.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from nicegui import ui
+
+from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+
+logger = logging.getLogger(__name__)
+
+# Level → colour mapping
+_LEVEL_COLOR = {
+    "INFO":    "#3b82f6",   # blue
+    "SUCCESS": "#22c55e",   # green
+    "WARNING": "#f59e0b",   # amber
+    "ERROR":   "#ef4444",   # red
+}
+
+# Category → emoji
+_CAT_ICON = {
+    "scroll":  "📜",
+    "shadow":  "👤",
+    "tool":    "🔧",
+    "job":     "⚙️",
+    "system":  "⚡",
+}
+
+
+def build_notifications_page() -> None:
+    state = AppState.get()
+    vault = state.vault
+
+    ui.label("🔔 Notifications").style(
+        f"font-size: 22px; font-weight: 800; color: {THEME['text']}; margin-bottom: 20px;"
+    )
+
+    with ui.tabs().classes("w-full") as tabs:
+        tab_log     = ui.tab("📋 Event Log")
+        tab_pending = ui.tab("⚠️ Pending Actions")
+
+    with ui.tab_panels(tabs, value=tab_log).classes("w-full bg-transparent"):
+
+        # ── EVENT LOG TAB ──────────────────────────────────────────────────────
+        with ui.tab_panel(tab_log):
+            ui.label("Live system event log — auto-refreshes every 2 seconds.").style(
+                f"font-size: 13px; color: {THEME['text_muted']}; margin-bottom: 16px;"
+            )
+
+            # Toolbar
+            with ui.row().style("gap: 10px; align-items: center; margin-bottom: 12px;"):
+                filter_input = ui.input(placeholder="Filter events...").style(
+                    f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+                    f"border-radius: 8px; padding: 6px 10px; color: {THEME['text']}; width: 280px;"
+                )
+                level_filter = ui.select(
+                    options={"": "All Levels", "INFO": "Info", "SUCCESS": "Success", "WARNING": "Warning", "ERROR": "Error"},
+                    label="Level",
+                ).style("min-width: 130px;")
+                level_filter.value = ""
+
+                # Clear log button
+                def _clear_log():
+                    log_path = _get_log_path(vault)
+                    if log_path and log_path.exists():
+                        log_path.write_text("", encoding="utf-8")
+                        ui.notify("Event log cleared.", type="positive")
+                        _log_table.refresh()
+
+                ui.button("🗑 Clear Log", on_click=_clear_log).style(
+                    f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                    f"border: 1px solid {THEME['border']}; border-radius: 8px; font-size: 12px;"
+                )
+
+            log_container = ui.column().classes("w-full")
+
+            @ui.refreshable
+            def _log_table():
+                events = _load_events(vault, max_lines=200)
+                q = filter_input.value.lower() if filter_input.value else ""
+                lv = level_filter.value or ""
+
+                filtered = [
+                    e for e in events
+                    if (not q or q in e.get("message", "").lower() or q in e.get("category", "").lower())
+                    and (not lv or e.get("level", "") == lv)
+                ]
+
+                if not filtered:
+                    ui.label("No events yet — events appear as the system processes scrolls and shadows.").style(
+                        f"color: {THEME['text_muted']}; font-style: italic; padding: 20px;"
+                    )
+                    return
+
+                with ui.element("table").style(
+                    f"width: 100%; border-collapse: collapse; background: {THEME['surface']}; "
+                    f"border: 1px solid {THEME['border']}; border-radius: 12px; overflow: hidden;"
+                ):
+                    with ui.element("thead"):
+                        with ui.element("tr"):
+                            for col in ["Time", "Level", "Category", "Message"]:
+                                with ui.element("th").style(
+                                    f"background: {THEME['surface2']}; color: {THEME['text_muted']}; "
+                                    f"font-size: 11px; font-weight: 600; text-transform: uppercase; "
+                                    f"letter-spacing: 0.08em; padding: 10px 16px; text-align: left; "
+                                    f"border-bottom: 1px solid {THEME['border']};"
+                                ):
+                                    ui.label(col)
+
+                    with ui.element("tbody"):
+                        # Reverse for newest-first
+                        for evt in reversed(filtered[-100:]):
+                            level    = evt.get("level", "INFO")
+                            color    = _LEVEL_COLOR.get(level, THEME["text"])
+                            cat      = evt.get("category", "system")
+                            icon     = _CAT_ICON.get(cat, "📌")
+                            ts_raw   = evt.get("ts", "")
+                            ts_disp  = ts_raw[11:19] if len(ts_raw) >= 19 else ts_raw  # HH:MM:SS
+                            msg      = evt.get("message", "")
+
+                            with ui.element("tr").style(
+                                f"border-bottom: 1px solid {THEME['border']};"
+                            ):
+                                _td_cell(ts_disp, muted=True, mono=True)
+                                with ui.element("td").style("padding: 10px 14px;"):
+                                    ui.html(
+                                        f'<span style="background: color-mix(in srgb, {color} 20%, transparent); '
+                                        f'color: {color}; font-size: 10px; font-weight: 700; '
+                                        f'padding: 2px 8px; border-radius: 4px; letter-spacing: 0.05em;">'
+                                        f'{level}</span>'
+                                    )
+                                with ui.element("td").style("padding: 10px 14px;"):
+                                    ui.label(f"{icon} {cat}").style(
+                                        f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 600;"
+                                    )
+                                _td_cell(msg)
+
+            _log_table()
+
+            # Hook filter inputs
+            filter_input.on("input", lambda _: _log_table.refresh())
+            level_filter.on("update:model-value", lambda _: _log_table.refresh())
+
+            # Auto-refresh timer — polls event_log.jsonl every 2 seconds.
+            # safe_timer wraps the callback so post-navigation ticks don't
+            # spam the log with `parent slot deleted` RuntimeErrors.
+            from systemu.interface.ui_helpers import safe_timer
+            safe_timer(2.0, _log_table.refresh)
+
+        # ── PENDING ACTIONS TAB ───────────────────────────────────────────────
+        with ui.tab_panel(tab_pending):
+            @ui.refreshable
+            def _pending_panel():
+                pending = _load_pending_notifications(vault)
+
+                if not pending:
+                    ui.label("No pending actions. Everything is up to date.").style(
+                        f"color: {THEME['text_muted']}; font-style: italic; padding: 20px;"
+                    )
+                    return
+
+                for notif in pending:
+                    _pending_card(notif, vault, _pending_panel)
+
+            _pending_panel()
+
+            # Refresh pending every 5s (safe_timer = silent on post-nav ticks)
+            from systemu.interface.ui_helpers import safe_timer
+            safe_timer(5.0, _pending_panel.refresh)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _td_cell(text: str, *, muted: bool = False, mono: bool = False) -> None:
+    style = (
+        f"padding: 10px 14px; font-size: 13px; "
+        f"color: {THEME['text_muted'] if muted else THEME['text']};"
+    )
+    if mono:
+        style += " font-family: monospace;"
+    with ui.element("td").style(style):
+        ui.label(text)
+
+
+def _get_log_path(vault) -> Optional[Path]:
+    """Return the path to event_log.jsonl."""
+    try:
+        path = Path(vault.root) / "notifications" / "event_log.jsonl"
+        return path
+    except Exception:
+        return None
+
+
+def _load_events(vault, max_lines: int = 200) -> List[Dict[str, Any]]:
+    """Read the last N lines of event_log.jsonl."""
+    log_path = _get_log_path(vault)
+    if not log_path or not log_path.exists():
+        return []
+    try:
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+        events = []
+        for line in lines[-max_lines:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return events
+    except Exception as exc:
+        logger.warning("[Notifications] Could not read event log: %s", exc)
+        return []
+
+
+def _load_pending_notifications(vault) -> List[Dict[str, Any]]:
+    """Load pending notifications from the vault."""
+    try:
+        all_notifs = vault.load_index("notifications")
+        return [n for n in all_notifs if n.get("status") == "pending"]
+    except Exception:
+        return []
+
+
+def _pending_card(notif: Dict[str, Any], vault, refresh_fn) -> None:
+    """Render a pending notification card with action buttons."""
+    with ui.card().style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; padding: 18px; margin-bottom: 12px; width: 100%;"
+    ):
+        with ui.row().style("align-items: flex-start; gap: 12px;"):
+            ui.label("⚠️").style("font-size: 24px; padding-top: 2px;")
+            with ui.column().style("flex: 1; gap: 6px;"):
+                ui.label(notif.get("title", "Notification")).style(
+                    f"font-size: 15px; font-weight: 700; color: {THEME['text']};"
+                )
+                ui.label(notif.get("message", "")).style(
+                    f"font-size: 13px; color: {THEME['text_muted']}; line-height: 1.5; "
+                    f"white-space: pre-wrap;"
+                )
+                ts = notif.get("created_at", "")
+                if ts:
+                    ui.label(f"Created: {ts[:19].replace('T', ' ')}").style(
+                        f"font-size: 11px; color: {THEME['text_muted']}; font-family: monospace;"
+                    )
+
+        actions  = notif.get("actions", ["OK"])
+        notif_id = notif.get("id", "")
+        ctx      = notif.get("context", {})
+
+        with ui.row().style("gap: 8px; margin-top: 12px;"):
+            for action in actions:
+                btn_color = (
+                    THEME["success"] if action.lower() in ("approve", "forge", "ok", "awaken")
+                    else THEME["danger"] if action.lower() in ("reject", "skip")
+                    else THEME["surface2"]
+                )
+                btn_text_color = "white" if action.lower() in ("approve", "forge", "ok", "awaken", "reject", "skip") else THEME["text"]
+
+                def _do_action(_, a=action, nid=notif_id, n_ctx=ctx):
+                    try:
+                        vault.resolve_notification(nid, a)
+                        _dispatch_notification_action(a, n_ctx, vault, refresh_fn)
+                    except Exception as exc:
+                        logger.exception("[Notifications] Action dispatch failed")
+                        ui.notify(f"Error: {exc}", type="negative")
+
+                ui.button(action, on_click=_do_action).style(
+                    f"background: {btn_color}; color: {btn_text_color}; "
+                    f"border-radius: 8px; font-size: 13px; font-weight: 600; padding: 6px 16px;"
+                )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Notification action dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dispatch_notification_action(action: str, ctx: dict, vault, refresh_fn) -> None:
+    """Route a notification button click to the appropriate pipeline action."""
+    notif_type = ctx.get("notification_type", "")
+    a = action.lower()
+
+    if notif_type == "scroll_approval" and a == "approve":
+        scroll_id = ctx.get("scroll_id")
+        if not scroll_id:
+            ui.notify("Notification missing scroll_id — cannot approve.", type="negative")
+            return
+        _approve_scroll_from_ui(scroll_id, vault)
+
+    elif notif_type == "forge_tool" and a == "forge":
+        tool_id = ctx.get("tool_id")
+        if not tool_id:
+            ui.notify("Notification missing tool_id — cannot open forge.", type="negative")
+            return
+        _open_forge_dialog(tool_id)
+
+    else:
+        # Informational notifications (OK / Reject / Skip / unknown types) — just dismiss
+        ui.notify(f"Action '{action}' recorded.", type="positive")
+
+    if refresh_fn:
+        refresh_fn.refresh()
+
+
+def _approve_scroll_from_ui(scroll_id: str, vault) -> None:
+    """Approve a PENDING_APPROVAL scroll and run the extraction pipeline in a background thread."""
+    import asyncio
+    from nicegui import context as _nicegui_ctx
+
+    state  = AppState.get()
+    # Capture client NOW while we're still inside the UI event handler context.
+    # After asyncio.to_thread() completes the slot stack for the spawned task is
+    # empty, so ui.notify() crashes unless we re-enter the client explicitly.
+    try:
+        client = _nicegui_ctx.client
+    except Exception:
+        client = None
+
+    def _safe_notify(message: str, type: str = "positive") -> None:
+        try:
+            if client is not None:
+                with client:
+                    ui.notify(message, type=type)
+        except Exception:
+            pass  # Client disconnected between approval and pipeline completion
+
+    async def _run():
+        try:
+            from systemu.pipelines.activity_extractor import init_pipeline
+            from systemu.pipelines.scroll_refiner import approve_pending_scroll
+            init_pipeline(state.config, vault)
+            await asyncio.to_thread(approve_pending_scroll, scroll_id, vault)
+            _safe_notify("Scroll approved — extraction pipeline started. Check the Event Log for progress.")
+        except ValueError as exc:
+            _safe_notify(f"Cannot approve: {exc}", type="warning")
+        except Exception as exc:
+            logger.exception("[Notifications] Scroll approval from UI failed")
+            _safe_notify(f"Approval failed: {exc}", type="negative")
+
+    asyncio.create_task(_run())
+
+
+def _open_forge_dialog(tool_id: str) -> None:
+    """Open the Gate 1 → Gate 2 spec review dialog for a PROPOSED tool."""
+    try:
+        from systemu.interface.pages.tools import _show_spec_review_dialog
+        _show_spec_review_dialog(tool_id)
+    except Exception as exc:
+        logger.exception("[Notifications] Could not open forge dialog")
+        ui.notify(f"Could not open forge dialog: {exc}", type="negative")

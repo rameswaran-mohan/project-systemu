@@ -1,0 +1,47 @@
+{
+  "id": "tool_aa8349c7",
+  "name": "download_file",
+  "description": "Download a file from a URL to a local path",
+  "tool_type": "api_call",
+  "parameters_schema": {
+    "url": {
+      "type": "string",
+      "description": "File URL to download"
+    },
+    "output_path": {
+      "type": "string",
+      "description": "Local path to save the file"
+    },
+    "overwrite": {
+      "type": "boolean",
+      "description": "Overwrite if file exists",
+      "default": false
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "output_path": {
+      "type": "string"
+    },
+    "size_bytes": {
+      "type": "integer"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [
+    "requests"
+  ],
+  "implementation_path": "vault/tools/implementations/download_file.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_aa8349c7\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

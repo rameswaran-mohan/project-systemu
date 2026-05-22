@@ -1,0 +1,45 @@
+{
+  "id": "tool_5a69f64d",
+  "name": "search_emails",
+  "description": "Search for emails in the inbox based on query criteria and return matching thread information",
+  "tool_type": "api_call",
+  "parameters_schema": {
+    "query": {
+      "type": "string",
+      "description": "Search query string (e.g., 'from:rameswaran subject:NYSE')"
+    },
+    "max_results": {
+      "type": "integer",
+      "description": "Maximum number of emails to return",
+      "default": 5
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "emails": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Use the Gmail API (google-api-python-client). Authenticate via OAuth2. Call users().messages().list(q=query). Iterate through results to fetch message details using users().messages().get(). Return a list of objects containing 'id', 'threadId', 'subject', and 'snippet'. Catch HttpError and return error.",
+  "dependencies": [
+    "google-api-python-client",
+    "google-auth-httplib2",
+    "google-auth-oauthlib"
+  ],
+  "implementation_path": "vault\\tools\\implementations\\search_emails.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_5a69f64d\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-05T21:11:36.882535",
+  "updated_at": "2026-05-05T21:11:36.882535"
+}

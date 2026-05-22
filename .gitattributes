@@ -1,0 +1,24 @@
+# Normalize line endings to LF on commit (checkout as-is on Windows)
+* text=auto eol=lf
+
+# Windows batch files MUST stay CRLF — cmd.exe misreads LF-only batch files
+# and silently mangles multi-line commands (e.g. `setlocal enabledelayedexpansion`
+# is parsed as an unknown command, `@echo off` doesn't suppress echo of comment
+# lines, etc.).  v0.6.1: discovered after start.bat / stop.bat produced
+# "'mu' is not recognized" / "drive not found" errors after a fresh clone.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell scripts also prefer CRLF on Windows (less critical but consistent)
+*.ps1 text eol=crlf
+
+# Explicitly binary — never mangle
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.db binary
+*.sqlite binary
+*.db-shm binary
+*.db-wal binary

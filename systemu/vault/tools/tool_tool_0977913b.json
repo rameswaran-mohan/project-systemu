@@ -1,0 +1,45 @@
+{
+  "id": "tool_0977913b",
+  "name": "web_screenshot",
+  "description": "Render a URL in a headless browser and capture a screenshot of the page or a specific element",
+  "tool_type": "browser_action",
+  "parameters_schema": {
+    "url": {
+      "type": "string",
+      "description": "Full URL to render"
+    },
+    "selector": {
+      "type": "string",
+      "description": "CSS selector to screenshot (optional, full page if empty)",
+      "default": ""
+    },
+    "output_path": {
+      "type": "string",
+      "description": "Where to save the PNG (optional)",
+      "default": ""
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "image_path": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Use playwright sync_playwright with Chromium headless. Call page.goto(url, wait_until='networkidle'). If selector is provided, use page.locator(selector).screenshot(path=output_path). Otherwise page.screenshot(path=output_path). Return base64 if no output_path. Catch playwright TimeoutError and return error.",
+  "dependencies": [
+    "playwright"
+  ],
+  "implementation_path": "vault/tools/implementations/web_screenshot.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_0977913b\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

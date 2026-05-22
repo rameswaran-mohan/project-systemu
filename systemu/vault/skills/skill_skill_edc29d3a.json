@@ -1,0 +1,22 @@
+{
+  "id": "skill_edc29d3a",
+  "name": "image_processing",
+  "description": "Ability to capture, resize, and manipulate image files",
+  "category": "productivity",
+  "proficiency_level": "intermediate",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_ecaccc06",
+    "tool_0977913b",
+    "tool_bfc76fb8"
+  ],
+  "required_tool_names": [
+    "take_screenshot",
+    "web_screenshot",
+    "image_resize"
+  ],
+  "instructions_md": "For image capture: use web_screenshot for web content (headless, no display needed), use take_screenshot for capturing the physical screen or a region. For resizing: use image_resize — provide either width or height and set the other to 0 to maintain aspect ratio. Common output formats: PNG for lossless, JPEG for photos (use quality=85). Always verify the returned width and height after resizing to confirm the operation succeeded.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_edc29d3a\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

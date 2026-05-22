@@ -1,0 +1,133 @@
+"""Dashboard recovery panel: /recover/<scope>/<scope_id>"""
+from __future__ import annotations
+from typing import List
+
+from nicegui import ui
+
+from systemu.recovery.engine import RecoveryEngine, RecoveryAction
+
+
+def _get_vault():
+    from systemu.interface.dashboard_state import AppState
+    return AppState.get().vault
+
+
+def _diagnose(scope: str, scope_id: str) -> List[RecoveryAction]:
+    if scope not in {"tool", "shadow", "scroll", "activity"}:
+        return []
+    eng = RecoveryEngine(vault=_get_vault())
+    method = {
+        "tool": eng.diagnose_tool,
+        "shadow": eng.diagnose_shadow,
+        "scroll": eng.diagnose_scroll,
+        "activity": eng.diagnose_activity,
+    }[scope]
+    return method(scope_id)
+
+
+def _severity_color(sev: str) -> str:
+    return {"blocker": "red", "warning": "amber", "info": "blue"}.get(sev, "grey")
+
+
+def render_recovery_panel(scope: str, scope_id: str) -> None:
+    """Reusable component — embed inside any page."""
+    actions = _diagnose(scope, scope_id)
+    with ui.card().classes("w-full"):
+        ui.label(f"Recovery: {scope} {scope_id}").classes("text-h6")
+        if not actions:
+            ui.label("No pending actions").classes("text-green-700")
+            return
+        for a in actions:
+            _render_action_row(a)
+
+
+def _render_action_row(a: RecoveryAction) -> None:
+    with ui.row().classes("w-full items-center"):
+        ui.icon("warning", color=_severity_color(a.severity)).classes("text-2xl")
+        with ui.column().classes("flex-grow"):
+            ui.label(f"{a.kind} - {a.reason}").classes("text-body1")
+            if a.fix_command:
+                ui.label(a.fix_command).classes("text-mono text-caption")
+        if a.kind in {"DEP_PENDING", "GATE_3_DISABLED", "MEMORY_POISONED"}:
+            ui.button(
+                "Approve & Apply",
+                on_click=lambda act=a: _handle_action_and_notify(act),
+            ).props("color=primary")
+        else:
+            ui.button(
+                "Open Gate Review",
+                on_click=lambda url=a.fix_url: ui.navigate.to(url),
+            )
+
+
+def _handle_action_and_notify(a: RecoveryAction) -> None:
+    try:
+        _handle_action(a)
+        ui.notify(f"Applied: {a.kind}", type="positive")
+    except Exception as e:
+        ui.notify(f"Failed: {e}", type="negative")
+
+
+# ---- per-kind dispatch (Task 8) ----
+
+def _extract_missing_package(reason: str) -> str:
+    if "missing package:" in reason:
+        return reason.split("missing package:", 1)[1].strip()
+    return ""
+
+
+def _dispatch_install_dep(tool_id: str, package: str):
+    from systemu.runtime.dep_approvals import approve_and_install
+    approve_and_install(tool_id=tool_id, package=package, source="dashboard")
+
+
+def _dispatch_enable_tool(tool_id: str):
+    """Flip Gate 3 to enabled.
+
+    ``vault.save_tool`` expects the Pydantic ``Tool`` model, not a raw
+    ``ToolRow``. Prefer ``get_tool`` (Pydantic) over ``find_tool`` (ORM row)
+    when both exist."""
+    vault = _get_vault()
+    tool = None
+    if hasattr(vault, "get_tool"):
+        try:
+            tool = vault.get_tool(tool_id)
+        except KeyError:
+            return
+    if tool is None and hasattr(vault, "find_tool"):
+        tool = vault.find_tool(tool_id)
+    if tool is None:
+        return
+    tool.enabled = True
+    if hasattr(vault, "save_tool"):
+        vault.save_tool(tool)
+    elif hasattr(vault, "update_tool"):
+        vault.update_tool(tool)
+    else:
+        raise NotImplementedError("vault has no save_tool/update_tool method")
+
+
+def _dispatch_reset_memory(shadow_id: str, keep_successes: bool):
+    from systemu.runtime.memory_consolidator import reset_shadow_memory
+    reset_shadow_memory(shadow_id=shadow_id, keep_successes=keep_successes,
+                        vault=_get_vault())
+
+
+def _handle_action(a: RecoveryAction) -> None:
+    if a.kind == "DEP_PENDING":
+        pkg = _extract_missing_package(a.reason)
+        if pkg:
+            _dispatch_install_dep(a.scope_id, pkg)
+    elif a.kind == "GATE_3_DISABLED":
+        _dispatch_enable_tool(a.scope_id)
+    elif a.kind == "MEMORY_POISONED":
+        _dispatch_reset_memory(a.scope_id, keep_successes=True)
+    # GATE_1_PENDING / GATE_2_PENDING route via fix_url, not handled here.
+
+
+@ui.page("/recover/{scope}/{scope_id}")
+def recover_page(scope: str, scope_id: str):
+    if scope not in {"tool", "shadow", "scroll", "activity"}:
+        ui.label(f"Unknown scope: {scope}").classes("text-red")
+        return
+    render_recovery_panel(scope, scope_id)

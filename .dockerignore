@@ -1,0 +1,51 @@
+# Credentials — must never be baked into an image layer
+.env
+*.pem
+*.key
+*.cert
+
+# Vault RUNTIME data — mounted as a named volume; never baked in.
+# Keep ALL Python source under systemu/vault/ so module imports work
+# (factory.py was being silently excluded before, breaking the dashboard).
+systemu/vault/scrolls/
+systemu/vault/activities/
+systemu/vault/shadow_army/shadow_*/
+systemu/vault/evolutions/
+systemu/vault/notifications/
+systemu/vault/elder/
+systemu/vault/executions/
+systemu/vault/*.jsonl
+systemu/vault/*.md
+
+# Capture data — screen recordings, screenshots, raw sharing_on output
+# These are runtime data, never needed inside the image
+captures/
+systemu/captures/
+**/captures/
+
+# Other runtime / local data directories
+.vault/
+systemu/.vault/
+
+# Development artifacts
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+htmlcov/
+.coverage
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

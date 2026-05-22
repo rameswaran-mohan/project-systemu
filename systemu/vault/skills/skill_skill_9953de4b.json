@@ -1,0 +1,22 @@
+{
+  "id": "skill_9953de4b",
+  "name": "financial_reporting_automation",
+  "description": "Proficiency in automating the collection of financial market data and compiling it into standardized, dated documentation.",
+  "category": "finance",
+  "proficiency_level": "intermediate",
+  "evidence_scroll_ids": [
+    "scroll_bd2c3a68"
+  ],
+  "required_tool_ids": [
+    "tool_0977913b",
+    "tool_6e6e62c0"
+  ],
+  "required_tool_names": [
+    "web_screenshot",
+    "create_word_doc"
+  ],
+  "instructions_md": "To automate financial reporting: 1) Use web_screenshot to capture the specific financial chart or data table from the source URL. 2) Use Python's datetime module to generate the required filename based on the current date. 3) Use create_word_doc to assemble the report, embedding the captured image and adding relevant metadata. 4) Ensure the file is saved in the designated directory structure.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_9953de4b\\SKILL.md",
+  "created_at": "2026-05-04T13:04:49.738844",
+  "updated_at": "2026-05-04T13:04:49.738844"
+}

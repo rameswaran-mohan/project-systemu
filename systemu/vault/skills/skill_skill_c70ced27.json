@@ -1,0 +1,20 @@
+{
+  "id": "skill_c70ced27",
+  "name": "archive_management",
+  "description": "Ability to compress and extract ZIP and TAR archives",
+  "category": "file_ops",
+  "proficiency_level": "beginner",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_a768204a",
+    "tool_cdf257f3"
+  ],
+  "required_tool_names": [
+    "compress_files",
+    "extract_archive"
+  ],
+  "instructions_md": "To compress: use compress_files with a list of file paths or an include_dir to zip an entire folder. Output path should end in .zip. To extract: use extract_archive with the archive path and target output_dir. Supports .zip, .tar, .tar.gz, .tgz formats automatically. Verify file_count in the return value matches the expected number of files.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_c70ced27\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

@@ -1,0 +1,936 @@
+"""sharing_on CLI — the main entry point.
+
+Commands:
+  record   Start recording computer activity
+  analyze  Re-analyze a completed session without re-recording
+  info     Show platform capabilities
+
+Systemu commands (agent factory):
+  scrolls  Manage Scrolls — refined SOPs from capture sessions
+  army     Manage the Shadow Army — autonomous agent personas
+  tools    Manage the Tool registry
+  skills   Manage the Skills registry
+  settings Show Systemu configuration
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+# Load .env BEFORE any module that reads env vars — Config, vault factory,
+# task queue protocol all check os.environ at import time.  Without this,
+# native-local-mode users following the README literally see file-backend
+# defaults instead of the sqlite/huey setup install.py wrote to .env.
+# Docker modes use compose's env_file: directive and don't need this; loading
+# is a no-op when there's no .env on disk (override=False = won't clobber
+# already-set env from the parent shell).
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    # Walk up from this file to find the nearest .env (handles both running
+    # from the repo root and from inside a venv).
+    _here = Path(__file__).resolve().parent
+    for _candidate in (_here, _here.parent, _here.parent.parent):
+        _env_path = _candidate / ".env"
+        if _env_path.exists():
+            _load_dotenv(_env_path, override=False)
+            break
+except ImportError:
+    # python-dotenv missing — the CLI still works, just without .env
+    # auto-loading.  Operators can pre-source manually.
+    pass
+
+import click
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
+from rich import print as rprint
+
+from sharing_on.analyzer.generator import generate_instructions
+from sharing_on.analyzer.step_detector import StepDetector
+from sharing_on.analyzer.unifier import unify_events
+from sharing_on.config import Config
+from sharing_on.output.markdown import render_markdown
+from sharing_on.platform_info import check_dependencies, detect_platform
+from sharing_on.session import CaptureSession
+
+console = Console()
+logger = logging.getLogger(__name__)
+
+
+def _append_intent_trace(scroll, intent) -> None:
+    """append a TraceEvent to scroll.pipeline_trace summarising Stage 1.
+
+    Called from _run_analysis after refine_scroll returns a scroll.  Adds a
+    single event whose level reflects the extraction outcome:
+      - ``error``: extraction failed entirely
+      - ``warn``:  ``confidence=low`` (downstream uses narrative-only fallback)
+      - ``info``:  ``confidence=medium|high`` (intent is used downstream)
+    """
+    from systemu.core.models import TraceEvent
+
+    if getattr(intent, "error", None):
+        scroll.pipeline_trace.append(TraceEvent(
+            stage="intent",
+            level="error",
+            message=f"intent extraction failed: {str(intent.error)[:80]}",
+            detail={"error": intent.error, "confidence": getattr(intent, "confidence", "?")},
+        ))
+    elif not getattr(intent, "is_usable", False):
+        conf = getattr(intent, "confidence", "?")
+        scroll.pipeline_trace.append(TraceEvent(
+            stage="intent",
+            level="warn",
+            message=f"confidence={conf}; downstream uses narrative-only fallback",
+            detail={"confidence": conf, "intent": str(getattr(intent, "intent", ""))[:80]},
+        ))
+    else:
+        conf = getattr(intent, "confidence", "?")
+        scroll.pipeline_trace.append(TraceEvent(
+            stage="intent",
+            level="info",
+            message=f"intent extracted ({conf})",
+            detail={"confidence": conf, "intent": str(getattr(intent, "intent", ""))[:80]},
+        ))
+
+
+def main():
+    """sharing_on CLI entry point."""
+    cli(obj={})
+
+
+@click.group()
+@click.version_option("0.1.0", prog_name="sharing_on")
+@click.option("--debug", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def cli(ctx, debug: bool):
+    """
+    sharing_on — Record computer activity and generate step-by-step instructions.
+
+    \b
+    Quick start:
+      1. Copy .env.example to .env and add your OpenRouter API key
+      2. Run:  sharing_on record --name "My Task"
+      3. Perform your task, then press Ctrl+C to stop
+      4. Find your instructions.md in the captures/ directory
+    """
+    ctx.ensure_object(dict)
+    level = logging.DEBUG if debug else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
+
+# ---------------------------------------------------------------------------
+# record command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option(
+    "--name", "-n",
+    default="",
+    help="Name for this capture session (e.g. 'Deploy to production').",
+    prompt="Session name (describe the task you're about to perform)",
+)
+@click.option(
+    "--watch", "-w",
+    multiple=True,
+    help="Directory to watch for file changes. Repeat for multiple dirs.",
+)
+@click.option(
+    "--output", "-o",
+    default="",
+    help="Output directory (default: ./captures/<name>_<session_id>/).",
+)
+@click.option(
+    "--screenshots",
+    is_flag=True,
+    default=False,
+    help="Enable periodic screenshot capture (opt-in; screenshots are not used by the LLM pipeline).",
+)
+@click.option(
+    "--screenshot-interval",
+    default=3.0,
+    show_default=True,
+    help="Seconds between screenshots (only applies when --screenshots is set).",
+    type=float,
+)
+@click.option(
+    "--model",
+    default="",
+    help="OpenRouter model (e.g. openai/gpt-4o, anthropic/claude-3-haiku).",
+)
+@click.option(
+    "--no-analyze",
+    is_flag=True,
+    default=False,
+    help="Skip LLM analysis after recording. Just save raw events.",
+)
+@click.pass_context
+def record(
+    ctx,
+    name: str,
+    watch: tuple,
+    output: str,
+    screenshots: bool,
+    screenshot_interval: float,
+    model: str,
+    no_analyze: bool,
+):
+    """
+    Record computer activity for a task and generate step-by-step instructions.
+
+    \b
+    Examples:
+      sharing_on record --name "Set up Python project"
+      sharing_on record --name "Deploy app" --watch ./src --watch ./config
+      sharing_on record --name "Fix bug" --screenshot-interval 5
+    """
+    # Load config from .env
+    config = Config.from_env()
+
+    # Apply CLI overrides
+    if model:
+        config.llm_model = model
+    config.capture_screenshots = screenshots
+    if screenshots and screenshot_interval:
+        config.screenshot_interval = screenshot_interval
+    if watch:
+        config.watch_dirs = list(watch)
+    if output:
+        config.output_base_dir = output
+
+    # Validate config (only needed for analysis step)
+    if not no_analyze:
+        errors = config.validate()
+        if errors:
+            console.print("\n[bold red]Configuration errors:[/bold red]")
+            for e in errors:
+                console.print(f"  ✗ {e}")
+            console.print(
+                "\n[dim]Tip: Copy .env.example to .env and add your OpenRouter key.[/dim]"
+            )
+            sys.exit(1)
+
+    # Check dependencies
+    missing = check_dependencies()
+    if missing:
+        console.print("\n[bold red]Missing dependencies:[/bold red]")
+        for dep in missing:
+            console.print(f"  ✗ {dep}")
+        console.print("\nRun: [bold]pip install -r requirements.txt[/bold]")
+        sys.exit(1)
+
+    # Detect and display platform info
+    platform = detect_platform()
+    _print_startup_banner(name, platform, config)
+
+    # Build the capture session
+    output_path = Path(output) if output else None
+    session = CaptureSession(
+        name=name,
+        config=config,
+        output_dir=output_path,
+    )
+
+    # Set up Ctrl+C → graceful stop
+    stop_requested = [False]
+
+    def _handle_interrupt(sig, frame):
+        if not stop_requested[0]:
+            stop_requested[0] = True
+            console.print("\n\n[bold yellow]⏹  Stopping capture...[/bold yellow]")
+
+    signal.signal(signal.SIGINT, _handle_interrupt)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_interrupt)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _handle_interrupt)
+
+    # Start recording
+    session.start()
+
+    # --- Live status display ---
+    _run_live_display(session, stop_requested)
+
+    # Stop collectors and flush
+    session.stop()
+
+    console.print()
+    console.print(Panel.fit(
+        f"[bold green]✓ Capture complete[/bold green]\n"
+        f"[dim]Events stored: {session.event_count:,}[/dim]\n"
+        f"[dim]Output dir: {session.output_dir}[/dim]",
+        border_style="green",
+    ))
+
+    if no_analyze:
+        console.print(
+            f"\n[dim]Skipping analysis. "
+            f"Run [bold]sharing_on analyze {session.output_dir}[/bold] later.[/dim]"
+        )
+        return
+
+    # --- Analyze in the background ---
+    _run_analysis_in_background(session.output_dir, config)
+
+
+def _run_analysis_in_background(output_dir: Path, config: Config) -> None:
+    """Spawn the 'analyze' command as a detached background process."""
+    import os
+    log_file = output_dir / "analysis.log"
+
+    # Build the command that calls the existing 'analyze' subcommand
+    cmd = [sys.executable, "-m", "sharing_on", "analyze", str(output_dir)]
+    if config.llm_model:
+        cmd += ["--model", config.llm_model]
+
+    # Force UTF-8 encoding in the child process so Rich can write to the log file
+    child_env = os.environ.copy()
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+    # Background process has no TTY — mark headless so notify_user() auto-approves
+    # prompts (scroll approval, shadow creation) instead of blocking indefinitely.
+    child_env["SYSTEMU_HEADLESS"] = "1"
+    
+    try:
+        import systemu
+        child_env["PYTHONPATH"] = str(Path(systemu.__file__).parent.parent.absolute())
+    except ImportError:
+        pass
+
+    try:
+        with open(log_file, "w", encoding="utf-8") as log_fp:
+            if sys.platform == "win32":
+                DETACHED_PROCESS = 0x00000008
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fp,
+                    stderr=log_fp,
+                    creationflags=DETACHED_PROCESS,
+                    close_fds=True,
+                    env=child_env,
+                )
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fp,
+                    stderr=log_fp,
+                    start_new_session=True,
+                    close_fds=True,
+                    env=child_env,
+                )
+
+        console.print()
+        console.print(Panel.fit(
+            f"[bold green]Analysis running in background[/bold green] (PID {proc.pid})\n\n"
+            f"[dim]Instructions will be saved to:[/dim]\n"
+            f"  {output_dir / 'instructions.md'}\n\n"
+            f"[dim]Follow progress:[/dim]\n"
+            f"  [bold]Get-Content -Wait \"{log_file}\"[/bold]  [dim](PowerShell)[/dim]\n"
+            f"  [bold]tail -f \"{log_file}\"[/bold]          [dim](macOS/Linux)[/dim]",
+            title="sharing_on",
+            border_style="cyan",
+        ))
+
+    except Exception as e:
+        # Background launch failed — fall back to inline analysis
+        console.print(
+            f"\n[yellow]! Could not spawn background process ({e}). "
+            f"Running analysis inline...[/yellow]\n"
+        )
+        from sharing_on.session import CaptureSession
+        # Re-use the session object path — load events from disk
+        from sharing_on.events.store import EventStore
+        dummy_store = EventStore(output_dir / "events.db")
+        import json
+        meta = json.loads((output_dir / "session.json").read_text())
+
+        class _SessionProxy:
+            event_count = dummy_store.event_count
+            name = meta.get("name", "Recorded Task")
+            session_id = meta.get("session_id", "unknown")
+            start_time = None
+            end_time = None
+
+            class platform:
+                @staticmethod
+                def summary(): return meta.get("platform", "Unknown")
+
+            def get_events(self):
+                return dummy_store.get_all_events()
+
+            @property
+            def output_dir(self):
+                return output_dir
+
+        _run_analysis(_SessionProxy(), config)
+
+
+def _run_live_display(session: "CaptureSession", stop_requested: list) -> None:
+    """Show a live updating status panel while recording."""
+    console.print()
+    console.print(
+        "[bold green]◉ Recording...[/bold green]  "
+        "[dim]Press [bold]Ctrl+C[/bold] when done, or press [bold]M[/bold] "
+        "then Enter to add a step marker.[/dim]"
+    )
+    console.print()
+
+    start_time = datetime.now()
+
+    with Progress(
+        SpinnerColumn(style="green"),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("Recording activity...", total=None)
+
+        while not stop_requested[0]:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            event_count = session.event_count
+
+            progress.update(
+                task,
+                description=(
+                    f"[green]●[/green] Recording  |  "
+                    f"Events: [bold]{event_count:,}[/bold]  |  "
+                    f"Collectors: [bold]{len([c for c in session.collector_status if c['running']])}[/bold] active"
+                ),
+            )
+            time.sleep(0.5)
+
+
+def _run_analysis(session: "CaptureSession", config: Config) -> None:
+    """Run step detection and LLM instruction generation."""
+    console.print()
+    console.rule("[bold blue]Analysis[/bold blue]")
+
+    # Step 1: Load events
+    with console.status("[bold]Loading captured events...[/bold]"):
+        events = session.get_events()
+
+    console.print(f"  [green]v[/green] Loaded [bold]{len(events):,}[/bold] raw events")
+
+    # Step 1b: Unify (deduplicate, filter noise, collapse repeats)
+    with console.status("[bold]Unifying and deduplicating events...[/bold]"):
+        events = unify_events(events)
+
+    console.print(f"  [green]v[/green] Unified to [bold]{len(events):,}[/bold] clean events")
+
+    # Step 2: Detect steps
+    with console.status("[bold]Detecting step boundaries...[/bold]"):
+        detector = StepDetector(idle_threshold=config.step_idle_threshold)
+        steps = detector.detect_steps(events)
+
+    console.print(f"  [green]✓[/green] Detected [bold]{len(steps)}[/bold] steps")
+
+    if not steps:
+        console.print(
+            "\n[yellow]⚠ No steps detected. "
+            "The session may have been too short or had no activity.[/yellow]"
+        )
+        return
+
+    # Print step summary
+    _print_step_table(steps)
+
+    # Step 3: Generate instructions with LLM
+    console.print()
+    console.print(
+        f"  [dim]Using model: [bold]{config.llm_model}[/bold][/dim]"
+    )
+
+    with console.status(
+        f"[bold]Generating instructions via {config.tier3_model}...[/bold]"
+    ):
+        duration = 0.0
+        if session.start_time and session.end_time:
+            duration = (session.end_time - session.start_time).total_seconds()
+
+        instructions = generate_instructions(
+            steps=steps,
+            session_name=session.name,
+            platform_info=session.platform.summary(),
+            duration_seconds=duration,
+            api_key=config.openrouter_api_key,
+            base_url=config.openrouter_base_url,
+            model=config.tier3_model,
+        )
+
+    console.print("  [green]v[/green] Instructions generated")
+
+    # Step 4: Render Markdown
+    with console.status("[bold]Rendering Markdown document...[/bold]"):
+        output_path = render_markdown(
+            instructions=instructions,
+            steps=steps,
+            session_name=session.name,
+            session_id=session.session_id,
+            platform_info=session.platform.summary(),
+            start_time=session.start_time,
+            end_time=session.end_time,
+            output_dir=session.output_dir,
+            event_count=session.event_count,
+        )
+
+    console.print(f"  [green]✓[/green] Markdown saved")
+
+    # Final output
+    console.print()
+    console.print(Panel.fit(
+        f"[bold green]Done![/bold green]\n\n"
+        f"📄 [bold]Instructions:[/bold] [link={output_path}]{output_path}[/link]\n"
+        f"📁 [bold]Full output:[/bold]  {session.output_dir}",
+        title="sharing_on",
+        border_style="green",
+    ))
+
+    # --- Systemu Stage 2: Post-capture hook ---
+    try:
+        from systemu.pipelines.scroll_refiner import refine_scroll
+        from systemu.vault.factory import open_vault
+        console.print()
+        console.print("[bold]Systemu:[/bold] Processing capture session...")
+        vault = open_vault(config)
+        console.print(f"  [dim]Storage backend: {type(vault).__name__}[/dim]")
+        refine_scroll(session.output_dir, config, vault)
+        console.print("  [green]v[/green] Session handed off to Systemu")
+    except ImportError:
+        pass  # systemu package not available in this environment
+    except Exception as e:
+        console.print(f"  [yellow]! Scroll refinement failed: {e}[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# analyze command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("session_dir", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--model",
+    default="",
+    help="Override the LLM model.",
+)
+def analyze(session_dir: str, model: str):
+    """
+    Re-analyze a completed capture session.
+
+    \b
+    Use this to regenerate instructions without re-recording.
+
+    \b
+    Example:
+      sharing_on analyze ./captures/my_task_cap_20260418_140000/
+    """
+    import json
+
+    session_path = Path(session_dir)
+    meta_file = session_path / "session.json"
+    db_file = session_path / "events.db"
+
+    if not meta_file.exists() or not db_file.exists():
+        console.print(
+            f"[red]x Invalid session directory: {session_dir}[/red]\n"
+            "[dim]Expected session.json and events.db files.[/dim]"
+        )
+        sys.exit(1)
+
+    with open(meta_file) as f:
+        metadata = json.load(f)
+
+    config = Config.from_env()
+    if model:
+        config.llm_model = model
+        config.tier3_model = model
+
+    errors = config.validate()
+    if errors:
+        for e in errors:
+            console.print(f"[red]x {e}[/red]")
+        sys.exit(1)
+
+    console.print(
+        Panel.fit(
+            f"[bold]Re-analyzing session:[/bold] {metadata.get('name', 'Unknown')}\n"
+            f"[dim]{session_dir}[/dim]",
+            border_style="blue",
+        )
+    )
+
+    # Load events from the existing store
+    from sharing_on.events.store import EventStore
+
+    store = EventStore(db_file)
+    events = store.get_all_events()
+
+    console.print(f"  [green]v[/green] Loaded [bold]{len(events):,}[/bold] raw events")
+
+    # Unify events
+    with console.status("[bold]Unifying events...[/bold]"):
+        events = unify_events(events)
+
+    console.print(f"  [green]v[/green] Unified to [bold]{len(events):,}[/bold] clean events")
+
+    # Detect steps
+    with console.status("[bold]Detecting steps...[/bold]"):
+        detector = StepDetector()
+        steps = detector.detect_steps(events)
+
+    console.print(f"  [green]v[/green] Detected [bold]{len(steps)}[/bold] steps")
+    _print_step_table(steps)
+
+    # Stage 1: pre-pass intent extraction.  Run BEFORE narrative
+    # generation so the narrative LLM gets explicit outcome-oriented intent
+    # rather than inferring it implicitly from a click-by-click log.  The
+    # intent.json artifact is read by Stage 2 (scroll refiner).
+    from sharing_on.analyzer.intent_extractor import extract_intent, write_intent_json
+
+    with console.status("[bold]Inferring intent...[/bold]"):
+        intent = extract_intent(
+            steps=steps,
+            events=events,
+            session_name=metadata.get("name", "Recorded Task"),
+            platform_info=metadata.get("platform", "Unknown platform"),
+            api_key=config.openrouter_api_key,
+            base_url=config.openrouter_base_url,
+            model=config.tier2_model,
+        )
+    write_intent_json(intent, session_path)
+    if intent.is_usable:
+        console.print(
+            f"  [green]v[/green] Inferred intent (confidence={intent.confidence}): "
+            f"[dim]{intent.intent[:80]}[/dim]"
+        )
+    else:
+        console.print(
+            f"  [yellow]i[/yellow] Intent inference low-confidence "
+            f"(falling back to narrative-only mode)"
+        )
+
+    # Generate instructions
+    with console.status(f"[bold]Generating via {config.tier3_model}...[/bold]"):
+        instructions = generate_instructions(
+            steps=steps,
+            session_name=metadata.get("name", "Recorded Task"),
+            platform_info=metadata.get("platform", "Unknown platform"),
+            duration_seconds=0.0,
+            api_key=config.openrouter_api_key,
+            base_url=config.openrouter_base_url,
+            model=config.tier3_model,
+            intent=intent if intent.is_usable else None,
+        )
+
+    # Render
+    from datetime import timezone
+
+    start_str = metadata.get("start_time")
+    end_str = metadata.get("end_time")
+    start_dt = datetime.fromisoformat(start_str) if start_str else None
+    end_dt = datetime.fromisoformat(end_str) if end_str else None
+
+    output_path = render_markdown(
+        instructions=instructions,
+        steps=steps,
+        session_name=metadata.get("name", "Recorded Task"),
+        session_id=metadata.get("session_id", "unknown"),
+        platform_info=metadata.get("platform", ""),
+        start_time=start_dt,
+        end_time=end_dt,
+        output_dir=session_path,
+        event_count=len(events),
+        intent=intent if intent.is_usable else None,
+    )
+
+    console.print(Panel.fit(
+        f"[bold green]Done![/bold green]\n\n"
+        f"Instructions: {output_path}\n"
+        f"Full output:  {session_path}",
+        border_style="green",
+    ))
+
+    # --- Systemu Stage 2: Post-capture hook ---
+    try:
+        from systemu.pipelines.scroll_refiner import refine_scroll
+        from systemu.vault.factory import open_vault
+        console.print()
+        console.print("[bold]Systemu:[/bold] Processing capture session...")
+        vault = open_vault(config)
+        console.print(f"  [dim]Storage backend: {type(vault).__name__}[/dim]")
+        refine_scroll(session_path, config, vault)
+        console.print("  [green]v[/green] Session handed off to Systemu")
+
+        # record Stage 1 outcome on the scroll's pipeline_trace.
+        # We look up the just-refined scroll by source_session_id and append
+        # the intent extraction outcome so the operator sees it on /scrolls.
+        try:
+            sess_id = metadata.get("session_id")
+            new_scroll = None
+            for header in (vault.load_index("scrolls") or []):
+                if header.get("source_session_id") == sess_id:
+                    new_scroll = vault.get_scroll(header["id"])
+                    break
+            if new_scroll is not None:
+                _append_intent_trace(new_scroll, intent)
+                vault.save_scroll(new_scroll)
+        except Exception:
+            logger.debug("[v0.6.5] could not append intent trace", exc_info=True)
+    except ImportError:
+        pass  # systemu package not available in this environment
+    except Exception as e:
+        console.print(f"  [yellow]! Scroll refinement failed: {e}[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# info command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def info():
+    """Show platform capabilities and configuration status."""
+    console.print()
+    console.rule("[bold]sharing_on — System Info[/bold]")
+
+    # Platform
+    platform = detect_platform()
+    console.print(f"\n[bold]Platform:[/bold] {platform.summary()}")
+
+    # Capabilities table
+    cap_table = Table(title="Capture Capabilities", show_header=True)
+    cap_table.add_column("Capability", style="bold")
+    cap_table.add_column("Status")
+
+    all_caps = [
+        ("screenshots", "[Screenshots]"),
+        ("window_tracker", "[Window tracking]"),
+        ("process_monitor", "[Process monitoring]"),
+        ("file_watcher", "[File watching]"),
+        ("clipboard", "[Clipboard]"),
+        ("wayland_session", "[Wayland]"),
+        ("ui_introspection", "[Native UI Introspection]"),
+    ]
+
+    for cap_id, cap_name in all_caps:
+        if cap_id in platform.capabilities:
+            cap_table.add_row(cap_name, "[green]v Available[/green]")
+        else:
+            cap_table.add_row(cap_name, "[dim]x Not available on this platform[/dim]")
+
+    console.print()
+    console.print(cap_table)
+
+    # Dependency check
+    missing = check_dependencies()
+    console.print()
+    if missing:
+        console.print("[bold red]Missing dependencies:[/bold red]")
+        for dep in missing:
+            console.print(f"  x {dep}")
+    else:
+        console.print("[bold green]v All dependencies installed[/bold green]")
+
+    # Config check
+    config = Config.from_env()
+    errors = config.validate()
+    console.print()
+    if errors:
+        console.print("[bold yellow]Configuration issues:[/bold yellow]")
+        for e in errors:
+            console.print(f"  ! {e}")
+    else:
+        console.print(
+            f"[bold green]v Configuration OK[/bold green]  "
+            f"[dim](model: {config.llm_model})[/dim]"
+        )
+
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# doctor command (v0.6.8-a)
+# ---------------------------------------------------------------------------
+# Diagnoses pending gates/blockers for any scroll/activity/shadow/tool by
+# delegating to systemu.recovery.engine.RecoveryEngine.  Operators run this
+# when a scroll is stuck and they want a checklist of fixes — same data
+# the dashboard's recovery panel shows, surfaced for the terminal.
+
+def _infer_scope(scope_id: str):
+    """Map an id prefix to the entity kind RecoveryEngine knows about.
+
+    Accepts both the canonical underscored prefixes (``scr_``, ``act_``,
+    ``sh_``, ``tool_``) and the unsuffixed short forms (``scr1``, ``act1``,
+    ``sh1``, ``tool_a``) used by older fixtures and ad-hoc inserts.
+    """
+    if scope_id.startswith(("scr_", "scroll_")) or scope_id.startswith("scr"):
+        return "scroll"
+    if scope_id.startswith(("act_", "activity_")) or scope_id.startswith("act"):
+        return "activity"
+    if scope_id.startswith(("sh_", "shadow_")) or scope_id.startswith("sh"):
+        return "shadow"
+    if scope_id.startswith("tool"):
+        return "tool"
+    return None
+
+
+@cli.command()
+@click.argument("scope_id")
+@click.option("--apply", "apply_mode", is_flag=True,
+              help="Interactive walkthrough mode (prompts y/N for each action).")
+def doctor(scope_id: str, apply_mode: bool):
+    """Diagnose pending gates for a scroll/activity/shadow/tool.
+
+    \b
+    Examples:
+      sharing_on doctor scr_abc123
+      sharing_on doctor tool_xyz789
+    """
+    import os
+    from systemu.recovery.engine import RecoveryEngine
+    from systemu.storage.sqlite.vault import SqliteVault
+
+    db_url = os.environ.get("SYSTEMU_DATABASE_URL")
+    if not db_url:
+        click.echo("ERROR: SYSTEMU_DATABASE_URL not set", err=True)
+        sys.exit(2)
+
+    scope = _infer_scope(scope_id)
+    if scope is None:
+        click.echo(
+            f"ERROR: cannot infer scope for id {scope_id!r} "
+            f"(expected prefix scr_/act_/sh_/tool_)",
+            err=True,
+        )
+        sys.exit(2)
+
+    vault = SqliteVault(database_url=db_url)
+    eng = RecoveryEngine(vault=vault)
+
+    finder = {
+        "scroll": vault.find_scroll,
+        "activity": vault.find_activity,
+        "shadow": vault.find_shadow,
+        "tool": vault.find_tool,
+    }[scope]
+
+    if finder(scope_id) is None:
+        click.echo(f"ERROR: {scope} {scope_id!r} not found in vault", err=True)
+        sys.exit(3)
+
+    method = {
+        "scroll": eng.diagnose_scroll,
+        "activity": eng.diagnose_activity,
+        "shadow": eng.diagnose_shadow,
+        "tool": eng.diagnose_tool,
+    }[scope]
+
+    actions = method(scope_id)
+    click.echo(f"Diagnosing {scope_id} (scope: {scope})")
+    if not actions:
+        click.echo("OK no pending actions")
+        sys.exit(0)
+    click.echo(f"{len(actions)} action(s) pending:")
+    for i, a in enumerate(actions, 1):
+        click.echo(f"  [{i}] {a.scope_kind} {a.scope_id}: {a.kind} ({a.severity})")
+        click.echo(f"      {a.reason}")
+        click.echo(f"      Fix:  {a.fix_url}")
+        if a.fix_command:
+            click.echo(f"            OR: {a.fix_command}")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _print_startup_banner(name: str, platform, config: Config) -> None:
+    """Print the startup banner with session details."""
+    watch_dirs = config.watch_dirs or ["(none — add --watch <dir>)"]
+
+    screenshots_label = (
+        f"enabled (every {config.screenshot_interval}s)"
+        if config.capture_screenshots
+        else "off  [dim](use --screenshots to enable)[/dim]"
+    )
+    console.print()
+    console.print(Panel.fit(
+        f"[bold cyan]sharing_on[/bold cyan]  [dim]v0.1.0[/dim]\n\n"
+        f"[bold]Task:[/bold]        {name}\n"
+        f"[bold]Platform:[/bold]    {platform.summary()}\n"
+        f"[bold]Model:[/bold]       {config.llm_model}\n"
+        f"[bold]Watching:[/bold]    {', '.join(watch_dirs)}\n"
+        f"[bold]Screenshots:[/bold] {screenshots_label}",
+        border_style="cyan",
+        title="◉ Starting",
+    ))
+
+
+def _print_step_table(steps) -> None:
+    """Print a summary table of detected steps."""
+    console.print()
+    table = Table(title="Detected Steps", show_header=True, min_width=60)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("App", style="cyan")
+    table.add_column("Duration", style="dim")
+    table.add_column("Events", justify="right")
+    table.add_column("Label")
+
+    for step in steps:
+        counts = step.event_summary
+        total = sum(v for k, v in counts.items() if k != "screen")
+        duration = f"{step.duration_seconds:.0f}s" if step.duration_seconds else "—"
+        label = step.label or "[dim]—[/dim]"
+
+        table.add_row(
+            str(step.step_number),
+            step.primary_app or "—",
+            duration,
+            str(total),
+            label,
+        )
+
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Systemu command groups
+# ---------------------------------------------------------------------------
+# Import and register all Systemu CLI groups so they appear under
+# `sharing_on <group> <command>` without modifying any pipeline code.
+
+try:
+    from systemu.interface.cli_commands import (
+        scrolls_group,
+        army_group,
+        tools_group,
+        skills_group,
+        settings_cmd,
+        evolve_group,
+        daemon_group,
+        chat_group,
+        debug_group,
+    )
+    cli.add_command(scrolls_group,  name="scrolls")
+    cli.add_command(army_group,     name="army")
+    cli.add_command(tools_group,    name="tools")
+    cli.add_command(skills_group,   name="skills")
+    cli.add_command(settings_cmd,   name="settings")
+    cli.add_command(evolve_group,   name="evolve")
+    cli.add_command(daemon_group,   name="daemon")
+    cli.add_command(chat_group,     name="chat")
+    cli.add_command(debug_group,    name="debug")
+except ImportError:
+    # systemu package not yet installed — sharing_on still works standalone
+    pass

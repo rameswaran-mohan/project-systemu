@@ -1,0 +1,64 @@
+name: AI-friendly task
+description: A focused, well-scoped task suitable for an AI contributor to pick up
+title: "[AI-task] "
+labels: ["good-for-ai", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to file a task you'd like an AI agent to
+        pick up.  See [CONTRIBUTING.md](../../CONTRIBUTING.md#for-ai-contributors)
+        for the contribution norms — every AI PR still requires
+        human maintainer review before merge.
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: |
+        What needs to change.  Keep it small enough to fit in a single
+        focused PR.
+    validations:
+      required: true
+
+  - type: textarea
+    id: success
+    attributes:
+      label: Success criteria
+      description: |
+        How does the AI (or a reviewer) know the task is complete?
+        List concrete, checkable outcomes.
+      placeholder: |
+        - All existing tests pass
+        - New test covers <specific case>
+        - <Specific docstring or doc page> is updated
+    validations:
+      required: true
+
+  - type: textarea
+    id: files
+    attributes:
+      label: Files / surface to touch
+      description: Best-guess list of files the change probably needs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: nonscope
+    attributes:
+      label: Out of scope (do NOT change in this PR)
+      description: |
+        Things the agent should leave alone, even if they look related.
+        Helps avoid PR sprawl.
+
+  - type: dropdown
+    id: difficulty
+    attributes:
+      label: Estimated difficulty
+      options:
+        - "Trivial — single-file mechanical edit"
+        - "Small — single-PR, <100 lines diff"
+        - "Medium — multiple files, needs some judgement"
+        - "Large — break this down further before assigning"
+    validations:
+      required: true

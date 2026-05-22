@@ -1,0 +1,32 @@
+{
+  "id": "tool_6c651325",
+  "name": "keyboard_shortcut",
+  "description": "Press a keyboard shortcut at the OS level using pynput (fallback tool)",
+  "tool_type": "cli_command",
+  "parameters_schema": {
+    "shortcut": {
+      "type": "string",
+      "description": "Shortcut string e.g. Ctrl+S, Alt+F4"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [
+    "pynput"
+  ],
+  "implementation_path": "vault/tools/implementations/keyboard_shortcut.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_6c651325\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

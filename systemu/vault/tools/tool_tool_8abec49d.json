@@ -1,0 +1,58 @@
+{
+  "id": "tool_8abec49d",
+  "name": "github_list_workflow_runs",
+  "description": "List workflow runs for a GitHub repository, with optional filtering by status (e.g., failure) and branch",
+  "tool_type": "api_call",
+  "parameters_schema": {
+    "owner": {
+      "type": "string",
+      "description": "Repository owner (user or organization)"
+    },
+    "repo": {
+      "type": "string",
+      "description": "Repository name"
+    },
+    "status": {
+      "type": "string",
+      "description": "Filter by status: completed, failure, success, cancelled, etc.",
+      "default": "failure"
+    },
+    "branch": {
+      "type": "string",
+      "description": "Filter by branch name (optional)",
+      "default": ""
+    },
+    "per_page": {
+      "type": "integer",
+      "description": "Number of results per page (max 100)",
+      "default": 30
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "description": "List of workflow run objects with id, name, status, conclusion, created_at, head_sha, etc."
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Use requests.get with URL https://api.github.com/repos/{owner}/{repo}/actions/runs. Pass params: status, branch, per_page. Set Accept header to application/vnd.github.v3+json. Parse JSON response. Return the 'workflow_runs' array. Catch requests.RequestException and return error.",
+  "dependencies": [
+    "requests"
+  ],
+  "implementation_path": "",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_8abec49d\\TOOL.md",
+  "status": "proposed",
+  "forged_by_systemu": true,
+  "enabled": false,
+  "version": 1,
+  "created_at": "2026-05-08T21:59:09.817637",
+  "updated_at": "2026-05-08T21:59:09.817637"
+}
