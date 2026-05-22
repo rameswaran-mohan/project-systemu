@@ -10,7 +10,8 @@ jobs:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     permissions:
-      id-token: write  # for trusted publishing
+      contents: read    # checkout the tagged commit
+      id-token: write   # PyPI Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
