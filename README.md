@@ -39,7 +39,7 @@ Systemu combines two components:
 [Architecture](ARCHITECTURE.md) ·
 [User Guide](USER_GUIDE.md) ·
 [Contributing](CONTRIBUTING.md) ·
-[Migration (v0.2)](MIGRATION.md)
+[Governance](docs/governance.md)
 
 ---
 
@@ -55,7 +55,7 @@ Sharing-On records: screenshots, window switches,
           ▼
 Intent extractor (Tier-2 LLM) infers what you
   actually wanted — written to intent.json, not
-  inferred from the click sequence              (v0.6.0)
+  inferred from the click sequence
           │
           ▼
 Scroll refiner turns the intent + abstracted
@@ -63,30 +63,30 @@ Scroll refiner turns the intent + abstracted
           │
           ▼
 Pre-flight scroll validator (opt-in) checks
-  satisfiability + intent-vs-tool fit;          (+ v0.6.0)
+  satisfiability + intent-vs-tool fit;
   surfaces a side-by-side remediation card
-  with a proposed_revision when blocked         (v0.6.0)
+  with a proposed_revision when blocked
           │
           ▼
 Activity extractor selects tools and skills
   via data-flow reasoning (schemas in headers,
-  not just keyword name match)                  (v0.6.0)
+  not just keyword name match)
           │
           ▼
 Missing tools forged with intent context →
-  dry-run validation gate (Gate 3.5)            (v0.5.0)
+  dry-run validation gate (Gate 3.5)
           │
           ▼
 Shadow decision picks an existing specialist OR
   creates a new one, scoring on semantic intent
-  match plus skill/tool ID overlap              (v0.6.0)
+  match plus skill/tool ID overlap
           │
           ▼
 Supervisor dispatches the Shadow.  Intelligent
   Supervisor (opt-in) intervenes between
   iterations with bounded actions including
   RECALIBRATE_TOOL / RECALIBRATE_SKILL when
-  capabilities are structurally inadequate      (+ v0.6.0)
+  capabilities are structurally inadequate
           │
           ▼
 Dashboard shows live progress, results,
@@ -171,7 +171,7 @@ The dashboard runs at [http://localhost:8765](http://localhost:8765) in every mo
 To re-run installer after changing your mind: `./install.sh` will detect the existing
 install and offer **reconfigure** / **upgrade-deps** / **quit**.
 
-To upgrade an existing install to the latest release (v0.6.4+): `./update.sh`
+To upgrade an existing install to the latest release: `./update.sh`
 (or `update.bat`). It stops the daemon, `git pull --ff-only`s, reinstalls deps,
 runs alembic migrations, and restarts. Pass `--yes` / `/y` for non-interactive
 CI / cron usage. Refuses on a dirty working tree.
@@ -194,44 +194,6 @@ sharing_on record --name "My workflow"
 # Press Ctrl+C when done — Systemu converts the recording into a Scroll
 ```
 
-### Legacy / advanced Docker profiles
-
-The original profiles are still in `docker-compose.yml` for backwards compatibility:
-
-```bash
-docker compose up systemu                          # legacy file backend
-docker compose --profile docker-sandbox up systemu-docker   # tool sandbox
-```
-
----
-
-## Migrating from a pre-pivot install
-
-If you already have a JSON-vault deployment from before the holistic-enterprise
-pivot and want to move to **docker-local** or **docker-enterprise**, run the
-one-shot migration tool after spinning up the new Postgres:
-
-```bash
-# 1. Start the new stack so Postgres is up + tables created
-./install.sh --mode docker-enterprise --skip-pull --pg-password=<your-pg> --redis-password=<your-redis>
-docker compose --profile enterprise up -d postgres
-alembic upgrade head     # creates tables in the new Postgres
-
-# 2. Dry-run — see what would migrate
-python -m systemu.migrations.json_to_db \
-    --source ./systemu/vault --dry-run
-
-# 3. Run for real
-python -m systemu.migrations.json_to_db \
-    --source ./systemu/vault \
-    --target "postgresql://systemu:<pg-password>@localhost:5432/systemu"
-```
-
-The migration is **idempotent** — re-running it after fixing any errors leaves
-already-migrated rows untouched.  See `systemu/migrations/json_to_db.py` for
-the source list (scrolls, shadows, tools, skills, activities, evolutions,
-chat history).
-
 For Redis topologies beyond the default standalone (TLS, Sentinel, custom CA),
 see [`docs/redis-topologies.md`](docs/redis-topologies.md).
 
@@ -243,18 +205,27 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 
 ### API Keys
 
-| Variable | Required | Description |
+You need at least one provider key.  The router auto-detects which
+provider to use from the model name (see [LLM Models](#llm-models) below).
+
+| Variable | When required | Description |
 |---|---|---|
-| `OPENROUTER_API_KEY` | Yes | OpenRouter key for Tier 3 / sharing_on LLM calls. Free tier available at [openrouter.ai](https://openrouter.ai) |
-| `GOOGLE_API_KEY` | Yes | Google AI Studio key for Tier 1 and Tier 2 calls. Free at [aistudio.google.com](https://aistudio.google.com) |
+| `OPENROUTER_API_KEY` | Default models (deepseek-v4-flash) | OpenRouter key.  Free tier available at [openrouter.ai](https://openrouter.ai). |
+| `ANTHROPIC_API_KEY` | Only if a tier is configured for a `claude-*` model | Direct Anthropic API.  Get one at [console.anthropic.com](https://console.anthropic.com). |
+| `OPENAI_API_KEY` | Only if a tier is configured for a `gpt-*` or `o1-*` / `o3-*` model | Direct OpenAI API. |
+| `GOOGLE_API_KEY` | Only if a tier is configured for a `gemini-*` model | Google AI Studio key — free at [aistudio.google.com](https://aistudio.google.com). |
+| `OLLAMA_URL` | Only if a tier is configured for an `ollama/*` model | Defaults to `http://localhost:11434`. |
 
 ### LLM Models
 
 | Variable | Default | Description |
 |---|---|---|
-| `SYSTEMU_TIER1_MODEL` | `gemini-3.1-flash-lite-preview` | Deep reasoning — scroll refinement, shadow decisions |
-| `SYSTEMU_TIER2_MODEL` | `gemini-3.1-flash-lite-preview` | Structured output — tool forge, execution planning |
+| `SYSTEMU_TIER1_MODEL` | `deepseek/deepseek-v4-flash` | Deep reasoning — scroll refinement, shadow decisions |
+| `SYSTEMU_TIER2_MODEL` | `deepseek/deepseek-v4-flash` | Structured output — tool forge, execution planning |
 | `SYSTEMU_TIER3_MODEL` | `z-ai/glm-4.5-air:free` | Fast formatting — log-to-instructions conversion |
+| `SYSTEMU_TIER1_PROVIDER` | _(auto from model)_ | Force a specific provider: `openrouter` \| `anthropic` \| `openai` \| `google` \| `ollama` |
+| `SYSTEMU_TIER2_PROVIDER` | _(auto from model)_ | Same as above |
+| `SYSTEMU_TIER3_PROVIDER` | _(auto from model)_ | Same as above |
 | `SHARING_ON_MODEL` | `z-ai/glm-4.5-air:free` | LLM used during sharing_on analysis |
 
 ### Storage
@@ -274,7 +245,7 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 | `SYSTEMU_REDIS_URL` | _(empty)_ | Required when `SYSTEMU_QUEUE_BROKER=redis`. e.g. `redis://:pass@redis:6379/0` |
 | `HUEY_WORKERS` | `4` | Huey thread count per worker process. |
 | `WORKER_REPLICAS` | `2` | docker-enterprise only — number of worker containers. |
-| `SYSTEMU_DB_BIND` | `127.0.0.1:5432` (docker-local) / empty (docker-enterprise) | **v0.6.6+** docker modes only. Host bind for the Postgres container. Required for `sharing_on record` from host to reach the container's vault. Loopback-only by default. Set to `0.0.0.0:5432` to expose on all interfaces (NOT recommended on shared hosts). To fully unpublish in docker-local, remove the `ports:` section via `docker-compose.override.yml`. |
+| `SYSTEMU_DB_BIND` | `127.0.0.1:5432` (docker-local) / empty (docker-enterprise) | Docker modes only. Host bind for the Postgres container. Required for `sharing_on record` from host to reach the container's vault. Loopback-only by default. Set to `0.0.0.0:5432` to expose on all interfaces (NOT recommended on shared hosts). To fully unpublish in docker-local, remove the `ports:` section via `docker-compose.override.yml`. |
 
 ### Deployment mode
 
@@ -291,7 +262,7 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SYSTEMU_NON_INTERACTIVE` | `false` | Auto-pick `actions[0]` (the safe-by-default choice) in every `notify_user` prompt. **Renamed from `SYSTEMU_AUTO_APPROVE_SCROLLS` in v0.6.1** — the old name lied about scope and is no longer recognised |
+| `SYSTEMU_NON_INTERACTIVE` | `false` | Auto-pick `actions[0]` (the safe-by-default choice) in every `notify_user` prompt. |
 | `SYSTEMU_AUTO_FORGE_TOOLS` | `false` | **Dev only** — auto-enables LLM-generated tools without review (bypasses Gate 2/3) |
 | `SYSTEMU_APPROVAL_TIMEOUT` | _(unset)_ | Seconds before a queued approval auto-resolves (sqlite_approval_gate) |
 
@@ -304,7 +275,7 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 | `SYSTEMU_TOOL_DEP_INSTALL_MODE` | `auto` | `auto` \| `off` \| `prompt` \| `always` — how the runtime handles tool pip deps |
 | `SYSTEMU_PREWARM_TOOL_DEPS` | `false` | Install all deployed-tool deps on daemon start instead of on first call |
 
-### Intelligent Supervisor (v0.4.0+)
+### Intelligent Supervisor
 
 | Variable | Default | Description |
 |---|---|---|
@@ -318,14 +289,14 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 | `SYSTEMU_SUPERVISOR_TIER_ROUTINE` | `tier_3` | Tier used for routine supervisor checks |
 | `SYSTEMU_SUPERVISOR_TIER_INTERVENTION` | `tier_1` | Tier used for high-stakes interventions |
 
-### Pre-flight validators (v0.6.0)
+### Pre-flight validators
 
 | Variable | Default | Description |
 |---|---|---|
 | `SYSTEMU_SCROLL_VALIDATOR` | _(off; on when supervisor on)_ | Run the intent-aware scroll validator before activity extraction |
 | `SYSTEMU_SKILL_VALIDATOR` | _(off; on when scroll validator on)_ | Run the GUI-codification skill validator at extraction time |
 
-### Recalibration auto-approve (+ v0.6.0)
+### Recalibration auto-approve
 
 | Variable | Default | Description |
 |---|---|---|
@@ -394,7 +365,7 @@ project-systemu/
 ├── sharing_on/                         — Capture engine + analyser
 │   ├── collectors/                       — Screen, clipboard, file, window monitors
 │   ├── analyzer/                         — Step detector, narrative generator
-│   │   ├── intent_extractor.py             — v0.6.0 Tier-2 pre-pass that infers
+│   │   ├── intent_extractor.py  — Tier-2 pre-pass that infers
 │   │   │                                     outcome-oriented intent before the
 │   │   │                                     narrative LLM runs (intent.json)
 │   │   └── prompts/                        — Analyzer prompt library
@@ -407,14 +378,14 @@ project-systemu/
 │   ├── pipelines/                        — Stage 1→6 transformations
 │   │   ├── scroll_refiner.py               — Stage 2 — intent + objectives
 │   │   ├── scroll_validator.py             — Pre-flight intent-aware check
-│   │   ├── scroll_remediator.py            — v0.6.0 side-by-side fix card
+│   │   ├── scroll_remediator.py  — side-by-side fix card
 │   │   ├── activity_extractor.py           — Stage 3 — schema-aware extraction
-│   │   ├── skill_validator.py              — v0.6.0 GUI-codification check
-│   │   ├── skill_recalibrator.py           — v0.6.0 re-author instructions_md
+│   │   ├── skill_validator.py  — GUI-codification check
+│   │   ├── skill_recalibrator.py  — re-author instructions_md
 │   │   ├── tool_forge.py                   — Spec → code → save (Gate 1/2)
-│   │   ├── tool_dry_run.py                 — v0.5.0 Gate 3.5 validation
-│   │   ├── tool_recalibrator.py            — v0.5.0 bump-vs-fork pipeline
-│   │   ├── tool_inadequacy_diagnosis.py    — v0.5.0 supervisor diagnosis
+│   │   ├── tool_dry_run.py  — Gate 3.5 validation
+│   │   ├── tool_recalibrator.py  — bump-vs-fork pipeline
+│   │   ├── tool_inadequacy_diagnosis.py  — supervisor diagnosis
 │   │   ├── shadow_decision.py              — Stage 5 — intent-aware tiebreak
 │   │   ├── refinery.py                     — Post-execution memory consolidation
 │   │   ├── evolution_engine.py             — Long-term shadow/skill evolution
@@ -424,8 +395,8 @@ project-systemu/
 │   ├── runtime/                          — Shadow ReAct loop + Supervisor
 │   │   ├── shadow_runtime.py               — Per-shadow execute loop
 │   │   ├── supervisor.py                   — Activity queue + worker pool
-│   │   ├── execution_mind.py               — Intelligent Supervisor (v0.4.0)
-│   │   ├── execution_snapshot.py           — v0.5.1 true snapshot resume
+│   │   ├── execution_mind.py               — Intelligent Supervisor
+│   │   ├── execution_snapshot.py  — true snapshot resume
 │   │   ├── failure_classifier.py           — 10-category failure taxonomy
 │   │   ├── tool_metrics.py / shadow_metrics.py — per-id telemetry
 │   │   ├── affinity_log.py                 — Activity-shadow routing memory
@@ -450,7 +421,7 @@ project-systemu/
 ├── alembic/versions/                   — DB schema migrations (0001–0007)
 ├── extension/                          — Chrome extension for web-event capture
 ├── docs/                               — Architecture, getting-started, messaging
-├── tests/                              — pytest suite (840 passed at v0.6.1)
+├── tests/                              — pytest suite
 ├── docker-compose.yml
 ├── Dockerfile
 ├── install.py / install.sh / install.bat
@@ -512,23 +483,7 @@ including the explicit guidelines for AI-authored PRs.
 
 ## Project status
 
-Pre-1.0.  Current release: **v0.7.0** (see [CHANGELOG](CHANGELOG.md) for what's new).  The table below summarises what's shipped vs. what's next.
-
-### Shipped
-
-| Version | Scope |
-|---|---|
-| **v0.2** | `silentgrasper` → `sharing_on` capture rename + identity split |
-| **v0.3** | Three-mode pivot (local / docker-local / docker-enterprise), identity_split, Postgres backend, Telegram messaging gateway |
-| **v0.4.0** | Intelligent Supervisor MVP — bounded action vocabulary, supervisor-flash bus, cost ledger, scroll validator |
-| **v0.4.1** | Per-shadow supervisor opt-in, TERMINATE resolution UX, operator-feedback learning, strategy-stream UI |
-| **v0.4.2** | Activity-shadow affinity routing |
-| **v0.4.3** | Shadow-level success metrics, `Shadow.specialty` routing tag, cost-pressure surfacing |
-| **v0.4.4** | Per-tool success-rate tracking, operator dashboard surfaces, specialty auto-suggest |
-| **v0.5.0** | Tool readiness pipeline (Gate 3.5 dry-run validation), mid-execution `RECALIBRATE_TOOL`, bump-vs-fork decision, operator-approved resume |
-| **v0.5.1** | Recalibration deferred items — override actions, spec-diff visualisation, low-risk auto-approve, cross-shadow inadequacy clustering, true snapshot-based resume |
-| **v0.6.0** | Intent-aware extraction pipeline (root-cause fix) — capture intent extractor, intent-aware scroll validator + remediation, schema-aware tool/skill selection, skill intent contracts + recalibration, intent-driven tool forge, intent-aware shadow tiebreak |
-| **v0.6.1** | Post-hardening — `Tool.name` path-traversal guard, `SYSTEMU_AUTO_APPROVE_SCROLLS` → `SYSTEMU_NON_INTERACTIVE` rename with safe-action ordering, `RECALIBRATE_SKILL` runtime wiring, catalog N+1 fix, batched `save_skill` resolution |
+Pre-1.0.  Current release: **v0.7.0** — see [CHANGELOG](CHANGELOG.md) for what shipped.
 
 ### What's next
 
@@ -601,7 +556,7 @@ sudo dnf install xdotool xclip      # Fedora
 
 Symptom: you set `SYSTEMU_AUTO_APPROVE_SCROLLS=true` expecting non-interactive mode; the daemon prompts you anyway.
 
-Cause: the env var was renamed to `SYSTEMU_NON_INTERACTIVE` in v0.6.1.  Hard cut, no alias.
+Cause: the env var was renamed to `SYSTEMU_NON_INTERACTIVE` .  Hard cut, no alias.
 
 Fix: edit `.env`, replace `SYSTEMU_AUTO_APPROVE_SCROLLS` with `SYSTEMU_NON_INTERACTIVE`, restart the daemon.
 
@@ -613,7 +568,7 @@ Symptom: dashboard loads but every page returns 500; `logs/daemon.log` shows `sq
 
 Cause: DB schema is behind the code.  Happens when you `git pull` a release with a new migration but skip re-running `install.py`.
 
-Fix: `start.bat` / `start.sh` (v0.6.1+) auto-runs `alembic upgrade head` on every start.  If you're on an older start script:
+Fix: `start.bat` / `start.sh` auto-runs `alembic upgrade head` on every start.  If you're on an older start script:
 
 ```bash
 python scripts/upgrade_db.py
@@ -632,7 +587,7 @@ Fix:
 2. System Settings → Privacy & Security → **Screen Recording** → click +, add Terminal
 3. Restart the daemon: `./stop.sh && ./start.sh`
 
-`install.py` (v0.6.3+) prints this guide automatically on macOS; the daemon does not detect the missing grant at runtime.
+`install.py` prints this guide automatically on macOS; the daemon does not detect the missing grant at runtime.
 
 ### `Python 3.10+ required` on Debian 11 / older systems
 
@@ -649,7 +604,7 @@ brew install python@3.11                          # macOS
 winget install Python.Python.3.11                 # Windows
 ```
 
-Then re-run with the new interpreter: `python3.11 install.py`. v0.6.3+ prints these hints automatically.
+Then re-run with the new interpreter: `python3.11 install.py`. Newer install.py revisions print these hints automatically.
 
 ### `Invalid key (HTTP 401 from OpenRouter)` during install
 
@@ -657,7 +612,7 @@ Symptom: install.py rejects the OpenRouter key with a 401 message and re-prompts
 
 Cause: the key was mistyped, revoked, or doesn't have model access enabled.
 
-Fix: generate a fresh key at <https://openrouter.ai/keys> — the installer (v0.6.3+) probe-validates it before writing to `.env`. After 3 attempts the installer stores the key anyway; correct it manually in `.env` later, then restart the daemon.
+Fix: generate a fresh key at <https://openrouter.ai/keys> — the installer probe-validates it before writing to `.env`. After 3 attempts the installer stores the key anyway; correct it manually in `.env` later, then restart the daemon.
 
 ### Behind a corporate proxy
 
@@ -680,7 +635,7 @@ $env:HTTP_PROXY = "http://user:pass@proxy.corp.example:3128"
 python install.py
 ```
 
-`install.py` (v0.6.3+) echoes the detected proxy URL (with password masked) at the top of the install log. If no proxy line appears, the vars weren't exported into the shell that ran `install.py`.
+`install.py` echoes the detected proxy URL (with password masked) at the top of the install log. If no proxy line appears, the vars weren't exported into the shell that ran `install.py`.
 
 ### Apple Silicon (M1 / M2 / M3 / M4) — install or Playwright errors
 
@@ -694,9 +649,9 @@ Fix: re-run install under Rosetta:
 arch -x86_64 python install.py
 ```
 
-`install.py` (v0.6.4+) prints an info banner on Apple Silicon listing this and other known caveats. Most installs complete natively without intervention.
+`install.py` prints an info banner on Apple Silicon listing this and other known caveats. Most installs complete natively without intervention.
 
-### Docker mode — captured scroll never appears on dashboard (v0.6.6+)
+### Docker mode — captured scroll never appears on dashboard
 
 Symptom: `sharing_on record` completes, you see `intent.json` + `instructions.md` in the capture directory, but no scroll lands on `/scrolls`.
 
@@ -715,7 +670,7 @@ Symptom: dashboard `/scrolls` lists fewer scrolls than `psql` shows in Postgres.
 
 Cause: pre-dashboard fell back to FileVault when `SYSTEMU_REDIS_URL` was missing (docker-local intentionally has no Redis). Dashboard wrote to `/data/vault/*.json` while the worker wrote to Postgres. Split-brain.
 
-Fix: upgrade to v0.6.6+ via `./update.sh` (or `update.bat`). The AppState fix ([commit `v0.6.6-c`](#)) gates the Redis URL requirement on `SYSTEMU_QUEUE_BROKER=redis` (enterprise only).
+Fix: upgrade to v0.7.0 via `./update.sh` (or `update.bat`). The AppState fix ([commit on the public repo](#)) gates the Redis URL requirement on `SYSTEMU_QUEUE_BROKER=redis` (enterprise only).
 
 ### Docker mode — elder/shadow memory disappears after `docker compose down -v` (pre-only)
 
@@ -723,7 +678,7 @@ Symptom: every container rebuild loses all consolidated learnings. `ELDER_MEMORY
 
 Cause: pre-SqliteVault defaulted `memory_dir` to `/tmp/systemu_memory` for Postgres URLs. `/tmp` in a container is the writable layer, not a volume mount, so it's lost on rebuild.
 
-Fix: upgrade to v0.6.6+. The new default is `${SYSTEMU_VAULT_DIR}/memory`, which is volume-mounted and persistent.
+Fix: upgrade to v0.7.0. The new default is `${SYSTEMU_VAULT_DIR}/memory`, which is volume-mounted and persistent.
 
 ---
 
