@@ -1,4 +1,4 @@
-"""idempotent skill-layout migrator.
+"""v0.7-c: idempotent skill-layout migrator.
 
 Transforms Systemu's internal ``skill_skill_<hash>/SKILL.md`` layout to the
 Anthropic Agent Skills spec:
@@ -44,6 +44,25 @@ def _parse(md_text: str) -> tuple[dict, str]:
 
 
 def _render(fm: dict, body: str) -> str:
+    return "---\n" + yaml.safe_dump(fm, sort_keys=False) + "---\n\n" + body
+
+
+def _render_skill_md(
+    *,
+    name: str,
+    description: str,
+    metadata: dict | None,
+    body: str,
+) -> str:
+    """Render a SKILL.md whose frontmatter is spec-conformant.
+
+    Top-level: only `name` + `description`. Optional `metadata:` block holds
+    everything Systemu-internal (category, proficiency_level, required_tools,
+    etc.). Body is appended verbatim after the frontmatter terminator.
+    """
+    fm: dict = {"name": name, "description": description}
+    if metadata:
+        fm["metadata"] = metadata
     return "---\n" + yaml.safe_dump(fm, sort_keys=False) + "---\n\n" + body
 
 

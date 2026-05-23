@@ -194,6 +194,20 @@ sharing_on record --name "My workflow"
 # Press Ctrl+C when done — Systemu converts the recording into a Scroll
 ```
 
+### Export a recorded workflow as a portable Agent Skill
+
+Once a recording has been analyzed, one command turns it into a portable
+[Anthropic Agent Skill](https://www.anthropic.com/news/skills) bundle that
+any Agent-Skills-compatible runtime (Claude Code, Cursor, etc.) can load:
+
+```bash
+sharing_on capture export-skill ./captures/<your_session_dir> \
+           --output ./my-skill
+# -> ./my-skill/<kebab-name>/SKILL.md
+```
+
+Validate the bundle with `skills-ref validate ./my-skill/<kebab-name>`.
+
 For Redis topologies beyond the default standalone (TLS, Sentinel, custom CA),
 see [`docs/redis-topologies.md`](docs/redis-topologies.md).
 

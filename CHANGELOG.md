@@ -9,6 +9,34 @@ changes between minor versions; each is called out explicitly below.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-23
+
+### Added
+- **`sharing_on capture export-skill <session_dir> --output <dir>`** — one
+  command turns a finished `sharing_on record` capture into a portable
+  Anthropic Agent Skill bundle. Re-uses the existing scroll-refiner +
+  activity-extractor + skill-exporter pipeline; no new privileged path.
+  Respects `SYSTEMU_HEADLESS=1` for non-interactive use.
+- New orchestrator module `systemu/pipelines/capture_to_skill.py`
+  sequencing refine_scroll → extract_and_process → export_skill, with
+  idempotent reuse when a Skill already exists for the scroll.
+
+### Changed
+- **`vault.save_skill()` now emits spec-conformant SKILL.md natively.**
+  On-disk layout switches from `skills/skill_<id>/SKILL.md` to
+  `skills/<kebab-name>/SKILL.md` with a `metadata:` block for the
+  Systemu-internal fields (category, proficiency_level, required_tools).
+  The skill migrator (still runs at daemon boot) becomes a one-time
+  backfill — new skills are born conformant.
+- The 22 starter-vault skills under `systemu/vault/skills/` are now
+  shipped in spec-conformant kebab-cased directories. The migrator no
+  longer rewrites them on first boot.
+
+### Security
+- No new gates. The v0.6.8-d `tool_dep_approvals` allow-list is the same
+  surface — the new `capture export-skill` command surfaces the existing
+  approval prompt at export time instead of at execution time.
+
 ## [0.7.0] - 2026-05-23
 
 First public release.

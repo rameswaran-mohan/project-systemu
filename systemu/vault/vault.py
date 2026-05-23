@@ -45,7 +45,7 @@ def _scroll_header(s: Scroll) -> Dict[str, Any]:
         "id": s.id, "name": s.name, "status": s.status,
         "source_session_id": s.source_session_id,
         "created_at": s.created_at.isoformat(), "tags": s.tags,
-        # fast badge rendering — derive from pipeline_trace
+        # v0.6.5-a: fast badge rendering — derive from pipeline_trace
         "has_warnings": s.has_warnings,
     }
 
@@ -61,7 +61,7 @@ def _skill_header(s: Skill) -> Dict[str, Any]:
     }
 
 def _summarise_schema(schema: Dict[str, Any]) -> Dict[str, str]:
-    """strip a JSON Schema to {field: type} pairs (max 20 fields).
+    """v0.6.1-d: strip a JSON Schema to {field: type} pairs (max 20 fields).
 
     Lives in vault.py so the canonical implementation is colocated with
     `_tool_header` (which embeds the summary).  Both pipelines
@@ -90,10 +90,10 @@ def _tool_header(t: Tool) -> Dict[str, Any]:
         "dependencies": t.dependencies or [],
         "status": t.status, "enabled": t.enabled,
         "forged_by_systemu": t.forged_by_systemu,
-        # dry-run status visible on the Tools page list
+        # v0.5.0-a: dry-run status visible on the Tools page list
         "dry_run_status": getattr(t, "dry_run_status", "not_run") or "not_run",
         "version": getattr(t, "version", 1),
-        # schema summaries inline in the header so catalog builders
+        # v0.6.1-d: schema summaries inline in the header so catalog builders
         # (scroll_validator, activity_extractor) don't N+1 `vault.get_tool()`
         # for every tool just to read schemas.
         "parameters_schema_summary": _summarise_schema(t.parameters_schema),
@@ -194,21 +194,27 @@ class Vault:
 
     def __init__(
         self,
-        vault_dir: str | Path,
+        vault_dir: str | Path | None = None,
         *,
+        root: str | Path | None = None,
         strict_tier_types: bool = True,
     ):
         """Construct a file-backed Vault rooted at ``vault_dir``.
 
         Args:
             vault_dir: Directory containing scrolls/, activities/, …
+                       Also accepts ``root=`` as a keyword alias.
+            root: Keyword alias for vault_dir.
             strict_tier_types: When True (default), the buffer
                 gate-keepers reject Shadow writes whose category is not
                 in ``SHADOW_CLAIM_TYPES``.  Flip to False to replay
                 pre-audit data with ad-hoc categories.  Elder tier is
                 always permissive — strictness applies to Shadow only.
         """
-        self.root = Path(vault_dir)
+        if vault_dir is None and root is None:
+            raise TypeError("Vault() requires vault_dir or root")
+        resolved = vault_dir if vault_dir is not None else root
+        self.root = Path(resolved)
         self._strict_tier_types = bool(strict_tier_types)
         self._ensure_structure()
 
@@ -386,7 +392,7 @@ class Vault:
                              required_tools (names)
           Procedural body:   Description + step-by-step Procedural Instructions
         """
-        # batch resolution — single index read + dict lookup instead
+        # v0.6.1-e: batch resolution — single index read + dict lookup instead
         # of N find_tool_by_name() calls (each of which previously opened a
         # session / read the full record).  Unknown names are silently dropped.
         if skill.required_tool_names:
@@ -406,53 +412,88 @@ class Vault:
                     )
             skill.required_tool_ids = resolved_ids
 
-        skill_dir = self.root / f"skills/skill_{skill.id}"
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "scripts").mkdir(exist_ok=True)
+        # ── Resolve the on-disk dir name (kebab-cased, spec-conformant) ──────
+        from systemu.storage.skill_migrator import _kebab, _render_skill_md
 
-        # ── YAML frontmatter ─────────────────────────────────────────────────
-        category        = skill.category or "general"
-        proficiency     = skill.proficiency_level or "intermediate"
-        tool_names      = skill.required_tool_names or skill.required_tool_ids  # fallback to IDs if names missing
+        base_name = _kebab(skill.name)
+        skills_root = self.root / "skills"
+        skills_root.mkdir(parents=True, exist_ok=True)
 
-        if tool_names:
-            tools_yaml = "required_tools:\n" + "\n".join(f"  - {t}" for t in tool_names)
+        # Find any existing dir for this skill by reading the JSON record's
+        # stored skill_md_path. If the parent of that path is still a child
+        # of skills_root, we treat it as the current dir.
+        existing_dir: Optional[Path] = None
+        try:
+            old_record = self._read_json(self.root / f"skills/skill_{skill.id}.json")
+            old_path = (old_record or {}).get("skill_md_path")
+            if old_path:
+                p = Path(old_path).parent
+                if p.exists() and p.parent == skills_root:
+                    existing_dir = p
+        except Exception:
+            existing_dir = None
+
+        # Pick the target dir: reuse existing, or claim base_name, or suffix.
+        target_dir = skills_root / base_name
+        if existing_dir is not None and existing_dir.name == base_name:
+            # Same-name rewrite — fall through.
+            pass
+        elif existing_dir is not None and existing_dir.name != base_name:
+            # Renamed skill — move the dir.
+            if target_dir.exists():
+                target_dir = skills_root / f"{base_name}-{skill.id[:8]}"
+            existing_dir.rename(target_dir)
+        elif target_dir.exists():
+            # Brand-new skill that collides with an unrelated existing dir.
+            target_dir = skills_root / f"{base_name}-{skill.id[:8]}"
+            target_dir.mkdir(parents=True, exist_ok=False)
         else:
-            tools_yaml = "required_tools: []"
+            target_dir.mkdir(parents=True, exist_ok=False)
 
-        # ── Body sections ────────────────────────────────────────────────────
+        (target_dir / "scripts").mkdir(exist_ok=True)
+
+        # ── Body: instructions + required-tools section + evidence section ───
+        category    = skill.category or "general"
+        proficiency = skill.proficiency_level or "intermediate"
+        tool_names  = skill.required_tool_names or skill.required_tool_ids  # fallback to IDs if names missing
+
         instructions_body = (
             skill.instructions_md.strip()
             if skill.instructions_md.strip()
             else "_No procedural instructions captured yet._"
         )
-
         if skill.evidence_scroll_ids:
             evidence_section = "\n".join(f"- {s}" for s in skill.evidence_scroll_ids)
         else:
             evidence_section = "_No evidence scrolls._"
 
-        skill_md_content = (
-            f"---\n"
-            f"name: {skill.name}\n"
-            f"description: {skill.description}\n"
-            f"category: {category}\n"
-            f"proficiency_level: {proficiency}\n"
-            f"{tools_yaml}\n"
-            f"---\n\n"
-            f"# {skill.name}\n\n"
-            f"## Description\n\n"
-            f"{skill.description}\n\n"
-            f"## Procedural Instructions\n\n"
-            f"{instructions_body}\n\n"
+        body = (
+            f"# {_kebab(skill.name)}\n\n"
+            f"## Description\n\n{skill.description}\n\n"
+            f"## Procedural Instructions\n\n{instructions_body}\n\n"
             f"## Required Tools\n\n"
             f"{chr(10).join('- ' + t for t in tool_names) if tool_names else '_No tools linked yet._'}\n\n"
-            f"## Evidence Scrolls\n\n"
-            f"{evidence_section}\n"
+            f"## Evidence Scrolls\n\n{evidence_section}\n"
         )
 
-        skill_md = skill_dir / "SKILL.md"
-        skill_md.write_text(skill_md_content, encoding="utf-8")
+        # ── Metadata block: everything Systemu-internal ──────────────────────
+        metadata: Dict[str, Any] = {
+            "category": category,
+            "proficiency_level": proficiency,
+        }
+        if tool_names:
+            metadata["required_tools"] = list(tool_names)
+
+        skill_md = target_dir / "SKILL.md"
+        skill_md.write_text(
+            _render_skill_md(
+                name=_kebab(skill.name),
+                description=skill.description,
+                metadata=metadata,
+                body=body,
+            ),
+            encoding="utf-8",
+        )
         skill.skill_md_path = str(skill_md)
 
         # ── Full JSON ────────────────────────────────────────────────────────
@@ -820,7 +861,7 @@ class Vault:
     ) -> int:
         """Remove buffer entries that match ``predicate``.  Returns the count.
 
-        — needed because the v0.4.0 Intelligent Supervisor writes
+        v0.4.0-a — needed because the v0.4.0 Intelligent Supervisor writes
         lessons live to ``memory_buffer.jsonl``.  When a confidently wrong
         lesson is detected (or an operator wants to retract one), today's
         only recourse would be hand-editing the file.  This API replaces

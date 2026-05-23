@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 
 def _append_intent_trace(scroll, intent) -> None:
-    """append a TraceEvent to scroll.pipeline_trace summarising Stage 1.
+    """v0.6.5-b: append a TraceEvent to scroll.pipeline_trace summarising Stage 1.
 
     Called from _run_analysis after refine_scroll returns a scroll.  Adds a
     single event whose level reflects the extraction outcome:
@@ -593,7 +593,7 @@ def analyze(session_dir: str, model: str):
     console.print(f"  [green]v[/green] Detected [bold]{len(steps)}[/bold] steps")
     _print_step_table(steps)
 
-    # Stage 1: pre-pass intent extraction.  Run BEFORE narrative
+    # v0.6.0-a Stage 1: pre-pass intent extraction.  Run BEFORE narrative
     # generation so the narrative LLM gets explicit outcome-oriented intent
     # rather than inferring it implicitly from a click-by-click log.  The
     # intent.json artifact is read by Stage 2 (scroll refiner).
@@ -673,7 +673,7 @@ def analyze(session_dir: str, model: str):
         refine_scroll(session_path, config, vault)
         console.print("  [green]v[/green] Session handed off to Systemu")
 
-        # record Stage 1 outcome on the scroll's pipeline_trace.
+        # v0.6.5-b: record Stage 1 outcome on the scroll's pipeline_trace.
         # We look up the just-refined scroll by source_session_id and append
         # the intent extraction outcome so the operator sees it on /scrolls.
         try:
@@ -849,6 +849,73 @@ def doctor(scope_id: str, apply_mode: bool):
         if a.fix_command:
             click.echo(f"            OR: {a.fix_command}")
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# capture command group (v0.7.1)
+# ---------------------------------------------------------------------------
+# Capture-side commands operating on a recorded session directory.  The
+# strategic-wedge command `export-skill` turns a finished recording into
+# a portable Anthropic Agent Skill bundle in one step.
+
+@cli.group()
+def capture():
+    """Capture-side commands operating on a recorded session directory."""
+
+
+@capture.command("export-skill")
+@click.argument("session", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--output", "-o", required=True,
+    type=click.Path(file_okay=False),
+    help="Directory where the spec-conformant skill bundle is written.",
+)
+@click.option(
+    "--auto-approve", is_flag=True, default=False,
+    help="Bypass the scroll PENDING_APPROVAL gate. Still respects the "
+         "tool-dep allow-list (v0.6.8-d) — same as analyze --auto-approve.",
+)
+def capture_export_skill(session: str, output: str, auto_approve: bool):
+    """Record once, export as a portable Anthropic Agent Skill.
+
+    \b
+    Example:
+      sharing_on capture export-skill ./captures/email_digest_cap_… \\
+                 --output ./my-skill
+    """
+    from systemu.pipelines.capture_to_skill import export_skill_from_capture
+    from systemu.vault.factory import open_vault
+
+    config = Config.from_env()
+    try:
+        vault = open_vault(config)
+    except Exception as e:
+        click.echo(f"ERROR: could not open vault: {e}", err=True)
+        sys.exit(1)
+
+    try:
+        out_path = export_skill_from_capture(
+            session_dir=Path(session),
+            target_dir=Path(output),
+            config=config,
+            vault=vault,
+            auto_approve=auto_approve,
+        )
+    except FileNotFoundError as e:
+        click.echo(f"ERROR: {e}", err=True)
+        sys.exit(2)
+    except KeyError as e:
+        click.echo(f"ERROR: skill not found in vault: {e}", err=True)
+        sys.exit(3)
+    except FileExistsError as e:
+        click.echo(f"ERROR: {e}", err=True)
+        sys.exit(4)
+    except RuntimeError as e:
+        click.echo(f"ERROR: {e}", err=True)
+        sys.exit(5)
+
+    click.echo(f"Exported -> {out_path}")
+    click.echo(f"Validate: skills-ref validate {out_path}")
 
 
 # ---------------------------------------------------------------------------
