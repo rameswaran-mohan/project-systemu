@@ -9,6 +9,39 @@ changes between minor versions; each is called out explicitly below.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-05-23
+
+### Changed
+- **Dashboard side menu reorganised.** 14 flat nav items → 9 routes in
+  3 collapsible groups (Run / Build / System). Daily-driver pages stay
+  expanded by default; Build + System collapse on first load. The active
+  route's group is force-expanded so the operator always sees where
+  they currently are.
+- `Shadow Army` label shortened to `Shadows` (URL `/army` preserved).
+- The duplicate ⚙️ sidebar icon (Flywheel + Settings shared it pre-v0.7.2)
+  is resolved automatically: Flywheel is no longer a top-level entry —
+  it's now a tab inside `/insights` with its own 🔁 tab icon, leaving
+  ⚙️ exclusively for Settings.
+
+### Added
+- **`/insights` page** with three tabs (Memory / Flywheel / Events) that
+  merge the formerly-separate `/memory`, `/flywheel`, `/notifications`
+  routes into one read-only analytics surface. Direct-link to a tab
+  via `?tab=memory|flywheel|events`.
+- **Chat is now tabbed:** `/chat` hosts both `Compose` (the existing
+  free-text task entry) and `Live Events` (the former /systemu-chat
+  supervisor feed). Direct-link to a tab via `?tab=compose|live`.
+
+### Deprecated
+- The standalone `/systemu-chat`, `/memory`, `/flywheel`, and
+  `/notifications` URLs are preserved as thin redirect handlers that
+  forward to the new tabbed parents. Bookmarks, notification deep-links,
+  and recovery panel "Fix URL" links continue to work unchanged.
+
+### Removed
+- Nothing functional. This release is a visual + URL reorganisation
+  only; no page logic, no vault schema, no pipeline code touched.
+
 ## [0.7.1] - 2026-05-23
 
 ### Added
