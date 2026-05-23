@@ -161,7 +161,11 @@ class TestSkillVault:
         md_path = Path(sample_skill.skill_md_path)
         assert md_path.exists()
         content = md_path.read_text()
-        assert sample_skill.name in content
+        # v0.7.1: vault.save_skill kebab-cases the on-disk name. The internal
+        # Skill.name (e.g., "web_data_capture") is preserved in the Python
+        # object; the SKILL.md uses the spec-conformant kebab form.
+        kebab_name = sample_skill.name.replace("_", "-").lower()
+        assert kebab_name in content
 
     def test_index_entry(self, tmp_vault, sample_skill):
         tmp_vault.save_skill(sample_skill)

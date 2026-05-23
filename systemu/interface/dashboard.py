@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _autoforge_banner_message() -> "str | None":
-    """return a persistent security banner message when auto-forge
+    """v0.6.9: return a persistent security banner message when auto-forge
     mode is on.  Returns None when disabled so callers can skip rendering.
 
     SYSTEMU_AUTO_FORGE_TOOLS=true bypasses all three tool security gates
@@ -55,22 +55,43 @@ def _autoforge_banner_message() -> "str | None":
 #  Nav layout helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-NAV_ITEMS = [
-    ("/",               "🏠",  "Overview"),
-    ("/chat",           "💬",  "Chat"),
-    ("/systemu-chat",   "🤖",  "Systemu Chat"),
-    ("/scrolls",        "📜",  "Scrolls"),
-    ("/army",           "👥",  "Shadow Army"),
-    ("/activities",     "📋",  "Activities"),
-    ("/tools",          "🔧",  "Tools"),
-    ("/skills",         "🧠",  "Skills"),
-    ("/memory",         "💡",  "Memory"),
-    ("/flywheel",       "⚙️",  "Flywheel"),
-    ("/workshop",       "🛠️",  "Workshop"),
-    ("/evolutions",     "🧬",  "Evolutions"),
-    ("/notifications",  "🔔",  "Notifications"),
-    ("/settings",       "⚙️",  "Settings"),
+# v0.7.2: side-nav reorganised into 3 collapsible groups.  Each group is
+# (group_label, default_open, [(path, icon, label), ...]).  See the
+# "Sidebar Consolidation" design at
+# docs/superpowers/specs/2026-05-23-sidebar-consolidation-design.md
+# (or the inline plan at C:\Users\…\.claude\plans\velvet-sparking-dusk.md)
+# for the rationale.  Daily-driver routes ("Run") stay expanded; the
+# "Build" and "System" groups collapse to a single header line on load.
+#
+# URL routes for the merged pages (/systemu-chat → /chat?tab=live,
+# /memory|/flywheel|/notifications → /insights?tab=…) are preserved as
+# redirect handlers in register_routes() below — bookmarks and email
+# deep-links continue to work.
+
+NAV_GROUPS = [
+    ("Run", True, [
+        ("/",               "🏠",  "Overview"),
+        ("/chat",           "💬",  "Chat"),
+        ("/scrolls",        "📜",  "Scrolls"),
+        ("/army",           "👥",  "Shadows"),
+        ("/activities",     "📋",  "Activities"),
+    ]),
+    ("Build", False, [
+        ("/tools",          "🔧",  "Tools"),
+        ("/skills",         "🧠",  "Skills"),
+        ("/workshop",       "🛠️",  "Workshop"),
+        ("/evolutions",     "🧬",  "Evolutions"),
+    ]),
+    ("System", False, [
+        ("/insights",       "📊",  "Insights"),
+        ("/settings",       "⚙️",  "Settings"),
+    ]),
 ]
+
+# Back-compat shim: a flat list of (path, icon, label) for any external
+# importer that scanned the old NAV_ITEMS symbol.  Built once at import
+# time so the cost is zero on subsequent reads.
+NAV_ITEMS = [item for _, _, items in NAV_GROUPS for item in items]
 
 
 def _build_layout(page_title: str, current_path: str):
@@ -121,9 +142,12 @@ def _build_layout(page_title: str, current_path: str):
                     f"font-size: 18px; font-weight: 800; color: {THEME['text']};"
                 )
 
-            # Nav links — the text part carries .s-sidebar-label so it hides
-            # cleanly when the sidebar collapses on narrow viewports.
-            for path, icon, label in NAV_ITEMS:
+            # v0.7.2: Nav links rendered in 3 collapsible groups.
+            # The active route's group is force-expanded so the operator
+            # always sees the current page even if the group is collapsed
+            # by default.  Group state is per-page-load (no persistence
+            # this release — visual reorg only per the design).
+            def _render_nav_link(path: str, icon: str, label: str) -> None:
                 is_active = current_path == path or (path != "/" and current_path.startswith(path))
                 bg = f"color-mix(in srgb, {THEME['primary']} 15%, transparent)" if is_active else "transparent"
                 text_color = THEME["text"] if is_active else THEME["text_muted"]
@@ -135,6 +159,27 @@ def _build_layout(page_title: str, current_path: str):
                 ):
                     ui.label(icon).style("min-width: 22px; text-align: center;")
                     ui.label(label).classes("s-sidebar-label")
+
+            def _group_contains_active(items) -> bool:
+                for path, _icon, _label in items:
+                    if current_path == path or (path != "/" and current_path.startswith(path)):
+                        return True
+                return False
+
+            for group_label, default_open, items in NAV_GROUPS:
+                # Force-expand the group containing the active route — even
+                # if its default is collapsed — so the operator never loses
+                # sight of where they currently are.
+                open_now = default_open or _group_contains_active(items)
+                with ui.expansion(group_label, value=open_now).classes(
+                    "s-sidebar-group"
+                ).style(
+                    f"width: 100%; color: {THEME['text_muted']}; "
+                    f"font-size: 11px; font-weight: 700; letter-spacing: 0.08em; "
+                    f"text-transform: uppercase;"
+                ):
+                    for path, icon, label in items:
+                        _render_nav_link(path, icon, label)
 
             # Spacer + daemon status
             ui.space()
@@ -251,7 +296,7 @@ def _build_layout(page_title: str, current_path: str):
                             ):
                                 _render_jobs_list()
 
-            # persistent security banner when auto-forge mode is on.
+            # v0.6.9: persistent security banner when auto-forge mode is on.
             # Rendered above page content so the operator sees it on every
             # route, not just in stdout where it scrolls away.
             _banner = _autoforge_banner_message()
@@ -380,7 +425,7 @@ def _stop_capture(jm):
                         sys.executable, "-m", "sharing_on",
                         "scrolls", "refine", str(latest)
                     ]
-                    # --auto when running non-interactively (env
+                    # v0.6.1-b: --auto when running non-interactively (env
                     # var SYSTEMU_NON_INTERACTIVE — renamed from the misleading
                     # SYSTEMU_AUTO_APPROVE_SCROLLS).
                     if state.config.non_interactive:
@@ -451,13 +496,10 @@ def register_routes() -> None:
     from systemu.interface.pages.workshop                  import build_workshop_page
     from systemu.interface.pages.evolutions                import build_evolutions_page
     from systemu.interface.pages.settings                  import build_settings_page
-    from systemu.interface.pages.notifications_page        import build_notifications_page
     from systemu.interface.pages.activities                import build_activities_page
     from systemu.interface.pages.shadow_memory_page        import build_shadow_memory_page
-    from systemu.interface.pages.memory_consolidation_page import build_memory_consolidation_page
-    from systemu.interface.pages.flywheel_page             import build_flywheel_page
-    from systemu.interface.pages.chat_page                 import build_chat_page
-    from systemu.interface.pages.systemu_chat              import build_systemu_chat_page
+    from systemu.interface.pages.chat_page                 import build_chat_tabs
+    from systemu.interface.pages.insights                  import build_insights_page
     from systemu.interface.pages.workflow_detail           import build_workflow_detail_page
     from systemu.interface.pages import recover as _recover_page_module  # noqa: F401  # registers /recover/<scope>/<id>
 
@@ -481,14 +523,19 @@ def register_routes() -> None:
         with _build_layout("👥 Shadow Army", "/army"):
             build_army_page()
 
-    @ui.page("/memory")
-    def page_memory():
-        with _build_layout("💡 Memory Consolidation", "/memory"):
-            build_memory_consolidation_page()
+    # ── Insights (v0.7.2: tabbed parent for Memory / Flywheel / Events) ───
+    @ui.page("/insights")
+    def page_insights(tab: str = "memory"):
+        # ?tab=memory|flywheel|events selects the active tab (invalid values
+        # fall back to memory inside build_insights_page).
+        with _build_layout("📊 Insights", "/insights"):
+            build_insights_page(default_tab=tab)
 
     @ui.page("/memory/{shadow_id}")
     def page_shadow_memory(shadow_id: str):
-        with _build_layout(f"🧠 Memory — {shadow_id}", "/memory"):
+        # Per-shadow memory view stays its own page — it's deep-linked from
+        # the Insights → Memory tab's "View memory" buttons.
+        with _build_layout(f"🧠 Memory — {shadow_id}", "/insights"):
             build_shadow_memory_page(shadow_id)
 
     @ui.page("/activities")
@@ -516,30 +563,38 @@ def register_routes() -> None:
         with _build_layout("🧬 Evolutions", "/evolutions"):
             build_evolutions_page()
 
-    @ui.page("/notifications")
-    def page_notifications():
-        with _build_layout("🔔 Notifications", "/notifications"):
-            build_notifications_page()
-
     @ui.page("/settings")
     def page_settings():
         with _build_layout("⚙️ Settings", "/settings"):
             build_settings_page()
 
-    @ui.page("/flywheel")
-    def page_flywheel():
-        with _build_layout("⚙️ Data Flywheel", "/flywheel"):
-            build_flywheel_page()
-
+    # ── Chat (v0.7.2: now tabbed — Compose + Live Events) ─────────────────
     @ui.page("/chat")
-    def page_chat():
+    def page_chat(tab: str = "compose"):
+        # ?tab=compose|live selects the active tab.  /systemu-chat redirects
+        # here with tab=live so legacy deep-links keep working.
         with _build_layout("💬 Chat", "/chat"):
-            build_chat_page()
+            build_chat_tabs(default_tab=tab)
 
+    # ── Legacy URL redirects (v0.7.2) ─────────────────────────────────────
+    # Preserve every old top-level URL so bookmarks, notification emails,
+    # and recovery panel "Fix URL" links continue to land in the right
+    # place after the sidebar merges.
     @ui.page("/systemu-chat")
-    def page_systemu_chat():
-        with _build_layout("🤖 Systemu Chat", "/systemu-chat"):
-            build_systemu_chat_page()
+    def _legacy_systemu_chat():
+        ui.navigate.to("/chat?tab=live")
+
+    @ui.page("/memory")
+    def _legacy_memory():
+        ui.navigate.to("/insights?tab=memory")
+
+    @ui.page("/flywheel")
+    def _legacy_flywheel():
+        ui.navigate.to("/insights?tab=flywheel")
+
+    @ui.page("/notifications")
+    def _legacy_notifications():
+        ui.navigate.to("/insights?tab=events")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

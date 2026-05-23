@@ -88,8 +88,14 @@ class TestSkillModelFields:
         assert loaded.skill_version == 2
 
     def test_skill_md_does_not_contain_new_fields(self, vault, tmp_path):
-        """v0.6.0-d.5 §8 hard constraint: SKILL.md frontmatter stays the
-        Anthropic standard 5 keys.  New fields live only in JSON+DB."""
+        """Hard constraint: SKILL.md frontmatter stays spec-conformant.
+
+        v0.7.1: top-level YAML carries only ``name`` + ``description``; the
+        Systemu-internal fields (category, proficiency_level, required_tools)
+        live under ``metadata:``.  Lifecycle-internal fields (target_outcomes,
+        produces, effectiveness_score, skill_version) stay out of the
+        portable bundle entirely — they're vault JSON only.
+        """
         from systemu.core.models import Skill
         s = Skill(
             id="skill_compliance", name="weather_capture",
@@ -104,12 +110,14 @@ class TestSkillModelFields:
         md_path = next((tmp_path / "skills").rglob("SKILL.md"), None)
         assert md_path is not None
         body = md_path.read_text(encoding="utf-8")
-        # Standard 5 keys present
-        assert "name: weather_capture" in body
+        # Spec-conformant name (kebab-cased) at top level.
+        assert "name: weather-capture" in body
         assert "description:" in body
+        # category + proficiency_level now nested under metadata:.
+        assert "metadata:" in body
         assert "category:" in body
         assert "proficiency_level:" in body
-        # New fields ABSENT from the portable export
+        # Lifecycle-internal fields ABSENT from the portable export.
         assert "target_outcomes" not in body
         assert "produces:" not in body
         assert "effectiveness_score" not in body

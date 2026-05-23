@@ -190,3 +190,41 @@ def build_chat_page() -> None:
 
     submit_btn.on_click(_on_submit)
     prompt_input.on("keydown.ctrl.enter", _on_submit)
+
+
+# ── v0.7.2: tabbed wrapper — Compose + Live Events ─────────────────────────
+# The Live tab calls the systemu_chat builder (formerly its own /systemu-chat
+# route).  Lazy import keeps the chat_page module importable in environments
+# where the supervisor's EventBus stack isn't installed (e.g. lightweight
+# pytest collection).
+
+_VALID_CHAT_TABS = ("compose", "live")
+
+
+def build_chat_tabs(default_tab: str = "compose") -> None:
+    """Two-tab chat: Compose (this page) + Live (supervisor event feed).
+
+    Args:
+        default_tab: ``"compose"`` or ``"live"``.  Anything else falls back
+                     to ``"compose"``.
+    """
+    if default_tab not in _VALID_CHAT_TABS:
+        default_tab = "compose"
+
+    # Local import — systemu_chat pulls EventBus + Supervisor symbols that
+    # are heavier than the chat-page surface needs at module import time.
+    from systemu.interface.pages.systemu_chat import build_systemu_chat_page
+
+    with ui.tabs().style(
+        f"background: {THEME['surface']}; border-bottom: 1px solid {THEME['border']};"
+    ) as tabs:
+        ui.tab("compose", label="💬 Compose")
+        ui.tab("live", label="📡 Live Events")
+
+    with ui.tab_panels(tabs, value=default_tab).classes("w-full").style(
+        "padding-top: 16px;"
+    ):
+        with ui.tab_panel("compose"):
+            build_chat_page()
+        with ui.tab_panel("live"):
+            build_systemu_chat_page()
