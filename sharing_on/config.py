@@ -59,19 +59,19 @@ class Config:
     google_api_key: str = ""   # Google AI Studio key — used for Tier 2 (Gemini direct)
 
     # --- Systemu LLM Tiers ---
-    # pinned to deepseek-v4-flash across all 3 modes (single OpenRouter
+    # v0.6.7: pinned to deepseek-v4-flash across all 3 modes (single OpenRouter
     # key + reliable rate limits + no separate Google AI Studio creds).  Override
     # via SYSTEMU_TIER{1,2,3}_MODEL env vars.
     tier1_model: str = "deepseek/deepseek-v4-flash"         # deep reasoning
     tier2_model: str = "deepseek/deepseek-v4-flash"         # structured / code
     tier3_model: str = "z-ai/glm-4.5-air:free"              # fast / formatting
-    # provider override per tier.  Empty string = auto-detect from
+    # v0.7-e: provider override per tier.  Empty string = auto-detect from
     # model name via systemu.llm.providers.resolve_provider_class.  Set to one
     # of {"openrouter","google","anthropic","openai","ollama"} to force.
     tier1_provider: str = ""
     tier2_provider: str = ""
     tier3_provider: str = ""
-    # renamed from auto_approve_scrolls.  The old name suggested
+    # v0.6.1-b: renamed from auto_approve_scrolls.  The old name suggested
     # this only affected scroll approval, but in practice it cascaded to
     # every multi-action notify_user prompt (auto-forge tools, auto-create
     # shadows, auto-approve workshop edits, etc.).  New name reflects
@@ -79,7 +79,7 @@ class Config:
     # action-ordering contract on notify_user — actions[0] must be the
     # safe-by-default choice for this flag to be safe to enable.
     non_interactive: bool = False                        # auto-pick actions[0] in every prompt
-    # Stage 6 pre-flight validator on by default.  Catches intent/data-flow
+    # v0.6.5-d: Stage 6 pre-flight validator on by default.  Catches intent/data-flow
     # mismatches before scrolls reach activity extraction.  Opt out via
     # SYSTEMU_SCROLL_VALIDATOR=false for legacy behavior.
     scroll_validator: bool = True
@@ -138,13 +138,13 @@ class Config:
     # See systemu/runtime/dependency_installer.py for resolution rules.
     tool_dep_install_mode: str = "auto"
 
-    # — When true, the daemon walks enabled tools at start and
+    # v0.3.5 — When true, the daemon walks enabled tools at start and
     # ensures every declared dep is installed.  Trades a small startup
     # cost for predictable first-call latency under PROMPT/ALWAYS modes.
     # Set via SYSTEMU_PREWARM_TOOL_DEPS=true.
     prewarm_tool_deps: bool = False
 
-    # --- Intelligent Supervisor (plumbing only at this phase) ---
+    # --- v0.4.0 Intelligent Supervisor (plumbing only at this phase) ---
     # The supervisor itself ships in v0.4.0-d; these knobs are read by code
     # added in subsequent phases.  All inert when intelligent_supervisor_enabled
     # is False (the default for the v0.4.0 rollout).
@@ -157,7 +157,7 @@ class Config:
     supervisor_directive_timeout_s:       float = 5.0
     supervisor_llm_budget_per_hour_usd:   float = 5.0
     supervisor_llm_budget_per_day_usd:    float = 50.0
-    # when True, low-risk RECALIBRATE_TOOL outcomes (fork mode,
+    # v0.5.1-c: when True, low-risk RECALIBRATE_TOOL outcomes (fork mode,
     # passing dry-run, non-destructive tool, high-confidence diagnosis)
     # auto-approve and resume without operator interaction.  Default OFF
     # so operators stay in the loop until they explicitly trust the
@@ -180,11 +180,11 @@ class Config:
             tier1_model=os.getenv("SYSTEMU_TIER1_MODEL", "deepseek/deepseek-v4-flash"),
             tier2_model=os.getenv("SYSTEMU_TIER2_MODEL", "deepseek/deepseek-v4-flash"),
             tier3_model=os.getenv("SYSTEMU_TIER3_MODEL", "z-ai/glm-4.5-air:free"),
-            # optional provider override per tier (empty = auto-detect)
+            # v0.7-e: optional provider override per tier (empty = auto-detect)
             tier1_provider=os.getenv("SYSTEMU_TIER1_PROVIDER", ""),
             tier2_provider=os.getenv("SYSTEMU_TIER2_PROVIDER", ""),
             tier3_provider=os.getenv("SYSTEMU_TIER3_PROVIDER", ""),
-            # hard rename — old SYSTEMU_AUTO_APPROVE_SCROLLS is no longer read.
+            # v0.6.1-b: hard rename — old SYSTEMU_AUTO_APPROVE_SCROLLS is no longer read.
             non_interactive=os.getenv("SYSTEMU_NON_INTERACTIVE", "false").lower() == "true",
             scroll_validator=os.getenv("SYSTEMU_SCROLL_VALIDATOR", "true").lower() == "true",
             auto_forge_tools=_load_auto_forge_tools(),
@@ -211,7 +211,7 @@ class Config:
             redis_url=os.getenv("SYSTEMU_REDIS_URL", ""),
             tool_dep_install_mode=os.getenv("SYSTEMU_TOOL_DEP_INSTALL_MODE", "auto").lower(),
             prewarm_tool_deps=os.getenv("SYSTEMU_PREWARM_TOOL_DEPS", "false").lower() == "true",
-            # supervisor knobs (env overrides)
+            # v0.4.0 supervisor knobs (env overrides)
             max_consecutive_think=int(os.getenv("SYSTEMU_MAX_CONSECUTIVE_THINK", "5")),
             intelligent_supervisor_enabled=os.getenv(
                 "SYSTEMU_INTELLIGENT_SUPERVISOR", "false").lower() == "true",
@@ -239,7 +239,7 @@ class Config:
 
     @staticmethod
     def _warn_environment_issues() -> None:
-        """print one-time runtime warnings for environment issues
+        """v0.6.2: print one-time runtime warnings for environment issues
         that won't crash startup but will silently degrade behaviour.
 
         Today's warnings:
@@ -257,11 +257,17 @@ class Config:
                     file=_sys.stderr,
                 )
         if _os.environ.get("SYSTEMU_AUTO_APPROVE_SCROLLS"):
+            # v0.7.3 Bug #20: tell the operator HOW to suppress this warning,
+            # not just that it appeared. Previous wording said "Update your
+            # .env" which led people to add SYSTEMU_NON_INTERACTIVE without
+            # removing the deprecated line, so the warning kept firing.
             print(
                 "[Config] WARNING: SYSTEMU_AUTO_APPROVE_SCROLLS is set but "
                 "this env var was renamed to SYSTEMU_NON_INTERACTIVE in "
-                "v0.6.1 and is now ignored.  Update your .env to use the "
-                "new name.",
+                "v0.6.1 and is now ignored. ACTION: delete the "
+                "SYSTEMU_AUTO_APPROVE_SCROLLS= line from your .env to "
+                "suppress this warning. If you want the auto-pick-safe-default "
+                "behaviour, set SYSTEMU_NON_INTERACTIVE=true instead.",
                 file=_sys.stderr,
             )
 

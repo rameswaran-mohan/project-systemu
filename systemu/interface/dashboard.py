@@ -596,6 +596,13 @@ def register_routes() -> None:
     def _legacy_notifications():
         ui.navigate.to("/insights?tab=events")
 
+    @ui.page("/shadows")
+    def _legacy_shadows():
+        # v0.7.3 Bug #3 — sidebar label is "Shadows" but the actual route is
+        # /army (historical naming). Bookmarks / docs / muscle-memory all
+        # expect /shadows to work.
+        ui.navigate.to("/army")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Public entry points
@@ -745,6 +752,12 @@ def run_dashboard(
         reload=reload,
         show=False,          # Don't auto-open browser
         uvicorn_logging_level="warning",
+        # v0.7.3 Bug #11 fix — default uvicorn WS max-message is 16MB but
+        # starlette / NiceGUI's full-state sync can exceed this with a busy
+        # vault (scrolls + tools + skills + activities all rendering). Raise
+        # to 64MB so click events keep propagating after the initial sync.
+        # NiceGUI passes unknown kwargs through to uvicorn.run().
+        ws_max_size=64 * 1024 * 1024,
     )
 
 

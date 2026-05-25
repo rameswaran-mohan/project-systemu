@@ -44,6 +44,23 @@ logger = logging.getLogger(__name__)
 _LOCK_FILENAME = "runtime.lock"
 
 
+def _is_in_container() -> bool:
+    """v0.7.3 Bug #16 — heuristic: skip interpreter-mismatch checks when
+    inside a docker container.
+
+    Cross-process interpreter coherence only matters when daemon and worker
+    share the same filesystem and use the same site-packages. In docker
+    modes each container has its own venv; the host daemon's recorded
+    interpreter path is irrelevant to the container's pip-install visibility.
+    """
+    if os.path.exists("/.dockerenv"):
+        return True
+    mode = (os.environ.get("SYSTEMU_MODE") or "").lower()
+    if mode.startswith("docker"):
+        return True
+    return False
+
+
 @dataclass
 class InterpreterCheckResult:
     matches:              bool
@@ -179,6 +196,18 @@ def assert_or_warn(data_dir: Path, *, recorded_by: str) -> InterpreterCheckResul
     sees it on the dashboard.  Does NOT call ``sys.exit`` — operators
     running mismatched setups today would otherwise lose service.
     """
+    # v0.7.3 Bug #16 — short-circuit in docker: cross-process interpreter
+    # checks don't apply when daemon and worker are in separate containers
+    # with their own filesystems and pip envs.
+    if _is_in_container():
+        return InterpreterCheckResult(
+            matches=True,
+            expected_interpreter=None,
+            actual_interpreter=sys.executable,
+            recorded_by=None,
+            note="container mode — cross-process interpreter check skipped",
+        )
+
     result = check_interpreter(data_dir)
     if result.matches:
         return result
@@ -210,7 +239,7 @@ def assert_or_warn(data_dir: Path, *, recorded_by: str) -> InterpreterCheckResul
     return result
 
 
-# opt-in strict mode.  Production operators who have shaken out
+# v0.3.5: opt-in strict mode.  Production operators who have shaken out
 # their launcher set ``SYSTEMU_STRICT_INTERPRETER=1`` so a mismatched
 # worker exits immediately instead of silently running with a different
 # pip site-packages than the daemon.

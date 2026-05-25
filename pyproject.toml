@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.7.2"
+version = "0.7.3"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,8 +36,13 @@ dependencies = [
     # appears on PyPI).
     "playwright>=1.50.0",
 
-    # --- runtime stack ---
-    "nicegui>=2.0",        # dashboard UI
+    # --- v0.7-a-fix2: runtime stack ---
+    # These were previously only in requirements.txt (a Windows-frozen
+    # lockfile that CI no longer installs).  Dashboard + vault + queue +
+    # scheduler need them to import; tests that exercise the dashboard
+    # (e.g. tests/test_recovery_panel.py) fail with ModuleNotFoundError
+    # if they are missing.  Listed at the loosest version that works.
+    "nicegui>=2.0",        # dashboard UI (Phase A/B/C/D/F pages)
     "sqlalchemy>=2.0",     # vault ORM
     "alembic>=1.13",       # vault migrations
     "huey>=2.5",           # task queue (SQLite + Redis broker)
@@ -46,14 +51,6 @@ dependencies = [
     "httpx>=0.27",         # used by the Ollama provider + general http
     "pyyaml>=6.0",         # config + skill migrator + skill exporter
 ]
-
-[project.urls]
-Homepage      = "https://github.com/rameswaran-mohan/project-systemu"
-Repository    = "https://github.com/rameswaran-mohan/project-systemu"
-Documentation = "https://github.com/rameswaran-mohan/project-systemu/blob/main/README.md"
-Issues        = "https://github.com/rameswaran-mohan/project-systemu/issues"
-Discussions   = "https://github.com/rameswaran-mohan/project-systemu/discussions"
-Changelog     = "https://github.com/rameswaran-mohan/project-systemu/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # Three install modes — pick one with: pip install -e ".[<mode>]"
@@ -119,3 +116,11 @@ markers = [
 # The `silentgrasper*` rename-compat shim was removed in v0.3 per the
 # deprecation window declared in v0.2's MIGRATION.md.
 include = ["sharing_on*", "systemu*"]
+
+[tool.setuptools.package-data]
+# v0.7.3 Bug #6 fix — pip wheel must include LLM prompt templates and the
+# starter skill/tool registry. Without these, every analyze / scroll-refine /
+# skill-export call from a pip-installed copy fails with FileNotFoundError.
+"sharing_on" = ["analyzer/prompts/*.md"]
+"systemu" = ["prompts/*.md"]
+"systemu.vault" = ["**/*.json", "**/*.md", "**/*.py"]

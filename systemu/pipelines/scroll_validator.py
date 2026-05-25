@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Blocker:
     objective_id:  Optional[int]
-    # expanded category set.
+    # v0.6.0-b: expanded category set.
     # Legacy: no_tool | tool_not_deployed | unmeasurable | contradiction | missing_resource | other
     # New (intent-aware): intent_mismatch | data_flow_break | output_type_mismatch | outcome_mismatch
     category:      str
@@ -49,10 +49,24 @@ class Blocker:
 
 @dataclass
 class ProposedRevision:
-    """candidate revised objectives the validator LLM emits when it
+    """v0.6.0-b: candidate revised objectives the validator LLM emits when it
     blocks a scroll.  Powers the side-by-side operator card on /scrolls."""
     objectives: List[Dict[str, Any]] = field(default_factory=list)
     rationale:  str = ""
+
+
+@dataclass
+class ProposedToolSpec:
+    """v0.7.3 Bug #14: a tool-shaped suggestion the validator emits when the
+    blockers are tool-gaps. Consumed by scroll_refiner's auto-forge bridge
+    to create new tools on demand before falling through to VALIDATOR_BLOCKED.
+    """
+    name:            str
+    description:     str
+    tool_type:       str = "cli_command"   # cli_command | python_function | api_call
+    parameter_hints: List[str] = field(default_factory=list)
+    output_hint:     str = ""
+    rationale:       str = ""
 
 
 @dataclass
@@ -62,10 +76,14 @@ class ValidationResult:
     blockers:    List[Blocker] = field(default_factory=list)
     summary:     str = ""
     error:       Optional[str] = None    # set when the validator itself errored
-    # when satisfiable=False, the LLM may emit a candidate revision
+    # v0.6.0-b: when satisfiable=False, the LLM may emit a candidate revision
     # the operator can one-click accept.  None when satisfiable or when the
     # LLM didn't produce one.
-    proposed_revision: Optional[ProposedRevision] = None
+    proposed_revision:  Optional[ProposedRevision] = None
+    # v0.7.3 Bug #14: when satisfiable=False AND blockers are tool-gaps,
+    # the LLM may emit one or more ProposedToolSpec records. The auto-forge
+    # bridge in scroll_refiner uses these to forge new tools before blocking.
+    missing_tool_specs: List["ProposedToolSpec"] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +91,7 @@ class ValidationResult:
 
 def is_enabled(config) -> bool:
     """Validator runs when SYSTEMU_SCROLL_VALIDATOR env var says so, OR when
-    config.scroll_validator is True (defaults True), OR when
+    config.scroll_validator is True (v0.6.5-d: defaults True), OR when
     config.intelligent_supervisor_enabled is True (legacy supervisor wiring).
     """
     env = (os.environ.get("SYSTEMU_SCROLL_VALIDATOR") or "").strip().lower()
@@ -81,7 +99,7 @@ def is_enabled(config) -> bool:
         return True
     if env in ("0", "false", "no"):
         return False
-    # respect the new dedicated config field (defaults True).
+    # v0.6.5-d: respect the new dedicated config field (defaults True).
     if bool(getattr(config, "scroll_validator", False)):
         return True
     return bool(getattr(config, "intelligent_supervisor_enabled", False))
@@ -127,7 +145,7 @@ def validate_scroll(
             error=str(exc),
         )
 
-    # payload now includes per-objective output_type (when present
+    # v0.6.0-b: payload now includes per-objective output_type (when present
     # on the model) and expected_outcome (new Scroll field added in Stage 2).
     # These let the LLM do explicit data-flow reasoning, not just keyword
     # capability matching.
@@ -172,7 +190,7 @@ def validate_scroll(
             user=json.dumps(payload),
             config=config,
             temperature=0.1,
-            # bumped from 1024 to fit the new proposed_revision
+            # v0.6.0-b: bumped from 1024 to fit the new proposed_revision
             # block.  Empirically a ~5-objective revision + blockers list
             # fits comfortably within 2048.
             max_tokens=2048,
@@ -194,7 +212,7 @@ def validate_scroll(
 def _build_catalog(vault) -> Dict[str, List[Dict[str, Any]]]:
     """Build the catalog payload for the validator LLM.
 
-    reads schema summaries directly from the index header
+    v0.6.1-d: reads schema summaries directly from the index header
     (``parameters_schema_summary`` / ``return_schema_summary``) — no per-tool
     ``vault.get_tool()`` fetch.  Headers older than v0.6.1 (no schema
     summaries) fall back to empty {} dicts; those tools will gain the
@@ -246,7 +264,7 @@ def _parse_validator_output(raw: Any) -> ValidationResult:
         except Exception:
             logger.debug("[ScrollValidator] malformed blocker entry; skipping")
 
-    # extract proposed_revision when present (only on failures).
+    # v0.6.0-b: extract proposed_revision when present (only on failures).
     proposed: Optional[ProposedRevision] = None
     if not satisfiable:
         pr = raw.get("proposed_revision")
@@ -269,10 +287,31 @@ def _parse_validator_output(raw: Any) -> ValidationResult:
             except Exception:
                 logger.debug("[ScrollValidator] malformed proposed_revision; skipping")
 
+    # v0.7.3 Bug #14: extract missing_tool_specs (only on failures).
+    missing_tool_specs: List[ProposedToolSpec] = []
+    if not satisfiable:
+        raw_specs = raw.get("missing_tool_specs") or []
+        if isinstance(raw_specs, list):
+            for spec in raw_specs[:10]:   # cap to prevent runaway
+                if not isinstance(spec, dict):
+                    continue
+                try:
+                    missing_tool_specs.append(ProposedToolSpec(
+                        name=str(spec.get("name", "")).strip()[:60],
+                        description=str(spec.get("description", "")).strip()[:300],
+                        tool_type=str(spec.get("tool_type", "cli_command")).strip()[:30] or "cli_command",
+                        parameter_hints=[str(p)[:40] for p in (spec.get("parameter_hints") or [])][:8],
+                        output_hint=str(spec.get("output_hint", "")).strip()[:200],
+                        rationale=str(spec.get("rationale", "")).strip()[:300],
+                    ))
+                except Exception:
+                    logger.debug("[ScrollValidator] malformed missing_tool_spec; skipping", exc_info=True)
+
     return ValidationResult(
         satisfiable=satisfiable,
         confidence=str(raw.get("confidence", "medium")),
         blockers=blockers,
         summary=str(raw.get("summary", ""))[:1000],
         proposed_revision=proposed,
+        missing_tool_specs=missing_tool_specs,
     )

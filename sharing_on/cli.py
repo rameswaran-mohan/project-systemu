@@ -34,10 +34,17 @@ from typing import List, Optional
 # already-set env from the parent shell).
 try:
     from dotenv import load_dotenv as _load_dotenv
-    # Walk up from this file to find the nearest .env (handles both running
-    # from the repo root and from inside a venv).
+    # v0.7.3 Bug #2 fix: check CWD FIRST so pip-install users' working-dir
+    # .env wins over anything next to the installed package (which only
+    # makes sense for git-clone / editable installs).
     _here = Path(__file__).resolve().parent
-    for _candidate in (_here, _here.parent, _here.parent.parent):
+    _candidates = [Path.cwd(), _here, _here.parent, _here.parent.parent]
+    _seen = set()
+    for _candidate in _candidates:
+        _candidate = _candidate.resolve()
+        if _candidate in _seen:
+            continue
+        _seen.add(_candidate)
         _env_path = _candidate / ".env"
         if _env_path.exists():
             _load_dotenv(_env_path, override=False)
@@ -55,6 +62,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from rich import print as rprint
 
+from sharing_on import __version__ as _sharing_on_version
 from sharing_on.analyzer.generator import generate_instructions
 from sharing_on.analyzer.step_detector import StepDetector
 from sharing_on.analyzer.unifier import unify_events
@@ -109,7 +117,7 @@ def main():
 
 
 @click.group()
-@click.version_option("0.1.0", prog_name="sharing_on")
+@click.version_option(_sharing_on_version, prog_name="sharing_on")
 @click.option("--debug", is_flag=True, help="Enable debug logging.")
 @click.pass_context
 def cli(ctx, debug: bool):
@@ -933,7 +941,7 @@ def _print_startup_banner(name: str, platform, config: Config) -> None:
     )
     console.print()
     console.print(Panel.fit(
-        f"[bold cyan]sharing_on[/bold cyan]  [dim]v0.1.0[/dim]\n\n"
+        f"[bold cyan]sharing_on[/bold cyan]  [dim]v{_sharing_on_version}[/dim]\n\n"
         f"[bold]Task:[/bold]        {name}\n"
         f"[bold]Platform:[/bold]    {platform.summary()}\n"
         f"[bold]Model:[/bold]       {config.llm_model}\n"

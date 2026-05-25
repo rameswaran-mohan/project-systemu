@@ -60,7 +60,7 @@ services:
   postgres-local:
     image: postgres:16-alpine
     container_name: systemu-postgres-local
-    # expose Postgres on the host so `sharing_on record` running
+    # v0.6.6-a: expose Postgres on the host so `sharing_on record` running
     # on the host can reach the container's vault for the capture-and-analyze
     # flow.  Default 127.0.0.1:5432 is loopback-only (same security boundary
     # as the dashboard's already-exposed port 8765).  Operators on shared
@@ -107,6 +107,17 @@ services:
     depends_on:
       postgres-local:
         condition: service_healthy
+        # v0.7.3 Bug #15 fix — restart dashboard if dep-health detection races
+        # on first compose up (Docker engine returned 500 on first attempt).
+        restart: true
+    # v0.7.3 Bug #15 fix — longer warm-up window so the daemon has time to
+    # run alembic migrations + initial vault scan before the healthcheck fires.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8765/ || exit 1"]
+      start_period: 45s
+      retries: 8
+      interval: 5s
+      timeout: 5s
     restart: unless-stopped
     profiles: ["local"]
 
@@ -221,8 +232,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        restart: true   # v0.7.3 Bug #15 — retry on dep-health race
       redis:
         condition: service_healthy
+        restart: true   # v0.7.3 Bug #15 — same race risk for redis
+    # v0.7.3 Bug #15 — longer warm-up window
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8765/ || exit 1"]
+      start_period: 45s
+      retries: 8
+      interval: 5s
+      timeout: 5s
     restart: unless-stopped
     profiles: ["enterprise"]
 
