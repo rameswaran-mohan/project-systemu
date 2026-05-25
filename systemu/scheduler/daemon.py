@@ -88,7 +88,15 @@ def start_daemon(
     import os
     import systemu
 
-    project_root = Path(systemu.__file__).parent.parent.absolute()
+    # v0.7.3 Bug #7 fix — prefer CWD when it looks like a systemu working dir
+    # (has .env or .systemu_mode). For pip-installed wheel users the previous
+    # systemu.__file__-based resolution landed the vault inside site-packages,
+    # which gets clobbered on `pip install --upgrade`.
+    _cwd = Path.cwd().absolute()
+    if (_cwd / ".env").exists() or (_cwd / ".systemu_mode").exists():
+        project_root = _cwd
+    else:
+        project_root = Path(systemu.__file__).parent.parent.absolute()
     env = os.environ.copy()
     env["PYTHONPATH"] = str(project_root)
 
@@ -190,7 +198,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     pid_file.write_text(str(os.getpid()))
     atexit.register(lambda: pid_file.unlink(missing_ok=True))
 
-    # / v0.3.5 — Record interpreter invariant + optional pre-warm.
+    # v0.3.3 / v0.3.5 — Record interpreter invariant + optional pre-warm.
     # Both are best-effort: failures here must never crash daemon boot.
     try:
         from systemu.runtime.interpreter_check import record_interpreter
@@ -222,7 +230,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # Initialise jobs (sets module-level config/vault globals)
     init_jobs(config, vault)
 
-    # seed tool_dep_approvals from the baked requirements file.
+    # v0.6.8-d: seed tool_dep_approvals from the baked requirements file.
     # Best-effort; never crash the daemon if the file is malformed or the
     # DB driver isn't installed for the configured backend.
     try:
@@ -242,7 +250,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     except Exception:
         logger.exception("[Daemon] tool dep approval seeding failed — continuing boot")
 
-    # migrate skills to Anthropic Agent Skills spec-conformant layout.
+    # v0.7-c: migrate skills to Anthropic Agent Skills spec-conformant layout.
     # Idempotent; best-effort.  Runs once at boot to fix legacy skill_skill_<hash>/
     # directories on operator upgrade.
     try:
@@ -251,20 +259,20 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         report = migrate_skill_layout(vault_dir)
         if report.migrated:
             logger.info(
-                "[Daemon] migrated %d skill(s) to spec-conformant layout "
+                "[Daemon] v0.7-c: migrated %d skill(s) to spec-conformant layout "
                 "(skipped %d already-conformant, %d collisions)",
                 report.migrated, report.skipped, report.collisions,
             )
         elif report.skipped:
             logger.info(
-                "[Daemon] all %d skill(s) already spec-conformant",
+                "[Daemon] v0.7-c: all %d skill(s) already spec-conformant",
                 report.skipped,
             )
         if report.errors:
             for err in report.errors:
-                logger.warning("[Daemon] skill migration error: %s", err)
+                logger.warning("[Daemon] v0.7-c: skill migration error: %s", err)
     except Exception:
-        logger.exception("[Daemon] skill_migrator failed — continuing boot")
+        logger.exception("[Daemon] v0.7-c: skill_migrator failed — continuing boot")
 
     # Build scheduler
     scheduler = BackgroundScheduler()

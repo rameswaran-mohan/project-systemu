@@ -133,7 +133,7 @@ def save_approved_code(
     """
     from systemu.interface.notifications import log_event
 
-    # defense in depth — Pydantic guards Tool.name at construction,
+    # v0.6.1-a: defense in depth — Pydantic guards Tool.name at construction,
     # but any non-Pydantic path supplying a tool (e.g. direct attribute mutation,
     # legacy deserialisation) still triggers this guard.  Catch BEFORE any
     # filesystem operation so a malicious name can't write outside impl_dir.
@@ -160,7 +160,7 @@ def save_approved_code(
         {"tool_id": tool.id, "impl_path": str(impl_path)},
     )
 
-    # dry-run gate.  Tool stays disabled either way (operator must
+    # v0.5.0-a: dry-run gate.  Tool stays disabled either way (operator must
     # still toggle ON), but a failed dry-run blocks the registry from
     # serving the tool even if the operator does enable it.  Operator can
     # use the "Re-forge with feedback" button on the Tools page to retry.
@@ -304,7 +304,7 @@ def forge_tool_by_name(
             )
         return forge_tool(existing, scroll, config, vault)
     else:
-        # when we have a real scroll (not a stub), forward intent
+        # v0.6.0-e: when we have a real scroll (not a stub), forward intent
         # context so the spec LLM can design schemas that fit the chain.
         scroll_intent = ""
         scroll_expected_outcome = ""
@@ -373,7 +373,7 @@ def forge_tool(
             f"Dependencies: {', '.join(tool.dependencies) or 'none'}\n\n"
             f"Context scroll: {scroll.name}"
         ),
-        # safe-default first (auto-skip in non-interactive mode)
+        # v0.6.1-b: safe-default first (auto-skip in non-interactive mode)
         actions=["Skip", "Forge"],
     )
 
@@ -496,7 +496,7 @@ def _spec_and_forge_new(
 ) -> Optional[Tool]:
     """Create a new tool from scratch: spec → confirm → code → save.
 
-    (Stage 4): the spec LLM now receives the requesting scroll's
+    v0.6.0-e (Stage 4): the spec LLM now receives the requesting scroll's
     intent + expected_outcome + the specific objective whose execution
     needs this tool, plus the next-objective's input shape if any.  This
     lets the forge design ``parameters_schema`` + ``return_schema`` that
@@ -515,7 +515,7 @@ def _spec_and_forge_new(
         "scroll_narrative":   context_hint,
         "preferred_packages": _approved_packages_hint(),
     }
-    # intent + objective context (omit when empty so older callers
+    # v0.6.0-e: intent + objective context (omit when empty so older callers
     # still produce identical prompts — the forge_tool_spec.md prompt treats
     # the new keys as optional).
     if scroll_intent:
@@ -564,3 +564,116 @@ def _spec_and_forge_new(
         raw_instructions_path="", narrative_md=context_hint,
     )
     return forge_tool(tool, stub_scroll, config, vault)
+
+
+def forge_proposed_tools_from_specs(
+    specs: list,                # list[ProposedToolSpec] from validator
+    scroll,                     # the Scroll being refined
+    config: Config,
+    vault: Vault,
+) -> list:
+    """Forge tools from validator-emitted ProposedToolSpec records.
+
+    v0.7.3 Bug #14 fix — used by scroll_refiner's auto-forge bridge to attempt
+    creating missing tools before validator-blocking the scroll.
+
+    Bypasses the operator-confirmation gate (notify_user in forge_tool) because
+    this path is only reached when SYSTEMU_AUTO_FORGE_TOOLS=true — the operator
+    has already opted into the dev escape hatch. Mirrors how the existing
+    ``forge_proposed_tools`` (called from activity_extractor) calls
+    ``_generate_and_save_code`` directly.
+
+    Returns the list of successfully forged Tool objects (may be empty).
+    """
+    if not specs:
+        return []
+    forged: list = []
+    # Read existing tool names to skip duplicates
+    existing_names = set()
+    try:
+        for t in (vault.load_index("tools") or []):
+            n = t.get("name")
+            if n:
+                existing_names.add(n)
+    except Exception:
+        logger.debug("[Forge] could not read tool index for de-dup", exc_info=True)
+
+    for spec in specs:
+        name = getattr(spec, "name", "") or ""
+        if not name:
+            logger.debug("[Forge] skipping spec with empty name")
+            continue
+        if name in existing_names:
+            logger.info("[Forge] skipping spec '%s' — tool already exists", name)
+            continue
+
+        # ── Step 1: generate spec via LLM (Tier 2), then save as PROPOSED ──
+        spec_payload: Dict[str, Any] = {
+            "tool_name":          name,
+            "scroll_narrative":   (getattr(scroll, "narrative_md", "") or "")[:500],
+            "preferred_packages": _approved_packages_hint(),
+            # validator-emitted hints to guide the spec
+            "validator_hint":     {
+                "description":     getattr(spec, "description", ""),
+                "tool_type":       getattr(spec, "tool_type", "cli_command"),
+                "parameter_hints": getattr(spec, "parameter_hints", []),
+                "output_hint":     getattr(spec, "output_hint", ""),
+                "rationale":       getattr(spec, "rationale", ""),
+            },
+        }
+        try:
+            spec_result = llm_call_json(
+                tier=2,
+                system=load_prompt("forge_tool_spec.md"),
+                user=json.dumps(spec_payload),
+                config=config,
+                temperature=0.2,
+                max_tokens=2048,
+            )
+        except Exception:
+            logger.exception("[Forge] spec generation failed for '%s'", name)
+            continue
+
+        try:
+            tool_type = ToolType(spec_result.get("tool_type", spec.tool_type))
+        except ValueError:
+            tool_type = ToolType.PYTHON_FUNCTION
+
+        tool = Tool(
+            id=generate_id("tool"),
+            name=spec_result.get("name", name),
+            description=spec_result.get("description", spec.description),
+            tool_type=tool_type,
+            parameters_schema=spec_result.get("parameters_schema", {}),
+            return_schema=spec_result.get("return_schema", {}),
+            implementation_notes=spec_result.get("implementation_notes", ""),
+            dependencies=spec_result.get("dependencies", []),
+            status=ToolStatus.PROPOSED,
+            forged_by_systemu=True,
+        )
+        try:
+            vault.save_tool(tool)
+        except Exception:
+            logger.exception("[Forge] could not save proposed tool '%s'", name)
+            continue
+
+        # ── Step 2: generate code (BYPASS the notify_user gate; auto-forge
+        #     mode has already opted into the dev escape hatch) ─────────────
+        try:
+            from systemu.core.models import Scroll as ScrollModel
+            stub_scroll = ScrollModel(
+                id="stub", name=name, source_session_id="auto-forge-bridge",
+                raw_instructions_path="",
+                narrative_md=(getattr(scroll, "narrative_md", "") or "")[:500],
+            )
+            result = _generate_and_save_code(tool, stub_scroll, config, vault)
+            if result is not None:
+                forged.append(result)
+                logger.info(
+                    "[Forge] validator-spec bridge forged tool '%s' (id=%s)",
+                    result.name, getattr(result, "id", "?"),
+                )
+        except Exception:
+            logger.exception("[Forge] code generation failed for proposed tool '%s'", name)
+
+    return forged

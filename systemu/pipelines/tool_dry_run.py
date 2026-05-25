@@ -13,7 +13,7 @@ The gate between forge and operator-enable.  Given a forged Tool:
 
 The result is a :class:`DryRunResult`.  Callers decide whether to block
 the tool from being enabled (forge pipeline) or whether to fork-vs-bump
-(recalibration).
+(v0.5.0-d recalibration).
 
 Safety:
 
@@ -176,7 +176,7 @@ def replay_against_history(
     config: "Config",
     max_replays: int = 20,
 ) -> DryRunResult:
-    """backward-compat replay.
+    """v0.5.0-d backward-compat replay.
 
     Re-runs the tool against every entry in ``tool.last_successful_params``
     (capped at ``max_replays``).  Returns ``status="passed"`` only when
@@ -339,9 +339,28 @@ def _execute(
     """
     try:
         from systemu.runtime.tool_sandbox import ToolSandbox
+        # v0.7.3 Bug #19 fix — resolve install_mode + load approval store so
+        # the sandbox can actually install the tool's pip deps before dry-run.
+        # Without this, PROMPT mode fail-closes ("no approval store") and the
+        # dry-run runs against missing deps → DRY_RUN_FAILED_BUG.
+        try:
+            from systemu.runtime.dependency_installer import resolve_install_mode
+            from systemu.runtime.dep_approvals import init_default_store
+            install_mode = resolve_install_mode(
+                config_mode=getattr(config, "tool_dep_install_mode", None),
+                systemu_mode=getattr(config, "systemu_mode", None),
+            )
+            approvals = init_default_store(Path("data"))
+        except Exception:
+            logger.debug("[ToolDryRun] could not load install mode/approvals; using defaults", exc_info=True)
+            install_mode = None
+            approvals = None
+
         sandbox = ToolSandbox(
             vault_root=Path(config.vault_dir).resolve(),
             default_timeout=int(getattr(config, "docker_tool_timeout", 60)),
+            install_mode=install_mode,
+            approvals=approvals,
         )
         coro = sandbox.execute_tool(
             tool.implementation_path,
@@ -408,7 +427,7 @@ def record_evolution(
 ) -> None:
     """Append a recalibration audit entry to ``tool.evolution_history``.
 
-    — used by the v0.5.0-d RECALIBRATE_TOOL action to maintain a
+    v0.5.0-b — used by the v0.5.0-d RECALIBRATE_TOOL action to maintain a
     durable audit of why and how a tool was recalibrated.  When
     ``mode="bump"`` we also bump ``tool.version`` (if ``new_version`` is
     None, increment by one).  For ``mode="fork"`` the new tool is a

@@ -30,7 +30,7 @@ from systemu.vault.vault import Vault
 logger = logging.getLogger(__name__)
 
 
-# ─── GUI-codification guard ───────────────────────────────────────
+# ─── v0.6.5-c: GUI-codification guard ───────────────────────────────────────
 
 # Two patterns: word-boundary patterns (verbs/app names) and file extensions
 # (which need to match the leading dot — \b doesn't help across `.docx`).
@@ -64,7 +64,7 @@ FORBIDDEN_GUI_PATTERNS = _GuiPatternProxy()
 
 
 def detect_gui_codification(objectives) -> List[Tuple[int, str]]:
-    """scan objective.goal text for GUI verbs / app names / extensions.
+    """v0.6.5-c: scan objective.goal text for GUI verbs / app names / extensions.
 
     Accepts both ``Objective`` instances and raw dicts (LLM output).  Returns
     ``[(obj.id, matched_pattern), ...]`` for each offender.  Empty list = clean.
@@ -87,7 +87,7 @@ def detect_gui_codification(objectives) -> List[Tuple[int, str]]:
 
 def _refine_with_gui_guard(*, payload: Dict[str, Any], prompt_text: str,
                            config: Config) -> Dict[str, Any]:
-    """thin wrapper around llm_call_json that post-processes the
+    """v0.6.5-c: thin wrapper around llm_call_json that post-processes the
     result for GUI-codified objectives and re-prompts once if any are detected.
 
     Returns the LLM result dict.  When a re-prompt fires, the returned dict
@@ -105,7 +105,7 @@ def _refine_with_gui_guard(*, payload: Dict[str, Any], prompt_text: str,
         return result
 
     logger.warning(
-        "[ScrollRefiner] %d objective(s) GUI-codified — rewriting: %s",
+        "[ScrollRefiner] v0.6.5: %d objective(s) GUI-codified — rewriting: %s",
         len(first_pass), first_pass,
     )
 
@@ -134,7 +134,7 @@ def _refine_with_gui_guard(*, payload: Dict[str, Any], prompt_text: str,
             config=config, temperature=0.1, max_tokens=2048,
         )
     except Exception as exc:
-        logger.warning("[ScrollRefiner] rewrite call failed: %s", exc)
+        logger.warning("[ScrollRefiner] v0.6.5: rewrite call failed: %s", exc)
         result["_v065_gui_guard"] = {
             "first_pass_offenders": [list(p) for p in first_pass],
             "second_pass_offenders": [list(p) for p in first_pass],
@@ -244,7 +244,7 @@ def refine_scroll(
 
     logger.info("[Scroll] Refining session '%s' with Tier 1 ...", session_name)
 
-    # ── Tier 1 call (with self-check retry loop) ─────────────────
+    # ── Tier 1 call (v0.6.0-c: with self-check retry loop) ─────────────────
     prompt = load_prompt("refine_scroll.md")
     user_msg = f"Session name: {session_name}\n\n---\n\n{raw_md}"
 
@@ -264,7 +264,7 @@ def refine_scroll(
             "Check your API key, model configuration, and network connectivity."
         ) from exc
 
-    # one automatic re-prompt if the LLM's own self-check failed.
+    # v0.6.0-c: one automatic re-prompt if the LLM's own self-check failed.
     # The prompt asks the LLM to verify each objective serves the stated intent;
     # if it can't, it sets self_check_passed=false with notes.  We give it ONE
     # chance to fix it before surfacing to the operator.
@@ -293,14 +293,14 @@ def refine_scroll(
         except Exception:
             logger.debug("[Scroll] self-check retry call failed", exc_info=True)
 
-    # ── GUI-codification guard ───────────────────────────────────
+    # ── v0.6.5-c: GUI-codification guard ───────────────────────────────────
     # Detect GUI verbs/app names in objective goals; re-prompt once to rewrite
     # in outcome-only language.  Result records first/second-pass offenders.
     gui_offenders_first = detect_gui_codification(result.get("objectives") or [])
     gui_offenders_second: List[Tuple[int, str]] = []
     if gui_offenders_first:
         logger.warning(
-            "[Scroll] %d objective(s) GUI-codified — rewriting: %s",
+            "[Scroll] v0.6.5: %d objective(s) GUI-codified — rewriting: %s",
             len(gui_offenders_first), gui_offenders_first,
         )
         try:
@@ -335,7 +335,7 @@ def refine_scroll(
                         o["success_criteria"] = rewrites[oid]["success_criteria"]
             gui_offenders_second = detect_gui_codification(result.get("objectives") or [])
         except Exception as exc:
-            logger.warning("[Scroll] GUI rewrite call failed: %s", exc)
+            logger.warning("[Scroll] v0.6.5: GUI rewrite call failed: %s", exc)
             gui_offenders_second = gui_offenders_first
 
     # ── Parse Objectives (intent-driven format) ────────────────────────────
@@ -347,7 +347,7 @@ def refine_scroll(
         except Exception as exc:
             logger.warning("[Scroll] Skipping malformed Objective: %s — %s", raw, exc)
 
-    # ── Build Scroll (expected_outcome added) ────────────────────
+    # ── Build Scroll (v0.6.0-c: expected_outcome added) ────────────────────
     scroll = Scroll(
         id=generate_id("scroll"),
         name=result.get("title", session_name),
@@ -363,7 +363,7 @@ def refine_scroll(
         tags=result.get("tags", []),
         status=ScrollStatus.PENDING_APPROVAL,
     )
-    # record GUI-guard outcome on the trace before save
+    # v0.6.5-c: record GUI-guard outcome on the trace before save
     if gui_offenders_first:
         if gui_offenders_second:
             scroll.pipeline_trace.append(TraceEvent(
@@ -403,7 +403,7 @@ def refine_scroll(
     # stdin) it either hung or errored.  Dashboard-first flow is the
     # canonical approval path now, and it logs the same event for any
     # CLI-only operator to inspect via `sharing_on scrolls list`.
-    # pre-execution validator runs BEFORE approval when enabled
+    # v0.4.0-c: pre-execution validator runs BEFORE approval when enabled
     # (intelligent_supervisor_enabled OR SYSTEMU_SCROLL_VALIDATOR=1).  When the
     # validator says "not satisfiable", surface an operator approval card via
     # the v0.3.6 supervisor flash path and HOLD the scroll at PENDING_APPROVAL
@@ -412,12 +412,49 @@ def refine_scroll(
         from systemu.pipelines.scroll_validator import is_enabled, validate_scroll
         if is_enabled(config):
             v_result = validate_scroll(scroll, config=config, vault=vault)
+
+            # v0.7.3 Bug #14 fix — auto-forge bridge.
+            # When the validator blocks AND emitted missing_tool_specs AND
+            # auto_forge_tools is enabled, attempt forging those tools and
+            # re-validating before falling through to VALIDATOR_BLOCKED.
+            if not v_result.satisfiable and getattr(config, "auto_forge_tools", False):
+                specs = getattr(v_result, "missing_tool_specs", None) or []
+                if specs:
+                    try:
+                        from systemu.pipelines.tool_forge import forge_proposed_tools_from_specs
+                        logger.info(
+                            "[Scroll] validator blocked '%s' but emitted %d tool spec(s) — attempting auto-forge bridge",
+                            scroll.name, len(specs),
+                        )
+                        forged = forge_proposed_tools_from_specs(
+                            specs, scroll, config, vault,
+                        )
+                        if forged:
+                            scroll.pipeline_trace.append(TraceEvent(
+                                stage="validate", level="info",
+                                message=f"auto-forge bridge: {len(forged)} tool(s) forged from validator specs",
+                                detail={"forged_tools": [t.name for t in forged][:10]},
+                            ))
+                            # Re-run validation now that new tools exist
+                            v_result = validate_scroll(scroll, config=config, vault=vault)
+                            if v_result.satisfiable:
+                                logger.info(
+                                    "[Scroll] auto-forge bridge UNBLOCKED scroll '%s' (re-validation passed)",
+                                    scroll.name,
+                                )
+                            else:
+                                logger.info(
+                                    "[Scroll] re-validation still blocked after forge — proceeding to VALIDATOR_BLOCKED",
+                                )
+                    except Exception:
+                        logger.exception("[Scroll] auto-forge bridge failed; treating as block")
+
             if not v_result.satisfiable:
                 logger.warning(
                     "[Scroll] pre-flight validator BLOCKED scroll '%s' — %s",
                     scroll.name, v_result.summary,
                 )
-                # set explicit VALIDATOR_BLOCKED status + record
+                # v0.6.5-d: set explicit VALIDATOR_BLOCKED status + record
                 # error trace event so the operator sees it on /scrolls.
                 scroll.status = ScrollStatus.VALIDATOR_BLOCKED
                 scroll.pipeline_trace.append(TraceEvent(
@@ -463,7 +500,7 @@ def refine_scroll(
                 )
                 return scroll
             else:
-                # record validator-passed info event
+                # v0.6.5-d: record validator-passed info event
                 scroll.pipeline_trace.append(TraceEvent(
                     stage="validate", level="info",
                     message="validator passed",
@@ -473,7 +510,7 @@ def refine_scroll(
     except Exception:
         logger.debug("[Scroll] validator pre-flight skipped", exc_info=True)
 
-    # renamed config.auto_approve_scrolls → config.non_interactive
+    # v0.6.1-b: renamed config.auto_approve_scrolls → config.non_interactive
     # (the flag was already governing more than scroll approval — see notify_user's
     # action-ordering contract).
     should_auto = auto_proceed or config.non_interactive
