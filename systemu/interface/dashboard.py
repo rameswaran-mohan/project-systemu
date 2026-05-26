@@ -203,6 +203,23 @@ def _build_layout(page_title: str, current_path: str):
         with ui.column().style(
             f"flex: 1; padding: 32px 40px; overflow-y: auto; background: {THEME['bg']}; position: relative;"
         ):
+            # v0.8.0.2: top-of-page health banner -- surfaces multi-daemon,
+            # missing OPENROUTER key, read-only vault.  Silent when healthy.
+            try:
+                from systemu.interface.components.health_banner import render_health_banner
+                from systemu.interface.dashboard_state import AppState
+                from pathlib import Path
+                _hb_state = AppState.get()
+                _hb_vault_dir = Path(_hb_state.config.vault_dir).resolve() if _hb_state and _hb_state.config else None
+            except Exception:
+                _hb_vault_dir = None
+                render_health_banner = None
+            if render_health_banner is not None:
+                try:
+                    render_health_banner(_hb_vault_dir)
+                except Exception:
+                    pass  # never let banner failure break the dashboard
+
             from systemu.interface.jobs import JobManager, JobStatus
             jm = JobManager.get()
             
