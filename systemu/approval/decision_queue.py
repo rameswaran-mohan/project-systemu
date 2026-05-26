@@ -172,8 +172,18 @@ class OperatorDecisionQueue:
         for did in pending_ids:
             try:
                 result.append(self._vault.get_decision(did))
-            except Exception:
-                logger.debug("[DecisionQueue] could not load %s", did, exc_info=True)
+            except Exception as exc:
+                # v0.8.0.1: promoted from debug to warning.  The original
+                # debug-level log made it impossible to discover that the
+                # FileVault wrapper was missing get_decision/save_decision
+                # proxies in v0.8.0 — the dashboard's Pending Actions tab
+                # silently rendered empty even when CLI saw pending records.
+                # Surfaces structural bugs like that immediately in dev / UAT.
+                logger.warning(
+                    "[DecisionQueue] could not load %s — %r "
+                    "(header was in pending list but get_decision failed)",
+                    did, exc,
+                )
         return result
 
     def get_resolved_choice(self, dedup_key: str) -> Optional[str]:

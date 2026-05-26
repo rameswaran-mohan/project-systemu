@@ -227,3 +227,55 @@ def test_sqlite_vault_round_trip(tmp_path, monkeypatch):
 
     pending_after = queue.list_pending()
     assert not any(d.id == decision_id for d in pending_after)
+
+
+def test_file_vault_wrapper_proxies_decisions(tmp_path):
+    """v0.8.0.1 regression: the FileVault adapter (used by the dashboard's
+    AppState when SYSTEMU_STORAGE=file) must proxy save_decision and
+    get_decision to the inner Vault.
+
+    Without this, OperatorDecisionQueue.list_pending swallows the
+    AttributeError from get_decision and silently returns an empty list,
+    causing the dashboard's Pending Actions tab to render the empty state
+    even when decisions exist in the vault. See UAT report
+    2026-05-26-uat-pypi-v0.8.0.md for the full live trace.
+    """
+    from systemu.vault.vault import Vault
+    from systemu.storage.file_vault import FileVault
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+
+    raw = Vault(str(tmp_path))
+    wrapped = FileVault(raw)
+
+    # Required surface — must exist
+    assert hasattr(wrapped, "save_decision"), (
+        "FileVault is missing save_decision proxy — dashboard queue is broken"
+    )
+    assert hasattr(wrapped, "get_decision"), (
+        "FileVault is missing get_decision proxy — dashboard queue is broken"
+    )
+
+    # Round-trip through the wrapper (NOT the raw Vault — that's the v0.8.0 hole)
+    queue = OperatorDecisionQueue(wrapped)
+    decision_id = queue.post(
+        title="Wrapper round-trip",
+        body="x",
+        options=["Skip", "Forge"],
+        dedup_key="filevault-wrapper-test:1",
+    )
+
+    # The dashboard's render path: must see the pending decision via wrapper
+    pending = queue.list_pending()
+    assert len(pending) == 1, (
+        f"expected 1 pending via FileVault wrapper, got {len(pending)} -- "
+        "the dashboard's Pending Actions tab will show empty state"
+    )
+    assert pending[0].id == decision_id
+    assert pending[0].dedup_key == "filevault-wrapper-test:1"
+
+    # Operator resolves through the wrapper (same path as dashboard button click)
+    queue.resolve(decision_id, choice="Forge")
+    assert queue.get_resolved_choice("filevault-wrapper-test:1") == "Forge"
+
+    pending_after_resolve = queue.list_pending()
+    assert not any(d.id == decision_id for d in pending_after_resolve)
