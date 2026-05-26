@@ -316,7 +316,8 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 | `SYSTEMU_MODE` | `local` | `local` \| `docker-local` \| `docker-enterprise` — written by `install.py`; `start.sh`/`start.bat` read it |
 | `SYSTEMU_DASHBOARD_HOST` | _(unset → 127.0.0.1)_ | Bind host for the NiceGUI dashboard |
 | `SYSTEMU_DASHBOARD_PORT` | `8765` | Dashboard port |
-| `SYSTEMU_HEADLESS` | _(unset)_ | When `1`, forces non-interactive mode at the `notify_user` layer (same effect as `SYSTEMU_NON_INTERACTIVE`) |
+| `SYSTEMU_DECISION_QUEUE` | _(unset)_ | **v0.8.0:** When `true`, operator-decision prompts in non-TTY contexts are persisted to the dashboard `/insights → Pending Actions` queue instead of being silently auto-picked. Recommended for dashboard-driven workflows. |
+| `SYSTEMU_HEADLESS` | _(unset)_ | **Deprecated in v0.8.0** (use `SYSTEMU_DECISION_QUEUE` instead). When `1`, forces non-interactive mode at the `notify_user` layer (same effect as `SYSTEMU_NON_INTERACTIVE`) — silently auto-picks the safe-default `actions[0]`. |
 | `SYSTEMU_OUTPUT_DIR` | `~/Documents` | Where Shadow-generated files are saved |
 | `SYSTEMU_EXECUTION_RETENTION` | _(unset)_ | Max execution audit dirs to keep on disk; older pruned during save |
 

@@ -27,6 +27,32 @@ console = Console()
 _vault: Any = None  # type: ignore[type-arg]
 _event_log_path: Any = None  # Path to event_log.jsonl, set when vault is injected
 
+# v0.8.0 Pattern 1: lazy-initialised OperatorDecisionQueue cache.  None until
+# the vault is set AND a queue is first requested.  Reset to None by tests via
+# monkeypatch so cache invalidation isn't a concern in production.
+_decision_queue_instance = None
+
+
+def _get_decision_queue():
+    """Lazy-initialise the OperatorDecisionQueue from the module-level _vault.
+
+    Returns None if the vault isn't set yet (e.g. during very early boot) OR
+    if the queue can't be constructed for any reason.  Callers must handle
+    None gracefully.
+    """
+    global _decision_queue_instance
+    if _decision_queue_instance is not None:
+        return _decision_queue_instance
+    if _vault is None:
+        return None
+    try:
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        _decision_queue_instance = OperatorDecisionQueue(_vault)
+        return _decision_queue_instance
+    except Exception:
+        logger.exception("[Notify] could not build decision queue")
+        return None
+
 
 def set_vault(vault: Any, event_log_path: Any = None) -> None:  # noqa: ANN401
     """Inject the vault instance so notifications can be persisted.
@@ -38,7 +64,10 @@ def set_vault(vault: Any, event_log_path: Any = None) -> None:  # noqa: ANN401
                         vault) or vault.data_dir (sqlite vault).  Pass an
                         explicit Path to suppress auto-detection entirely.
     """
-    global _vault, _event_log_path
+    global _vault, _event_log_path, _decision_queue_instance
+    # v0.8.0 Pattern 1: invalidate the lazily-cached OperatorDecisionQueue so
+    # it gets rebuilt against the new vault on next request.
+    _decision_queue_instance = None
     _vault = vault
 
     if event_log_path is not None:
@@ -180,6 +209,7 @@ def notify_user(
     *,
     context: Optional[Dict[str, Any]] = None,
     prompt_for_name: bool = False,
+    dedup_key: Optional[str] = None,
 ) -> str:
     """Display a rich CLI notification and wait for the user to choose an action.
 
@@ -197,6 +227,12 @@ def notify_user(
                            BAD:  ["Approve", "Reject"]  auto-approve = silent yes
         context:         Arbitrary dict persisted with the notification record.
         prompt_for_name: If True, additionally ask for a name string after the choice.
+        dedup_key:       Optional v0.8.0+ idempotency key for the OperatorDecisionQueue.
+                         When SYSTEMU_DECISION_QUEUE=true is set and stdin is not a TTY,
+                         a non-empty dedup_key routes the decision to the dashboard
+                         queue and raises PendingOperatorDecision instead of auto-picking
+                         actions[0]. Format suggestion: "<caller_id>:<entity_id>" e.g.
+                         "tool_forge:tool_abc123".
 
     Returns:
         The user's chosen action string (always one of `actions`).
@@ -232,6 +268,59 @@ def notify_user(
             return f"{only}:"
         return only
 
+    # ── v0.8.0 Pattern 1: queue-mode branch ──────────────────────────────────
+    # When SYSTEMU_DECISION_QUEUE=true AND stdin is not a TTY, route this
+    # decision through the OperatorDecisionQueue: persisted in the vault,
+    # surfaced on the dashboard /insights page, resolved by an operator
+    # click.  The caller is expected to catch PendingOperatorDecision and
+    # exit cleanly with a "waiting for operator" message.
+    import sys as _sys
+    import os as _os
+    _decision_queue_enabled = (
+        (_os.environ.get("SYSTEMU_DECISION_QUEUE") or "").lower() == "true"
+    )
+    if _decision_queue_enabled and not _sys.stdin.isatty():
+        queue = _get_decision_queue()
+        if queue is not None and dedup_key:
+            resolved = queue.get_resolved_choice(dedup_key)
+            if resolved is not None:
+                logger.info(
+                    "[Notify] Queue-mode: returning resolved choice %r for %r",
+                    resolved, dedup_key,
+                )
+                if _vault is not None:
+                    try:
+                        _vault.resolve_notification(notif.id, resolved)
+                    except Exception:
+                        pass
+                return f"{resolved}:" if prompt_for_name else resolved
+        elif queue is not None and not dedup_key:
+            logger.debug(
+                "[Notify] Queue-mode active but no dedup_key passed — "
+                "each call will post a new decision. Callers should pass "
+                "a stable dedup_key (e.g. 'tool_forge:<tool_id>') to enable "
+                "idempotent resolution."
+            )
+        if queue is not None:
+            decision_id = queue.post(
+                title=title,
+                body=message,
+                options=actions,
+                context=context or {},
+                dedup_key=dedup_key or "",
+            )
+            from systemu.approval.exceptions import PendingOperatorDecision
+            raise PendingOperatorDecision(
+                decision_id=decision_id,
+                dedup_key=dedup_key or "",
+                options=actions,
+            )
+        # Queue requested but unavailable — fall through to legacy headless
+        logger.warning(
+            "[Notify] SYSTEMU_DECISION_QUEUE=true but no queue available; "
+            "falling back to legacy headless auto-pick."
+        )
+
     # ── Headless detection: if no TTY, auto-select first action ──────────────
     #
     # Defensive checks — `sys.stdin.isatty()` alone is unreliable on Windows
@@ -243,7 +332,7 @@ def notify_user(
     import sys, os
     _stdout_enc = getattr(sys.stdout, "encoding", "utf-8") or "utf-8"
     _console_non_unicode = _stdout_enc.lower().replace("-", "") not in ("utf8", "utf16", "utf32")
-    # env renamed from SYSTEMU_AUTO_APPROVE_SCROLLS (which misled
+    # v0.6.1-b: env renamed from SYSTEMU_AUTO_APPROVE_SCROLLS (which misled
     # operators into thinking it only affected scroll approval).  When set,
     # any multi-action prompt auto-picks actions[0] — callers MUST order
     # actions so the first entry is the SAFE-by-default choice.  See the
@@ -261,6 +350,14 @@ def notify_user(
             "[Notify] Headless mode — auto-selecting '%s' for: %s",
             auto_choice, title,
         )
+        # v0.8.0: deprecation warning when SYSTEMU_HEADLESS is set explicitly
+        # (does not fire when headless was detected via no-TTY alone).
+        if os.environ.get("SYSTEMU_HEADLESS") == "1":
+            logger.warning(
+                "[Notify] SYSTEMU_HEADLESS=1 is deprecated in v0.8.0 — set "
+                "SYSTEMU_DECISION_QUEUE=true to route operator decisions to "
+                "the dashboard queue instead of silent auto-pick."
+            )
         if _vault is not None:
             try:
                 _vault.resolve_notification(notif.id, auto_choice)

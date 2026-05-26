@@ -14,6 +14,7 @@ from systemu.core.utils import utcnow
 # v0.6.8-c: hoist _dr import to module level so tests can monkeypatch
 # jobs_mod._dr.dry_run_tool without triggering a fresh import each call.
 from systemu.pipelines import tool_dry_run as _dr
+from systemu.approval.exceptions import PendingOperatorDecision
 
 logger = logging.getLogger(__name__)
 
@@ -635,6 +636,15 @@ def hourly_shadow_sweep() -> None:
             _vault.save_activity(activity)
             healed += 1
             decide_shadow(activity, _config, _vault)
+        except PendingOperatorDecision as pd:
+            # v0.8.0 Pattern 1: queue-mode raised — the decision is persisted
+            # in the queue, operator will resolve via dashboard. Log INFO not
+            # WARNING so monitoring doesn't fire false alerts.
+            logger.info(
+                "[Job] Hourly heal: activity %s awaiting operator decision %s "
+                "(dedup_key=%s) — will retry next sweep.",
+                header["id"], pd.decision_id, pd.dedup_key,
+            )
         except Exception as exc:
             logger.warning("[Job] Hourly heal error for activity %s: %s", header["id"], exc)
 
@@ -646,6 +656,13 @@ def hourly_shadow_sweep() -> None:
             try:
                 activity = _vault.get_activity(header["id"])
                 decide_shadow(activity, _config, _vault)
+            except PendingOperatorDecision as pd:
+                # v0.8.0 Pattern 1: queue-mode raised — see Pass 1 above.
+                logger.info(
+                    "[Job] Sweep: activity %s awaiting operator decision %s "
+                    "(dedup_key=%s) — will retry next sweep.",
+                    header["id"], pd.decision_id, pd.dedup_key,
+                )
             except Exception as exc:
                 logger.warning("[Job] Sweep error for activity %s: %s", header["id"], exc)
 

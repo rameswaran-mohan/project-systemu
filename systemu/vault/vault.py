@@ -330,6 +330,7 @@ class Vault:
             "shadow_army":   "shadow_army/index.json",
             "evolutions":    "evolutions/index.json",
             "notifications": "notifications/pending.json",
+            "decisions":     "decisions/index.json",
         }.get(entity)
         if index_file is None:
             raise ValueError(f"Unknown entity type: {entity!r}")
@@ -1134,3 +1135,43 @@ class Vault:
     def list_pending_notifications(self) -> List[Dict[str, Any]]:
         pending = self._read_json(self.root / "notifications/pending.json")
         return [n for n in pending if n.get("status") == NotificationStatus.PENDING.value]
+
+    # ── Decisions (v0.8.0 Pattern 1: OperatorDecisionQueue backing) ───────
+
+    def save_decision(self, decision) -> None:
+        """Persist an OperatorDecision (upsert). Updates decisions/index.json."""
+        from systemu.approval.decision_queue import OperatorDecision
+        if not isinstance(decision, OperatorDecision):
+            raise TypeError(f"expected OperatorDecision, got {type(decision).__name__}")
+        decisions_dir = self.root / "decisions"
+        decisions_dir.mkdir(parents=True, exist_ok=True)
+        # Write the per-decision JSON
+        body_path = decisions_dir / f"{decision.id}.json"
+        self._write_json(body_path, decision.to_dict())
+        # Upsert the header in the index
+        index_path = decisions_dir / "index.json"
+        try:
+            idx = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else []
+        except Exception:
+            idx = []
+        header = {
+            "id":         decision.id,
+            "title":      decision.title,
+            "dedup_key":  decision.dedup_key,
+            "status":     decision.status,
+            "options":    decision.options,
+            "created_at": decision.created_at.isoformat() if decision.created_at else None,
+        }
+        # Remove any existing entry with the same id, then append
+        idx = [h for h in idx if h.get("id") != decision.id]
+        idx.append(header)
+        self._write_json(index_path, idx)
+
+    def get_decision(self, decision_id: str):
+        """Load a single OperatorDecision by id."""
+        from systemu.approval.decision_queue import OperatorDecision
+        path = self.root / "decisions" / f"{decision_id}.json"
+        if not path.exists():
+            raise KeyError(f"decision {decision_id} not found at {path}")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return OperatorDecision.from_dict(raw)

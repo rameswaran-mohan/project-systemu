@@ -64,6 +64,38 @@ def _get_vault_and_config(ctx: click.Context):
     return obj["config"], obj["vault"]
 
 
+# ── v0.8.0 Pattern 1 — Pending-decision exit wrapper ─────────────────────────
+
+def _handle_pending_decision_or_run(ctx, work):
+    """Run ``work()`` and translate ``PendingOperatorDecision`` into a clean
+    exit-75 (EX_TEMPFAIL) with an operator-friendly message.
+
+    v0.8.0 Pattern 1: when a CLI command running in queue mode
+    (SYSTEMU_DECISION_QUEUE=true, no-TTY) hits a notify_user call without a
+    resolved decision, the queue persists a pending record and raises
+    PendingOperatorDecision. This wrapper catches that exception and prints
+    a clear "queued for operator review" message instead of letting the
+    traceback escape, then exits with code 75 so the JobManager / scheduler
+    can tell the difference between "failed" and "waiting for operator".
+    """
+    from systemu.approval.exceptions import PendingOperatorDecision
+    try:
+        return work()
+    except PendingOperatorDecision as pd:
+        console.print(
+            f"[yellow]⏸  Queued for operator review.[/yellow]\n"
+            f"   Decision ID:   [bold]{pd.decision_id}[/bold]\n"
+            f"   Question key:  {pd.dedup_key}\n"
+            f"   Options:       {', '.join(pd.options)}\n"
+            f"\n"
+            f"   Resolve via dashboard at /insights → Pending Actions tab,\n"
+            f"   or:  [bold]sharing_on decisions resolve {pd.decision_id} --choice <option>[/bold]\n"
+            f"\n"
+            f"   Re-run this command after resolving to pick up the operator's choice."
+        )
+        ctx.exit(75)  # EX_TEMPFAIL
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  scrolls group
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,17 +264,19 @@ def scrolls_refine(ctx, session_dir: str, auto: bool):
 @click.pass_context
 def scrolls_approve(ctx, scroll_id: str):
     """Approve a PENDING_APPROVAL scroll and trigger activity extraction (Stages 3-6)."""
-    config, vault = _get_vault_and_config(ctx)
-    from systemu.pipelines import activity_extractor as ae
-    ae.init_pipeline(config, vault)
-    from systemu.pipelines.scroll_refiner import approve_pending_scroll
+    def _work():
+        config, vault = _get_vault_and_config(ctx)
+        from systemu.pipelines import activity_extractor as ae
+        ae.init_pipeline(config, vault)
+        from systemu.pipelines.scroll_refiner import approve_pending_scroll
 
-    try:
-        scroll = approve_pending_scroll(scroll_id, vault)
-        console.print(f"\n[green]✓ Scroll {scroll_id} approved — pipeline running.[/green]")
-    except (ValueError, KeyError) as exc:
-        console.print(f"\n[red]Error:[/red] {exc}")
-        sys.exit(1)
+        try:
+            scroll = approve_pending_scroll(scroll_id, vault)
+            console.print(f"\n[green]✓ Scroll {scroll_id} approved — pipeline running.[/green]")
+        except (ValueError, KeyError) as exc:
+            console.print(f"\n[red]Error:[/red] {exc}")
+            sys.exit(1)
+    _handle_pending_decision_or_run(ctx, _work)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,15 +568,17 @@ def tools_forge(ctx, name: str, context: str):
     If the tool already exists as PROPOSED, generates its implementation.
     If it doesn't exist, first designs the specification, then generates code.
     """
-    config, vault = _get_vault_and_config(ctx)
-    from systemu.pipelines.tool_forge import forge_tool_by_name
+    def _work():
+        config, vault = _get_vault_and_config(ctx)
+        from systemu.pipelines.tool_forge import forge_tool_by_name
 
-    console.print(f"\n[cyan]🔧 Forging tool:[/cyan] {name}\n")
-    result = forge_tool_by_name(name, config, vault, context_hint=context)
-    if result:
-        console.print(f"[green]✓ Tool '{result.name}' forged successfully (status: {result.status})[/green]")
-    else:
-        console.print("[yellow]Forge skipped or failed.[/yellow]")
+        console.print(f"\n[cyan]🔧 Forging tool:[/cyan] {name}\n")
+        result = forge_tool_by_name(name, config, vault, context_hint=context)
+        if result:
+            console.print(f"[green]✓ Tool '{result.name}' forged successfully (status: {result.status})[/green]")
+        else:
+            console.print("[yellow]Forge skipped or failed.[/yellow]")
+    _handle_pending_decision_or_run(ctx, _work)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1359,3 +1395,70 @@ def debug_failure_histogram(group_by: str, event_types: Optional[str], top: int)
             str(row["count"]),
         )
     console.print(table)
+
+
+# ── decisions group (v0.8.0 Pattern 1: OperatorDecisionQueue) ────────────────
+
+@click.group("decisions")
+def decisions_group():
+    """Manage the OperatorDecisionQueue — operator decisions awaiting resolution.
+
+    The queue is the v0.8.0 operator-decision surface for non-TTY contexts.
+    When a dashboard-spawned CLI subprocess needs operator input and
+    SYSTEMU_DECISION_QUEUE=true is set, it posts a decision here for the
+    operator to resolve via the dashboard /insights?tab=actions page or
+    via these CLI commands.
+    """
+
+
+@decisions_group.command("list")
+@click.pass_context
+def decisions_list(ctx):
+    """Show pending OperatorDecision records."""
+    _, vault = _get_vault_and_config(ctx)
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    queue = OperatorDecisionQueue(vault)
+
+    pending = queue.list_pending()
+    if not pending:
+        console.print("[dim]No pending decisions.[/dim]")
+        return
+
+    table = Table(title="Pending Operator Decisions", show_lines=True)
+    table.add_column("ID",         style="dim",   no_wrap=True)
+    table.add_column("Title",      style="bold")
+    table.add_column("Options",    style="cyan")
+    table.add_column("Dedup key",  style="dim")
+    table.add_column("Created",    style="dim")
+    for d in pending:
+        ts = d.created_at.isoformat(timespec="seconds") if d.created_at else ""
+        table.add_row(
+            d.id,
+            (d.title or "")[:60],
+            ", ".join(d.options),
+            d.dedup_key or "",
+            ts,
+        )
+    console.print(table)
+
+
+@decisions_group.command("resolve")
+@click.argument("decision_id")
+@click.option("--choice", "-c", required=True, help="One of the decision's options.")
+@click.pass_context
+def decisions_resolve(ctx, decision_id: str, choice: str):
+    """Resolve a pending decision with the operator's chosen option."""
+    _, vault = _get_vault_and_config(ctx)
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    queue = OperatorDecisionQueue(vault)
+    try:
+        resolved = queue.resolve(decision_id, choice=choice)
+    except KeyError as exc:
+        console.print(f"[red]Not found:[/red] {exc}")
+        ctx.exit(1)
+        return
+    except ValueError as exc:
+        console.print(f"[red]Invalid choice:[/red] {exc}")
+        ctx.exit(2)
+        return
+    console.print(f"[green]Resolved {decision_id} -> {resolved.choice}[/green]")

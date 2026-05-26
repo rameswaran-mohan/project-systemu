@@ -82,7 +82,7 @@ def test_insights_page_importable():
     from systemu.interface.pages.insights import build_insights_page, _VALID_TABS
 
     assert callable(build_insights_page)
-    assert set(_VALID_TABS) == {"memory", "flywheel", "events"}
+    assert set(_VALID_TABS) == {"memory", "flywheel", "events", "actions"}  # actions tab added in v0.8.0
 
 
 def test_chat_tabs_importable():

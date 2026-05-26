@@ -50,6 +50,7 @@ from systemu.storage.sqlite.models import (
     Base,
     ActivityRow,
     ChatHistoryRow,
+    DecisionRow,
     ElderMemoryRow,
     EvolutionRow,
     NotificationRow,
@@ -66,7 +67,7 @@ _ELDER_MEMORY_ID = 1   # ElderMemoryRow always uses row id=1
 
 
 def _resolve_memory_dir(database_url: str, memory_dir: Optional[Path] = None) -> Path:
-    """resolve where ELDER_MEMORY.md + shadow_<id>/ memory dirs live.
+    """v0.6.6-d: resolve where ELDER_MEMORY.md + shadow_<id>/ memory dirs live.
 
     Resolution order:
       1. Explicit ``memory_dir`` parameter (operator override) — wins.
@@ -124,7 +125,7 @@ def _scroll_to_row(s: Scroll) -> ScrollRow:
         status=s.status.value if hasattr(s.status, "value") else str(s.status),
         version=s.version,
         tags=data["tags"],
-        # round-trip the pipeline_trace
+        # v0.6.5-a: round-trip the pipeline_trace
         pipeline_trace=data.get("pipeline_trace", []),
         created_at=_dt(s.created_at),
         updated_at=_dt(s.updated_at),
@@ -147,7 +148,7 @@ def _row_to_scroll(r: ScrollRow) -> Scroll:
         "status": r.status,
         "version": r.version,
         "tags": r.tags or [],
-        # load pipeline_trace; legacy rows have NULL → empty list
+        # v0.6.5-a: load pipeline_trace; legacy rows have NULL → empty list
         "pipeline_trace": getattr(r, "pipeline_trace", None) or [],
         "created_at": r.created_at,
         "updated_at": r.updated_at,
@@ -160,7 +161,7 @@ def _scroll_header(r: ScrollRow) -> Dict[str, Any]:
         "source_session_id": r.source_session_id or "",
         "created_at": r.created_at.isoformat() if r.created_at else "",
         "tags": r.tags or [],
-        # fast badge rendering — derive from pipeline_trace
+        # v0.6.5-a: fast badge rendering — derive from pipeline_trace
         "has_warnings": any(
             (e.get("level") if isinstance(e, dict) else None) in ("warn", "error")
             for e in (getattr(r, "pipeline_trace", None) or [])
@@ -224,10 +225,10 @@ def _tool_header(r: ToolRow) -> Dict[str, Any]:
         "status": r.status,
         "enabled": r.enabled,
         "forged_by_systemu": r.forged_by_systemu,
-        # dry-run status surfaces in the Tools page list
+        # v0.5.0-a: dry-run status surfaces in the Tools page list
         "dry_run_status": getattr(r, "dry_run_status", None) or "not_run",
         "version": r.version,
-        # schema summaries inline in the header — see vault.py
+        # v0.6.1-d: schema summaries inline in the header — see vault.py
         "parameters_schema_summary": _summarise_schema(r.parameters_schema or {}),
         "return_schema_summary":    _summarise_schema(r.return_schema or {}),
         "created_at": r.created_at.isoformat() if r.created_at else "",
@@ -305,7 +306,8 @@ def _activity_to_row(a: Activity) -> ActivityRow:
         missing_tools=data["missing_tools"],
         assigned_shadow_id=a.assigned_shadow_id,
         status=data["status"],
-        intent_snapshot=getattr(a, "intent_snapshot", ""),    # created_at=_dt(a.created_at),
+        intent_snapshot=getattr(a, "intent_snapshot", ""),    # v0.6.0-f
+        created_at=_dt(a.created_at),
         updated_at=_dt(a.updated_at),
     )
 
@@ -318,7 +320,8 @@ def _row_to_activity(r: ActivityRow) -> Activity:
         "missing_tools": r.missing_tools or [],
         "assigned_shadow_id": r.assigned_shadow_id,
         "status": r.status,
-        "intent_snapshot": getattr(r, "intent_snapshot", "") or "",    # "created_at": r.created_at,
+        "intent_snapshot": getattr(r, "intent_snapshot", "") or "",    # v0.6.0-f
+        "created_at": r.created_at,
         "updated_at": r.updated_at,
     })
 
@@ -331,7 +334,8 @@ def _activity_header(r: ActivityRow) -> Dict[str, Any]:
         "missing_tools": r.missing_tools or [],
         "assigned_shadow_id": r.assigned_shadow_id,
         "status": r.status,
-        "intent_snapshot": getattr(r, "intent_snapshot", "") or "",    # "created_at": r.created_at.isoformat() if r.created_at else "",
+        "intent_snapshot": getattr(r, "intent_snapshot", "") or "",    # v0.6.0-f
+        "created_at": r.created_at.isoformat() if r.created_at else "",
     }
 
 
@@ -364,7 +368,7 @@ def _shadow_to_row(s: Shadow, memory_md_path: str = "", memory_buffer_path: str 
 def _row_to_shadow(r: ShadowRow) -> Shadow:
     # Backwards compat: when the row has identity_block populated, use it
     # directly.  When only the legacy system_prompt column is set
-    # (pre-data), the Pydantic model's migration validator transfers
+    # (pre-v0.3 data), the Pydantic model's migration validator transfers
     # it into identity_block.
     return Shadow.model_validate({
         "id": r.id, "name": r.name, "description": r.description or "",
@@ -471,6 +475,39 @@ def _row_to_notification(r: NotificationRow) -> Notification:
         "resolved_at": r.resolved_at,
         "resolution": r.resolution,
     })
+
+
+def _decision_to_row(d) -> "DecisionRow":
+    """OperatorDecision → DecisionRow (v0.8.0 Pattern 1)."""
+    return DecisionRow(
+        id=d.id,
+        title=d.title,
+        body=d.body,
+        options=list(d.options),
+        context=dict(d.context),
+        dedup_key=d.dedup_key,
+        status=d.status,
+        choice=d.choice,
+        created_at=d.created_at,
+        resolved_at=d.resolved_at,
+    )
+
+
+def _row_to_decision(r: "DecisionRow"):
+    """DecisionRow → OperatorDecision (v0.8.0 Pattern 1)."""
+    from systemu.approval.decision_queue import OperatorDecision
+    return OperatorDecision(
+        id=r.id,
+        title=r.title or "",
+        body=r.body or "",
+        options=list(r.options or []),
+        context=dict(r.context or {}),
+        dedup_key=r.dedup_key or "",
+        status=r.status or "pending",
+        choice=r.choice,
+        created_at=r.created_at,
+        resolved_at=r.resolved_at,
+    )
 
 
 def _notification_header(r: NotificationRow) -> Dict[str, Any]:
@@ -597,7 +634,7 @@ class SqliteVault:
         self._url = database_url
         self._strict_tier_types = bool(strict_tier_types)
 
-        # memory_dir resolution extracted into _resolve_memory_dir
+        # v0.6.6-d: memory_dir resolution extracted into _resolve_memory_dir
         # so it's testable + Postgres URLs default to a volume-mounted path
         # instead of the container's volatile /tmp.
         self._memory_dir = _resolve_memory_dir(database_url, memory_dir)
@@ -834,6 +871,19 @@ class SqliteVault:
             elif entity == "notifications":
                 rows = s.execute(select(NotificationRow)).scalars().all()
                 return [_notification_header(r) for r in rows]
+            elif entity == "decisions":
+                rows = s.execute(select(DecisionRow)).scalars().all()
+                return [
+                    {
+                        "id":         r.id,
+                        "title":      r.title,
+                        "dedup_key":  r.dedup_key,
+                        "status":     r.status,
+                        "options":    list(r.options or []),
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                    }
+                    for r in rows
+                ]
             else:
                 raise ValueError(f"Unknown entity type: {entity!r}")
 
@@ -863,7 +913,7 @@ class SqliteVault:
     # ── Skill ─────────────────────────────────────────────────────────────────
 
     def save_skill(self, skill: Skill) -> None:
-        # batch resolution — single SELECT WHERE IN instead of N
+        # v0.6.1-e: batch resolution — single SELECT WHERE IN instead of N
         # find_tool_by_name() calls (each of which previously opened a
         # separate session).  Case-insensitive to match find_tool_by_name's
         # behaviour.  Unknown names are silently dropped (same as before).
@@ -939,7 +989,27 @@ class SqliteVault:
                 return None
             return _row_to_tool(row)
 
-    # ── recovery-engine duck-typed finders ─────────────────────────
+    # ── Decisions (v0.8.0 Pattern 1: OperatorDecisionQueue backing) ──────────
+
+    def save_decision(self, decision) -> None:
+        """Persist an OperatorDecision (upsert) into operator_decisions table."""
+        from systemu.approval.decision_queue import OperatorDecision
+        if not isinstance(decision, OperatorDecision):
+            raise TypeError(f"expected OperatorDecision, got {type(decision).__name__}")
+        with self._session() as s:
+            _upsert(s, _decision_to_row(decision))
+            s.commit()
+        logger.debug("[SqliteVault] Saved decision %s (%s)", decision.id, decision.status)
+
+    def get_decision(self, decision_id: str):
+        """Load a single OperatorDecision by id."""
+        with self._session() as s:
+            row = s.get(DecisionRow, decision_id)
+            if row is None:
+                raise KeyError(f"decision {decision_id} not found")
+            return _row_to_decision(row)
+
+    # ── v0.6.8-a: recovery-engine duck-typed finders ─────────────────────────
     # The RecoveryEngine (systemu/recovery/engine.py) needs lightweight
     # find_* methods that return raw ORM rows (or None) without raising.
     # The engine only touches plain attributes (id, name, status, enabled,
@@ -1481,7 +1551,7 @@ class SqliteVault:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  — Seed tool_dep_approvals from requirements-tools.txt
+#  v0.6.8-d — Seed tool_dep_approvals from requirements-tools.txt
 # ─────────────────────────────────────────────────────────────────────────────
 
 def seed_tool_dep_approvals(database_url: str, requirements_path) -> int:

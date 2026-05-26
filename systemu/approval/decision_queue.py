@@ -1,0 +1,247 @@
+"""OperatorDecisionQueue — vault-backed cache of operator decisions.
+
+v0.8.0 Pattern 1 from the 2026-05-26 architecture audit. Used by the
+queue-mode branch of ``notify_user`` (in interface/notifications.py)
+so that when a CLI subprocess is spawned by the dashboard JobManager
+without a TTY, its operator-decision prompts are persisted here for
+the operator to resolve via the dashboard, rather than being silently
+auto-picked to actions[0] ("Skip").
+
+The queue is a thin wrapper over the vault's existing index/get/save
+abstraction so all three vault backends (file / sqlite / postgres)
+work without backend-specific code.
+
+Vault contract (interface methods this module assumes exist on
+vault objects):
+  - ``vault.load_index("decisions") -> list[dict]``  — returns the
+    persisted index of decision headers (lightweight summaries).
+  - ``vault.get_decision(decision_id: str) -> OperatorDecision``  — load
+    a single decision by id.
+  - ``vault.save_decision(decision: OperatorDecision) -> None``  — persist
+    a decision (upsert).
+
+Backends implement these in Task 3 (file_vault) and Task 4 (sqlite_vault).
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from systemu.vault.vault import Vault
+
+
+_VALID_STATUS = ("pending", "resolved", "expired")
+
+
+@dataclass
+class OperatorDecision:
+    """A single operator decision record.
+
+    Attributes:
+        id:            Globally unique id, prefixed "dec_".
+        title:         Short heading shown to the operator.
+        body:          Detail / explanation shown under the title.
+        options:       Ordered list of choice labels the operator can pick.
+                       options[0] is the safe-by-default for emergency
+                       auto-resolve scenarios (timeouts, etc.).
+        context:       Arbitrary dict carried with the decision (scroll_id,
+                       tool_id, etc.) — consumed by the resuming caller.
+        dedup_key:     String the caller passes to short-circuit duplicate
+                       prompts for the same logical question (e.g.
+                       "tool_forge:tool_x"). Two posts with the same
+                       dedup_key while pending return the existing id.
+        status:        "pending" | "resolved" | "expired".
+        choice:        The operator's chosen option label (None until resolved).
+        created_at:    UTC timestamp of post.
+        resolved_at:   UTC timestamp of resolve (None when pending).
+    """
+
+    id: str
+    title: str
+    body: str
+    options: List[str]
+    context: Dict[str, Any] = field(default_factory=dict)
+    dedup_key: str = ""
+    status: str = "pending"
+    choice: Optional[str] = None
+    created_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id":          self.id,
+            "title":       self.title,
+            "body":        self.body,
+            "options":     list(self.options),
+            "context":     dict(self.context),
+            "dedup_key":   self.dedup_key,
+            "status":      self.status,
+            "choice":      self.choice,
+            "created_at":  self.created_at.isoformat() if self.created_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "OperatorDecision":
+        def _parse(ts):
+            if not ts:
+                return None
+            return datetime.fromisoformat(ts)
+        return cls(
+            id=raw["id"],
+            title=raw.get("title", ""),
+            body=raw.get("body", ""),
+            options=list(raw.get("options", [])),
+            context=dict(raw.get("context", {})),
+            dedup_key=raw.get("dedup_key", ""),
+            status=raw.get("status", "pending"),
+            choice=raw.get("choice"),
+            created_at=_parse(raw.get("created_at")),
+            resolved_at=_parse(raw.get("resolved_at")),
+        )
+
+
+class OperatorDecisionQueue:
+    """Vault-backed cache of operator decisions."""
+
+    def __init__(self, vault: "Vault"):
+        self._vault = vault
+
+    def post(
+        self,
+        *,
+        title: str,
+        body: str,
+        options: List[str],
+        context: Optional[Dict[str, Any]] = None,
+        dedup_key: str = "",
+    ) -> str:
+        """Persist a pending decision (or return existing pending id).
+
+        If a pending decision already exists with the same ``dedup_key``,
+        returns that decision's id without creating a duplicate. This is
+        what lets a CLI command be re-attempted safely while the operator
+        is still deciding.
+
+        Returns the decision id.
+        """
+        if not options:
+            raise ValueError("OperatorDecisionQueue.post: options must be non-empty")
+
+        # Check for existing pending decision with same dedup_key
+        if dedup_key:
+            existing = self._find_pending_by_dedup_key(dedup_key)
+            if existing is not None:
+                return existing.id
+
+        decision = OperatorDecision(
+            id=f"dec_{uuid.uuid4().hex[:8]}",
+            title=title,
+            body=body,
+            options=list(options),
+            context=dict(context or {}),
+            dedup_key=dedup_key,
+            status="pending",
+            choice=None,
+            created_at=datetime.now(tz=timezone.utc),
+            resolved_at=None,
+        )
+        self._vault.save_decision(decision)
+        logger.info(
+            "[DecisionQueue] posted '%s' (id=%s, dedup_key=%r, options=%s)",
+            title, decision.id, dedup_key, options,
+        )
+        return decision.id
+
+    def list_pending(self) -> List[OperatorDecision]:
+        """Return all decisions with status='pending'."""
+        try:
+            headers = self._vault.load_index("decisions") or []
+        except Exception:
+            logger.exception("[DecisionQueue] could not load decisions index")
+            return []
+        pending_ids = [h["id"] for h in headers if h.get("status") == "pending"]
+        result = []
+        for did in pending_ids:
+            try:
+                result.append(self._vault.get_decision(did))
+            except Exception:
+                logger.debug("[DecisionQueue] could not load %s", did, exc_info=True)
+        return result
+
+    def get_resolved_choice(self, dedup_key: str) -> Optional[str]:
+        """Return the operator's choice for the given dedup_key, or None.
+
+        Returns None if no decision exists for that dedup_key, OR if the
+        decision is still pending. Returns the choice string if resolved.
+        """
+        if not dedup_key:
+            return None
+        try:
+            headers = self._vault.load_index("decisions") or []
+        except Exception:
+            logger.exception("[DecisionQueue] could not load decisions index")
+            return None
+
+        # Walk decisions newest-first by created_at (if present in header)
+        for h in sorted(
+            headers,
+            key=lambda x: x.get("created_at") or "",
+            reverse=True,
+        ):
+            if h.get("dedup_key") != dedup_key:
+                continue
+            if h.get("status") != "resolved":
+                continue
+            try:
+                decision = self._vault.get_decision(h["id"])
+            except Exception:
+                continue
+            return decision.choice
+        return None
+
+    def resolve(self, decision_id: str, *, choice: str) -> OperatorDecision:
+        """Mark a decision resolved with the operator's chosen option.
+
+        Raises ValueError if the choice is not in the decision's options.
+        """
+        try:
+            decision = self._vault.get_decision(decision_id)
+        except Exception as exc:
+            raise KeyError(f"OperatorDecision {decision_id} not found: {exc}")
+        if choice not in decision.options:
+            raise ValueError(
+                f"choice {choice!r} not in options {decision.options!r} "
+                f"for decision {decision_id}"
+            )
+        decision.status = "resolved"
+        decision.choice = choice
+        decision.resolved_at = datetime.now(tz=timezone.utc)
+        self._vault.save_decision(decision)
+        logger.info(
+            "[DecisionQueue] resolved %s -> %r (dedup_key=%r)",
+            decision_id, choice, decision.dedup_key,
+        )
+        return decision
+
+    # ── Private helpers ──────────────────────────────────────────────
+
+    def _find_pending_by_dedup_key(self, dedup_key: str) -> Optional[OperatorDecision]:
+        try:
+            headers = self._vault.load_index("decisions") or []
+        except Exception:
+            return None
+        for h in headers:
+            if h.get("dedup_key") == dedup_key and h.get("status") == "pending":
+                try:
+                    return self._vault.get_decision(h["id"])
+                except Exception:
+                    continue
+        return None
