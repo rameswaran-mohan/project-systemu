@@ -34,6 +34,38 @@ def _pid_file_path(vault_dir: str) -> Path:
     return Path(vault_dir).parent / _PID_FILE_NAME
 
 
+def _check_port_available(host: str, port: int) -> bool:
+    """v0.8.0.2: return True iff (host, port) can be bound for listen.
+
+    Prevents the silent-multi-daemon failure where a leftover daemon wins
+    the port race and serves the new user's dashboard with stale config.
+    """
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _find_listening_pid(port: int):
+    """Best-effort: return PID of the process holding `port`, or None.
+
+    psutil is already a project dependency.
+    """
+    try:
+        import psutil
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+                return conn.pid
+    except Exception:
+        return None
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Public commands
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,5 +567,25 @@ if __name__ == "__main__":
     _config = Config.from_env()
     _vault = Vault(args.vault_dir)
     pid_file = _pid_file_path(args.vault_dir)
+
+    # ── v0.8.0.2: refuse to start when port is already in use ───────────────
+    _bind_host = "127.0.0.1"
+    if not _check_port_available(_bind_host, args.port):
+        _existing_pid = _find_listening_pid(args.port)
+        _pid_info = f"PID {_existing_pid}" if _existing_pid else "an unknown process"
+        print(
+            f"\n[ERROR] Port {args.port} on {_bind_host} is already in use by {_pid_info}.\n"
+            f"\n"
+            f"  Another systemu daemon (or another app) is bound to this port.\n"
+            f"  Running two daemons on the same port creates a silent failure\n"
+            f"  where whichever wins the race serves your dashboard with the\n"
+            f"  wrong vault. Recordings + decisions land in the wrong place.\n"
+            f"\n"
+            f"  Fix one of:\n"
+            f"    sharing_on daemon stop --all              # kill ALL systemu daemons\n"
+            f"    SYSTEMU_DASHBOARD_PORT=8766 sharing_on daemon start   # use a different port\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     _run_daemon_loop(_config, _vault, args.port, pid_file)

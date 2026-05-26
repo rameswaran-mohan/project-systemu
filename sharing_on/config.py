@@ -9,11 +9,26 @@ from typing import List
 
 from dotenv import load_dotenv
 
-# Load .env from project root (walk up from this file)
+# v0.8.0.2: load .env from CWD FIRST so every CLI verb (analyze, init,
+# scrolls, decisions, etc.) gets consistent dotenv behavior — not just
+# `daemon start`.  Previously only the install-time _PROJECT_ROOT/.env was
+# loaded, which silently ignored the user's working-directory .env on
+# pip-installed setups.
+#
+# override=False: existing process env vars take precedence over .env values
+# so subprocesses spawned with explicit env (e.g. JobManager) keep their
+# parent's overrides.
+_CWD_ENV = Path.cwd() / ".env"
+if _CWD_ENV.exists():
+    load_dotenv(_CWD_ENV, override=False)
+
+# Legacy: also load .env from the install dir (for git-clone / editable
+# installs where the .env lives alongside the source).  override=False so
+# CWD .env (loaded above) wins for keys that appear in both.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE = _PROJECT_ROOT / ".env"
 if _ENV_FILE.exists():
-    load_dotenv(_ENV_FILE)
+    load_dotenv(_ENV_FILE, override=False)
 
 
 # Legacy env-var compatibility shim for silentgrasper_* names was

@@ -1168,9 +1168,40 @@ def daemon_start(ctx, port: int, foreground: bool):
 
 
 @daemon_group.command("stop")
+@click.option("--all", "stop_all", is_flag=True, default=False,
+              help="Kill ALL systemu daemon processes "
+                   "(incl. orphans from prior runs that aren't in the pidfile).")
 @click.pass_context
-def daemon_stop(ctx):
-    """Stop the running Systemu daemon."""
+def daemon_stop(ctx, stop_all: bool):
+    """Stop the running Systemu daemon.
+
+    By default stops only the daemon tracked in the pidfile.  Use --all to
+    sweep up orphan daemon processes (e.g. when an old daemon survived a
+    crash or was spawned by a different installation).
+    """
+    if stop_all:
+        # v0.8.0.2: kill every python process whose cmdline mentions our
+        # daemon module.  This sidesteps the pidfile and catches orphans.
+        import psutil
+        killed = []
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                cmdline = " ".join(proc.info.get("cmdline") or [])
+                if "systemu.scheduler.daemon" in cmdline:
+                    proc.kill()
+                    killed.append(proc.info["pid"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if killed:
+            console.print(
+                f"[green]Killed {len(killed)} daemon process(es): "
+                f"{', '.join(str(p) for p in killed)}[/green]"
+            )
+        else:
+            console.print("[dim]No systemu daemon processes found.[/dim]")
+        return
+
+    # Default path: pidfile-based single-daemon stop (preserve original logic)
     config, _ = _get_vault_and_config(ctx)
     from systemu.scheduler.daemon import stop_daemon
 
