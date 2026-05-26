@@ -422,44 +422,75 @@ def _stop_capture(jm):
         if j.type == "capture" and j.status.value in ("running", "stopping")
     ]
     
+    # v0.8.0.3: ALWAYS run the refine launcher (was previously gated on
+    # `captures_dir.exists()` which silently did nothing when the dir didn't
+    # exist — every pip install hit this).  The launcher now surfaces a toast
+    # for every outcome (dispatched / no captures dir / no session) so the
+    # operator sees what happened.
+    from nicegui import ui as _ui_for_toast
     for j in capture_jobs:
         job_name = j.name  # capture name BEFORE stopping (closure-safe)
         jm.stop_job_gracefully(j.id)
-        
-        if captures_dir.exists():
-            def _launch_refine(captured_name=job_name):
-                import time
-                # Wait for the process to finish flushing (2s)
-                time.sleep(2)
-                # Find the most recently modified capture directory
-                dirs = sorted(
-                    [d for d in captures_dir.iterdir() if d.is_dir()],
-                    key=os.path.getmtime
-                )
-                if dirs:
-                    latest = dirs[-1]
-                    refine_cmd = [
-                        sys.executable, "-m", "sharing_on",
-                        "scrolls", "refine", str(latest)
-                    ]
-                    # v0.6.1-b: --auto when running non-interactively (env
-                    # var SYSTEMU_NON_INTERACTIVE — renamed from the misleading
-                    # SYSTEMU_AUTO_APPROVE_SCROLLS).
-                    if state.config.non_interactive:
-                        refine_cmd.append("--auto")
-                    jm.start_job(
-                        f"Refining: {captured_name}",
-                        "refine",
-                        refine_cmd,
-                        cwd,
+
+        def _launch_refine(captured_name=job_name):
+            import time
+            # Wait for the capture process to flush events.db + session.json
+            time.sleep(2)
+            if not captures_dir.exists():
+                logger.warning("[Dashboard] captures dir does not exist: %s", captures_dir)
+                try:
+                    _ui_for_toast.notify(
+                        f"No captures directory at {captures_dir} — "
+                        f"refine not dispatched.",
+                        type="negative",
                     )
-                    logger.info("[Dashboard] Refine job dispatched for: %s", latest)
-                else:
-                    logger.warning("[Dashboard] No capture directory found to refine.")
-            
-            # Run in a daemon thread so we don't block NiceGUI
-            t = threading.Thread(target=_launch_refine, daemon=True, name="refine-launcher")
-            t.start()
+                except Exception:
+                    pass
+                return
+            dirs = sorted(
+                [d for d in captures_dir.iterdir() if d.is_dir()],
+                key=os.path.getmtime,
+            )
+            if not dirs:
+                logger.warning("[Dashboard] No capture directory found in %s to refine.", captures_dir)
+                try:
+                    _ui_for_toast.notify(
+                        "Capture stopped but no session directory was written. "
+                        "Recording may have crashed — check daemon log.",
+                        type="negative",
+                    )
+                except Exception:
+                    pass
+                return
+            latest = dirs[-1]
+            refine_cmd = [
+                sys.executable, "-m", "sharing_on",
+                "scrolls", "refine", str(latest),
+            ]
+            # v0.6.1-b: --auto when running non-interactively (env var
+            # SYSTEMU_NON_INTERACTIVE — renamed from the misleading
+            # SYSTEMU_AUTO_APPROVE_SCROLLS).
+            if state.config.non_interactive:
+                refine_cmd.append("--auto")
+            jm.start_job(
+                f"Refining: {captured_name}",
+                "refine",
+                refine_cmd,
+                cwd,
+            )
+            logger.info("[Dashboard] Refine job dispatched for: %s", latest)
+            try:
+                _ui_for_toast.notify(
+                    f"Refine job dispatched for {latest.name}. "
+                    f"Watch /scrolls for the result.",
+                    type="positive",
+                )
+            except Exception:
+                pass
+
+        # Run in a daemon thread so we don't block NiceGUI
+        t = threading.Thread(target=_launch_refine, daemon=True, name="refine-launcher")
+        t.start()
 
 
 def _cancel_capture(jm):

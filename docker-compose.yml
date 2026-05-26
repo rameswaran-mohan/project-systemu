@@ -50,6 +50,10 @@ services:
       SYSTEMU_STORAGE: "file"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
     restart: unless-stopped
     profiles: ["legacy"]
 
@@ -104,6 +108,10 @@ services:
       SYSTEMU_VAULT_DIR: "/data/vault"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
     depends_on:
       postgres-local:
         condition: service_healthy
@@ -229,6 +237,10 @@ services:
       SYSTEMU_VAULT_DIR: "/data/vault"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
     depends_on:
       postgres:
         condition: service_healthy
@@ -298,6 +310,10 @@ services:
       SYSTEMU_TOOL_BACKEND: "docker"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
     restart: unless-stopped
     profiles: ["docker-sandbox"]
 

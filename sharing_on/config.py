@@ -18,9 +18,14 @@ from dotenv import load_dotenv
 # override=False: existing process env vars take precedence over .env values
 # so subprocesses spawned with explicit env (e.g. JobManager) keep their
 # parent's overrides.
+# v0.8.0.3: tolerate UTF-8 BOM (Windows PowerShell's `Set-Content -Encoding
+# utf8` writes UTF-8 with BOM, which python-dotenv mis-parses — the first
+# key ends up as "﻿OPENROUTER_API_KEY" instead of "OPENROUTER_API_KEY"
+# and os.environ.get(...) returns empty.  utf-8-sig strips the BOM if
+# present and is safe for files written without one.
 _CWD_ENV = Path.cwd() / ".env"
 if _CWD_ENV.exists():
-    load_dotenv(_CWD_ENV, override=False)
+    load_dotenv(_CWD_ENV, override=False, encoding="utf-8-sig")
 
 # Legacy: also load .env from the install dir (for git-clone / editable
 # installs where the .env lives alongside the source).  override=False so
@@ -28,7 +33,7 @@ if _CWD_ENV.exists():
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE = _PROJECT_ROOT / ".env"
 if _ENV_FILE.exists():
-    load_dotenv(_ENV_FILE, override=False)
+    load_dotenv(_ENV_FILE, override=False, encoding="utf-8-sig")
 
 
 # Legacy env-var compatibility shim for silentgrasper_* names was
