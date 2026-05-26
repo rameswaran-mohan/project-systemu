@@ -377,7 +377,7 @@ def skills_group():
 )
 @click.pass_context
 def skills_deprecate(ctx, skill_id, reason, reactivate):
-    """deprecate (effectiveness_score=0.0) or reactivate a skill.
+    """v0.6.5-e: deprecate (effectiveness_score=0.0) or reactivate a skill.
 
     Deprecated skills are excluded from shadow_decision matching when
     effectiveness_score < 0.5.  Use this command when the v0.6.0-d.5 startup
@@ -438,7 +438,7 @@ def skills_deprecate(ctx, skill_id, reason, reactivate):
 )
 @click.pass_context
 def skills_export(ctx, skill_id: str, output: Path) -> None:
-    """Export a Systemu Skill as a portable Anthropic Agent Skill bundle.
+    """v0.7-d: Export a Systemu Skill as a portable Anthropic Agent Skill bundle.
 
     Writes ``<output>/<kebab-name>/SKILL.md`` with spec-conformant YAML
     frontmatter (top-level ``name`` + ``description``; everything else under
@@ -543,6 +543,67 @@ def tools_forge(ctx, name: str, context: str):
         console.print(f"[green]✓ Tool '{result.name}' forged successfully (status: {result.status})[/green]")
     else:
         console.print("[yellow]Forge skipped or failed.[/yellow]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  tools dry-run — manual single-tool dry-run advance (v0.7.4 Pattern 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tools_group.command("dry-run")
+@click.argument("tool_id")
+@click.pass_context
+def tools_dryrun(ctx, tool_id: str):
+    """Run dry-run validation on a single tool (v0.7.4 Pattern 2).
+
+    Equivalent to the dashboard `/tools` page [Dry-Run] action on a single row.
+    On pass, the tool advances to DEPLOYED. On fail, the tool stays at FORGED
+    with dry_run_status='failed' and a WARNING event is published.
+    """
+    config, vault = _get_vault_and_config(ctx)
+    try:
+        tool = vault.get_tool(tool_id)
+    except KeyError:
+        console.print(f"[red]Tool '{tool_id}' not found in vault.[/red]")
+        ctx.exit(1)
+        return
+
+    if not getattr(tool, "implementation_path", None):
+        console.print(
+            f"[yellow]Tool '{tool.name}' has no implementation_path yet — "
+            "skipping (forge incomplete).[/yellow]"
+        )
+        ctx.exit(2)
+        return
+
+    from systemu.pipelines.tool_dry_run import dry_run_tool
+    from systemu.core.models import ToolStatus
+    from systemu.interface.notifications import log_event
+
+    result = dry_run_tool(tool, vault=vault, config=config)
+    tool.dry_run_status = result.status
+
+    if result.status == "passed":
+        tool.status = ToolStatus.DEPLOYED
+        vault.save_tool(tool)
+        console.print(
+            f"[green]✓ Tool '{tool.name}' dry-run passed ({result.elapsed_ms}ms) "
+            f"— status advanced to DEPLOYED.[/green]"
+        )
+    elif result.status == "skipped":
+        vault.save_tool(tool)
+        console.print(
+            f"[yellow]Tool '{tool.name}' dry-run skipped: {result.skip_reason}[/yellow]"
+        )
+    else:
+        vault.save_tool(tool)
+        log_event(
+            "WARNING", "tool",
+            f"Tool '{tool.name}' failed dry-run validation: {(result.error or '')[:200]}",
+            {"tool_id": tool.id, "tool_name": tool.name, "error": result.error},
+        )
+        console.print(
+            f"[red]✗ Tool '{tool.name}' dry-run failed: {result.error}[/red]"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

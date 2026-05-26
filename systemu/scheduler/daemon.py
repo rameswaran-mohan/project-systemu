@@ -227,6 +227,31 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         )
         # vault remains the raw Vault(args.vault_dir) passed in — degraded mode
 
+    # v0.7.4 Pattern 4: warn loudly if vault is empty on startup. The wheel
+    # ships a starter catalog in systemu/vault/* but the daemon reads CWD —
+    # `sharing_on init` is the operator's bridge between the two.
+    try:
+        _t = vault.load_index("tools") or []
+        _s = vault.load_index("skills") or []
+        if not _t and not _s:
+            logger.warning(
+                "[Daemon] Vault is empty (0 tools, 0 skills). Run "
+                "`sharing_on init` to seed the bundled starter catalog, "
+                "or `sharing_on record` to capture a workflow that will "
+                "trigger auto-forge."
+            )
+            try:
+                from systemu.interface.notifications import log_event as _le
+                _le(
+                    "WARNING", "runtime",
+                    "Empty vault on daemon startup — run `sharing_on init`",
+                    {"action": "init"},
+                )
+            except Exception:
+                pass
+    except Exception:
+        logger.debug("[Daemon] vault-empty check failed (ignored)", exc_info=True)
+
     # Initialise jobs (sets module-level config/vault globals)
     init_jobs(config, vault)
 
@@ -303,6 +328,25 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # v0.7.4 Pattern 2: tool lifecycle reconciler — advance FORGED tools
+    # to DEPLOYED via dry-run on a short interval. Closes the Bug #22 gap
+    # where forged tools never reached the runtime.
+    from systemu.scheduler.tool_reconciler import reconcile_once as _reconcile_tools
+    def _reconcile_tools_job():
+        try:
+            _reconcile_tools(vault, config)
+        except Exception:
+            logger.exception("[Daemon] tool reconciler job crashed")
+
+    scheduler.add_job(
+        _reconcile_tools_job,
+        trigger="interval",
+        seconds=30,
+        id="tool_reconciler",
+        name="Tool Lifecycle Reconciler",
+        replace_existing=True,
+    )
+
     scheduler.start()
 
     # One-shot recovery sweep — fires 5 seconds after startup to heal any
@@ -321,7 +365,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
 
     logger.info("[Daemon] Scheduler started. PID=%d | Port=%d", os.getpid(), port)
     logger.info(
-        "[Daemon] Jobs: shadow sweep (hourly) | memory consolidation (02:00) | evolution check (03:00)",
+        "[Daemon] Jobs: shadow sweep (hourly) | memory consolidation (02:00) | evolution check (03:00) | tool reconciler (every 30s)",
     )
 
     # ── Start NiceGUI dashboard in a background thread ─────────────────────

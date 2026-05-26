@@ -24,6 +24,45 @@ from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
 
 logger = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  v0.7.4 Pattern 2 — per-row action helpers (pure-data so unit-testable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _row_actions_for(header):
+    """v0.7.4 Pattern 2: decide which action buttons to render for a tool row.
+
+    Returns a list of dicts: [{"label": str, "kind": str, "tool_id": str}, ...]
+    Kept as pure data so tests can verify the policy without driving NiceGUI.
+    """
+    actions = []
+    status = (header.get("status") or "").lower()
+    dryrun = (header.get("dry_run_status") or "").lower()
+    if status in ("forged", "proposed") and dryrun in ("", "not_run", "failed"):
+        actions.append({"label": "Dry-Run", "kind": "dryrun", "tool_id": header.get("id")})
+    # Future: more action types (delete, retry-forge, etc.) join here.
+    return actions
+
+
+def _dispatch_dryrun(tool_id: str) -> None:
+    """Dashboard [Dry-Run] button → spawn `sharing_on tools dry-run <id>` via JobManager.
+
+    Mirrors the existing pattern used by /scrolls page approve button: dispatch
+    the same CLI command the operator could run manually.
+    """
+    import sys
+    from systemu.interface.jobs import JobManager
+    from systemu.interface.dashboard_state import AppState
+    jm = JobManager.get()
+    state = AppState.get()
+    cmd = [sys.executable, "-m", "sharing_on", "tools", "dry-run", tool_id]
+    try:
+        jm.start_job(f"Dry-Run: {tool_id[:8]}", "tool_dryrun", cmd, state.project_root)
+        ui.notify(f"Dry-run dispatched for {tool_id[:8]}", type="positive")
+    except Exception as exc:
+        ui.notify(f"Failed to dispatch dry-run: {exc}", type="negative")
+
+
 # Dangerous patterns the risk checker scans for in generated code
 _RISK_PATTERNS: dict[str, str] = {
     "shell=True":      "subprocess shell injection (shell=True)",
@@ -44,7 +83,7 @@ _RISK_PATTERNS: dict[str, str] = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _render_unbaked_banner() -> None:
-    """surface runtime-approved deps that haven't been baked into
+    """v0.6.8-e: surface runtime-approved deps that haven't been baked into
     the docker image yet — they live in pip on the running container but
     will vanish on the next ``docker compose up`` unless ``docker compose
     build`` is run first.  Best-effort: any failure (no DB URL, no table)
@@ -195,7 +234,7 @@ def build_tools_page() -> None:
                     desc = t.get("description", "") or ""
                     _td(desc[:70] + "…" if len(desc) > 70 else desc or "—")
 
-                    # Actions column
+                    # Actions column — v0.7.4 Pattern 2: dynamic per-row buttons
                     with ui.element("td").style("padding: 12px 16px;"):
                         if status == "proposed":
                             ui.button(
@@ -206,7 +245,21 @@ def build_tools_page() -> None:
                                 f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
                             )
                         else:
-                            ui.label("—").style(f"color: {THEME['text_muted']}; font-size: 12px;")
+                            _actions = _row_actions_for(t)
+                            if not _actions:
+                                ui.label("—").style(f"color: {THEME['text_muted']}; font-size: 12px;")
+                            else:
+                                with ui.row().style("gap: 6px;"):
+                                    for _a in _actions:
+                                        if _a["kind"] == "dryrun":
+                                            ui.button(
+                                                _a["label"],
+                                                on_click=lambda _, tid=_a["tool_id"]: _dispatch_dryrun(tid),
+                                            ).style(
+                                                f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                                                f"border: 1px solid {THEME['border']}; border-radius: 6px; "
+                                                f"font-size: 12px; padding: 4px 10px;"
+                                            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,7 +267,7 @@ def build_tools_page() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_recalibration_cards(vault) -> None:
-    """surface pending RECALIBRATE_TOOL approvals on the Tools page.
+    """v0.5.0-e: surface pending RECALIBRATE_TOOL approvals on the Tools page.
 
     Scans the EventBus ring buffer for unresolved
     ``tool-recalibrate:*`` approval cards.  Renders each as an actionable
@@ -280,7 +333,7 @@ def _render_recalibration_card(ev: dict, vault) -> None:
         ui.label(ctx.get("approval_message") or "").style(
             f"font-size: 12px; color: {THEME['text']}; white-space: pre-wrap;"
         )
-        # spec diff (collapsible).  Shows what changed in the
+        # v0.5.1-b: spec diff (collapsible).  Shows what changed in the
         # tool spec so the operator can audit before approving.
         spec_diff = rec.get("spec_diff") or []
         if spec_diff:
@@ -324,7 +377,7 @@ def _render_recalibration_card(ev: dict, vault) -> None:
                 f"background: {THEME['success']}; color: white; border-radius: 6px; "
                 f"font-size: 12px; font-weight: 600; padding: 6px 12px;"
             )
-            # operator override actions.  When the supervisor
+            # v0.5.1-a: operator override actions.  When the supervisor
             # recommended one mode, operator can force the other.  Hides
             # the override that matches the supervisor's pick (no point
             # re-running the same recalibration).
@@ -360,7 +413,7 @@ def _render_recalibration_card(ev: dict, vault) -> None:
 
 
 def _on_enable_and_resume(rec: dict, ctx: dict, vault) -> None:
-    """— enable the new tool + ask the Supervisor to resume."""
+    """v0.5.0-e — enable the new tool + ask the Supervisor to resume."""
     new_tool_id      = rec.get("new_tool_id") or rec.get("original_tool_id")
     original_tool_id = rec.get("original_tool_id")
     mode             = rec.get("mode") or "bump_version"
@@ -426,7 +479,7 @@ def _on_override_recalibration(
     *,
     forced_mode: str,
 ) -> None:
-    """— operator forces a different recalibration mode.
+    """v0.5.1-a — operator forces a different recalibration mode.
 
     Re-runs the recalibration pipeline with the operator's chosen mode
     instead of the supervisor's recommendation.  The new run produces a

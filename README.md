@@ -13,6 +13,17 @@ pip install systemu                                                       # PyPI
 docker run -p 8765:8765 ghcr.io/rameswaran-mohan/systemu:0.7.0            # Docker (post-v0.7.0 tag)
 ```
 
+### First run (after `pip install`)
+
+In your chosen working directory:
+
+```bash
+sharing_on init       # seeds ./systemu/vault/ with the bundled starter catalog
+sharing_on daemon start
+```
+
+> The `init` command is idempotent and only needs to run once per working directory. It copies the starter tools + skills from the wheel into your vault so the system has a working catalog on first run. Without `init`, the daemon will start but the vault will be empty until you run a capture session that triggers auto-forge.
+
 Open the dashboard at <http://localhost:8765>.
 
 > New to the vocabulary? See [docs/glossary.md](docs/glossary.md) for a Systemu → industry-terms map.

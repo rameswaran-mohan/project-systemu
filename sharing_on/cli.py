@@ -768,6 +768,139 @@ def info():
 
 
 # ---------------------------------------------------------------------------
+# init command (v0.7.4 Pattern 4)
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--force", is_flag=True, help="Overwrite existing vault entries (default: skip).")
+@click.option("--no-seed", is_flag=True, help="Create vault structure only; skip starter catalog seeding.")
+def init(force: bool, no_seed: bool):
+    """Initialise the CWD vault from the package's starter catalog (v0.7.4).
+
+    Run this once after `pip install systemu` in your working directory.
+    It creates ``./systemu/vault/`` and copies the bundled starter tools,
+    skills, and tool implementations so the system has a working catalog
+    on first run.
+
+    Idempotent — existing entries are kept unless ``--force`` is passed.
+    Use ``--no-seed`` if you want only the directory structure.
+    """
+    import json as _json
+    from importlib import resources
+    from datetime import datetime as _dt, timezone as _tz
+
+    cwd = Path.cwd()
+    target_root = cwd / "systemu" / "vault"
+    target_root.mkdir(parents=True, exist_ok=True)
+    console.print(f"[dim]Vault root: {target_root}[/dim]")
+
+    if no_seed:
+        console.print("[yellow]--no-seed: skipping starter catalog.[/yellow]")
+        return
+
+    try:
+        pkg_vault = resources.files("systemu") / "vault"
+    except Exception as exc:
+        console.print(f"[red]Could not locate packaged vault: {exc}[/red]")
+        raise click.Abort()
+
+    seed_log = target_root / ".seed_log.json"
+    prior = {}
+    if seed_log.exists():
+        try:
+            prior = _json.loads(seed_log.read_text(encoding="utf-8"))
+        except Exception:
+            prior = {}
+
+    copied = {"tools": 0, "skills": 0, "implementations": 0, "skipped": 0}
+
+    def _copy_indexed(kind: str):
+        src_idx = pkg_vault / kind / "index.json"
+        dst_idx = target_root / kind / "index.json"
+        dst_idx.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            src_entries = _json.loads(src_idx.read_text(encoding="utf-8"))
+        except Exception:
+            console.print(f"[yellow]No starter {kind}/index.json in package — skipping.[/yellow]")
+            return
+
+        if dst_idx.exists() and not force:
+            existing = _json.loads(dst_idx.read_text(encoding="utf-8"))
+            existing_ids = {e.get("id") for e in existing}
+            merged = list(existing)
+            for entry in src_entries:
+                if entry.get("id") in existing_ids:
+                    copied["skipped"] += 1
+                    continue
+                merged.append(entry)
+                copied[kind] += 1
+        else:
+            merged = list(src_entries)
+            copied[kind] = len(merged)
+
+        dst_idx.write_text(_json.dumps(merged, indent=2), encoding="utf-8")
+
+        # Copy per-entry JSON files
+        for entry in src_entries:
+            entry_id = entry.get("id")
+            if not entry_id:
+                continue
+            src_file = pkg_vault / kind / f"{entry_id}.json"
+            dst_file = target_root / kind / f"{entry_id}.json"
+            if src_file.is_file():
+                if dst_file.exists() and not force:
+                    continue
+                dst_file.write_text(src_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+    _copy_indexed("tools")
+    _copy_indexed("skills")
+
+    # Copy tool implementations directory
+    impl_src = pkg_vault / "tools" / "implementations"
+    impl_dst = target_root / "tools" / "implementations"
+    impl_dst.mkdir(parents=True, exist_ok=True)
+    if impl_src.is_dir():
+        for child in impl_src.iterdir():
+            if not child.is_file():
+                continue
+            target = impl_dst / child.name
+            if target.exists() and not force:
+                continue
+            target.write_text(child.read_text(encoding="utf-8"), encoding="utf-8")
+            copied["implementations"] += 1
+
+    # Copy skill SKILL.md files
+    skill_src_root = pkg_vault / "skills"
+    skill_dst_root = target_root / "skills"
+    skill_dst_root.mkdir(parents=True, exist_ok=True)
+    if skill_src_root.is_dir():
+        for skill_dir in skill_src_root.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            dest_dir = skill_dst_root / skill_dir.name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            src_md = skill_dir / "SKILL.md"
+            if src_md.is_file():
+                dest_md = dest_dir / "SKILL.md"
+                if dest_md.exists() and not force:
+                    continue
+                dest_md.write_text(src_md.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # Write seed log
+    prior["last_init_at"] = _dt.now(tz=_tz.utc).isoformat(timespec="seconds")
+    prior["last_init_version"] = _sharing_on_version
+    prior["last_init_copied"] = copied
+    seed_log.write_text(_json.dumps(prior, indent=2), encoding="utf-8")
+
+    console.print(
+        f"[green]✓ init complete.[/green] "
+        f"tools={copied['tools']} skills={copied['skills']} "
+        f"implementations={copied['implementations']} skipped={copied['skipped']}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # doctor command (v0.6.8-a)
 # ---------------------------------------------------------------------------
 # Diagnoses pending gates/blockers for any scroll/activity/shadow/tool by
