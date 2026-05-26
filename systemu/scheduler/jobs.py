@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 
 from systemu.core.utils import utcnow
-# hoist _dr import to module level so tests can monkeypatch
+# v0.6.8-c: hoist _dr import to module level so tests can monkeypatch
 # jobs_mod._dr.dry_run_tool without triggering a fresh import each call.
 from systemu.pipelines import tool_dry_run as _dr
 
@@ -134,36 +134,57 @@ def startup_recovery_sweep() -> None:
     # (no-op once every header has the new keys).
     _backfill_tool_headers_v061(_vault)
 
-    # ── Pass 7 (v0.6.5-f): dry-run any enabled tools that haven't been
-    # validated yet.  Failures auto-disable + emit operator card.  Closes
-    # the "web_screenshot tool failed at runtime" finding from the 2026-05-17
-    # weather E2E — broken tools shouldn't reach shadow execution.
+    # ── Pass 7 (v0.6.5-f, updated v0.7.4): dry-run any pending FORGED or
+    # PROPOSED tools that haven't been validated yet.  v0.7.4 removed the
+    # `enabled=True` filter — the new reconciler advances tools through
+    # the lifecycle independent of operator enable-intent. Failures
+    # auto-disable + emit operator card. Closes the "web_screenshot tool
+    # failed at runtime" finding from the 2026-05-17 weather E2E.
     try:
         dry_run_all_pending_tools(_vault, _config)
     except Exception:
-        logger.exception("[Job] tool dry-run sweep failed")
+        logger.exception("[Job] v0.6.5-f tool dry-run sweep failed")
 
     logger.info("[Job] Startup recovery sweep complete.")
 
 
-def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None:
-    """One-shot startup sweep.
+def _find_pending_dry_run_via_index(headers):
+    """Return tool index entries whose dry-run hasn't been validated yet.
 
-    For each ``enabled=True, dry_run_status in {None, 'not_run'}`` tool,
-    dispatch the dry-run pipeline.  Bounded by ``max_concurrent``
+    v0.7.4: previously filtered on `enabled=True`. Removed — the
+    reconciler advances FORGED tools to DEPLOYED regardless of operator
+    enable state, because `enabled` is operator-intent (do I want this
+    available to shadows?) not lifecycle-state (has this been validated?).
+    """
+    return [
+        h for h in headers
+        if h.get("dry_run_status") in (None, "not_run")
+        # status=None covers legacy index entries written before `status` was a required field
+        and h.get("status") in ("forged", "proposed", None)
+    ]
+
+
+def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None:
+    """v0.6.5-f / v0.6.8-c: one-shot startup sweep.
+
+    For each FORGED/proposed tool with ``dry_run_status in {None, 'not_run'}``,
+    dispatch the v0.5.0-a dry-run pipeline.  Bounded by ``max_concurrent``
     (default 5).  Each dry-run is capped at 30s by the existing sandbox.
 
-    this sweep is now NON-DESTRUCTIVE.  Failures (whether a
+    v0.7.4: ``enabled`` is no longer part of the pending filter — see
+    ``_find_pending_dry_run_via_index`` for rationale.
+
+    v0.6.8-c: this sweep is now NON-DESTRUCTIVE.  Failures (whether a
     returned ``success=False`` result or a raised exception like an
     uncaught ImportError) record ``dry_run_status='failed'`` plus a
     classified evidence dict on the tool, but never set ``enabled=False``.
     Operators recover via /recover/tool/<id>.  This generalises the
-    hotfix (which only kept the tool enabled when the failure
+    v0.6.5-i hotfix (which only kept the tool enabled when the failure
     string matched ``"treating all packages as pending"``) to ANY failure.
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    # prefer the dedicated vault helper if it exists (mockable in
+    # v0.6.8-c: prefer the dedicated vault helper if it exists (mockable in
     # unit tests).  Fall back to scanning load_index("tools") so existing
     # vault implementations without the helper still work.
     pending = None
@@ -173,21 +194,18 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
             pending = list(finder() or [])
         except Exception:
             logger.debug(
-                "[Job] find_tools_pending_dry_run() raised — falling back to index scan",
+                "[Job] v0.6.8-c: find_tools_pending_dry_run() raised — falling back to index scan",
                 exc_info=True,
             )
             pending = None
     if pending is None:
-        pending = [
-            h for h in (vault.load_index("tools") or [])
-            if h.get("enabled") and h.get("dry_run_status") in (None, "not_run")
-        ]
+        pending = _find_pending_dry_run_via_index(vault.load_index("tools") or [])
     if not pending:
-        logger.debug("[Job] no tools pending dry-run")
+        logger.debug("[Job] v0.6.5-f: no tools pending dry-run")
         return
 
     logger.info(
-        "[Job] dry-running %d tools (max %d concurrent)",
+        "[Job] v0.6.5-f: dry-running %d tools (max %d concurrent)",
         len(pending), max_concurrent,
     )
 
@@ -197,7 +215,7 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
             try:
                 return vault.get_tool(item["id"])
             except Exception:
-                logger.exception("[Job] get_tool failed for %s", item.get("id"))
+                logger.exception("[Job] v0.6.5-f: get_tool failed for %s", item.get("id"))
                 return None
         return item
 
@@ -215,13 +233,13 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
         }
         tool.dry_run_status = "failed"
         tool.dry_run_evidence = evidence
-        # NEVER set tool.enabled = False here.  Operators recover
+        # v0.6.8-c: NEVER set tool.enabled = False here.  Operators recover
         # via the dashboard recovery panel.
         try:
             vault.save_tool(tool)
         except Exception:
             logger.debug(
-                "[Job] save_tool failed for %s", getattr(tool, "id", "?"),
+                "[Job] v0.6.8-c: save_tool failed for %s", getattr(tool, "id", "?"),
                 exc_info=True,
             )
         try:
@@ -229,7 +247,7 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
         except Exception:
             link = "/recover/tool/<id>"
         logger.warning(
-            "[Job] tool %s dry-run failed (%s) — left ENABLED; recover at %s",
+            "[Job] v0.6.8-c: tool %s dry-run failed (%s) — left ENABLED; recover at %s",
             getattr(tool, "name", "?"), classified.kind, link,
         )
 
@@ -243,7 +261,7 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
             vault.save_tool(tool)
         except Exception:
             logger.debug(
-                "[Job] save_tool failed for %s", getattr(tool, "id", "?"),
+                "[Job] v0.6.8-c: save_tool failed for %s", getattr(tool, "id", "?"),
                 exc_info=True,
             )
 
@@ -252,21 +270,21 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
         if tool is None:
             return
         try:
-            # hotfix: dry_run_tool's signature is (tool, *, vault, config).
+            # v0.6.5-i hotfix: dry_run_tool's signature is (tool, *, vault, config).
             result = _dr.dry_run_tool(tool, vault=vault, config=config)
         except Exception as exc:
-            # an UNCAUGHT exception from the dry-run pipeline (e.g.
+            # v0.6.8-c: an UNCAUGHT exception from the dry-run pipeline (e.g.
             # a downstream ImportError on a missing dep) is still a failure
             # signal — record it but keep the tool enabled.
             error_text = f"{type(exc).__name__}: {exc}"
             logger.warning(
-                "[Job] dry-run for %s raised %s — recording as failed (tool stays enabled)",
+                "[Job] v0.6.8-c: dry-run for %s raised %s — recording as failed (tool stays enabled)",
                 getattr(tool, "name", "?"), error_text,
             )
             _record_failure(tool, error_text)
             return
 
-        # tolerate fake/stub returns (None, plain dict, etc.) — only
+        # v0.6.8-c: tolerate fake/stub returns (None, plain dict, etc.) — only
         # treat an explicit success=False as a failure.  If the stub returns
         # None we assume success (used by tests).
         if result is None:
@@ -290,7 +308,7 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
         _record_failure(tool, error_text)
         if is_dep_pending:
             logger.info(
-                "[Job] tool %s dry-run pending dep approval — "
+                "[Job] v0.6.5-i: tool %s dry-run pending dep approval — "
                 "leaving enabled (operator must approve deps via /tools)",
                 getattr(tool, "name", "?"),
             )
@@ -300,9 +318,9 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
 
 
 def dry_run_one_tool(tool_id: str) -> None:
-    """Re-run dry-run for ONE tool (used after a dep is approved).
+    """v0.6.8-e: Re-run dry-run for ONE tool (used after a dep is approved).
 
-    lazy-init vault + config from env when called outside the
+    v0.6.9: lazy-init vault + config from env when called outside the
     daemon (CLI, dashboard, tests). Silent no-op if neither init_jobs()
     has run nor SYSTEMU_DATABASE_URL is set.
     """
@@ -367,7 +385,7 @@ def dry_run_one_tool(tool_id: str) -> None:
 
 
 def _emit_dry_run_fail_card(tool, error) -> None:
-    """surface a 'tool dry-run failed' operator card via the
+    """v0.6.5-f: surface a 'tool dry-run failed' operator card via the
     existing v0.3.6 supervisor-flash bus."""
     try:
         from datetime import datetime as _dt, timezone as _tz
@@ -389,7 +407,7 @@ def _emit_dry_run_fail_card(tool, error) -> None:
             },
         })
     except Exception:
-        logger.debug("[Job] could not emit dry-run-fail card", exc_info=True)
+        logger.debug("[Job] v0.6.5-f: could not emit dry-run-fail card", exc_info=True)
 
 
 def _resubmit_unexecuted_assigned(vault) -> None:
@@ -449,7 +467,7 @@ def _resubmit_unexecuted_assigned(vault) -> None:
 
 
 def _backfill_tool_headers_v061(vault) -> None:
-    """re-save every tool to rewrite its index header with the new
+    """v0.6.1-d: re-save every tool to rewrite its index header with the new
     schema-summary fields (parameters_schema_summary + return_schema_summary).
 
     Idempotent — running on a vault that already has the new headers is a
@@ -477,7 +495,7 @@ def _backfill_tool_headers_v061(vault) -> None:
                 )
         if count:
             logger.info(
-                "[Job] backfilled %d tool header(s) with schema summaries",
+                "[Job] v0.6.1-d: backfilled %d tool header(s) with schema summaries",
                 count,
             )
     except Exception:
@@ -874,7 +892,7 @@ def _graduate_memory_to_skills(shadow, memory_md: str, vault) -> None:
                 f"  {lesson}\n\n"
                 f"Promote this to a reusable Skill?"
             ),
-            # safe-default first (auto-reject in non-interactive mode)
+            # v0.6.1-b: safe-default first (auto-reject in non-interactive mode)
             actions=["Reject", "Approve"],
             context={
                 "notification_type": "memory_graduation",

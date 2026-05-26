@@ -1,4 +1,4 @@
-"""— startup dry-run sweep auto-disables broken tools."""
+"""v0.6.5-f — startup dry-run sweep auto-disables broken tools."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -11,7 +11,7 @@ def test_sweep_skips_passed_tools():
     vault.load_index.return_value = [
         {"id": "t1", "enabled": True, "dry_run_status": "passed"},
         {"id": "t2", "enabled": True, "dry_run_status": "failed"},
-        {"id": "t3", "enabled": False, "dry_run_status": "not_run"},  # disabled
+        {"id": "t3", "enabled": False, "dry_run_status": "not_run", "status": "deployed"},  # already-deployed; excluded by status filter
     ]
 
     with patch("systemu.pipelines.tool_dry_run.dry_run_tool") as mock_run:
@@ -20,13 +20,13 @@ def test_sweep_skips_passed_tools():
 
 
 def test_sweep_runs_pending_and_marks_failure_non_destructively():
-    """contract: dry-run failures NO LONGER disable the tool.
+    """v0.6.8-c contract: dry-run failures NO LONGER disable the tool.
     Instead the sweep sets dry_run_status='failed' and populates
     dry_run_evidence so the recovery panel can surface a fix path."""
     from systemu.scheduler.jobs import dry_run_all_pending_tools
 
     vault = MagicMock()
-    # force the load_index fallback path. MagicMock would otherwise
+    # v0.6.8-c: force the load_index fallback path. MagicMock would otherwise
     # auto-return an empty iterable from find_tools_pending_dry_run().
     vault.find_tools_pending_dry_run = None
     vault.load_index.return_value = [
@@ -55,7 +55,7 @@ def test_sweep_runs_pending_and_marks_failure_non_destructively():
     saves = [c.args[0] for c in vault.save_tool.call_args_list]
     bad = next((t for t in saves if t.id == "t_bad"), None)
     assert bad is not None, "t_bad should still be saved (status update)"
-    # tool stays enabled; failure is recorded as evidence
+    # v0.6.8-c: tool stays enabled; failure is recorded as evidence
     assert bad.enabled is True
     assert bad.dry_run_status == "failed"
 
@@ -96,8 +96,8 @@ def test_sweep_handles_get_tool_exception_gracefully():
 
 
 def test_sweep_does_not_disable_on_pending_dependency(monkeypatch):
-    """hotfix kept the tool enabled when deps were pending.
-    generalises: the tool stays enabled for ANY failure, and the
+    """v0.6.5-i hotfix kept the tool enabled when deps were pending.
+    v0.6.8-c generalises: the tool stays enabled for ANY failure, and the
     sweep now records dry_run_status='failed' via save_tool (so the dashboard
     recovery panel can surface a fix path)."""
     from systemu.scheduler.jobs import dry_run_all_pending_tools
@@ -123,7 +123,7 @@ def test_sweep_does_not_disable_on_pending_dependency(monkeypatch):
                side_effect=fake_dry_run):
         dry_run_all_pending_tools(vault, MagicMock(), max_concurrent=1)
 
-    # tool stays enabled (the killer assertion)
+    # v0.6.8-c: tool stays enabled (the killer assertion)
     assert fake_tool.enabled is True
     # save_tool IS now called to persist the dry_run_evidence
     saves = [c.args[0] for c in vault.save_tool.call_args_list]
