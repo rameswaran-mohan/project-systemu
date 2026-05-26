@@ -375,6 +375,10 @@ def forge_tool(
         ),
         # v0.6.1-b: safe-default first (auto-skip in non-interactive mode)
         actions=["Skip", "Forge"],
+        # v0.8.0 Pattern 1: dedup_key routes the decision to the dashboard
+        # /insights → Pending Actions queue when SYSTEMU_DECISION_QUEUE=true.
+        # PendingOperatorDecision propagates up to the CLI wrapper (Task 9).
+        dedup_key=f"tool_forge:{tool.id}",
     )
 
     if choice.lower() != "forge":

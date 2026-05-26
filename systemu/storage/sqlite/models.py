@@ -50,7 +50,7 @@ class ScrollRow(Base):
     raw_instructions_path: Mapped[str]      = mapped_column(Text, default="")
     narrative_md:          Mapped[str]      = mapped_column(Text, default="")
     intent:                Mapped[str]      = mapped_column(Text, default="")
-    # concrete "what success looks like" description.  Nullable for
+    # v0.6.0-c: concrete "what success looks like" description.  Nullable for
     # legacy rows so the migration is safe.
     expected_outcome:      Mapped[str]      = mapped_column(Text, default="", nullable=True)
     objectives:            Mapped[list]     = mapped_column(JSON, default=list)
@@ -61,7 +61,7 @@ class ScrollRow(Base):
     status:                Mapped[str]      = mapped_column(String, default="draft")
     version:               Mapped[int]      = mapped_column(Integer, default=1)
     tags:                  Mapped[list]     = mapped_column(JSON, default=list)
-    # per-stage pipeline observability events.  Nullable for
+    # v0.6.5-a: per-stage pipeline observability events.  Nullable for
     # legacy rows so the migration is safe.
     pipeline_trace:        Mapped[list]     = mapped_column(JSON, default=list, nullable=True)
     created_at:            Mapped[datetime] = mapped_column(DateTime, default=func.now())
@@ -85,7 +85,7 @@ class ToolRow(Base):
     forged_by_systemu:    Mapped[bool]     = mapped_column(Boolean, default=False)
     enabled:              Mapped[bool]     = mapped_column(Boolean, default=False)
     version:              Mapped[int]      = mapped_column(Integer, default=1)
-    # / -b: dry-run gate + observed-success replay + evolution audit.
+    # v0.5.0-a / -b: dry-run gate + observed-success replay + evolution audit.
     # Nullable so existing rows (pre-migration) read as defaults.
     dry_run_status:        Mapped[str]      = mapped_column(String, default="not_run", nullable=True)
     dry_run_evidence:      Mapped[dict]     = mapped_column(JSON, default=dict, nullable=True)
@@ -131,7 +131,7 @@ class ActivityRow(Base):
     missing_tools:      Mapped[list]     = mapped_column(JSON, default=list)
     assigned_shadow_id: Mapped[str|None] = mapped_column(String, nullable=True)
     status:             Mapped[str]      = mapped_column(String, default="unassigned")
-    # frozen intent at extraction time so Stage 5 (shadow tiebreak)
+    # v0.6.0-f: frozen intent at extraction time so Stage 5 (shadow tiebreak)
     # can match on intent without re-loading the scroll on every decision.
     intent_snapshot:    Mapped[str]      = mapped_column(Text, default="", nullable=True)
     created_at:         Mapped[datetime] = mapped_column(DateTime, default=func.now())
@@ -164,10 +164,10 @@ class ShadowRow(Base):
     # the filesystem path so both access patterns work.
     memory_md_path:        Mapped[str]      = mapped_column(Text, default="")
     memory_buffer_path:    Mapped[str]      = mapped_column(Text, default="")
-    # per-shadow opt-in for the Intelligent Supervisor.  Nullable so
+    # v0.4.1: per-shadow opt-in for the Intelligent Supervisor.  Nullable so
     # existing rows (pre-migration) read as False without an UPDATE.
     supervisor_enabled:    Mapped[bool]     = mapped_column(Boolean, default=False, nullable=True)
-    # operator-labelled specialty for routing preference.
+    # v0.4.3-b: operator-labelled specialty for routing preference.
     specialty:             Mapped[str]      = mapped_column(Text, default="", nullable=True)
     created_at:            Mapped[datetime] = mapped_column(DateTime, default=func.now())
     updated_at:            Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
@@ -337,7 +337,7 @@ class SupervisorQueueRow(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  — Operator Recovery Path: tool-dependency approvals
+#  v0.6.8 — Operator Recovery Path: tool-dependency approvals
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ToolDepApproval(Base):
@@ -358,3 +358,23 @@ class ToolDepApproval(Base):
     approved_at:          Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     source:               Mapped[str]      = mapped_column(String, nullable=False, default="dashboard")
     baked_in_image:       Mapped[bool]     = mapped_column(Boolean, nullable=False, default=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  v0.8.0 Pattern 1 — OperatorDecisionQueue backing store
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DecisionRow(Base):
+    """v0.8.0 Pattern 1: persisted OperatorDecision rows."""
+    __tablename__ = "operator_decisions"
+
+    id:          Mapped[str]             = mapped_column(String, primary_key=True)
+    title:       Mapped[str]             = mapped_column(String, nullable=False, default="")
+    body:        Mapped[str]             = mapped_column(Text,   nullable=False, default="")
+    options:     Mapped[list]            = mapped_column(JSON,   nullable=False, default=list)
+    context:     Mapped[dict]            = mapped_column(JSON,   nullable=False, default=dict)
+    dedup_key:   Mapped[str]             = mapped_column(String, nullable=False, default="", index=True)
+    status:      Mapped[str]             = mapped_column(String, nullable=False, default="pending", index=True)
+    choice:      Mapped[str | None]      = mapped_column(String, nullable=True)
+    created_at:  Mapped[datetime]        = mapped_column(DateTime, nullable=False, default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

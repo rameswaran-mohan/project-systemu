@@ -1129,16 +1129,18 @@ try:
         daemon_group,
         chat_group,
         debug_group,
+        decisions_group,
     )
-    cli.add_command(scrolls_group,  name="scrolls")
-    cli.add_command(army_group,     name="army")
-    cli.add_command(tools_group,    name="tools")
-    cli.add_command(skills_group,   name="skills")
-    cli.add_command(settings_cmd,   name="settings")
-    cli.add_command(evolve_group,   name="evolve")
-    cli.add_command(daemon_group,   name="daemon")
-    cli.add_command(chat_group,     name="chat")
-    cli.add_command(debug_group,    name="debug")
+    cli.add_command(scrolls_group,   name="scrolls")
+    cli.add_command(army_group,      name="army")
+    cli.add_command(tools_group,     name="tools")
+    cli.add_command(skills_group,    name="skills")
+    cli.add_command(settings_cmd,    name="settings")
+    cli.add_command(evolve_group,    name="evolve")
+    cli.add_command(daemon_group,    name="daemon")
+    cli.add_command(chat_group,      name="chat")
+    cli.add_command(debug_group,     name="debug")
+    cli.add_command(decisions_group, name="decisions")
 except ImportError:
     # systemu package not yet installed — sharing_on still works standalone
     pass

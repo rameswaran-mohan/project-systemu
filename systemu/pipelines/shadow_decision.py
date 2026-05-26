@@ -283,7 +283,7 @@ def _llm_shadow_decision(
         if s.get("name") != "Wild Card"
     ]
 
-    # enrich the payload with the scroll's intent + expected_outcome
+    # v0.6.0-f: enrich the payload with the scroll's intent + expected_outcome
     # so the LLM tiebreak can score semantic match between the activity's
     # intent and each shadow's specialty/memory — not just ID overlap.  Pulls
     # from Activity.intent_snapshot (frozen at extraction time in Stage 3)
@@ -450,9 +450,13 @@ def _prompt_create_new(
             f"Suggested name: {name_hint}\n\n"
             f"Reasoning: {reasoning_preview}"
         ),
-        # safe-default first (auto-skip in non-interactive mode)
+        # v0.6.1-b: safe-default first (auto-skip in non-interactive mode)
         actions=["Skip", "Assign to Existing", "Awaken"],
         prompt_for_name=True,
+        # v0.8.0 Pattern 1: dedup_key routes the decision to the dashboard
+        # /insights → Pending Actions queue when SYSTEMU_DECISION_QUEUE=true.
+        # PendingOperatorDecision propagates up to the CLI wrapper.
+        dedup_key=f"shadow_decision:{activity.id}",
     )
 
     if choice.lower().startswith("awaken"):
