@@ -194,3 +194,21 @@ class FileVault:
 
     def list_pending_notifications(self) -> List[Dict[str, Any]]:
         return self._v.list_pending_notifications()
+
+    # ── Decisions (v0.8.0 Pattern 1 — OperatorDecisionQueue backing) ─────────
+    #
+    # These methods were added to the inner Vault class in v0.8.0 (commit
+    # 78bce27) but the FileVault adapter wrapper was not updated to proxy
+    # them.  Result: the dashboard's `/insights → Pending Actions` tab (which
+    # consumes `AppState.vault`, which is a FileVault in `SYSTEMU_STORAGE=file`
+    # mode) could not read or write OperatorDecision records — every dashboard
+    # render of the queue showed the empty-state message even when CLI
+    # `sharing_on decisions list` clearly showed pending records.  The CLI
+    # path uses the raw Vault directly (`open_vault(config)`) and so was
+    # unaffected.  See v0.8.0.1 UAT report for the live trace.
+
+    def save_decision(self, decision) -> None:
+        return self._v.save_decision(decision)
+
+    def get_decision(self, decision_id: str):
+        return self._v.get_decision(decision_id)
