@@ -131,6 +131,11 @@ def start_daemon(
         project_root = Path(systemu.__file__).parent.parent.absolute()
     env = os.environ.copy()
     env["PYTHONPATH"] = str(project_root)
+    # v0.8.0.3: propagate the resolved project root into the daemon's
+    # environment so AppState._resolve_project_root() picks it up via Tier 1
+    # instead of recomputing (broken on pip installs) or walking the vault.
+    # setdefault so an operator override on the parent shell still wins.
+    env.setdefault("SYSTEMU_PROJECT_ROOT", str(project_root))
 
     proc = subprocess.Popen(
         cmd,
@@ -257,7 +262,40 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         logger.warning(
             "[Daemon] AppState pre-creation failed (%s) — using file vault for scheduler", exc
         )
+        state = None
         # vault remains the raw Vault(args.vault_dir) passed in — degraded mode
+
+    # v0.8.0.3: startup banner — make misconfiguration visible immediately
+    # instead of letting users hit silent failures hours later (recordings
+    # going to wrong dir, refine not dispatching, etc).
+    try:
+        _raw_vault = getattr(vault, "_v", vault)
+        _vault_root_abs = getattr(_raw_vault, "root", None) \
+                          or getattr(_raw_vault, "vault_root", None) \
+                          or "(unknown)"
+        _proj_root = state.project_root if state else "(state init failed)"
+        _key_status = "set" if os.environ.get("OPENROUTER_API_KEY", "").strip() else "MISSING"
+        _mode = (os.environ.get("SYSTEMU_MODE") or getattr(config, "systemu_mode", None) or "local")
+        _storage = (os.environ.get("SYSTEMU_STORAGE") or getattr(config, "storage_backend", None) or "file")
+        _banner_lines = [
+            "=" * 70,
+            "Systemu daemon configured:",
+            f"  Project root:       {_proj_root}",
+            f"  Vault:              {_vault_root_abs}",
+            f"  OPENROUTER_API_KEY: {_key_status}",
+            f"  Storage backend:    {_storage}",
+            f"  Mode:               {_mode}",
+            f"  Listening on:       http://127.0.0.1:{port}",
+            "=" * 70,
+        ]
+        for line in _banner_lines:
+            logger.info("[Daemon] %s", line)
+        # Also print to stdout for foreground daemons so operators see it
+        # without tail-ing the log file.
+        for line in _banner_lines:
+            print(line, flush=True)
+    except Exception:
+        logger.exception("[Daemon] startup banner emit failed (non-fatal)")
 
     # v0.7.4 Pattern 4: warn loudly if vault is empty on startup. The wheel
     # ships a starter catalog in systemu/vault/* but the daemon reads CWD —

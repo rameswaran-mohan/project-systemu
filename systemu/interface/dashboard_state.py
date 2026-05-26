@@ -34,6 +34,60 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Project root resolution (v0.8.0.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_project_root(vault, config) -> str:
+    """Find the directory the operator is working from.
+
+    Project root = where the operator expects captures/, scrolls, .env, and
+    vault data to live.  Used as the cwd for dashboard-spawned subprocesses
+    (`sharing_on record`, `scrolls refine`, etc.) and as the search root for
+    the post-stop refine job's "find the latest capture session" logic.
+
+    Tiered lookup so every install + deploy mode works without operator
+    intervention:
+
+      Tier 1  Explicit ``SYSTEMU_PROJECT_ROOT`` env var.  Set automatically by
+              ``sharing_on daemon start`` (captures the operator's CWD), and by
+              the bundled ``docker-compose.yml`` (``/data`` inside container).
+              Always wins when set.
+
+      Tier 2  Walk up from the vault's absolute root path looking for ``.env``.
+              Handles pip-install + git-clone-editable in local mode without
+              any explicit configuration.
+
+      Tier 3  Vault root's parent.  Fallback when no ``.env`` exists anywhere
+              up the tree (test environments, docker without the env var).
+
+      Tier 4  ``config.vault_dir``'s parent.  Last-ditch when the vault object
+              doesn't expose a ``.root`` attribute.
+
+    Before v0.8.0.3 this was ``Path(systemu.__file__).parent.parent`` which
+    silently resolved to ``site-packages/`` on every pip install, breaking
+    the dashboard's record/stop/refine handoff because the captures dir was
+    looked up at the wrong absolute path.
+    """
+    import os
+    explicit = os.environ.get("SYSTEMU_PROJECT_ROOT", "").strip()
+    if explicit and Path(explicit).is_dir():
+        return str(Path(explicit).resolve())
+
+    raw = getattr(vault, "_v", vault)
+    vault_root = getattr(raw, "root", None) or getattr(raw, "vault_root", None)
+    if vault_root:
+        here = Path(vault_root).resolve()
+        for candidate in [here, *here.parents]:
+            if (candidate / ".env").exists():
+                return str(candidate)
+            if candidate == candidate.parent:
+                break
+        return str(here.parent)
+
+    return str(Path(config.vault_dir).resolve().parent)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Global app state
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -63,11 +117,7 @@ class AppState:
         self.approvals = approvals    # IApprovalGate — log_event / notify_user / confirm
 
         # Resolve project root once — absolute, survives cwd changes in subprocess
-        try:
-            import systemu as _systemu_pkg
-            self._project_root = str(Path(_systemu_pkg.__file__).parent.parent.absolute())
-        except Exception:
-            self._project_root = str(Path(config.vault_dir).parent.absolute())
+        self._project_root = _resolve_project_root(vault, config)
 
         AppState._instance = self
 
@@ -242,7 +292,7 @@ class AppState:
             or os.environ.get("REDIS_URL")
         )
 
-        # the Redis URL is only required when the Huey queue
+        # v0.6.6-c: the Redis URL is only required when the Huey queue
         # broker is Redis (i.e. docker-enterprise).  docker-local uses
         # Huey-SQLite + Postgres with no Redis container — the original
         # check rejected that combo and silently fell back to FileVault
