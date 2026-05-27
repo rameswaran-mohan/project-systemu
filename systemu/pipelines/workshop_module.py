@@ -69,16 +69,47 @@ async def rebuild_scroll(scroll_id: str, prompt: str, config: Config, vault: Vau
     from datetime import datetime
     updated_scroll.updated_at = utcnow()
     
-    # 5. Save back into the Vault with status reset to PENDING_APPROVAL.
+    # 5. Save back into the Vault.
     # The content has changed — downstream artifacts (skills, tools, shadow)
     # were extracted from the previous version and must be re-derived.
     prior_status          = scroll.status
     had_linked_activity   = bool(scroll.activity_id)
-    updated_scroll.status = ScrollStatus.PENDING_APPROVAL
+
+    # v0.8.4: run the validator + propose-bridge on the rebuilt content
+    # BEFORE deciding the new status.  If the rebuilt scroll still has tool
+    # gaps, this proposes Tool records (status=PROPOSED) and posts a
+    # decision card to /insights → Pending Actions — same surface as the
+    # CLI refine path.  If validator passes, scroll proceeds to
+    # PENDING_APPROVAL as before.
+    #
+    # Pre-v0.8.4: Workshop skipped the validator entirely and set
+    # PENDING_APPROVAL unconditionally → the v0.8.1 propose-bridge never
+    # fired for operators who used Workshop to edit blocked scrolls.
+    new_status = ScrollStatus.PENDING_APPROVAL
+    try:
+        from systemu.pipelines.scroll_validator import is_enabled
+        if is_enabled(config):
+            from systemu.pipelines.scroll_refiner import validate_and_propose_tools
+            v_result = validate_and_propose_tools(updated_scroll, config=config, vault=vault)
+            if not v_result.satisfiable:
+                from systemu.core.models import ScrollStatus as _SS
+                new_status = _SS.VALIDATOR_BLOCKED
+                logger.warning(
+                    "[Workshop] Rebuilt scroll '%s' still blocked by validator — "
+                    "status=VALIDATOR_BLOCKED.  Check /tools for proposed tools "
+                    "and /insights → Pending Actions for the decision card.",
+                    updated_scroll.name,
+                )
+    except Exception:
+        # Fail-open: never let a validator error block the rebuild from
+        # being saved.  Falls through to PENDING_APPROVAL.
+        logger.exception("[Workshop] validator failed during rebuild; defaulting to PENDING_APPROVAL")
+
+    updated_scroll.status = new_status
     vault.save_scroll(updated_scroll)
     logger.info(
-        "[Workshop] Saved rebuilt scroll %s (prior status: %s → PENDING_APPROVAL)",
-        scroll.id, prior_status,
+        "[Workshop] Saved rebuilt scroll %s (prior status: %s → %s)",
+        scroll.id, prior_status, new_status.value,
     )
 
     # 6. Dismiss any stale scroll_approval notification for this scroll so the
@@ -109,7 +140,7 @@ async def rebuild_scroll(scroll_id: str, prompt: str, config: Config, vault: Vau
             f"Review the updated content and approve to re-run skill/tool extraction."
             + supersede_note
         ),
-        # safe-default first (auto-reject in non-interactive mode)
+        # v0.6.1-b: safe-default first (auto-reject in non-interactive mode)
         actions=["Reject", "Approve"],
         context={
             "notification_type": "scroll_approval",

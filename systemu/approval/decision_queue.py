@@ -212,7 +212,19 @@ class OperatorDecisionQueue:
                 continue
             try:
                 decision = self._vault.get_decision(h["id"])
-            except Exception:
+            except Exception as exc:
+                # v0.8.4: was silent `continue` — masked vault corruption
+                # (e.g. index header without a matching body file from the
+                # v0.8.2 init-seed-copy bug class).  Operator would be
+                # re-prompted for an already-resolved decision and their
+                # original click would be lost.  Surface it as WARNING so
+                # the issue is visible in daemon logs.
+                logger.warning(
+                    "[DecisionQueue] resolved header %r (dedup_key=%r) has no "
+                    "loadable body — vault may be corrupt.  Operator will be "
+                    "re-prompted.  Error: %r",
+                    h.get("id"), dedup_key, exc,
+                )
                 continue
             return decision.choice
         return None
