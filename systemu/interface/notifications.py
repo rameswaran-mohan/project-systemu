@@ -269,17 +269,34 @@ def notify_user(
         return only
 
     # ── v0.8.0 Pattern 1: queue-mode branch ──────────────────────────────────
-    # When SYSTEMU_DECISION_QUEUE=true AND stdin is not a TTY, route this
-    # decision through the OperatorDecisionQueue: persisted in the vault,
-    # surfaced on the dashboard /insights page, resolved by an operator
-    # click.  The caller is expected to catch PendingOperatorDecision and
-    # exit cleanly with a "waiting for operator" message.
+    # When SYSTEMU_DECISION_QUEUE=true is set, route operator decisions
+    # through the OperatorDecisionQueue: persisted in the vault, surfaced on
+    # the dashboard /insights page, resolved by an operator click.  The caller
+    # is expected to catch PendingOperatorDecision and exit cleanly with a
+    # "waiting for operator" message.
+    #
+    # v0.8.3: removed the `not isatty()` co-condition.  Background daemons
+    # spawned from interactive shells (PowerShell, bash, etc.) inherit the
+    # parent's TTY stdin handle, so isatty() returns True even in a process
+    # that has no actual interactive operator.  The legacy headless detection
+    # below uses a broader OR-of-signals predicate (cp1252 encoding, TTY
+    # absent, non_interactive flag, HEADLESS env) so it triggered even when
+    # queue-mode didn't — net effect: every shadow_decision prompt in a
+    # PowerShell-spawned daemon silently auto-selected actions[0] instead of
+    # routing to the dashboard, even with SYSTEMU_DECISION_QUEUE=true
+    # explicitly set.
+    #
+    # The fix: an explicit operator opt-in (SYSTEMU_DECISION_QUEUE=true) ALWAYS
+    # routes through the queue, regardless of TTY status.  The queue + dedup
+    # availability already gate it appropriately for legitimate use cases.
+    # Interactive TTY operators who don't want queue routing should simply not
+    # set the env var.
     import sys as _sys
     import os as _os
     _decision_queue_enabled = (
         (_os.environ.get("SYSTEMU_DECISION_QUEUE") or "").lower() == "true"
     )
-    if _decision_queue_enabled and not _sys.stdin.isatty():
+    if _decision_queue_enabled:
         queue = _get_decision_queue()
         if queue is not None and dedup_key:
             resolved = queue.get_resolved_choice(dedup_key)
