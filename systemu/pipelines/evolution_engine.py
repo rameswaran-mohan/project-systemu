@@ -83,7 +83,10 @@ def run_evolution_check(config: Config, vault: Vault) -> List[Evolution]:
         try:
             evolution = _store_proposal(prop, vault)
             saved.append(evolution)
-            _notify_evolution(evolution, vault)
+            # v0.8.4: pass config so _notify_evolution can auto-call
+            # apply_evolution on operator approval (apply needs config for
+            # LLM-driven shadow upgrades).
+            _notify_evolution(evolution, config, vault)
         except Exception as exc:
             logger.warning("[Evolution] Failed to process proposal: %s — %s", prop, exc)
 
@@ -188,7 +191,7 @@ def _store_proposal(prop: Dict[str, Any], vault: Vault) -> Evolution:
     return evolution
 
 
-def _notify_evolution(evolution: Evolution, vault: Vault) -> None:
+def _notify_evolution(evolution: Evolution, config: Config, vault: Vault) -> None:
     """Notify user about a new evolution proposal and handle approval."""
     priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
         getattr(evolution, "priority", "medium"), "🟡"
@@ -211,8 +214,30 @@ def _notify_evolution(evolution: Evolution, vault: Vault) -> None:
         evolution.resolved_at = utcnow()
         vault.save_evolution(evolution)
         logger.info("[Evolution] Approved: %s", evolution.id)
-        # Note: actual application (merging, upgrading entities) is Phase S3+
-        # For now, mark as approved so it's tracked.
+
+        # v0.8.4: auto-apply immediately so APPROVED isn't a dead-end state.
+        # Previously the operator clicked Approve, status went to APPROVED,
+        # and nothing else happened — apply_evolution() existed but was only
+        # reachable via `sharing_on evolve apply <id>` CLI, with no
+        # scheduler job invoking it.  Now Approve → APPLIED in one step.
+        # Failure is logged but doesn't roll back the APPROVED status —
+        # operator can manually retry via the CLI if needed.
+        try:
+            applied = apply_evolution(evolution.id, config, vault)
+            if applied:
+                logger.info("[Evolution] Auto-applied: %s", evolution.id)
+            else:
+                logger.warning(
+                    "[Evolution] Auto-apply returned False for %s — operator "
+                    "can retry via `sharing_on evolve apply %s`",
+                    evolution.id, evolution.id,
+                )
+        except Exception:
+            logger.exception(
+                "[Evolution] Auto-apply raised for %s — operator can retry "
+                "via `sharing_on evolve apply %s`",
+                evolution.id, evolution.id,
+            )
     else:
         evolution.status = EvolutionStatus.REJECTED
         evolution.resolved_at = utcnow()
@@ -255,7 +280,7 @@ def apply_evolution(evolution_id: str, config: Config, vault: Vault) -> bool:
 def _apply_shadow_upgrade(evolution: Evolution, config: Config, vault: Vault) -> bool:
     """Re-generate a Shadow's identity_block incorporating the evolution's description.
 
-    identity split: the upgrade touches **only** the operator-controlled
+    v0.3 identity split: the upgrade touches **only** the operator-controlled
     ``identity_block`` half of the Shadow's identity tier.  The
     consolidator-grown ``accumulated_voice`` is intentionally NOT proposed
     by the Evolution Engine — that field is the runtime's observation of
@@ -304,7 +329,7 @@ def _apply_shadow_upgrade(evolution: Evolution, config: Config, vault: Vault) ->
                 "description": evolution.description,
                 "applied_at": utcnow().isoformat(),
             })
-            # identity split: shadow.system_prompt is a computed
+            # v0.3 identity split: shadow.system_prompt is a computed
             # property composed from identity_block + accumulated_voice.
             # Shadow upgrades touch the operator-controlled half — write
             # to identity_block.  accumulated_voice is owned by the
