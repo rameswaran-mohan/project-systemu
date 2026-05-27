@@ -413,41 +413,105 @@ def refine_scroll(
         if is_enabled(config):
             v_result = validate_scroll(scroll, config=config, vault=vault)
 
-            # v0.7.3 Bug #14 fix — auto-forge bridge.
-            # When the validator blocks AND emitted missing_tool_specs AND
-            # auto_forge_tools is enabled, attempt forging those tools and
-            # re-validating before falling through to VALIDATOR_BLOCKED.
-            if not v_result.satisfiable and getattr(config, "auto_forge_tools", False):
+            # v0.8.1 Pattern 3 — validator-to-propose bridge.
+            # When the validator blocks AND emitted missing_tool_specs, we
+            # ALWAYS create Tool records (status=PROPOSED) so they show up on
+            # the dashboard /tools page where the operator can review + click
+            # Forge.  We ALSO post a decision card to the OperatorDecisionQueue
+            # so the operator sees the block on /insights → Pending Actions
+            # without having to navigate to /scrolls first.
+            #
+            # If SYSTEMU_AUTO_FORGE_TOOLS=true is set (dev escape-hatch), the
+            # proposed tools are ALSO immediately code-generated (Step 2) and
+            # the scroll is re-validated — preserves backward-compat with the
+            # v0.7.3 Bug #14 fix for unattended-CI workflows.
+            #
+            # Before v0.8.1 this branch was gated entirely on
+            # ``auto_forge_tools``, which meant the default operator install
+            # silently dropped every missing_tool_spec the validator emitted —
+            # scrolls would stay blocked with no actionable surface in the UI.
+            if not v_result.satisfiable:
                 specs = getattr(v_result, "missing_tool_specs", None) or []
                 if specs:
                     try:
-                        from systemu.pipelines.tool_forge import forge_proposed_tools_from_specs
+                        from systemu.pipelines.tool_forge import (
+                            propose_tools_from_specs,
+                            forge_proposed_tools_from_specs,
+                        )
                         logger.info(
-                            "[Scroll] validator blocked '%s' but emitted %d tool spec(s) — attempting auto-forge bridge",
+                            "[Scroll] validator blocked '%s' with %d missing tool spec(s) — proposing for operator review",
                             scroll.name, len(specs),
                         )
-                        forged = forge_proposed_tools_from_specs(
-                            specs, scroll, config, vault,
-                        )
-                        if forged:
+                        proposed = propose_tools_from_specs(specs, scroll, config, vault)
+
+                        if proposed:
                             scroll.pipeline_trace.append(TraceEvent(
                                 stage="validate", level="info",
-                                message=f"auto-forge bridge: {len(forged)} tool(s) forged from validator specs",
-                                detail={"forged_tools": [t.name for t in forged][:10]},
+                                message=f"validator-propose bridge: {len(proposed)} tool(s) proposed for review",
+                                detail={"proposed_tools": [
+                                    {"id": t.id, "name": t.name, "description": (t.description or "")[:120]}
+                                    for t in proposed
+                                ][:10]},
                             ))
-                            # Re-run validation now that new tools exist
-                            v_result = validate_scroll(scroll, config=config, vault=vault)
-                            if v_result.satisfiable:
-                                logger.info(
-                                    "[Scroll] auto-forge bridge UNBLOCKED scroll '%s' (re-validation passed)",
-                                    scroll.name,
+
+                            # Post one decision card so the operator sees this
+                            # on /insights → Pending Actions.  dedup_key on
+                            # scroll.id so re-runs of refine don't pile up
+                            # duplicate cards.
+                            try:
+                                from systemu.approval.decision_queue import OperatorDecisionQueue
+                                queue = OperatorDecisionQueue(vault)
+                                queue.post(
+                                    title=f"Scroll blocked: forge {len(proposed)} suggested tool(s)?",
+                                    body=(
+                                        f"The pre-flight validator blocked scroll "
+                                        f"'{scroll.name}' because it lacks tools to "
+                                        f"satisfy its objectives.  It proposed "
+                                        f"{len(proposed)} tool(s) you can forge to "
+                                        f"unblock it:\n\n"
+                                        + "\n".join(f"  • {t.name} — {(t.description or '')[:80]}"
+                                                    for t in proposed[:10])
+                                        + "\n\nReview the spec on /tools then click "
+                                        + "Forge per tool, or click Forge All here to "
+                                        + "forge them in one batch."
+                                    ),
+                                    options=["Skip", "Forge All"],
+                                    context={
+                                        "scroll_id":      scroll.id,
+                                        "scroll_name":    scroll.name,
+                                        "proposed_tool_ids":   [t.id for t in proposed],
+                                        "proposed_tool_names": [t.name for t in proposed],
+                                    },
+                                    dedup_key=f"validator_propose:{scroll.id}",
                                 )
-                            else:
-                                logger.info(
-                                    "[Scroll] re-validation still blocked after forge — proceeding to VALIDATOR_BLOCKED",
-                                )
+                            except Exception:
+                                logger.debug("[Scroll] could not post validator-propose decision", exc_info=True)
+
+                        # Dev escape-hatch: if auto_forge_tools=true, also
+                        # code-generate the proposed tools in-place and try
+                        # re-validation.  Preserves v0.7.3 Bug #14 behavior.
+                        if getattr(config, "auto_forge_tools", False) and proposed:
+                            forged = forge_proposed_tools_from_specs(
+                                specs, scroll, config, vault,
+                            )
+                            if forged:
+                                scroll.pipeline_trace.append(TraceEvent(
+                                    stage="validate", level="info",
+                                    message=f"auto-forge bridge: {len(forged)} tool(s) forged from validator specs",
+                                    detail={"forged_tools": [t.name for t in forged][:10]},
+                                ))
+                                v_result = validate_scroll(scroll, config=config, vault=vault)
+                                if v_result.satisfiable:
+                                    logger.info(
+                                        "[Scroll] auto-forge bridge UNBLOCKED scroll '%s' (re-validation passed)",
+                                        scroll.name,
+                                    )
+                                else:
+                                    logger.info(
+                                        "[Scroll] re-validation still blocked after forge — proceeding to VALIDATOR_BLOCKED",
+                                    )
                     except Exception:
-                        logger.exception("[Scroll] auto-forge bridge failed; treating as block")
+                        logger.exception("[Scroll] validator-propose bridge failed; treating as block")
 
             if not v_result.satisfiable:
                 logger.warning(
@@ -467,6 +531,14 @@ def refine_scroll(
                             v_result.proposed_revision.__dict__
                             if v_result.proposed_revision else None
                         ),
+                        # v0.8.1: persist what the validator suggested as
+                        # missing tools so the scroll history records the
+                        # operator-reviewable surface (also visible via
+                        # `sharing_on scrolls show <id>`).
+                        "missing_tool_specs": [
+                            s.__dict__ if hasattr(s, "__dict__") else dict(s)
+                            for s in (getattr(v_result, "missing_tool_specs", None) or [])
+                        ][:10],
                     },
                 ))
                 vault.save_scroll(scroll)

@@ -570,29 +570,29 @@ def _spec_and_forge_new(
     return forge_tool(tool, stub_scroll, config, vault)
 
 
-def forge_proposed_tools_from_specs(
+def propose_tools_from_specs(
     specs: list,                # list[ProposedToolSpec] from validator
     scroll,                     # the Scroll being refined
     config: Config,
     vault: Vault,
 ) -> list:
-    """Forge tools from validator-emitted ProposedToolSpec records.
+    """Create Tool records (status=PROPOSED) from validator-emitted specs.
 
-    v0.7.3 Bug #14 fix — used by scroll_refiner's auto-forge bridge to attempt
-    creating missing tools before validator-blocking the scroll.
+    Does NOT generate implementation code — that's the second step (handled by
+    ``forge_proposed_tools_from_specs`` or by the operator clicking "Forge" on
+    /tools page).  Each Tool record has a fully-populated spec
+    (parameters_schema, return_schema, implementation_notes) generated via the
+    Tier-2 LLM from the validator's hints, so the operator can review the
+    spec before approving the forge.
 
-    Bypasses the operator-confirmation gate (notify_user in forge_tool) because
-    this path is only reached when SYSTEMU_AUTO_FORGE_TOOLS=true — the operator
-    has already opted into the dev escape hatch. Mirrors how the existing
-    ``forge_proposed_tools`` (called from activity_extractor) calls
-    ``_generate_and_save_code`` directly.
-
-    Returns the list of successfully forged Tool objects (may be empty).
+    v0.8.1 (Pattern 3): replaces the previous "silently drop validator specs
+    unless SYSTEMU_AUTO_FORGE_TOOLS=true" bridge with an operator-reviewable
+    surface.  Returns the list of Tool records created (may be empty if all
+    specs duplicated existing tools or LLM spec generation failed for each).
     """
     if not specs:
         return []
-    forged: list = []
-    # Read existing tool names to skip duplicates
+    proposed: list = []
     existing_names = set()
     try:
         for t in (vault.load_index("tools") or []):
@@ -611,12 +611,11 @@ def forge_proposed_tools_from_specs(
             logger.info("[Forge] skipping spec '%s' — tool already exists", name)
             continue
 
-        # ── Step 1: generate spec via LLM (Tier 2), then save as PROPOSED ──
+        # Generate spec via LLM (Tier 2) and save with status=PROPOSED.
         spec_payload: Dict[str, Any] = {
             "tool_name":          name,
             "scroll_narrative":   (getattr(scroll, "narrative_md", "") or "")[:500],
             "preferred_packages": _approved_packages_hint(),
-            # validator-emitted hints to guide the spec
             "validator_hint":     {
                 "description":     getattr(spec, "description", ""),
                 "tool_type":       getattr(spec, "tool_type", "cli_command"),
@@ -657,16 +656,56 @@ def forge_proposed_tools_from_specs(
         )
         try:
             vault.save_tool(tool)
+            proposed.append(tool)
+            existing_names.add(tool.name)
+            logger.info(
+                "[Forge] PROPOSED tool '%s' (id=%s) from validator spec for scroll '%s'",
+                tool.name, tool.id, getattr(scroll, "name", "?"),
+            )
         except Exception:
             logger.exception("[Forge] could not save proposed tool '%s'", name)
-            continue
 
-        # ── Step 2: generate code (BYPASS the notify_user gate; auto-forge
-        #     mode has already opted into the dev escape hatch) ─────────────
+    return proposed
+
+
+def forge_proposed_tools_from_specs(
+    specs: list,                # list[ProposedToolSpec] from validator
+    scroll,                     # the Scroll being refined
+    config: Config,
+    vault: Vault,
+) -> list:
+    """Forge tools from validator-emitted ProposedToolSpec records.
+
+    v0.7.3 Bug #14 fix — used by scroll_refiner's auto-forge bridge to attempt
+    creating missing tools before validator-blocking the scroll.
+
+    Bypasses the operator-confirmation gate (notify_user in forge_tool) because
+    this path is only reached when SYSTEMU_AUTO_FORGE_TOOLS=true — the operator
+    has already opted into the dev escape hatch. Mirrors how the existing
+    ``forge_proposed_tools`` (called from activity_extractor) calls
+    ``_generate_and_save_code`` directly.
+
+    v0.8.1: now delegates the spec-creation step to ``propose_tools_from_specs``
+    (shared with the v0.8.1 operator-review bridge), then code-generates the
+    proposed tools in-place.
+
+    Returns the list of successfully forged Tool objects (may be empty).
+    """
+    if not specs:
+        return []
+    # Step 1: spec + propose (creates Tool records with status=PROPOSED)
+    proposed = propose_tools_from_specs(specs, scroll, config, vault)
+    if not proposed:
+        return []
+    # Step 2: code-generate each PROPOSED tool from Step 1 (BYPASS the
+    # notify_user gate; auto-forge mode has already opted into the dev
+    # escape hatch)
+    forged: list = []
+    for tool in proposed:
         try:
             from systemu.core.models import Scroll as ScrollModel
             stub_scroll = ScrollModel(
-                id="stub", name=name, source_session_id="auto-forge-bridge",
+                id="stub", name=tool.name, source_session_id="auto-forge-bridge",
                 raw_instructions_path="",
                 narrative_md=(getattr(scroll, "narrative_md", "") or "")[:500],
             )
@@ -678,6 +717,6 @@ def forge_proposed_tools_from_specs(
                     result.name, getattr(result, "id", "?"),
                 )
         except Exception:
-            logger.exception("[Forge] code generation failed for proposed tool '%s'", name)
+            logger.exception("[Forge] code generation failed for proposed tool '%s'", tool.name)
 
     return forged
