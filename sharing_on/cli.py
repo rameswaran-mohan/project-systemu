@@ -841,17 +841,39 @@ def init(force: bool, no_seed: bool):
 
         dst_idx.write_text(_json.dumps(merged, indent=2), encoding="utf-8")
 
-        # Copy per-entry JSON files
+        # Copy per-entry JSON files.
+        #
+        # v0.8.2 BUGFIX: Vault.save_tool / save_skill write to
+        # ``{kind}/{kind-singular}_{entry.id}.json`` (e.g.  tool record id
+        # ``tool_abc123`` is saved as ``tools/tool_tool_abc123.json`` — the
+        # ``tool_`` prefix from save_tool plus the id which already starts with
+        # ``tool_``).  The previous version of this loop looked for
+        # ``{entry_id}.json`` (a single prefix) and silently skipped every file
+        # because ``src_file.is_file()`` returned False for all 40 starter
+        # tools.  Operators ended up with an index promising 40 tools and ZERO
+        # body files; every ``get_tool()`` in the pipeline raised KeyError,
+        # breaking activity extraction, shadow assignment, and execution.
+        #
+        # Fix: derive the prefix from ``kind`` ("tools" → "tool", "skills" →
+        # "skill") and look for the actual filename Vault uses.
+        kind_singular = kind.rstrip("s")  # "tools"→"tool", "skills"→"skill"
         for entry in src_entries:
             entry_id = entry.get("id")
             if not entry_id:
                 continue
-            src_file = pkg_vault / kind / f"{entry_id}.json"
-            dst_file = target_root / kind / f"{entry_id}.json"
+            src_file = pkg_vault / kind / f"{kind_singular}_{entry_id}.json"
+            dst_file = target_root / kind / f"{kind_singular}_{entry_id}.json"
             if src_file.is_file():
                 if dst_file.exists() and not force:
                     continue
                 dst_file.write_text(src_file.read_text(encoding="utf-8"), encoding="utf-8")
+            else:
+                # Surface the gap loudly — silent skip is what bit operators
+                # in v0.7.4 through v0.8.1.
+                logger.warning(
+                    "[init] %s entry %s has no body file in package vault at %s — skipping",
+                    kind_singular, entry_id, src_file,
+                )
 
     _copy_indexed("tools")
     _copy_indexed("skills")
