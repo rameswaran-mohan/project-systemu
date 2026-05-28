@@ -87,12 +87,25 @@ def disable_tool(tool_id: str, vault: "Vault") -> bool:
 
 
 def heal_activities_for_tool(tool_id: str, config: "Config", vault: "Vault") -> None:
-    """Public alias — call this after enable_tool() to unblock PARTIAL activities.
+    """Public alias — call this after enable_tool() to unblock PARTIAL activities
+    AND auto-advance any VALIDATOR_BLOCKED scrolls that this tool unblocks.
 
-    Blocking: contains LLM calls (shadow_decision). Run in a background thread
-    from async contexts (e.g. NiceGUI event loop).
+    Blocking: contains LLM calls (shadow_decision + validator).  Run in a
+    background thread from async contexts (e.g. NiceGUI event loop).
     """
     _heal_partial_activities(tool_id, config, vault)
+
+    # v0.8.5: also re-validate any VALIDATOR_BLOCKED scrolls — this tool
+    # transitioning to DEPLOYED may have unblocked them.  Wrapped in
+    # try/except so a validator failure never blocks tool deploy itself.
+    try:
+        from systemu.pipelines.scroll_refiner import revalidate_blocked_scrolls_for_tool
+        revalidate_blocked_scrolls_for_tool(tool_id, config=config, vault=vault)
+    except Exception:
+        logger.exception(
+            "[ToolService] re-validation hook raised for tool %s — non-fatal",
+            tool_id,
+        )
 
 
 def _heal_partial_activities(tool_id: str, config: "Config", vault: "Vault") -> None:

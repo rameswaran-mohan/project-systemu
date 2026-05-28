@@ -131,27 +131,55 @@ async def rebuild_scroll(scroll_id: str, prompt: str, config: Config, vault: Vau
             "Re-approving will run fresh extraction and may update or supersede them."
         )
 
-    notif = Notification(
-        id=generate_id("notif"),
-        title=f"🔄 Rebuilt Scroll — Re-approval Required: {updated_scroll.name}",
-        message=(
-            f"Scroll \"{updated_scroll.name}\" was rebuilt in the Workshop "
-            f"(previous status: {prior_status}).\n"
-            f"Review the updated content and approve to re-run skill/tool extraction."
-            + supersede_note
-        ),
-        # v0.6.1-b: safe-default first (auto-reject in non-interactive mode)
-        actions=["Reject", "Approve"],
-        context={
-            "notification_type": "scroll_approval",
-            "scroll_id":         scroll.id,
-            "rebuilt":           True,
-        },
-    )
+    # v0.8.5: queue a notification appropriate to the new scroll status.
+    # Pre-v0.8.5 always queued an Approve/Reject card regardless of status,
+    # so clicking Approve on a VALIDATOR_BLOCKED card silently errored in
+    # approve_pending_scroll (status check rejected non-PENDING_APPROVAL).
+    if new_status == ScrollStatus.PENDING_APPROVAL:
+        notif = Notification(
+            id=generate_id("notif"),
+            title=f"🔄 Rebuilt Scroll — Re-approval Required: {updated_scroll.name}",
+            message=(
+                f"Scroll \"{updated_scroll.name}\" was rebuilt in the Workshop "
+                f"(previous status: {prior_status}).\n"
+                f"Review the updated content and approve to re-run skill/tool extraction."
+                + supersede_note
+            ),
+            # v0.6.1-b: safe-default first (auto-reject in non-interactive mode)
+            actions=["Reject", "Approve"],
+            context={
+                "notification_type": "scroll_approval",
+                "scroll_id":         scroll.id,
+                "rebuilt":           True,
+            },
+        )
+    else:
+        # VALIDATOR_BLOCKED (or any other non-PENDING_APPROVAL state):
+        # queue an informational card with NO Approve action.  Once the
+        # required tools are deployed, scroll_refiner's revalidation hook
+        # (v0.8.5 Fix B) will auto-advance the scroll and queue a fresh
+        # Approve/Reject card.
+        notif = Notification(
+            id=generate_id("notif"),
+            title=f"⏳ Rebuilt Scroll Blocked — Tools Required: {updated_scroll.name}",
+            message=(
+                f"Scroll \"{updated_scroll.name}\" was rebuilt but the validator "
+                f"identified missing tools. Forge them on /tools, then return to "
+                f"/insights → Pending Actions to re-approve.\n\n"
+                f"Once all required tools are deployed, the scroll will "
+                f"automatically advance to ready-for-approval."
+            ),
+            actions=["OK"],
+            context={
+                "notification_type": "scroll_blocked_info",
+                "scroll_id":         scroll.id,
+                "rebuilt":           True,
+            },
+        )
     try:
         vault.queue_notification(notif)
     except Exception as exc:
-        logger.warning("[Workshop] Could not queue re-approval notification: %s", exc)
+        logger.warning("[Workshop] Could not queue post-rebuild notification: %s", exc)
 
     # 8. Log event so the Event Log tab shows the rebuild.
     try:

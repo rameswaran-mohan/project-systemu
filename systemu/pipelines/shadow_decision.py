@@ -231,7 +231,7 @@ def _assign_to_existing(
     vault.save_activity(activity)
 
     # Mark scroll LINKED now that a shadow is confirmed
-    _mark_scroll_linked(activity.scroll_id, vault)
+    _advance_scroll_after_shadow_assignment(activity.scroll_id, vault)
 
     logger.info(
         "[Shadow] Activity '%s' assigned to existing Shadow '%s' (+%d skills, +%d tools)",
@@ -501,15 +501,40 @@ def _prompt_create_new(
         return None
 
 
-def _mark_scroll_linked(scroll_id: str, vault: Vault) -> None:
-    """Advance the scroll from ACTIVE to LINKED after shadow assignment succeeds."""
+def _advance_scroll_after_shadow_assignment(scroll_id: str, vault: Vault) -> None:
+    """Advance the scroll to LINKED after shadow assignment succeeds.
+
+    Pre-v0.8.5 this only advanced ACTIVE -> LINKED.  v0.8.5 broadens to
+    also cover VALIDATOR_BLOCKED and PENDING_APPROVAL -> LINKED, because:
+
+      - VALIDATOR_BLOCKED: when the scroll was regressed to blocked by a
+        post-hoc validator pass but the pre-existing activity already has
+        a shadow doing the work, the blocked display is stale.
+
+      - PENDING_APPROVAL: rare edge case where shadow is created via the
+        startup-recovery sweep before scroll was explicitly approved.
+    """
     try:
         scroll = vault.get_scroll(scroll_id)
-        if scroll.status == ScrollStatus.ACTIVE:
+        if scroll.status in (
+            ScrollStatus.ACTIVE,
+            ScrollStatus.VALIDATOR_BLOCKED,
+            ScrollStatus.PENDING_APPROVAL,
+        ):
+            prior = scroll.status
             scroll.status = ScrollStatus.LINKED
             vault.save_scroll(scroll)
+            logger.info(
+                "[Shadow] Scroll %s advanced %s -> LINKED",
+                scroll_id, prior.value,
+            )
     except Exception as exc:
-        logger.warning("[Shadow] Could not mark scroll %s as LINKED: %s", scroll_id, exc)
+        logger.warning("[Shadow] Could not advance scroll %s: %s", scroll_id, exc)
+
+
+# Backward-compat alias (will be removed in v0.9.0).  Some internal callers
+# may still use the old name; this keeps them working.
+_mark_scroll_linked = _advance_scroll_after_shadow_assignment
 
 
 def _is_chat_activity(activity: Activity, vault: Vault) -> bool:
@@ -623,7 +648,7 @@ def create_shadow(
     vault.save_activity(activity)
 
     # Mark scroll LINKED now that a shadow is confirmed
-    _mark_scroll_linked(activity.scroll_id, vault)
+    _advance_scroll_after_shadow_assignment(activity.scroll_id, vault)
 
     logger.info("[Shadow] Shadow '%s' (%s) awakened — assigned to activity '%s'",
                 shadow.name, shadow.id, activity.name)
@@ -644,3 +669,35 @@ def create_shadow(
     if not skip_supervisor:
         _submit_to_supervisor(activity.id, shadow.id, shadow.name)
     return shadow
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.8.5: Register dispatcher handler so the dashboard can trigger shadow
+# creation immediately after the operator clicks Awaken/Skip/Assign on the
+# /insights -> Pending Actions card (instead of waiting up to 60min for the
+# hourly sweep).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_resolved_shadow_decision(decision, choice, config, vault):
+    """Continuation for a resolved shadow_decision:* decision.
+
+    Re-invokes decide_shadow on the referenced activity. decide_shadow's
+    inner notify_user call will short-circuit to the resolved choice via
+    queue.get_resolved_choice(dedup_key), then branch to create_shadow /
+    _assign_to_existing / skip.
+    """
+    _, _, activity_id = decision.dedup_key.partition(":")
+    if not activity_id:
+        logger.warning("[Shadow] dispatcher: malformed dedup_key %r", decision.dedup_key)
+        return
+    try:
+        activity = vault.get_activity(activity_id)
+    except KeyError:
+        logger.warning("[Shadow] dispatcher: activity %s not found", activity_id)
+        return
+    decide_shadow(activity, config, vault)
+
+
+from systemu.approval.decision_dispatcher import register as _register_dispatch
+_register_dispatch("shadow_decision", _handle_resolved_shadow_decision)
+
