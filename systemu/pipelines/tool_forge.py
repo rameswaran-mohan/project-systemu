@@ -720,3 +720,33 @@ def forge_proposed_tools_from_specs(
             logger.exception("[Forge] code generation failed for proposed tool '%s'", tool.name)
 
     return forged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.8.5: dispatcher handler for forge_tool:* decisions.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_resolved_forge_tool(decision, choice, config, vault):
+    if (choice or "").lower() not in ("forge", "approve"):
+        logger.info("[ToolForge] dispatcher: forge_tool choice %r — skipping", choice)
+        return
+    _, _, tool_id = decision.dedup_key.partition(":")
+    if not tool_id:
+        logger.warning(
+            "[ToolForge] dispatcher: malformed dedup_key %r",
+            decision.dedup_key,
+        )
+        return
+    # Replay the UI-approved forge path: pass the unedited spec back through
+    # forge_tool_from_spec, which already handles vault lookup + scroll context
+    # discovery + code generation.
+    try:
+        tool = vault.get_tool(tool_id)
+    except KeyError:
+        logger.warning("[ToolForge] dispatcher: tool %s not found", tool_id)
+        return
+    forge_tool_from_spec(tool_id, tool.model_dump_json(), config, vault)
+
+
+from systemu.approval.decision_dispatcher import register as _register_dispatch
+_register_dispatch("forge_tool", _handle_resolved_forge_tool)

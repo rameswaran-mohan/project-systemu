@@ -17,6 +17,8 @@ links continue to work.
 
 from __future__ import annotations
 
+import logging
+
 from nicegui import ui
 
 from systemu.interface.dashboard_state import THEME
@@ -25,6 +27,8 @@ from systemu.interface.pages.memory_consolidation_page import (
     build_memory_consolidation_page,
 )
 from systemu.interface.pages.notifications_page import build_notifications_page
+
+logger = logging.getLogger(__name__)
 
 _VALID_TABS = ("memory", "flywheel", "events", "actions")
 
@@ -165,19 +169,51 @@ def _render_pending_decisions() -> None:
                     f"font-family: monospace; margin-bottom: 8px;"
                 )
 
-            def _make_handler(did, label, the_queue):
+            def _make_handler(did, dedup_key, label, the_queue):
                 def _click(_e=None):
                     try:
                         the_queue.resolve(did, choice=label)
                         ui.notify(f"Resolved: {label}", type="positive")
                         _render_pending_decisions.refresh()
+                        # v0.8.5: dispatch the resolved choice to the registered
+                        # pipeline handler in a worker thread so the UI event loop
+                        # isn't blocked on multi-second LLM continuations.
+                        from systemu.approval.decision_dispatcher import dispatch
+                        from systemu.interface.dashboard_state import AppState
+                        _state = AppState.get()
+                        if _state.config and _state.vault:
+                            import threading
+                            def _dispatch_resolved():
+                                try:
+                                    decision = _state.vault.get_decision(did)
+                                except Exception:
+                                    logger.exception(
+                                        "[Insights] could not load decision %s for dispatch", did,
+                                    )
+                                    return
+                                dispatch(decision, label, _state.config, _state.vault)
+                            # daemon=True trades off shutdown cleanup for unblocked exits:
+                            # if the dashboard process exits while this thread is mid-LLM-call,
+                            # the thread is killed without finishing the vault write. The
+                            # idempotency guard in shadow_decision.decide_shadow (which checks
+                            # for an already-assigned shadow on retry) covers the most common
+                            # crash-between-saves case, but a kill *during* save_shadow JSON
+                            # serialization is not covered. Acceptable for v0.8.5 because the
+                            # hourly_shadow_sweep will reconcile any partial state on restart.
+                            threading.Thread(
+                                target=_dispatch_resolved,
+                                daemon=True,
+                            ).start()
                     except Exception as exc:
                         ui.notify(f"Failed to resolve: {exc}", type="negative")
                 return _click
 
             with ui.row().style("gap: 8px;"):
                 for opt in card["options"]:
-                    ui.button(opt, on_click=_make_handler(card["id"], opt, queue)).style(
+                    ui.button(
+                        opt,
+                        on_click=_make_handler(card["id"], card["dedup_key"], opt, queue),
+                    ).style(
                         f"background: {THEME['surface2']}; color: {THEME['text']}; "
                         f"border: 1px solid {THEME['border']}; border-radius: 6px; "
                         f"padding: 6px 14px; font-size: 13px;"

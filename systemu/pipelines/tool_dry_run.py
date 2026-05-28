@@ -53,6 +53,34 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v0.8.5: safe sync-from-async coroutine runner
+
+def _run_coro_sync(coro):
+    """Execute an async coroutine from sync code.
+
+    Safe from any context: if no event loop is running in the current
+    thread, uses asyncio.run directly (fast path).  If a loop IS running
+    (e.g. dashboard's NiceGUI event loop), offloads to a fresh thread
+    that owns its own loop — avoiding the
+    'asyncio.run() cannot be called from a running event loop' error.
+
+    Pre-v0.8.5: tool_dry_run called asyncio.run(coro) unconditionally,
+    which crashed every dashboard-initiated dry-run.
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop in this thread — fast path
+        return asyncio.run(coro)
+    # Already in a running loop — run in a fresh thread with its own loop
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Result type
 
 @dataclass
@@ -368,7 +396,7 @@ def _execute(
             extra_packages=tool.dependencies or [],
             timeout=int(getattr(config, "docker_tool_timeout", 60)),
         )
-        result = asyncio.run(coro)
+        result = _run_coro_sync(coro)
         return result.to_dict()
     except Exception as exc:
         logger.exception("[ToolDryRun] sandbox execution crashed")

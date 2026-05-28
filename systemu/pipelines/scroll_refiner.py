@@ -622,6 +622,78 @@ def validate_and_propose_tools(scroll: Scroll, *, config: Config, vault: Vault):
     return v_result
 
 
+def revalidate_blocked_scrolls_for_tool(
+    tool_id: str,
+    *,
+    config: Config,
+    vault: Vault,
+) -> int:
+    """Re-run validate_and_propose_tools on every VALIDATOR_BLOCKED scroll.
+
+    Triggered by tool_service.heal_activities_for_tool when a tool transitions
+    to DEPLOYED.  For each scroll that's now satisfiable, transitions to
+    PENDING_APPROVAL and queues a fresh scroll_approval notification.
+
+    Returns the number of scrolls advanced.
+
+    Notes:
+      - We re-validate ALL blocked scrolls, not just those referencing tool_id
+        in missing_tool_specs.  The vault list is small in practice and this
+        avoids brittle index tracking on changing tool_id sets.
+      - Each scroll's revalidation is wrapped in try/except so one bad scroll
+        doesn't block the others.
+    """
+    advanced = 0
+    for header in vault.list_scrolls(status=ScrollStatus.VALIDATOR_BLOCKED):
+        try:
+            scroll = vault.get_scroll(header["id"])
+            v_result = validate_and_propose_tools(scroll, config=config, vault=vault)
+            if v_result.satisfiable:
+                prior = scroll.status
+                scroll.status = ScrollStatus.PENDING_APPROVAL
+                vault.save_scroll(scroll)
+                advanced += 1
+                logger.info(
+                    "[ScrollRefiner] Re-validation: scroll '%s' %s -> PENDING_APPROVAL "
+                    "(tool %s deploy unblocked it)",
+                    scroll.name, prior.value, tool_id,
+                )
+                _queue_ready_for_reapproval_notification(scroll, vault)
+        except Exception:
+            logger.exception(
+                "[ScrollRefiner] re-validation failed for scroll %s",
+                header.get("id"),
+            )
+    return advanced
+
+
+def _queue_ready_for_reapproval_notification(scroll: Scroll, vault: Vault) -> None:
+    """Queue a scroll_approval card when a blocked scroll auto-unblocks."""
+    from systemu.core.models import Notification
+
+    notif = Notification(
+        id=generate_id("notif"),
+        title=f"Tools Deployed - Scroll Ready for Approval: {scroll.name}",
+        message=(
+            f"All required tools for scroll \"{scroll.name}\" are now deployed. "
+            f"Review and approve to run skill/tool extraction and create the activity."
+        ),
+        actions=["Reject", "Approve"],
+        context={
+            "notification_type": "scroll_approval",
+            "scroll_id":         scroll.id,
+            "auto_unblocked":    True,
+        },
+    )
+    try:
+        vault.queue_notification(notif)
+    except Exception as exc:
+        logger.warning(
+            "[ScrollRefiner] could not queue auto-unblock notification for %s: %s",
+            scroll.id, exc,
+        )
+
+
 def _approve_scroll(scroll: Scroll, vault: Vault) -> None:
     """Advance scroll to APPROVED and trigger Stage 3."""
     scroll.status = ScrollStatus.APPROVED
@@ -736,3 +808,54 @@ def approve_pending_scroll(scroll_id: str, vault: Vault) -> Scroll:
         )
     _approve_scroll(scroll, vault)
     return scroll
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.8.5: dispatcher handler for validator_propose:* decisions.  When the
+# operator clicks "Forge All" on a /insights -> Pending Actions card, this
+# kicks off the LLM-forge pipeline immediately (matching the operator's
+# expressed intent).  Pre-v0.8.5 the resolved choice sat until next sweep.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_resolved_validator_propose(decision, choice, config, vault):
+    if (choice or "").lower() not in ("forge all", "forge", "approve"):
+        logger.info(
+            "[ScrollRefiner] dispatcher: validator_propose choice %r — skipping forge",
+            choice,
+        )
+        return
+
+    _, _, scroll_id = decision.dedup_key.partition(":")
+    if not scroll_id:
+        logger.warning(
+            "[ScrollRefiner] dispatcher: malformed dedup_key %r",
+            decision.dedup_key,
+        )
+        return
+
+    try:
+        scroll = vault.get_scroll(scroll_id)
+    except KeyError:
+        logger.warning("[ScrollRefiner] dispatcher: scroll %s not found", scroll_id)
+        return
+
+    # Prefer specs carried on the decision (the snapshot at post time);
+    # fall back to re-validating the live scroll if the context didn't carry them.
+    specs = (decision.context or {}).get("missing_tool_specs")
+    if not specs:
+        v_result = validate_and_propose_tools(scroll, config=config, vault=vault)
+        specs = getattr(v_result, "missing_tool_specs", None) or []
+
+    if not specs:
+        logger.info(
+            "[ScrollRefiner] dispatcher: no missing tool specs to forge for %s",
+            scroll_id,
+        )
+        return
+
+    from systemu.pipelines.tool_forge import forge_proposed_tools_from_specs
+    forge_proposed_tools_from_specs(specs, scroll, config, vault)
+
+
+from systemu.approval.decision_dispatcher import register as _register_dispatch
+_register_dispatch("validator_propose", _handle_resolved_validator_propose)
