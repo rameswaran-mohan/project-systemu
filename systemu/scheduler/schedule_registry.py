@@ -184,6 +184,41 @@ def mark_fired(schedule_id: str, now: datetime, vault: "Vault") -> None:
     _save_schedule_file(sched, vault)
 
 
+def mark_missed(
+    schedule_id: str,
+    now: datetime,
+    vault: "Vault",
+    advance_to: Optional[datetime] = None,
+) -> None:
+    """Mark a schedule as having missed a fire window (v0.8.7).
+
+    Unlike mark_fired, this does NOT advance via skip-missed semantics —
+    advance_to is computed by the caller (in _compute_next_valid_fire) based
+    on the original scheduled_at + N*interval. This is the operator-friendly
+    "resume from next valid slot" behavior.
+
+    Args:
+      schedule_id: target schedule
+      now:         wall-clock UTC naive datetime (sets last_missed_at)
+      vault:       vault instance
+      advance_to:  for RECURRING, the new next_fire_at (computed by caller);
+                   None for ONCE (marks COMPLETED with missed=True)
+    """
+    sched = get_schedule(schedule_id, vault)
+    sched.last_missed_at = now
+    if advance_to is None:
+        # ONCE — never fires; terminal with missed flag
+        sched.missed = True
+        sched.status = ScheduleStatus.COMPLETED
+    else:
+        # RECURRING — advance + increment counter
+        sched.missed_fires_count += 1
+        sched.next_fire_at = advance_to
+        if sched.end_at and sched.next_fire_at > sched.end_at:
+            sched.status = ScheduleStatus.COMPLETED
+    _save_schedule_file(sched, vault)
+
+
 def delete_schedule(schedule_id: str, vault: "Vault") -> bool:
     """Hard delete (housekeeping). Returns True if removed."""
     path = _schedule_path(schedule_id, vault)

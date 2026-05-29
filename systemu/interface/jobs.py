@@ -100,14 +100,12 @@ class JobManager:
         output_dir: str = None,
         dedup_key:  str = "",
     ) -> Job:
-        # v0.8.6: dedup check — if a non-terminal job with this key exists, return it.
-        if dedup_key:
-            existing = self.find_active_by_dedup_key(dedup_key)
-            if existing is not None:
-                logger.info("[Jobs] dedup_key %r matches existing job %s (%s) — returning existing",
-                            dedup_key, existing.id, existing.status.value)
-                return existing
-
+        # v0.8.7: dedup_key is stored on the Job for display + traceability
+        # but does NOT suppress spawn. The operator's intent ("I clicked Execute
+        # again") is honored. UI can use find_active_by_dedup_key() to surface
+        # an informational notice ("N other runs for this shadow+scroll are
+        # in flight"), but the spawn proceeds either way. Queue + cancel give
+        # the operator the safety net.
         job_id = str(uuid.uuid4())[:8]
 
         # v0.8.6: for execute jobs, check concurrency cap BEFORE spawning.
