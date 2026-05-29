@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 from systemu.core.utils import utcnow
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 _config    = None
 _vault     = None
 _scheduler = None   # APScheduler instance — set by daemon after start()
+
+# v0.8.7: schedules whose next_fire_at is older than this threshold at tick
+# time are considered "missed" — they don't fire, the operator gets alerted.
+SCHEDULE_MISSED_THRESHOLD_SECONDS = int(
+    os.environ.get("SYSTEMU_SCHEDULE_MISSED_THRESHOLD_SECONDS", "300")
+)
 
 
 def init_jobs(config, vault) -> None:
@@ -927,16 +934,11 @@ def _graduate_memory_to_skills(shadow, memory_md: str, vault) -> None:
 
 
 def _scheduled_execute_job() -> None:
-    """v0.8.6: APScheduler job — every minute, find due schedules and dispatch.
+    """v0.8.6 + v0.8.7: APScheduler job — every minute.
 
-    Each tick:
-      - Lists ACTIVE schedules whose next_fire_at <= now
-      - For each, calls JobManager.start_job with a dedup_key so a duplicate
-        click + schedule fire don't both spawn
-      - mark_fired() advances next_fire_at (recurring) or marks COMPLETED (once),
-        regardless of whether the dispatch actually spawned — this prevents a
-        permanently-blocked dedup from causing the same schedule to retry every
-        minute forever.
+    v0.8.7: split due schedules into "fresh" (within SCHEDULE_MISSED_THRESHOLD_SECONDS)
+    and "missed" (older). Fresh ones dispatch normally. Missed ones get the
+    skip-and-alert treatment (no dispatch, notification queued, event published).
     """
     if _config is None or _vault is None:
         return
@@ -945,21 +947,49 @@ def _scheduled_execute_job() -> None:
     from systemu.scheduler.schedule_registry import list_active_schedules
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    due = [s for s in list_active_schedules(_vault) if s.next_fire_at <= now]
+    threshold = SCHEDULE_MISSED_THRESHOLD_SECONDS
+    due = []
+    missed = []
 
-    if not due:
+    for s in list_active_schedules(_vault):
+        if s.next_fire_at > now:
+            continue
+        age_seconds = (now - s.next_fire_at).total_seconds()
+        if age_seconds <= threshold:
+            due.append(s)
+        else:
+            missed.append((s, age_seconds))
+
+    if not due and not missed:
         return
 
-    logger.info("[Scheduler] %d schedule(s) due — dispatching", len(due))
-    for schedule in due:
-        try:
-            _dispatch_scheduled(schedule, now, _config, _vault)
-        except Exception:
-            logger.exception("[Scheduler] dispatch failed for schedule %s", schedule.id)
+    if missed:
+        logger.warning(
+            "[Scheduler] %d schedule(s) missed (staleness > %ds) — skipping dispatch, surfacing alerts",
+            len(missed), threshold,
+        )
+        for schedule, age in missed:
+            try:
+                _handle_missed_schedule(schedule, now, age, _config, _vault)
+            except Exception:
+                logger.exception("[Scheduler] missed-handling failed for %s", schedule.id)
+
+    if due:
+        logger.info("[Scheduler] %d schedule(s) due — dispatching", len(due))
+        for schedule in due:
+            try:
+                _dispatch_scheduled(schedule, now, _config, _vault)
+            except Exception:
+                logger.exception("[Scheduler] dispatch failed for schedule %s", schedule.id)
 
 
 def _dispatch_scheduled(schedule, now, config, vault) -> None:
-    """Fire one scheduled execution via JobManager, then advance the schedule."""
+    """Fire one scheduled execution via JobManager, then advance the schedule.
+
+    v0.8.7: no dedup skip. If a previous run of the same (shadow, scroll) is
+    still active, this fire dispatches anyway — operator's expressed intent
+    via the schedule is honored.
+    """
     from systemu.interface.jobs import JobManager
     from systemu.scheduler.schedule_registry import mark_fired
     from pathlib import Path
@@ -967,15 +997,6 @@ def _dispatch_scheduled(schedule, now, config, vault) -> None:
 
     jm = JobManager.get()
     dedup_key = f"execute:{schedule.shadow_id}:{schedule.scroll_id}"
-
-    existing = jm.find_active_by_dedup_key(dedup_key)
-    if existing is not None:
-        logger.info(
-            "[Scheduler] Schedule %s skipped — previous job %s still %s",
-            schedule.id, existing.id, existing.status.value,
-        )
-        mark_fired(schedule.id, now, vault)
-        return
 
     project_root = str(Path(config.vault_dir).parent.parent.resolve())
     cmd = [
@@ -1002,3 +1023,137 @@ def _dispatch_scheduled(schedule, now, config, vault) -> None:
         logger.warning("[Scheduler] Could not dispatch schedule %s: %s", schedule.id, exc)
 
     mark_fired(schedule.id, now, vault)
+
+
+def _compute_next_valid_fire(schedule, now):
+    """v0.8.7: For RECURRING — smallest scheduled_at + N*interval > now.
+
+    Example: scheduled_at=09:00, interval=60min, now=14:30 → returns 15:00
+    (not 15:30, not 09:00+5*60min=14:00). This gives the operator the next
+    valid future slot.
+    """
+    from datetime import timedelta
+    interval = timedelta(minutes=schedule.interval_minutes)
+    elapsed = now - schedule.scheduled_at
+    n = int(elapsed.total_seconds() // (schedule.interval_minutes * 60)) + 1
+    return schedule.scheduled_at + n * interval
+
+
+def _format_age(seconds: float) -> str:
+    """1234 -> '20m 34s', 7200 -> '2h', 90000 -> '1d 1h'."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s" if s else f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m}m" if m else f"{h}h"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h" if h else f"{d}d"
+
+
+def _queue_missed_notification(schedule, age_seconds, advanced_to, vault) -> None:
+    """Queue an operator-visible Notification card for a missed schedule fire."""
+    from systemu.core.models import Notification
+    from systemu.core.utils import generate_id
+
+    shadow_name = schedule.shadow_id
+    scroll_name = schedule.scroll_id
+    try:
+        sh = vault.get_shadow(schedule.shadow_id)
+        shadow_name = getattr(sh, "name", schedule.shadow_id)
+    except Exception:
+        pass
+    try:
+        sc = vault.get_scroll(schedule.scroll_id)
+        scroll_name = getattr(sc, "name", schedule.scroll_id)
+    except Exception:
+        pass
+
+    age_human = _format_age(age_seconds)
+
+    if advanced_to is None:
+        title = f"⏰ One-time schedule missed: {scroll_name}"
+        message = (
+            f"Scheduled fire for \"{scroll_name}\" via shadow \"{shadow_name}\" was due "
+            f"{age_human} ago. Dashboard was likely down at the fire time. "
+            f"Schedule has been marked completed without running. "
+            f"Re-create the schedule if you still want it to execute."
+        )
+    else:
+        title = f"⏰ Recurring schedule fire missed: {scroll_name}"
+        message = (
+            f"Scheduled fire for \"{scroll_name}\" via shadow \"{shadow_name}\" was due "
+            f"{age_human} ago. Skipping this fire (dashboard was likely down). "
+            f"Next fire is at {advanced_to.strftime('%Y-%m-%d %H:%M UTC')}. "
+            f"Total missed fires for this schedule: {schedule.missed_fires_count + 1}."
+        )
+
+    notif = Notification(
+        id=generate_id("notif"),
+        title=title,
+        message=message,
+        actions=["OK"],
+        context={
+            "notification_type":  "schedule_missed",
+            "schedule_id":        schedule.id,
+            "shadow_id":          schedule.shadow_id,
+            "scroll_id":          schedule.scroll_id,
+            "age_seconds":        int(age_seconds),
+            "advanced_to":        advanced_to.isoformat() if advanced_to else None,
+        },
+    )
+    try:
+        vault.queue_notification(notif)
+    except Exception as exc:
+        logger.warning("[Scheduler] Could not queue missed-schedule notification: %s", exc)
+
+
+def _publish_missed_event(schedule, age_seconds, advanced_to) -> None:
+    """Publish a WARNING event for the missed schedule. Visible in /insights → Events."""
+    try:
+        from systemu.interface.event_bus import EventBus
+        msg = (
+            f"Schedule {schedule.id} missed: due {_format_age(age_seconds)} ago"
+        )
+        if advanced_to is not None:
+            msg += f", next_fire advanced to {advanced_to.strftime('%H:%M UTC')}"
+        else:
+            msg += ", marked COMPLETED (one-time, will not run)"
+        EventBus.get().publish({
+            "category": "scheduler",
+            "level":    "WARNING",
+            "message":  msg,
+            "context": {
+                "schedule_id":  schedule.id,
+                "shadow_id":    schedule.shadow_id,
+                "scroll_id":    schedule.scroll_id,
+                "age_seconds":  int(age_seconds),
+                "advanced_to":  advanced_to.isoformat() if advanced_to else None,
+            },
+        })
+    except Exception:
+        logger.debug("[Scheduler] could not publish missed-schedule event", exc_info=True)
+
+
+def _handle_missed_schedule(schedule, now, age_seconds, config, vault) -> None:
+    """v0.8.7: Skip a missed schedule, advance state, queue operator alert.
+
+    For ONCE: status → COMPLETED with missed=True. Schedule never fires.
+    For RECURRING: next_fire_at recomputed to next valid future slot;
+                   missed_fires_count incremented. Schedule resumes normally.
+    """
+    from systemu.scheduler.schedule_registry import mark_missed
+    from systemu.core.models import ScheduleMode
+
+    if schedule.mode == ScheduleMode.ONCE:
+        mark_missed(schedule.id, now, vault, advance_to=None)
+        _queue_missed_notification(schedule, age_seconds, advanced_to=None, vault=vault)
+        _publish_missed_event(schedule, age_seconds, advanced_to=None)
+    else:  # RECURRING
+        next_fire = _compute_next_valid_fire(schedule, now)
+        mark_missed(schedule.id, now, vault, advance_to=next_fire)
+        _queue_missed_notification(schedule, age_seconds, advanced_to=next_fire, vault=vault)
+        _publish_missed_event(schedule, age_seconds, advanced_to=next_fire)

@@ -503,3 +503,11 @@ class Schedule(BaseModel):
     status:           ScheduleStatus = ScheduleStatus.ACTIVE
     created_at:       datetime
     created_by:       str = "operator (dashboard)"
+    # v0.8.7: missed-fire tracking
+    missed:             bool = False
+    """ONCE schedules: True if this schedule was skipped due to staleness
+       (dashboard down past fire time + threshold). RECURRING: not used."""
+    missed_fires_count: int = 0
+    """RECURRING schedules: cumulative number of fires skipped due to staleness."""
+    last_missed_at:     Optional[datetime] = None
+    """Wall-clock UTC timestamp of the most recent missed-fire detection."""

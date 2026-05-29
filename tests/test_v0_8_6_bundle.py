@@ -420,7 +420,12 @@ class TestScheduledExecuteJob:
         v.root = str(tmp_path)
         config = MagicMock()
 
-        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+        # v0.8.7: keep this well under SCHEDULE_MISSED_THRESHOLD_SECONDS (300s)
+        # so the schedule goes through the FRESH dispatch path, not the missed
+        # path. The original v0.8.6 value of 5 minutes is exactly on the
+        # boundary and collides with the new staleness threshold under any
+        # test-execution overhead.
+        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1)
         s = create_schedule(
             shadow_id="x", scroll_id="y",
             mode=ScheduleMode.RECURRING, interval_minutes=30,
@@ -444,6 +449,11 @@ class TestScheduledExecuteJob:
         expected_next = now + timedelta(minutes=30)
         assert abs((reloaded.next_fire_at - expected_next).total_seconds()) < 5
 
+    @pytest.mark.xfail(
+        reason="v0.8.7 removed the dedup skip from _dispatch_scheduled — "
+               "scheduled fires now dispatch even with active runs in flight",
+        strict=True,
+    )
     def test_skip_if_previous_run_still_active(self, tmp_path, monkeypatch):
         from systemu.scheduler.schedule_registry import create_schedule, get_schedule
         from systemu.core.models import ScheduleMode
