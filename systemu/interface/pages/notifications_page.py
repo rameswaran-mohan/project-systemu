@@ -38,6 +38,28 @@ _CAT_ICON = {
 }
 
 
+def _filter_events(events: list, mode: str) -> list:
+    """Filter events by origin.
+
+    mode:
+      - "all":    everything
+      - "system": context.origin != "manual_execute" (or missing)
+      - "manual": context.origin == "manual_execute"
+    """
+    if mode == "all":
+        return list(events)
+    if mode == "manual":
+        return [
+            e for e in events
+            if (e.get("context", {}) or {}).get("origin") == "manual_execute"
+        ]
+    # system
+    return [
+        e for e in events
+        if (e.get("context", {}) or {}).get("origin") != "manual_execute"
+    ]
+
+
 def build_notifications_page() -> None:
     state = AppState.get()
     vault = state.vault
@@ -70,6 +92,12 @@ def build_notifications_page() -> None:
                 ).style("min-width: 130px;")
                 level_filter.value = ""
 
+                origin_filter = ui.select(
+                    options={"all": "All Events", "system": "System Only", "manual": "Manual Only"},
+                    label="Show",
+                ).style("min-width: 160px;")
+                origin_filter.value = "all"
+
                 # Clear log button
                 def _clear_log():
                     log_path = _get_log_path(vault)
@@ -88,6 +116,9 @@ def build_notifications_page() -> None:
             @ui.refreshable
             def _log_table():
                 events = _load_events(vault, max_lines=200)
+                # Apply origin filter (All / System / Manual) first so the rest
+                # of the rendering only sees the relevant subset.
+                events = _filter_events(events, origin_filter.value or "all")
                 q = filter_input.value.lower() if filter_input.value else ""
                 lv = level_filter.value or ""
 
@@ -151,6 +182,7 @@ def build_notifications_page() -> None:
             # Hook filter inputs
             filter_input.on("input", lambda _: _log_table.refresh())
             level_filter.on("update:model-value", lambda _: _log_table.refresh())
+            origin_filter.on("update:model-value", lambda _: _log_table.refresh())
 
             # Auto-refresh timer — polls event_log.jsonl every 2 seconds.
             # safe_timer wraps the callback so post-navigation ticks don't

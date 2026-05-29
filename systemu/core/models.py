@@ -22,7 +22,7 @@ import re
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 
-# tool names become filenames on disk (impl_dir / f"{name}.py").  An
+# v0.6.1-a: tool names become filenames on disk (impl_dir / f"{name}.py").  An
 # LLM-supplied name with ../ or / would escape impl_dir.  This regex is the
 # single source of truth — used by the Tool.name validator AND by the backstop
 # check in systemu/pipelines/tool_forge.py.
@@ -43,11 +43,11 @@ class ScrollStatus(str, Enum):
     ACTIVE            = "active"             # Activity extracted; shadow assignment in progress
     LINKED            = "linked"             # Activity extracted AND shadow assigned
     EVOLVED           = "evolved"            # Evolution has been applied
-    VALIDATOR_BLOCKED = "validator_blocked"  # Stage 6 validator found a blocker
+    VALIDATOR_BLOCKED = "validator_blocked"  # v0.6.5-d: Stage 6 validator found a blocker
 
 
 class TraceEvent(BaseModel):
-    """Per-stage pipeline observation appended to Scroll.pipeline_trace.
+    """v0.6.5-a: Per-stage pipeline observation appended to Scroll.pipeline_trace.
 
     Each pipeline stage (intent/refine/extract/validate/deprecate) appends a
     TraceEvent describing what it decided and why.  Surfaced on /scrolls as
@@ -93,7 +93,7 @@ class Scroll(BaseModel):
 
     # ── Intent-driven fields (new scrolls) ────────────────────────────────────
     intent:               str = ""               # 1-2 sentence overall goal — the WHY
-    # concrete success description distinct from intent.  Where
+    # v0.6.0-c: concrete success description distinct from intent.  Where
     # `intent` is "why" (the outcome the user wants), `expected_outcome` is
     # "what success looks like" in observable terms (artifacts created,
     # state changed).  Read by Stage 5 (shadow tiebreak) and Stage 6 (validator).
@@ -112,14 +112,14 @@ class Scroll(BaseModel):
     created_at:            datetime = Field(default_factory=_now)
     updated_at:            datetime = Field(default_factory=_now)
 
-    # pipeline observability — each stage appends a TraceEvent.
+    # v0.6.5-a: pipeline observability — each stage appends a TraceEvent.
     # Read by /scrolls UI for the warning badge + Pipeline Trace panel.
     pipeline_trace:        List[TraceEvent] = Field(default_factory=list)
 
     @computed_field
     @property
     def has_warnings(self) -> bool:
-        """True when any trace event has level in {warn, error}."""
+        """v0.6.5-a: True when any trace event has level in {warn, error}."""
         return any(e.level in ("warn", "error") for e in self.pipeline_trace)
 
 
@@ -152,7 +152,7 @@ class Tool(BaseModel):
     tool_type:           ToolType
     parameters_schema:   Dict[str, Any] = {}    # JSON Schema describing inputs
 
-    # validate Tool.name at construction so unsafe values can never
+    # v0.6.1-a: validate Tool.name at construction so unsafe values can never
     # reach the filesystem.  See _SAFE_TOOL_NAME at the top of this module.
     @field_validator("name")
     @classmethod
@@ -173,18 +173,18 @@ class Tool(BaseModel):
     forged_by_systemu:   bool = False
     enabled:             bool = False   # Must be explicitly toggled ON by user after code review
     version:             int = 1
-    # dry-run validation gate (Gate 3.5).
+    # v0.5.0-a: dry-run validation gate (Gate 3.5).
     # Tools cannot be enabled until dry_run_status == "passed".
     # ``dry_run_evidence`` stores the last attempt's outcome (params used,
     # error, elapsed_ms) for operator inspection on the Tools page.
     dry_run_status:      str = "not_run"   # not_run | passed | failed | skipped
     dry_run_evidence:    Dict[str, Any] = {}
-    # rolling buffer of observed-successful param sets, capped
+    # v0.5.0-a: rolling buffer of observed-successful param sets, capped
     # at 20 entries.  Used by v0.5.0-d's backward-compat replay when the
     # supervisor wants to bump the tool's version — replays each entry
     # against the new code to prove no regression for known-working uses.
     last_successful_params: List[Dict[str, Any]] = []
-    # append-only audit of recalibration events.  Each entry:
+    # v0.5.0-b: append-only audit of recalibration events.  Each entry:
     #   {"version": int, "reason": str, "mode": "bump"|"fork",
     #    "diff_summary": str, "ts": iso}
     evolution_history:   List[Dict[str, Any]] = []
@@ -254,7 +254,7 @@ class Activity(BaseModel):
     missing_tools:       List[str] = []    # tool names not yet forged
     assigned_shadow_id:  Optional[str] = None
     status:              ActivityStatus = ActivityStatus.UNASSIGNED
-    # Frozen intent at extraction time so Stage 5 (shadow tiebreak)
+    # v0.6.0-f: Frozen intent at extraction time so Stage 5 (shadow tiebreak)
     # can do semantic matching without re-loading the scroll on every call.
     intent_snapshot:     str = ""
     created_at:          datetime = Field(default_factory=_now)
@@ -316,12 +316,12 @@ class Shadow(BaseModel):
     evolution_history:    List[Dict[str, Any]] = []
     memory_md_path:       str = ""           # path to SHADOW_MEMORY.md
     memory_buffer_path:   str = ""           # path to memory_buffer.jsonl
-    # per-shadow opt-in for the Intelligent Supervisor (v0.4.0).
+    # v0.4.1: per-shadow opt-in for the Intelligent Supervisor (v0.4.0).
     # The Supervisor activates when either this OR
     # ``config.intelligent_supervisor_enabled`` is True — lets the operator
     # A/B test on one shadow before flipping the global switch.
     supervisor_enabled:   bool = False
-    # operator-labelled specialty for routing preference.
+    # v0.4.3-b: operator-labelled specialty for routing preference.
     # Free-form short tag (e.g. "browser", "data-pipeline", "devops").
     # When set, ``Supervisor._resolve_shadow_with_affinity`` prefers
     # candidates whose specialty matches the originating shadow's
@@ -334,7 +334,7 @@ class Shadow(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _migrate_legacy_system_prompt(cls, data: Any) -> Any:
-        """Pre-shadow.json had a single ``system_prompt`` field.
+        """Pre-v0.3 shadow.json had a single ``system_prompt`` field.
 
         Migrate it transparently: when ``identity_block`` is absent or
         empty but ``system_prompt`` is set, treat the legacy value as
@@ -460,3 +460,46 @@ class Notification(BaseModel):
     created_at:  datetime = Field(default_factory=_now)
     resolved_at: Optional[datetime] = None
     resolution:  Optional[str] = None  # which action was chosen
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Schedule (v0.8.6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ScheduleMode(str, Enum):
+    ONCE      = "once"
+    RECURRING = "recurring"
+
+
+class ScheduleStatus(str, Enum):
+    ACTIVE    = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class Schedule(BaseModel):
+    """v0.8.6: Operator-created schedule for executing a shadow against a scroll.
+
+    Modes:
+      - ONCE:      scheduled_at is the single fire time. status → COMPLETED after firing.
+      - RECURRING: scheduled_at is the first fire; next_fire_at advances by
+                   interval_minutes after each fire. end_at (optional) caps the
+                   recurring sequence.
+
+    Skip-missed semantics: if the dashboard was down at next_fire_at, the
+    scheduler fires once on restart and recomputes next_fire_at = now + interval
+    (recurring) or marks COMPLETED (once).
+    """
+    id:               str
+    shadow_id:        str
+    scroll_id:        str
+    mode:             ScheduleMode
+    dry_run:          bool = False
+    scheduled_at:     datetime
+    interval_minutes: Optional[int] = None
+    end_at:           Optional[datetime] = None
+    next_fire_at:     datetime
+    last_fire_at:     Optional[datetime] = None
+    status:           ScheduleStatus = ScheduleStatus.ACTIVE
+    created_at:       datetime
+    created_by:       str = "operator (dashboard)"

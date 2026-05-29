@@ -417,6 +417,17 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # v0.8.6: scheduled execute dispatcher — fires due schedules through JobManager
+    from systemu.scheduler.jobs import _scheduled_execute_job
+    scheduler.add_job(
+        _scheduled_execute_job,
+        trigger="interval",
+        minutes=1,
+        id="scheduled_execute",
+        name="Scheduled Execute Dispatch",
+        replace_existing=True,
+    )
+
     scheduler.start()
 
     # One-shot recovery sweep — fires 5 seconds after startup to heal any
@@ -433,9 +444,19 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # Share the live scheduler instance with the dashboard page
     set_scheduler(scheduler)
 
+    # v0.8.6: manual event bridge — surface subprocess events to dashboard
+    from pathlib import Path as _Path
+    try:
+        from systemu.interface.manual_event_bridge import ManualEventBridge
+        ManualEventBridge.start(str(_Path(config.vault_dir).resolve()))
+    except Exception:
+        logger.exception("[Daemon] manual event bridge failed to start — non-fatal")
+
     logger.info("[Daemon] Scheduler started. PID=%d | Port=%d", os.getpid(), port)
     logger.info(
-        "[Daemon] Jobs: shadow sweep (hourly) | memory consolidation (02:00) | evolution check (03:00) | tool reconciler (every 30s)",
+        "[Daemon] Jobs: shadow sweep (hourly) | memory consolidation (02:00) | "
+        "evolution check (03:00) | tool reconciler (every 30s) | "
+        "scheduled execute (every 1min)",
     )
 
     # ── Start NiceGUI dashboard in a background thread ─────────────────────
