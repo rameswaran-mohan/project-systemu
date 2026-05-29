@@ -10,6 +10,7 @@ from __future__ import annotations
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.nav_helpers import workshop_deeplink
 
 
 def build_scrolls_page() -> None:
@@ -67,7 +68,7 @@ def build_scrolls_page() -> None:
                         _td(s.get("name", s["id"]), bold=True)
                         with ui.element("td").style(f"padding: 12px 16px;"):
                             badge_html = status_badge_html(s.get("status", "?"))
-                            # warning badge for scrolls with trace warnings
+                            # v0.6.5-g: warning badge for scrolls with trace warnings
                             if s.get("has_warnings"):
                                 badge_html += (
                                     " <span title='Pipeline warnings — click View for detail'"
@@ -79,21 +80,31 @@ def build_scrolls_page() -> None:
                         with ui.element("td").style("padding: 12px 16px;"):
                             sid = s["id"]
                             status = s.get("status", "")
-                            if status == "pending_approval":
-                                def _on_approve(_, i=sid):
-                                    _approve_scroll(i)
-                                    _scroll_table.refresh(search_input.value)
+                            with ui.row().style("gap: 6px;"):
+                                if status == "pending_approval":
+                                    def _on_approve(_, i=sid):
+                                        _approve_scroll(i)
+                                        _scroll_table.refresh(search_input.value)
+                                    ui.button(
+                                        "✓ Approve",
+                                        on_click=_on_approve,
+                                    ).style(
+                                        f"background: {THEME['success']}; color: white; "
+                                        f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
+                                    )
+                                else:
+                                    ui.button(
+                                        "View",
+                                        on_click=lambda _, i=sid: _show_scroll_detail(i),
+                                    ).style(
+                                        f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                                        f"border: 1px solid {THEME['border']}; "
+                                        f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
+                                    )
+                                # v0.8.8: deep-link into Workshop Scrolls tab (pre-selected)
                                 ui.button(
-                                    "✓ Approve",
-                                    on_click=_on_approve,
-                                ).style(
-                                    f"background: {THEME['success']}; color: white; "
-                                    f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
-                                )
-                            else:
-                                ui.button(
-                                    "View",
-                                    on_click=lambda _, i=sid: _show_scroll_detail(i),
+                                    "✏️ Edit",
+                                    on_click=lambda _, i=sid: ui.navigate.to(workshop_deeplink("scroll", i)),
                                 ).style(
                                     f"background: {THEME['surface2']}; color: {THEME['text']}; "
                                     f"border: 1px solid {THEME['border']}; "
@@ -177,7 +188,7 @@ def _show_scroll_detail(scroll_id: str) -> None:
                             f"font-size: 12px; color: {THEME['text_muted']};"
                         )
 
-        # Pipeline Trace panel — show per-stage decisions/warnings
+        # v0.6.5-g: Pipeline Trace panel — show per-stage decisions/warnings
         trace = list(getattr(scroll, "pipeline_trace", []) or [])
         ui.separator().style(f"background: {THEME['border']}; margin: 12px 0;")
         ui.label(f"📋 Pipeline Trace ({len(trace)})").style(
@@ -223,7 +234,7 @@ def _show_scroll_detail(scroll_id: str) -> None:
                             f"color: {THEME['text_muted']}; font-size: 10px;"
                         )
 
-        # embedded recovery panel for this scroll
+        # v0.6.8-b: embedded recovery panel for this scroll
         ui.separator().style(f"background: {THEME['border']}; margin: 12px 0;")
         try:
             from systemu.interface.pages.recover import render_recovery_panel

@@ -26,13 +26,17 @@ from systemu.interface.dashboard_state import AppState, THEME
 #  Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_workshop_page() -> None:
+def build_workshop_page(deeplink_type: str | None = None, deeplink_id: str | None = None) -> None:
+    from systemu.interface.nav_helpers import resolve_deeplink_tab
+
     state = AppState.get()
     vault = state.vault
 
     ui.label("🛠️ Workshop").style(
         f"font-size: 22px; font-weight: 800; color: {THEME['text']}; margin-bottom: 20px;"
     )
+
+    target_tab_label = resolve_deeplink_tab(deeplink_type)
 
     with ui.tabs().classes("w-full") as tabs:
         tab_scrolls    = ui.tab("Scrolls")
@@ -41,10 +45,16 @@ def build_workshop_page() -> None:
         tab_tools      = ui.tab("Tools")
         tab_skills     = ui.tab("Skills")
 
-    with ui.tab_panels(tabs, value=tab_scrolls).classes("w-full bg-transparent"):
+    _tab_by_label = {
+        "Scrolls": tab_scrolls, "Activities": tab_activities,
+        "Shadows": tab_shadows, "Tools": tab_tools, "Skills": tab_skills,
+    }
+    initial_tab = _tab_by_label.get(target_tab_label, tab_scrolls)
+
+    with ui.tab_panels(tabs, value=initial_tab).classes("w-full bg-transparent"):
 
         with ui.tab_panel(tab_scrolls):
-            _scrolls_tab(state, vault)
+            _scrolls_tab(state, vault, preselect_id=deeplink_id if deeplink_type == "scroll" else None)
 
         with ui.tab_panel(tab_activities):
             from systemu.interface.pages.activities import build_activities_page
@@ -59,12 +69,25 @@ def build_workshop_page() -> None:
         with ui.tab_panel(tab_skills):
             _skills_tab(vault)
 
+    # v0.8.8: auto-open the entity editor for non-scroll deeplinks
+    if deeplink_id and deeplink_type in ("shadow", "tool", "skill"):
+        try:
+            if deeplink_type == "shadow":
+                _open_shadow_edit(deeplink_id, vault)
+            elif deeplink_type == "tool":
+                _open_tool_edit(deeplink_id, vault)
+            elif deeplink_type == "skill":
+                _open_skill_edit(deeplink_id, vault)
+        except Exception:
+            # Best-effort: if the entity is gone, the _open_*_edit notify handles it.
+            pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Scrolls tab — keep existing interactive behaviour intact
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _scrolls_tab(state, vault) -> None:
+def _scrolls_tab(state, vault, preselect_id: str | None = None) -> None:
     scrolls = vault.load_index("scrolls")
     if not scrolls:
         ui.label("No scrolls available.").style(f"color: {THEME['text_muted']};")
@@ -73,6 +96,9 @@ def _scrolls_tab(state, vault) -> None:
     ui.label("Select a Scroll to modify:").style(f"font-weight: 600; color: {THEME['text']};")
     options = {s["id"]: f"{s['name']} (ID: {s['id']})" for s in scrolls}
     selected_scroll = ui.radio(options).style(f"color: {THEME['text']}; margin-bottom: 20px;")
+    # v0.8.8: pre-select when arriving via Edit deeplink
+    if preselect_id and preselect_id in options:
+        selected_scroll.value = preselect_id
 
     def show_scroll_data():
         if not selected_scroll.value:
@@ -191,7 +217,7 @@ def _open_shadow_edit(shadow_id: str, vault) -> None:
 
         f_desc = ui.textarea("Description", value=shadow.description).classes("w-full")
 
-        # identity split — two-field editor.  `identity_block` is the
+        # v0.3 identity split — two-field editor.  `identity_block` is the
         # operator-controlled persona contract.  `accumulated_voice` is
         # consolidator-grown (see docs/memory-model.md) and shown
         # read-only so the operator can audit what the runtime has
@@ -219,7 +245,7 @@ def _open_shadow_edit(shadow_id: str, vault) -> None:
             "docs/memory-model.md."
         ).style(f"color: {THEME['text_muted']}; font-size: 12px; margin-top: 4px;")
 
-        # per-shadow Intelligent Supervisor toggle.  When on,
+        # v0.4.2-b: per-shadow Intelligent Supervisor toggle.  When on,
         # the v0.4.0 supervisor activates for this specific shadow even if
         # the global SYSTEMU_INTELLIGENT_SUPERVISOR flag is off.  Lets the
         # operator A/B test the supervisor on one specialist before
@@ -238,7 +264,7 @@ def _open_shadow_edit(shadow_id: str, vault) -> None:
             f"color: {THEME['text_muted']}; font-size: 12px; margin-top: 4px;"
         )
 
-        # operator-labelled specialty for routing preference.
+        # v0.4.3-b: operator-labelled specialty for routing preference.
         _section_label("Specialty (routing preference)")
         f_specialty = ui.input(
             "Specialty tag",

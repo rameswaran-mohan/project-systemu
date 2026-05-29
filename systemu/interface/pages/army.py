@@ -13,6 +13,7 @@ from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
 from systemu.interface.jobs import JobManager, JobStatus, Job
+from systemu.interface.nav_helpers import workshop_deeplink
 
 
 _STATUS_ICON = {
@@ -324,6 +325,15 @@ def _shadow_card(sh: dict) -> None:
             ui.button(
                 "📅 Schedule",
                 on_click=lambda _, sid=uid: _show_schedule_dialog(sid),
+            ).style(
+                f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                f"border: 1px solid {THEME['border']}; border-radius: 6px; "
+                f"padding: 4px 10px; font-size: 12px; margin-left: 6px;"
+            )
+            # v0.8.8: deep-link into Workshop Shadows tab (auto-opens editor)
+            ui.button(
+                "✏️ Edit",
+                on_click=lambda _, sid=uid: ui.navigate.to(workshop_deeplink("shadow", sid)),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
                 f"border: 1px solid {THEME['border']}; border-radius: 6px; "

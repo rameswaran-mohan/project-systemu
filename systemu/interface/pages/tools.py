@@ -21,6 +21,7 @@ import logging
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.nav_helpers import workshop_deeplink
 
 logger = logging.getLogger(__name__)
 
@@ -236,30 +237,35 @@ def build_tools_page() -> None:
 
                     # Actions column — v0.7.4 Pattern 2: dynamic per-row buttons
                     with ui.element("td").style("padding: 12px 16px;"):
-                        if status == "proposed":
-                            ui.button(
-                                "Review & Forge",
-                                on_click=lambda _, i=tid: _show_spec_review_dialog(i),
-                            ).style(
-                                f"background: {THEME['warning']}; color: white; "
-                                f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
-                            )
-                        else:
-                            _actions = _row_actions_for(t)
-                            if not _actions:
-                                ui.label("—").style(f"color: {THEME['text_muted']}; font-size: 12px;")
+                        with ui.row().style("gap: 6px;"):
+                            if status == "proposed":
+                                ui.button(
+                                    "Review & Forge",
+                                    on_click=lambda _, i=tid: _show_spec_review_dialog(i),
+                                ).style(
+                                    f"background: {THEME['warning']}; color: white; "
+                                    f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
+                                )
                             else:
-                                with ui.row().style("gap: 6px;"):
-                                    for _a in _actions:
-                                        if _a["kind"] == "dryrun":
-                                            ui.button(
-                                                _a["label"],
-                                                on_click=lambda _, tid=_a["tool_id"]: _dispatch_dryrun(tid),
-                                            ).style(
-                                                f"background: {THEME['surface2']}; color: {THEME['text']}; "
-                                                f"border: 1px solid {THEME['border']}; border-radius: 6px; "
-                                                f"font-size: 12px; padding: 4px 10px;"
-                                            )
+                                for _a in _row_actions_for(t):
+                                    if _a["kind"] == "dryrun":
+                                        ui.button(
+                                            _a["label"],
+                                            on_click=lambda _, tid=_a["tool_id"]: _dispatch_dryrun(tid),
+                                        ).style(
+                                            f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                                            f"border: 1px solid {THEME['border']}; border-radius: 6px; "
+                                            f"font-size: 12px; padding: 4px 10px;"
+                                        )
+                            # v0.8.8: deep-link into Workshop Tools tab (auto-opens editor)
+                            ui.button(
+                                "✏️ Edit",
+                                on_click=lambda _, i=tid: ui.navigate.to(workshop_deeplink("tool", i)),
+                            ).style(
+                                f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                                f"border: 1px solid {THEME['border']}; border-radius: 6px; "
+                                f"font-size: 12px; padding: 4px 10px;"
+                            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

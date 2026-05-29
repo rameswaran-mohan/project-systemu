@@ -12,6 +12,7 @@ from pathlib import Path
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.nav_helpers import workshop_deeplink
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,17 @@ def _skill_row(s: dict, vault) -> None:
                     f'<span style="font-size: 11px; color: {THEME["text_muted"]}; white-space: nowrap;">'
                     f'📜 {len(evidence)} scroll{"s" if len(evidence) != 1 else ""}</span>'
                 )
+
+            # v0.8.8: deep-link into Workshop Skills tab (auto-opens editor).
+            # @click.stop keeps the button from also toggling the row's detail panel.
+            ui.button(
+                "✏️ Edit",
+                on_click=lambda _, i=skill_id: ui.navigate.to(workshop_deeplink("skill", i)),
+            ).props("@click.stop").style(
+                f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                f"border: 1px solid {THEME['border']}; border-radius: 6px; "
+                f"font-size: 12px; padding: 4px 10px; white-space: nowrap;"
+            )
 
             # Expand chevron
             ui.label("▾").style(f"color: {THEME['text_muted']}; font-size: 14px;")

@@ -68,9 +68,13 @@ def _autoforge_banner_message() -> "str | None":
 # redirect handlers in register_routes() below — bookmarks and email
 # deep-links continue to work.
 
+# v0.8.8: Console is a standalone top item (ungrouped), rendered above the
+# grouped nav. Overview was removed from the Run group — Console at "/" is
+# the new home/console surface.
+NAV_TOP = ("/", "🖥️", "Console")
+
 NAV_GROUPS = [
     ("Run", True, [
-        ("/",               "🏠",  "Overview"),
         ("/chat",           "💬",  "Chat"),
         ("/scrolls",        "📜",  "Scrolls"),
         ("/army",           "👥",  "Shadows"),
@@ -88,10 +92,8 @@ NAV_GROUPS = [
     ]),
 ]
 
-# Back-compat shim: a flat list of (path, icon, label) for any external
-# importer that scanned the old NAV_ITEMS symbol.  Built once at import
-# time so the cost is zero on subsequent reads.
-NAV_ITEMS = [item for _, _, items in NAV_GROUPS for item in items]
+# Back-compat flat list — Console first, then all grouped items.
+NAV_ITEMS = [NAV_TOP] + [item for _, _, items in NAV_GROUPS for item in items]
 
 
 def _build_layout(page_title: str, current_path: str):
@@ -165,6 +167,9 @@ def _build_layout(page_title: str, current_path: str):
                     if current_path == path or (path != "/" and current_path.startswith(path)):
                         return True
                 return False
+
+            # v0.8.8: standalone Console link, above the grouped nav
+            _render_nav_link(*NAV_TOP)
 
             for group_label, default_open, items in NAV_GROUPS:
                 # Force-expand the group containing the active route — even
@@ -536,7 +541,7 @@ def register_routes() -> None:
     from nicegui import ui
 
     # Deferred imports to keep this module importable without nicegui installed
-    from systemu.interface.pages.overview                  import build_overview_page
+    from systemu.interface.pages.console                   import build_console_page
     from systemu.interface.pages.scrolls                   import build_scrolls_page
     from systemu.interface.pages.army                      import build_army_page
     from systemu.interface.pages.tools                     import build_tools_page
@@ -552,9 +557,9 @@ def register_routes() -> None:
     from systemu.interface.pages import recover as _recover_page_module  # noqa: F401  # registers /recover/<scope>/<id>
 
     @ui.page("/")
-    def page_overview():
-        with _build_layout("🏠 Overview", "/"):
-            build_overview_page()
+    def page_console():
+        with _build_layout("🖥️ Console", "/"):
+            build_console_page()
 
     @ui.page("/workflow/{workflow_id}")
     def page_workflow_detail(workflow_id: str):
@@ -602,9 +607,9 @@ def register_routes() -> None:
             build_skills_page()
 
     @ui.page("/workshop")
-    def page_workshop():
+    def page_workshop(type: str = "", id: str = ""):
         with _build_layout("🛠️ Workshop", "/workshop"):
-            build_workshop_page()
+            build_workshop_page(deeplink_type=type or None, deeplink_id=id or None)
 
     @ui.page("/evolutions")
     def page_evolutions():

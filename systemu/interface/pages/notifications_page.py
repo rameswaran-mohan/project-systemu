@@ -256,6 +256,47 @@ def _load_events(vault, max_lines: int = 200) -> List[Dict[str, Any]]:
         return []
 
 
+def build_events_log_pane(max_rows: int = 50, height_px: int = 320) -> None:
+    """Compact event-log pane for the v0.8.8 Console right column.
+
+    Renders the last ``max_rows`` events from the same file-tail source the
+    /insights Events tab uses (``_load_events``), color-coded by level, inside
+    a fixed-height scroll area. Refreshes every 2s via ui.timer.
+
+    Self-contained: drop it into any column and it wires its own refresh.
+    """
+    from systemu.interface.dashboard_state import AppState
+    state = AppState.get()
+
+    @ui.refreshable
+    def _pane():
+        events = _load_events(state.vault)
+        events = events[-max_rows:]
+        if not events:
+            ui.label("No events yet.").style(
+                f"color: {THEME['text_muted']}; font-size: 12px;"
+            )
+            return
+        for ev in events:
+            _level = (ev.get("level") or "INFO").upper()
+            _color = {
+                "ERROR":   THEME["danger"],
+                "WARNING": THEME["warning"],
+                "SUCCESS": THEME["success"],
+            }.get(_level, THEME["text_muted"])
+            with ui.row().style("gap: 8px; align-items: baseline; padding: 2px 0;"):
+                ui.label(f"[{_level}]").style(
+                    f"color: {_color}; font-size: 11px; font-weight: 700; min-width: 70px;"
+                )
+                ui.label(str(ev.get("message", ""))[:200]).style(
+                    f"color: {THEME['text']}; font-size: 12px;"
+                )
+
+    with ui.scroll_area().style(f"height: {height_px}px; width: 100%;"):
+        _pane()
+    ui.timer(2.0, _pane.refresh)
+
+
 def _load_pending_notifications(vault) -> List[Dict[str, Any]]:
     """Load pending notifications from the vault."""
     try:
