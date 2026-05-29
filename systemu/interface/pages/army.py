@@ -12,6 +12,7 @@ from __future__ import annotations
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.jobs import JobManager, JobStatus, Job
 
 
 _STATUS_ICON = {
@@ -19,6 +20,202 @@ _STATUS_ICON = {
     "dormant":  "💤",
     "retired":  "🪦",
 }
+
+
+def _build_execute_jobs_panel_view_model(job_manager) -> dict:
+    """Pure-data view model for the Recent Execute Jobs panel.
+
+    Returns:
+      {
+        "queued":    [{id, name, position, dedup_key, type, ...}, ...],
+        "running":   [{id, name, started_at, type, ...}, ...],
+        "completed": [{id, name, status, finished_at, type, ...}, ...],
+      }
+
+    Total entries across the three groups is capped at 30 (spec acceptance #5).
+    Non-execute jobs (capture/forge/etc.) are filtered out.
+    """
+    queued: list = []
+    running: list = []
+    completed: list = []
+    for j in job_manager.jobs.values():
+        if j.type != "execute":
+            continue
+        entry = {
+            "id":         j.id,
+            "name":       j.name,
+            "type":       j.type,
+            "status":     j.status.value,
+            "dedup_key":  getattr(j, "dedup_key", ""),
+            "start_time": j.start_time.isoformat(),
+        }
+        if j.status == JobStatus.QUEUED:
+            queued.append(entry)
+        elif j.status in (JobStatus.RUNNING, JobStatus.STOPPING):
+            running.append(entry)
+        else:
+            completed.append(entry)
+    # Sort: queued oldest-first (position #1 = next to run); completed newest-first
+    queued.sort(key=lambda e: e["start_time"])
+    running.sort(key=lambda e: e["start_time"])
+    completed.sort(key=lambda e: e["start_time"], reverse=True)
+    # Position numbers for queued
+    for i, e in enumerate(queued):
+        e["position"] = i + 1
+    # Cap total at 30: keep all queued + running, fill rest with most-recent completed
+    available = 30 - len(queued) - len(running)
+    if available < 0:
+        available = 0
+    completed = completed[:available]
+    return {"queued": queued, "running": running, "completed": completed}
+
+
+@ui.refreshable
+def _render_execute_jobs_panel() -> None:
+    """v0.8.6: Recent Execute Jobs panel — queued/running/completed."""
+    jm = JobManager.get()
+    vm = _build_execute_jobs_panel_view_model(jm)
+
+    with ui.row().style("gap: 12px; width: 100%; margin-bottom: 16px;"):
+        for label, key, color in (
+            ("⏳ Queued", "queued", THEME["warning"]),
+            ("▶️ Running", "running", THEME["primary"]),
+            ("✓ Completed", "completed", THEME["success"]),
+        ):
+            with ui.card().style(
+                f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+                f"border-radius: 12px; padding: 16px; flex: 1; min-height: 120px;"
+            ):
+                ui.label(f"{label} ({len(vm[key])})").style(
+                    f"font-size: 13px; font-weight: 700; color: {color}; margin-bottom: 8px;"
+                )
+                for entry in vm[key]:
+                    with ui.row().style("gap: 6px; align-items: center; margin-bottom: 4px;"):
+                        if key == "queued":
+                            ui.label(f"#{entry['position']}").style(
+                                f"color: {THEME['text_muted']}; font-size: 11px; min-width: 24px;"
+                            )
+                        ui.label(entry["name"]).style(
+                            f"color: {THEME['text']}; font-size: 12px; flex: 1;"
+                        )
+                        if key in ("queued", "running"):
+                            def _make_cancel(jid=entry["id"], status=entry["status"]):
+                                def _click(_e=None):
+                                    if status == "queued":
+                                        ok = jm.cancel_queued(jid)
+                                    else:
+                                        jm.cancel_job_hard(jid)
+                                        ok = True
+                                    if ok:
+                                        ui.notify("Cancelled", type="positive")
+                                        _render_execute_jobs_panel.refresh()
+                                return _click
+                            ui.button("Cancel", on_click=_make_cancel()).style(
+                                f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                                f"font-size: 10px; padding: 2px 8px; border-radius: 4px;"
+                            )
+                if not vm[key]:
+                    ui.label("—").style(f"color: {THEME['text_muted']}; font-size: 12px;")
+
+
+def _format_relative_time(target_dt) -> str:
+    """Return 'in 23 min' / 'in 2h 14m' / 'now' / 'overdue'."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    delta = target_dt - now
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "overdue"
+    if secs < 60:
+        return "now"
+    mins = secs // 60
+    if mins < 60:
+        return f"in {mins} min"
+    hours = mins // 60
+    rem = mins % 60
+    if hours < 24:
+        return f"in {hours}h {rem}m"
+    days = hours // 24
+    return f"in {days}d {hours % 24}h"
+
+
+def _build_schedules_list_view_model(vault) -> list:
+    """Pure-data view model for the Schedules list panel."""
+    from systemu.scheduler.schedule_registry import list_active_schedules
+    shadows = {s.get("id"): s.get("name", s.get("id")) for s in vault.list_shadows()}
+    try:
+        scrolls = {s["id"]: s.get("name", s["id"]) for s in vault.load_index("scrolls")}
+    except Exception:
+        scrolls = {}
+    out = []
+    for sched in list_active_schedules(vault):
+        out.append({
+            "id":                  sched.id,
+            "shadow_id":           sched.shadow_id,
+            "scroll_id":           sched.scroll_id,
+            "shadow_name":         shadows.get(sched.shadow_id, sched.shadow_id),
+            "scroll_name":         scrolls.get(sched.scroll_id, sched.scroll_id),
+            "mode":                sched.mode.value,
+            "interval_minutes":    sched.interval_minutes,
+            "next_fire_at":        sched.next_fire_at.isoformat(),
+            "next_fire_relative":  _format_relative_time(sched.next_fire_at),
+            "dry_run":             sched.dry_run,
+        })
+    return out
+
+
+@ui.refreshable
+def _render_schedules_list_panel() -> None:
+    """v0.8.6: Active Schedules panel on /army."""
+    state = AppState.get()
+    vm = _build_schedules_list_view_model(state.vault)
+
+    with ui.card().style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; padding: 16px; margin-bottom: 16px;"
+    ):
+        with ui.row().style("align-items: center; gap: 8px; margin-bottom: 8px;"):
+            ui.label("📅 Active Schedules").style(
+                f"font-size: 14px; font-weight: 700; color: {THEME['text']};"
+            )
+            ui.label(f"({len(vm)})").style(f"color: {THEME['text_muted']};")
+
+        if not vm:
+            ui.label("No active schedules.").style(
+                f"color: {THEME['text_muted']}; font-size: 12px;"
+            )
+            return
+
+        for entry in vm:
+            with ui.row().style(
+                f"gap: 12px; align-items: center; padding: 6px 0; "
+                f"border-bottom: 1px solid {THEME['border']};"
+            ):
+                ui.label(entry["shadow_name"]).style(
+                    f"color: {THEME['text']}; font-size: 12px; font-weight: 600; min-width: 100px;"
+                )
+                ui.label("→").style(f"color: {THEME['text_muted']};")
+                ui.label(entry["scroll_name"]).style(
+                    f"color: {THEME['text']}; font-size: 12px; flex: 1;"
+                )
+                mode_label = "Once" if entry["mode"] == "once" else f"Every {entry['interval_minutes']}m"
+                ui.label(mode_label).style(
+                    f"color: {THEME['text_muted']}; font-size: 11px;"
+                )
+                ui.label(entry["next_fire_relative"]).style(
+                    f"color: {THEME['primary']}; font-size: 11px; min-width: 80px;"
+                )
+                def _make_cancel(sid=entry["id"]):
+                    def _click(_e=None):
+                        from systemu.scheduler.schedule_registry import cancel_schedule
+                        if cancel_schedule(sid, state.vault):
+                            ui.notify("Schedule cancelled", type="positive")
+                            _render_schedules_list_panel.refresh()
+                    return _click
+                ui.button("Cancel", on_click=_make_cancel()).style(
+                    f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                    f"font-size: 10px; padding: 2px 8px; border-radius: 4px;"
+                )
 
 
 def build_army_page() -> None:
@@ -32,6 +229,14 @@ def build_army_page() -> None:
         ui.button("+ Awaken New Shadow", on_click=_show_awaken_dialog).style(
             f"background: {THEME['primary']}; color: white; border-radius: 8px;"
         )
+
+    # v0.8.6: recent execute jobs panel
+    _render_execute_jobs_panel()
+    ui.timer(2.0, _render_execute_jobs_panel.refresh)
+
+    # v0.8.6: active schedules panel
+    _render_schedules_list_panel()
+    ui.timer(30.0, _render_schedules_list_panel.refresh)
 
     shadows = vault.load_index("shadow_army")
 
@@ -116,6 +321,14 @@ def _shadow_card(sh: dict) -> None:
                 f"background: {color}; color: white; border-radius: 8px; "
                 f"font-size: 12px; flex: 1;"
             )
+            ui.button(
+                "📅 Schedule",
+                on_click=lambda _, sid=uid: _show_schedule_dialog(sid),
+            ).style(
+                f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                f"border: 1px solid {THEME['border']}; border-radius: 6px; "
+                f"padding: 4px 10px; font-size: 12px; margin-left: 6px;"
+            )
 
 
 def _mini_stat(icon: str, value: str, label: str) -> None:
@@ -164,12 +377,12 @@ def _show_shadow_detail(shadow_id: str) -> None:
         if shadow.assigned_activity_ids:
             _detail_section("Activities", " · ".join(shadow.assigned_activity_ids))
 
-        # operator-labelled specialty tag (routing preference).
+        # v0.4.3-b: operator-labelled specialty tag (routing preference).
         specialty = str(getattr(shadow, "specialty", "") or "")
         if specialty:
             _detail_section("Specialty", specialty)
 
-        # surface the per-shadow Intelligent Supervisor opt-in.
+        # v0.4.2-b: surface the per-shadow Intelligent Supervisor opt-in.
         # Editable in the Workshop (separate page); read-only here so the
         # operator can see at a glance which shadows have it enabled.
         supervisor_on = bool(getattr(shadow, "supervisor_enabled", False))
@@ -188,7 +401,7 @@ def _show_shadow_detail(shadow_id: str) -> None:
                 f"font-size: 11px; color: {THEME['text_muted']};"
             )
 
-        # Shadow success metrics by intent_hash.  Operator can see
+        # v0.4.4-b: Shadow success metrics by intent_hash.  Operator can see
         # what kinds of work this shadow has succeeded / failed on.
         try:
             from systemu.runtime.shadow_metrics import get_shadow_metrics
@@ -238,7 +451,7 @@ def _show_shadow_detail(shadow_id: str) -> None:
                     ui.label(f"[{entry.get('status', '?').upper()}]").style(f"color: {color}; font-size: 12px; font-weight: 700;")
                     ui.label(entry.get("summary", "")[:80]).style(f"font-size: 12px; color: {THEME['text']};")
 
-        # embedded recovery panel for this shadow
+        # v0.6.8-b: embedded recovery panel for this shadow
         ui.separator().style(f"background: {THEME['border']}; margin: 12px 0;")
         try:
             from systemu.interface.pages.recover import render_recovery_panel
@@ -297,6 +510,121 @@ def _show_execute_dialog(shadow_id: str) -> None:
 
         with ui.row().style("gap: 10px; margin-top: 16px;"):
             ui.button("▶ Execute", on_click=_do_execute).style(
+                f"background: {THEME['primary']}; color: white; border-radius: 8px;"
+            )
+            ui.button("Cancel", on_click=dlg.close).style(
+                f"background: {THEME['surface2']}; color: {THEME['text']}; border-radius: 8px;"
+            )
+    dlg.open()
+
+
+def _validate_schedule_payload(mode: str, scheduled_at: str, interval_minutes: int | None,
+                                end_at: str | None) -> tuple[bool, str]:
+    """Return (ok, error_message). Used by the Schedule dialog before persistence."""
+    from datetime import datetime, timezone
+    try:
+        sched_dt = datetime.fromisoformat(scheduled_at)
+    except Exception:
+        return False, "scheduled_at must be a valid ISO datetime"
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    sched_dt_naive = sched_dt.replace(tzinfo=None) if sched_dt.tzinfo else sched_dt
+    if sched_dt_naive <= now:
+        return False, "scheduled_at is in the past — pick a future time"
+    if mode == "recurring":
+        if not interval_minutes:
+            return False, "interval_minutes is required for recurring schedules"
+        if interval_minutes < 5:
+            return False, "interval_minutes must be at least 5 minutes"
+    return True, ""
+
+
+def _show_schedule_dialog(shadow_id: str) -> None:
+    """v0.8.6: dialog for creating a one-time or recurring scheduled execute."""
+    state = AppState.get()
+    scrolls = state.vault.load_index("scrolls")
+
+    with ui.dialog() as dlg, ui.card().style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 16px; padding: 28px; min-width: 480px;"
+    ):
+        ui.label("📅 Schedule Execution").style(
+            f"font-size: 18px; font-weight: 700; color: {THEME['text']}; margin-bottom: 16px;"
+        )
+
+        scroll_select = ui.select(
+            label="Scroll",
+            options={s["id"]: s.get("name", s["id"]) for s in scrolls},
+        ).style("width: 100%;")
+        dry_run = ui.checkbox("Dry-run (no real tool execution)").style(f"color: {THEME['text']};")
+        dry_run.value = True
+
+        mode_radio = ui.radio(
+            options={"once": "One-time", "recurring": "Recurring"},
+            value="once",
+        ).style("margin-top: 12px;")
+
+        from datetime import datetime, timedelta
+        default_when = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M")
+        scheduled_at_input = ui.input(
+            label="Run at (local time)",
+            value=default_when,
+        ).props("type=datetime-local").style("width: 100%; margin-top: 12px;")
+
+        interval_input = ui.number(
+            label="Every (minutes)",
+            value=60, min=5,
+        ).style("width: 100%; margin-top: 12px;").bind_visibility_from(mode_radio, "value",
+                                                                       lambda v: v == "recurring")
+
+        end_at_input = ui.input(
+            label="End date (optional, recurring only)",
+        ).props("type=date").style("width: 100%; margin-top: 12px;").bind_visibility_from(
+            mode_radio, "value", lambda v: v == "recurring",
+        )
+
+        def _do_schedule():
+            mode_val = mode_radio.value
+            if not scroll_select.value:
+                ui.notify("Please select a scroll.", type="warning")
+                return
+            sched_iso = scheduled_at_input.value
+            interval = int(interval_input.value) if mode_val == "recurring" else None
+            end_iso = end_at_input.value if (mode_val == "recurring" and end_at_input.value) else None
+
+            ok, err = _validate_schedule_payload(mode_val, sched_iso, interval, end_iso)
+            if not ok:
+                ui.notify(err, type="negative")
+                return
+
+            from datetime import datetime
+            from systemu.scheduler.schedule_registry import create_schedule
+            from systemu.core.models import ScheduleMode
+
+            sched_dt = datetime.fromisoformat(sched_iso)
+            end_dt = datetime.fromisoformat(end_iso) if end_iso else None
+            mode_enum = ScheduleMode.RECURRING if mode_val == "recurring" else ScheduleMode.ONCE
+
+            try:
+                sched = create_schedule(
+                    shadow_id=shadow_id,
+                    scroll_id=scroll_select.value,
+                    mode=mode_enum,
+                    interval_minutes=interval,
+                    scheduled_at=sched_dt,
+                    end_at=end_dt,
+                    dry_run=dry_run.value,
+                    vault=state.vault,
+                )
+                ui.notify(
+                    f"Scheduled — next fire: {sched.next_fire_at.isoformat(timespec='minutes')}",
+                    type="positive",
+                )
+                dlg.close()
+            except Exception as exc:
+                ui.notify(f"Error: {exc}", type="negative")
+
+        with ui.row().style("gap: 10px; margin-top: 20px;"):
+            ui.button("📅 Schedule", on_click=_do_schedule).style(
                 f"background: {THEME['primary']}; color: white; border-radius: 8px;"
             )
             ui.button("Cancel", on_click=dlg.close).style(

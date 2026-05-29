@@ -924,3 +924,81 @@ def _graduate_memory_to_skills(shadow, memory_md: str, vault) -> None:
 
     if proposed:
         logger.info("[Job] Proposed %d skill graduation(s) for shadow %s", proposed, shadow.id)
+
+
+def _scheduled_execute_job() -> None:
+    """v0.8.6: APScheduler job — every minute, find due schedules and dispatch.
+
+    Each tick:
+      - Lists ACTIVE schedules whose next_fire_at <= now
+      - For each, calls JobManager.start_job with a dedup_key so a duplicate
+        click + schedule fire don't both spawn
+      - mark_fired() advances next_fire_at (recurring) or marks COMPLETED (once),
+        regardless of whether the dispatch actually spawned — this prevents a
+        permanently-blocked dedup from causing the same schedule to retry every
+        minute forever.
+    """
+    if _config is None or _vault is None:
+        return
+
+    from datetime import datetime, timezone
+    from systemu.scheduler.schedule_registry import list_active_schedules
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    due = [s for s in list_active_schedules(_vault) if s.next_fire_at <= now]
+
+    if not due:
+        return
+
+    logger.info("[Scheduler] %d schedule(s) due — dispatching", len(due))
+    for schedule in due:
+        try:
+            _dispatch_scheduled(schedule, now, _config, _vault)
+        except Exception:
+            logger.exception("[Scheduler] dispatch failed for schedule %s", schedule.id)
+
+
+def _dispatch_scheduled(schedule, now, config, vault) -> None:
+    """Fire one scheduled execution via JobManager, then advance the schedule."""
+    from systemu.interface.jobs import JobManager
+    from systemu.scheduler.schedule_registry import mark_fired
+    from pathlib import Path
+    import sys
+
+    jm = JobManager.get()
+    dedup_key = f"execute:{schedule.shadow_id}:{schedule.scroll_id}"
+
+    existing = jm.find_active_by_dedup_key(dedup_key)
+    if existing is not None:
+        logger.info(
+            "[Scheduler] Schedule %s skipped — previous job %s still %s",
+            schedule.id, existing.id, existing.status.value,
+        )
+        mark_fired(schedule.id, now, vault)
+        return
+
+    project_root = str(Path(config.vault_dir).parent.parent.resolve())
+    cmd = [
+        sys.executable, "-m", "sharing_on",
+        "army", "execute", schedule.shadow_id, schedule.scroll_id,
+    ]
+    if schedule.dry_run:
+        cmd.append("--dry-run")
+
+    try:
+        job = jm.start_job(
+            name=f"Scheduled Execute: {schedule.scroll_id[:12]}",
+            job_type="execute",
+            cmd=cmd,
+            cwd=project_root,
+            dedup_key=dedup_key,
+        )
+        logger.info(
+            "[Scheduler] Schedule %s fired → job %s (%s)",
+            schedule.id, job.id, job.status.value,
+        )
+    except RuntimeError as exc:
+        # Queue full, etc. — log + advance schedule (skip-missed semantics)
+        logger.warning("[Scheduler] Could not dispatch schedule %s: %s", schedule.id, exc)
+
+    mark_fired(schedule.id, now, vault)

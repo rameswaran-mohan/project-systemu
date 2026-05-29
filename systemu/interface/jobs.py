@@ -6,6 +6,7 @@ import signal
 import logging
 import subprocess
 import threading
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
@@ -20,8 +21,17 @@ _JOB_TIMEOUT_SECONDS = 7200   # 2 hours
 _POLL_INTERVAL       = 1.0    # seconds between process.poll() checks
 _TERMINAL_KEEP       = 20     # max completed/failed/cancelled jobs retained in dict
 
+# v0.8.6: bounded concurrency for execute jobs (operator-initiated subprocess flows)
+JOBMANAGER_MAX_CONCURRENT_EXECUTE = int(
+    os.environ.get("JOBMANAGER_MAX_CONCURRENT_EXECUTE", "3")
+)
+JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH = int(
+    os.environ.get("JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH", "50")
+)
+
 
 class JobStatus(Enum):
+    QUEUED    = "queued"      # v0.8.6: waiting for an execute slot
     RUNNING   = "running"
     STOPPING  = "stopping"
     COMPLETED = "completed"
@@ -39,6 +49,7 @@ class Job:
     output_dir: Optional[str]             = None
     on_cancel:  Optional[Callable[['Job'], None]] = None
     start_time: datetime = field(default_factory=datetime.now)  # per-instance, not shared
+    dedup_key:  str = ""    # v0.8.6: scope-of-uniqueness for execute jobs
 
 
 class JobManager:
@@ -47,6 +58,14 @@ class JobManager:
     def __init__(self):
         self.jobs: Dict[str, Job] = {}
         self.lock = threading.Lock()
+        self._execute_pending: deque = deque()   # v0.8.6: queued execute jobs
+        # v0.8.6: background dispatcher drains QUEUED execute jobs when slots free.
+        self._dispatcher_thread = threading.Thread(
+            target=self._dispatcher_loop,
+            daemon=True,
+            name="jobs-execute-dispatcher",
+        )
+        self._dispatcher_thread.start()
 
     @classmethod
     def get(cls) -> 'JobManager':
@@ -79,9 +98,63 @@ class JobManager:
         cwd:        str,
         on_cancel:  Callable = None,
         output_dir: str = None,
+        dedup_key:  str = "",
     ) -> Job:
+        # v0.8.6: dedup check — if a non-terminal job with this key exists, return it.
+        if dedup_key:
+            existing = self.find_active_by_dedup_key(dedup_key)
+            if existing is not None:
+                logger.info("[Jobs] dedup_key %r matches existing job %s (%s) — returning existing",
+                            dedup_key, existing.id, existing.status.value)
+                return existing
+
         job_id = str(uuid.uuid4())[:8]
 
+        # v0.8.6: for execute jobs, check concurrency cap BEFORE spawning.
+        if job_type == "execute":
+            with self.lock:
+                running_execute_count = sum(
+                    1 for j in self.jobs.values()
+                    if j.type == "execute" and j.status == JobStatus.RUNNING
+                )
+                queued_execute_count = sum(
+                    1 for j in self.jobs.values()
+                    if j.type == "execute" and j.status == JobStatus.QUEUED
+                )
+                total_execute = running_execute_count + queued_execute_count
+                if total_execute >= JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH:
+                    raise RuntimeError(
+                        f"execute queue full ({total_execute} jobs in flight; "
+                        f"cap is {JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH})"
+                    )
+                slot_free = running_execute_count < JOBMANAGER_MAX_CONCURRENT_EXECUTE
+
+            if not slot_free:
+                # Enqueue: create a Job with status=QUEUED, no Popen
+                job = Job(
+                    id=job_id, name=name, type=job_type,
+                    status=JobStatus.QUEUED, process=None,
+                    output_dir=output_dir, on_cancel=on_cancel,
+                    dedup_key=dedup_key,
+                )
+                # Stash cmd+cwd as private attrs so the dispatcher can spawn later
+                job._cmd = list(cmd)
+                job._cwd = cwd
+                with self.lock:
+                    self.jobs[job_id] = job
+                    self._execute_pending.append(job)
+                logger.info(
+                    "[Jobs] Execute job %s enqueued (position %d) — running=%d/%d",
+                    job_id, len(self._execute_pending),
+                    running_execute_count, JOBMANAGER_MAX_CONCURRENT_EXECUTE,
+                )
+                return job
+
+        # Spawn immediately (non-execute, or execute with free slot)
+        return self._spawn_job(job_id, name, job_type, cmd, cwd, on_cancel, output_dir, dedup_key)
+
+    def _spawn_job(self, job_id, name, job_type, cmd, cwd, on_cancel, output_dir, dedup_key):
+        """Inner helper: build child env, Popen, register, start poll thread."""
         child_env = os.environ.copy()
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"]       = "1"
@@ -106,6 +179,11 @@ class JobManager:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fp = open(log_path, "a", encoding="utf-8")
 
+        # v0.8.6: execute jobs get a bridge file env so the subprocess can publish
+        # events back to the dashboard's EventBus via manual_events.jsonl
+        if job_type == "execute":
+            child_env["SYSTEMU_EVENT_BRIDGE_FILE"] = str(Path(vault_dir) / "manual_events.jsonl")
+
         proc = subprocess.Popen(
             cmd,
             cwd=cwd,
@@ -123,6 +201,7 @@ class JobManager:
             process=proc,
             output_dir=output_dir,
             on_cancel=on_cancel,
+            dedup_key=dedup_key,
         )
         with self.lock:
             self.jobs[job_id] = job
@@ -132,6 +211,17 @@ class JobManager:
             target=self._poll, args=(job, log_fp), daemon=True
         ).start()
         return job
+
+    def find_active_by_dedup_key(self, dedup_key: str) -> Optional[Job]:
+        """Return the first non-terminal job matching dedup_key, or None."""
+        if not dedup_key:
+            return None
+        with self.lock:
+            for job in self.jobs.values():
+                if (job.dedup_key == dedup_key and
+                    job.status in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.STOPPING)):
+                    return job
+        return None
 
     def stop_job_gracefully(self, job_id: str) -> None:
         """Send SIGINT / CTRL_BREAK to let the process flush and clean up."""
@@ -171,6 +261,71 @@ class JobManager:
                 job.on_cancel(job)
             except Exception as exc:
                 logger.error("[Jobs] Rollback handler for job %s raised: %s", job_id, exc)
+
+    def cancel_queued(self, job_id: str) -> bool:
+        """Cancel a QUEUED execute job: remove from pending deque + mark CANCELLED.
+
+        Does NOT affect RUNNING jobs (use cancel_job_hard for those).
+        Returns True if cancelled, False if not found or not QUEUED.
+        """
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None or job.status != JobStatus.QUEUED:
+                return False
+            try:
+                self._execute_pending.remove(job)
+            except ValueError:
+                pass   # already popped by dispatcher between status check + here
+            job.status = JobStatus.CANCELLED
+            logger.info("[Jobs] Queued execute job %s cancelled by operator", job_id)
+            return True
+
+    def _dispatcher_tick(self) -> None:
+        """One iteration of the execute dispatcher: promote oldest QUEUED if slot free."""
+        job_to_spawn: Optional[Job] = None
+        with self.lock:
+            running_execute_count = sum(
+                1 for j in self.jobs.values()
+                if j.type == "execute" and j.status == JobStatus.RUNNING
+            )
+            if running_execute_count >= JOBMANAGER_MAX_CONCURRENT_EXECUTE:
+                return
+            # Pop oldest QUEUED, skipping any that were cancelled between
+            # enqueue and now.
+            while self._execute_pending:
+                candidate = self._execute_pending.popleft()
+                if candidate.status == JobStatus.QUEUED:
+                    job_to_spawn = candidate
+                    break
+
+        if job_to_spawn is None:
+            return
+
+        # Reconstruct the cmd from job metadata; cmd+cwd were stashed on the
+        # Job during enqueue as private attrs. _spawn_job will flip status to RUNNING.
+        try:
+            self._spawn_job(
+                job_to_spawn.id, job_to_spawn.name, job_to_spawn.type,
+                getattr(job_to_spawn, "_cmd", []),
+                getattr(job_to_spawn, "_cwd", ""),
+                job_to_spawn.on_cancel,
+                job_to_spawn.output_dir,
+                job_to_spawn.dedup_key,
+            )
+            logger.info("[Jobs] Dispatcher promoted queued job %s to RUNNING", job_to_spawn.id)
+        except Exception:
+            logger.exception("[Jobs] Dispatcher failed to spawn queued job %s", job_to_spawn.id)
+            with self.lock:
+                job_to_spawn.status = JobStatus.FAILED
+
+    def _dispatcher_loop(self) -> None:
+        """Background thread: drain QUEUED execute jobs into RUNNING as slots free."""
+        while True:
+            try:
+                self._dispatcher_tick()
+            except Exception:
+                logger.exception("[Jobs] Dispatcher loop error — continuing")
+            time.sleep(1.0)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

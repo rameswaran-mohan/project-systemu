@@ -40,6 +40,23 @@ from rich import print as rprint
 console = Console()
 
 
+def _maybe_install_bridge_writer() -> None:
+    """v0.8.6: when run as an execute subprocess from the dashboard,
+    JobManager sets SYSTEMU_EVENT_BRIDGE_FILE. Install the writer so this
+    subprocess's EventBus events surface to the dashboard.
+    """
+    import os
+    bridge_file = os.environ.get("SYSTEMU_EVENT_BRIDGE_FILE", "")
+    if not bridge_file:
+        return
+    try:
+        from systemu.interface.event_bridge_writer import install_bridge_writer
+        install_bridge_writer(bridge_file)
+    except Exception:
+        # Bridge install failure must not break the subprocess
+        pass
+
+
 # ─── Shared initialiser ───────────────────────────────────────────────────────
 
 def _get_vault_and_config(ctx: click.Context):
@@ -928,6 +945,7 @@ def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool):
     Requires the Shadow to have at least one DEPLOYED tool. Use --dry-run to
     preview the execution plan without invoking real tools (all PROPOSED tools allowed).
     """
+    _maybe_install_bridge_writer()   # v0.8.6
     config, vault = _get_vault_and_config(ctx)
 
     try:
