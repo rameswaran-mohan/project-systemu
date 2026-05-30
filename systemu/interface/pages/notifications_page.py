@@ -272,11 +272,13 @@ def build_events_log_pane(max_rows: int = 50, height_px: int = 320) -> None:
     def _pane():
         events = _load_events(state.vault)
         events = events[-max_rows:]
+        events = list(reversed(events))   # v0.8.9: newest first
         if not events:
             ui.label("No events yet.").style(
                 f"color: {THEME['text_muted']}; font-size: 12px;"
             )
             return
+        from systemu.interface.components.live_events_pane import _format_event_time
         for ev in events:
             _level = (ev.get("level") or "INFO").upper()
             _color = {
@@ -284,7 +286,13 @@ def build_events_log_pane(max_rows: int = 50, height_px: int = 320) -> None:
                 "WARNING": THEME["warning"],
                 "SUCCESS": THEME["success"],
             }.get(_level, THEME["text_muted"])
+            tstr = _format_event_time(ev.get("ts") or ev.get("timestamp") or ev.get("time"))
             with ui.row().style("gap: 8px; align-items: baseline; padding: 2px 0;"):
+                if tstr:
+                    ui.label(tstr).style(
+                        f"color: {THEME['text_muted']}; font-size: 11px; "
+                        f"font-family: monospace; min-width: 62px;"
+                    )
                 ui.label(f"[{_level}]").style(
                     f"color: {_color}; font-size: 11px; font-weight: 700; min-width: 70px;"
                 )

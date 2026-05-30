@@ -35,7 +35,7 @@ def build_console_page() -> None:
     # ── Header + Quick Actions ─────────────────────────────────────────
     with ui.row().style("width: 100%; align-items: center; justify-content: space-between; margin-bottom: 16px;"):
         ui.label("🖥️ Console").style(
-            f"font-size: 26px; font-weight: 800; color: {THEME['text']};"
+            f"font-size: 20px; font-weight: 800; color: {THEME['text']};"
         )
         with ui.row().style("gap: 8px;"):
             ui.button("⚡ Record", on_click=_trigger_record_dialog).style(
@@ -58,57 +58,76 @@ def build_console_page() -> None:
                 f"border: 1px solid {THEME['warning']}; border-radius: 8px; font-size: 13px;"
             ).tooltip("Restart Supervisor threads — use when a shadow appears stuck")
 
-    # ── Clickable stat tiles ───────────────────────────────────────────
-    with ui.row().classes("w-full gap-4 flex-wrap"):
-        _stat_card("📜", "Scrolls",    len(scrolls),
-                   THEME["primary"], f"{len(pending_scrolls)} pending", nav_target=tile_nav_target("Scrolls"))
-        _stat_card("👥", "Shadows",    len(shadows),
-                   THEME["info"], f"{len([s for s in shadows if s.get('status')=='awakened'])} active",
-                   nav_target=tile_nav_target("Shadows"))
-        _stat_card("🔧", "Tools",      len(tools),
-                   THEME["success"], f"{len([t for t in tools if t.get('status')=='forged'])} forged",
-                   nav_target=tile_nav_target("Tools"))
-        _stat_card("🧠", "Skills",     len(skills),
-                   "#a78bfa", "across all shadows", nav_target=tile_nav_target("Skills"))
-        _stat_card("📋", "Activities", len(activities),
-                   THEME["info"], f"{len([a for a in activities if a.get('status')=='unassigned'])} unassigned",
-                   nav_target=tile_nav_target("Activities"))
-        _stat_card("🧬", "Evolutions", len(pending_evolutions),
-                   THEME["warning"], "pending review", nav_target=tile_nav_target("Evolutions"))
+    # ── Overview (clickable stat tiles) — collapsed ────────────────────
+    with ui.expansion("Overview", value=False).classes("w-full").style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; margin-bottom: 8px;"
+    ):
+        with ui.row().classes("w-full gap-4 flex-wrap").style("padding: 8px;"):
+            _stat_card("📜", "Scrolls", len(scrolls), THEME["primary"],
+                       f"{len(pending_scrolls)} pending", nav_target=tile_nav_target("Scrolls"))
+            _stat_card("👥", "Shadows", len(shadows), THEME["info"],
+                       f"{len([s for s in shadows if s.get('status')=='awakened'])} active",
+                       nav_target=tile_nav_target("Shadows"))
+            _stat_card("🔧", "Tools", len(tools), THEME["success"],
+                       f"{len([t for t in tools if t.get('status')=='forged'])} forged",
+                       nav_target=tile_nav_target("Tools"))
+            _stat_card("🧠", "Skills", len(skills), "#a78bfa",
+                       "across all shadows", nav_target=tile_nav_target("Skills"))
+            _stat_card("📋", "Activities", len(activities), THEME["info"],
+                       f"{len([a for a in activities if a.get('status')=='unassigned'])} unassigned",
+                       nav_target=tile_nav_target("Activities"))
+            _stat_card("🧬", "Evolutions", len(pending_evolutions), THEME["warning"],
+                       "pending review", nav_target=tile_nav_target("Evolutions"))
 
-    ui.separator().style(f"background:{THEME['border']}; margin: 20px 0;")
+    # ── Pending Actions — collapsed ────────────────────────────────────
+    with ui.expansion("Pending Actions", value=False).classes("w-full").style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; margin-bottom: 8px;"
+    ):
+        with ui.column().style("width: 100%; padding: 8px;"):
+            with ui.row().style("align-items: center; gap: 8px;"):
+                ui.link("→ Insights", "/insights?tab=actions").style(
+                    f"font-size: 12px; color: {THEME['primary']}; text-decoration: none;"
+                )
+            _build_pending_actions_minipane(vault)
 
-    # ── Pending Actions mini-pane ──────────────────────────────────────
-    with ui.row().style("width: 100%; align-items: center; gap: 8px;"):
-        ui.label("⏳ Pending Actions").style(
-            f"font-size: 15px; font-weight: 700; color: {THEME['text']};"
-        )
-        ui.link("→ Insights", "/insights?tab=actions").style(
-            f"font-size: 12px; color: {THEME['primary']};"
-        )
-    _build_pending_actions_minipane(vault)
+    # ── Events (two panes, header arrows) — collapsed ──────────────────
+    with ui.expansion("Events", value=False).classes("w-full").style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; margin-bottom: 8px;"
+    ):
+        with ui.row().classes("w-full gap-4").style("flex-wrap: wrap; padding: 8px;"):
+            # Supervisor live events (left)
+            with ui.column().style("flex: 1; min-width: 360px;"):
+                with ui.row().style("align-items: center; gap: 6px; margin-bottom: 8px;"):
+                    ui.label("▶️ Supervisor Live Events").style(
+                        f"font-size: 12px; font-weight: 700; color: {THEME['text']};"
+                    )
+                    ui.link("→", "/systemu-chat").style(
+                        f"font-size: 13px; color: {THEME['primary']}; text-decoration: none;"
+                    ).tooltip("Open full supervisor feed")
+                from systemu.interface.components.live_events_pane import build_supervisor_events_pane
+                build_supervisor_events_pane()
+            # Event log (right)
+            with ui.column().style("flex: 1; min-width: 360px;"):
+                with ui.row().style("align-items: center; gap: 6px; margin-bottom: 8px;"):
+                    ui.label("🔔 Events Log").style(
+                        f"font-size: 12px; font-weight: 700; color: {THEME['text']};"
+                    )
+                    ui.link("→", "/insights?tab=events").style(
+                        f"font-size: 13px; color: {THEME['primary']}; text-decoration: none;"
+                    ).tooltip("Open full event log")
+                from systemu.interface.pages.notifications_page import build_events_log_pane
+                build_events_log_pane()
 
-    ui.separator().style(f"background:{THEME['border']}; margin: 20px 0;")
-
-    # ── Two event panes ────────────────────────────────────────────────
-    with ui.row().classes("w-full gap-4").style("flex-wrap: wrap;"):
-        with ui.column().style("flex: 1; min-width: 360px;"):
-            ui.label("▶️ Supervisor Live Events").style(
-                f"font-size: 14px; font-weight: 700; color: {THEME['text']}; margin-bottom: 8px;"
-            )
-            from systemu.interface.components.live_events_pane import build_supervisor_events_pane
-            build_supervisor_events_pane()
-        with ui.column().style("flex: 1; min-width: 360px;"):
-            ui.label("🔔 Events Log").style(
-                f"font-size: 14px; font-weight: 700; color: {THEME['text']}; margin-bottom: 8px;"
-            )
-            from systemu.interface.pages.notifications_page import build_events_log_pane
-            build_events_log_pane()
-
-    ui.separator().style(f"background:{THEME['border']}; margin: 20px 0;")
-
-    # ── More (collapsed expansions) ────────────────────────────────────
-    _build_expansions()
+    # ── More (collapsed expansion wrapping the lazy cards) ─────────────
+    with ui.expansion("More", value=False).classes("w-full").style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; margin-bottom: 8px;"
+    ):
+        with ui.column().style("width: 100%; padding: 8px;"):
+            _build_expansions()
 
 
 def _build_pending_actions_minipane(vault) -> None:
@@ -168,11 +187,6 @@ def _build_expansions() -> None:
     Lazy-load each card body on expansion open — keeps the initial
     Console render cheap.
     """
-    ui.label("More").style(
-        f"font-size: 13px; color: {THEME['text_muted']}; font-weight: 700; "
-        f"letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px;"
-    )
-
     _expansion("📈", "Learning Curves",
                "Compact view of Shadow execution metrics and the data flywheel.",
                _load_learning_curves)
