@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.8.9"
+version = "0.8.10"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -109,6 +109,13 @@ markers = [
     "e2e: end-to-end live tests (skipped by default)",
 ]
 
+[tool.setuptools]
+# v0.8.10: ship non-Python data files (the vault seed + tool implementations)
+# inside the wheel.  Combined with the package-data globs below, this makes a
+# bare `pip install systemu` carry the curated tool pack + Wild Card shadow so
+# the daemon boots with a working capability set out of the box.
+include-package-data = true
+
 [tool.setuptools.packages.find]
 # Both top-level packages are part of the editable install:
 #   * sharing_on  — the capture engine (declared as the PyPI package above)
@@ -122,5 +129,13 @@ include = ["sharing_on*", "systemu*"]
 # starter skill/tool registry. Without these, every analyze / scroll-refine /
 # skill-export call from a pip-installed copy fails with FileNotFoundError.
 "sharing_on" = ["analyzer/prompts/*.md"]
-"systemu" = ["prompts/*.md"]
+# v0.8.10: also ship the vault seed (curated tool pack + Wild Card shadow) and
+# the tool implementations from the top-level `systemu` package so a bare wheel
+# install carries a working capability set.
+"systemu" = [
+    "prompts/*.md",
+    "vault/**/*.json",
+    "vault/tools/implementations/*.py",
+    "vault/**/*.md",
+]
 "systemu.vault" = ["**/*.json", "**/*.md", "**/*.py"]

@@ -1,0 +1,31 @@
+{
+  "id": "tool_write_csv_file",
+  "name": "write_csv_file",
+  "description": "Write a list of dictionaries to a CSV file.",
+  "tool_type": "file_operation",
+  "parameters_schema": {
+    "output_path": {
+      "type": "string",
+      "description": "Path to save the CSV file"
+    },
+    "data": {
+      "type": "array",
+      "description": "List of dictionaries representing rows"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/write_csv_file.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_write_csv_file\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

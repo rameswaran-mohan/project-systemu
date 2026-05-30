@@ -12,7 +12,7 @@ TOOL_META = {
 }
 
 
-# schema mirrors the vault JSON definition so callers can introspect
+# v0.6.9: schema mirrors the vault JSON definition so callers can introspect
 # the tool contract directly from the module.  The output_path description is
 # the operator-facing contract and MUST stay in sync with
 # systemu/vault/tools/tool_tool_6e6e62c0.json.
@@ -77,7 +77,7 @@ def _slugify(text: str) -> str:
 
 
 def _resolve_output_file(output_path: str, title: str) -> Path:
-    """turn an output_path that might be a directory, a path without
+    """v0.6.9: turn an output_path that might be a directory, a path without
     extension, or a path with a trailing separator, into a concrete .docx
     file path under the intended directory."""
     op = Path(output_path).expanduser()
@@ -108,7 +108,7 @@ def run(**kwargs) -> dict:
         from docx import Document
         from docx.shared import Inches
 
-        # resolve dir / extensionless / trailing-separator paths
+        # v0.6.9: resolve dir / extensionless / trailing-separator paths
         # gracefully so the LLM doesn't have to know whether it was handed a
         # directory or a file.
         target_path = _resolve_output_file(output_path, title)
@@ -130,7 +130,7 @@ def run(**kwargs) -> dict:
         if body_text:
             doc.add_paragraph(body_text)
 
-        # structured sections support — each entry is {heading, content}
+        # v0.6.9: structured sections support — each entry is {heading, content}
         for section in sections:
             if not isinstance(section, dict):
                 continue
@@ -154,7 +154,7 @@ def run(**kwargs) -> dict:
         return {"success": False, "output_path": "", "error": str(exc)}
 
 
-# callable alias so callers can import the tool by name without going
+# v0.6.9: callable alias so callers can import the tool by name without going
 # through the dispatch dict.  Mirrors the run(**kwargs) signature.
 def create_word_doc(**kwargs) -> dict:
     return run(**kwargs)

@@ -1,0 +1,46 @@
+{
+  "id": "tool_web_read",
+  "name": "web_read",
+  "description": "Read a web page and return readable title, text, and links. Uses a fast HTTP fetch first and escalates to a headless browser for JavaScript/SPA pages.",
+  "tool_type": "web",
+  "parameters_schema": {
+    "url": {
+      "type": "string",
+      "description": "Full URL to read"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "title": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "links": {
+      "type": "array",
+      "description": "List of {url, text}"
+    },
+    "tier_used": {
+      "type": "string",
+      "description": "'fetch' (T0 httpx) or 'browser' (T2 chromium)"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "T0: httpx fetch + pure-Python readability via systemu.runtime.web.fetch_core. If the page looks like a JS/SPA shell, escalate to systemu.runtime.web.browser_pool.BrowserPool.render_html. Returns missing_packages=['playwright-chromium'] while chromium is still installing.",
+  "dependencies": [
+    "playwright"
+  ],
+  "implementation_path": "vault/tools/implementations/web_read.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_web_read\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-30T00:00:00",
+  "updated_at": "2026-05-30T00:00:00"
+}

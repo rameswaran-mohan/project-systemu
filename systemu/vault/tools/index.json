@@ -1,12 +1,42 @@
 [
   {
-    "id": "tool_0977913b",
+    "id": "tool_web_search",
+    "name": "web_search",
+    "description": "Search the web and return results with title, URL, and snippet. Multi-provider: keyed (Brave/Serper) preferred, free DuckDuckGo-lite fallback.",
+    "tool_type": "web",
+    "parameter_names": [
+      "query",
+      "max_results"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-30T00:00:00"
+  },
+  {
+    "id": "tool_web_read",
+    "name": "web_read",
+    "description": "Read a web page and return readable title, text, and links. Fast HTTP fetch first; escalates to a headless browser for JS/SPA pages.",
+    "tool_type": "web",
+    "parameter_names": [
+      "url"
+    ],
+    "dependencies": [
+      "playwright"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-30T00:00:00"
+  },
+  {
+    "id": "tool_web_screenshot",
     "name": "web_screenshot",
-    "description": "Render a URL in a headless browser and capture a screenshot of the page or a specific element",
+    "description": "Render a URL in a headless browser and capture a full-page screenshot.",
     "tool_type": "browser_action",
     "parameter_names": [
       "url",
-      "selector",
       "output_path"
     ],
     "dependencies": [
@@ -15,16 +45,17 @@
     "status": "deployed",
     "enabled": true,
     "forged_by_systemu": true,
-    "created_at": "2026-05-04T00:00:00"
+    "created_at": "2026-05-30T00:00:00"
   },
   {
-    "id": "tool_6b1b3809",
-    "name": "web_extract_text",
-    "description": "Extract visible text content from a web page or a specific element using a CSS selector",
+    "id": "tool_web_act",
+    "name": "web_act",
+    "description": "Drive a web page to accomplish an instruction using accessibility-tree-first interaction (click/type/read) in a bounded LLM loop.",
     "tool_type": "browser_action",
     "parameter_names": [
       "url",
-      "selector"
+      "instruction",
+      "max_steps"
     ],
     "dependencies": [
       "playwright"
@@ -32,25 +63,7 @@
     "status": "deployed",
     "enabled": true,
     "forged_by_systemu": true,
-    "created_at": "2026-05-04T00:00:00"
-  },
-  {
-    "id": "tool_69f090ed",
-    "name": "web_extract_table",
-    "description": "Extract an HTML table from a web page and return it as headers and rows",
-    "tool_type": "browser_action",
-    "parameter_names": [
-      "url",
-      "table_index",
-      "selector"
-    ],
-    "dependencies": [
-      "playwright"
-    ],
-    "status": "deployed",
-    "enabled": true,
-    "forged_by_systemu": true,
-    "created_at": "2026-05-04T00:00:00"
+    "created_at": "2026-05-30T00:00:00"
   },
   {
     "id": "tool_a1f69543",
@@ -96,23 +109,6 @@
       "url",
       "output_path",
       "overwrite"
-    ],
-    "dependencies": [
-      "requests"
-    ],
-    "status": "deployed",
-    "enabled": true,
-    "forged_by_systemu": true,
-    "created_at": "2026-05-04T00:00:00"
-  },
-  {
-    "id": "tool_30db21be",
-    "name": "web_search",
-    "description": "Search the web via DuckDuckGo and return results with title, URL, and snippet",
-    "tool_type": "api_call",
-    "parameter_names": [
-      "query",
-      "max_results"
     ],
     "dependencies": [
       "requests"
@@ -519,169 +515,109 @@
     "created_at": "2026-05-04T00:00:00"
   },
   {
-    "id": "tool_48cd1173",
-    "name": "mouse_click",
-    "description": "Click at screen coordinates or a browser element (fallback tool)",
+    "id": "tool_api_call_get",
+    "name": "api_call_get",
+    "description": "Perform a GET request to a REST API endpoint.",
+    "tool_type": "api_call",
+    "parameter_names": [
+      "url",
+      "headers",
+      "timeout"
+    ],
+    "dependencies": [
+      "requests"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_detect_language_from_extension",
+    "name": "detect_language_from_extension",
+    "description": "Detect programming language from a file extension using a built-in mapping dictionary.",
+    "tool_type": "python_function",
+    "parameter_names": [
+      "filename"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_file_scan_directory",
+    "name": "file_scan_directory",
+    "description": "Recursively scan a directory and collect file metadata.",
+    "tool_type": "python_function",
+    "parameter_names": [
+      "source_path"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_run_cli_command",
+    "name": "run_cli_command",
+    "description": "Execute a shell command in the container and capture its stdout and stderr output.",
     "tool_type": "cli_command",
     "parameter_names": [
-      "target",
-      "x",
-      "y"
+      "command",
+      "timeout_seconds"
     ],
-    "dependencies": [
-      "pynput"
-    ],
+    "dependencies": [],
     "status": "deployed",
     "enabled": true,
     "forged_by_systemu": true,
     "created_at": "2026-05-04T00:00:00"
   },
   {
-    "id": "tool_e3734ca3",
-    "name": "mouse_drag",
-    "description": "Drag mouse from start to end coordinates at the OS level (fallback tool)",
-    "tool_type": "cli_command",
+    "id": "tool_write_csv_file",
+    "name": "write_csv_file",
+    "description": "Write a list of dictionaries to a CSV file.",
+    "tool_type": "file_operation",
     "parameter_names": [
-      "start_x",
-      "start_y",
-      "end_x",
-      "end_y"
+      "output_path",
+      "data"
     ],
-    "dependencies": [
-      "pynput"
-    ],
+    "dependencies": [],
     "status": "deployed",
     "enabled": true,
     "forged_by_systemu": true,
     "created_at": "2026-05-04T00:00:00"
   },
   {
-    "id": "tool_9b79befb",
-    "name": "browser_navigate",
-    "description": "Navigate a headless browser to a URL and wait for the page to fully load",
-    "tool_type": "browser_action",
+    "id": "tool_write_markdown_file",
+    "name": "write_markdown_file",
+    "description": "Write content to a markdown file at a specified path.",
+    "tool_type": "file_operation",
     "parameter_names": [
-      "url"
+      "file_path",
+      "content"
     ],
-    "dependencies": [
-      "playwright"
-    ],
+    "dependencies": [],
     "status": "deployed",
     "enabled": true,
     "forged_by_systemu": true,
     "created_at": "2026-05-04T00:00:00"
   },
   {
-    "id": "tool_378f77a9",
-    "name": "send_email",
-    "description": "Send an email with an optional file attachment using SMTP",
-    "tool_type": "api_call",
+    "id": "tool_write_text_file",
+    "name": "write_text_file",
+    "description": "Write raw text content to a file at a specified path.",
+    "tool_type": "file_operation",
     "parameter_names": [
-      "recipient",
-      "subject",
-      "body",
-      "attachment_path"
+      "file_path",
+      "content"
     ],
-    "dependencies": [
-      "smtplib"
-    ],
+    "dependencies": [],
     "status": "deployed",
     "enabled": true,
     "forged_by_systemu": true,
-    "created_at": "2026-05-05T19:59:23.289150"
-  },
-  {
-    "id": "tool_5a69f64d",
-    "name": "search_emails",
-    "description": "Search for emails in the inbox based on query criteria and return matching thread information",
-    "tool_type": "api_call",
-    "parameter_names": [
-      "query",
-      "max_results"
-    ],
-    "dependencies": [
-      "google-api-python-client",
-      "google-auth-httplib2",
-      "google-auth-oauthlib"
-    ],
-    "status": "deployed",
-    "enabled": true,
-    "forged_by_systemu": true,
-    "created_at": "2026-05-05T21:11:36.882535"
-  },
-  {
-    "id": "tool_8abec49d",
-    "name": "github_list_workflow_runs",
-    "description": "List workflow runs for a GitHub repository, with optional filtering by status (e.g., failure) and branch",
-    "tool_type": "api_call",
-    "parameter_names": [
-      "owner",
-      "repo",
-      "status",
-      "branch",
-      "per_page"
-    ],
-    "dependencies": [
-      "requests"
-    ],
-    "status": "proposed",
-    "enabled": false,
-    "forged_by_systemu": true,
-    "created_at": "2026-05-08T21:59:09.817637"
-  },
-  {
-    "id": "tool_0c6190ec",
-    "name": "github_get_workflow_run",
-    "description": "Get detailed information about a specific workflow run, including jobs and logs",
-    "tool_type": "api_call",
-    "parameter_names": [
-      "owner",
-      "repo",
-      "run_id"
-    ],
-    "dependencies": [
-      "requests"
-    ],
-    "status": "proposed",
-    "enabled": false,
-    "forged_by_systemu": true,
-    "created_at": "2026-05-08T21:59:10.209081"
-  },
-  {
-    "id": "tool_ed618bdb",
-    "name": "github_get_commit",
-    "description": "Get details about a specific commit in a GitHub repository",
-    "tool_type": "api_call",
-    "parameter_names": [
-      "owner",
-      "repo",
-      "sha"
-    ],
-    "dependencies": [
-      "requests"
-    ],
-    "status": "proposed",
-    "enabled": false,
-    "forged_by_systemu": true,
-    "created_at": "2026-05-08T21:59:10.222156"
-  },
-  {
-    "id": "tool_ecf146c8",
-    "name": "github_list_workflow_files",
-    "description": "List and optionally read workflow YAML files from the .github/workflows directory of a GitHub repository",
-    "tool_type": "api_call",
-    "parameter_names": [
-      "owner",
-      "repo",
-      "branch",
-      "read_contents"
-    ],
-    "dependencies": [
-      "requests"
-    ],
-    "status": "proposed",
-    "enabled": false,
-    "forged_by_systemu": true,
-    "created_at": "2026-05-08T21:59:10.255665"
+    "created_at": "2026-05-04T00:00:00"
   }
 ]
