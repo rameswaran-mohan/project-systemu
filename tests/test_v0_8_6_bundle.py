@@ -386,8 +386,11 @@ class TestScheduledExecuteJob:
         config = MagicMock()
         config.vault_dir = str(tmp_path / "vault")
 
-        # Create a schedule that is already due (5 min ago)
-        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+        # Create a schedule that is freshly due — 1 min ago, well under the
+        # v0.8.7 staleness threshold (300s). 5 min lands exactly on the 300s
+        # boundary, so a 15ms clock-tick crossing between the test's now() and
+        # the scheduler's now() flips it between "due" and "missed" → flaky.
+        past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1)
         s = create_schedule(
             shadow_id="shadow_x", scroll_id="scroll_y",
             mode=ScheduleMode.ONCE, scheduled_at=past, vault=v,

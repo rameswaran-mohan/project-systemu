@@ -31,6 +31,25 @@ def _level_color(level: str) -> str:
     }.get((level or "").upper(), THEME["text_muted"])
 
 
+def _format_event_time(ts) -> str:
+    """Return HH:MM:SS from an ISO string, epoch float/int, or '' if missing/unparseable."""
+    from datetime import datetime, timezone
+    if not ts:
+        return ""
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
+        s = str(ts).replace("Z", "+00:00")
+        return datetime.fromisoformat(s).strftime("%H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _display_order(buf: list) -> list:
+    """Return a new list with newest-first ordering (input is oldest-first)."""
+    return list(reversed(buf))
+
+
 def build_supervisor_events_pane(height_px: int = 320) -> None:
     """Render the live Supervisor/EventBus stream, auto-scrolling."""
     from systemu.interface.event_bus import EventBus
@@ -44,9 +63,15 @@ def build_supervisor_events_pane(height_px: int = 320) -> None:
                 f"color: {THEME['text_muted']}; font-size: 12px;"
             )
             return
-        for ev in events:
+        for ev in _display_order(events):   # newest first
             level = (ev.get("level") or "INFO").upper()
+            tstr = _format_event_time(ev.get("ts"))
             with ui.row().style("gap: 8px; align-items: baseline; padding: 2px 0;"):
+                if tstr:
+                    ui.label(tstr).style(
+                        f"color: {THEME['text_muted']}; font-size: 11px; "
+                        f"font-family: monospace; min-width: 62px;"
+                    )
                 ui.label(f"[{level}]").style(
                     f"color: {_level_color(level)}; font-size: 11px; "
                     f"font-weight: 700; min-width: 70px;"
