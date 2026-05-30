@@ -232,7 +232,11 @@ def dry_run_all_pending_tools(vault, config, *, max_concurrent: int = 5) -> None
         from systemu.recovery.classifier import classify_dry_run_error
         from systemu.recovery.links import recover_url
 
-        classified = classify_dry_run_error(error_text)
+        classified = classify_dry_run_error(
+            error_text,
+            missing_packages=(tool.dry_run_evidence or {}).get("missing_packages")
+            if isinstance(getattr(tool, "dry_run_evidence", None), dict) else None,
+        )
         evidence = {
             "error": error_text,
             "classified_reason": classified.kind,
@@ -363,7 +367,11 @@ def dry_run_one_tool(tool_id: str) -> None:
     except Exception as exc:
         from systemu.recovery.classifier import classify_dry_run_error
         error_text = f"{type(exc).__name__}: {exc}"
-        classified = classify_dry_run_error(error_text)
+        classified = classify_dry_run_error(
+            error_text,
+            missing_packages=(tool.dry_run_evidence or {}).get("missing_packages")
+            if isinstance(getattr(tool, "dry_run_evidence", None), dict) else None,
+        )
         tool.dry_run_status = "failed"
         tool.dry_run_evidence = {
             "error": error_text,
@@ -381,7 +389,11 @@ def dry_run_one_tool(tool_id: str) -> None:
     else:
         from systemu.recovery.classifier import classify_dry_run_error
         error_text = getattr(result, "error", None) or "(no error detail)"
-        classified = classify_dry_run_error(error_text)
+        classified = classify_dry_run_error(
+            error_text,
+            missing_packages=(tool.dry_run_evidence or {}).get("missing_packages")
+            if isinstance(getattr(tool, "dry_run_evidence", None), dict) else None,
+        )
         tool.dry_run_status = "failed"
         tool.dry_run_evidence = {
             "error": error_text,
