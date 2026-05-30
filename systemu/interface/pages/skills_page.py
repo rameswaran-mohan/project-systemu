@@ -12,6 +12,7 @@ from pathlib import Path
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.name_resolver import resolve_name, short_id
 from systemu.interface.nav_helpers import workshop_deeplink
 
 logger = logging.getLogger(__name__)
@@ -216,7 +217,11 @@ def _skill_detail(skill_id: str, vault) -> None:
             if evidence:
                 ui.label("Evidence Scrolls:").style(f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 600;")
                 for sid in evidence:
-                    ui.label(f"• {sid}").style(f"font-size: 11px; color: {THEME['text_muted']}; font-family: monospace;")
+                    with ui.row().style("gap: 6px; align-items: baseline;"):
+                        ui.label(f"• {resolve_name(sid, vault)}").style(
+                            f"font-size: 11px; color: {THEME['text']};")
+                        ui.label(short_id(sid)).style(
+                            f"font-size: 10px; color: {THEME['text_muted']}; font-family: monospace;")
 
         # Right column — instructions / SKILL.md
         if instructions or skill_md_path:

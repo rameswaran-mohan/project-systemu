@@ -31,9 +31,15 @@ def _severity_color(sev: str) -> str:
 
 def render_recovery_panel(scope: str, scope_id: str) -> None:
     """Reusable component — embed inside any page."""
+    from systemu.interface.name_resolver import resolve_name, short_id
+
     actions = _diagnose(scope, scope_id)
+    _v = _get_vault()
     with ui.card().classes("w-full"):
-        ui.label(f"Recovery: {scope} {scope_id}").classes("text-h6")
+        ui.label(f"Recovery: {scope} {resolve_name(scope_id, _v)}").classes("text-h6")
+        ui.label(short_id(scope_id)).style(
+            "color: #94a3b8; font-size: 11px; font-family: monospace;"
+        )
         if not actions:
             ui.label("No pending actions").classes("text-green-700")
             return

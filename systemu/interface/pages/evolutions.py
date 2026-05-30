@@ -11,6 +11,7 @@ from nicegui import ui
 
 from systemu.core.utils import utcnow
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.name_resolver import resolve_names
 
 
 _TYPE_ICON = {
@@ -106,7 +107,7 @@ def _proposal_card(evo: dict) -> None:
                 ui.label(f"{etype.upper()} — {evo.get('target_entity_type', '?')}").style(
                     f"font-size: 14px; font-weight: 700; color: {THEME['warning']};"
                 )
-            ui.label(", ".join(evo.get("target_ids", [])[:3])).style(
+            ui.label(", ".join(resolve_names(evo.get("target_ids", [])[:3], AppState.get().vault))).style(
                 f"font-size: 12px; color: {THEME['text_muted']};"
             )
 

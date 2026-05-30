@@ -12,6 +12,7 @@ from __future__ import annotations
 from nicegui import ui
 
 from systemu.interface.dashboard_state import THEME
+from systemu.interface.name_resolver import resolve_name, short_id
 from systemu.runtime.workflow_tracker import STAGES, WorkflowTracker
 
 
@@ -178,6 +179,8 @@ def _timeline_row(stage: str, *, reached: bool, entered_at: str | None) -> None:
 
 
 def _link_row(icon: str, label: str, entity_id: str, route: str) -> None:
+    from systemu.interface.dashboard_state import AppState
+    name = resolve_name(entity_id, AppState.get().vault)
     with ui.row().style(
         f"width: 100%; gap: 12px; padding: 10px 16px; align-items: center; "
         f"border-bottom: 1px solid {THEME['border']}; cursor: pointer;"
@@ -187,9 +190,17 @@ def _link_row(icon: str, label: str, entity_id: str, route: str) -> None:
             f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 700; "
             f"letter-spacing: 0.06em; min-width: 80px; text-transform: uppercase;"
         )
-        ui.label(entity_id).style(
-            f"font-family: monospace; font-size: 12px; color: {THEME['text']};"
-        )
+        if name != entity_id:
+            # A real name resolved — show it primary with a grey short-id companion.
+            ui.label(name).style(f"font-size: 12px; color: {THEME['text']};")
+            ui.label(short_id(entity_id)).style(
+                f"font-family: monospace; font-size: 11px; color: {THEME['text_muted']};"
+            )
+        else:
+            # No name (execution/submission) — short id only.
+            ui.label(short_id(entity_id)).style(
+                f"font-family: monospace; font-size: 12px; color: {THEME['text']};"
+            )
 
 
 def _short_ts(iso: str) -> str:
@@ -198,7 +209,7 @@ def _short_ts(iso: str) -> str:
 
 
 def _build_affinity_log_panel(shadow_id: str) -> None:
-    """— show this shadow's recent TERMINATE entries in the
+    """v0.4.4-b — show this shadow's recent TERMINATE entries in the
     affinity log.  Empty when the shadow has no terminations on record.
     """
     try:
@@ -246,7 +257,7 @@ def _build_supervisor_decision_panel(
     shadow_id:    str | None,
     activity_id:  str | None,
 ) -> None:
-    """— TERMINATE resolution UX.
+    """v0.4.1-b — TERMINATE resolution UX.
 
     Shown only when the supervisor's audit file for this execution contains
     a TERMINATE entry.  Offers three operator actions:
@@ -340,7 +351,7 @@ def _on_retry_different_shadow(
 ) -> None:
     """Re-queue the activity, excluding the bad shadow via the affinity log.
 
-    Supervisor.submit() now auto-consults the affinity log AND
+    v0.4.2-a: Supervisor.submit() now auto-consults the affinity log AND
     accepts ``exclude_shadow_id`` to force a swap.  The retry-button path
     just passes the bad shadow id and trusts the supervisor to pick an
     alternative whose skill_ids overlap with the activity's requirements.
@@ -350,6 +361,7 @@ def _on_retry_different_shadow(
         return
     try:
         from systemu.runtime.supervisor import Supervisor
+        from systemu.interface.dashboard_state import AppState
         sup = Supervisor.get()
         sub_id = sup.submit(
             activity_id=activity_id,
@@ -360,9 +372,12 @@ def _on_retry_different_shadow(
             exclude_shadow_id=shadow_id,
             scroll_id=scroll_id,
         )
+        _vault = AppState.get().vault
+        _activity_name = resolve_name(activity_id, _vault)
+        _shadow_name = resolve_name(shadow_id, _vault) if shadow_id else "unknown"
         ui.notify(
-            f"Activity {activity_id[:12]}… re-queued ({sub_id}). "
-            f"Supervisor swapped excluded shadow {(shadow_id or 'unknown')[:12]}… "
+            f"Activity {_activity_name} re-queued ({short_id(sub_id)}). "
+            f"Supervisor swapped excluded shadow {_shadow_name} "
             "for an alternative.",
             type="positive", multi_line=True,
         )

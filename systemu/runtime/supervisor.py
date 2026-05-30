@@ -283,7 +283,7 @@ class Supervisor:
             retry_count:  Internal — used when re-queuing after failure.
             exclude_shadow_id: When provided AND it matches ``shadow_id``, find
                           an alternative shadow before queueing.  Used by the
-                          "Retry with different shadow" operator
+                          v0.4.1-b "Retry with different shadow" operator
                           action — caller passes the shadow that just gave up.
             scroll_id:    Scroll id (used by the affinity-log consultation to
                           compute intent_hash; falls back to vault lookup when
@@ -297,7 +297,7 @@ class Supervisor:
         Returns:
             A submission_id string for tracking.
         """
-        # Affinity-aware routing.  Two reasons to swap the assigned
+        # v0.4.2-a: Affinity-aware routing.  Two reasons to swap the assigned
         # shadow before queueing:
         #   1. Caller explicitly excluded this shadow (Retry-different-shadow).
         #   2. The affinity log has a recent TERMINATE for (intent_hash, shadow).
@@ -350,7 +350,7 @@ class Supervisor:
             "retry_count":   retry_count,
             "reason":        reason,
             "enqueued_at":   time.time(),
-            # resume hint carried in payload so the shadow runtime
+            # v0.5.1-e: resume hint carried in payload so the shadow runtime
             # can rebuild its context from the snapshot persisted by
             # RECALIBRATE_TOOL.  When None, runtime starts fresh.
             "resume_from_execution_id": resume_from_execution_id,
@@ -371,7 +371,7 @@ class Supervisor:
             self._pending_activity_ids.add(activity_id)
         self._queue.put((priority, time.time(), payload))
         self._publish(
-            f"📥 Activity queued: {activity_id} (priority={priority}, reason={reason}, retry={retry_count})",
+            f"📥 Activity queued: {self._aname(activity_id)} (priority={priority}, reason={reason}, retry={retry_count})",
             context={"submission_id": submission_id, "activity_id": activity_id,
                      "shadow_id": shadow_id, "priority": priority, "retry_count": retry_count},
         )
@@ -449,7 +449,7 @@ class Supervisor:
         except Exception:
             return shadow_id
 
-        # look up the originating shadow's specialty so we can
+        # v0.4.3-b: look up the originating shadow's specialty so we can
         # prefer candidates that share it.  Empty specialty on either side
         # → specialty bonus is 0 (no preference signal).
         origin_specialty = ""
@@ -465,10 +465,10 @@ class Supervisor:
         # Lower sorts first, so: higher overlap → preferred, then matching
         # specialty → preferred, then higher success_rate → preferred,
         # then deterministic lexical id.
-        # ShadowMetrics second-tier ranking — when two shadows
+        # v0.4.3-a: ShadowMetrics second-tier ranking — when two shadows
         # both have skill_overlap=2, the one with a better track record on
         # this intent_hash wins.
-        # specialty tag breaks ties between metric-equivalent
+        # v0.4.3-b: specialty tag breaks ties between metric-equivalent
         # candidates by preferring those with matching specialty.
         scored: List[tuple] = []
         # Cache affinity-log excludes per shadow so we don't double-check.
@@ -496,7 +496,7 @@ class Supervisor:
                     continue
             else:
                 overlap = 0
-            # specialty match (1 when both have the same non-empty
+            # v0.4.3-b: specialty match (1 when both have the same non-empty
             # specialty, 0 otherwise).  Inserted between overlap and metrics
             # so two equal-skill candidates split on specialty first.
             cand_specialty = (
@@ -552,7 +552,7 @@ class Supervisor:
         original_shadow_id: str,
         scroll_id: Optional[str] = None,
     ) -> str:
-        """operator approved a recalibration — re-queue activity.
+        """v0.5.0-e: operator approved a recalibration — re-queue activity.
 
         Looks up the originating activity (from the audit / vault), updates
         the shadow's ``available_tool_ids`` if forking (so the shadow uses
@@ -608,11 +608,11 @@ class Supervisor:
         # 3. Re-queue with elevated priority and a sticky-note hint that
         #    will land in the new execution's context.  Affinity log is
         #    intentionally NOT consulted — we want the same shadow back.
-        # also pass the prior execution_id so the new run can
+        # v0.5.1-e: also pass the prior execution_id so the new run can
         #    load + apply the snapshot RECALIBRATE_TOOL persisted (true
         #    resume — preserves completed objectives + recent context).
         #    When the snapshot is missing the runtime falls back to the
-        #    fresh-restart-with-sticky behaviour.
+        #    v0.5.0 fresh-restart-with-sticky behaviour.
         return self.submit(
             activity_id=activity_id,
             shadow_id=original_shadow_id,
@@ -740,7 +740,7 @@ class Supervisor:
 
         self._update_heartbeat(key, "running")
         self._publish(
-            f"▶️ Executing: {activity_id} (retry={retry_count})",
+            f"▶️ Executing: {self._aname(activity_id)} (retry={retry_count})",
             context={"activity_id": activity_id, "shadow_id": shadow_id,
                      "retry_count": retry_count, "key": key},
         )
@@ -759,7 +759,7 @@ class Supervisor:
 
             self._update_heartbeat(key, "running")
 
-            # thread the resume hint from the queue payload through
+            # v0.5.1-e: thread the resume hint from the queue payload through
             # to runtime.execute().  When set, the runtime loads the snapshot
             # written by RECALIBRATE_TOOL and rebuilds context (true resume).
             resume_from = payload.get("resume_from_execution_id")
@@ -839,7 +839,7 @@ class Supervisor:
                 except Exception as exc:
                     logger.warning("[Supervisor] SQLite queue mark_completed failed: %s", exc)
             self._publish(
-                f"✅ Completed: {activity_id}",
+                f"✅ Completed: {self._aname(activity_id)}",
                 level="SUCCESS",
                 context={"activity_id": activity_id, "shadow_id": shadow_id,
                          "result": result},
@@ -901,7 +901,7 @@ class Supervisor:
                 except Exception as exc:
                     logger.warning("[Supervisor] SQLite queue mark_dead_letter failed: %s", exc)
             self._publish(
-                f"💀 Dead-lettered: {activity_id} (exhausted {retry_count} retries) — {error[:200]}",
+                f"💀 Dead-lettered: {self._aname(activity_id)} (exhausted {retry_count} retries) — {error[:200]}",
                 level="ERROR",
                 context=dl_entry,
             )
@@ -964,7 +964,7 @@ Respond with a JSON object exactly matching this schema:
 
             if isinstance(analysis, dict) and "root_cause" in analysis:
                 self._publish(
-                    f"🧠 Diagnosis for {activity_id}:\n"
+                    f"🧠 Diagnosis for {self._aname(activity_id)}:\n"
                     f"• Cause: {analysis.get('root_cause', '?')}\n"
                     f"• Fix: {analysis.get('immediate_fix', '?')}\n"
                     f"• Retry: {'✅' if analysis.get('retry_recommended') else '❌'}",
@@ -975,7 +975,7 @@ Respond with a JSON object exactly matching this schema:
                         "type":        "failure_analysis",
                     },
                 )
-                # also mirror to failure_telemetry.jsonl so a single
+                # v0.4.0-0: also mirror to failure_telemetry.jsonl so a single
                 # file holds the full failure-mode history for histogram analysis.
                 try:
                     from systemu.runtime.failure_telemetry import record_supervisor_diagnosis
@@ -986,7 +986,7 @@ Respond with a JSON object exactly matching this schema:
                     )
                 except Exception:
                     logger.debug("[Supervisor] diagnosis telemetry skipped", exc_info=True)
-                # also write a structured failure_patterns entry to
+                # v0.4.0-c: also write a structured failure_patterns entry to
                 # the shadow's memory_buffer so the next execution of this
                 # shadow can recall the diagnosis.  Today the diagnosis only
                 # reaches the dashboard event log — without this write the
@@ -1168,7 +1168,7 @@ Respond with a JSON object exactly matching this schema:
                     except Exception as exc:
                         logger.warning("[Supervisor] SQLite queue watchdog dead_letter: %s", exc)
                 self._publish(
-                    f"💀 Dead-lettered (stuck + max retries): {payload['activity_id']}",
+                    f"💀 Dead-lettered (stuck + max retries): {self._aname(payload['activity_id'])}",
                     level="ERROR",
                     context=dl_entry,
                 )
@@ -1351,6 +1351,14 @@ Respond with a JSON object exactly matching this schema:
                 self._running[key]["last_heartbeat_at"]      = time.time()
                 self._running[key]["last_heartbeat_at_mono"] = time.monotonic()  # [A.3]
                 self._running[key]["status"] = status
+
+    def _aname(self, activity_id: str) -> str:
+        """Resolve an activity id to its name for operator-facing event text."""
+        try:
+            from systemu.interface.name_resolver import resolve_name
+            return resolve_name(activity_id, self.vault)
+        except Exception:
+            return activity_id
 
     def _publish(
         self,

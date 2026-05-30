@@ -19,6 +19,7 @@ from typing import Any, Dict
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME
+from systemu.interface.name_resolver import resolve_name, short_id
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +106,9 @@ def build_chat_page() -> None:
                     )
                     meta = ts
                     if sid:
-                        meta += f"  ·  shadow: {sid[:12]}"
+                        meta += f"  ·  shadow: {resolve_name(sid, vault)}"
                     if exec_id:
-                        meta += f"  ·  exec: {exec_id}"
+                        meta += f"  ·  exec: {short_id(exec_id)}"
                     ui.label(meta).style(
                         f"font-size: 11px; color: {THEME['text_muted']};"
                     )
