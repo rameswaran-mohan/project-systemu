@@ -23,6 +23,20 @@ from systemu.interface.dashboard_state import AppState, THEME
 logger = logging.getLogger(__name__)
 
 
+def _should_schedule_refresh(client) -> bool:
+    """True iff the NiceGUI client is still connected.
+
+    ui.timer fails ASYNCHRONOUSLY (inside _can_start -> client.connected())
+    when the client was deleted, so a synchronous try/except around the timer
+    cannot catch it. We must pre-check the connected flag before scheduling.
+    Missing attribute / any error -> treat as not-connected (skip safely).
+    """
+    try:
+        return bool(getattr(client, "has_socket_connection", False))
+    except Exception:
+        return False
+
+
 def _default_dispatch_mode() -> str:
     """Pick a sensible default for the Run-now / Queue radio.
 
@@ -169,17 +183,15 @@ def build_chat_page() -> None:
             except Exception as exc:
                 logger.error("[ChatPage] run_direct_task failed: %s", exc)
             finally:
-                # Re-enter the captured client's slot before touching any UI.
-                # If the client has gone away (page closed, dashboard
-                # restarted), silently skip — the work itself completed.
+                # v0.8.11 RC2: ui.timer fails asynchronously when the client
+                # navigated away — a sync try/except can't catch it. Pre-check
+                # the connection so the post-run refresh is skipped cleanly.
                 try:
-                    with client:
-                        ui.timer(0, _on_done, once=True)
-                except RuntimeError as exc:
-                    logger.debug(
-                        "[ChatPage] Skipping post-run UI update — client gone: %s",
-                        exc,
-                    )
+                    if _should_schedule_refresh(client):
+                        with client:
+                            ui.timer(0.1, _on_done, once=True)
+                except Exception:
+                    logger.debug("[ChatPage] post-run UI refresh skipped — client unavailable")
 
         def _on_done() -> None:
             status_label.set_text("")

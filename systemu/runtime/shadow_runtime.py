@@ -34,7 +34,7 @@ from systemu.runtime.context_builder import ExecutionContext
 from systemu.runtime.tool_sandbox import ToolResult, ToolSandbox
 from systemu.vault.vault import Vault
 
-# Stage 3.5 cure path — decay + recalibrate skill loaded during
+# v0.6.1-c: Stage 3.5 cure path — decay + recalibrate skill loaded during
 # failed executions.  These imports are top-level (not lazy) so tests can
 # monkey-patch them at module level.
 from systemu.pipelines.skill_recalibrator import (
@@ -182,7 +182,7 @@ def _apply_terminate_directive(
 def _auto_approve_recalibration(
     *, result, vault, shadow, scroll, execution_id: str,
 ) -> None:
-    """— bypass the operator card, enable + resume immediately.
+    """v0.5.1-c — bypass the operator card, enable + resume immediately.
 
     Used only when ``is_low_risk_recalibration()`` returned True AND the
     config flag is on.  Mirrors the operator's "Enable & Resume" click on
@@ -229,7 +229,7 @@ def _apply_recalibrate_tool_directive(
     vault,
     consec_tool_fails: Dict[str, int],
 ) -> None:
-    """Handle a RECALIBRATE_TOOL supervisor directive.
+    """v0.5.0-d: Handle a RECALIBRATE_TOOL supervisor directive.
 
     1. Identify the failing tool from ``consec_tool_fails`` (highest-fail-count tool).
     2. Run the Tier-1 inadequacy diagnosis (cached per tool × execution).
@@ -302,7 +302,7 @@ def _apply_recalibrate_tool_directive(
             config=config, vault=vault, execution_id=execution_id,
         )
 
-        # auto-approve low-risk recalibrations when config allows.
+        # v0.5.1-c: auto-approve low-risk recalibrations when config allows.
         # Bypasses the operator card entirely — enables tool + resumes the
         # activity directly.  Default config has this OFF; opt-in via
         # SYSTEMU_AUTO_APPROVE_LOW_RISK_RECAL=true.
@@ -338,7 +338,7 @@ def _apply_recalibrate_tool_directive(
         logger.exception("[Runtime] recalibration pipeline crashed")
         return
 
-    # persist execution snapshot for true resume after the
+    # v0.5.1-e: persist execution snapshot for true resume after the
     # operator approves the recalibrated tool.  When skipped (auto-
     # approve path or write failure), the resume falls back to v0.5.0's
     # fresh-restart-with-sticky behaviour.
@@ -388,7 +388,7 @@ def _maybe_decay_loaded_skills(
     vault,
     status: str,
 ) -> None:
-    """per-iteration hook — decay effectiveness on loaded skills
+    """v0.6.1-c: per-iteration hook — decay effectiveness on loaded skills
     when the current execution observed a failure / partial.
 
     Idempotent per (execution × skill) via ``context._decayed_skills_this_exec``.
@@ -439,7 +439,7 @@ def _apply_recalibrate_skill_directive(
     config,
     execution_id: str,
 ) -> None:
-    """dispatch RECALIBRATE_SKILL — re-author the failing skill's
+    """v0.6.1-c: dispatch RECALIBRATE_SKILL — re-author the failing skill's
     ``instructions_md`` and either auto-apply (low-risk + opt-in env knob)
     or surface a flash card on /skills.
 
@@ -569,7 +569,7 @@ def _apply_supervisor_directives(directives, *, context, config, shadow=None, sc
                 except Exception:
                     pass  # frozen dataclass; supervisor must use a mutable config
             elif d.action == "TERMINATE":
-                # TERMINATE now produces an operator-facing approval
+                # v0.4.1-b: TERMINATE now produces an operator-facing approval
                 # card + records to the affinity log so future assignment
                 # decisions can exclude the shadow that just gave up.
                 _apply_terminate_directive(
@@ -577,7 +577,7 @@ def _apply_supervisor_directives(directives, *, context, config, shadow=None, sc
                     execution_id=execution_id,
                 )
             elif d.action == "RECALIBRATE_TOOL":
-                # tool inadequacy → diagnose → bump / fork → operator card.
+                # v0.5.0-d: tool inadequacy → diagnose → bump / fork → operator card.
                 # The dispatcher infers the failing tool from the rolling
                 # ``_consec_tool_fails`` map (most-recently-failing tool wins).
                 _apply_recalibrate_tool_directive(
@@ -586,7 +586,7 @@ def _apply_supervisor_directives(directives, *, context, config, shadow=None, sc
                     consec_tool_fails=consec_tool_fails or {},
                 )
             elif d.action == "RECALIBRATE_SKILL":
-                # skill inadequacy → re-author instructions_md →
+                # v0.6.1-c: skill inadequacy → re-author instructions_md →
                 # operator card (or auto-apply when low-risk + env knob set).
                 _apply_recalibrate_skill_directive(
                     d, context=context, vault=vault, config=config,
@@ -645,13 +645,13 @@ def _record_terminal_telemetry(
     iteration: int,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """— best-effort telemetry write at execution terminal state.
+    """v0.4.0-0 — best-effort telemetry write at execution terminal state.
 
     Skipped for ``status="success"`` (we only want failure-mode data).
     Failures inside this function are swallowed inside the telemetry module
     so the shadow's exit path is never affected.
 
-    Also records the outcome to ShadowMetrics keyed by
+    v0.4.3-a: Also records the outcome to ShadowMetrics keyed by
     (shadow_id, intent_hash) — this runs for ALL statuses including
     success.  The metrics feed the supervisor's affinity-routing
     alternative-selection so shadows with proven track records on
@@ -671,7 +671,7 @@ def _record_terminal_telemetry(
     except Exception:
         logger.debug("[Runtime] terminal telemetry skipped", exc_info=True)
 
-    # separate metric update path — runs for every status.
+    # v0.4.3-a: separate metric update path — runs for every status.
     _record_shadow_metric(shadow=shadow, scroll=scroll, status=status)
 
 
@@ -726,6 +726,36 @@ def _build_history_slice(context, max_events: int = 30) -> list:
     return recent
 
 
+import re as _re
+
+_PKG_TOKEN_RE = _re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _install_hint(missing_packages: list) -> str:
+    """Return an actionable install hint, never the misleading 'pip install unknown'.
+
+    If the first entry looks like a real package token, suggest pip; otherwise
+    (it's a human fallback phrase, or the list is empty) point at the manifest.
+    """
+    pkg = (missing_packages or [None])[0]
+    if pkg and _PKG_TOKEN_RE.match(pkg):
+        return f"pip install {pkg}"
+    return "see the tool's manifest"
+
+
+def _resolve_missing_packages(result_missing, declared) -> list:
+    """Pick the most honest missing-package list for operator messaging.
+
+    Priority: the tool result's own missing_packages → the tool's declared
+    manifest dependencies → a clear human phrase. NEVER returns ['unknown'].
+    """
+    if result_missing:
+        return list(result_missing)
+    if declared:
+        return list(declared)
+    return ["a required package (see tool manifest)"]
+
+
 def _dep_failure_messages(
     *,
     tool_name:        str,
@@ -741,7 +771,7 @@ def _dep_failure_messages(
     FAIL the objective" — the variability is in *why* and in what the
     operator should do.
     """
-    pkgs = ", ".join(missing_packages) or "unknown"
+    pkgs = ", ".join(missing_packages) if missing_packages else "a required package (see tool manifest)"
     if error_type == "missing_dependency":
         return (
             f"Tool '{tool_name}' cannot run: Python package '{pkgs}' is not installed "
@@ -850,11 +880,11 @@ class ShadowRuntime:
         )
         # Tools that returned a dep-related error during this execution.
         # Mapped to the list of packages that blocked them so we can clear the
-        # suppression precisely when an approval lands (no-restart fix).
+        # suppression precisely when an approval lands (v0.3.6 no-restart fix).
         # Older code paths that used this as a set still see truthy membership
         # via ``tool_name in self._dep_failed_tools``.
         self._dep_failed_tools: dict[str, list[str]] = {}
-        # per-tool consecutive-failure counter for in-loop reflection.
+        # v0.4.0-b: per-tool consecutive-failure counter for in-loop reflection.
         # Reset whenever the same tool succeeds.
         self._consec_tool_fails: dict[str, int] = {}
         # Directory is created lazily when the vault's prune_old_executions needs it;
@@ -865,7 +895,7 @@ class ShadowRuntime:
     def _gate3_check(self, tool) -> "dict | None":
         """Return structured error dict if the tool can't be invoked, else None.
 
-        messages now point operators to the dashboard recovery URL
+        v0.6.9: messages now point operators to the dashboard recovery URL
         instead of the misleading "Re-forge with feedback" instruction —
         most blockers are dep approval / dry-run re-runs, not re-forges.
         """
@@ -893,10 +923,10 @@ class ShadowRuntime:
             }
         return None
 
-    CIRCUIT_BREAKER_FAILURES = 3  # bail after N consecutive same-tool same-reason failures
+    CIRCUIT_BREAKER_FAILURES = 3  # v0.6.9: bail after N consecutive same-tool same-reason failures
 
     def _record_tool_failure(self, tool_name: str, reason: str) -> bool:
-        """iteration-loop circuit breaker.
+        """v0.6.9 iteration-loop circuit breaker.
 
         Append a failure to the consecutive-failures window. Returns True
         when the circuit is now tripped (caller should bail the iteration
@@ -916,9 +946,9 @@ class ShadowRuntime:
 
     def _build_memory_context_for_prompt(self) -> str:
         """LLM-facing memory view (consolidated, not the raw execution_log).
-        also includes refined lessons from memory_buffer, filtered
+        v0.6.9: also includes refined lessons from memory_buffer, filtered
         for resolved causes.
-        buffer comes via the configurable memory backend (defaults to
+        v0.7-g: buffer comes via the configurable memory backend (defaults to
         filesystem, lifts the existing vault layout — operators can switch to
         Mem0 via SYSTEMU_MEMORY_BACKEND=mem0)."""
         from systemu.runtime.memory_consolidator import MemoryConsolidator
@@ -1036,7 +1066,7 @@ class ShadowRuntime:
         # Legacy ActionBlock tracking
         current_ab   = 1
 
-        # ── resume from prior-execution snapshot ─────────────────
+        # ── v0.5.1-e: resume from prior-execution snapshot ─────────────────
         # When the supervisor's RECALIBRATE_TOOL → operator-approval flow
         # triggers re-queue with resume_from_execution_id, load the snapshot
         # and pre-populate sticky notes + completed_objectives so the new
@@ -1074,12 +1104,12 @@ class ShadowRuntime:
         iteration    = 0
         consecutive_thinks = 0  # throttle THINK storms
 
-        # Intelligent Supervisor (opt-in via config).  When enabled,
+        # v0.4.0-d: Intelligent Supervisor (opt-in via config).  When enabled,
         # an ExecutionMind subscribes to events for this run, observes failures,
         # and emits directives into a small inbox the loop drains each tick.
         # When disabled the inbox stays empty and shadow runtime behaves
         # exactly as in v0.3.x.
-        # per-shadow opt-in.  The supervisor activates when EITHER
+        # v0.4.1-a: per-shadow opt-in.  The supervisor activates when EITHER
         # the global config flag OR the shadow's own ``supervisor_enabled`` is
         # True.  Lets the operator A/B test on one specialist before flipping
         # the global switch.
@@ -1118,12 +1148,12 @@ class ShadowRuntime:
         while iteration < MAX_ITERATIONS:
             iteration += 1
 
-            # ── drain supervisor directive inbox and apply ─────────
+            # ── v0.4.0-d: drain supervisor directive inbox and apply ─────────
             # ExecutionMind populates this asynchronously; we apply pending
             # directives at the top of each iteration so they shape the
             # next LLM decision.  Empty when supervisor is disabled.
             if directive_inbox is not None and len(directive_inbox) > 0:
-                # stash loop state on the context so RECALIBRATE_TOOL
+                # v0.5.1-e: stash loop state on the context so RECALIBRATE_TOOL
                 # snapshot capture can read it without threading every state
                 # variable through every helper.
                 context._resume_iteration = iteration
@@ -1181,7 +1211,7 @@ class ShadowRuntime:
                 current_ab if not use_objectives else 0,
                 completed_objectives=completed_objectives if use_objectives else None,
             )
-            # THINK throttle ceiling is now config-driven.
+            # v0.4.0-a: THINK throttle ceiling is now config-driven.
             think_ceiling = getattr(self.config, "max_consecutive_think", 5) or 5
             loop = asyncio.get_event_loop()
             try:
@@ -1308,7 +1338,7 @@ class ShadowRuntime:
                     status="success",
                     final_summary=summary,
                 )
-                # record success in ShadowMetrics so the supervisor's
+                # v0.4.3-a: record success in ShadowMetrics so the supervisor's
                 # affinity-routing alternative-selection learns this shadow
                 # handles this intent_hash well.
                 _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
@@ -1442,7 +1472,7 @@ class ShadowRuntime:
                 else:
                     context.add_resource_load(resource_type, resource_id, md_content, current_ab)
                     logger.debug("[Runtime] LOAD_RESOURCE %s/%s", resource_type, resource_id)
-                    # track loaded skills so _maybe_decay_loaded_skills
+                    # v0.6.1-c: track loaded skills so _maybe_decay_loaded_skills
                     # knows which skills were in scope when failures hit.
                     if resource_type == "skill":
                         loaded = getattr(context, "_loaded_skill_ids", None)
@@ -1461,7 +1491,7 @@ class ShadowRuntime:
                     continue   # User denied destructive call
                 tool_call_count += 1
 
-                # iteration-loop circuit breaker — bail when the LLM
+                # v0.6.9: iteration-loop circuit breaker — bail when the LLM
                 # is stuck re-invoking the same broken tool with the same
                 # failure class. Saves 20+ wasted iterations on a recoverable
                 # blocker (op needs to use the recovery URL).
@@ -1475,7 +1505,7 @@ class ShadowRuntime:
                     tripped = self._record_tool_failure(cb_tool_name, cb_reason)
                     if tripped:
                         logger.warning(
-                            "[Runtime] circuit breaker tripped: "
+                            "[Runtime] v0.6.9 circuit breaker tripped: "
                             "tool=%s reason=%s after %d consecutive failures",
                             cb_tool_name, cb_reason, self.CIRCUIT_BREAKER_FAILURES,
                         )
@@ -1673,7 +1703,7 @@ class ShadowRuntime:
 
         # Suppress retries for tools that already failed with a dep error in
         # THIS run — but first re-check whether the blocking packages are now
-        # approved (no-restart fix).  When all are approved, drop the
+        # approved (v0.3.6 no-restart fix).  When all are approved, drop the
         # suppression and let the actual call proceed; the registry's
         # self-heal path will install + retry the import.
         if tool_name in self._dep_failed_tools:
@@ -1707,9 +1737,11 @@ class ShadowRuntime:
             "dependency_install_pending_approval",
             "dependency_install_failed",
         ):
-            missing_list = result.parsed.get("missing_packages") or ["unknown"]
-            missing      = missing_list[0]
-            hint         = result.parsed.get("install_hint", f"pip install {missing}")
+            missing_list = _resolve_missing_packages(
+                result.parsed.get("missing_packages"),
+                list(getattr(tool_obj, "dependencies", []) or []),
+            )
+            hint = result.parsed.get("install_hint") or _install_hint(missing_list)
             # Remember the EXACT packages that blocked this tool so we can
             # clear the suppression precisely when they're approved.
             self._dep_failed_tools[tool_name] = list(missing_list)
@@ -1751,7 +1783,7 @@ class ShadowRuntime:
             logger.warning(
                 "[Runtime] Tool %s failed: %s", tool_name, result.error or result.stderr[:500]
             )
-            # structured telemetry so we can build a real failure-mode
+            # v0.4.0-0: structured telemetry so we can build a real failure-mode
             # histogram before designing the supervisor.  Best-effort: telemetry
             # write failures are swallowed inside the module.
             try:
@@ -1774,7 +1806,7 @@ class ShadowRuntime:
             except Exception:
                 logger.debug("[Runtime] telemetry write skipped", exc_info=True)
 
-            # tool-level metrics (per-tool lifetime success rate).
+            # v0.4.4-a: tool-level metrics (per-tool lifetime success rate).
             # Used for operator visibility + Evolution proposals when tools
             # have chronically low success rates.  Keyed by tool_id so cross-
             # shadow signal accumulates.  Dependency-blocked failures are
@@ -1792,7 +1824,7 @@ class ShadowRuntime:
             except Exception:
                 logger.debug("[Runtime] tool_metrics record skipped", exc_info=True)
 
-            # in-loop reflection.  Classify cheaply, count
+            # v0.4.0-b: in-loop reflection.  Classify cheaply, count
             # consecutive failures for THIS tool, and queue a reflection
             # block for the next iteration.  After 3 consecutive failures,
             # the block explicitly forces a strategy choice via REFLECT.
@@ -1808,7 +1840,7 @@ class ShadowRuntime:
                 )
                 consec = self._consec_tool_fails[tool_name]
 
-                # decay loaded-skill effectiveness on this failure.
+                # v0.6.1-c: decay loaded-skill effectiveness on this failure.
                 # Threshold-crossing queues RECALIBRATE_SKILL on pending_directives.
                 try:
                     _maybe_decay_loaded_skills(
@@ -1833,7 +1865,7 @@ class ShadowRuntime:
             except Exception:
                 logger.debug("[Runtime] reflection injection skipped", exc_info=True)
 
-            # notify Intelligent Supervisor of this failure so it
+            # v0.4.0-d: notify Intelligent Supervisor of this failure so it
             # can decide whether to layer additional intervention on top of
             # the rule-based reflection block already queued above.
             mind = getattr(self, "_execution_mind", None)
@@ -1851,7 +1883,7 @@ class ShadowRuntime:
         else:
             # Reset the per-tool failure counter on success.
             self._consec_tool_fails.pop(tool_name, None)
-            # record success in tool metrics.
+            # v0.4.4-a: record success in tool metrics.
             try:
                 from systemu.runtime.tool_metrics import get_tool_metrics
                 get_tool_metrics().record(
@@ -1860,7 +1892,7 @@ class ShadowRuntime:
                 )
             except Exception:
                 logger.debug("[Runtime] tool_metrics record (success) skipped", exc_info=True)
-            # capture successful params for the backward-compat
+            # v0.5.0-a: capture successful params for the backward-compat
             # replay used by RECALIBRATE_TOOL's bump-version path.  Rolling
             # buffer capped at 20 entries; secret-like keys redacted.
             try:
@@ -1869,7 +1901,7 @@ class ShadowRuntime:
             except Exception:
                 logger.debug("[Runtime] last_successful_params capture skipped", exc_info=True)
 
-        # On a successful tool call, check whether this tool was
+        # v0.3.4: On a successful tool call, check whether this tool was
         # previously gated by a missing-dep failure (either earlier in
         # *this* run via ``_dep_failed_tools``, or in a prior run that
         # left a stale ``failure_patterns`` lesson in the shadow's buffer).
@@ -1900,7 +1932,7 @@ class ShadowRuntime:
         Reads the approval store via the ToolSandbox's already-resolved
         ``_approvals`` reference so we re-use the same store the
         registry consults — and so the read picks up out-of-process
-        mutations (store re-reads on every check).
+        mutations (v0.3.6 store re-reads on every check).
         """
         if not blocking:
             self._dep_failed_tools.pop(tool_name, None)

@@ -55,9 +55,15 @@ class RecoveryEngine:
             err_text = ""
             if tool.dry_run_evidence and isinstance(tool.dry_run_evidence, dict):
                 err_text = tool.dry_run_evidence.get("error", "")
-            classified = classify_dry_run_error(err_text)
+            classified = classify_dry_run_error(
+                err_text,
+                missing_packages=(tool.dry_run_evidence or {}).get("missing_packages")
+                if isinstance(tool.dry_run_evidence, dict) else None,
+            )
             if classified.kind == "DEP_PENDING":
-                pkg = classified.missing_package or "<unknown>"
+                pkg = classified.missing_package or (
+                    (tool.dependencies or [None])[0] if getattr(tool, "dependencies", None) else None
+                ) or "a required package (see tool manifest)"
                 actions.append(self._make(
                     "tool", tool_id, "DEP_PENDING",
                     f"Tool {tool.name} missing package: {pkg}",
