@@ -1,0 +1,27 @@
+{
+  "id": "tool_detect_language_from_extension",
+  "name": "detect_language_from_extension",
+  "description": "Detect programming language from a file extension using a built-in mapping dictionary.",
+  "tool_type": "python_function",
+  "parameters_schema": {
+    "filename": {
+      "type": "string",
+      "description": "Filename with extension (e.g., 'main.py')"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/detect_language_from_extension.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_detect_language_from_extension\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

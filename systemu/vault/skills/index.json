@@ -7,13 +7,11 @@
     "proficiency_level": "intermediate",
     "required_tool_names": [
       "web_screenshot",
-      "web_extract_text",
-      "web_extract_table"
+      "web_read"
     ],
     "required_tool_ids": [
-      "tool_0977913b",
-      "tool_6b1b3809",
-      "tool_69f090ed"
+      "tool_web_screenshot",
+      "tool_web_read"
     ],
     "evidence_scroll_ids": [],
     "created_at": "2026-05-04T00:00:00"
@@ -26,12 +24,12 @@
     "proficiency_level": "intermediate",
     "required_tool_names": [
       "web_search",
-      "web_extract_text",
+      "web_read",
       "fetch_html"
     ],
     "required_tool_ids": [
-      "tool_30db21be",
-      "tool_6b1b3809",
+      "tool_web_search",
+      "tool_web_read",
       "tool_70a65c87"
     ],
     "evidence_scroll_ids": [],
@@ -162,7 +160,7 @@
     ],
     "required_tool_ids": [
       "tool_ecaccc06",
-      "tool_0977913b",
+      "tool_web_screenshot",
       "tool_bfc76fb8"
     ],
     "evidence_scroll_ids": [],
@@ -196,31 +194,6 @@
     "required_tool_ids": [
       "tool_c80288c5",
       "tool_7053c530"
-    ],
-    "evidence_scroll_ids": [],
-    "created_at": "2026-05-04T00:00:00"
-  },
-  {
-    "id": "skill_a7075e4f",
-    "name": "finance_data_collection",
-    "description": "Expert-level proficiency in collecting financial data from web sources and organizing it into structured documents",
-    "category": "finance",
-    "proficiency_level": "expert",
-    "required_tool_names": [
-      "web_screenshot",
-      "web_extract_text",
-      "web_extract_table",
-      "fetch_json",
-      "create_word_doc",
-      "create_excel_sheet"
-    ],
-    "required_tool_ids": [
-      "tool_0977913b",
-      "tool_6b1b3809",
-      "tool_69f090ed",
-      "tool_a1f69543",
-      "tool_6e6e62c0",
-      "tool_7bc4c9a3"
     ],
     "evidence_scroll_ids": [],
     "created_at": "2026-05-04T00:00:00"
@@ -281,146 +254,5 @@
     ],
     "evidence_scroll_ids": [],
     "created_at": "2026-05-04T00:00:00"
-  },
-  {
-    "id": "skill_9953de4b",
-    "name": "financial_reporting_automation",
-    "description": "Proficiency in automating the collection of financial market data and compiling it into standardized, dated documentation.",
-    "category": "finance",
-    "proficiency_level": "intermediate",
-    "required_tool_names": [
-      "web_screenshot",
-      "create_word_doc"
-    ],
-    "required_tool_ids": [
-      "tool_0977913b",
-      "tool_6e6e62c0"
-    ],
-    "evidence_scroll_ids": [
-      "scroll_bd2c3a68"
-    ],
-    "created_at": "2026-05-04T13:04:49.738844"
-  },
-  {
-    "id": "skill_20dbfd9b",
-    "name": "email_automation",
-    "description": "Proficiency in programmatically sending emails with attachments using secure authentication protocols",
-    "category": "communication",
-    "proficiency_level": "intermediate",
-    "required_tool_names": [
-      "send_email"
-    ],
-    "required_tool_ids": [
-      "tool_378f77a9"
-    ],
-    "evidence_scroll_ids": [
-      "scroll_22e82474"
-    ],
-    "created_at": "2026-05-05T19:59:23.340488"
-  },
-  {
-    "id": "skill_13607e03",
-    "name": "email_thread_management",
-    "description": "Proficiency in searching, reading, and replying to specific email threads using programmatic APIs",
-    "category": "communication",
-    "proficiency_level": "intermediate",
-    "required_tool_names": [
-      "search_emails",
-      "send_email"
-    ],
-    "required_tool_ids": [
-      "tool_5a69f64d",
-      "tool_378f77a9"
-    ],
-    "evidence_scroll_ids": [
-      "scroll_22e82474"
-    ],
-    "created_at": "2026-05-05T21:11:36.907567"
-  },
-  {
-    "id": "skill_cd9aabd7",
-    "name": "ci_cd_pipeline_analysis",
-    "description": "Proficiency in analyzing CI/CD pipeline runs on GitHub Actions, including filtering for failures, extracting run metadata, reviewing associated commits, and inspecting workflow definitions",
-    "category": "devops",
-    "proficiency_level": "intermediate",
-    "required_tool_names": [
-      "fetch_json",
-      "fetch_html",
-      "web_extract_text",
-      "file_list_dir",
-      "file_read"
-    ],
-    "required_tool_ids": [
-      "tool_a1f69543",
-      "tool_70a65c87",
-      "tool_6b1b3809",
-      "tool_1f0bb1cf",
-      "tool_8c300ad3"
-    ],
-    "evidence_scroll_ids": [
-      "scroll_e9749c8e"
-    ],
-    "created_at": "2026-05-08T21:59:10.272120"
-  },
-  {
-    "id": "skill_721d02b6",
-    "name": "clinical_trial_search",
-    "description": "Proficiency in searching ClinicalTrials.gov for clinical trials by condition, phase, and recruitment status, and extracting structured trial listings",
-    "category": "browser",
-    "proficiency_level": "intermediate",
-    "required_tool_names": [
-      "web_extract_text",
-      "web_extract_table",
-      "browser_navigate"
-    ],
-    "required_tool_ids": [
-      "tool_6b1b3809",
-      "tool_69f090ed",
-      "tool_9b79befb"
-    ],
-    "evidence_scroll_ids": [
-      "scroll_abb228dc"
-    ],
-    "created_at": "2026-05-08T22:06:02.672096"
-  },
-  {
-    "id": "skill_679cb540",
-    "name": "clinical_trial_detail_extraction",
-    "description": "Proficiency in navigating to a specific clinical trial page on ClinicalTrials.gov and extracting detailed trial information including title, status, phase, interventions, outcomes, and eligibility criteria",
-    "category": "browser",
-    "proficiency_level": "intermediate",
-    "required_tool_names": [
-      "browser_navigate",
-      "web_extract_text",
-      "web_extract_table"
-    ],
-    "required_tool_ids": [
-      "tool_9b79befb",
-      "tool_6b1b3809",
-      "tool_69f090ed"
-    ],
-    "evidence_scroll_ids": [
-      "scroll_abb228dc"
-    ],
-    "created_at": "2026-05-08T22:06:02.727739"
-  },
-  {
-    "id": "skill_a6f6087b",
-    "name": "weather_report_creation",
-    "description": "Proficiency in capturing current weather data from a web source and compiling it into a dated Word document with an embedded screenshot",
-    "category": "browser",
-    "proficiency_level": "intermediate",
-    "required_tool_names": [
-      "web_screenshot",
-      "create_word_doc"
-    ],
-    "required_tool_ids": [
-      "tool_0977913b",
-      "tool_6e6e62c0"
-    ],
-    "evidence_scroll_ids": [
-      "scroll_fb8c620f"
-    ],
-    "created_at": "2026-05-09T06:51:58.225927"
   }
 ]

@@ -249,6 +249,15 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         except Exception:
             logger.exception("[Daemon] tool-dep pre-warm failed — continuing boot")
 
+    # v0.8.10: ensure a headless browser is available (background, non-blocking).
+    # T0 fetch + T1 search work immediately; T2 browser tools come online once
+    # chromium finishes installing.
+    try:
+        from systemu.runtime.web.provision import ensure_chromium_async
+        ensure_chromium_async()
+    except Exception:
+        logger.exception("[Daemon] browser provision probe failed — continuing boot")
+
     # Create AppState FIRST so the scheduler jobs and the dashboard both use
     # the same vault backend (selected by SYSTEMU_STORAGE).  Without this,
     # the CLI and scheduler would write to the file vault while the dashboard

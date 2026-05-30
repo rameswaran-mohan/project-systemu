@@ -20,6 +20,10 @@ systemu/vault/notifications/
 systemu/vault/elder/
 systemu/vault/scrolls/*.json
 systemu/vault/shadow_army/shadow_shadow_*/
+# v0.8.10: the seed Wild Card generalist shadow ships with the repo (fresh-install
+# posture). Runtime-generated shadows above stay ignored; this seed is the exception.
+!systemu/vault/shadow_army/shadow_shadow_wildcard/
+!systemu/vault/shadow_army/shadow_shadow_wildcard/**
 
 # ── Database files ────────────────────────────────────────────────────────────
 *.db
@@ -66,6 +70,8 @@ build/
 .coverage
 htmlcov/
 *.xml
+# Stray dirs created when a test passes a MagicMock() as a vault root path.
+MagicMock/
 
 # ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/

@@ -7,8 +7,7 @@ metadata:
   proficiency_level: intermediate
   required_tools:
   - web_screenshot
-  - web_extract_text
-  - web_extract_table
+  - web_read
 ---
 
 # web_data_capture
@@ -19,13 +18,12 @@ Proficiency in fetching, rendering, and capturing data from web pages using prog
 
 ## Procedural Instructions
 
-To capture web data: 1) Identify the target URL and data type needed (text, table, or screenshot). 2) Use web_screenshot for visual captures or financial charts where exact pixel representation matters. 3) Use web_extract_text with a CSS selector for structured text extraction. 4) Use web_extract_table when the data is in an HTML table format — check table_index if multiple tables exist. 5) Verify the captured content is complete and matches the expected data before storing or using it downstream.
+To capture web data: 1) Identify the target URL and data type needed (readable text or a visual capture). 2) Use web_screenshot for visual captures or charts where exact pixel representation matters — it renders the page in a headless browser and saves a full-page image. 3) Use web_read to pull the page's readable text and links; it fetches the page directly and escalates to a headless browser automatically for JS-heavy or single-page apps, so tables and dynamic content are included in the extracted text. 4) Verify the captured content is complete and matches the expected data before storing or using it downstream.
 
 ## Required Tools
 
 - web_screenshot
-- web_extract_text
-- web_extract_table
+- web_read
 
 ## Evidence Scrolls
 

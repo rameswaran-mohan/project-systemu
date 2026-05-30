@@ -7,7 +7,7 @@ metadata:
   proficiency_level: intermediate
   required_tools:
   - web_search
-  - web_extract_text
+  - web_read
   - fetch_html
 ---
 
@@ -19,12 +19,12 @@ Ability to search the web, evaluate results, and extract relevant information fo
 
 ## Procedural Instructions
 
-To research a topic: 1) Formulate a specific search query — prefer factual, concise terms over natural language. 2) Call web_search with the query and review the returned results (title, URL, snippet). 3) Navigate to the most relevant result using web_extract_text to get the full page content. 4) If the snippet is sufficient, avoid fetching the full page. 5) Cross-reference from at least 2 sources when accuracy is critical.
+To research a topic: 1) Formulate a specific search query — prefer factual, concise terms over natural language. 2) Call web_search with the query and review the returned results (title, URL, snippet). 3) Navigate to the most relevant result using web_read to get the full page text (it fetches the page and falls back to a headless browser for JS-heavy pages automatically). 4) If the snippet is sufficient, avoid fetching the full page. 5) Cross-reference from at least 2 sources when accuracy is critical.
 
 ## Required Tools
 
 - web_search
-- web_extract_text
+- web_read
 - fetch_html
 
 ## Evidence Scrolls

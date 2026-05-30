@@ -354,16 +354,23 @@ class TestImageResize:
 # ─── Tool META validation ─────────────────────────────────────────────────────
 
 class TestToolMeta:
+    # v0.8.10: curated tool pack — tiered web capability replaced the old
+    # web_extract_text/web_extract_table/browser_navigate tools with
+    # web_read/web_act (and rewrote web_search/web_screenshot).
+    # Curated KEEP list = 38 tools. The trailing 7 (api_call_get + 6) were
+    # wrongly dropped during curation and restored in fix/v0.8.10-web-capability.
     REQUIRED_TOOLS = [
-        "web_screenshot", "web_extract_text", "web_extract_table",
-        "fetch_json", "fetch_html", "download_file", "web_search",
+        "web_search", "web_read", "web_screenshot", "web_act",
+        "fetch_json", "fetch_html", "download_file",
         "file_read", "file_write", "file_append", "file_list_dir",
         "file_copy", "file_delete", "compress_files", "extract_archive",
         "create_word_doc", "read_word_doc", "create_excel_sheet", "read_excel_sheet",
         "take_screenshot", "clipboard_read", "clipboard_write",
         "notify_desktop", "run_command", "parse_json", "format_date", "image_resize",
         "launch_application", "close_application", "keyboard_shortcut",
-        "type_text", "browser_navigate",
+        "type_text",
+        "api_call_get", "detect_language_from_extension", "file_scan_directory",
+        "run_cli_command", "write_csv_file", "write_markdown_file", "write_text_file",
     ]
 
     @pytest.mark.parametrize("tool_name", REQUIRED_TOOLS)

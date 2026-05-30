@@ -16,7 +16,10 @@ _IMPORT_RE = re.compile(
 )
 
 
-def classify_dry_run_error(error_text: str) -> ClassifiedError:
+def classify_dry_run_error(error_text: str, missing_packages: Optional[list] = None) -> ClassifiedError:
+    # v0.8.10: prefer a structured missing-packages list over regex sniffing.
+    if missing_packages:
+        return ClassifiedError(kind="DEP_PENDING", missing_package=missing_packages[0])
     if not error_text:
         return ClassifiedError(kind="DRY_RUN_FAILED_BUG")
     m = _IMPORT_RE.search(error_text)
