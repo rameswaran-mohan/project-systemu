@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.name_resolver import resolve_name, short_id
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,14 @@ def build_activities_page() -> None:
 
                         # Scroll
                         with ui.element("td").style(f"padding: 12px 16px; font-size: 13px; color: {THEME['text_muted']};"):
-                            ui.label(scroll_id[:16] + "…" if len(scroll_id) > 16 else scroll_id)
+                            if scroll_id and scroll_id != "—":
+                                with ui.column().style("gap: 0;"):
+                                    ui.label(resolve_name(scroll_id, vault)).style(
+                                        f"color: {THEME['text']}; font-size: 13px;")
+                                    ui.label(short_id(scroll_id)).style(
+                                        f"color: {THEME['text_muted']}; font-size: 11px; font-family: monospace;")
+                            else:
+                                ui.label("—")
 
                         # Skills count with warning if missing tools
                         with ui.element("td").style("padding: 12px 16px;"):
@@ -146,7 +154,14 @@ def build_activities_page() -> None:
 
                         # Shadow
                         with ui.element("td").style(f"padding: 12px 16px; font-size: 12px; color: {THEME['text_muted']};"):
-                            ui.label(shadow_id[:12] + "…" if len(shadow_id) > 12 else shadow_id)
+                            if shadow_id and shadow_id != "—":
+                                with ui.column().style("gap: 0;"):
+                                    ui.label(resolve_name(shadow_id, vault)).style(
+                                        f"color: {THEME['text']}; font-size: 13px;")
+                                    ui.label(short_id(shadow_id)).style(
+                                        f"color: {THEME['text_muted']}; font-size: 11px; font-family: monospace;")
+                            else:
+                                ui.label("—")
 
                         # Actions
                         with ui.element("td").style("padding: 12px 16px;"):
@@ -203,9 +218,13 @@ def _show_activity_detail(activity_id: str, vault) -> None:
         # Scroll link
         _section_header("📜 Source Scroll")
         with ui.row().style("align-items: center; gap: 10px; margin-bottom: 16px;"):
-            ui.label(activity.scroll_id).style(
-                f"font-size: 13px; color: {THEME['text']}; font-family: monospace;"
-            )
+            with ui.column().style("gap: 0;"):
+                ui.label(resolve_name(activity.scroll_id, vault)).style(
+                    f"font-size: 13px; color: {THEME['text']};"
+                )
+                ui.label(short_id(activity.scroll_id)).style(
+                    f"font-size: 11px; color: {THEME['text_muted']}; font-family: monospace;"
+                )
             ui.button("View Scroll", on_click=lambda: _view_scroll(activity.scroll_id, vault, dlg)).style(
                 f"background: {THEME['primary']}; color: white; border-radius: 6px; "
                 f"font-size: 12px; padding: 4px 10px;"
@@ -242,9 +261,13 @@ def _show_activity_detail(activity_id: str, vault) -> None:
         # Shadow assignment
         _section_header("👤 Assigned Shadow")
         if activity.assigned_shadow_id:
-            ui.label(activity.assigned_shadow_id).style(
-                f"font-size: 13px; color: {THEME['text']}; font-family: monospace; margin-bottom: 16px;"
-            )
+            with ui.column().style("gap: 0; margin-bottom: 16px;"):
+                ui.label(resolve_name(activity.assigned_shadow_id, vault)).style(
+                    f"font-size: 13px; color: {THEME['text']};"
+                )
+                ui.label(short_id(activity.assigned_shadow_id)).style(
+                    f"font-size: 11px; color: {THEME['text_muted']}; font-family: monospace;"
+                )
         else:
             ui.label("No shadow assigned yet.").style(
                 f"font-size: 13px; color: {THEME['text_muted']}; margin-bottom: 16px;"

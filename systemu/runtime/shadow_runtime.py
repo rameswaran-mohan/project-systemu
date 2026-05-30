@@ -105,6 +105,7 @@ def _apply_terminate_directive(
     shadow,
     scroll,
     execution_id: str,
+    vault=None,
 ) -> None:
     """Handle a TERMINATE directive from the Intelligent Supervisor (v0.4.1-b).
 
@@ -148,6 +149,18 @@ def _apply_terminate_directive(
         "being notified separately and will choose the recovery action."
     )
 
+    # Resolve scroll/shadow names for the operator-facing card; the execution
+    # id has no name so it stays as a short companion.
+    from systemu.interface.name_resolver import resolve_name, short_id
+    _scroll_name = (
+        resolve_name(getattr(scroll, "id", ""), vault) if vault is not None and getattr(scroll, "id", "")
+        else getattr(scroll, "name", "") or "this scroll"
+    )
+    _shadow_name = (
+        resolve_name(getattr(shadow, "id", ""), vault) if vault is not None and getattr(shadow, "id", "")
+        else getattr(shadow, "name", "") or "the shadow"
+    )
+
     # Operator approval card via the v0.3.6 supervisor-flash bus.
     try:
         from datetime import datetime as _dt, timezone as _tz
@@ -157,11 +170,12 @@ def _apply_terminate_directive(
             "ts":       _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
             "level":    "WARNING",
             "category": "approval",
-            "message":  f"🛑 Supervisor TERMINATEd execution {execution_id[:12]}…",
+            "message":  f"🛑 Supervisor TERMINATEd: {_scroll_name} · {short_id(execution_id)}",
             "context": {
                 "approval_message": (
-                    f"The Intelligent Supervisor has decided execution "
-                    f"{execution_id} cannot succeed and should terminate. "
+                    f"The Intelligent Supervisor has decided {_shadow_name}'s run of "
+                    f"“{_scroll_name}” cannot succeed and should terminate "
+                    f"(execution {short_id(execution_id)}). "
                     f"Reason: {directive.rationale or 'see audit log'}.\n\n"
                     "Choose a recovery action on the workflow detail page."
                 ),
@@ -574,7 +588,7 @@ def _apply_supervisor_directives(directives, *, context, config, shadow=None, sc
                 # decisions can exclude the shadow that just gave up.
                 _apply_terminate_directive(
                     d, context=context, shadow=shadow, scroll=scroll,
-                    execution_id=execution_id,
+                    execution_id=execution_id, vault=vault,
                 )
             elif d.action == "RECALIBRATE_TOOL":
                 # v0.5.0-d: tool inadequacy → diagnose → bump / fork → operator card.

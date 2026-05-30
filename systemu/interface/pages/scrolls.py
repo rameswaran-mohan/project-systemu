@@ -131,14 +131,16 @@ def _approve_scroll(scroll_id: str) -> None:
     import sys
     from pathlib import Path
     from systemu.interface.dashboard_state import AppState
+    from systemu.interface.name_resolver import resolve_name
     jm = JobManager.get()
     state = AppState.get()
     try:
         cwd = state.project_root
         cmd = [sys.executable, "-m", "sharing_on", "scrolls", "approve", scroll_id]
-        
-        jm.start_job(f"Approving Scroll: {scroll_id[:8]}", "approve", cmd, cwd)
-        ui.notify(f"Dispatched background approval for Scroll {scroll_id[:8]}", type="positive")
+
+        scroll_name = resolve_name(scroll_id, state.vault)
+        jm.start_job(f"Approving Scroll: {scroll_name}", "approve", cmd, cwd)
+        ui.notify(f"Dispatched background approval for Scroll {scroll_name}", type="positive")
     except Exception as exc:
         ui.notify(f"Error: {exc}", type="negative")
 

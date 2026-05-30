@@ -193,6 +193,8 @@ def _store_proposal(prop: Dict[str, Any], vault: Vault) -> Evolution:
 
 def _notify_evolution(evolution: Evolution, config: Config, vault: Vault) -> None:
     """Notify user about a new evolution proposal and handle approval."""
+    from systemu.interface.name_resolver import resolve_names
+
     priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
         getattr(evolution, "priority", "medium"), "🟡"
     )
@@ -202,7 +204,7 @@ def _notify_evolution(evolution: Evolution, config: Config, vault: Vault) -> Non
     choice = notify_user(
         title=f"{priority_icon} Evolution Opportunity — {evolution.evolution_type.value.title()}",
         message=(
-            f"Target: {evolution.target_entity_type} — {', '.join(evolution.target_entity_ids)}\n\n"
+            f"Target: {evolution.target_entity_type} — {', '.join(resolve_names(evolution.target_entity_ids, vault))}\n\n"
             f"[bold]Proposal:[/bold] {evolution.description}\n\n"
             f"[dim]Rationale:[/dim] {evolution.rationale}"
         ),

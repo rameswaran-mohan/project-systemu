@@ -7,6 +7,38 @@ import pytest
 # ─── Fix A: DecisionDispatcher ─────────────────────────────────────────────
 
 class TestDispatcher:
+    @pytest.fixture(autouse=True)
+    def _isolate_dispatcher_state(self):
+        """Snapshot + restore the dispatcher's module globals around every test.
+
+        Several tests in this class call ``_HANDLERS.clear()`` to assert
+        registration behaviour in isolation.  Without restoring afterwards, that
+        clear leaks into later tests that rely on the import-time registrations
+        (``validator_propose``/``forge_tool``/``shadow_decision``) — and because
+        Python caches imports, a ``from systemu.pipelines import scroll_refiner``
+        in a later test does NOT re-run the module-level ``register()`` when the
+        module was already imported earlier in the process (e.g. by an earlier
+        test file).  Snapshot/restore makes this class order-independent.
+
+        It also force-imports the three handler-registering pipeline modules and
+        runs the dispatcher's eager bootstrap so the registrations are present
+        for tests that depend on them, regardless of prior import state.
+        """
+        import systemu.approval.decision_dispatcher as _disp_mod
+        # Ensure the three import-time registrations are present (idempotent).
+        try:
+            _disp_mod._ensure_handlers_registered()
+        except Exception:
+            pass
+        saved_handlers = dict(_disp_mod._HANDLERS)
+        saved_boot = getattr(_disp_mod, "_handlers_bootstrapped", False)
+        try:
+            yield
+        finally:
+            _disp_mod._HANDLERS.clear()
+            _disp_mod._HANDLERS.update(saved_handlers)
+            _disp_mod._handlers_bootstrapped = saved_boot
+
     def test_register_and_dispatch_calls_handler(self):
         from systemu.approval.decision_dispatcher import register, dispatch, _HANDLERS
         from systemu.approval.decision_queue import OperatorDecision

@@ -14,6 +14,7 @@ from nicegui import ui
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
 from systemu.interface.jobs import JobManager, JobStatus, Job
 from systemu.interface.nav_helpers import workshop_deeplink
+from systemu.interface.name_resolver import resolve_names
 
 
 _STATUS_ICON = {
@@ -381,11 +382,11 @@ def _show_shadow_detail(shadow_id: str) -> None:
         _detail_section("System Prompt (preview)", shadow.system_prompt[:600] + "…" if len(shadow.system_prompt) > 600 else shadow.system_prompt)
 
         if shadow.skill_ids:
-            _detail_section("Skills", " · ".join(shadow.skill_ids))
+            _detail_section("Skills", " · ".join(resolve_names(shadow.skill_ids, state.vault)) or "—")
         if shadow.available_tool_ids:
-            _detail_section("Tools", " · ".join(shadow.available_tool_ids))
+            _detail_section("Tools", " · ".join(resolve_names(shadow.available_tool_ids, state.vault)) or "—")
         if shadow.assigned_activity_ids:
-            _detail_section("Activities", " · ".join(shadow.assigned_activity_ids))
+            _detail_section("Activities", " · ".join(resolve_names(shadow.assigned_activity_ids, state.vault)) or "—")
 
         # v0.4.3-b: operator-labelled specialty tag (routing preference).
         specialty = str(getattr(shadow, "specialty", "") or "")
