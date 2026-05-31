@@ -106,9 +106,21 @@ def _render_unbaked_banner() -> None:
         ).classes("text-blue-900")
 
 
-def build_tools_page() -> None:
+def build_tools_page(forge_tool_id: str | None = None) -> None:
     state = AppState.get()
     vault = state.vault
+
+    # Deep-link: /tools?forge=<id> auto-opens the spec/code review dialog after
+    # the page has rendered (ui.timer defers past the slot-stack build).  This
+    # is scheduled before the no-tools early return so the deep-link still
+    # resolves (the dialog notifies + no-ops on an unknown/missing id).
+    if forge_tool_id:
+        def _open_forge(tid: str = forge_tool_id) -> None:
+            try:
+                _show_spec_review_dialog(tid)
+            except Exception:
+                ui.notify("Could not open the tool review dialog.", type="negative")
+        ui.timer(0.1, _open_forge, once=True)
 
     _render_unbaked_banner()
 

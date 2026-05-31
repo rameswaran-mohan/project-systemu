@@ -18,6 +18,26 @@ from systemu.interface.dashboard_state import AppState, THEME
 from systemu.interface.nav_helpers import tile_nav_target
 
 
+def _pending_approvals_count(vault) -> int:
+    """Count items awaiting operator approval — proposed tools + pending deps.
+
+    Pure + robust: never raises (returns 0 on any error). In file mode the
+    DepApprovalStore reads ``data/dep_approvals.json``.
+    """
+    try:
+        tools = vault.load_index("tools") or []
+    except Exception:
+        tools = []
+    proposed = sum(1 for t in tools if t.get("status") == "proposed")
+    try:
+        from pathlib import Path
+        from systemu.runtime.dep_approvals import DepApprovalStore
+        deps = len(DepApprovalStore(Path("data") / "dep_approvals.json").list_pending())
+    except Exception:
+        deps = 0
+    return proposed + deps
+
+
 def build_console_page() -> None:
     state = AppState.get()
     vault = state.vault
@@ -91,6 +111,18 @@ def build_console_page() -> None:
                     f"font-size: 12px; color: {THEME['primary']}; text-decoration: none;"
                 )
             _build_pending_actions_minipane(vault)
+
+    # ── Pending Approvals — auto-open when anything is pending ─────────
+    n_appr = _pending_approvals_count(vault)
+    with ui.expansion(f"Pending Approvals ({n_appr})", value=n_appr > 0).classes("w-full").style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; margin-bottom: 8px;"
+    ):
+        with ui.column().classes("w-full").style("padding: 8px 4px; gap: 12px;"):
+            from systemu.interface.components.pending_tools import build_pending_tools
+            from systemu.interface.components.pending_deps import build_pending_deps
+            build_pending_tools()
+            build_pending_deps(compact=True)
 
     # ── Events (two panes, header arrows) — collapsed ──────────────────
     with ui.expansion("Events", value=False).classes("w-full").style(
@@ -182,10 +214,11 @@ def _stat_card(icon: str, label: str, value: int, color: str, subtitle: str,
 # carried over — the feed is removed in v0.8.8 (the event panes supersede it).
 
 def _build_expansions() -> None:
-    """Render the four collapsed-by-default Console expansion cards.
+    """Render the collapsed-by-default Console "More" expansion cards.
 
     Lazy-load each card body on expansion open — keeps the initial
-    Console render cheap.
+    Console render cheap. (Pending Tools / Tool Dependencies now live in the
+    top-level "Pending Approvals" section, so they are no longer rendered here.)
     """
     _expansion("📈", "Learning Curves",
                "Compact view of Shadow execution metrics and the data flywheel.",
@@ -198,14 +231,6 @@ def _build_expansions() -> None:
     _expansion("🧩", "Skills Snapshot",
                "Top skills by usage, with a link to the full skill registry.",
                _load_skills_snapshot)
-
-    _expansion("🔧", "Pending Tools",
-               "Tools the Tool Forge has proposed but you haven't enabled yet.",
-               _load_pending_tools)
-
-    _expansion("📦", "Tool Dependencies",
-               "Pip packages awaiting your approval before tools may install them.",
-               _load_pending_deps)
 
 
 def _expansion(icon: str, title: str, subtitle: str, body_loader) -> None:
@@ -262,16 +287,6 @@ def _load_memory_status() -> None:
 def _load_skills_snapshot() -> None:
     from systemu.interface.components.skills_snapshot import build_skills_snapshot
     build_skills_snapshot()
-
-
-def _load_pending_tools() -> None:
-    from systemu.interface.components.pending_tools import build_pending_tools
-    build_pending_tools()
-
-
-def _load_pending_deps() -> None:
-    from systemu.interface.components.pending_deps import build_pending_deps
-    build_pending_deps(compact=True)
 
 
 # ── Quick-action handlers ──────────────────────────────────────────────
