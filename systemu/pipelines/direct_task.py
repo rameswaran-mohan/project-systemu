@@ -193,6 +193,15 @@ def run_direct_task(
         })
         return None
 
+    # v0.8.16: this is a chat-originated task — stamp the trigger origin so
+    # every downstream event (sync execute + queued worker) partitions into
+    # the Supervisor (chat) pane, not Manual Logs.
+    try:
+        activity.origin = "chat"
+        vault.save_activity(activity)
+    except Exception:
+        logger.debug("[DirectTask] could not stamp chat origin on activity", exc_info=True)
+
     # ── Stage 3: Shadow assignment ────────────────────────────────────────
     from systemu.pipelines.shadow_decision import decide_shadow
     try:
@@ -274,7 +283,7 @@ def run_direct_task(
 
             sub_id = supervisor.submit(
                 activity.id, shadow.id,
-                priority=2, reason="chat",
+                priority=2, reason="chat", origin="chat",
             )
             vault.update_chat_history_entry(ts, {
                 "status": "queued",
@@ -296,7 +305,7 @@ def run_direct_task(
     from systemu.runtime.shadow_runtime import ShadowRuntime
     runtime = ShadowRuntime(config, vault)
     try:
-        result = _run_coroutine(runtime.execute(shadow, activity))
+        result = _run_coroutine(runtime.execute(shadow, activity, origin="chat"))
     except Exception as exc:
         logger.error("[DirectTask] Execution failed: %s", exc)
         vault.update_chat_history_entry(ts, {

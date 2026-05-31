@@ -47,7 +47,7 @@ def build_insights_page(default_tab: str = "memory") -> None:
         f"font-size: 28px; font-weight: 800; color: {THEME['text']}; margin-bottom: 4px;"
     )
     ui.label(
-        "Operational analytics — memory health, the data flywheel, and the live event log."
+        "Operational analytics — memory health, the data flywheel, and the live Manual Logs."
     ).style(
         f"color: {THEME['text_muted']}; font-size: 14px; margin-bottom: 20px;"
     )
@@ -58,7 +58,7 @@ def build_insights_page(default_tab: str = "memory") -> None:
     ) as tabs:
         ui.tab("memory", label="💡 Memory")
         ui.tab("flywheel", label="🔁 Flywheel")
-        ui.tab("events", label="🔔 Events")
+        ui.tab("events", label="🔔 Manual Logs")
         ui.tab("actions", label="⏳ Pending Actions")
 
     # ── Tab panels ──────────────────────────────────────────────────────────
@@ -71,6 +71,21 @@ def build_insights_page(default_tab: str = "memory") -> None:
         with ui.tab_panel("flywheel"):
             build_flywheel_page()
         with ui.tab_panel("events"):
+            # v0.8.16: render the live, origin-filtered Manual Logs feed at the
+            # top so the full-page tab matches the Console mini-pane (capture /
+            # manual / scheduled).  The existing pending-notifications file-tail
+            # content stays below — this is purely additive.
+            from systemu.interface.components.live_events_pane import (
+                build_supervisor_events_pane,
+            )
+            ui.label("🔔 Live Manual Logs").style(
+                f"font-size: 14px; font-weight: 700; color: {THEME['text']}; "
+                f"margin-bottom: 8px;"
+            )
+            build_supervisor_events_pane(
+                origins=frozenset({"capture", "manual", "scheduled"})
+            )
+            ui.separator().style("margin: 16px 0;")
             build_notifications_page()
         with ui.tab_panel("actions"):
             _render_pending_decisions()

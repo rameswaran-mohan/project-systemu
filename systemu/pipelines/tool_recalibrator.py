@@ -62,7 +62,7 @@ class RecalibrationResult:
     spec_diff_summary:    str = ""
     forced_fallback:      bool = False   # bump tried, fell back to fork
     error:                Optional[str] = None
-    # structured spec diff for the operator's approval card.
+    # v0.5.1-b: structured spec diff for the operator's approval card.
     # Populated by _bump_version / _fork_new_tool when both old and new
     # specs are available.  Each entry: {"field": str, "old": str, "new": str}.
     spec_diff:            List[Dict[str, str]] = field(default_factory=list)
@@ -95,7 +95,7 @@ def compute_spec_diff(
 ) -> List[Dict[str, str]]:
     """Build a structured field-by-field diff between two tool specs.
 
-    — operator-facing visualisation only; never used for
+    v0.5.1-b — operator-facing visualisation only; never used for
     correctness checks.  Each entry has the field name + truncated
     old/new values (200 chars each) for compact display on the
     approval card.
@@ -122,7 +122,7 @@ def is_low_risk_recalibration(
     tool: "Tool",
     diagnosis: "InadequacyDiagnosis",
 ) -> tuple[bool, str]:
-    """— classify whether a recalibration is safe to auto-approve.
+    """v0.5.1-c — classify whether a recalibration is safe to auto-approve.
 
     Conservative criteria — every one must be True:
 
@@ -566,6 +566,7 @@ def publish_recalibration_card(
     shadow_id: str,
     execution_id: str,
     scroll_id: Optional[str] = None,
+    origin: str = "system",
 ) -> None:
     """Surface the recalibration outcome to the operator chat feed.
 
@@ -586,6 +587,7 @@ def publish_recalibration_card(
             "ts":       datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "level":    "WARNING" if not result.success else "INFO",
             "category": "approval",
+            "origin":   origin,
             "message":  f"{glyph} {title}",
             "context": {
                 "approval_message": _compose_approval_message(result),
@@ -596,7 +598,7 @@ def publish_recalibration_card(
                 "shadow_id":        shadow_id,
                 "scroll_id":        scroll_id,
                 "recalibration":    result.to_card_context(),
-                # actions field expected by the workflow detail panel.
+                # v0.4.1-b actions field expected by the workflow detail panel.
                 "actions":          [
                     "enable_recalibrated_tool",
                     "override_to_bump",

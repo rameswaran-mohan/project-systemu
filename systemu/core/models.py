@@ -35,6 +35,35 @@ from systemu.core.utils import utcnow as _now
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  v0.8.16: Origin taxonomy — canonical trigger origin for every event
+# ─────────────────────────────────────────────────────────────────────────────
+
+ORIGINS = {"chat", "capture", "manual", "scheduled", "system"}
+
+_REASON_TO_ORIGIN = {
+    "chat": "chat", "ui-submit": "chat",
+    "manual": "manual",
+    "scheduled": "scheduled",
+    "capture": "capture",
+    "restart-restore": "system", "crash-recovery": "system", "db-restore": "system",
+    "startup_recovery_assigned": "system",
+}
+
+
+def coerce_origin(reason) -> str:
+    """Map a submit `reason` (or raw origin) to a canonical event origin.
+    Exact origin → itself; known reason → mapped; retry-* → system; unknown/empty → manual."""
+    if reason in ORIGINS:
+        return reason
+    key = str(reason or "").strip().lower()
+    if key in _REASON_TO_ORIGIN:
+        return _REASON_TO_ORIGIN[key]
+    if key.startswith("retry") or key.startswith("operator_") or "recovery" in key or "restore" in key:
+        return "system"
+    return "manual"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Scroll
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -297,6 +326,7 @@ class Activity(BaseModel):
     missing_tools:       List[str] = []    # tool names not yet forged
     assigned_shadow_id:  Optional[str] = None
     status:              ActivityStatus = ActivityStatus.UNASSIGNED
+    origin:              str = "manual"   # v0.8.16: trigger origin {chat,capture,manual,scheduled,system}
     # v0.6.0-f: Frozen intent at extraction time so Stage 5 (shadow tiebreak)
     # can do semantic matching without re-loading the scroll on every call.
     intent_snapshot:     str = ""

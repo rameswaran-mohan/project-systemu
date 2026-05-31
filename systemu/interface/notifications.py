@@ -122,6 +122,11 @@ def log_event(
         "category": category,
         "message": message,
         "context": context or {},
+        # v0.8.16: surface the trigger origin to a TOP-LEVEL key so the
+        # origin-partitioned live panes (which read event["origin"]) classify
+        # correctly.  Runtime call sites already pass origin inside the context
+        # dict; absent → "manual" (the coerce_origin default).
+        "origin": (context or {}).get("origin") or "manual",
     }
 
     # Write to logger

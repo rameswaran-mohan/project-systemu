@@ -58,7 +58,7 @@ FILTER_OPTIONS = ["All", "Execution", "Supervisor", "Errors", "Approvals"]
 FILTER_CATEGORIES: Dict[str, Optional[List[str]]] = {
     "All":        None,
     "Execution":  ["shadow", "tool", "tool_call", "observation", "thought"],
-    # "Supervisor" filter now also includes supervisor_action
+    # v0.4.1-d: "Supervisor" filter now also includes supervisor_action
     # events (the strategy-stream from the Intelligent Supervisor).
     "Supervisor": ["supervisor", "system", "supervisor_action"],
     "Errors":     None,   # handled by level check
@@ -211,7 +211,10 @@ def build_systemu_chat_page() -> None:
                 try:
                     from systemu.runtime.supervisor import Supervisor
                     sup = Supervisor.get()
-                    sid = sup.submit(activity_id, shadow_id, priority=priority, reason="ui-submit")
+                    # v0.8.16: operator-initiated manual submit → "manual" origin
+                    # so it partitions into Manual Logs, not the Supervisor (chat) pane.
+                    sid = sup.submit(activity_id, shadow_id, priority=priority,
+                                     reason="ui-submit", origin="manual")
                     ui.notify(f"✅ Submitted — submission_id: {sid}", type="positive")
                     activity_input.set_value("")
                 except RuntimeError:
@@ -258,7 +261,7 @@ def build_systemu_chat_page() -> None:
     # Maps approval key → small dict holding {col, btn_row} so we can
     # surgically update the card when a dismissal event arrives.  Keyed by
     # request_id for classic blocking approvals, and by dedup_key for
-    # out-of-band approvals (e.g. tool-dep installs).
+    # v0.3.6 out-of-band approvals (e.g. tool-dep installs).
     _pending_approvals: Dict[str, Dict[str, Any]] = {}
 
     # ── Render a single message card ─────────────────────────────────────────
@@ -307,14 +310,14 @@ def build_systemu_chat_page() -> None:
             _render_approval_card(event, ts_str, level_color)
             return
 
-        # out-of-band approval resolved on another surface
+        # v0.3.6: out-of-band approval resolved on another surface
         # (Tools page approve / revoke).  Close any open card with the
         # matching dedup_key so the operator sees the resolution land.
         if category == "approval_dismissed":
             _handle_approval_dismissed(event)
             return
 
-        # supervisor strategy-stream tick — compact inline card.
+        # v0.4.1-d: supervisor strategy-stream tick — compact inline card.
         if category == "supervisor_action":
             _render_supervisor_action(event, ts_str)
             return
@@ -445,7 +448,7 @@ def build_systemu_chat_page() -> None:
 
                 btn_row = ui.row().style("gap: 8px; margin-top: 4px;")
 
-                # redirect-style approval — single navigation button.
+                # v0.3.6: redirect-style approval — single navigation button.
                 if redirect_to and not request_id:
                     with btn_row:
                         ui.button(
@@ -591,7 +594,7 @@ def build_systemu_chat_page() -> None:
                        action: Optional[str] = None) -> None:
         """Operator clicked 'Dismiss notice' — hide the card locally.
 
-        also records the dismissal to the RejectionStore so the
+        v0.4.1-c: also records the dismissal to the RejectionStore so the
         Intelligent Supervisor can consult it before re-proposing the same
         intervention.  The card carries a ``pattern_signature`` when the
         supervisor or a v0.4.0+ pipeline published it; legacy cards

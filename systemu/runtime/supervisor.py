@@ -272,6 +272,7 @@ class Supervisor:
         scroll_id: Optional[str] = None,
         consult_affinity_log: bool = True,
         resume_from_execution_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> str:
         """Queue an activity for execution.
 
@@ -293,10 +294,20 @@ class Supervisor:
                           a recent TERMINATE, pick a different shadow before
                           queueing.  Set to False to skip the check (e.g. for
                           tests or operator-forced submissions).
+            origin:       v0.8.16 — canonical trigger origin
+                          ({chat,capture,manual,scheduled,system}).  When None,
+                          it is derived from ``reason`` via ``coerce_origin``.
+                          Stamped onto the queued event so the origin-partitioned
+                          live panes can filter, and carried on the queue payload
+                          so the worker can thread it into the runtime.
 
         Returns:
             A submission_id string for tracking.
         """
+        # v0.8.16: resolve the canonical trigger origin once, up-front.  An
+        # explicit `origin` wins; otherwise derive it from the submit `reason`.
+        from systemu.core.models import coerce_origin
+        resolved_origin = coerce_origin(origin or reason)
         # v0.4.2-a: Affinity-aware routing.  Two reasons to swap the assigned
         # shadow before queueing:
         #   1. Caller explicitly excluded this shadow (Retry-different-shadow).
@@ -349,6 +360,7 @@ class Supervisor:
             "priority":      priority,
             "retry_count":   retry_count,
             "reason":        reason,
+            "origin":        resolved_origin,   # v0.8.16: trigger origin → worker → runtime
             "enqueued_at":   time.time(),
             # v0.5.1-e: resume hint carried in payload so the shadow runtime
             # can rebuild its context from the snapshot persisted by
@@ -373,7 +385,9 @@ class Supervisor:
         self._publish(
             f"📥 Activity queued: {self._aname(activity_id)} (priority={priority}, reason={reason}, retry={retry_count})",
             context={"submission_id": submission_id, "activity_id": activity_id,
-                     "shadow_id": shadow_id, "priority": priority, "retry_count": retry_count},
+                     "shadow_id": shadow_id, "priority": priority, "retry_count": retry_count,
+                     "origin": resolved_origin},
+            origin=resolved_origin,
         )
         logger.info("[Supervisor] Queued %s / %s (submission=%s retry=%d)",
                     activity_id, shadow_id, submission_id, retry_count)
@@ -685,6 +699,7 @@ class Supervisor:
                         f"⚠️ Activity {payload['activity_id']} waited {wait_s:.0f}s in queue",
                         level="WARNING",
                         context=payload,
+                        origin=payload.get("origin"),
                     )
 
                 # Acquire slot (blocks if all slots busy, respects shutdown)
@@ -743,6 +758,7 @@ class Supervisor:
             f"▶️ Executing: {self._aname(activity_id)} (retry={retry_count})",
             context={"activity_id": activity_id, "shadow_id": shadow_id,
                      "retry_count": retry_count, "key": key},
+            origin=payload.get("origin"),   # v0.8.16: lifecycle event partitions on origin
         )
 
         result: Dict[str, Any] = {}
@@ -773,6 +789,7 @@ class Supervisor:
                         shadow, activity,
                         cancel_event=cancel_event,
                         resume_from_execution_id=resume_from,
+                        origin=payload.get("origin"),   # v0.8.16: thread trigger origin
                     )
                 )
             finally:
@@ -843,6 +860,7 @@ class Supervisor:
                 level="SUCCESS",
                 context={"activity_id": activity_id, "shadow_id": shadow_id,
                          "result": result},
+                origin=payload.get("origin"),   # v0.8.16
             )
             return
 
@@ -853,6 +871,7 @@ class Supervisor:
                 f"🚫 Shadow cancelled (watchdog-requested): {activity_id}",
                 level="WARNING",
                 context={"activity_id": activity_id},
+                origin=payload.get("origin"),   # v0.8.16
             )
             return
 
@@ -870,6 +889,7 @@ class Supervisor:
                 f"(in {wait_s}s) — reason: {error[:120]}",
                 level="WARNING",
                 context={"activity_id": activity_id, "retry_count": retry_count + 1},
+                origin=payload.get("origin"),   # v0.8.16
             )
             threading.Timer(
                 wait_s,
@@ -880,6 +900,7 @@ class Supervisor:
                     "priority":    payload.get("priority", 5),
                     "reason":      f"retry-{retry_count + 1}",
                     "retry_count": retry_count + 1,
+                    "origin":      payload.get("origin"),   # v0.8.16: preserve origin across retries
                 },
             ).start()
         else:
@@ -904,6 +925,7 @@ class Supervisor:
                 f"💀 Dead-lettered: {self._aname(activity_id)} (exhausted {retry_count} retries) — {error[:200]}",
                 level="ERROR",
                 context=dl_entry,
+                origin=payload.get("origin"),   # v0.8.16
             )
 
             # Trigger LLM diagnosis in background
@@ -926,6 +948,7 @@ class Supervisor:
         self._publish(
             f"🔍 Analyzing failure for {activity_id}…",
             context={"activity_id": activity_id},
+            origin=payload.get("origin"),
         )
 
         recent_events = self._read_recent_events(limit=30)
@@ -974,6 +997,7 @@ Respond with a JSON object exactly matching this schema:
                         "analysis":    analysis,
                         "type":        "failure_analysis",
                     },
+                    origin=payload.get("origin"),
                 )
                 # v0.4.0-0: also mirror to failure_telemetry.jsonl so a single
                 # file holds the full failure-mode history for histogram analysis.
@@ -1025,6 +1049,7 @@ Respond with a JSON object exactly matching this schema:
                 self._publish(
                     f"🧠 Diagnosis complete for {activity_id} (raw): {str(analysis)[:300]}",
                     context={"activity_id": activity_id, "raw_analysis": str(analysis)},
+                    origin=payload.get("origin"),
                 )
         except Exception as exc:
             logger.warning("[Supervisor] LLM diagnosis failed: %s", exc)
@@ -1032,6 +1057,7 @@ Respond with a JSON object exactly matching this schema:
                 f"⚠️ Could not generate diagnosis for {activity_id}: {exc}",
                 level="WARNING",
                 context={"activity_id": activity_id},
+                origin=payload.get("origin"),
             )
 
     # ── Heartbeat watchdog ────────────────────────────────────────────────────
@@ -1124,6 +1150,7 @@ Respond with a JSON object exactly matching this schema:
                 level="WARNING",
                 context={"key": key, "payload": payload,
                          "silence_s": silence_s, "new_retry_count": retry_count},
+                origin=payload.get("origin"),   # v0.8.16
             )
 
             # [FIX-6] Signal the shadow to exit cleanly at the next iteration boundary
@@ -1149,6 +1176,7 @@ Respond with a JSON object exactly matching this schema:
                     priority=payload.get("priority", 5),
                     reason="stuck-watchdog-retry",
                     retry_count=retry_count,   # [FIX-5] correct count
+                    origin=payload.get("origin"),   # v0.8.16: preserve origin across retries
                 )
             else:
                 dl_entry = {
@@ -1171,6 +1199,7 @@ Respond with a JSON object exactly matching this schema:
                     f"💀 Dead-lettered (stuck + max retries): {self._aname(payload['activity_id'])}",
                     level="ERROR",
                     context=dl_entry,
+                    origin=payload.get("origin"),   # v0.8.16
                 )
                 threading.Thread(
                     target=self._analyze_failure,
@@ -1365,11 +1394,28 @@ Respond with a JSON object exactly matching this schema:
         message: str,
         level: str = "INFO",
         context: Optional[Dict[str, Any]] = None,
+        origin: Optional[str] = None,
     ) -> None:
-        """Publish a supervisor event to the EventBus (non-blocking)."""
+        """Publish a supervisor event to the EventBus (non-blocking).
+
+        v0.8.16: when *origin* is supplied, the event is published with a
+        top-level ``origin`` key so the origin-partitioned live panes can
+        filter on it; otherwise we use the plain ``publish_supervisor`` path.
+        """
         try:
             from systemu.interface.event_bus import EventBus
-            EventBus.get().publish_supervisor(message, level=level, context=context or {})
+            if origin is not None:
+                from datetime import datetime, timezone
+                EventBus.get().publish({
+                    "ts":       datetime.now(timezone.utc).isoformat(),
+                    "level":    level.upper(),
+                    "category": "supervisor",
+                    "message":  message,
+                    "context":  context or {},
+                    "origin":   origin,
+                })
+            else:
+                EventBus.get().publish_supervisor(message, level=level, context=context or {})
         except Exception as exc:
             logger.debug("[Supervisor] EventBus publish error: %s", exc)
 
