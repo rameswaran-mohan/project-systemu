@@ -32,6 +32,18 @@ logger = logging.getLogger(__name__)
 # tool subprocesses (_SAFE_ENV_KEYS) lives in systemu/runtime/backend/local.py
 # now that the backend is pluggable.  See ARCHITECTURE.md for the model.
 
+_SUBPROCESS_ONLY_DEPS = {"playwright", "playwright-stealth", "selenium"}
+
+
+def _must_use_subprocess(tool_type, dependencies) -> bool:
+    """Playwright/Selenium use a sync API that cannot run inside the asyncio
+    loop the in-process fast path uses, so such tools must run in a fresh
+    subprocess (the dry-run path already does this)."""
+    if str(tool_type or "") == "browser_action":
+        return True
+    deps = {str(d).lower() for d in (dependencies or [])}
+    return bool(deps & _SUBPROCESS_ONLY_DEPS)
+
 
 @dataclass
 class ToolResult:
@@ -136,6 +148,7 @@ class ToolSandbox:
         *,
         timeout: Optional[int] = None,
         extra_packages: Optional[List[str]] = None,
+        tool_type: Optional[str] = None,
     ) -> ToolResult:
         """Execute a tool implementation script with the given parameters.
 
@@ -145,6 +158,10 @@ class ToolSandbox:
             timeout:             Optional per-call timeout override.
             extra_packages:      pip packages to install inside the Docker container
                                  before running (Docker mode only; ignored otherwise).
+            tool_type:           Tool category (e.g. "browser_action"). Playwright/
+                                 Selenium tools are forced through the subprocess path
+                                 (their sync API cannot run in the in-process async
+                                 fast path). See ``_must_use_subprocess``.
 
         Returns:
             ToolResult with parsed stdout JSON and metadata.
@@ -161,7 +178,10 @@ class ToolSandbox:
         tool_name = impl_path.stem   # derive name from filename, e.g. "browser_navigate"
 
         # ── Fast path: ToolRegistry (direct Python function call) ─────────
-        if self._registry is not None and impl_path.exists():
+        # Browser/Playwright tools MUST go through the subprocess path — their
+        # sync API cannot run inside the in-process async fast path (v0.8.15).
+        if (self._registry is not None and impl_path.exists()
+                and not _must_use_subprocess(tool_type, extra_packages)):
             try:
                 from systemu.runtime.tool_registry import ToolDependencyError, ToolNotEnabledError
                 result_dict = await self._registry.execute(

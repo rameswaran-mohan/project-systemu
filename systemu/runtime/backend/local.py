@@ -39,6 +39,7 @@ _SAFE_ENV_KEYS = {
     "HOME",
     "LC_ALL",
     "PYTHONPATH",
+    "PLAYWRIGHT_BROWSERS_PATH",
 }
 
 

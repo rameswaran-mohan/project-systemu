@@ -1751,6 +1751,7 @@ class ShadowRuntime:
             tool_obj.implementation_path,
             parameters,
             extra_packages=tool_obj.dependencies or [],
+            tool_type=getattr(tool_obj.tool_type, "value", tool_obj.tool_type),
         )
 
         # Detect dependency-related result types and suppress retries.
