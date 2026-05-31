@@ -24,6 +24,24 @@ from systemu.interface.name_resolver import resolve_name, short_id
 logger = logging.getLogger(__name__)
 
 
+# Terminal chat statuses. Note both "failed" (extraction/decision crash, set by
+# direct_task) and "failure" (ShadowRuntime result status) occur in practice.
+_TERMINAL_STATUSES = {"success", "failure", "failed", "partial", "skipped_no_shadow", "cancelled"}
+
+
+def _stale_terminal_ts(entries) -> set:
+    """Timestamps of terminal entries that are NOT the newest entry — i.e. old,
+    finished tasks that should not read as the current state. `entries` are in
+    chat-history file order (oldest first)."""
+    if not entries:
+        return set()
+    newest_ts = entries[-1].get("ts")
+    return {
+        e.get("ts") for e in entries
+        if e.get("ts") != newest_ts and e.get("status") in _TERMINAL_STATUSES
+    }
+
+
 def _should_schedule_refresh(client) -> bool:
     """True iff the NiceGUI client is still connected.
 
@@ -76,11 +94,19 @@ def build_chat_page() -> None:
                     f"color: {THEME['text_muted']}; font-size: 14px;"
                 )
             return
+        stale = _stale_terminal_ts(entries)
         with history_col:
+            with ui.row().classes("w-full justify-end"):
+                ui.button(
+                    "Clear history",
+                    on_click=lambda: (vault.clear_chat_history(), _render_history()),
+                ).props("flat dense").style(
+                    f"color: {THEME['text_muted']}; font-size: 11px;"
+                )
             for entry in reversed(entries):
-                _render_entry(entry)
+                _render_entry(entry, is_stale=entry.get("ts") in stale)
 
-    def _render_entry(entry: Dict[str, Any]) -> None:
+    def _render_entry(entry: Dict[str, Any], is_stale: bool = False) -> None:
         status   = entry.get("status", "?")
         prompt   = entry.get("prompt", "")
         ts       = entry.get("ts", "")[:19].replace("T", " ")
@@ -96,16 +122,17 @@ def build_chat_page() -> None:
             "waiting_on_tools": THEME.get("warning", "#f59e0b"),
         }.get(status, THEME.get("text_muted", "#94a3b8"))
 
+        card_opacity = "opacity: 0.55; " if is_stale else ""
         with ui.card().classes("w-full").style(
             f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-            f"border-radius: 12px; padding: 14px 18px;"
+            f"border-radius: 12px; padding: 14px 18px; {card_opacity}"
         ):
             with ui.row().classes("w-full items-start justify-between"):
                 with ui.column().style("gap: 4px; flex: 1;"):
                     ui.label(prompt[:120] + ("…" if len(prompt) > 120 else "")).style(
                         f"font-size: 15px; font-weight: 600; color: {THEME['text']};"
                     )
-                    meta = ts
+                    meta = ("previous · " + ts) if is_stale else ts
                     if sid:
                         meta += f"  ·  shadow: {resolve_name(sid, vault)}"
                     if exec_id:

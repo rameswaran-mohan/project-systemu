@@ -1079,6 +1079,15 @@ class Vault:
                 pass
             raise
 
+    def clear_chat_history(self) -> None:
+        """Delete all chat-history entries (operator-initiated 'Clear history')."""
+        path = self.root / "elder" / "chat_history.jsonl"
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:
+            logger.warning("[Vault] clear_chat_history failed: %s", exc)
+
     def get_latest_chat_scroll(self) -> Optional["Scroll"]:
         """Return the most recent Scroll created from a direct chat task, or None."""
         history = self.load_chat_history(limit=1)

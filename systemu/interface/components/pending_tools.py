@@ -14,6 +14,10 @@ from nicegui import ui
 from systemu.interface.dashboard_state import AppState, THEME
 
 
+def _forge_link(tool_id: str) -> str:
+    return f"/tools?forge={tool_id}"
+
+
 def build_pending_tools() -> None:
     """Render the list of tools in 'proposed' status."""
     state = AppState.get()
@@ -70,6 +74,12 @@ def build_pending_tools() -> None:
                     f"padding: 2px 8px; "
                     f"background: color-mix(in srgb, {THEME['warning']} 15%, transparent); "
                     f"border-radius: 999px;"
+                )
+                ui.button(
+                    "Review & forge →",
+                    on_click=lambda tid=t.get("id"): ui.navigate.to(_forge_link(tid)),
+                ).props("flat dense").style(
+                    f"color: {THEME['warning']}; font-size: 11px; font-weight: 700;"
                 )
 
     ui.button(

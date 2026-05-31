@@ -597,9 +597,11 @@ def register_routes() -> None:
             build_activities_page()
 
     @ui.page("/tools")
-    def page_tools():
+    def page_tools(forge: str = ""):
+        # ?forge=<tool_id> deep-links to a proposed tool and auto-opens its
+        # spec/code review dialog (precedent: page_insights(tab=...)).
         with _build_layout("🔧 Tool Registry", "/tools"):
-            build_tools_page()
+            build_tools_page(forge_tool_id=forge or None)
 
     @ui.page("/skills")
     def page_skills():
