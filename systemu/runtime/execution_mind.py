@@ -67,7 +67,7 @@ ACTION_VOCABULARY = (
     "ESCALATE",
     "TERMINATE",
     "SET_THINK_BUDGET",
-    # tool inadequacy → propose recalibration to operator
+    # v0.5.0-d: tool inadequacy → propose recalibration to operator
     "RECALIBRATE_TOOL",
     # v0.6.0-d.5: skill inadequacy → re-author instructions_md.  Mirrors
     # RECALIBRATE_TOOL but targets the procedural-knowledge layer (Skills)
@@ -147,17 +147,22 @@ class ExecutionMind:
         directive_sink: Callable[["Directive"], None],
         data_dir:       Optional[Path] = None,
         force_enabled:  bool = False,
+        origin:         str = "system",
     ):
         self.execution_id   = execution_id
         self.shadow_id      = shadow_id
         self.config         = config
         self._sink          = directive_sink
         self.data_dir       = Path(data_dir or "data")
+        # v0.8.16: canonical trigger origin of the run this Mind supervises.
+        # Stamped onto every strategy-stream tick so it partitions into the
+        # same live pane as the run.  Defaults to "system".
+        self._origin        = origin or "system"
         self.hypothesis     = Hypothesis()
         self._actions:      List[str] = []
         self._calls_made    = 0
         self._high_impact_calls = 0
-        # enable via global config OR force_enabled (per-shadow opt-in)
+        # v0.4.1-a: enable via global config OR force_enabled (per-shadow opt-in)
         self._enabled       = (
             bool(getattr(config, "intelligent_supervisor_enabled", False))
             or bool(force_enabled)
@@ -214,7 +219,7 @@ class ExecutionMind:
                 )
             self._calls_made += 1
 
-        # per-hour / per-day USD cap check via the cost ledger.
+        # v0.4.0-f: per-hour / per-day USD cap check via the cost ledger.
         # When breached the kill switch trips and every future call returns
         # DO_NOTHING until operator reset (day) or hour rollover (hour).
         try:
@@ -243,7 +248,7 @@ class ExecutionMind:
             timeout=timeout,
         )
 
-        # consult the operator-rejection store before committing
+        # v0.4.1-c: consult the operator-rejection store before committing
         # to a non-trivial action.  If the operator recently dismissed a
         # similar proposal (same pattern_signature), downgrade to DO_NOTHING
         # with a clear rationale so the audit log shows why we backed off.
@@ -274,7 +279,7 @@ class ExecutionMind:
         with self._lock:
             self._actions.append(directive.action)
 
-        # record the cost of the call we just made.  Conservative
+        # v0.4.0-f: record the cost of the call we just made.  Conservative
         # estimate ($0.01 per Tier-3 call, $0.05 per Tier-1) — refined later
         # if we wire up real pricing.  Best-effort.
         try:
@@ -296,7 +301,7 @@ class ExecutionMind:
         except Exception:
             logger.exception("[ExecutionMind] directive sink raised")
 
-        # publish a strategy-stream tick so the chat feed shows
+        # v0.4.1-d: publish a strategy-stream tick so the chat feed shows
         # the supervisor reasoning in real time.  Audit file remains the
         # source of forensic truth; this is the operator-facing view.
         try:
@@ -316,6 +321,7 @@ class ExecutionMind:
                 iteration=iteration,
                 shadow_id=self.shadow_id,
                 pattern_signature=sig,
+                origin=getattr(self, "_origin", "system"),   # v0.8.16
             )
         except Exception:
             logger.debug("[ExecutionMind] strategy-stream publish skipped", exc_info=True)
@@ -393,7 +399,7 @@ class ExecutionMind:
         )
         tier_label = interv_tier_name if is_intervention_warranted else routine_tier_name
 
-        # surface live cost-pressure to the supervisor LLM so it
+        # v0.4.3-c: surface live cost-pressure to the supervisor LLM so it
         # can prefer cheaper directives (NUDGE, DO_NOTHING) when budgets
         # are near exhaustion.  We pass utilisation ratios + absolute
         # spend so the model can reason about both proportion and headroom.

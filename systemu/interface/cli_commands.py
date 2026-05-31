@@ -937,13 +937,20 @@ def army_awaken(ctx, name: str, activity: Optional[str],
 @click.argument("shadow_id")
 @click.argument("scroll_id")
 @click.option("--dry-run", is_flag=True, help="Show execution plan without invoking real tools.")
+@click.option("--origin", default="manual", show_default=True,
+              help="v0.8.16: trigger origin stamped on every event "
+                   "(manual=operator Execute button, scheduled=schedule fire).")
 @click.pass_context
-def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool):
+def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool, origin: str):
     """Execute a Scroll via a Shadow (agentic runtime).
 
     Uses the ShadowRuntime ReAct loop: Reason → Tool Call → Observe → repeat.
     Requires the Shadow to have at least one DEPLOYED tool. Use --dry-run to
     preview the execution plan without invoking real tools (all PROPOSED tools allowed).
+
+    v0.8.16: ``--origin`` tags every published event so the dashboard panes
+    partition correctly.  The scheduled-execute job passes ``scheduled``; the
+    operator Execute button uses the ``manual`` default.
     """
     _maybe_install_bridge_writer()   # v0.8.6
     config, vault = _get_vault_and_config(ctx)
@@ -987,7 +994,7 @@ def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool):
     from systemu.runtime.shadow_runtime import ShadowRuntime
     runtime = ShadowRuntime(config=config, vault=vault)
 
-    result = asyncio.run(runtime.execute(shadow, activity, dry_run=dry_run))
+    result = asyncio.run(runtime.execute(shadow, activity, dry_run=dry_run, origin=origin))
 
     status  = result.get("status", "?")
     summary = result.get("summary", "")

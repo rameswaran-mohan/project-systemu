@@ -398,18 +398,24 @@ class EventBus:
         iteration:    int = 0,
         shadow_id:    Optional[str] = None,
         pattern_signature: Optional[str] = None,
+        origin:       str = "system",
     ) -> None:
         """Emit a strategy-stream tick to the chat feed.
 
         Always informational — no operator response expected.  The chat
         renderer groups these by execution_id and shows a compact action
         glyph plus a collapsible rationale.
+
+        v0.8.16: ``origin`` is stamped TOP-LEVEL so the origin-partitioned live
+        panes classify the tick into the same pane as the run it belongs to
+        (fed from the runtime's ``_origin``; defaults to ``"system"``).
         """
         self.publish({
             "ts":       datetime.now(timezone.utc).isoformat(),
             "level":    "INFO",
             "category": "supervisor_action",
             "message":  f"🧠 Supervisor → {action}",
+            "origin":   origin,
             "context": {
                 "execution_id":      execution_id,
                 "supervisor_action": action,

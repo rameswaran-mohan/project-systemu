@@ -4,7 +4,7 @@ Layout (top to bottom):
   1. Header: "🖥️ Console" + horizontal Quick Actions row
   2. Six clickable stat tiles (navigate to list pages)
   3. Pending Actions mini-pane (scrollable, capped height)
-  4. Two event panes: Supervisor live events (left) + Insights event log (right)
+  4. Two live event panes: Supervisor=chat (left) + Manual Logs=capture/manual/scheduled (right)
   5. "More" — five collapsed lazy-loaded expansion cards
 
 Replaces the v0.7.2 Overview. build_overview_page is re-exported from
@@ -129,29 +129,30 @@ def build_console_page() -> None:
         f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
         f"border-radius: 12px; margin-bottom: 8px;"
     ):
+        from systemu.interface.components.live_events_pane import build_supervisor_events_pane
         with ui.row().classes("w-full gap-4").style("flex-wrap: wrap; padding: 8px;"):
-            # Supervisor live events (left)
+            # Supervisor (chat) live events (left)
             with ui.column().style("flex: 1; min-width: 360px;"):
                 with ui.row().style("align-items: center; gap: 6px; margin-bottom: 8px;"):
-                    ui.label("▶️ Supervisor Live Events").style(
+                    ui.label("▶️ Supervisor (chat)").style(
                         f"font-size: 12px; font-weight: 700; color: {THEME['text']};"
                     )
                     ui.link("→", "/systemu-chat").style(
                         f"font-size: 13px; color: {THEME['primary']}; text-decoration: none;"
                     ).tooltip("Open full supervisor feed")
-                from systemu.interface.components.live_events_pane import build_supervisor_events_pane
-                build_supervisor_events_pane()
-            # Event log (right)
+                build_supervisor_events_pane(origins=frozenset({"chat"}))
+            # Manual Logs — capture / manual / scheduled (right)
             with ui.column().style("flex: 1; min-width: 360px;"):
                 with ui.row().style("align-items: center; gap: 6px; margin-bottom: 8px;"):
-                    ui.label("🔔 Events Log").style(
+                    ui.label("🔔 Manual Logs").style(
                         f"font-size: 12px; font-weight: 700; color: {THEME['text']};"
                     )
                     ui.link("→", "/insights?tab=events").style(
                         f"font-size: 13px; color: {THEME['primary']}; text-decoration: none;"
-                    ).tooltip("Open full event log")
-                from systemu.interface.pages.notifications_page import build_events_log_pane
-                build_events_log_pane()
+                    ).tooltip("Open full Manual Logs")
+                build_supervisor_events_pane(
+                    origins=frozenset({"capture", "manual", "scheduled"})
+                )
 
     # ── More (collapsed expansion wrapping the lazy cards) ─────────────
     with ui.expansion("More", value=False).classes("w-full").style(

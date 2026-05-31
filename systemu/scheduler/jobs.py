@@ -515,6 +515,11 @@ def _resubmit_unexecuted_assigned(vault) -> None:
                 activity.id,
                 shadow.id,
                 reason="startup_recovery_assigned",
+                # v0.8.16: preserve the activity's true trigger origin across a
+                # recovery re-submit so a recovered chat/capture task partitions
+                # into its real pane.  When the activity has no origin recorded,
+                # coerce_origin(reason) falls back to "system" (recovery noise).
+                origin=getattr(activity, "origin", None),
             )
             submitted += 1
             logger.info(
@@ -1065,6 +1070,10 @@ def _dispatch_scheduled(schedule, now, config, vault) -> None:
     cmd = [
         sys.executable, "-m", "sharing_on",
         "army", "execute", schedule.shadow_id, schedule.scroll_id,
+        # v0.8.16: a schedule fire is the "scheduled" trigger origin — the CLI
+        # threads this into ShadowRuntime.execute(origin=...) so every event
+        # partitions into Manual Logs (scheduled), not Supervisor (chat).
+        "--origin", "scheduled",
     ]
     if schedule.dry_run:
         cmd.append("--dry-run")

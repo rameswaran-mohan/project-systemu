@@ -158,14 +158,24 @@ def decide_shadow(
 
 # ─── Shadow assignment helpers ────────────────────────────────────────────────
 
-def _submit_to_supervisor(activity_id: str, shadow_id: str, shadow_name: str) -> None:
+def _submit_to_supervisor(
+    activity_id: str,
+    shadow_id: str,
+    shadow_name: str,
+    *,
+    origin: str | None = None,
+) -> None:
     """Submit the activity to the Supervisor for immediate execution.
 
     Silently skips if the Supervisor is not running (CLI / test mode).
+
+    v0.8.16: ``origin`` carries the *activity's* trigger origin (chat / capture)
+    so a shadow-awakened submission partitions into the right event pane.  The
+    awaken ``reason`` is kept for the audit trail but does NOT drive the origin.
     """
     try:
         from systemu.runtime.supervisor import Supervisor
-        Supervisor.get().submit(activity_id, shadow_id, reason="shadow_awakened")
+        Supervisor.get().submit(activity_id, shadow_id, reason="shadow_awakened", origin=origin)
         logger.info("[Shadow] Submitted activity '%s' to Supervisor via shadow '%s'",
                     activity_id, shadow_name)
     except RuntimeError:
@@ -199,7 +209,8 @@ def _assign_shadow_to_activity(
         actions=["OK"],
     )
     if not skip_supervisor:
-        _submit_to_supervisor(activity.id, shadow.id, shadow.name)
+        _submit_to_supervisor(activity.id, shadow.id, shadow.name,
+                              origin=getattr(activity, "origin", None))
 
 
 def _assign_to_existing(
@@ -252,7 +263,8 @@ def _assign_to_existing(
         actions=["OK"],
     )
     if not skip_supervisor:
-        _submit_to_supervisor(activity.id, shadow.id, shadow.name)
+        _submit_to_supervisor(activity.id, shadow.id, shadow.name,
+                              origin=getattr(activity, "origin", None))
     return shadow
 
 
@@ -667,7 +679,8 @@ def create_shadow(
         actions=["OK"],
     )
     if not skip_supervisor:
-        _submit_to_supervisor(activity.id, shadow.id, shadow.name)
+        _submit_to_supervisor(activity.id, shadow.id, shadow.name,
+                              origin=getattr(activity, "origin", None))
     return shadow
 
 

@@ -119,6 +119,7 @@ def _apply_terminate_directive(
     scroll,
     execution_id: str,
     vault=None,
+    origin: str = "system",
 ) -> None:
     """Handle a TERMINATE directive from the Intelligent Supervisor (v0.4.1-b).
 
@@ -183,6 +184,7 @@ def _apply_terminate_directive(
             "ts":       _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
             "level":    "WARNING",
             "category": "approval",
+            "origin":   origin,   # v0.8.16: trigger origin threaded from execute()
             "message":  f"🛑 Supervisor TERMINATEd: {_scroll_name} · {short_id(execution_id)}",
             "context": {
                 "approval_message": (
@@ -255,6 +257,7 @@ def _apply_recalibrate_tool_directive(
     config,
     vault,
     consec_tool_fails: Dict[str, int],
+    origin: str = "system",
 ) -> None:
     """v0.5.0-d: Handle a RECALIBRATE_TOOL supervisor directive.
 
@@ -360,6 +363,7 @@ def _apply_recalibrate_tool_directive(
                 result=result, shadow_id=shadow.id,
                 execution_id=execution_id,
                 scroll_id=getattr(scroll, "id", None) if scroll is not None else None,
+                origin=origin,
             )
     except Exception:
         logger.exception("[Runtime] recalibration pipeline crashed")
@@ -465,6 +469,7 @@ def _apply_recalibrate_skill_directive(
     vault,
     config,
     execution_id: str,
+    origin: str = "system",
 ) -> None:
     """v0.6.1-c: dispatch RECALIBRATE_SKILL — re-author the failing skill's
     ``instructions_md`` and either auto-apply (low-risk + opt-in env knob)
@@ -534,6 +539,7 @@ def _apply_recalibrate_skill_directive(
             "ts": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
             "level": "WARNING",
             "category": "approval",
+            "origin": origin,   # v0.8.16: trigger origin threaded from execute()
             "message": f"Skill '{skill.name}' needs recalibration",
             "context": {
                 "approval_message": (
@@ -553,7 +559,7 @@ def _apply_recalibrate_skill_directive(
         )
 
 
-def _apply_supervisor_directives(directives, *, context, config, shadow=None, scroll=None, execution_id: str = "", vault=None, consec_tool_fails=None) -> None:
+def _apply_supervisor_directives(directives, *, context, config, shadow=None, scroll=None, execution_id: str = "", vault=None, consec_tool_fails=None, origin: str = "system") -> None:
     """Apply directives from the Intelligent Supervisor between iterations.
 
     Each directive is one of the bounded vocabulary actions defined in
@@ -601,7 +607,7 @@ def _apply_supervisor_directives(directives, *, context, config, shadow=None, sc
                 # decisions can exclude the shadow that just gave up.
                 _apply_terminate_directive(
                     d, context=context, shadow=shadow, scroll=scroll,
-                    execution_id=execution_id, vault=vault,
+                    execution_id=execution_id, vault=vault, origin=origin,
                 )
             elif d.action == "RECALIBRATE_TOOL":
                 # v0.5.0-d: tool inadequacy → diagnose → bump / fork → operator card.
@@ -610,14 +616,14 @@ def _apply_supervisor_directives(directives, *, context, config, shadow=None, sc
                 _apply_recalibrate_tool_directive(
                     d, context=context, shadow=shadow, scroll=scroll,
                     execution_id=execution_id, config=config, vault=vault,
-                    consec_tool_fails=consec_tool_fails or {},
+                    consec_tool_fails=consec_tool_fails or {}, origin=origin,
                 )
             elif d.action == "RECALIBRATE_SKILL":
                 # v0.6.1-c: skill inadequacy → re-author instructions_md →
                 # operator card (or auto-apply when low-risk + env knob set).
                 _apply_recalibrate_skill_directive(
                     d, context=context, vault=vault, config=config,
-                    execution_id=execution_id,
+                    execution_id=execution_id, origin=origin,
                 )
             elif d.action in ("DO_NOTHING", "SWAP_SHADOW", "ESCALATE"):
                 # No-op in-shadow; operator-facing — handled at the
@@ -914,8 +920,63 @@ class ShadowRuntime:
         # v0.4.0-b: per-tool consecutive-failure counter for in-loop reflection.
         # Reset whenever the same tool succeeds.
         self._consec_tool_fails: dict[str, int] = {}
+        # v0.8.16: canonical trigger origin for every event this runtime
+        # publishes.  Defaults to "manual"; `execute()` resets it from the
+        # passed `origin` (or the activity's stamped origin) at the top of a run.
+        self._origin: str = "manual"
         # Directory is created lazily when the vault's prune_old_executions needs it;
         # we no longer eagerly create it since snapshot/SKILL.md disk writes are removed.
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _stamp(self, event: dict) -> dict:
+        """v0.8.16: stamp the canonical trigger origin onto an event payload.
+
+        ``setdefault`` so an event that already carries an explicit ``origin``
+        is never clobbered.  Used to wrap every EventBus publish so the
+        origin-partitioned live panes can filter on ``event["origin"]``.
+        """
+        event.setdefault("origin", getattr(self, "_origin", "manual"))
+        return event
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _iteration_event(
+        self,
+        *,
+        iteration,
+        decision,
+        tool_result=None,
+        execution_id=None,
+        llm_ref=None,
+    ) -> dict:
+        """v0.8.16: build a bounded per-iteration event with expandable details.
+
+        The ``details`` dict carries the reasoning + tool I/O the live panes
+        render on expand.  ``tool_result`` is truncated (≤4000 chars) and the
+        raw LLM completion is NOT inlined — only referenced by ``llm_ref``
+        ({exec_id, call_index}) for lazy load from the per-execution transcript.
+        """
+        d = decision or {}
+        action = d.get("action", "?")
+        message = f"iter={iteration} {action}"
+        if action == "TOOL_CALL":
+            message += f" {d.get('tool_name', '')}"
+        return self._stamp({
+            "ts":       utcnow().isoformat() + "Z",
+            "level":    "INFO",
+            "category": "runtime",
+            "message":  message,
+            "context":  {"execution_id": execution_id},
+            "details": {
+                "reasoning":   d.get("reasoning") or d.get("thought"),
+                "action":      action,
+                "tool_name":   d.get("tool_name"),
+                "tool_params": d.get("parameters"),
+                "tool_result": (str(tool_result)[:4000] if tool_result is not None else None),
+                "llm_ref":     llm_ref,
+            },
+        })
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1004,6 +1065,7 @@ class ShadowRuntime:
         dry_run: bool = False,
         cancel_event: Optional[threading.Event] = None,
         resume_from_execution_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run a Shadow through its assigned Activity.
 
@@ -1014,10 +1076,18 @@ class ShadowRuntime:
             cancel_event:  Optional threading.Event set by the Supervisor watchdog to
                            request clean cancellation.  Checked at the top of each
                            loop iteration — shadow exits with status="cancelled".
+            origin:        v0.8.16 — canonical trigger origin threaded from the
+                           Supervisor queue payload.  Falls back to the activity's
+                           own ``origin`` field, then "manual".  Stamped onto every
+                           event this run publishes so the origin-partitioned live
+                           panes can filter on it.
 
         Returns:
             Execution result dict with status, summary, snapshots_taken, etc.
         """
+        # v0.8.16: resolve + remember the trigger origin for the whole run so
+        # `_stamp` can tag every published event.
+        self._origin = origin or getattr(activity, "origin", None) or "manual"
         execution_id = _gen_execution_id()
         exec_start   = __import__("time").time()
         tool_call_count = 0
@@ -1130,6 +1200,11 @@ class ShadowRuntime:
         last_snap_ab = 0
         iteration    = 0
         consecutive_thinks = 0  # throttle THINK storms
+        # v0.8.16: llm_ref for the most-recent tier-2 decision LLM call —
+        # {exec_id, call_index} into the per-execution transcript file.  Set
+        # right after each LLM call (Task 8); consumed by _iteration_event so
+        # the panes can lazily load the raw completion on expand.
+        _last_llm_ref: Optional[Dict[str, Any]] = None
 
         # v0.4.0-d: Intelligent Supervisor (opt-in via config).  When enabled,
         # an ExecutionMind subscribes to events for this run, observes failures,
@@ -1157,6 +1232,7 @@ class ShadowRuntime:
                     # force the Mind to enable itself rather than reading from
                     # the global config it doesn't know about.
                     force_enabled=_supervisor_per_shadow_on,
+                    origin=self._origin,   # v0.8.16: strategy-stream ticks partition on origin
                 )
                 # Stash on self so _handle_tool_call (a method) can reach it
                 # without threading another parameter through the call chain.
@@ -1197,6 +1273,7 @@ class ShadowRuntime:
                     execution_id=execution_id,
                     vault=self.vault,
                     consec_tool_fails=self._consec_tool_fails,
+                    origin=self._origin,   # v0.8.16: stamp origin on supervisor cards
                 )
 
             # ── Cancellation gate — Supervisor watchdog may request clean exit ──
@@ -1240,60 +1317,87 @@ class ShadowRuntime:
             )
             # v0.4.0-a: THINK throttle ceiling is now config-driven.
             think_ceiling = getattr(self.config, "max_consecutive_think", 5) or 5
+            # v0.8.16: build the decision-prompt system/user once so the LLM
+            # transcript writer can record a request summary (the raw
+            # completion is recorded after the call returns).
+            _llm_system = (
+                step_prompt
+                if consecutive_thinks < think_ceiling else
+                step_prompt + (
+                    "\n\n# ENFORCEMENT OVERRIDE\n"
+                    f"You have produced {consecutive_thinks} consecutive THINK responses "
+                    "with NO tool call. Your NEXT response MUST have "
+                    "action==TOOL_CALL, COMPLETE, or FAIL. No more THINK "
+                    "will be accepted. Act now."
+                )
+            )
+            _llm_user = json.dumps({
+                "shadow_name":        shadow.name,
+                # output_dir: where Shadow-generated files must be written.
+                # Bind-mounted to the host's ./outputs/ directory so files
+                # are accessible outside the container.
+                "output_dir":         self.config.output_dir,
+                # Temporal context — avoids LLM THINK storms over "what is today's date?"
+                "current_date":        _datetime_module.date.today().isoformat(),
+                "current_datetime_utc": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                **(
+                    {
+                        "intent":              scroll.intent,
+                        "objectives":          scroll_json,
+                        "completed_objectives": list(completed_objectives),
+                        "pending_objectives":  pending_objs,
+                    }
+                    if use_objectives else
+                    {
+                        "current_action_block": current_ab,
+                        "pending_action_blocks": [
+                            ab for ab in scroll_json
+                            if ab.get("step_number", 0) >= current_ab
+                        ],
+                    }
+                ),
+                "available_tools": tool_index,
+                "history":         _build_history_slice(context),
+                "last_snapshot":   context._snapshots[-1].summary if context._snapshots else None,
+            })
             loop = asyncio.get_event_loop()
             try:
                 decision = await loop.run_in_executor(
                     None,
                     lambda: llm_call_json(
                         tier=2,
-                        system=(
-                            step_prompt
-                            if consecutive_thinks < think_ceiling else
-                            step_prompt + (
-                                "\n\n# ENFORCEMENT OVERRIDE\n"
-                                f"You have produced {consecutive_thinks} consecutive THINK responses "
-                                "with NO tool call. Your NEXT response MUST have "
-                                "action==TOOL_CALL, COMPLETE, or FAIL. No more THINK "
-                                "will be accepted. Act now."
-                            )
-                        ),
-                        user=json.dumps({
-                            "shadow_name":        shadow.name,
-                            # output_dir: where Shadow-generated files must be written.
-                            # Bind-mounted to the host's ./outputs/ directory so files
-                            # are accessible outside the container.
-                            "output_dir":         self.config.output_dir,
-                            # Temporal context — avoids LLM THINK storms over "what is today's date?"
-                            "current_date":        _datetime_module.date.today().isoformat(),
-                            "current_datetime_utc": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            **(
-                                {
-                                    "intent":              scroll.intent,
-                                    "objectives":          scroll_json,
-                                    "completed_objectives": list(completed_objectives),
-                                    "pending_objectives":  pending_objs,
-                                }
-                                if use_objectives else
-                                {
-                                    "current_action_block": current_ab,
-                                    "pending_action_blocks": [
-                                        ab for ab in scroll_json
-                                        if ab.get("step_number", 0) >= current_ab
-                                    ],
-                                }
-                            ),
-                            "available_tools": tool_index,
-                            "history":         _build_history_slice(context),
-                            "last_snapshot":   context._snapshots[-1].summary if context._snapshots else None,
-                        }),
+                        system=_llm_system,
+                        user=_llm_user,
                         config=self.config,
                         temperature=0.1,
                         max_tokens=4096,
                     )
                 )
+                # v0.8.16: record the raw decision completion to the per-
+                # execution transcript and remember its index so the
+                # per-iteration event (Task 7) can reference it via llm_ref
+                # for lazy UI expand.  Best-effort — append_call never raises.
+                try:
+                    from systemu.runtime.llm_transcript import append_call
+                    _call_index = append_call(
+                        self.vault.root, execution_id,
+                        {
+                            "iteration": iteration,
+                            "tier":      2,
+                            "system":    _llm_system,
+                            "user":      _llm_user,
+                            "response":  json.dumps(decision),
+                        },
+                    )
+                    _last_llm_ref = (
+                        {"exec_id": execution_id, "call_index": _call_index}
+                        if _call_index >= 0 else None
+                    )
+                except Exception:
+                    _last_llm_ref = None
             except Exception as exc:
                 logger.error("[Runtime] LLM error on iteration %d: %s", iteration, exc)
-                log_event("ERROR", "shadow", f"LLM error in execution {execution_id} iteration {iteration}: {exc}", {"shadow_id": shadow.id})
+                log_event("ERROR", "shadow", f"LLM error in execution {execution_id} iteration {iteration}: {exc}", {"shadow_id": shadow.id, "origin": getattr(self, "_origin", "manual")})
                 context.add_thought(f"LLM call failed: {exc}", current_ab)
                 continue
 
@@ -1314,7 +1418,7 @@ class ShadowRuntime:
             # ── Publish per-iteration event to Systemu Chat ───────────────────
             try:
                 from systemu.interface.event_bus import EventBus
-                EventBus.get().publish({
+                EventBus.get().publish(self._stamp({
                     "ts":       utcnow().isoformat() + "Z",
                     "level":    "INFO",
                     "category": "shadow",
@@ -1327,9 +1431,25 @@ class ShadowRuntime:
                         "objectives_done": len(completed_objectives) if use_objectives else current_ab - 1,
                         "objectives_total": total_objectives if use_objectives else len(scroll_json),
                     },
-                })
+                }))
             except Exception:
                 pass  # EventBus is optional — never break execution
+
+            # ── v0.8.16: per-iteration detail event (reasoning + tool I/O) ─────
+            # Carries a bounded `details` dict the live panes render on expand.
+            # For TOOL_CALL the publish is deferred to AFTER the tool runs (so
+            # tool_result is captured); every other action publishes here.
+            if action != "TOOL_CALL":
+                try:
+                    from systemu.interface.event_bus import EventBus
+                    EventBus.get().publish(self._iteration_event(
+                        iteration=iteration,
+                        decision=decision,
+                        execution_id=execution_id,
+                        llm_ref=_last_llm_ref,
+                    ))
+                except Exception:
+                    pass  # EventBus is optional — never break execution
 
             # ── COMPLETE ───────────────────────────────────────────────────────
             if action == "COMPLETE":
@@ -1517,6 +1637,25 @@ class ShadowRuntime:
                 if result is None:
                     continue   # User denied destructive call
                 tool_call_count += 1
+
+                # v0.8.16: per-iteration detail event AFTER the tool runs, so
+                # the bounded `details` dict carries the tool result the live
+                # panes render on expand.  Raw LLM is referenced via llm_ref.
+                try:
+                    from systemu.interface.event_bus import EventBus
+                    _tool_result_for_event = (
+                        result.parsed if getattr(result, "parsed", None) is not None
+                        else getattr(result, "output", None) or result
+                    )
+                    EventBus.get().publish(self._iteration_event(
+                        iteration=iteration,
+                        decision=decision,
+                        tool_result=_tool_result_for_event,
+                        execution_id=execution_id,
+                        llm_ref=_last_llm_ref,
+                    ))
+                except Exception:
+                    pass  # EventBus is optional — never break execution
 
                 # v0.6.9: iteration-loop circuit breaker — bail when the LLM
                 # is stuck re-invoking the same broken tool with the same
@@ -1795,6 +1934,7 @@ class ShadowRuntime:
                         "error_type":       error_type,
                         "missing_packages": missing_list,
                         "install_hint":     hint,
+                        "origin":           getattr(self, "_origin", "manual"),
                     },
                 )
             except Exception:

@@ -1,7 +1,7 @@
 """NiceGUI Dashboard — Notifications page.
 
 Two-tab layout:
-  • Event Log  — real-time tail of vault/notifications/event_log.jsonl (auto-refreshes every 2s)
+  • Manual Logs — real-time tail of vault/notifications/event_log.jsonl (auto-refreshes every 2s)
   • Pending    — list of PENDING notifications with Approve/Reject actions
 
 Fixes the 404 that occurred because this route was never registered.
@@ -69,14 +69,14 @@ def build_notifications_page() -> None:
     )
 
     with ui.tabs().classes("w-full") as tabs:
-        tab_log     = ui.tab("📋 Event Log")
+        tab_log     = ui.tab("📋 Manual Logs")
         tab_pending = ui.tab("⚠️ Pending Actions")
 
     with ui.tab_panels(tabs, value=tab_log).classes("w-full bg-transparent"):
 
         # ── EVENT LOG TAB ──────────────────────────────────────────────────────
         with ui.tab_panel(tab_log):
-            ui.label("Live system event log — auto-refreshes every 2 seconds.").style(
+            ui.label("Live Manual Logs — auto-refreshes every 2 seconds.").style(
                 f"font-size: 13px; color: {THEME['text_muted']}; margin-bottom: 16px;"
             )
 
@@ -103,7 +103,7 @@ def build_notifications_page() -> None:
                     log_path = _get_log_path(vault)
                     if log_path and log_path.exists():
                         log_path.write_text("", encoding="utf-8")
-                        ui.notify("Event log cleared.", type="positive")
+                        ui.notify("Manual Logs cleared.", type="positive")
                         _log_table.refresh()
 
                 ui.button("🗑 Clear Log", on_click=_clear_log).style(
@@ -444,7 +444,7 @@ def _approve_scroll_from_ui(scroll_id: str, vault) -> None:
             from systemu.pipelines.scroll_refiner import approve_pending_scroll
             init_pipeline(state.config, vault)
             await asyncio.to_thread(approve_pending_scroll, scroll_id, vault)
-            _safe_notify("Scroll approved — extraction pipeline started. Check the Event Log for progress.")
+            _safe_notify("Scroll approved — extraction pipeline started. Check the Manual Logs for progress.")
         except ValueError as exc:
             _safe_notify(f"Cannot approve: {exc}", type="warning")
         except Exception as exc:

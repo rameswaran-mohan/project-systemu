@@ -211,6 +211,12 @@ def extract_and_process(
         return None
 
     # ── Stage 4: Create Activity ───────────────────────────────────────────
+    # v0.8.16: stamp the trigger origin from the scroll source so every
+    # downstream event partitions into the right pane.  A chat scroll
+    # (source_session_id == "chat") → "chat"; any other source (a recorded
+    # capture session) → "capture".  direct_task re-asserts "chat" after this
+    # for the chat path; decide_shadow propagates this value into submit().
+    _origin = "chat" if getattr(scroll, "source_session_id", "") == "chat" else "capture"
     activity = Activity(
         id=generate_id("activity"),
         name=scroll.name,
@@ -219,6 +225,7 @@ def extract_and_process(
         required_skill_ids=skill_ids,
         missing_tools=missing_tool_names,
         status=ActivityStatus.PARTIAL if missing_tool_ids else ActivityStatus.UNASSIGNED,
+        origin=_origin,
         # v0.6.0-f: freeze the scroll's intent on the activity so Stage 5
         # (shadow tiebreak) can do semantic matching without re-loading the
         # scroll on every decision.
