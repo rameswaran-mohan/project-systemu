@@ -97,7 +97,7 @@ class DepApprovalStore:
     # ── Public API ────────────────────────────────────────────────────────
 
     def is_approved(self, package: str) -> bool:
-        # re-read on every check so out-of-process mutations
+        # v0.3.6: re-read on every check so out-of-process mutations
         # (the CLI / Tools page run in a separate Python interpreter from
         # the daemon) are picked up WITHOUT requiring a daemon restart.
         # Cost: one tiny JSON read per check (~100µs for an operator-scale
@@ -288,7 +288,7 @@ def reset_default_store_for_tests() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# database-backed runtime approval workflow for the dashboard
+# v0.6.8-e: database-backed runtime approval workflow for the dashboard
 # recovery panel.  Separate from the JSON-file DepApprovalStore above —
 # this writes to the ``tool_dep_approvals`` SQLAlchemy table seeded by
 # v0.6.8-d.  The two stores coexist:
@@ -299,19 +299,33 @@ def reset_default_store_for_tests() -> None:
 def approve_and_install(*, tool_id: str, package: str, source: str = "dashboard") -> None:
     """Persist operator approval, pip-install the package, re-run dry-run.
 
-    Called from the dashboard recovery panel (/recover) when an operator
-    clicks "Install <pkg>" on a DEP_PENDING action.  Three steps:
-      1. Insert a ToolDepApproval row (baked_in_image=False).
+    Storage-aware (v0.8.13): file mode persists to the JSON DepApprovalStore
+    (the store the local PROMPT installer actually consults); docker/sqlite
+    mode persists to the tool_dep_approvals table. Both then pip-install + dry-run.
+
+    Called from the dashboard recovery panel (/recover) and the dep_approval
+    notification when an operator clicks "Install <pkg>".  Three steps:
+      1. Persist the approval (JSON store in file mode; ToolDepApproval row
+         in sqlite/docker mode).
       2. Run ``pip install <pkg>`` into the current interpreter.
       3. Re-run dry-run for ``tool_id`` so the tool's status updates.
 
     Raises:
         RuntimeError: when ``pip install`` exits non-zero.  The approval
-                      row is still persisted (operator intent is captured);
+                      is still persisted (operator intent is captured);
                       a subsequent docker rebuild will retry the install.
     """
-    approval = _make_approval(package=package, source=source)
-    _persist_approval(approval)
+    import os
+    from pathlib import Path
+
+    if os.environ.get("SYSTEMU_DATABASE_URL"):
+        approval = _make_approval(package=package, source=source)
+        _persist_approval(approval)
+    else:
+        # file mode — write the JSON store the installer reads
+        store = DepApprovalStore(Path("data") / "dep_approvals.json")
+        store.approve(package, approved_by=source, tool_id=tool_id)
+
     rc = _run_pip_install(package)
     if rc != 0:
         raise RuntimeError(f"pip install {package} failed (rc={rc})")

@@ -93,6 +93,7 @@ def build_chat_page() -> None:
             "failed":           "#ef4444",
             "running":          THEME.get("primary", "#6366f1"),
             "skipped_no_shadow":"#94a3b8",
+            "waiting_on_tools": THEME.get("warning", "#f59e0b"),
         }.get(status, THEME.get("text_muted", "#94a3b8"))
 
         with ui.card().classes("w-full").style(
@@ -109,10 +110,13 @@ def build_chat_page() -> None:
                         meta += f"  ·  shadow: {resolve_name(sid, vault)}"
                     if exec_id:
                         meta += f"  ·  exec: {short_id(exec_id)}"
+                    miss = entry.get("missing_tools") or []
+                    if status == "waiting_on_tools" and miss:
+                        meta += "  ·  needs: " + ", ".join(miss[:4])
                     ui.label(meta).style(
                         f"font-size: 11px; color: {THEME['text_muted']};"
                     )
-                ui.badge(status.upper()).style(
+                ui.badge(status.upper().replace("_", " ")).style(
                     f"background: {status_color}; color: white; "
                     f"border-radius: 6px; font-size: 11px; padding: 3px 8px; white-space: nowrap;"
                 )

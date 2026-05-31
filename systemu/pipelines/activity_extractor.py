@@ -21,7 +21,7 @@ from systemu.core.llm_router import llm_call_json
 from systemu.core.models import (
     Activity, ActivityStatus,
     Scroll, ScrollStatus,
-    Skill, Tool, ToolStatus, ToolType,
+    Skill, Tool, ToolStatus,
 )
 from systemu.core.utils import generate_id, load_prompt
 from systemu.vault.vault import Vault
@@ -66,7 +66,7 @@ def extract_and_process(
     logger.info("[Extract] Processing scroll '%s' ...", scroll.name)
 
     # ── Stage 3a: Load existing indexes for deduplication ─────────────────
-    # catalogs now include schema-level info so the LLM can do
+    # v0.6.0-d: catalogs now include schema-level info so the LLM can do
     # data-flow reasoning instead of name-keyword matching.  We still keep
     # the payload bounded by truncating schemas to {field: type} pairs and
     # capping field count per record.
@@ -89,7 +89,7 @@ def extract_and_process(
         task_spec = {
             "scroll_name":      scroll.name,
             "intent":           scroll.intent,
-            # also surface expected_outcome from Stage 2
+            # v0.6.0-d: also surface expected_outcome from Stage 2
             "expected_outcome": getattr(scroll, "expected_outcome", ""),
             "narrative":        scroll.narrative_md,
             "objectives":       [obj.model_dump(mode="json") for obj in scroll.objectives],
@@ -219,7 +219,7 @@ def extract_and_process(
         required_skill_ids=skill_ids,
         missing_tools=missing_tool_names,
         status=ActivityStatus.PARTIAL if missing_tool_ids else ActivityStatus.UNASSIGNED,
-        # freeze the scroll's intent on the activity so Stage 5
+        # v0.6.0-f: freeze the scroll's intent on the activity so Stage 5
         # (shadow tiebreak) can do semantic matching without re-loading the
         # scroll on every decision.
         intent_snapshot=getattr(scroll, "intent", "") or "",
@@ -291,7 +291,7 @@ def extract_and_process(
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-# ── catalog enrichment helpers ────────────────────────────────────
+# ── v0.6.0-d catalog enrichment helpers ────────────────────────────────────
 
 def _summarise_schema(schema: dict) -> dict:
     """Strip a JSON Schema to {field: type} pairs (max 20 fields).
@@ -314,7 +314,7 @@ def _summarise_schema(schema: dict) -> dict:
 
 
 def _enrich_tool_for_catalog(t: dict, vlt: Vault) -> dict:
-    """reads schema summaries directly from the index header —
+    """v0.6.1-d: reads schema summaries directly from the index header —
     no per-tool ``vault.get_tool()`` fetch.  Legacy headers without the
     new fields fall back to empty {} (vault rewrites the header on next
     save_tool).
@@ -441,18 +441,12 @@ def _upsert_tool(spec: dict, vlt: Vault) -> tuple[str, bool]:
         logger.debug("[Extract] Name dedup: reusing existing tool %s (%s)", name_match.id, name_match.name)
         return name_match.id, False
 
-    # Parse tool_type safely
-    raw_type = spec.get("tool_type", "python_function")
-    try:
-        tool_type = ToolType(raw_type)
-    except ValueError:
-        tool_type = ToolType.PYTHON_FUNCTION
-
     tool = Tool(
         id=generate_id("tool"),
         name=spec.get("name", "unknown_tool"),
         description=spec.get("description", ""),
-        tool_type=tool_type,
+        # v0.8.13: pass raw; Tool's before-validator coerces (web->api_call, unknown/None->python_function).
+        tool_type=spec.get("tool_type"),
         parameters_schema=spec.get("parameters_schema", {}),
         return_schema=spec.get("return_schema", {}),
         implementation_notes=spec.get("implementation_notes", ""),
@@ -505,7 +499,7 @@ def _queue_forge_notifications(
             id=generate_id("notif"),
             title=f"🔧 Forge Tool: {tool.name}",
             message=message,
-            # safe-default first (auto-skip in non-interactive mode)
+            # v0.6.1-b: safe-default first (auto-skip in non-interactive mode)
             actions=["Skip", "Forge"],
             context={
                 "notification_type": "forge_tool",

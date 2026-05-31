@@ -140,6 +140,15 @@ def _heal_partial_activities(tool_id: str, config: "Config", vault: "Vault") -> 
             activity.name,
         )
 
+        # v0.8.13 Fix 6b: live resume — if a parked (waiting_on_tools) chat entry
+        # references this activity, flip it to running now (not only at startup
+        # sweep). Lazy import avoids a circular import between tool_service and jobs.
+        try:
+            from systemu.scheduler.jobs import _resume_waiting_chat_entry
+            _resume_waiting_chat_entry(vault, activity.id)
+        except Exception:
+            logger.debug("[ToolService] resume hook failed for %s", activity.id, exc_info=True)
+
         try:
             decide_shadow(activity, config, vault)
         except Exception as exc:

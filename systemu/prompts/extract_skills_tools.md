@@ -58,7 +58,6 @@ error type to catch.
 | `file_operation` | `pathlib` + domain libs (`python-docx`, `openpyxl`, `pillow`) | Create/read/modify documents and files |
 | `cli_command` | `subprocess.run()` | System operations, launch apps non-blocking |
 | `python_function` | stdlib + `json`/`csv`/`re` | Pure data transform, parsing, formatting |
-| `screen_capture` | `mss` + `pillow` | Capture screen regions when no web/API source exists |
 
 For `dependencies`, list exact pip package names:
 - `browser_action` → `["playwright"]`
@@ -221,6 +220,10 @@ Return **only** a valid JSON object with this exact structure:
 **Valid `tool_type` values:**
 `python_function` | `cli_command` | `browser_action` | `api_call` | `file_operation`
 
+> **HARD RULE:** `tool_type` MUST be exactly one of: `python_function`, `cli_command`, `browser_action`, `api_call`, `file_operation`.
+> For fetching web pages or calling HTTP/REST APIs use `api_call`. For rendering or scraping pages with a headless browser use `browser_action`.
+> Never invent other values (e.g. `'web'`, `'screen_capture'`) — they will be rejected.
+
 **Valid `category` values for skills:**
 `browser` | `file_ops` | `devops` | `data` | `productivity` | `communication` | `code` | `system` | `finance` | `general`
 
@@ -246,12 +249,12 @@ Return **only** a valid JSON object with this exact structure:
 13. (v0.6.0-d) Do **NOT** select a tool whose `return_schema` cannot satisfy the objective's `output_type` — even if the tool's name superficially matches.  If no existing tool fits, propose a new one whose `return_schema` actually serves the objective.
     - The `observed_preferences.tools_used` field (if present) shows what the HUMAN used via GUI — ignore it.
     - Your job is to design the PROGRAMMATIC equivalent:
-      - Human used "Snipping Tool" → extract `web_screenshot` or `screen_capture`
+      - Human used "Snipping Tool" → extract `web_screenshot`
       - Human used "Microsoft Word" → extract `create_word_doc`
       - Human used "Google Chrome" or "Microsoft Edge" → extract a browser or API-call tool
       - Objectives hint at "Microsoft Edge browser, Snipping Tool" → those are HUMAN hints, not your tools
     - **Never return empty `tools` or `skills` arrays for a task with clear objectives.**
-    - An objective that requires a screenshot → `web_screenshot` or `screen_capture` tool (use existing if in vault)
+    - An objective that requires a screenshot → `web_screenshot` tool (use existing if in vault)
     - An objective that requires a Word document → `create_word_doc` tool (use existing if in vault)
 12. **Hints inside objectives are human workflow notes, not your tool list.** Translate GUI hints to their programmatic equivalents.
 

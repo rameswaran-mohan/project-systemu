@@ -57,6 +57,19 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS       = 30     # Hard ceiling on agentic loop iterations
 SNAPSHOT_INTERVAL    = 5      # Compact after every N completed ActionBlocks
 
+# v0.8.13 (RC#3): single source of truth for "can this tool be used in a normal
+# (non-dry-run) run?" — shared by ShadowRuntime._load_tools and the direct_task
+# readiness gate so the loader and the gate cannot drift.
+_RUNTIME_READY_STATUSES = frozenset({ToolStatus.DEPLOYED, ToolStatus.TESTED, ToolStatus.UPGRADED})
+
+
+def tool_is_runtime_ready(status) -> bool:
+    """True iff a tool with this status can be used in a normal (non-dry-run) run.
+
+    Single source of truth shared by ShadowRuntime._load_tools and the
+    direct_task readiness gate so they cannot drift."""
+    return status in _RUNTIME_READY_STATUSES
+
 
 def _gen_execution_id() -> str:
     return f"exec_{secrets.token_hex(4)}"
@@ -1984,7 +1997,7 @@ class ShadowRuntime:
         Normal run : DEPLOYED, TESTED (dry-run passed), UPGRADED (evolved)
         Dry-run    : also includes FORGED (code exists, not yet enabled)
         """
-        allowed_statuses = {ToolStatus.DEPLOYED, ToolStatus.TESTED, ToolStatus.UPGRADED}
+        allowed_statuses = set(_RUNTIME_READY_STATUSES)
         if dry_run:
             allowed_statuses.add(ToolStatus.FORGED)
 
