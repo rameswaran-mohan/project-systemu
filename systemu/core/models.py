@@ -13,11 +13,14 @@ Entities:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
 import re
+
+logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
@@ -44,6 +47,7 @@ class ScrollStatus(str, Enum):
     LINKED            = "linked"             # Activity extracted AND shadow assigned
     EVOLVED           = "evolved"            # Evolution has been applied
     VALIDATOR_BLOCKED = "validator_blocked"  # v0.6.5-d: Stage 6 validator found a blocker
+    EXTRACTION_FAILED = "extraction_failed"  # v0.8.13: re-extraction repeatedly failed — terminal
 
 
 class TraceEvent(BaseModel):
@@ -108,6 +112,7 @@ class Scroll(BaseModel):
     activity_id:           Optional[str] = None
     status:                ScrollStatus = ScrollStatus.DRAFT
     version:               int = 1
+    recovery_attempts:     int = 0           # v0.8.13: bounded re-extraction retry counter
     tags:                  List[str] = []
     created_at:            datetime = Field(default_factory=_now)
     updated_at:            datetime = Field(default_factory=_now)
@@ -133,6 +138,39 @@ class ToolType(str, Enum):
     BROWSER_ACTION  = "browser_action"
     API_CALL        = "api_call"
     FILE_OPERATION  = "file_operation"
+
+
+_TOOL_TYPE_SYNONYMS = {
+    "web": ToolType.API_CALL, "web_fetch": ToolType.API_CALL, "http": ToolType.API_CALL,
+    "https": ToolType.API_CALL, "url": ToolType.API_CALL, "rest": ToolType.API_CALL,
+    "fetch": ToolType.API_CALL, "request": ToolType.API_CALL, "download": ToolType.API_CALL,
+    "scrape": ToolType.BROWSER_ACTION, "scraping": ToolType.BROWSER_ACTION,
+    "browser": ToolType.BROWSER_ACTION, "render": ToolType.BROWSER_ACTION,
+    "screen_capture": ToolType.BROWSER_ACTION, "screenshot": ToolType.BROWSER_ACTION,
+    "screen": ToolType.BROWSER_ACTION,
+    "shell": ToolType.CLI_COMMAND, "command": ToolType.CLI_COMMAND, "bash": ToolType.CLI_COMMAND,
+    "file": ToolType.FILE_OPERATION, "filesystem": ToolType.FILE_OPERATION, "io": ToolType.FILE_OPERATION,
+    "function": ToolType.PYTHON_FUNCTION, "code": ToolType.PYTHON_FUNCTION, "python": ToolType.PYTHON_FUNCTION,
+}
+
+
+def coerce_tool_type(raw, *, default: "ToolType" = ToolType.PYTHON_FUNCTION) -> "ToolType":
+    """Map any value to a valid ToolType. Never raises.
+
+    Exact enum value/member -> itself; known synonym -> mapped; unknown/empty/None -> default.
+    Logs at DEBUG when it coerces a non-exact string so we can see what the model emits.
+    """
+    if isinstance(raw, ToolType):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return default
+    key = raw.strip().lower()
+    try:
+        return ToolType(key)               # exact value match
+    except ValueError:
+        mapped = _TOOL_TYPE_SYNONYMS.get(key, default)
+        logger.debug("[models] coerce_tool_type: %r -> %s", raw, mapped.value)
+        return mapped
 
 
 class ToolStatus(str, Enum):
@@ -163,6 +201,11 @@ class Tool(BaseModel):
                 f"(got {v!r}).  Reject to prevent path traversal during forge."
             )
         return v
+
+    @field_validator("tool_type", mode="before")
+    @classmethod
+    def _coerce_tool_type(cls, v):
+        return coerce_tool_type(v)
 
     return_schema:       Dict[str, Any] = {}    # JSON Schema describing output
     implementation_notes: str = ""              # Library choices, approach, API hints for code gen

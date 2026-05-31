@@ -184,7 +184,9 @@ def queue_dependency_reminder(tool: Any, vault: Any) -> None:
                 f"If a package is missing, the tool will fail with a clear install "
                 f"instruction in the Event Log."
             ),
-            actions=["OK"],
+            # v0.8.13 Fix 6d: actionable — route the operator into the spec/code
+            # review dialog (which then installs deps + enables on sign-off).
+            actions=["Review & approve", "Dismiss"],
             context={
                 "notification_type": "dep_reminder",
                 "tool_id":           tool.id,

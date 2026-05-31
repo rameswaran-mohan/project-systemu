@@ -209,6 +209,45 @@ def run_direct_task(
         vault.update_chat_history_entry(ts, {"status": "skipped_no_shadow"})
         return activity
 
+    # ── Stage 3.5: readiness gate (v0.8.13 RC#3) ──────────────────────────
+    # If the activity needs tools that are not runtime-ready (freshly PROPOSED /
+    # FORGED, deps pending approval), do NOT execute tool-less and report failure.
+    # Park it as waiting_on_tools; recovery Pass 2 auto-runs it once tools deploy.
+    from systemu.runtime.shadow_runtime import tool_is_runtime_ready
+    not_ready = []
+    for tid in activity.required_tool_ids:
+        try:
+            t = vault.get_tool(tid)
+        except KeyError:
+            not_ready.append(tid)
+            continue
+        if not tool_is_runtime_ready(t.status):
+            not_ready.append(t.name)
+    if not_ready:
+        msg = ("Waiting on tools: " + ", ".join(not_ready)
+               + ". Approve their dependencies (Notifications → Approve & install) "
+                 "or forge them; the task runs automatically once they deploy.")
+        # v0.8.13 Fix 6a: re-mark the activity PARTIAL so the heal sweeps
+        # (tool_service._heal_partial_activities + recovery Pass 2) always cover
+        # it — even when a reused tool left it UNASSIGNED.
+        from systemu.core.models import ActivityStatus
+        try:
+            activity.status = ActivityStatus.PARTIAL
+            activity.missing_tools = not_ready
+            vault.save_activity(activity)
+        except Exception:
+            logger.debug("[DirectTask] could not re-mark activity PARTIAL", exc_info=True)
+        vault.update_chat_history_entry(ts, {
+            "status":       "waiting_on_tools",
+            "shadow_id":    shadow.id,
+            "activity_id":  activity.id,
+            "missing_tools": not_ready,
+            "error":        msg,
+        })
+        logger.info("[DirectTask] Parked '%s' as waiting_on_tools — not ready: %s",
+                    activity.id, not_ready)
+        return activity
+
     # ── Stage 4: Execute ──────────────────────────────────────────────────
     if route_through_supervisor:
         # Submit to the Supervisor queue and return immediately.  Workers will

@@ -598,6 +598,24 @@ def _on_reject_recalibration(ctx: dict) -> None:
                type="warning")
 
 
+def _approve_install_and_enable(tool_id, vault, config) -> None:
+    """v0.8.13 Fix 6c: after spec+code review sign-off, install declared deps,
+    enable the tool, and heal waiting activities. Operator has reviewed the code."""
+    from systemu.runtime.dep_approvals import approve_and_install
+    from systemu.pipelines.tool_service import enable_tool, heal_activities_for_tool
+    try:
+        tool = vault.get_tool(tool_id)
+    except KeyError:
+        return
+    for pkg in (tool.dependencies or []):
+        try:
+            approve_and_install(tool_id=tool_id, package=pkg, source="dashboard-review")
+        except Exception:
+            logger.warning("[Tools] dep install failed for %s/%s", tool_id, pkg, exc_info=True)
+    enable_tool(tool_id, vault)
+    heal_activities_for_tool(tool_id, config, vault)
+
+
 def _show_spec_review_dialog(tool_id: str) -> None:
     """Opens the two-gate spec→code review dialog for a PROPOSED tool."""
     state = AppState.get()
@@ -798,10 +816,40 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                 try:
                     save_approved_code(tool, _pending_code[0], state.config, state.vault)
                     ui.notify(
-                        f"✓ '{tool.name}' forged. Enable it in the registry when ready.",
+                        f"✓ '{tool.name}' forged. Installing deps & enabling…",
                         type="positive",
                     )
                     dlg.close()
+                    # v0.8.13 Fix 6c: a reviewed approval also installs the tool's
+                    # declared deps + enables it + heals waiting activities. pip
+                    # install is blocking, so offload off the UI loop (same pattern
+                    # as _toggle_enabled's _heal_async).
+                    from nicegui import context as _nicegui_ctx
+                    try:
+                        _client = _nicegui_ctx.client
+                    except Exception:
+                        _client = None
+
+                    async def _install_enable_async(t_id=tool.id, t_name=tool.name,
+                                                    cfg=state.config, v=state.vault, c=_client):
+                        try:
+                            await asyncio.to_thread(_approve_install_and_enable, t_id, v, cfg)
+                            if c is not None:
+                                with c:
+                                    ui.notify(
+                                        f"'{t_name}' enabled — deps installed, waiting tasks resumed.",
+                                        type="positive",
+                                    )
+                        except Exception as exc:
+                            logger.exception("[Tools UI] approve-install-enable failed for %s", t_id)
+                            if c is not None:
+                                with c:
+                                    ui.notify(
+                                        f"'{t_name}' forged but install/enable failed: {exc}",
+                                        type="warning",
+                                    )
+
+                    asyncio.create_task(_install_enable_async())
                 except Exception as exc:
                     logger.exception("[Tools UI] save_approved_code failed")
                     ui.notify(f"Error saving tool: {exc}", type="negative")

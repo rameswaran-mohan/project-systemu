@@ -24,6 +24,8 @@ _config    = None
 _vault     = None
 _scheduler = None   # APScheduler instance — set by daemon after start()
 
+MAX_RECOVERY_ATTEMPTS = 2   # v0.8.13: re-extraction retries before terminating a scroll
+
 # v0.8.7: schedules whose next_fire_at is older than this threshold at tick
 # time are considered "missed" — they don't fire, the operator gets alerted.
 SCHEDULE_MISSED_THRESHOLD_SECONDS = int(
@@ -48,6 +50,24 @@ def get_scheduler():
     return _scheduler
 
 
+def _resume_waiting_chat_entry(vault, activity_id: str) -> None:
+    """v0.8.13: when a parked (waiting_on_tools) activity becomes runnable,
+    flip its chat-history entry to running and wire a completion update."""
+    try:
+        for entry in vault.load_chat_history(limit=50):
+            if entry.get("activity_id") == activity_id and entry.get("status") == "waiting_on_tools":
+                ts = entry.get("ts")
+                vault.update_chat_history_entry(ts, {"status": "running"})
+                try:
+                    from systemu.pipelines.direct_task import _wire_chat_history_completion
+                    _wire_chat_history_completion(vault, ts, activity_id, "recovery-autorun")
+                except Exception:
+                    logger.debug("[Job] could not wire chat completion for %s", activity_id, exc_info=True)
+                return
+    except Exception:
+        logger.debug("[Job] _resume_waiting_chat_entry failed for %s", activity_id, exc_info=True)
+
+
 def startup_recovery_sweep() -> None:
     """Run once at daemon start: audit the vault for pipeline states left incomplete
     by a prior crash. Safe to call multiple times — every step is idempotent.
@@ -66,6 +86,14 @@ def startup_recovery_sweep() -> None:
     from systemu.pipelines.shadow_decision import decide_shadow
     from systemu.interface.notifications import log_event
 
+    # v0.8.13: the scheduler process must initialise the extraction pipeline
+    # before re-extraction, or extract_and_process raises "not initialised".
+    try:
+        from systemu.pipelines.activity_extractor import init_pipeline
+        init_pipeline(_config, _vault)
+    except Exception:
+        logger.exception("[Job] Recovery: init_pipeline failed — re-extraction may be skipped")
+
     logger.info("[Job] Startup recovery sweep — scanning vault for incomplete pipeline states ...")
 
     # ── Pass 1: APPROVED scrolls with no linked activity ─────────────────────
@@ -75,16 +103,29 @@ def startup_recovery_sweep() -> None:
             continue
         scroll_id   = header["id"]
         scroll_name = header.get("name", scroll_id)
-        logger.info("[Job] Recovery: scroll '%s' is APPROVED but has no activity — re-running extraction", scroll_name)
+
+        scroll = _vault.get_scroll(scroll_id)
+        if getattr(scroll, "recovery_attempts", 0) >= MAX_RECOVERY_ATTEMPTS:
+            scroll.status = ScrollStatus.EXTRACTION_FAILED
+            _vault.save_scroll(scroll)
+            logger.warning("[Job] Recovery: scroll '%s' exceeded %d attempts — marked EXTRACTION_FAILED",
+                           scroll_name, MAX_RECOVERY_ATTEMPTS)
+            log_event("WARNING", "scroll",
+                      f"Scroll '{scroll_name}' extraction repeatedly failed — needs attention.",
+                      {"scroll_id": scroll_id})
+            continue
+
+        scroll.recovery_attempts = getattr(scroll, "recovery_attempts", 0) + 1
+        _vault.save_scroll(scroll)
+        logger.info("[Job] Recovery: scroll '%s' APPROVED but no activity — re-extracting (attempt %d/%d)",
+                    scroll_name, scroll.recovery_attempts, MAX_RECOVERY_ATTEMPTS)
         log_event("WARNING", "scroll",
                   f"Scroll '{scroll_name}' was approved but extraction never completed — re-running.",
                   {"scroll_id": scroll_id})
         try:
             from systemu.pipelines.scroll_refiner import approve_pending_scroll
-            # approve_pending_scroll checks for PENDING_APPROVAL; temporarily patch status
             scroll = _vault.get_scroll(scroll_id)
-            from systemu.core.models import ScrollStatus as _SS
-            scroll.status = _SS.PENDING_APPROVAL
+            scroll.status = ScrollStatus.PENDING_APPROVAL
             _vault.save_scroll(scroll)
             approve_pending_scroll(scroll_id, _vault)
         except Exception as exc:
@@ -107,6 +148,7 @@ def startup_recovery_sweep() -> None:
             activity.missing_tools = []
             _vault.save_activity(activity)
             logger.info("[Job] Recovery: healed PARTIAL activity '%s' → UNASSIGNED", activity.name)
+            _resume_waiting_chat_entry(_vault, activity.id)
             decide_shadow(activity, _config, _vault)
         except Exception as exc:
             logger.warning("[Job] Recovery PARTIAL heal failed for %s: %s", header["id"], exc)
@@ -567,18 +609,25 @@ def _startup_dep_audit(vault) -> None:
     if not at_risk:
         return
 
-    # Dedup: skip if a startup_dep_audit notification covering these exact tool IDs exists
+    # Dedup: skip if a dep_approval notification covering these exact tool IDs exists
     at_risk_ids = sorted(item["tool_id"] for item in at_risk)
     try:
         pending = vault.list_pending_notifications()
         for n in pending:
             ctx = n.get("context", {})
-            if (ctx.get("notification_type") == "startup_dep_audit"
+            if (ctx.get("notification_type") == "dep_approval"
                     and sorted(ctx.get("tool_ids", [])) == at_risk_ids):
                 logger.debug("[Job] Dep audit: suppressed duplicate notification")
                 return
     except Exception:
         pass
+
+    # v0.8.13: map each missing package -> the (first) tool_id that needs it,
+    # so the notification's "Install <pkg>" actions can route to approve_and_install.
+    pkg_tool_map = {}
+    for item in at_risk:
+        for pkg in item["missing_hints"]:
+            pkg_tool_map.setdefault(pkg, item["tool_id"])
 
     # Build a single batched message
     lines = ["The following enabled tools have declared Python dependencies that"]
@@ -600,10 +649,12 @@ def _startup_dep_audit(vault) -> None:
             id=generate_id("notif"),
             title=f"Dependency check: {len(at_risk)} tool(s) may need packages installed",
             message="\n".join(lines),
-            actions=["OK"],
+            # v0.8.13: actionable — one "Install <pkg>" per missing package + Dismiss.
+            actions=[f"Install {pkg}" for pkg in unique_cmds] + ["Dismiss"],
             context={
-                "notification_type": "startup_dep_audit",
+                "notification_type": "dep_approval",
                 "tool_ids":          at_risk_ids,
+                "pkg_tool_map":      pkg_tool_map,
             },
         )
         vault.queue_notification(notif)

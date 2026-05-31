@@ -1,4 +1,4 @@
-"""approve_and_install + is_allowlisted tests for the dashboard
+"""v0.6.8-e: approve_and_install + is_allowlisted tests for the dashboard
 runtime approval workflow.
 
 These tests do NOT exercise the existing ``DepApprovalStore`` JSON-file
@@ -11,6 +11,11 @@ from unittest.mock import MagicMock
 
 def test_approve_and_install_persists_and_runs_pip(monkeypatch):
     from systemu.runtime import dep_approvals
+
+    # v0.8.13: approve_and_install is now storage-aware — the sqlite
+    # (_persist_approval) path runs only when SYSTEMU_DATABASE_URL is set.
+    # This suite covers the database-backed path, so select it explicitly.
+    monkeypatch.setenv("SYSTEMU_DATABASE_URL", "sqlite:///:memory:")
 
     saved = []
     monkeypatch.setattr(dep_approvals, "_persist_approval",
@@ -41,6 +46,7 @@ def test_approve_and_install_raises_on_pip_failure(monkeypatch):
     import pytest
     from systemu.runtime import dep_approvals
 
+    monkeypatch.setenv("SYSTEMU_DATABASE_URL", "sqlite:///:memory:")
     monkeypatch.setattr(dep_approvals, "_persist_approval", lambda a: None)
     monkeypatch.setattr(dep_approvals, "_run_pip_install", lambda p: 1)
     monkeypatch.setattr(dep_approvals, "_rerun_dry_run", lambda t: None)

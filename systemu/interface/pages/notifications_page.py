@@ -386,6 +386,28 @@ def _dispatch_notification_action(action: str, ctx: dict, vault, refresh_fn) -> 
             return
         _open_forge_dialog(tool_id)
 
+    elif notif_type == "dep_approval" and action.startswith("Install "):
+        package = action[len("Install "):].strip()
+        tool_id = (ctx.get("pkg_tool_map") or {}).get(package)
+        if not tool_id:
+            ui.notify(f"No tool mapped for package '{package}'.", type="negative")
+            return
+        from systemu.runtime.dep_approvals import approve_and_install
+        try:
+            approve_and_install(tool_id=tool_id, package=package, source="dashboard")
+            ui.notify(f"Approved + installed '{package}'. Re-running dry-run…", type="positive")
+        except Exception as exc:
+            logger.exception("[Notifications] dep approve+install failed")
+            ui.notify(f"Install failed for '{package}': {exc}", type="negative")
+
+    elif notif_type == "dep_reminder" and action.lower().startswith("review"):
+        # v0.8.13 Fix 6d: route the operator into the spec/code review dialog.
+        tool_id = ctx.get("tool_id")
+        if not tool_id:
+            ui.notify("Notification missing tool_id.", type="negative")
+            return
+        _open_forge_dialog(tool_id)
+
     else:
         # Informational notifications (OK / Reject / Skip / unknown types) — just dismiss
         ui.notify(f"Action '{action}' recorded.", type="positive")
