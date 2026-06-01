@@ -491,6 +491,40 @@ def request_credential(req, *, resolver=None) -> Optional[str]:
                                    options=actions, credential_key=req.key)
 
 
+def request_choice(questions, *, dedup_key) -> Optional[dict]:
+    """v0.8.19 — ask the operator a structured question (multi-option + free-text).
+
+    questions: [{id, prompt, multi: bool, options: [{label, desc}], allow_free_text: bool}]
+    Returns the answer dict {qid: value} once resolved; None when no queue is available
+    (caller proceeds with a default). Raises PendingChoiceRequest while awaiting an answer.
+    """
+    import json
+    queue = _get_decision_queue()
+    if queue is None:
+        return None
+    resolved = queue.get_resolved_choice(dedup_key)
+    if resolved is not None:
+        try:
+            return json.loads(resolved)
+        except Exception:
+            return {"_raw": resolved}
+    q0 = questions[0] if questions else {"prompt": "Input needed", "options": []}
+    labels = [o.get("label") for o in q0.get("options", []) if o.get("label")]
+    if q0.get("allow_free_text"):
+        labels = labels + ["Other"]
+    if not labels:
+        labels = ["Submit"]   # post() requires non-empty options
+    decision_id = queue.post(
+        title=(q0.get("prompt") or "Input needed")[:80],
+        body="Answer to continue.",
+        options=labels,
+        context={"kind": "structured_question", "questions": questions},
+        dedup_key=dedup_key,
+    )
+    from systemu.approval.exceptions import PendingChoiceRequest
+    raise PendingChoiceRequest(decision_id=decision_id, dedup_key=dedup_key, options=labels)
+
+
 def confirm(prompt_text: str, default: bool = True) -> bool:
     """Simple yes/no confirmation wrapper."""
     import sys, os

@@ -112,6 +112,8 @@ If any objective fails this check (e.g., the objective is a GUI step that the us
 8. Tags: 2–5 lowercase slug keywords describing the intent domain.
 9. Run the self-check (above) before emitting.  Set `self_check_passed: true` if every objective serves the stated intent; otherwise `false` with notes.
 
+**clarifying_questions (optional):** Default to `[]`. Emit 1–2 questions ONLY when the request is genuinely ambiguous in a way that would materially change the outcome and you cannot reasonably infer the answer. Shape: `[{"id": "short_key", "prompt": "the question", "options": [{"label": "A", "desc": "..."}, {"label": "B", "desc": "..."}], "allow_free_text": true}]`. Most requests need none — do not ask about things you can infer from the capture.
+
 ## Output format
 
 Return **only** valid JSON in this exact structure. No markdown fences, no explanation:
@@ -144,6 +146,7 @@ Return **only** valid JSON in this exact structure. No markdown fences, no expla
   },
   "tags": ["tag1", "tag2"],
   "self_check_passed": true,
-  "self_check_notes": ""
+  "self_check_notes": "",
+  "clarifying_questions": []
 }
 ```

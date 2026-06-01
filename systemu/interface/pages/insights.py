@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 _VALID_TABS = ("memory", "flywheel", "events", "actions")
 
 
+def build_structured_answer(questions: list, values: dict) -> str:
+    """v0.8.19 — serialize structured-question answers to the JSON stored as choice."""
+    import json
+    return json.dumps({q["id"]: values.get(q["id"]) for q in (questions or [])})
+
+
 def build_insights_page(default_tab: str = "memory") -> None:
     """Render the Insights page with four tabs.
 
@@ -193,6 +199,48 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                 except Exception as exc:
                     ui.notify(f"Failed to resolve: {exc}", type="negative")
             return _click
+
+        # v0.8.19 (R3): structured ask-user cards render option pickers + free
+        # text + a single Submit that serializes answers to JSON and resolves
+        # the decision with that JSON as the choice.  Returning early skips the
+        # flat option buttons + the Context expansion below.
+        _qs = (card.get("context") or {}).get("questions")
+        if (card.get("context") or {}).get("kind") == "structured_question" and _qs:
+            _values: dict = {}
+            for _q in _qs:
+                ui.label(_q.get("prompt", "")).style(
+                    f"font-size: 13px; color: {THEME['text']}; margin-top: 6px;"
+                )
+                _opts = [o.get("label") for o in _q.get("options", []) if o.get("label")]
+                if _opts:
+                    if _q.get("multi"):
+                        _sel = ui.select(_opts, multiple=True).style("min-width: 220px;")
+                    else:
+                        _sel = ui.radio(_opts).style("")
+                    _values[_q["id"]] = _sel
+                if _q.get("allow_free_text"):
+                    _txt = ui.input("Other / free text").style("min-width: 220px;")
+                    _values[_q["id"] + "__free"] = _txt
+
+            def _submit(_e=None, did=card["id"], the_queue=queue, qs=_qs, vals=_values):
+                try:
+                    answers = {}
+                    for q in qs:
+                        sel = vals.get(q["id"])
+                        free = vals.get(q["id"] + "__free")
+                        ftext = (free.value or "").strip() if free is not None else ""
+                        answers[q["id"]] = ftext or (sel.value if sel is not None else None)
+                    the_queue.resolve(did, choice=build_structured_answer(qs, answers))
+                    ui.notify("Submitted", type="positive")
+                    on_resolved()
+                except Exception as exc:
+                    ui.notify(f"Failed: {exc}", type="negative")
+
+            ui.button("Submit", on_click=_submit).style(
+                f"background: {THEME['primary']}; color: white; border-radius: 6px; "
+                f"padding: 6px 14px; font-size: 13px; margin-top: 8px;"
+            )
+            return   # structured branch handled — skip the flat option buttons
 
         with ui.row().style("gap: 8px;"):
             for opt in card["options"]:

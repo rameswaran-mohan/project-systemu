@@ -267,13 +267,18 @@ def scrolls_refine(ctx, session_dir: str, auto: bool):
 
     # Stage 2 — Refine into Scroll
     from systemu.pipelines.scroll_refiner import refine_scroll
-    try:
-        scroll = refine_scroll(session_path, config, vault, auto_proceed=auto)
-        console.print(f"\n[green]✓ Scroll created:[/green] {scroll.id} — status: {scroll.status}")
-    except Exception as exc:
-        console.print(f"\n[red]Error:[/red] {exc}")
-        import traceback; traceback.print_exc()
-        sys.exit(1)
+    from systemu.approval.exceptions import PendingOperatorDecision
+    def _refine_work():
+        try:
+            scroll = refine_scroll(session_path, config, vault, auto_proceed=auto)
+            console.print(f"\n[green]✓ Scroll created:[/green] {scroll.id} — status: {scroll.status}")
+        except PendingOperatorDecision:
+            raise   # v0.8.19: let the wrapper park it (exit 75) so re-run resumes with the answer
+        except Exception as exc:
+            console.print(f"\n[red]Error:[/red] {exc}")
+            import traceback; traceback.print_exc()
+            sys.exit(1)
+    _handle_pending_decision_or_run(ctx, _refine_work)
 
 
 @scrolls_group.command("approve")

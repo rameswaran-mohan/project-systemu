@@ -154,6 +154,15 @@ def build_console_page() -> None:
                     origins=frozenset({"capture", "manual", "scheduled"})
                 )
 
+    # ── Live Objectives (v0.8.19) — collapsed ─────────────────────────
+    with ui.expansion("Live Objectives", value=False).classes("w-full").style(
+        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 12px; margin-bottom: 8px;"
+    ):
+        from systemu.interface.components.live_objectives_pane import build_live_objectives_pane
+        with ui.column().style("padding: 8px; width: 100%;"):
+            build_live_objectives_pane()
+
     # ── More (collapsed expansion wrapping the lazy cards) ─────────────
     with ui.expansion("More", value=False).classes("w-full").style(
         f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "

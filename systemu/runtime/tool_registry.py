@@ -325,6 +325,13 @@ class ToolRegistry:
         tool = self._vault.find_tool_by_name(name)
         if tool is None:
             return {"success": False, "error": f"Tool '{name}' not found in vault"}
+        # ── Gate 2.5 (v0.8.19): validate params against the declared schema ──
+        from systemu.runtime.param_validation import validate_params
+        _perr = validate_params(getattr(tool, "parameters_schema", {}) or {}, params or {})
+        if _perr:
+            return {"success": False, "error_type": "tool_param_invalid",
+                    "error": ("Invalid parameters for '" + name + "': " + "; ".join(_perr)
+                              + ". Correct the parameters and call the tool again.")}
         if not tool.enabled:
             raise ToolNotEnabledError(
                 f"Tool '{name}' is not enabled. "
