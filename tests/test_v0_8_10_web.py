@@ -52,22 +52,28 @@ class TestSearchProviders:
 
     def test_falls_back_to_free_when_no_key(self, monkeypatch):
         from systemu.runtime.web import search_providers as sp
+        sp._CACHE.clear()
+        monkeypatch.delenv("SYSTEMU_TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("SYSTEMU_EXA_API_KEY", raising=False)
         monkeypatch.delenv("SYSTEMU_BRAVE_API_KEY", raising=False)
         monkeypatch.delenv("SYSTEMU_SERPER_API_KEY", raising=False)
         free = [{"title": "F", "url": "https://f", "snippet": "x"}]
-        monkeypatch.setattr(sp.DuckDuckGoLiteProvider, "search", lambda self, q, n: free)
+        monkeypatch.setattr(sp.DdgsProvider, "search", lambda self, q, n: free)
         out = sp.search("cheese", 5)
-        assert out["provider"] == "duckduckgo_lite"
+        assert out["provider"] == "ddgs"
         assert out["degraded"] is True
 
     def test_all_fail_returns_empty_with_chain(self, monkeypatch):
         from systemu.runtime.web import search_providers as sp
+        sp._CACHE.clear()
+        monkeypatch.delenv("SYSTEMU_TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("SYSTEMU_EXA_API_KEY", raising=False)
         monkeypatch.delenv("SYSTEMU_BRAVE_API_KEY", raising=False)
         monkeypatch.delenv("SYSTEMU_SERPER_API_KEY", raising=False)
-        monkeypatch.setattr(sp.DuckDuckGoLiteProvider, "search", lambda self, q, n: [])
+        monkeypatch.setattr(sp.DdgsProvider, "search", lambda self, q, n: [])
         out = sp.search("cheese", 5)
         assert out["results"] == []
-        assert "duckduckgo_lite" in out.get("error", "")
+        assert "ddgs" in out.get("error", "")
 
     def test_keyed_provider_unavailable_without_env(self, monkeypatch):
         from systemu.runtime.web import search_providers as sp

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.8.16"
+version = "0.8.17"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,6 +50,7 @@ dependencies = [
     "pydantic>=2.0",       # vault Pydantic models
     "httpx>=0.27",         # used by the Ollama provider + general http
     "pyyaml>=6.0",         # config + skill migrator + skill exporter
+    "ddgs>=9.14",
 ]
 
 [project.optional-dependencies]

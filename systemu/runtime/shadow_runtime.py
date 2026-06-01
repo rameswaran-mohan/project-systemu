@@ -57,6 +57,21 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS       = 30     # Hard ceiling on agentic loop iterations
 SNAPSHOT_INTERVAL    = 5      # Compact after every N completed ActionBlocks
 
+# v0.8.17: fail-fast constants + helper for consecutive-degraded-search detection.
+_SEARCH_TOOLS = {"web_search"}
+_MAX_CONSEC_DEGRADED_SEARCH = 3
+
+
+def _is_degraded_search_result(tool_name, parsed) -> bool:
+    """True iff a search tool returned a degraded result with no usable data
+    (the whole provider chain failed/empty). NOT keyed on len(results)==0 —
+    engines fuzzy-match and rarely return truly zero; degraded is the real
+    'search is down' signal (v0.8.17 POC finding)."""
+    if tool_name not in _SEARCH_TOOLS or not isinstance(parsed, dict):
+        return False
+    return bool(parsed.get("degraded")) and not parsed.get("results")
+
+
 # v0.8.13 (RC#3): single source of truth for "can this tool be used in a normal
 # (non-dry-run) run?" — shared by ShadowRuntime._load_tools and the direct_task
 # readiness gate so the loader and the gate cannot drift.
@@ -924,6 +939,8 @@ class ShadowRuntime:
         # publishes.  Defaults to "manual"; `execute()` resets it from the
         # passed `origin` (or the activity's stamped origin) at the top of a run.
         self._origin: str = "manual"
+        # v0.8.17: consecutive degraded web-search counter; reset per run in execute().
+        self._consec_degraded_search: int = 0
         # Directory is created lazily when the vault's prune_old_executions needs it;
         # we no longer eagerly create it since snapshot/SKILL.md disk writes are removed.
 
@@ -1088,6 +1105,8 @@ class ShadowRuntime:
         # v0.8.16: resolve + remember the trigger origin for the whole run so
         # `_stamp` can tag every published event.
         self._origin = origin or getattr(activity, "origin", None) or "manual"
+        # v0.8.17: reset per-run consecutive-degraded-search counter.
+        self._consec_degraded_search = 0
         execution_id = _gen_execution_id()
         exec_start   = __import__("time").time()
         tool_call_count = 0
@@ -1656,6 +1675,41 @@ class ShadowRuntime:
                     ))
                 except Exception:
                     pass  # EventBus is optional — never break execution
+
+                # v0.8.17: fail-fast after 3 consecutive degraded web-search results.
+                # "degraded" means the entire provider chain failed (not just zero results) —
+                # reset on any non-degraded search so a single blip doesn't end the run.
+                _tool_name_for_ff = decision.get("tool_name", "")
+                _parsed_for_ff = getattr(result, "parsed", None)
+                if _is_degraded_search_result(_tool_name_for_ff, _parsed_for_ff):
+                    self._consec_degraded_search += 1
+                else:
+                    self._consec_degraded_search = 0
+                if self._consec_degraded_search >= _MAX_CONSEC_DEGRADED_SEARCH:
+                    _ff_msg = (
+                        f"Web search capability unavailable — search backends failed "
+                        f"{self._consec_degraded_search}x. Set SYSTEMU_TAVILY_API_KEY or "
+                        f"SYSTEMU_EXA_API_KEY for reliable search."
+                    )
+                    logger.warning("[Runtime] fail-fast: %s", _ff_msg)
+                    self._append_to_shadow_log(
+                        shadow, execution_id, "failure", _ff_msg,
+                        iteration_count=iteration, tool_calls_made=tool_call_count,
+                        objectives_completed=len(completed_objectives) if use_objectives else current_ab - 1,
+                        objectives_total=total_objectives if use_objectives else len(scroll_json),
+                        duration_seconds=__import__("time").time() - exec_start,
+                    )
+                    _ff_res = context.build_result(
+                        status="failure",
+                        final_summary=f"Shadow reported failure: {_ff_msg}",
+                        error=_ff_msg,
+                    )
+                    _record_terminal_telemetry(
+                        shadow=shadow, execution_id=execution_id, scroll=scroll,
+                        status="failure", iteration=iteration,
+                    )
+                    _dispatch_refinery(shadow, scroll, _ff_res, context, self.config, self.vault)
+                    return _ff_res
 
                 # v0.6.9: iteration-loop circuit breaker — bail when the LLM
                 # is stuck re-invoking the same broken tool with the same
