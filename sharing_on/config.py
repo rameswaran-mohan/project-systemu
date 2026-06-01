@@ -158,6 +158,12 @@ class Config:
     # See systemu/runtime/dependency_installer.py for resolution rules.
     tool_dep_install_mode: str = "auto"
 
+    # v0.8.18 — Credential-resolution policy read by Gate-4.  Controls whether
+    # a missing tool credential prompts the operator (asked once via the
+    # decision-queue dedup, then degrades if the operator skips) or silently
+    # degrades the tool call.
+    credential_policy: str = "prompt"   # v0.8.18: "prompt" (ask once via queue dedup, then degrade if skipped) | "degrade"
+
     # v0.3.5 — When true, the daemon walks enabled tools at start and
     # ensures every declared dep is installed.  Trades a small startup
     # cost for predictable first-call latency under PROMPT/ALWAYS modes.
@@ -230,6 +236,7 @@ class Config:
             database_url=os.getenv("SYSTEMU_DATABASE_URL", ""),
             redis_url=os.getenv("SYSTEMU_REDIS_URL", ""),
             tool_dep_install_mode=os.getenv("SYSTEMU_TOOL_DEP_INSTALL_MODE", "auto").lower(),
+            credential_policy=os.getenv("SYSTEMU_CREDENTIAL_POLICY", "prompt").lower(),
             prewarm_tool_deps=os.getenv("SYSTEMU_PREWARM_TOOL_DEPS", "false").lower() == "true",
             # v0.4.0 supervisor knobs (env overrides)
             max_consecutive_think=int(os.getenv("SYSTEMU_MAX_CONSECUTIVE_THINK", "5")),

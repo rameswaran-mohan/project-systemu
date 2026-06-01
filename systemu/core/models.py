@@ -31,6 +31,9 @@ from pydantic import BaseModel, Field, computed_field, field_validator, model_va
 # check in systemu/pipelines/tool_forge.py.
 _SAFE_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
+# v0.8.18: credential keys become env-var-style identifiers (e.g. OPENWEATHER_API_KEY).
+_SAFE_CRED_KEY = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+
 from systemu.core.utils import utcnow as _now
 
 
@@ -210,6 +213,23 @@ class ToolStatus(str, Enum):
     UPGRADED = "upgraded"   # Evolution improved it
 
 
+class CredentialRequirement(BaseModel):
+    """A credential a tool needs to run (v0.8.18)."""
+    key:         str                                    # env-var-style id, e.g. "OPENWEATHER_API_KEY"
+    label:       str                                    # human label
+    auth_type:   Literal["none", "api_key"] = "api_key" # "oauth" reserved for a follow-up
+    signup_url:  Optional[str] = None
+    free_tier:   bool = False
+    description: str = ""
+
+    @field_validator("key")
+    @classmethod
+    def _validate_key(cls, v: str) -> str:
+        if not isinstance(v, str) or not _SAFE_CRED_KEY.match(v):
+            raise ValueError(f"CredentialRequirement.key must match ^[A-Z][A-Z0-9_]{{1,63}}$ (got {v!r}).")
+        return v
+
+
 class Tool(BaseModel):
     """A callable capability registered in the vault tool registry."""
 
@@ -218,6 +238,7 @@ class Tool(BaseModel):
     description:         str
     tool_type:           ToolType
     parameters_schema:   Dict[str, Any] = {}    # JSON Schema describing inputs
+    requires_credentials: List["CredentialRequirement"] = []   # v0.8.18: declared credential needs
 
     # v0.6.1-a: validate Tool.name at construction so unsafe values can never
     # reach the filesystem.  See _SAFE_TOOL_NAME at the top of this module.

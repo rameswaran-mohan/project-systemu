@@ -27,6 +27,28 @@ from systemu.vault.vault import Vault
 logger = logging.getLogger(__name__)
 
 
+def _coerce_requires_credentials(raw: Any) -> list:
+    """Coerce an LLM-emitted `requires_credentials` list into validated models.
+
+    v0.8.18: the forge spec prompt asks the LLM to declare credential needs as a
+    list of dicts. Build `CredentialRequirement` models from them so the forged
+    Tool carries its declared needs (activating Gate-4 / Connections). Malformed
+    entries (e.g. a `key` that fails the env-var regex) are dropped with a warning
+    rather than raising — a bad credential hint must not abort the whole forge.
+    """
+    from systemu.core.models import CredentialRequirement
+    out: list = []
+    for entry in (raw or []):
+        try:
+            out.append(
+                entry if isinstance(entry, CredentialRequirement)
+                else CredentialRequirement(**entry)
+            )
+        except Exception:
+            logger.warning("[Forge] dropping malformed requires_credentials entry: %r", entry)
+    return out
+
+
 def _approved_packages_hint() -> list[str]:
     """Return the operator-approved pip allow-list as a plain string list.
 
@@ -235,6 +257,12 @@ def forge_tool_from_spec(
             tool.implementation_notes = edited["implementation_notes"]
         if "dependencies" in edited:
             tool.dependencies = edited["dependencies"]
+        if "requires_credentials" in edited:
+            # v0.8.18: honour credential declarations carried in a user-edited
+            # spec. Tool has no validate_assignment, so coerce the list-of-dicts
+            # into CredentialRequirement models explicitly (a malformed entry is
+            # dropped rather than corrupting the record).
+            tool.requires_credentials = _coerce_requires_credentials(edited["requires_credentials"])
         # Parse tool_type safely
         if "tool_type" in edited:
             try:
@@ -556,6 +584,10 @@ def _spec_and_forge_new(
         return_schema=spec_result.get("return_schema", {}),
         implementation_notes=spec_result.get("implementation_notes", ""),
         dependencies=spec_result.get("dependencies", []),
+        # v0.8.18: carry the LLM-declared credential needs onto the Tool so the
+        # credential flow (Gate-4 / Connections) activates instead of the tool
+        # failing at call time.
+        requires_credentials=_coerce_requires_credentials(spec_result.get("requires_credentials")),
         status=ToolStatus.PROPOSED,
         forged_by_systemu=True,
     )
@@ -651,6 +683,9 @@ def propose_tools_from_specs(
             return_schema=spec_result.get("return_schema", {}),
             implementation_notes=spec_result.get("implementation_notes", ""),
             dependencies=spec_result.get("dependencies", []),
+            # v0.8.18: carry LLM-declared credential needs onto the Tool (see
+            # _spec_and_forge_new above).
+            requires_credentials=_coerce_requires_credentials(spec_result.get("requires_credentials")),
             status=ToolStatus.PROPOSED,
             forged_by_systemu=True,
         )

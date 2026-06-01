@@ -447,6 +447,50 @@ def notify_user(
     return resolved
 
 
+def request_credential(req, *, resolver=None) -> Optional[str]:
+    """v0.8.18 — return a declared credential if available, else pause (queue) to ask.
+
+    Returns the secret value if already resolvable (keyring/env). Returns None when
+    no queue is available (headless/legacy -> caller should degrade). Raises
+    PendingCredentialRequest when it must be collected (operator acts on Connections page).
+    NEVER logs the value.
+    """
+    from systemu.runtime.credentials.resolver import CredentialResolver
+    resolver = resolver or CredentialResolver()
+    value, _src = resolver.resolve(req)
+    # v0.8.18 M3: None means missing → proceed to ask; "" means auth_type="none"
+    # (no credential required) → return "" without queuing; a real value → return it.
+    if value is not None:
+        return value
+
+    queue = _get_decision_queue()
+    dedup_key = f"cred:{req.key}"
+    actions = ["I've connected it", "Skip (disable tool)", "Cancel run"]
+    if queue is None:
+        return None  # headless/legacy: caller degrades
+
+    resolved = queue.get_resolved_choice(dedup_key)
+    if resolved is not None:
+        # operator acted; re-check the store (they may have added it on Connections)
+        return resolver.resolve(req)[0]
+
+    body = (f"A tool needs your {req.label}. "
+            + ("A free tier is available. " if getattr(req, "free_tier", False) else "")
+            + (f"Get one at {req.signup_url}. " if getattr(req, "signup_url", None) else "")
+            + "Add it on the Connections page (Settings -> Connections), then click “I've connected it”.")
+    decision_id = queue.post(
+        title=f"{req.label} needed",
+        body=body,
+        options=actions,
+        context={"kind": "credential", "credential_key": req.key,
+                 "signup_url": getattr(req, "signup_url", "") or "", "label": req.label},
+        dedup_key=dedup_key,
+    )
+    from systemu.approval.exceptions import PendingCredentialRequest
+    raise PendingCredentialRequest(decision_id=decision_id, dedup_key=dedup_key,
+                                   options=actions, credential_key=req.key)
+
+
 def confirm(prompt_text: str, default: bool = True) -> bool:
     """Simple yes/no confirmation wrapper."""
     import sys, os

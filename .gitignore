@@ -3,6 +3,10 @@
 .env.local
 .env.*.local
 
+# v0.8.18: tool credential fallback store (secrets — never commit)
+.credentials.json
+**/.credentials.json
+
 # ── Personal usage data (sharing_on capture sessions) ────────────────────────
 captures/
 systemu/captures/

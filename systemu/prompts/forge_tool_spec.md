@@ -71,7 +71,8 @@ Return **only** valid JSON in this exact structure:
     }
   },
   "implementation_notes": "Use playwright-sync with Chromium. Call page.goto(url). If wait_for is specified, call page.wait_for_selector(wait_for). Return page.title() and page.url() on success.",
-  "dependencies": ["playwright"]
+  "dependencies": ["playwright"],
+  "requires_credentials": []
 }
 ```
 
@@ -91,4 +92,11 @@ Return **only** valid JSON in this exact structure:
      allowed but each one will require operator approval before installation.
 6. Do NOT create multi-purpose tools (no "do_everything" tools).
 7. Do NOT add parameters that are not needed for the specific operation.
-8. Return only the JSON object. No markdown fences, no explanation outside the JSON.
+8. **Credentials:** If the tool calls an external API that requires an API key or a paid
+   subscription, populate the top-level `requires_credentials` field — a JSON list of objects
+   `{"key": "<UPPER_SNAKE_ENV_NAME>", "label": "<human label>", "auth_type": "api_key",
+   "signup_url": "<where to get it>", "free_tier": <true|false>, "description": "<short>"}`.
+   - Use an UPPER_SNAKE env-var-style `key` (e.g. `OPENWEATHER_API_KEY`).
+   - NEVER invent or hardcode the key's value — only declare that it is needed.
+   - If no external credential is needed, use `[]`.
+9. Return only the JSON object. No markdown fences, no explanation outside the JSON.
