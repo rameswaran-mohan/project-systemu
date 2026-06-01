@@ -248,6 +248,12 @@ def extract_and_process(
     if missing_tool_ids:
         _queue_forge_notifications(missing_tool_ids, activity, scroll, vlt)
 
+    # ── Stage 4b1: Pre-flight credential scan (v0.8.18) ───────────────────────
+    # Heads-up only: scan the deployed tools' declared credentials and, if any
+    # are unresolved, post ONE batched decision so the operator can connect them
+    # up front. Gate-4 (tool_registry.execute) is the actual run-time enforcement.
+    _queue_credential_requests(tool_ids, activity_id=activity.id, vlt=vlt)
+
     # ── Stage 4b2: Output-type coverage check ─────────────────────────────────
     # Warn when the selected tools don't appear to cover the scroll's expected
     # outputs. This catches the "wrong tool" scenario where the LLM picks an
@@ -525,6 +531,46 @@ def _queue_forge_notifications(
             logger.info("[Extract] Queued forge notification for tool '%s' (%s)", tool.name, tid)
         except Exception as exc:
             logger.warning("[Extract] Could not queue forge notification for %s: %s", tid, exc)
+
+
+def _get_decision_queue():
+    try:
+        from systemu.interface.notifications import _get_decision_queue as _g
+        return _g()
+    except Exception:
+        return None
+
+
+def _queue_credential_requests(tool_ids, *, activity_id: str, vlt) -> None:
+    """v0.8.18 pre-flight: post ONE batched decision listing all missing
+    credentials across the run's tools (heads-up; Gate-4 enforces at run time)."""
+    from systemu.runtime.credentials.resolver import CredentialResolver
+    resolver = CredentialResolver()
+    missing, seen = [], set()
+    for tid in tool_ids:
+        try:
+            tool = vlt.get_tool(tid)
+        except Exception:
+            continue
+        for req in (getattr(tool, "requires_credentials", None) or []):
+            if req.key in seen:
+                continue
+            if resolver.resolve(req)[0] is None:
+                seen.add(req.key)
+                missing.append(req)
+    if not missing:
+        return
+    queue = _get_decision_queue()
+    if queue is None:
+        return
+    lines = [f"- {r.label} ({r.key})" + (f" - {r.signup_url}" if r.signup_url else "") for r in missing]
+    queue.post(
+        title=f"This task needs {len(missing)} credential(s)",
+        body="Connect these on the Connections page (Settings -> Connections), then re-run:\n" + "\n".join(lines),
+        options=["I've connected them", "Proceed anyway", "Cancel run"],
+        context={"kind": "credential_batch", "keys": [r.key for r in missing]},
+        dedup_key=f"creds:{activity_id}",
+    )
 
 
 # ─── Dependency singleton (avoids passing config/vault through every call) ────

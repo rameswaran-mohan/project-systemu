@@ -32,3 +32,13 @@ class PendingOperatorDecision(Exception):
             f"Open the dashboard /insights page and click one of: {', '.join(options)}."
         )
         super().__init__(msg)
+
+
+class PendingCredentialRequest(PendingOperatorDecision):
+    """Raised when a tool needs a credential the operator hasn't provided yet.
+    Subclasses PendingOperatorDecision so the existing CLI/daemon catch + resume
+    path (keyed on dedup_key) handles it unchanged (v0.8.18)."""
+
+    def __init__(self, decision_id: str, dedup_key: str, options, credential_key: str, message=None):
+        self.credential_key = credential_key
+        super().__init__(decision_id=decision_id, dedup_key=dedup_key, options=options, message=message)

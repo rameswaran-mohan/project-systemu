@@ -97,6 +97,36 @@ def build_settings_page() -> None:
                 f"font-size: 12px; color: {THEME['text_muted']};"
             )
 
+        # ── Connections (v0.8.18) ──────────────────────────────────────────
+        # Operator enters per-tool API keys here.  Values are stored via
+        # CredentialStore (keyring, 0600-file fallback) — never written to
+        # .env and never echoed back; only the last-4 of a stored key is shown.
+        _section_header("Connections")
+        with ui.column().style(
+            f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+            f"border-radius: 12px; padding: 20px; gap: 16px;"
+        ):
+            ui.label(
+                "Connect the credentials your tools declare. Keys are stored "
+                "securely in your OS keychain — they are never shown after saving."
+            ).style(f"font-size: 12px; color: {THEME['text_muted']};")
+
+            try:
+                conn_rows = connection_rows(state.vault)
+            except Exception as exc:  # pragma: no cover - defensive UI guard
+                conn_rows = []
+                ui.label(f"Could not load connections: {exc}").style(
+                    f"font-size: 12px; color: {THEME['danger']};"
+                )
+
+            if not conn_rows:
+                ui.label(
+                    "No tools declare credential requirements yet."
+                ).style(f"font-size: 13px; color: {THEME['text_muted']};")
+            else:
+                for row in conn_rows:
+                    _connection_card(row)
+
         # ── Save Button ────────────────────────────────────────────────────
         def _save():
             """Write updated model names + auto-approve back to .env."""
@@ -119,11 +149,129 @@ def build_settings_page() -> None:
         )
 
 
+def connection_rows(vault) -> list:
+    """Rows for tools that declare credential requirements (v0.8.18).
+
+    Enumerates FULL Tool records via the real Vault API — the lightweight
+    index header does NOT carry ``requires_credentials``, so we read each
+    tool's full record: ``load_index("tools")`` headers + ``get_tool(id)``.
+    """
+    from systemu.runtime.credentials.store import CredentialStore
+    store = CredentialStore()
+    rows, seen = [], set()
+    try:
+        headers = vault.load_index("tools") or []
+    except Exception:
+        headers = []
+    for header in headers:
+        tid = header.get("id") if isinstance(header, dict) else None
+        if not tid:
+            continue
+        try:
+            t = vault.get_tool(tid)
+        except Exception:
+            continue
+        for req in (getattr(t, "requires_credentials", None) or []):
+            sig = (t.name, req.key)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            st = store.status(req.key)
+            rows.append({"tool": t.name, "key": req.key, "label": req.label,
+                         "signup_url": req.signup_url,
+                         "present": st["present"], "last4": st["last4"]})
+    return rows
+
+
+def save_credential(key: str, value: str) -> None:
+    from systemu.runtime.credentials.store import CredentialStore
+    CredentialStore().set(key, value)
+
+
+def delete_credential(key: str) -> None:
+    from systemu.runtime.credentials.store import CredentialStore
+    CredentialStore().delete(key)
+
+
 def _section_header(title: str) -> None:
     ui.label(title).style(
         f"font-size: 14px; font-weight: 700; color: {THEME['text_muted']}; "
         f"text-transform: uppercase; letter-spacing: 0.08em;"
     )
+
+
+def _connection_card(row: dict) -> None:
+    """Render one credential connection: status + masked entry + Save/Disconnect.
+
+    ``row`` is a dict from :func:`connection_rows`:
+    {tool, key, label, signup_url, present, last4}.
+    """
+    key = row["key"]
+    with ui.column().style(
+        f"background: {THEME['surface2']}; border: 1px solid {THEME['border']}; "
+        f"border-radius: 10px; padding: 14px; gap: 8px;"
+    ):
+        # Header row — label + key id + status badge
+        with ui.row().style("align-items: center; gap: 10px; flex-wrap: wrap;"):
+            ui.label(row["label"]).style(
+                f"font-size: 13px; font-weight: 600; color: {THEME['text']};"
+            )
+            ui.label(key).style(
+                f"font-size: 11px; color: {THEME['text_muted']}; font-family: monospace; "
+                f"background: {THEME['surface']}; padding: 2px 8px; border-radius: 6px;"
+            )
+            if row["present"]:
+                last4 = row.get("last4")
+                masked = f"••••{last4}" if last4 else ""
+                status_text  = f"✅ Connected {masked}".rstrip()
+                status_color = THEME["success"]
+            else:
+                status_text  = "❌ Not connected"
+                status_color = THEME["danger"]
+            ui.label(status_text).style(
+                f"font-size: 12px; font-weight: 600; color: {status_color};"
+            )
+
+        if row.get("signup_url"):
+            ui.link("Get an API key ↗", row["signup_url"], new_tab=True).style(
+                f"font-size: 11px; color: {THEME['primary']};"
+            )
+
+        # Masked entry + actions
+        with ui.row().style("align-items: center; gap: 8px; width: 100%;"):
+            inp = ui.input(placeholder="Paste or type the API key", password=True).style(
+                f"flex: 1; min-width: 220px; background: {THEME['surface']}; "
+                f"border: 1px solid {THEME['border']}; border-radius: 8px; "
+                f"color: {THEME['text']}; font-size: 13px; font-family: monospace;"
+            )
+
+            def _save_cred(_=None, key=key, inp=inp, label=row["label"]) -> None:
+                value = (inp.value or "").strip()
+                if not value:
+                    ui.notify("Enter a key before saving.", type="warning")
+                    return
+                try:
+                    save_credential(key, value)
+                    inp.value = ""
+                    ui.notify(f"{label} connected.", type="positive")
+                except Exception as exc:
+                    ui.notify(f"Could not save {label}: {exc}", type="negative")
+
+            def _disconnect(_=None, key=key, label=row["label"]) -> None:
+                try:
+                    delete_credential(key)
+                    ui.notify(f"{label} disconnected.", type="info")
+                except Exception as exc:
+                    ui.notify(f"Could not disconnect {label}: {exc}", type="negative")
+
+            ui.button("Save", on_click=_save_cred).style(
+                f"background: {THEME['primary']}; color: white; border-radius: 8px;"
+            )
+            if row["present"]:
+                ui.button("Disconnect", on_click=_disconnect).style(
+                    f"background: transparent; color: {THEME['danger']}; "
+                    f"border: 1px solid {THEME['danger']}; border-radius: 8px;"
+                )
 
 
 def _model_input(label: str, description: str, current_value: str):

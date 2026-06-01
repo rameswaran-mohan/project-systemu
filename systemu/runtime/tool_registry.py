@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -94,6 +95,22 @@ def _dep_error_dict(exc: "ToolDependencyError") -> dict:
         "error_type":      "missing_dependency",
         "missing_packages": [exc.missing],
         "install_hint":    f"pip install {exc.missing}",
+    }
+
+
+def _credential_degraded(name: str, req) -> dict:
+    """v0.8.18 — structured result when a required credential is unavailable.
+
+    The Shadow runtime treats ``degraded`` results as a soft, non-retryable
+    skip: the tool simply cannot run until the operator connects the secret
+    on the Connections page.  Never contains the secret value.
+    """
+    return {
+        "success": False, "degraded": True,
+        "error": f"Tool '{name}' unavailable: missing {req.key}",
+        "error_type": "tool_credential_missing",
+        "note": (f"This tool needs {req.label}. "
+                 f"Connect it at {req.signup_url or 'the Connections page (Settings -> Connections)'} to enable it."),
     }
 
 
@@ -329,6 +346,22 @@ class ToolRegistry:
                 "error_type": "tool_dry_run_failed",
                 "dry_run_evidence": getattr(tool, "dry_run_evidence", {}) or {},
             }
+
+        # ── Gate 4 (v0.8.18): required credentials must be available ───────
+        reqs = getattr(tool, "requires_credentials", None) or []
+        if reqs:
+            from systemu.runtime.credentials.resolver import CredentialResolver
+            resolver = CredentialResolver()
+            missing = resolver.missing(reqs)
+            if missing:
+                policy = (os.environ.get("SYSTEMU_CREDENTIAL_POLICY", "prompt") or "prompt").lower()
+                interactive = (os.environ.get("SYSTEMU_DECISION_QUEUE", "").lower() == "true")
+                if policy == "degrade" or not interactive:
+                    return _credential_degraded(name, missing[0])
+                from systemu.interface.notifications import request_credential
+                if not request_credential(missing[0]):     # may raise PendingCredentialRequest
+                    return _credential_degraded(name, missing[0])  # operator skipped
+            resolver.promote_to_env(reqs)   # make resolved secrets visible to the tool (os.environ)
 
         # ── Load module (cached after first import; self-heals on ImportError) ─
         load_result = self._load_with_self_heal(name, tool)

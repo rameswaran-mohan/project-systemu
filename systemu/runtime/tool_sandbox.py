@@ -184,6 +184,7 @@ class ToolSandbox:
                 and not _must_use_subprocess(tool_type, extra_packages)):
             try:
                 from systemu.runtime.tool_registry import ToolDependencyError, ToolNotEnabledError
+                from systemu.approval.exceptions import PendingOperatorDecision
                 result_dict = await self._registry.execute(
                     tool_name, parameters, timeout=float(effective_timeout)
                 )
@@ -206,6 +207,13 @@ class ToolSandbox:
                 rd = _dep_error_dict(exc)
                 logger.warning("[Sandbox] Dep error for '%s': %s", tool_name, exc.missing)
                 return ToolResult(success=False, parsed=rd, error=rd["error"])
+            except PendingOperatorDecision:
+                # v0.8.18 Gate-4: an interactive credential ask (or any operator
+                # decision) was raised mid-call.  This is NOT a fast-path failure —
+                # it MUST propagate to the decision-queue resume handlers
+                # (scheduler/jobs.py, cli_commands.py).  Falling through to the
+                # subprocess backend here would run the tool UN-GATED.
+                raise
             except Exception as exc:
                 logger.warning(
                     "[Sandbox] Registry fast-path failed for '%s' (%s) — falling back to subprocess",
