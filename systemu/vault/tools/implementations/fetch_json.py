@@ -11,11 +11,19 @@ TOOL_META = {
 
 def run(**kwargs) -> dict:
     url: str = kwargs.get("url", "")
-    headers: dict = kwargs.get("headers", {}) or {}
+    headers: dict = dict(kwargs.get("headers", {}) or {})
     params: dict = kwargs.get("params", {}) or {}
 
     if not url:
         return {"success": False, "data": None, "status_code": 0, "error": "url is required"}
+
+    # v0.8.20: default a descriptive User-Agent + JSON Accept when the caller omits
+    # them. The requests default ("python-requests/x") is rejected by several free
+    # APIs the agent commonly reaches for — Nominatim returns 403 (per the OSM usage
+    # policy) and Overpass returns 406 — which made free "nearby places" tasks fail.
+    # Caller-supplied headers always win (setdefault).
+    headers.setdefault("User-Agent", "systemu/0.8 (+https://github.com/rameswaran-mohan/project-systemu)")
+    headers.setdefault("Accept", "application/json")
 
     try:
         import requests
