@@ -90,6 +90,33 @@ def _gen_execution_id() -> str:
     return f"exec_{secrets.token_hex(4)}"
 
 
+def _objective_items(objectives, completed) -> list:
+    """v0.8.19 (R2): derive per-objective status for the live checklist.
+    done = in completed; in_progress = deps satisfied but not done; else pending."""
+    items = []
+    for o in objectives:
+        if o.id in completed:
+            st = "done"
+        elif all(d in completed for d in (o.depends_on or [])):
+            st = "in_progress"
+        else:
+            st = "pending"
+        items.append({"id": o.id, "goal": o.goal, "status": st})
+    return items
+
+
+def _objective_state_event(objectives, completed, execution_id, *, stamp) -> dict:
+    """v0.8.19 (R2): build an objective_state EventBus event (stamp = origin wrapper)."""
+    return stamp({
+        "ts": utcnow().isoformat() + "Z",
+        "level": "INFO",
+        "category": "objective_state",
+        "message": f"objectives {len(completed)}/{len(objectives)}",
+        "context": {"execution_id": execution_id,
+                    "items": _objective_items(objectives, completed)},
+    })
+
+
 def _build_boot_memory(shadow: Any, vault: Any) -> str:
     """Build the boot-time memory block for a shadow.
 
@@ -1179,6 +1206,17 @@ class ShadowRuntime:
         completed_objectives: set[int] = set()
         total_objectives = len(objectives)
 
+        # v0.8.19 (R2): publish the initial objective_state so the live pane
+        # can render the full checklist at boot.  Best-effort — EventBus is
+        # optional and a publish failure must never break execution.
+        if use_objectives:
+            try:
+                from systemu.interface.event_bus import EventBus
+                EventBus.get().publish(_objective_state_event(
+                    objectives, completed_objectives, execution_id, stamp=self._stamp))
+            except Exception:
+                pass  # EventBus is optional — never break execution
+
         # Legacy ActionBlock tracking
         current_ab   = 1
 
@@ -1748,6 +1786,14 @@ class ShadowRuntime:
                     if isinstance(completed_obj, int) and completed_obj not in completed_objectives:
                         if result is not None and result.success:
                             completed_objectives.add(completed_obj)
+                            # v0.8.19 (R2): publish updated objective_state so the
+                            # live pane ticks the checklist.  Best-effort.
+                            try:
+                                from systemu.interface.event_bus import EventBus
+                                EventBus.get().publish(_objective_state_event(
+                                    objectives, completed_objectives, execution_id, stamp=self._stamp))
+                            except Exception:
+                                pass
                             logger.info("[Runtime] Objective %d complete. %d/%d done.",
                                         completed_obj, len(completed_objectives), total_objectives)
 

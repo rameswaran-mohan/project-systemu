@@ -238,7 +238,10 @@ class OperatorDecisionQueue:
             decision = self._vault.get_decision(decision_id)
         except Exception as exc:
             raise KeyError(f"OperatorDecision {decision_id} not found: {exc}")
-        if choice not in decision.options:
+        # v0.8.19 (R3): structured-question answers are JSON, not an option label —
+        # skip the membership check for that kind; plain decisions stay strict.
+        _structured = (decision.context or {}).get("kind") == "structured_question"
+        if not _structured and choice not in decision.options:
             raise ValueError(
                 f"choice {choice!r} not in options {decision.options!r} "
                 f"for decision {decision_id}"

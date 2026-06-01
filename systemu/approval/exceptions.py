@@ -42,3 +42,8 @@ class PendingCredentialRequest(PendingOperatorDecision):
     def __init__(self, decision_id: str, dedup_key: str, options, credential_key: str, message=None):
         self.credential_key = credential_key
         super().__init__(decision_id=decision_id, dedup_key=dedup_key, options=options, message=message)
+
+
+class PendingChoiceRequest(PendingOperatorDecision):
+    """v0.8.19 — raised when a structured clarifying question is posted and awaits
+    the operator's answer. Resumes via dedup_key like the base PendingOperatorDecision."""

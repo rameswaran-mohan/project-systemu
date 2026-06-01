@@ -165,6 +165,27 @@ def _refine_with_gui_guard(*, payload: Dict[str, Any], prompt_text: str,
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _apply_clarifications(result, session_id, call_refine, *, asker=None):
+    """v0.8.19 (R3): if the draft emitted clarifying_questions, ask the operator a
+    structured question (parks via PendingChoiceRequest until answered; degrades to a
+    no-op when no decision queue / headless), then re-refine with the answers folded in.
+    Returns the (possibly updated) draft dict. Conservative: only fires when the LLM
+    explicitly emits clarifying_questions."""
+    cqs = result.get("clarifying_questions") or []
+    if not cqs:
+        return result
+    if asker is None:
+        from systemu.interface.notifications import request_choice as asker
+    answers = asker(cqs, dedup_key=f"clarify:{session_id}")  # may raise PendingChoiceRequest; None when headless
+    if answers:
+        ctx = ("## Operator answers to clarifying questions\n\n"
+               + "\n".join(f"- {q}: {a}" for q, a in answers.items()))
+        return call_refine(ctx)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def refine_scroll(
     session_dir: Path,
     config: Config,
@@ -337,6 +358,9 @@ def refine_scroll(
         except Exception as exc:
             logger.warning("[Scroll] v0.6.5: GUI rewrite call failed: %s", exc)
             gui_offenders_second = gui_offenders_first
+
+    # ── v0.8.19 (R3): ask clarifying questions for genuinely ambiguous requests ──
+    result = _apply_clarifications(result, session_id, _call_refine)
 
     # ── Parse Objectives (intent-driven format) ────────────────────────────
     raw_objectives = result.get("objectives", [])
