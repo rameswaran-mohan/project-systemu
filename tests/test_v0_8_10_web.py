@@ -318,9 +318,11 @@ class TestSeedIntegrity:
             f"index/impl mismatch: index-only={idx_names - disk_impls}, "
             f"impl-only={disk_impls - idx_names}"
         )
-        # curated count locked at 38
-        assert len(idx) == 38, f"expected 38 curated tools, got {len(idx)}"
-        assert len(disk_impls) == 38, f"expected 38 impl files, got {len(disk_impls)}"
+        # curated count locked at 40
+        # v0.8.21: bumped 38 -> 40 after adding `extract_records` and `web_extract`
+        # seed tools (RCA fix for "find top 5 bakeries" stuck-at-iteration-30 run).
+        assert len(idx) == 40, f"expected 40 curated tools, got {len(idx)}"
+        assert len(disk_impls) == 40, f"expected 40 impl files, got {len(disk_impls)}"
         # no dangling old web tools in index
         for gone in ["web_extract_text","web_extract_table","browser_navigate","mouse_click","mouse_drag"]:
             assert gone not in idx_names

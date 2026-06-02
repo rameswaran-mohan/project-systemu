@@ -619,5 +619,45 @@
     "enabled": true,
     "forged_by_systemu": true,
     "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_extract_records",
+    "name": "extract_records",
+    "description": "Extract structured records from HTML/text you already have. Use AFTER web_read/fetch_html. If you only have a URL, use web_extract instead.",
+    "tool_type": "api_call",
+    "parameter_names": [
+      "text",
+      "schema",
+      "max_records"
+    ],
+    "dependencies": [
+      "jsonschema"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": false,
+    "created_at": "2026-06-02T00:00:00"
+  },
+  {
+    "id": "tool_web_extract",
+    "name": "web_extract",
+    "description": "Fetch a URL and extract structured records from it in one step. Prefer this over chaining fetch_html/web_read + extract_records when you start from a URL.",
+    "tool_type": "web",
+    "parameter_names": [
+      "url",
+      "schema",
+      "max_records",
+      "max_pages",
+      "headers",
+      "timeout"
+    ],
+    "dependencies": [
+      "requests",
+      "jsonschema"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": false,
+    "created_at": "2026-06-02T00:00:00"
   }
 ]

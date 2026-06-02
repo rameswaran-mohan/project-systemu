@@ -69,6 +69,14 @@ def build_settings_page() -> None:
                 f"font-size: 12px; color: {THEME['text_muted']};"
             )
 
+        # ── Stuck-loop guard (v0.8.21) ─────────────────────────────────────
+        _section_header("Stuck-loop guard")
+        with ui.column().style(
+            f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+            f"border-radius: 12px; padding: 20px; gap: 14px;"
+        ):
+            stuck_settings_card()
+
         # ── Vault ──────────────────────────────────────────────────────────
         _section_header("Storage")
         with ui.column().style(
@@ -305,3 +313,65 @@ def _update_env_var(key: str, value: str) -> None:
     if not found:
         updated.append(f"{key}={value}\n")
     env_path.write_text("".join(updated), encoding="utf-8")
+
+
+def get_stuck_settings() -> dict:
+    """v0.8.21: read current values from env. Always returns sane defaults if missing."""
+    import os
+    return {
+        "guard_on":    (os.environ.get("SYSTEMU_STUCK_GUARD", "on") or "on").lower() != "off",
+        "no_progress": int(os.environ.get("SYSTEMU_STUCK_NO_PROGRESS", "5") or "5"),
+        "tool_fails":  int(os.environ.get("SYSTEMU_STUCK_TOOL_FAILS", "3") or "3"),
+    }
+
+
+def save_stuck_settings(*, guard_on: bool, no_progress: int, tool_fails: int) -> None:
+    """v0.8.21: validate ranges; persist to .env; patch live os.environ.
+    Raises ValueError on out-of-range input (UI surfaces the error via ui.notify)."""
+    if not (1 <= int(no_progress) <= 30):
+        raise ValueError("no_progress must be in 1..30")
+    if not (1 <= int(tool_fails) <= 10):
+        raise ValueError("tool_fails must be in 1..10")
+    import os
+    g_str = "on" if guard_on else "off"
+    _update_env_var("SYSTEMU_STUCK_GUARD", g_str)
+    _update_env_var("SYSTEMU_STUCK_NO_PROGRESS", str(int(no_progress)))
+    _update_env_var("SYSTEMU_STUCK_TOOL_FAILS", str(int(tool_fails)))
+    os.environ["SYSTEMU_STUCK_GUARD"] = g_str
+    os.environ["SYSTEMU_STUCK_NO_PROGRESS"] = str(int(no_progress))
+    os.environ["SYSTEMU_STUCK_TOOL_FAILS"] = str(int(tool_fails))
+
+
+def stuck_settings_card() -> None:
+    """v0.8.21: render the Stuck-loop guard section. Caller wraps it in `with ui.column():`."""
+    state = get_stuck_settings()
+    guard_cb = ui.checkbox("Enable stuck-loop guard (pause when the agent stops making progress)").style(
+        f"color: {THEME['text']};")
+    guard_cb.value = state["guard_on"]
+    ui.label(
+        "When enabled, the runtime pauses for operator input if the agent makes no "
+        "objective progress for N iterations OR the same tool fails N consecutive times. "
+        "Tunables below apply on the NEXT iteration — no daemon restart needed."
+    ).style(f"font-size: 12px; color: {THEME['text_muted']};")
+    with ui.row().style("gap: 16px; align-items: center;"):
+        ui.label("Iterations without progress before pause:").style(
+            f"font-size: 13px; color: {THEME['text']};")
+        no_prog = ui.number(label="", value=state["no_progress"], min=1).style("width: 110px;")
+    with ui.row().style("gap: 16px; align-items: center;"):
+        ui.label("Consecutive same-tool failures before pause:").style(
+            f"font-size: 13px; color: {THEME['text']};")
+        tool_fails = ui.number(label="", value=state["tool_fails"], min=1).style("width: 110px;")
+
+    def _save():
+        try:
+            save_stuck_settings(guard_on=guard_cb.value,
+                                 no_progress=int(no_prog.value or 5),
+                                 tool_fails=int(tool_fails.value or 3))
+            ui.notify("Stuck-loop guard saved (live for next iteration).", type="positive")
+        except ValueError as exc:
+            ui.notify(f"Invalid value: {exc}", type="negative")
+        except Exception as exc:
+            ui.notify(f"Save failed: {exc}", type="negative")
+
+    ui.button("💾 Save Stuck-loop guard", on_click=_save).style(
+        f"background: {THEME['primary']}; color: white; border-radius: 8px; margin-top: 8px;")
