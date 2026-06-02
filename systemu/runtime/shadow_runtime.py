@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as _datetime_module
 import json
 import logging
+import os
 import secrets
 import threading
 from pathlib import Path
@@ -115,6 +116,14 @@ def _objective_state_event(objectives, completed, execution_id, *, stamp) -> dic
         "context": {"execution_id": execution_id,
                     "items": _objective_items(objectives, completed)},
     })
+
+
+def _stuck_thresholds() -> tuple[int, int, bool]:
+    """v0.8.21: per-call read of stuck-guard env vars (live-editable via Settings)."""
+    no_progress = int(os.environ.get("SYSTEMU_STUCK_NO_PROGRESS", "5") or "5")
+    tool_fails  = int(os.environ.get("SYSTEMU_STUCK_TOOL_FAILS", "3") or "3")
+    guard_on    = (os.environ.get("SYSTEMU_STUCK_GUARD", "on") or "on").lower() != "off"
+    return (no_progress, tool_fails, guard_on)
 
 
 def _build_boot_memory(shadow: Any, vault: Any) -> str:
@@ -968,6 +977,11 @@ class ShadowRuntime:
         self._origin: str = "manual"
         # v0.8.17: consecutive degraded web-search counter; reset per run in execute().
         self._consec_degraded_search: int = 0
+        # v0.8.21: stuck-loop guard counters; reset at top of execute() like _consec_degraded_search.
+        self._iters_since_obj_credit: int = 0
+        self._same_tool_fail_streak: dict[str, int] = {}
+        self._stuck_round_for_obj: dict[int, int] = {}
+        self._operator_hint: "str | None" = None
         # Directory is created lazily when the vault's prune_old_executions needs it;
         # we no longer eagerly create it since snapshot/SKILL.md disk writes are removed.
 
@@ -1076,6 +1090,104 @@ class ShadowRuntime:
         self._consecutive_failures.append(key)
         return len(self._consecutive_failures) >= self.CIRCUIT_BREAKER_FAILURES
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # v0.8.21 — stuck-loop guard helpers (pure; wired into execute() in T6).
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _update_stuck_counters(self, *, action: str, tool_name: "str | None",
+                                 tool_success: "bool | None", credited_obj_id: "int | None") -> None:
+        """v0.8.21: per-iteration counter update.
+        Progress (objective credited) resets BOTH counters.
+        TOOL_CALL failure increments same_tool_fail_streak.
+        Any iteration without a credit increments iters_since_obj_credit."""
+        if credited_obj_id is not None:
+            self._iters_since_obj_credit = 0
+            self._same_tool_fail_streak.clear()
+            return
+        self._iters_since_obj_credit += 1
+        if action == "TOOL_CALL" and tool_name:
+            if tool_success:
+                self._same_tool_fail_streak[tool_name] = 0
+            else:
+                self._same_tool_fail_streak[tool_name] = \
+                    self._same_tool_fail_streak.get(tool_name, 0) + 1
+
+    def _stuck_trigger(self) -> "tuple[bool, str]":
+        """v0.8.21: hybrid trigger — no-progress OR same-tool-failure streak."""
+        no_progress, tool_fails, guard_on = _stuck_thresholds()
+        if not guard_on:
+            return (False, "")
+        if self._iters_since_obj_credit >= no_progress:
+            return (True, f"no objective credit for {self._iters_since_obj_credit} iterations")
+        worst = max(self._same_tool_fail_streak.items(),
+                    key=lambda kv: kv[1], default=(None, 0))
+        if worst[1] >= tool_fails:
+            return (True, f"tool '{worst[0]}' failed {worst[1]} consecutive times")
+        return (False, "")
+
+    def _ask_stuck_or_degrade(self, *, execution_id: str, current_objective,
+                                 tools_tried, reason: str):
+        """v0.8.21: post stuck-loop decision via v0.8.19 R3 request_choice.
+        Returns the answer dict on resume, None when no queue (headless),
+        raises PendingChoiceRequest while awaiting operator."""
+        round_n = self._stuck_round_for_obj.get(current_objective.id, 0) + 1
+        self._stuck_round_for_obj[current_objective.id] = round_n
+        dedup = f"stuck:{execution_id}:obj_{current_objective.id}:r{round_n}"
+        goal_short = (getattr(current_objective, "goal", "") or "")[:120]
+        tried = ", ".join(sorted(set(tools_tried or [])))
+        qs = [{
+          "id": "action",
+          "prompt": (f"Stuck on Objective {current_objective.id}: '{goal_short}'.  "
+                     f"{reason}. Tools tried: {tried or '(none)'}."),
+          "multi": False,
+          "options": [
+            {"label": "Provide hint",   "desc": "free-text suggestion folded into next iteration"},
+            {"label": "Accept partial", "desc": "finalize with completed objectives; mark this as N/A"},
+            {"label": "Cancel run",     "desc": "stop the run cleanly"},
+          ],
+          "allow_free_text": True,
+        }]
+        from systemu.interface.notifications import request_choice
+        return request_choice(qs, dedup_key=dedup)
+
+    def _finalize_stuck(self, *, context, status: str, reason: str,
+                          stuck_on: int, completed, iteration: int,
+                          tool_calls_made: int, scroll, shadow,
+                          execution_id: str, exec_start: float,
+                          total_objectives: int):
+        """v0.8.21: terminal finalize for stuck-loop. Mirrors the MaxIterations path
+        (build_result + telemetry + refinery + shadow-log) so downstream consumers
+        treat 'partial' / 'cancelled' here identically."""
+        try:
+            self._append_to_shadow_log(
+                shadow, execution_id, status, f"Stuck-loop: {reason}",
+                iteration_count=iteration, tool_calls_made=tool_calls_made,
+                objectives_completed=len(completed or []),
+                objectives_total=total_objectives,
+                duration_seconds=(__import__("time").time() - exec_start),
+            )
+        except Exception:
+            pass
+        res = context.build_result(
+            status=status,
+            final_summary=f"Stuck on objective {stuck_on}: {reason}",
+            error="StuckLoopDetected",
+        )
+        try:
+            _record_terminal_telemetry(
+                shadow=shadow, execution_id=execution_id, scroll=scroll,
+                status=status, iteration=iteration,
+                extra={"reason": "StuckLoopDetected",
+                       "stuck_on_objective": stuck_on},
+            )
+        except Exception:
+            pass
+        try:
+            _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+        except Exception:
+            pass
+        return res
+
     def _build_memory_context_for_prompt(self) -> str:
         """LLM-facing memory view (consolidated, not the raw execution_log).
         v0.6.9: also includes refined lessons from memory_buffer, filtered
@@ -1134,6 +1246,11 @@ class ShadowRuntime:
         self._origin = origin or getattr(activity, "origin", None) or "manual"
         # v0.8.17: reset per-run consecutive-degraded-search counter.
         self._consec_degraded_search = 0
+        # v0.8.21: reset stuck-guard counters per run (declared in __init__).
+        self._iters_since_obj_credit = 0
+        self._same_tool_fail_streak.clear()
+        self._stuck_round_for_obj.clear()
+        self._operator_hint = None
         execution_id = _gen_execution_id()
         exec_start   = __import__("time").time()
         tool_call_count = 0
@@ -1388,7 +1505,7 @@ class ShadowRuntime:
                     "will be accepted. Act now."
                 )
             )
-            _llm_user = json.dumps({
+            _user_payload = {
                 "shadow_name":        shadow.name,
                 # output_dir: where Shadow-generated files must be written.
                 # Bind-mounted to the host's ./outputs/ directory so files
@@ -1416,7 +1533,12 @@ class ShadowRuntime:
                 "available_tools": tool_index,
                 "history":         _build_history_slice(context),
                 "last_snapshot":   context._snapshots[-1].summary if context._snapshots else None,
-            })
+            }
+            # v0.8.21: one-shot operator hint fold-back (cleared after this iteration).
+            if self._operator_hint:
+                _user_payload["operator_hint"] = self._operator_hint
+                self._operator_hint = None
+            _llm_user = json.dumps(_user_payload)
             loop = asyncio.get_event_loop()
             try:
                 decision = await loop.run_in_executor(
@@ -1459,6 +1581,10 @@ class ShadowRuntime:
                 continue
 
             action = decision.get("action", "THINK")
+            # v0.8.21: stuck-guard — every iteration without a TOOL_CALL still counts toward stuck.
+            if action != "TOOL_CALL":
+                self._update_stuck_counters(action=action, tool_name=None,
+                                              tool_success=None, credited_obj_id=None)
             if action == "THINK":  # LOAD_RESOURCE is productive — only throttle idle THINK
                 consecutive_thinks += 1
             else:
@@ -1695,6 +1821,15 @@ class ShadowRuntime:
                     continue   # User denied destructive call
                 tool_call_count += 1
 
+                # v0.8.21: stuck-guard — record tool outcome.
+                # (objective-credit reset is applied below at the credit site.)
+                self._update_stuck_counters(
+                    action="TOOL_CALL",
+                    tool_name=decision.get("tool_name") or "?",
+                    tool_success=bool(getattr(result, "success", False)),
+                    credited_obj_id=None,
+                )
+
                 # v0.8.16: per-iteration detail event AFTER the tool runs, so
                 # the bounded `details` dict carries the tool result the live
                 # panes render on expand.  Raw LLM is referenced via llm_ref.
@@ -1794,6 +1929,13 @@ class ShadowRuntime:
                                     objectives, completed_objectives, execution_id, stamp=self._stamp))
                             except Exception:
                                 pass
+                            # v0.8.21: stuck-guard — credit resets BOTH counters.
+                            self._update_stuck_counters(
+                                action="TOOL_CALL",
+                                tool_name=decision.get("tool_name") or "?",
+                                tool_success=True,
+                                credited_obj_id=completed_obj,
+                            )
                             logger.info("[Runtime] Objective %d complete. %d/%d done.",
                                         completed_obj, len(completed_objectives), total_objectives)
 
@@ -1849,6 +1991,79 @@ class ShadowRuntime:
                             _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
                             _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
                             return res
+
+                # v0.8.21: stuck-guard — check after this iteration's effects are recorded.
+                triggered, reason = self._stuck_trigger()
+                if triggered and use_objectives:
+                    # which objective are we stuck on? the first pending (lowest id whose deps are met & not done)
+                    pending = [o for o in objectives if o.id not in completed_objectives
+                               and all(d in completed_objectives for d in (o.depends_on or []))]
+                    stuck_obj = pending[0] if pending else objectives[-1]
+                    tools_tried = sorted(self._same_tool_fail_streak.keys())
+                    ans = self._ask_stuck_or_degrade(execution_id=execution_id,
+                                                       current_objective=stuck_obj,
+                                                       tools_tried=tools_tried, reason=reason)
+                    if ans is None:
+                        # headless — degrade as 'partial' (closest to MaxIterations semantics)
+                        return self._finalize_stuck(context=context, status="partial",
+                                                     reason=reason, stuck_on=stuck_obj.id,
+                                                     completed=list(completed_objectives),
+                                                     iteration=iteration,
+                                                     tool_calls_made=tool_call_count,
+                                                     scroll=scroll, shadow=shadow,
+                                                     execution_id=execution_id,
+                                                     exec_start=exec_start,
+                                                     total_objectives=total_objectives)
+                    action_choice = ans.get("action") or ""
+                    # v0.8.21 fix: the /insights Submit handler collapses radio choice + free text
+                    # into ONE value (`{"action": <ftext or label>}`); there is no `action__free` key.
+                    # So: if the answer isn't one of the canonical labels, treat it as a hint string
+                    # (operator typed free text → implicit "Provide hint").
+                    _canonical = {"Provide hint", "Accept partial", "Cancel run"}
+                    if action_choice in _canonical:
+                        hint_text = ""
+                    else:
+                        hint_text = action_choice.strip()
+                        action_choice = "Provide hint" if hint_text else action_choice
+                    if action_choice == "Provide hint" and hint_text:
+                        self._operator_hint = (
+                            f"## Operator hint (use to retry Objective {stuck_obj.id})\n{hint_text}"
+                        )
+                        self._iters_since_obj_credit = 0
+                        self._same_tool_fail_streak.clear()
+                        # loop continues with hint in context for next iteration
+                    elif action_choice == "Accept partial":
+                        return self._finalize_stuck(context=context, status="partial",
+                                                     reason=reason, stuck_on=stuck_obj.id,
+                                                     completed=list(completed_objectives),
+                                                     iteration=iteration,
+                                                     tool_calls_made=tool_call_count,
+                                                     scroll=scroll, shadow=shadow,
+                                                     execution_id=execution_id,
+                                                     exec_start=exec_start,
+                                                     total_objectives=total_objectives)
+                    elif action_choice == "Cancel run":
+                        return self._finalize_stuck(context=context, status="cancelled",
+                                                     reason="operator cancelled",
+                                                     stuck_on=stuck_obj.id,
+                                                     completed=list(completed_objectives),
+                                                     iteration=iteration,
+                                                     tool_calls_made=tool_call_count,
+                                                     scroll=scroll, shadow=shadow,
+                                                     execution_id=execution_id,
+                                                     exec_start=exec_start,
+                                                     total_objectives=total_objectives)
+                    else:
+                        # ambiguous answer → treat as Accept partial
+                        return self._finalize_stuck(context=context, status="partial",
+                                                     reason=reason, stuck_on=stuck_obj.id,
+                                                     completed=list(completed_objectives),
+                                                     iteration=iteration,
+                                                     tool_calls_made=tool_call_count,
+                                                     scroll=scroll, shadow=shadow,
+                                                     execution_id=execution_id,
+                                                     exec_start=exec_start,
+                                                     total_objectives=total_objectives)
 
             else:
                 logger.warning("[Runtime] Unknown action: %s — treating as THINK", action)

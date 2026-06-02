@@ -58,7 +58,9 @@
       "tool_run_cli_command",
       "tool_write_csv_file",
       "tool_write_markdown_file",
-      "tool_write_text_file"
+      "tool_write_text_file",
+      "tool_extract_records",
+      "tool_web_extract"
     ],
     "activity_count": 0,
     "memory_md_path": "",

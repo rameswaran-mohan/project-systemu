@@ -99,6 +99,12 @@ class Config:
     # action-ordering contract on notify_user — actions[0] must be the
     # safe-by-default choice for this flag to be safe to enable.
     non_interactive: bool = False                        # auto-pick actions[0] in every prompt
+    # v0.8.21: stuck-loop guard — pauses run when the agent makes no progress.
+    # Per-call env reads in shadow_runtime so changes via the Settings page
+    # take effect on the NEXT iteration without a daemon restart.
+    stuck_guard:        bool = True
+    stuck_no_progress:  int  = 5        # iters without objective credit before pause
+    stuck_tool_fails:   int  = 3        # consecutive same-tool failures before pause
     # v0.6.5-d: Stage 6 pre-flight validator on by default.  Catches intent/data-flow
     # mismatches before scrolls reach activity extraction.  Opt out via
     # SYSTEMU_SCROLL_VALIDATOR=false for legacy behavior.
@@ -212,6 +218,9 @@ class Config:
             tier3_provider=os.getenv("SYSTEMU_TIER3_PROVIDER", ""),
             # v0.6.1-b: hard rename — old SYSTEMU_AUTO_APPROVE_SCROLLS is no longer read.
             non_interactive=os.getenv("SYSTEMU_NON_INTERACTIVE", "false").lower() == "true",
+            stuck_guard       = (os.getenv("SYSTEMU_STUCK_GUARD", "on") or "on").lower() != "off",
+            stuck_no_progress = int(os.getenv("SYSTEMU_STUCK_NO_PROGRESS", "5") or "5"),
+            stuck_tool_fails  = int(os.getenv("SYSTEMU_STUCK_TOOL_FAILS", "3") or "3"),
             scroll_validator=os.getenv("SYSTEMU_SCROLL_VALIDATOR", "true").lower() == "true",
             auto_forge_tools=_load_auto_forge_tools(),
             tool_backend=_resolve_tool_backend(),
