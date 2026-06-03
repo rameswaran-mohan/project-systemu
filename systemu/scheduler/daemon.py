@@ -210,6 +210,20 @@ def get_status(vault_dir: str) -> dict:
 #  Daemon loop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _v0822_run_vault_migrator(vault, *, logger_=None) -> None:
+    """v0.8.22: idempotent vault seed upgrade. Reads installed __version__ vs
+    <vault>/.seed_version; on diff, deploys new/updated seed tools and wires
+    Wild Card. Silent on fast path; one INFO line per upgrade. Never raises."""
+    log = logger_ or logger
+    try:
+        from systemu.runtime.vault_migrator import run as _migrate_vault
+        from pathlib import Path
+        summary = _migrate_vault(Path(vault.root), logger_=log)
+        log.info("[Daemon] v0.8.22 vault migrator: %s", summary)
+    except Exception:
+        log.exception("[Daemon] v0.8.22 vault migrator crashed — continuing boot")
+
+
 def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     """Main daemon loop — runs APScheduler jobs."""
     # Daemon runs headless — no TTY, no interactive prompts.
@@ -377,6 +391,10 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
                 logger.warning("[Daemon] v0.7-c: skill migration error: %s", err)
     except Exception:
         logger.exception("[Daemon] v0.7-c: skill_migrator failed — continuing boot")
+
+    # v0.8.22 (A): silent vault upgrade migrator. Mirrors v0.7-c skill_migrator
+    # pattern — best-effort; daemon boots even on migrator failure.
+    _v0822_run_vault_migrator(vault, logger_=logger)
 
     # Build scheduler
     scheduler = BackgroundScheduler()

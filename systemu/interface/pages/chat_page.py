@@ -120,6 +120,7 @@ def build_chat_page() -> None:
             "running":          THEME.get("primary", "#6366f1"),
             "skipped_no_shadow":"#94a3b8",
             "waiting_on_tools": THEME.get("warning", "#f59e0b"),
+            "pending_decision": THEME.get("warning", "#f59e0b"),
         }.get(status, THEME.get("text_muted", "#94a3b8"))
 
         card_opacity = "opacity: 0.55; " if is_stale else ""
@@ -148,7 +149,49 @@ def build_chat_page() -> None:
                     f"border-radius: 6px; font-size: 11px; padding: 3px 8px; white-space: nowrap;"
                 )
 
+            # v0.8.22 (C): if this entry is parked on a pending operator decision,
+            # render the inline card so the operator can resolve in chat.
+            if entry.get("status") == "pending_decision" and entry.get("decision_id"):
+                _render_pending_decision_inline(vault, entry)
+
+    def _render_pending_decision_inline(vlt, entry):
+        from systemu.interface.components.pending_decision_card import build_pending_decision_card
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        try:
+            queue = OperatorDecisionQueue(vlt)
+            dec = vlt.get_decision(entry["decision_id"])
+            if dec.status != "pending":
+                return  # already resolved elsewhere; nothing to render
+            build_pending_decision_card(
+                dec.to_dict(), queue,
+                on_resolved=lambda: _render_history(),
+            )
+        except Exception as exc:
+            ui.label(f"[card unavailable: {exc}]").style(
+                f"font-size: 11px; color: {THEME['text_muted']};"
+            )
+
     _render_history()
+
+    # v0.8.22 (C): live refresh when decisions are posted/resolved for any
+    # chat-tied submission. Cheap: just re-render the history.
+    try:
+        from systemu.interface.event_bus import EventBus
+        def _on_event(ev):
+            cat = ev.get("category")
+            if cat in ("operator_decision_posted", "operator_decision_resolved"):
+                try:
+                    ui.timer(0, _render_history, once=True)
+                except Exception:
+                    pass
+        unsubscribe = EventBus.get().subscribe(_on_event, replay=False)
+        try:
+            from nicegui import app
+            app.on_disconnect(lambda: unsubscribe())
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     ui.separator().style(f"background: {THEME['border']}; margin: 8px 0;")
 

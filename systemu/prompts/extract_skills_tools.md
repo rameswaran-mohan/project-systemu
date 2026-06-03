@@ -136,6 +136,28 @@ Skills now have `target_outcomes` and `produces` (v0.6.0-d.5 fields).  When sele
 
 ---
 
+## v0.8.22 — PREFER existing tools (STRONG steering)
+
+The `existing_tools` array in your input lists every tool the vault already
+has. Before describing a new tool, check this list carefully.
+
+- **PREFER existing tools whenever they fit the objective.** Even an imperfect
+  reuse beats forging a new tool.
+- **Only describe a NEW tool** (with `"is_new": true`) when no existing tool
+  can satisfy the objective.
+- When you DO propose a new tool, **set `"forge_rationale"` explaining WHY
+  the existing tools are insufficient.** This is logged for diagnosis. A
+  missing or empty `forge_rationale` on an `is_new: true` tool is treated as
+  a warning sign — the system will favor existing tools regardless.
+
+### Examples of correct reuse
+- "find restaurants near me" → use `web_extract` (URL → records) and/or
+  `fetch_json` (Overpass API for free geo data). Do NOT invent `search_places`.
+- "summarize this URL" → use `web_extract` or `web_read` + `extract_records`.
+  Do NOT invent `summarize_url`.
+
+---
+
 ## Deduplication Rules
 
 Check `existing_skills` and `existing_tools` for semantic matches (not just exact name).

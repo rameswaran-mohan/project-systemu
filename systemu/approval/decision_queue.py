@@ -158,6 +158,21 @@ class OperatorDecisionQueue:
             "[DecisionQueue] posted '%s' (id=%s, dedup_key=%r, options=%s)",
             title, decision.id, dedup_key, options,
         )
+        # v0.8.22 (C): emit EventBus event so chat UI can render an inline card.
+        try:
+            from systemu.interface.event_bus import EventBus
+            EventBus.get().publish({
+                "category": "operator_decision_posted",
+                "context": {
+                    "decision_id": decision.id,
+                    "dedup_key": decision.dedup_key,
+                    "title": decision.title,
+                    "options": list(decision.options),
+                    "chat_submission_id": (decision.context or {}).get("chat_submission_id"),
+                },
+            })
+        except Exception:
+            pass  # EventBus is optional — never block a vault-saved decision
         return decision.id
 
     def list_pending(self) -> List[OperatorDecision]:
@@ -254,6 +269,19 @@ class OperatorDecisionQueue:
             "[DecisionQueue] resolved %s -> %r (dedup_key=%r)",
             decision_id, choice, decision.dedup_key,
         )
+        # v0.8.22 (C): emit EventBus event so the chat UI hides the inline card.
+        try:
+            from systemu.interface.event_bus import EventBus
+            EventBus.get().publish({
+                "category": "operator_decision_resolved",
+                "context": {
+                    "decision_id": decision.id,
+                    "choice": choice,
+                    "chat_submission_id": (decision.context or {}).get("chat_submission_id"),
+                },
+            })
+        except Exception:
+            pass
         return decision
 
     # ── Private helpers ──────────────────────────────────────────────
