@@ -27,6 +27,17 @@ console = Console()
 _vault: Any = None  # type: ignore[type-arg]
 _event_log_path: Any = None  # Path to event_log.jsonl, set when vault is injected
 
+
+def _v0822_merge_chat_id(context):
+    """v0.8.22 (C): merge chat_submission_id from contextvar into OperatorDecision
+    context. Returns a NEW dict so caller-passed dicts aren't mutated."""
+    from systemu.runtime.chat_submission_ctx import current_chat_submission_id
+    out = dict(context or {})
+    cid = current_chat_submission_id()
+    if cid:
+        out["chat_submission_id"] = cid
+    return out
+
 # v0.8.0 Pattern 1: lazy-initialised OperatorDecisionQueue cache.  None until
 # the vault is set AND a queue is first requested.  Reset to None by tests via
 # monkeypatch so cache invalidation isn't a concern in production.
@@ -330,7 +341,7 @@ def notify_user(
                 title=title,
                 body=message,
                 options=actions,
-                context=context or {},
+                context=_v0822_merge_chat_id(context),
                 dedup_key=dedup_key or "",
             )
             from systemu.approval.exceptions import PendingOperatorDecision
@@ -482,8 +493,12 @@ def request_credential(req, *, resolver=None) -> Optional[str]:
         title=f"{req.label} needed",
         body=body,
         options=actions,
-        context={"kind": "credential", "credential_key": req.key,
-                 "signup_url": getattr(req, "signup_url", "") or "", "label": req.label},
+        context=_v0822_merge_chat_id({
+            "kind": "credential",
+            "credential_key": req.key,
+            "signup_url": getattr(req, "signup_url", "") or "",
+            "label": req.label,
+        }),
         dedup_key=dedup_key,
     )
     from systemu.approval.exceptions import PendingCredentialRequest
@@ -518,7 +533,10 @@ def request_choice(questions, *, dedup_key) -> Optional[dict]:
         title=(q0.get("prompt") or "Input needed")[:80],
         body="Answer to continue.",
         options=labels,
-        context={"kind": "structured_question", "questions": questions},
+        context=_v0822_merge_chat_id({
+            "kind": "structured_question",
+            "questions": questions,
+        }),
         dedup_key=dedup_key,
     )
     from systemu.approval.exceptions import PendingChoiceRequest

@@ -21,10 +21,24 @@ from typing import Any, Dict, Optional
 from systemu.core.utils import utcnow
 
 from sharing_on.config import Config
+from systemu.approval.exceptions import PendingOperatorDecision
 from systemu.core.llm_router import _run_coroutine
 from systemu.vault.vault import Vault
 
 logger = logging.getLogger(__name__)
+
+
+def _handle_pending_decision_in_chat(vault, ts, *, decision_id, dedup_key, options) -> None:
+    """v0.8.22 (C): when a chat-submitted run pauses on PendingOperatorDecision,
+    update the chat history entry to status='pending_decision' so the chat UI
+    can render an inline card instead of a cryptic 'failed' message."""
+    vault.update_chat_history_entry(ts, {
+        "status": "pending_decision",
+        "decision_id": decision_id,
+        "dedup_key": dedup_key,
+        "options": list(options or []),
+        # No secret values; redacted snapshot only
+    })
 
 
 def _wire_chat_history_completion(
@@ -305,7 +319,23 @@ def run_direct_task(
     from systemu.runtime.shadow_runtime import ShadowRuntime
     runtime = ShadowRuntime(config, vault)
     try:
-        result = _run_coroutine(runtime.execute(shadow, activity, origin="chat"))
+        result = _run_coroutine(runtime.execute(shadow, activity,
+                                                 origin="chat",
+                                                 chat_submission_id=ts))
+    except PendingOperatorDecision as pd:
+        # v0.8.22 (C): the run parked itself waiting on an operator decision.
+        # Surface the parked state on the chat history entry so the chat UI can
+        # render an inline card (matched against the live OperatorDecisionQueue
+        # by decision_id) — NOT as a generic "failed".
+        _handle_pending_decision_in_chat(
+            vault, ts,
+            decision_id=pd.decision_id,
+            dedup_key=pd.dedup_key,
+            options=pd.options,
+        )
+        logger.info("[DirectTask] chat task %r parked on decision %s — surfaced inline",
+                    ts, pd.decision_id)
+        return activity
     except Exception as exc:
         logger.error("[DirectTask] Execution failed: %s", exc)
         vault.update_chat_history_entry(ts, {

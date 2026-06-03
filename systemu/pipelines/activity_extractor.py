@@ -29,6 +29,22 @@ from systemu.vault.vault import Vault
 logger = logging.getLogger(__name__)
 
 
+def _log_forge_rationale(spec: dict) -> None:
+    """v0.8.22 (B): log forge_rationale when the LLM proposes a new tool.
+    Provides the diagnostic data needed before deciding G3 (approval gate)."""
+    if not isinstance(spec, dict):
+        return
+    if not spec.get("is_new"):
+        return
+    rationale = (spec.get("forge_rationale") or "").strip()
+    name = spec.get("name", "?")
+    if rationale:
+        logger.info("[ActivityExtractor] forge rationale for %r: %s", name, rationale[:240])
+    else:
+        logger.warning("[ActivityExtractor] new tool %r proposed WITHOUT forge_rationale "
+                       "(prompt instructs to explain why)", name)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_and_process(
@@ -130,6 +146,7 @@ def extract_and_process(
     missing_tool_ids: List[str] = []
 
     for spec in result.get("tools", []):
+        _log_forge_rationale(spec)  # v0.8.22 (B): diagnostic
         tid, is_new = _upsert_tool(spec, vlt)
         tool_ids.append(tid)
         if is_new:
@@ -327,17 +344,29 @@ def _summarise_schema(schema: dict) -> dict:
 
 
 def _enrich_tool_for_catalog(t: dict, vlt: Vault) -> dict:
-    """v0.6.1-d: reads schema summaries directly from the index header —
-    no per-tool ``vault.get_tool()`` fetch.  Legacy headers without the
-    new fields fall back to empty {} (vault rewrites the header on next
-    save_tool).
-    """
+    """v0.6.1-d: prefer index header's schema summaries (cheap, no I/O).
+    v0.8.22: when summary fields are empty, fall back to the per-tool body
+    JSON so the LLM sees real schemas for tools whose index header pre-dates
+    the summary fields (very common in user vaults)."""
+    params = t.get("parameters_schema_summary") or {}
+    returns = t.get("return_schema_summary") or {}
+    if not params or not returns:
+        tid = t.get("id")
+        try:
+            from pathlib import Path
+            body_path = Path(vlt.root) / "tools" / f"tool_{tid}.json"
+            if body_path.exists():
+                body = json.loads(body_path.read_text(encoding="utf-8"))
+                params = params or body.get("parameters_schema") or {}
+                returns = returns or body.get("return_schema") or {}
+        except Exception:
+            pass
     return {
-        "id":           t.get("id", ""),
-        "name":         t.get("name", ""),
-        "description":  (t.get("description") or "")[:200],
-        "parameters_schema": t.get("parameters_schema_summary") or {},
-        "return_schema":     t.get("return_schema_summary") or {},
+        "id":                t.get("id", ""),
+        "name":              t.get("name", ""),
+        "description":       (t.get("description") or "")[:200],
+        "parameters_schema": params,
+        "return_schema":     returns,
     }
 
 

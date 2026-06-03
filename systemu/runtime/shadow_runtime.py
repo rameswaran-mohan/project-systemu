@@ -1222,6 +1222,7 @@ class ShadowRuntime:
         cancel_event: Optional[threading.Event] = None,
         resume_from_execution_id: Optional[str] = None,
         origin: Optional[str] = None,
+        chat_submission_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run a Shadow through its assigned Activity.
 
@@ -1251,844 +1252,857 @@ class ShadowRuntime:
         self._same_tool_fail_streak.clear()
         self._stuck_round_for_obj.clear()
         self._operator_hint = None
-        execution_id = _gen_execution_id()
-        exec_start   = __import__("time").time()
-        tool_call_count = 0
-        logger.info(
-            "[Runtime] Starting execution %s — shadow='%s' activity='%s'",
-            execution_id, shadow.name, activity.name,
-        )
+        # v0.8.22 (C): carry chat_submission_id for the run so the R3 producers
+        # can thread it into OperatorDecision.context, enabling the chat UI to
+        # surface decisions inline.
+        from systemu.runtime.chat_submission_ctx import set_chat_submission_id
+        self._chat_submission_id = chat_submission_id
+        self._chat_submission_token = set_chat_submission_id(chat_submission_id)
+        try:
+            execution_id = _gen_execution_id()
+            exec_start   = __import__("time").time()
+            tool_call_count = 0
+            logger.info(
+                "[Runtime] Starting execution %s — shadow='%s' activity='%s'",
+                execution_id, shadow.name, activity.name,
+            )
 
-        # ── Load entities from vault ──────────────────────────────────────────
-        scroll = self.vault.get_scroll(activity.scroll_id)
-        tools  = self._load_tools(activity.required_tool_ids, dry_run=dry_run)
-        skills = self._load_skills(activity.required_skill_ids)
+            # ── Load entities from vault ──────────────────────────────────────────
+            scroll = self.vault.get_scroll(activity.scroll_id)
+            tools  = self._load_tools(activity.required_tool_ids, dry_run=dry_run)
+            skills = self._load_skills(activity.required_skill_ids)
 
-        # ── Determine execution mode: objectives (new) or action_blocks (legacy) ─
-        use_objectives = bool(scroll.objectives)
-        objectives     = scroll.objectives if use_objectives else []
-        scroll_json    = [obj.model_dump(mode="json") for obj in objectives] if use_objectives \
-                         else [ab.model_dump(mode="json") for ab in scroll.action_blocks]
+            # ── Determine execution mode: objectives (new) or action_blocks (legacy) ─
+            use_objectives = bool(scroll.objectives)
+            objectives     = scroll.objectives if use_objectives else []
+            scroll_json    = [obj.model_dump(mode="json") for obj in objectives] if use_objectives \
+                             else [ab.model_dump(mode="json") for ab in scroll.action_blocks]
 
-        if use_objectives and not objectives:
-            return {"status": "failure", "error": "Scroll has no objectives", "execution_id": execution_id}
-        if not use_objectives and not scroll.action_blocks:
-            return {"status": "failure", "error": "Scroll has no ActionBlocks", "execution_id": execution_id}
+            if use_objectives and not objectives:
+                return {"status": "failure", "error": "Scroll has no objectives", "execution_id": execution_id}
+            if not use_objectives and not scroll.action_blocks:
+                return {"status": "failure", "error": "Scroll has no ActionBlocks", "execution_id": execution_id}
 
-        if not tools and not dry_run:
-            return {"status": "failure", "error": "No deployed tools available for this Shadow", "execution_id": execution_id}
+            if not tools and not dry_run:
+                return {"status": "failure", "error": "No deployed tools available for this Shadow", "execution_id": execution_id}
 
-        if not tools and dry_run:
-            logger.warning("[Runtime] Dry-run with 0 tools — executing as THINK-only planning mode")
+            if not tools and dry_run:
+                logger.warning("[Runtime] Dry-run with 0 tools — executing as THINK-only planning mode")
 
-        # ── Build skeleton indexes (Progressive Disclosure) ─
-        # Include parameter_names so the LLM knows which kwargs each tool
-        # expects WITHOUT needing a LOAD_RESOURCE round-trip.  Without this
-        # the LLM has to guess, leading to tool_call(args={}) and the tool's
-        # required-arg guard rejecting every call.
-        tool_index = [
-            {
-                "id": t.id,
-                "name": t.name,
-                "description": t.description,
-                "parameter_names": list(getattr(t, "parameter_names", []) or []),
-            }
-            for t in tools
-        ]
-        skill_index = [
-            {"id": s.id, "name": s.name, "category": s.category, "description": s.description}
-            for s in skills
-        ]
-
-        # ── Boot-time memory injection ────────────────────────────────────────
-        # Global memory: always full (personalisation applies to every task).
-        # Shadow memory: header-only at boot; shadow calls LOAD_RESOURCE on demand.
-        recalled_memory = _build_boot_memory(shadow, self.vault)
-
-        # ── Initialise context ────────────────────────────────────────────────
-        context = ExecutionContext(
-            execution_id=execution_id,
-            system_prompt=shadow.system_prompt,
-            scroll_json=scroll_json,
-            tool_index=tool_index,
-            skill_index=skill_index,
-            recalled_memory=recalled_memory,
-            use_objectives=use_objectives,
-            scroll_intent=scroll.intent,
-        )
-
-        step_prompt = load_prompt("execute_step.md")
-
-        # Objective tracking (intent-driven mode)
-        completed_objectives: set[int] = set()
-        total_objectives = len(objectives)
-
-        # v0.8.19 (R2): publish the initial objective_state so the live pane
-        # can render the full checklist at boot.  Best-effort — EventBus is
-        # optional and a publish failure must never break execution.
-        if use_objectives:
-            try:
-                from systemu.interface.event_bus import EventBus
-                EventBus.get().publish(_objective_state_event(
-                    objectives, completed_objectives, execution_id, stamp=self._stamp))
-            except Exception:
-                pass  # EventBus is optional — never break execution
-
-        # Legacy ActionBlock tracking
-        current_ab   = 1
-
-        # ── v0.5.1-e: resume from prior-execution snapshot ─────────────────
-        # When the supervisor's RECALIBRATE_TOOL → operator-approval flow
-        # triggers re-queue with resume_from_execution_id, load the snapshot
-        # and pre-populate sticky notes + completed_objectives so the new
-        # run picks up where the prior one left off.  Snapshot is consumed
-        # (deleted) after read so a subsequent restart starts clean.
-        if resume_from_execution_id:
-            try:
-                from systemu.runtime.execution_snapshot import (
-                    apply_to_context, delete_snapshot, read_snapshot,
-                )
-                snap = read_snapshot(resume_from_execution_id)
-                if snap is not None:
-                    apply_to_context(snap, context=context)
-                    if use_objectives and snap.completed_objective_ids:
-                        # Restore completed objective ids — the runtime won't
-                        # ask the LLM to redo them.
-                        completed_objectives.update(snap.completed_objective_ids)
-                    if not use_objectives and snap.current_action_block:
-                        current_ab = max(current_ab, int(snap.current_action_block))
-                    logger.info(
-                        "[Runtime] resumed from snapshot of %s — restored %d completed objective(s), %d sticky note(s)",
-                        resume_from_execution_id,
-                        len(snap.completed_objective_ids),
-                        len(snap.sticky_notes),
-                    )
-                    delete_snapshot(resume_from_execution_id)
-                else:
-                    logger.info(
-                        "[Runtime] resume requested for %s but no snapshot found — starting fresh",
-                        resume_from_execution_id,
-                    )
-            except Exception:
-                logger.exception("[Runtime] resume hook crashed — starting fresh")
-        last_snap_ab = 0
-        iteration    = 0
-        consecutive_thinks = 0  # throttle THINK storms
-        # v0.8.16: llm_ref for the most-recent tier-2 decision LLM call —
-        # {exec_id, call_index} into the per-execution transcript file.  Set
-        # right after each LLM call (Task 8); consumed by _iteration_event so
-        # the panes can lazily load the raw completion on expand.
-        _last_llm_ref: Optional[Dict[str, Any]] = None
-
-        # v0.4.0-d: Intelligent Supervisor (opt-in via config).  When enabled,
-        # an ExecutionMind subscribes to events for this run, observes failures,
-        # and emits directives into a small inbox the loop drains each tick.
-        # When disabled the inbox stays empty and shadow runtime behaves
-        # exactly as in v0.3.x.
-        # v0.4.1-a: per-shadow opt-in.  The supervisor activates when EITHER
-        # the global config flag OR the shadow's own ``supervisor_enabled`` is
-        # True.  Lets the operator A/B test on one specialist before flipping
-        # the global switch.
-        execution_mind = None
-        directive_inbox = None
-        _supervisor_globally_on = bool(getattr(self.config, "intelligent_supervisor_enabled", False))
-        _supervisor_per_shadow_on = bool(getattr(shadow, "supervisor_enabled", False))
-        if _supervisor_globally_on or _supervisor_per_shadow_on:
-            try:
-                from systemu.runtime.execution_mind import ExecutionMind, DirectiveInbox
-                directive_inbox = DirectiveInbox()
-                execution_mind = ExecutionMind(
-                    execution_id=execution_id,
-                    shadow_id=getattr(shadow, "id", None),
-                    config=self.config,
-                    directive_sink=directive_inbox.append,
-                    # When only the per-shadow flag is on (global still off),
-                    # force the Mind to enable itself rather than reading from
-                    # the global config it doesn't know about.
-                    force_enabled=_supervisor_per_shadow_on,
-                    origin=self._origin,   # v0.8.16: strategy-stream ticks partition on origin
-                )
-                # Stash on self so _handle_tool_call (a method) can reach it
-                # without threading another parameter through the call chain.
-                self._execution_mind = execution_mind
-            except Exception:
-                logger.exception("[Runtime] ExecutionMind construction failed — disabling supervisor")
-                execution_mind = None
-                directive_inbox = None
-                self._execution_mind = None
-        else:
-            self._execution_mind = None
-
-        import asyncio
-
-        # ─── THE AGENTIC LOOP ─────────────────────────────────────────────────
-        while iteration < MAX_ITERATIONS:
-            iteration += 1
-
-            # ── v0.4.0-d: drain supervisor directive inbox and apply ─────────
-            # ExecutionMind populates this asynchronously; we apply pending
-            # directives at the top of each iteration so they shape the
-            # next LLM decision.  Empty when supervisor is disabled.
-            if directive_inbox is not None and len(directive_inbox) > 0:
-                # v0.5.1-e: stash loop state on the context so RECALIBRATE_TOOL
-                # snapshot capture can read it without threading every state
-                # variable through every helper.
-                context._resume_iteration = iteration
-                context._resume_current_ab = current_ab
-                context._resume_completed_objectives = (
-                    set(completed_objectives) if use_objectives else set()
-                )
-                _apply_supervisor_directives(
-                    directive_inbox.drain(),
-                    context=context,
-                    config=self.config,
-                    shadow=shadow,
-                    scroll=scroll,
-                    execution_id=execution_id,
-                    vault=self.vault,
-                    consec_tool_fails=self._consec_tool_fails,
-                    origin=self._origin,   # v0.8.16: stamp origin on supervisor cards
-                )
-
-            # ── Cancellation gate — Supervisor watchdog may request clean exit ──
-            if cancel_event is not None and cancel_event.is_set():
-                logger.info(
-                    "[Runtime] Cancellation requested by Supervisor watchdog at iter=%d "
-                    "— exiting cleanly (execution_id=%s)",
-                    iteration, execution_id,
-                )
-                _record_terminal_telemetry(
-                    shadow=shadow, execution_id=execution_id, scroll=scroll,
-                    status="cancelled", iteration=iteration,
-                )
-                return {
-                    "status":        "cancelled",
-                    "final_summary": f"Shadow cancelled by watchdog at iteration {iteration}.",
-                    "error":         "WatchdogCancelled",
-                    "execution_id":  execution_id,
+            # ── Build skeleton indexes (Progressive Disclosure) ─
+            # Include parameter_names so the LLM knows which kwargs each tool
+            # expects WITHOUT needing a LOAD_RESOURCE round-trip.  Without this
+            # the LLM has to guess, leading to tool_call(args={}) and the tool's
+            # required-arg guard rejecting every call.
+            tool_index = [
+                {
+                    "id": t.id,
+                    "name": t.name,
+                    "description": t.description,
+                    "parameter_names": list(getattr(t, "parameter_names", []) or []),
                 }
+                for t in tools
+            ]
+            skill_index = [
+                {"id": s.id, "name": s.name, "category": s.category, "description": s.description}
+                for s in skills
+            ]
 
+            # ── Boot-time memory injection ────────────────────────────────────────
+            # Global memory: always full (personalisation applies to every task).
+            # Shadow memory: header-only at boot; shadow calls LOAD_RESOURCE on demand.
+            recalled_memory = _build_boot_memory(shadow, self.vault)
+
+            # ── Initialise context ────────────────────────────────────────────────
+            context = ExecutionContext(
+                execution_id=execution_id,
+                system_prompt=shadow.system_prompt,
+                scroll_json=scroll_json,
+                tool_index=tool_index,
+                skill_index=skill_index,
+                recalled_memory=recalled_memory,
+                use_objectives=use_objectives,
+                scroll_intent=scroll.intent,
+            )
+
+            step_prompt = load_prompt("execute_step.md")
+
+            # Objective tracking (intent-driven mode)
+            completed_objectives: set[int] = set()
+            total_objectives = len(objectives)
+
+            # v0.8.19 (R2): publish the initial objective_state so the live pane
+            # can render the full checklist at boot.  Best-effort — EventBus is
+            # optional and a publish failure must never break execution.
             if use_objectives:
-                # Only show objectives whose dependencies are fully satisfied.
-                # Objectives with unmet depends_on are withheld — they become
-                # visible once their prerequisite IDs appear in completed_objectives.
-                pending_objs = [
-                    obj.model_dump(mode="json") for obj in objectives
-                    if obj.id not in completed_objectives
-                    and all(dep in completed_objectives for dep in obj.depends_on)
-                ]
-                logger.debug("[Runtime] Iteration %d/%d — %d/%d objectives done",
-                             iteration, MAX_ITERATIONS, len(completed_objectives), total_objectives)
-            else:
-                pending_objs = None
-                logger.debug("[Runtime] Iteration %d/%d — ActionBlock %d",
-                             iteration, MAX_ITERATIONS, current_ab)
-
-            # Build and send the decision prompt
-            messages = context.build_messages(
-                current_ab if not use_objectives else 0,
-                completed_objectives=completed_objectives if use_objectives else None,
-            )
-            # v0.4.0-a: THINK throttle ceiling is now config-driven.
-            think_ceiling = getattr(self.config, "max_consecutive_think", 5) or 5
-            # v0.8.16: build the decision-prompt system/user once so the LLM
-            # transcript writer can record a request summary (the raw
-            # completion is recorded after the call returns).
-            _llm_system = (
-                step_prompt
-                if consecutive_thinks < think_ceiling else
-                step_prompt + (
-                    "\n\n# ENFORCEMENT OVERRIDE\n"
-                    f"You have produced {consecutive_thinks} consecutive THINK responses "
-                    "with NO tool call. Your NEXT response MUST have "
-                    "action==TOOL_CALL, COMPLETE, or FAIL. No more THINK "
-                    "will be accepted. Act now."
-                )
-            )
-            _user_payload = {
-                "shadow_name":        shadow.name,
-                # output_dir: where Shadow-generated files must be written.
-                # Bind-mounted to the host's ./outputs/ directory so files
-                # are accessible outside the container.
-                "output_dir":         self.config.output_dir,
-                # Temporal context — avoids LLM THINK storms over "what is today's date?"
-                "current_date":        _datetime_module.date.today().isoformat(),
-                "current_datetime_utc": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                **(
-                    {
-                        "intent":              scroll.intent,
-                        "objectives":          scroll_json,
-                        "completed_objectives": list(completed_objectives),
-                        "pending_objectives":  pending_objs,
-                    }
-                    if use_objectives else
-                    {
-                        "current_action_block": current_ab,
-                        "pending_action_blocks": [
-                            ab for ab in scroll_json
-                            if ab.get("step_number", 0) >= current_ab
-                        ],
-                    }
-                ),
-                "available_tools": tool_index,
-                "history":         _build_history_slice(context),
-                "last_snapshot":   context._snapshots[-1].summary if context._snapshots else None,
-            }
-            # v0.8.21: one-shot operator hint fold-back (cleared after this iteration).
-            if self._operator_hint:
-                _user_payload["operator_hint"] = self._operator_hint
-                self._operator_hint = None
-            _llm_user = json.dumps(_user_payload)
-            loop = asyncio.get_event_loop()
-            try:
-                decision = await loop.run_in_executor(
-                    None,
-                    lambda: llm_call_json(
-                        tier=2,
-                        system=_llm_system,
-                        user=_llm_user,
-                        config=self.config,
-                        temperature=0.1,
-                        max_tokens=4096,
-                    )
-                )
-                # v0.8.16: record the raw decision completion to the per-
-                # execution transcript and remember its index so the
-                # per-iteration event (Task 7) can reference it via llm_ref
-                # for lazy UI expand.  Best-effort — append_call never raises.
-                try:
-                    from systemu.runtime.llm_transcript import append_call
-                    _call_index = append_call(
-                        self.vault.root, execution_id,
-                        {
-                            "iteration": iteration,
-                            "tier":      2,
-                            "system":    _llm_system,
-                            "user":      _llm_user,
-                            "response":  json.dumps(decision),
-                        },
-                    )
-                    _last_llm_ref = (
-                        {"exec_id": execution_id, "call_index": _call_index}
-                        if _call_index >= 0 else None
-                    )
-                except Exception:
-                    _last_llm_ref = None
-            except Exception as exc:
-                logger.error("[Runtime] LLM error on iteration %d: %s", iteration, exc)
-                log_event("ERROR", "shadow", f"LLM error in execution {execution_id} iteration {iteration}: {exc}", {"shadow_id": shadow.id, "origin": getattr(self, "_origin", "manual")})
-                context.add_thought(f"LLM call failed: {exc}", current_ab)
-                continue
-
-            action = decision.get("action", "THINK")
-            # v0.8.21: stuck-guard — every iteration without a TOOL_CALL still counts toward stuck.
-            if action != "TOOL_CALL":
-                self._update_stuck_counters(action=action, tool_name=None,
-                                              tool_success=None, credited_obj_id=None)
-            if action == "THINK":  # LOAD_RESOURCE is productive — only throttle idle THINK
-                consecutive_thinks += 1
-            else:
-                consecutive_thinks = 0
-            logger.info("[Runtime] iter=%d action=%s", iteration, action)
-
-            # ── Supervisor heartbeat — signals watchdog this shadow is alive ──
-            try:
-                from systemu.runtime.supervisor import Supervisor
-                Supervisor.get().update_heartbeat(activity.id)
-            except Exception:
-                pass  # Supervisor not running in CLI/test mode — safe to ignore
-
-            # ── Publish per-iteration event to Systemu Chat ───────────────────
-            try:
-                from systemu.interface.event_bus import EventBus
-                EventBus.get().publish(self._stamp({
-                    "ts":       utcnow().isoformat() + "Z",
-                    "level":    "INFO",
-                    "category": "shadow",
-                    "message":  f"[{shadow.name}] iter={iteration} action={action}",
-                    "context":  {
-                        "shadow_id":    shadow.id,
-                        "execution_id": execution_id,
-                        "iteration":    iteration,
-                        "action":       action,
-                        "objectives_done": len(completed_objectives) if use_objectives else current_ab - 1,
-                        "objectives_total": total_objectives if use_objectives else len(scroll_json),
-                    },
-                }))
-            except Exception:
-                pass  # EventBus is optional — never break execution
-
-            # ── v0.8.16: per-iteration detail event (reasoning + tool I/O) ─────
-            # Carries a bounded `details` dict the live panes render on expand.
-            # For TOOL_CALL the publish is deferred to AFTER the tool runs (so
-            # tool_result is captured); every other action publishes here.
-            if action != "TOOL_CALL":
                 try:
                     from systemu.interface.event_bus import EventBus
-                    EventBus.get().publish(self._iteration_event(
-                        iteration=iteration,
-                        decision=decision,
-                        execution_id=execution_id,
-                        llm_ref=_last_llm_ref,
-                    ))
+                    EventBus.get().publish(_objective_state_event(
+                        objectives, completed_objectives, execution_id, stamp=self._stamp))
                 except Exception:
                     pass  # EventBus is optional — never break execution
 
-            # ── COMPLETE ───────────────────────────────────────────────────────
-            if action == "COMPLETE":
-                # Reject premature COMPLETE when objectives are still pending.
-                # This prevents false-success when the LLM declares done too early.
-                if use_objectives and len(completed_objectives) < total_objectives:
-                    missing = [obj.id for obj in objectives if obj.id not in completed_objectives]
-                    logger.warning(
-                        "[Runtime] COMPLETE rejected — %d/%d objectives still pending: %s",
-                        len(missing), total_objectives, missing,
+            # Legacy ActionBlock tracking
+            current_ab   = 1
+
+            # ── v0.5.1-e: resume from prior-execution snapshot ─────────────────
+            # When the supervisor's RECALIBRATE_TOOL → operator-approval flow
+            # triggers re-queue with resume_from_execution_id, load the snapshot
+            # and pre-populate sticky notes + completed_objectives so the new
+            # run picks up where the prior one left off.  Snapshot is consumed
+            # (deleted) after read so a subsequent restart starts clean.
+            if resume_from_execution_id:
+                try:
+                    from systemu.runtime.execution_snapshot import (
+                        apply_to_context, delete_snapshot, read_snapshot,
                     )
-                    context.add_observation(
+                    snap = read_snapshot(resume_from_execution_id)
+                    if snap is not None:
+                        apply_to_context(snap, context=context)
+                        if use_objectives and snap.completed_objective_ids:
+                            # Restore completed objective ids — the runtime won't
+                            # ask the LLM to redo them.
+                            completed_objectives.update(snap.completed_objective_ids)
+                        if not use_objectives and snap.current_action_block:
+                            current_ab = max(current_ab, int(snap.current_action_block))
+                        logger.info(
+                            "[Runtime] resumed from snapshot of %s — restored %d completed objective(s), %d sticky note(s)",
+                            resume_from_execution_id,
+                            len(snap.completed_objective_ids),
+                            len(snap.sticky_notes),
+                        )
+                        delete_snapshot(resume_from_execution_id)
+                    else:
+                        logger.info(
+                            "[Runtime] resume requested for %s but no snapshot found — starting fresh",
+                            resume_from_execution_id,
+                        )
+                except Exception:
+                    logger.exception("[Runtime] resume hook crashed — starting fresh")
+            last_snap_ab = 0
+            iteration    = 0
+            consecutive_thinks = 0  # throttle THINK storms
+            # v0.8.16: llm_ref for the most-recent tier-2 decision LLM call —
+            # {exec_id, call_index} into the per-execution transcript file.  Set
+            # right after each LLM call (Task 8); consumed by _iteration_event so
+            # the panes can lazily load the raw completion on expand.
+            _last_llm_ref: Optional[Dict[str, Any]] = None
+
+            # v0.4.0-d: Intelligent Supervisor (opt-in via config).  When enabled,
+            # an ExecutionMind subscribes to events for this run, observes failures,
+            # and emits directives into a small inbox the loop drains each tick.
+            # When disabled the inbox stays empty and shadow runtime behaves
+            # exactly as in v0.3.x.
+            # v0.4.1-a: per-shadow opt-in.  The supervisor activates when EITHER
+            # the global config flag OR the shadow's own ``supervisor_enabled`` is
+            # True.  Lets the operator A/B test on one specialist before flipping
+            # the global switch.
+            execution_mind = None
+            directive_inbox = None
+            _supervisor_globally_on = bool(getattr(self.config, "intelligent_supervisor_enabled", False))
+            _supervisor_per_shadow_on = bool(getattr(shadow, "supervisor_enabled", False))
+            if _supervisor_globally_on or _supervisor_per_shadow_on:
+                try:
+                    from systemu.runtime.execution_mind import ExecutionMind, DirectiveInbox
+                    directive_inbox = DirectiveInbox()
+                    execution_mind = ExecutionMind(
+                        execution_id=execution_id,
+                        shadow_id=getattr(shadow, "id", None),
+                        config=self.config,
+                        directive_sink=directive_inbox.append,
+                        # When only the per-shadow flag is on (global still off),
+                        # force the Mind to enable itself rather than reading from
+                        # the global config it doesn't know about.
+                        force_enabled=_supervisor_per_shadow_on,
+                        origin=self._origin,   # v0.8.16: strategy-stream ticks partition on origin
+                    )
+                    # Stash on self so _handle_tool_call (a method) can reach it
+                    # without threading another parameter through the call chain.
+                    self._execution_mind = execution_mind
+                except Exception:
+                    logger.exception("[Runtime] ExecutionMind construction failed — disabling supervisor")
+                    execution_mind = None
+                    directive_inbox = None
+                    self._execution_mind = None
+            else:
+                self._execution_mind = None
+
+            import asyncio
+
+            # ─── THE AGENTIC LOOP ─────────────────────────────────────────────────
+            while iteration < MAX_ITERATIONS:
+                iteration += 1
+
+                # ── v0.4.0-d: drain supervisor directive inbox and apply ─────────
+                # ExecutionMind populates this asynchronously; we apply pending
+                # directives at the top of each iteration so they shape the
+                # next LLM decision.  Empty when supervisor is disabled.
+                if directive_inbox is not None and len(directive_inbox) > 0:
+                    # v0.5.1-e: stash loop state on the context so RECALIBRATE_TOOL
+                    # snapshot capture can read it without threading every state
+                    # variable through every helper.
+                    context._resume_iteration = iteration
+                    context._resume_current_ab = current_ab
+                    context._resume_completed_objectives = (
+                        set(completed_objectives) if use_objectives else set()
+                    )
+                    _apply_supervisor_directives(
+                        directive_inbox.drain(),
+                        context=context,
+                        config=self.config,
+                        shadow=shadow,
+                        scroll=scroll,
+                        execution_id=execution_id,
+                        vault=self.vault,
+                        consec_tool_fails=self._consec_tool_fails,
+                        origin=self._origin,   # v0.8.16: stamp origin on supervisor cards
+                    )
+
+                # ── Cancellation gate — Supervisor watchdog may request clean exit ──
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info(
+                        "[Runtime] Cancellation requested by Supervisor watchdog at iter=%d "
+                        "— exiting cleanly (execution_id=%s)",
+                        iteration, execution_id,
+                    )
+                    _record_terminal_telemetry(
+                        shadow=shadow, execution_id=execution_id, scroll=scroll,
+                        status="cancelled", iteration=iteration,
+                    )
+                    return {
+                        "status":        "cancelled",
+                        "final_summary": f"Shadow cancelled by watchdog at iteration {iteration}.",
+                        "error":         "WatchdogCancelled",
+                        "execution_id":  execution_id,
+                    }
+
+                if use_objectives:
+                    # Only show objectives whose dependencies are fully satisfied.
+                    # Objectives with unmet depends_on are withheld — they become
+                    # visible once their prerequisite IDs appear in completed_objectives.
+                    pending_objs = [
+                        obj.model_dump(mode="json") for obj in objectives
+                        if obj.id not in completed_objectives
+                        and all(dep in completed_objectives for dep in obj.depends_on)
+                    ]
+                    logger.debug("[Runtime] Iteration %d/%d — %d/%d objectives done",
+                                 iteration, MAX_ITERATIONS, len(completed_objectives), total_objectives)
+                else:
+                    pending_objs = None
+                    logger.debug("[Runtime] Iteration %d/%d — ActionBlock %d",
+                                 iteration, MAX_ITERATIONS, current_ab)
+
+                # Build and send the decision prompt
+                messages = context.build_messages(
+                    current_ab if not use_objectives else 0,
+                    completed_objectives=completed_objectives if use_objectives else None,
+                )
+                # v0.4.0-a: THINK throttle ceiling is now config-driven.
+                think_ceiling = getattr(self.config, "max_consecutive_think", 5) or 5
+                # v0.8.16: build the decision-prompt system/user once so the LLM
+                # transcript writer can record a request summary (the raw
+                # completion is recorded after the call returns).
+                _llm_system = (
+                    step_prompt
+                    if consecutive_thinks < think_ceiling else
+                    step_prompt + (
+                        "\n\n# ENFORCEMENT OVERRIDE\n"
+                        f"You have produced {consecutive_thinks} consecutive THINK responses "
+                        "with NO tool call. Your NEXT response MUST have "
+                        "action==TOOL_CALL, COMPLETE, or FAIL. No more THINK "
+                        "will be accepted. Act now."
+                    )
+                )
+                _user_payload = {
+                    "shadow_name":        shadow.name,
+                    # output_dir: where Shadow-generated files must be written.
+                    # Bind-mounted to the host's ./outputs/ directory so files
+                    # are accessible outside the container.
+                    "output_dir":         self.config.output_dir,
+                    # Temporal context — avoids LLM THINK storms over "what is today's date?"
+                    "current_date":        _datetime_module.date.today().isoformat(),
+                    "current_datetime_utc": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    **(
                         {
-                            "warning": (
-                                f"COMPLETE rejected: {len(missing)} objective(s) not yet "
-                                f"verified: {missing}. Finish all objectives before COMPLETE."
-                            )
+                            "intent":              scroll.intent,
+                            "objectives":          scroll_json,
+                            "completed_objectives": list(completed_objectives),
+                            "pending_objectives":  pending_objs,
+                        }
+                        if use_objectives else
+                        {
+                            "current_action_block": current_ab,
+                            "pending_action_blocks": [
+                                ab for ab in scroll_json
+                                if ab.get("step_number", 0) >= current_ab
+                            ],
+                        }
+                    ),
+                    "available_tools": tool_index,
+                    "history":         _build_history_slice(context),
+                    "last_snapshot":   context._snapshots[-1].summary if context._snapshots else None,
+                }
+                # v0.8.21: one-shot operator hint fold-back (cleared after this iteration).
+                if self._operator_hint:
+                    _user_payload["operator_hint"] = self._operator_hint
+                    self._operator_hint = None
+                _llm_user = json.dumps(_user_payload)
+                loop = asyncio.get_event_loop()
+                try:
+                    decision = await loop.run_in_executor(
+                        None,
+                        lambda: llm_call_json(
+                            tier=2,
+                            system=_llm_system,
+                            user=_llm_user,
+                            config=self.config,
+                            temperature=0.1,
+                            max_tokens=4096,
+                        )
+                    )
+                    # v0.8.16: record the raw decision completion to the per-
+                    # execution transcript and remember its index so the
+                    # per-iteration event (Task 7) can reference it via llm_ref
+                    # for lazy UI expand.  Best-effort — append_call never raises.
+                    try:
+                        from systemu.runtime.llm_transcript import append_call
+                        _call_index = append_call(
+                            self.vault.root, execution_id,
+                            {
+                                "iteration": iteration,
+                                "tier":      2,
+                                "system":    _llm_system,
+                                "user":      _llm_user,
+                                "response":  json.dumps(decision),
+                            },
+                        )
+                        _last_llm_ref = (
+                            {"exec_id": execution_id, "call_index": _call_index}
+                            if _call_index >= 0 else None
+                        )
+                    except Exception:
+                        _last_llm_ref = None
+                except Exception as exc:
+                    logger.error("[Runtime] LLM error on iteration %d: %s", iteration, exc)
+                    log_event("ERROR", "shadow", f"LLM error in execution {execution_id} iteration {iteration}: {exc}", {"shadow_id": shadow.id, "origin": getattr(self, "_origin", "manual")})
+                    context.add_thought(f"LLM call failed: {exc}", current_ab)
+                    continue
+
+                action = decision.get("action", "THINK")
+                # v0.8.21: stuck-guard — every iteration without a TOOL_CALL still counts toward stuck.
+                if action != "TOOL_CALL":
+                    self._update_stuck_counters(action=action, tool_name=None,
+                                                  tool_success=None, credited_obj_id=None)
+                if action == "THINK":  # LOAD_RESOURCE is productive — only throttle idle THINK
+                    consecutive_thinks += 1
+                else:
+                    consecutive_thinks = 0
+                logger.info("[Runtime] iter=%d action=%s", iteration, action)
+
+                # ── Supervisor heartbeat — signals watchdog this shadow is alive ──
+                try:
+                    from systemu.runtime.supervisor import Supervisor
+                    Supervisor.get().update_heartbeat(activity.id)
+                except Exception:
+                    pass  # Supervisor not running in CLI/test mode — safe to ignore
+
+                # ── Publish per-iteration event to Systemu Chat ───────────────────
+                try:
+                    from systemu.interface.event_bus import EventBus
+                    EventBus.get().publish(self._stamp({
+                        "ts":       utcnow().isoformat() + "Z",
+                        "level":    "INFO",
+                        "category": "shadow",
+                        "message":  f"[{shadow.name}] iter={iteration} action={action}",
+                        "context":  {
+                            "shadow_id":    shadow.id,
+                            "execution_id": execution_id,
+                            "iteration":    iteration,
+                            "action":       action,
+                            "objectives_done": len(completed_objectives) if use_objectives else current_ab - 1,
+                            "objectives_total": total_objectives if use_objectives else len(scroll_json),
                         },
-                        current_ab,
-                    )
-                    continue  # Return to loop — shadow must finish remaining objectives
+                    }))
+                except Exception:
+                    pass  # EventBus is optional — never break execution
 
-                summary = decision.get("summary", "Task completed.")
-                logger.info("[Runtime] Execution COMPLETE: %s", summary)
-                self._append_to_shadow_log(
-                    shadow, execution_id, "success", summary,
-                    iteration_count=iteration, tool_calls_made=tool_call_count,
-                    objectives_completed=len(completed_objectives) if use_objectives else len(scroll_json),
-                    objectives_total=total_objectives if use_objectives else len(scroll_json),
-                    duration_seconds=__import__("time").time() - exec_start,
-                )
-                res = context.build_result(
-                    status="success",
-                    final_summary=summary,
-                )
-                # v0.4.3-a: record success in ShadowMetrics so the supervisor's
-                # affinity-routing alternative-selection learns this shadow
-                # handles this intent_hash well.
-                _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
-                _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
-                return res
+                # ── v0.8.16: per-iteration detail event (reasoning + tool I/O) ─────
+                # Carries a bounded `details` dict the live panes render on expand.
+                # For TOOL_CALL the publish is deferred to AFTER the tool runs (so
+                # tool_result is captured); every other action publishes here.
+                if action != "TOOL_CALL":
+                    try:
+                        from systemu.interface.event_bus import EventBus
+                        EventBus.get().publish(self._iteration_event(
+                            iteration=iteration,
+                            decision=decision,
+                            execution_id=execution_id,
+                            llm_ref=_last_llm_ref,
+                        ))
+                    except Exception:
+                        pass  # EventBus is optional — never break execution
 
-            # ── FAIL ───────────────────────────────────────────────────────────
-            elif action == "FAIL":
-                reason = decision.get("reason", "Unknown failure.")
-                logger.warning("[Runtime] Execution FAIL: %s", reason)
-                self._append_to_shadow_log(
-                    shadow, execution_id, "failure", reason,
-                    iteration_count=iteration, tool_calls_made=tool_call_count,
-                    objectives_completed=len(completed_objectives) if use_objectives else current_ab - 1,
-                    objectives_total=total_objectives if use_objectives else len(scroll_json),
-                    duration_seconds=__import__("time").time() - exec_start,
-                )
-                res = context.build_result(
-                    status="failure",
-                    final_summary=f"Shadow reported failure: {reason}",
-                    error=reason,
-                )
-                _record_terminal_telemetry(
-                    shadow=shadow, execution_id=execution_id, scroll=scroll,
-                    status="failure", iteration=iteration,
-                )
-                _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
-                return res
-
-            # ── THINK ──────────────────────────────────────────────────────────
-            elif action == "THINK":
-                thought = decision.get("thought", "")
-                context.add_thought(thought, current_ab)
-                logger.debug("[Runtime] THINK: %s", thought[:120])
-                # THINK is reasoning-only — it cannot credit objective completion.
-                # Only a successful TOOL_CALL result gates objective advancement.
-
-            # ── REFLECT (v0.4.0-b) ─────────────────────────────────────────────
-            # An explicit diagnosis step after a cluster of failures.  The LLM
-            # names the strategy it intends to follow and may optionally
-            # invoke ROLLBACK to rewind context to the last snapshot.  Treated
-            # like a structured THINK: persists a thought and a sticky note,
-            # does NOT credit objective completion, does NOT count as a fresh
-            # THINK for the throttle (resets the consecutive count).
-            elif action == "REFLECT":
-                strategy = (decision.get("strategy") or "").strip().upper()
-                rationale = (decision.get("rationale") or "").strip()
-                logger.info(
-                    "[Runtime] REFLECT strategy=%s rationale=%s",
-                    strategy or "(none)", rationale[:160],
-                )
-                context.add_thought(
-                    f"REFLECT — strategy={strategy or 'unspecified'}: {rationale}"[:500],
-                    current_ab,
-                )
-                # Sticky note survives a subsequent rollback so the LLM keeps
-                # memory of "we tried X, then we said we'd try Y" even after
-                # context is rewound.
-                if strategy:
-                    context.add_sticky_note(
-                        f"Reflected: chose strategy {strategy}"
-                        + (f" — {rationale[:160]}" if rationale else "")
-                    )
-                # Optional ROLLBACK in the same decision: lets the LLM combine
-                # "I'm changing strategy" with "and I want to rewind context".
-                if decision.get("rollback") or strategy == "ROLLBACK_AND_REPLAN":
-                    rolled = context.rollback_to_last_snapshot()
-                    if rolled is None:
-                        context.add_thought(
-                            "Requested rollback but no snapshot available — continuing forward.",
+                # ── COMPLETE ───────────────────────────────────────────────────────
+                if action == "COMPLETE":
+                    # Reject premature COMPLETE when objectives are still pending.
+                    # This prevents false-success when the LLM declares done too early.
+                    if use_objectives and len(completed_objectives) < total_objectives:
+                        missing = [obj.id for obj in objectives if obj.id not in completed_objectives]
+                        logger.warning(
+                            "[Runtime] COMPLETE rejected — %d/%d objectives still pending: %s",
+                            len(missing), total_objectives, missing,
+                        )
+                        context.add_observation(
+                            {
+                                "warning": (
+                                    f"COMPLETE rejected: {len(missing)} objective(s) not yet "
+                                    f"verified: {missing}. Finish all objectives before COMPLETE."
+                                )
+                            },
                             current_ab,
                         )
-                    else:
-                        # Replace any pending reflection so the rolled-back
-                        # LLM sees a fresh post-rollback nudge, not stale.
-                        context.queue_reflection_block(
-                            "Context was rolled back to the last snapshot at your "
-                            f"request.  Sticky notes above record what was tried.  "
-                            f"Now choose a different approach than before."
-                        )
+                        continue  # Return to loop — shadow must finish remaining objectives
 
-            # ── LOAD_RESOURCE ──────────────────────────────────────────────────
-            elif action == "LOAD_RESOURCE":
-                resource_type = decision.get("resource_type", "")
-                resource_id   = decision.get("resource_id", "")
-                md_content    = ""
-                load_error    = None
-
-                try:
-                    if resource_type == "skill":
-                        obj = self.vault.get_skill(resource_id)
-                        if obj.skill_md_path and Path(obj.skill_md_path).exists():
-                            md_content = Path(obj.skill_md_path).read_text(encoding="utf-8")
-                        else:
-                            md_content = f"# {obj.name}\n\n{obj.instructions_md or '_No instructions available._'}"
-                    elif resource_type == "tool":
-                        obj = self.vault.get_tool(resource_id)
-                        if obj.tool_md_path and Path(obj.tool_md_path).exists():
-                            md_content = Path(obj.tool_md_path).read_text(encoding="utf-8")
-                        else:
-                            md_content = f"# {obj.name}\n\n{obj.description}"
-                    elif resource_type == "memory":
-                        if resource_id == "global":
-                            md_content = self.vault.load_global_memory()
-                            if not md_content.strip():
-                                md_content = "# Global Memory\n\n_No global memory yet._"
-                        else:
-                            # resource_id == "self" or shadow id
-                            md_path = shadow.memory_md_path
-                            if md_path and Path(md_path).exists():
-                                md_content = Path(md_path).read_text(encoding="utf-8")
-                                resource_id = shadow.id
-                            else:
-                                md_content = (
-                                    f"# Memory: {shadow.name}\n\n"
-                                    f"_No memory persisted yet — this shadow has not been consolidated._"
-                                )
-                                resource_id = shadow.id
-                    else:
-                        load_error = (
-                            f"Unknown resource_type {resource_type!r}. "
-                            f"Use 'skill', 'tool', or 'memory'."
-                        )
-                except KeyError:
-                    load_error = f"Resource {resource_type}/{resource_id!r} not found in vault."
-                except OSError as exc:
-                    load_error = f"Could not read {resource_type} manifest for {resource_id!r}: {exc}"
-
-                if load_error:
-                    context.add_observation({"error": load_error}, current_ab)
-                else:
-                    context.add_resource_load(resource_type, resource_id, md_content, current_ab)
-                    logger.debug("[Runtime] LOAD_RESOURCE %s/%s", resource_type, resource_id)
-                    # v0.6.1-c: track loaded skills so _maybe_decay_loaded_skills
-                    # knows which skills were in scope when failures hit.
-                    if resource_type == "skill":
-                        loaded = getattr(context, "_loaded_skill_ids", None)
-                        if loaded is None:
-                            loaded = set()
-                            context._loaded_skill_ids = loaded
-                        loaded.add(resource_id)
-
-            # ── TOOL_CALL ──────────────────────────────────────────────────────
-            elif action == "TOOL_CALL":
-                result = await self._handle_tool_call(
-                    decision, tools, context, current_ab, dry_run,
-                    shadow=shadow, execution_id=execution_id,
-                )
-                if result is None:
-                    continue   # User denied destructive call
-                tool_call_count += 1
-
-                # v0.8.21: stuck-guard — record tool outcome.
-                # (objective-credit reset is applied below at the credit site.)
-                self._update_stuck_counters(
-                    action="TOOL_CALL",
-                    tool_name=decision.get("tool_name") or "?",
-                    tool_success=bool(getattr(result, "success", False)),
-                    credited_obj_id=None,
-                )
-
-                # v0.8.16: per-iteration detail event AFTER the tool runs, so
-                # the bounded `details` dict carries the tool result the live
-                # panes render on expand.  Raw LLM is referenced via llm_ref.
-                try:
-                    from systemu.interface.event_bus import EventBus
-                    _tool_result_for_event = (
-                        result.parsed if getattr(result, "parsed", None) is not None
-                        else getattr(result, "output", None) or result
-                    )
-                    EventBus.get().publish(self._iteration_event(
-                        iteration=iteration,
-                        decision=decision,
-                        tool_result=_tool_result_for_event,
-                        execution_id=execution_id,
-                        llm_ref=_last_llm_ref,
-                    ))
-                except Exception:
-                    pass  # EventBus is optional — never break execution
-
-                # v0.8.17: fail-fast after 3 consecutive degraded web-search results.
-                # "degraded" means the entire provider chain failed (not just zero results) —
-                # reset on any non-degraded search so a single blip doesn't end the run.
-                _tool_name_for_ff = decision.get("tool_name", "")
-                _parsed_for_ff = getattr(result, "parsed", None)
-                if _is_degraded_search_result(_tool_name_for_ff, _parsed_for_ff):
-                    self._consec_degraded_search += 1
-                else:
-                    self._consec_degraded_search = 0
-                if self._consec_degraded_search >= _MAX_CONSEC_DEGRADED_SEARCH:
-                    _ff_msg = (
-                        f"Web search capability unavailable — search backends failed "
-                        f"{self._consec_degraded_search}x. Set SYSTEMU_TAVILY_API_KEY or "
-                        f"SYSTEMU_EXA_API_KEY for reliable search."
-                    )
-                    logger.warning("[Runtime] fail-fast: %s", _ff_msg)
+                    summary = decision.get("summary", "Task completed.")
+                    logger.info("[Runtime] Execution COMPLETE: %s", summary)
                     self._append_to_shadow_log(
-                        shadow, execution_id, "failure", _ff_msg,
+                        shadow, execution_id, "success", summary,
+                        iteration_count=iteration, tool_calls_made=tool_call_count,
+                        objectives_completed=len(completed_objectives) if use_objectives else len(scroll_json),
+                        objectives_total=total_objectives if use_objectives else len(scroll_json),
+                        duration_seconds=__import__("time").time() - exec_start,
+                    )
+                    res = context.build_result(
+                        status="success",
+                        final_summary=summary,
+                    )
+                    # v0.4.3-a: record success in ShadowMetrics so the supervisor's
+                    # affinity-routing alternative-selection learns this shadow
+                    # handles this intent_hash well.
+                    _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
+                    _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+                    return res
+
+                # ── FAIL ───────────────────────────────────────────────────────────
+                elif action == "FAIL":
+                    reason = decision.get("reason", "Unknown failure.")
+                    logger.warning("[Runtime] Execution FAIL: %s", reason)
+                    self._append_to_shadow_log(
+                        shadow, execution_id, "failure", reason,
                         iteration_count=iteration, tool_calls_made=tool_call_count,
                         objectives_completed=len(completed_objectives) if use_objectives else current_ab - 1,
                         objectives_total=total_objectives if use_objectives else len(scroll_json),
                         duration_seconds=__import__("time").time() - exec_start,
                     )
-                    _ff_res = context.build_result(
+                    res = context.build_result(
                         status="failure",
-                        final_summary=f"Shadow reported failure: {_ff_msg}",
-                        error=_ff_msg,
+                        final_summary=f"Shadow reported failure: {reason}",
+                        error=reason,
                     )
                     _record_terminal_telemetry(
                         shadow=shadow, execution_id=execution_id, scroll=scroll,
                         status="failure", iteration=iteration,
                     )
-                    _dispatch_refinery(shadow, scroll, _ff_res, context, self.config, self.vault)
-                    return _ff_res
+                    _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+                    return res
 
-                # v0.6.9: iteration-loop circuit breaker — bail when the LLM
-                # is stuck re-invoking the same broken tool with the same
-                # failure class. Saves 20+ wasted iterations on a recoverable
-                # blocker (op needs to use the recovery URL).
-                if not result.success:
-                    cb_tool_name = decision.get("tool_name", "") or "?"
-                    cb_reason = (
-                        (result.parsed or {}).get("error_type")
-                        or (result.parsed or {}).get("classified_reason")
-                        or "TOOL_FAILED"
+                # ── THINK ──────────────────────────────────────────────────────────
+                elif action == "THINK":
+                    thought = decision.get("thought", "")
+                    context.add_thought(thought, current_ab)
+                    logger.debug("[Runtime] THINK: %s", thought[:120])
+                    # THINK is reasoning-only — it cannot credit objective completion.
+                    # Only a successful TOOL_CALL result gates objective advancement.
+
+                # ── REFLECT (v0.4.0-b) ─────────────────────────────────────────────
+                # An explicit diagnosis step after a cluster of failures.  The LLM
+                # names the strategy it intends to follow and may optionally
+                # invoke ROLLBACK to rewind context to the last snapshot.  Treated
+                # like a structured THINK: persists a thought and a sticky note,
+                # does NOT credit objective completion, does NOT count as a fresh
+                # THINK for the throttle (resets the consecutive count).
+                elif action == "REFLECT":
+                    strategy = (decision.get("strategy") or "").strip().upper()
+                    rationale = (decision.get("rationale") or "").strip()
+                    logger.info(
+                        "[Runtime] REFLECT strategy=%s rationale=%s",
+                        strategy or "(none)", rationale[:160],
                     )
-                    tripped = self._record_tool_failure(cb_tool_name, cb_reason)
-                    if tripped:
-                        logger.warning(
-                            "[Runtime] v0.6.9 circuit breaker tripped: "
-                            "tool=%s reason=%s after %d consecutive failures",
-                            cb_tool_name, cb_reason, self.CIRCUIT_BREAKER_FAILURES,
+                    context.add_thought(
+                        f"REFLECT — strategy={strategy or 'unspecified'}: {rationale}"[:500],
+                        current_ab,
+                    )
+                    # Sticky note survives a subsequent rollback so the LLM keeps
+                    # memory of "we tried X, then we said we'd try Y" even after
+                    # context is rewound.
+                    if strategy:
+                        context.add_sticky_note(
+                            f"Reflected: chose strategy {strategy}"
+                            + (f" — {rationale[:160]}" if rationale else "")
                         )
-                        return {
-                            "status": "failure",
-                            "final_summary": (
-                                f"Circuit breaker: tool {cb_tool_name} failed "
-                                f"{self.CIRCUIT_BREAKER_FAILURES} consecutive "
-                                f"times with reason {cb_reason}. Apply the fix at "
-                                f"the recovery URL surfaced in prior iterations."
-                            ),
-                            "execution_id": execution_id,
-                        }
-
-                if use_objectives:
-                    # Credit objective only when the tool actually succeeded.
-                    # A failed tool (result.success=False) cannot advance the objective —
-                    # the shadow must try again or choose a different approach.
-                    completed_obj = decision.get("completes_objective")
-                    if isinstance(completed_obj, int) and completed_obj not in completed_objectives:
-                        if result is not None and result.success:
-                            completed_objectives.add(completed_obj)
-                            # v0.8.19 (R2): publish updated objective_state so the
-                            # live pane ticks the checklist.  Best-effort.
-                            try:
-                                from systemu.interface.event_bus import EventBus
-                                EventBus.get().publish(_objective_state_event(
-                                    objectives, completed_objectives, execution_id, stamp=self._stamp))
-                            except Exception:
-                                pass
-                            # v0.8.21: stuck-guard — credit resets BOTH counters.
-                            self._update_stuck_counters(
-                                action="TOOL_CALL",
-                                tool_name=decision.get("tool_name") or "?",
-                                tool_success=True,
-                                credited_obj_id=completed_obj,
+                    # Optional ROLLBACK in the same decision: lets the LLM combine
+                    # "I'm changing strategy" with "and I want to rewind context".
+                    if decision.get("rollback") or strategy == "ROLLBACK_AND_REPLAN":
+                        rolled = context.rollback_to_last_snapshot()
+                        if rolled is None:
+                            context.add_thought(
+                                "Requested rollback but no snapshot available — continuing forward.",
+                                current_ab,
                             )
-                            logger.info("[Runtime] Objective %d complete. %d/%d done.",
-                                        completed_obj, len(completed_objectives), total_objectives)
+                        else:
+                            # Replace any pending reflection so the rolled-back
+                            # LLM sees a fresh post-rollback nudge, not stale.
+                            context.queue_reflection_block(
+                                "Context was rolled back to the last snapshot at your "
+                                f"request.  Sticky notes above record what was tried.  "
+                                f"Now choose a different approach than before."
+                            )
 
-                            if (len(completed_objectives) % SNAPSHOT_INTERVAL) == 0:
-                                context.take_snapshot(len(completed_objectives), self.config)
+                # ── LOAD_RESOURCE ──────────────────────────────────────────────────
+                elif action == "LOAD_RESOURCE":
+                    resource_type = decision.get("resource_type", "")
+                    resource_id   = decision.get("resource_id", "")
+                    md_content    = ""
+                    load_error    = None
 
-                            if len(completed_objectives) >= total_objectives:
-                                logger.info("[Runtime] All objectives complete via advancement.")
+                    try:
+                        if resource_type == "skill":
+                            obj = self.vault.get_skill(resource_id)
+                            if obj.skill_md_path and Path(obj.skill_md_path).exists():
+                                md_content = Path(obj.skill_md_path).read_text(encoding="utf-8")
+                            else:
+                                md_content = f"# {obj.name}\n\n{obj.instructions_md or '_No instructions available._'}"
+                        elif resource_type == "tool":
+                            obj = self.vault.get_tool(resource_id)
+                            if obj.tool_md_path and Path(obj.tool_md_path).exists():
+                                md_content = Path(obj.tool_md_path).read_text(encoding="utf-8")
+                            else:
+                                md_content = f"# {obj.name}\n\n{obj.description}"
+                        elif resource_type == "memory":
+                            if resource_id == "global":
+                                md_content = self.vault.load_global_memory()
+                                if not md_content.strip():
+                                    md_content = "# Global Memory\n\n_No global memory yet._"
+                            else:
+                                # resource_id == "self" or shadow id
+                                md_path = shadow.memory_md_path
+                                if md_path and Path(md_path).exists():
+                                    md_content = Path(md_path).read_text(encoding="utf-8")
+                                    resource_id = shadow.id
+                                else:
+                                    md_content = (
+                                        f"# Memory: {shadow.name}\n\n"
+                                        f"_No memory persisted yet — this shadow has not been consolidated._"
+                                    )
+                                    resource_id = shadow.id
+                        else:
+                            load_error = (
+                                f"Unknown resource_type {resource_type!r}. "
+                                f"Use 'skill', 'tool', or 'memory'."
+                            )
+                    except KeyError:
+                        load_error = f"Resource {resource_type}/{resource_id!r} not found in vault."
+                    except OSError as exc:
+                        load_error = f"Could not read {resource_type} manifest for {resource_id!r}: {exc}"
+
+                    if load_error:
+                        context.add_observation({"error": load_error}, current_ab)
+                    else:
+                        context.add_resource_load(resource_type, resource_id, md_content, current_ab)
+                        logger.debug("[Runtime] LOAD_RESOURCE %s/%s", resource_type, resource_id)
+                        # v0.6.1-c: track loaded skills so _maybe_decay_loaded_skills
+                        # knows which skills were in scope when failures hit.
+                        if resource_type == "skill":
+                            loaded = getattr(context, "_loaded_skill_ids", None)
+                            if loaded is None:
+                                loaded = set()
+                                context._loaded_skill_ids = loaded
+                            loaded.add(resource_id)
+
+                # ── TOOL_CALL ──────────────────────────────────────────────────────
+                elif action == "TOOL_CALL":
+                    result = await self._handle_tool_call(
+                        decision, tools, context, current_ab, dry_run,
+                        shadow=shadow, execution_id=execution_id,
+                    )
+                    if result is None:
+                        continue   # User denied destructive call
+                    tool_call_count += 1
+
+                    # v0.8.21: stuck-guard — record tool outcome.
+                    # (objective-credit reset is applied below at the credit site.)
+                    self._update_stuck_counters(
+                        action="TOOL_CALL",
+                        tool_name=decision.get("tool_name") or "?",
+                        tool_success=bool(getattr(result, "success", False)),
+                        credited_obj_id=None,
+                    )
+
+                    # v0.8.16: per-iteration detail event AFTER the tool runs, so
+                    # the bounded `details` dict carries the tool result the live
+                    # panes render on expand.  Raw LLM is referenced via llm_ref.
+                    try:
+                        from systemu.interface.event_bus import EventBus
+                        _tool_result_for_event = (
+                            result.parsed if getattr(result, "parsed", None) is not None
+                            else getattr(result, "output", None) or result
+                        )
+                        EventBus.get().publish(self._iteration_event(
+                            iteration=iteration,
+                            decision=decision,
+                            tool_result=_tool_result_for_event,
+                            execution_id=execution_id,
+                            llm_ref=_last_llm_ref,
+                        ))
+                    except Exception:
+                        pass  # EventBus is optional — never break execution
+
+                    # v0.8.17: fail-fast after 3 consecutive degraded web-search results.
+                    # "degraded" means the entire provider chain failed (not just zero results) —
+                    # reset on any non-degraded search so a single blip doesn't end the run.
+                    _tool_name_for_ff = decision.get("tool_name", "")
+                    _parsed_for_ff = getattr(result, "parsed", None)
+                    if _is_degraded_search_result(_tool_name_for_ff, _parsed_for_ff):
+                        self._consec_degraded_search += 1
+                    else:
+                        self._consec_degraded_search = 0
+                    if self._consec_degraded_search >= _MAX_CONSEC_DEGRADED_SEARCH:
+                        _ff_msg = (
+                            f"Web search capability unavailable — search backends failed "
+                            f"{self._consec_degraded_search}x. Set SYSTEMU_TAVILY_API_KEY or "
+                            f"SYSTEMU_EXA_API_KEY for reliable search."
+                        )
+                        logger.warning("[Runtime] fail-fast: %s", _ff_msg)
+                        self._append_to_shadow_log(
+                            shadow, execution_id, "failure", _ff_msg,
+                            iteration_count=iteration, tool_calls_made=tool_call_count,
+                            objectives_completed=len(completed_objectives) if use_objectives else current_ab - 1,
+                            objectives_total=total_objectives if use_objectives else len(scroll_json),
+                            duration_seconds=__import__("time").time() - exec_start,
+                        )
+                        _ff_res = context.build_result(
+                            status="failure",
+                            final_summary=f"Shadow reported failure: {_ff_msg}",
+                            error=_ff_msg,
+                        )
+                        _record_terminal_telemetry(
+                            shadow=shadow, execution_id=execution_id, scroll=scroll,
+                            status="failure", iteration=iteration,
+                        )
+                        _dispatch_refinery(shadow, scroll, _ff_res, context, self.config, self.vault)
+                        return _ff_res
+
+                    # v0.6.9: iteration-loop circuit breaker — bail when the LLM
+                    # is stuck re-invoking the same broken tool with the same
+                    # failure class. Saves 20+ wasted iterations on a recoverable
+                    # blocker (op needs to use the recovery URL).
+                    if not result.success:
+                        cb_tool_name = decision.get("tool_name", "") or "?"
+                        cb_reason = (
+                            (result.parsed or {}).get("error_type")
+                            or (result.parsed or {}).get("classified_reason")
+                            or "TOOL_FAILED"
+                        )
+                        tripped = self._record_tool_failure(cb_tool_name, cb_reason)
+                        if tripped:
+                            logger.warning(
+                                "[Runtime] v0.6.9 circuit breaker tripped: "
+                                "tool=%s reason=%s after %d consecutive failures",
+                                cb_tool_name, cb_reason, self.CIRCUIT_BREAKER_FAILURES,
+                            )
+                            return {
+                                "status": "failure",
+                                "final_summary": (
+                                    f"Circuit breaker: tool {cb_tool_name} failed "
+                                    f"{self.CIRCUIT_BREAKER_FAILURES} consecutive "
+                                    f"times with reason {cb_reason}. Apply the fix at "
+                                    f"the recovery URL surfaced in prior iterations."
+                                ),
+                                "execution_id": execution_id,
+                            }
+
+                    if use_objectives:
+                        # Credit objective only when the tool actually succeeded.
+                        # A failed tool (result.success=False) cannot advance the objective —
+                        # the shadow must try again or choose a different approach.
+                        completed_obj = decision.get("completes_objective")
+                        if isinstance(completed_obj, int) and completed_obj not in completed_objectives:
+                            if result is not None and result.success:
+                                completed_objectives.add(completed_obj)
+                                # v0.8.19 (R2): publish updated objective_state so the
+                                # live pane ticks the checklist.  Best-effort.
+                                try:
+                                    from systemu.interface.event_bus import EventBus
+                                    EventBus.get().publish(_objective_state_event(
+                                        objectives, completed_objectives, execution_id, stamp=self._stamp))
+                                except Exception:
+                                    pass
+                                # v0.8.21: stuck-guard — credit resets BOTH counters.
+                                self._update_stuck_counters(
+                                    action="TOOL_CALL",
+                                    tool_name=decision.get("tool_name") or "?",
+                                    tool_success=True,
+                                    credited_obj_id=completed_obj,
+                                )
+                                logger.info("[Runtime] Objective %d complete. %d/%d done.",
+                                            completed_obj, len(completed_objectives), total_objectives)
+
+                                if (len(completed_objectives) % SNAPSHOT_INTERVAL) == 0:
+                                    context.take_snapshot(len(completed_objectives), self.config)
+
+                                if len(completed_objectives) >= total_objectives:
+                                    logger.info("[Runtime] All objectives complete via advancement.")
+                                    self._append_to_shadow_log(
+                                        shadow, execution_id, "success", "All objectives completed.",
+                                        iteration_count=iteration, tool_calls_made=tool_call_count,
+                                        objectives_completed=len(completed_objectives),
+                                        objectives_total=total_objectives,
+                                        duration_seconds=__import__("time").time() - exec_start,
+                                    )
+                                    res = context.build_result(
+                                        status="success",
+                                        final_summary="All objectives completed successfully.",
+                                    )
+                                    _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
+                                    _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+                                    return res
+                            else:
+                                logger.warning(
+                                    "[Runtime] TOOL_CALL claimed completes_objective=%d "
+                                    "but tool failed (success=%s) — objective NOT credited.",
+                                    completed_obj,
+                                    result.success if result is not None else None,
+                                )
+                    else:
+                        # Legacy ActionBlock completion tracking
+                        completed_ab = decision.get("completes_action_block")
+                        if isinstance(completed_ab, int) and completed_ab >= current_ab:
+                            current_ab = completed_ab + 1
+                            logger.info("[Runtime] Advanced to ActionBlock %d", current_ab)
+
+                            if (current_ab - last_snap_ab) >= SNAPSHOT_INTERVAL:
+                                context.take_snapshot(completed_ab, self.config)
+                                last_snap_ab = completed_ab
+
+                            if current_ab > len(scroll_json):
+                                logger.info("[Runtime] All ActionBlocks complete via advancement.")
                                 self._append_to_shadow_log(
-                                    shadow, execution_id, "success", "All objectives completed.",
+                                    shadow, execution_id, "success", "All steps completed.",
                                     iteration_count=iteration, tool_calls_made=tool_call_count,
-                                    objectives_completed=len(completed_objectives),
-                                    objectives_total=total_objectives,
+                                    objectives_completed=current_ab - 1, objectives_total=len(scroll_json),
                                     duration_seconds=__import__("time").time() - exec_start,
                                 )
                                 res = context.build_result(
                                     status="success",
-                                    final_summary="All objectives completed successfully.",
+                                    final_summary="All ActionBlocks completed successfully.",
                                 )
                                 _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
                                 _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
                                 return res
+
+                    # v0.8.21: stuck-guard — check after this iteration's effects are recorded.
+                    triggered, reason = self._stuck_trigger()
+                    if triggered and use_objectives:
+                        # which objective are we stuck on? the first pending (lowest id whose deps are met & not done)
+                        pending = [o for o in objectives if o.id not in completed_objectives
+                                   and all(d in completed_objectives for d in (o.depends_on or []))]
+                        stuck_obj = pending[0] if pending else objectives[-1]
+                        tools_tried = sorted(self._same_tool_fail_streak.keys())
+                        ans = self._ask_stuck_or_degrade(execution_id=execution_id,
+                                                           current_objective=stuck_obj,
+                                                           tools_tried=tools_tried, reason=reason)
+                        if ans is None:
+                            # headless — degrade as 'partial' (closest to MaxIterations semantics)
+                            return self._finalize_stuck(context=context, status="partial",
+                                                         reason=reason, stuck_on=stuck_obj.id,
+                                                         completed=list(completed_objectives),
+                                                         iteration=iteration,
+                                                         tool_calls_made=tool_call_count,
+                                                         scroll=scroll, shadow=shadow,
+                                                         execution_id=execution_id,
+                                                         exec_start=exec_start,
+                                                         total_objectives=total_objectives)
+                        action_choice = ans.get("action") or ""
+                        # v0.8.21 fix: the /insights Submit handler collapses radio choice + free text
+                        # into ONE value (`{"action": <ftext or label>}`); there is no `action__free` key.
+                        # So: if the answer isn't one of the canonical labels, treat it as a hint string
+                        # (operator typed free text → implicit "Provide hint").
+                        _canonical = {"Provide hint", "Accept partial", "Cancel run"}
+                        if action_choice in _canonical:
+                            hint_text = ""
                         else:
-                            logger.warning(
-                                "[Runtime] TOOL_CALL claimed completes_objective=%d "
-                                "but tool failed (success=%s) — objective NOT credited.",
-                                completed_obj,
-                                result.success if result is not None else None,
+                            hint_text = action_choice.strip()
+                            action_choice = "Provide hint" if hint_text else action_choice
+                        if action_choice == "Provide hint" and hint_text:
+                            self._operator_hint = (
+                                f"## Operator hint (use to retry Objective {stuck_obj.id})\n{hint_text}"
                             )
+                            self._iters_since_obj_credit = 0
+                            self._same_tool_fail_streak.clear()
+                            # loop continues with hint in context for next iteration
+                        elif action_choice == "Accept partial":
+                            return self._finalize_stuck(context=context, status="partial",
+                                                         reason=reason, stuck_on=stuck_obj.id,
+                                                         completed=list(completed_objectives),
+                                                         iteration=iteration,
+                                                         tool_calls_made=tool_call_count,
+                                                         scroll=scroll, shadow=shadow,
+                                                         execution_id=execution_id,
+                                                         exec_start=exec_start,
+                                                         total_objectives=total_objectives)
+                        elif action_choice == "Cancel run":
+                            return self._finalize_stuck(context=context, status="cancelled",
+                                                         reason="operator cancelled",
+                                                         stuck_on=stuck_obj.id,
+                                                         completed=list(completed_objectives),
+                                                         iteration=iteration,
+                                                         tool_calls_made=tool_call_count,
+                                                         scroll=scroll, shadow=shadow,
+                                                         execution_id=execution_id,
+                                                         exec_start=exec_start,
+                                                         total_objectives=total_objectives)
+                        else:
+                            # ambiguous answer → treat as Accept partial
+                            return self._finalize_stuck(context=context, status="partial",
+                                                         reason=reason, stuck_on=stuck_obj.id,
+                                                         completed=list(completed_objectives),
+                                                         iteration=iteration,
+                                                         tool_calls_made=tool_call_count,
+                                                         scroll=scroll, shadow=shadow,
+                                                         execution_id=execution_id,
+                                                         exec_start=exec_start,
+                                                         total_objectives=total_objectives)
+
                 else:
-                    # Legacy ActionBlock completion tracking
-                    completed_ab = decision.get("completes_action_block")
-                    if isinstance(completed_ab, int) and completed_ab >= current_ab:
-                        current_ab = completed_ab + 1
-                        logger.info("[Runtime] Advanced to ActionBlock %d", current_ab)
+                    logger.warning("[Runtime] Unknown action: %s — treating as THINK", action)
+                    context.add_thought(f"Unrecognised action type: {action}", current_ab)
 
-                        if (current_ab - last_snap_ab) >= SNAPSHOT_INTERVAL:
-                            context.take_snapshot(completed_ab, self.config)
-                            last_snap_ab = completed_ab
-
-                        if current_ab > len(scroll_json):
-                            logger.info("[Runtime] All ActionBlocks complete via advancement.")
-                            self._append_to_shadow_log(
-                                shadow, execution_id, "success", "All steps completed.",
-                                iteration_count=iteration, tool_calls_made=tool_call_count,
-                                objectives_completed=current_ab - 1, objectives_total=len(scroll_json),
-                                duration_seconds=__import__("time").time() - exec_start,
-                            )
-                            res = context.build_result(
-                                status="success",
-                                final_summary="All ActionBlocks completed successfully.",
-                            )
-                            _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
-                            _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
-                            return res
-
-                # v0.8.21: stuck-guard — check after this iteration's effects are recorded.
-                triggered, reason = self._stuck_trigger()
-                if triggered and use_objectives:
-                    # which objective are we stuck on? the first pending (lowest id whose deps are met & not done)
-                    pending = [o for o in objectives if o.id not in completed_objectives
-                               and all(d in completed_objectives for d in (o.depends_on or []))]
-                    stuck_obj = pending[0] if pending else objectives[-1]
-                    tools_tried = sorted(self._same_tool_fail_streak.keys())
-                    ans = self._ask_stuck_or_degrade(execution_id=execution_id,
-                                                       current_objective=stuck_obj,
-                                                       tools_tried=tools_tried, reason=reason)
-                    if ans is None:
-                        # headless — degrade as 'partial' (closest to MaxIterations semantics)
-                        return self._finalize_stuck(context=context, status="partial",
-                                                     reason=reason, stuck_on=stuck_obj.id,
-                                                     completed=list(completed_objectives),
-                                                     iteration=iteration,
-                                                     tool_calls_made=tool_call_count,
-                                                     scroll=scroll, shadow=shadow,
-                                                     execution_id=execution_id,
-                                                     exec_start=exec_start,
-                                                     total_objectives=total_objectives)
-                    action_choice = ans.get("action") or ""
-                    # v0.8.21 fix: the /insights Submit handler collapses radio choice + free text
-                    # into ONE value (`{"action": <ftext or label>}`); there is no `action__free` key.
-                    # So: if the answer isn't one of the canonical labels, treat it as a hint string
-                    # (operator typed free text → implicit "Provide hint").
-                    _canonical = {"Provide hint", "Accept partial", "Cancel run"}
-                    if action_choice in _canonical:
-                        hint_text = ""
-                    else:
-                        hint_text = action_choice.strip()
-                        action_choice = "Provide hint" if hint_text else action_choice
-                    if action_choice == "Provide hint" and hint_text:
-                        self._operator_hint = (
-                            f"## Operator hint (use to retry Objective {stuck_obj.id})\n{hint_text}"
-                        )
-                        self._iters_since_obj_credit = 0
-                        self._same_tool_fail_streak.clear()
-                        # loop continues with hint in context for next iteration
-                    elif action_choice == "Accept partial":
-                        return self._finalize_stuck(context=context, status="partial",
-                                                     reason=reason, stuck_on=stuck_obj.id,
-                                                     completed=list(completed_objectives),
-                                                     iteration=iteration,
-                                                     tool_calls_made=tool_call_count,
-                                                     scroll=scroll, shadow=shadow,
-                                                     execution_id=execution_id,
-                                                     exec_start=exec_start,
-                                                     total_objectives=total_objectives)
-                    elif action_choice == "Cancel run":
-                        return self._finalize_stuck(context=context, status="cancelled",
-                                                     reason="operator cancelled",
-                                                     stuck_on=stuck_obj.id,
-                                                     completed=list(completed_objectives),
-                                                     iteration=iteration,
-                                                     tool_calls_made=tool_call_count,
-                                                     scroll=scroll, shadow=shadow,
-                                                     execution_id=execution_id,
-                                                     exec_start=exec_start,
-                                                     total_objectives=total_objectives)
-                    else:
-                        # ambiguous answer → treat as Accept partial
-                        return self._finalize_stuck(context=context, status="partial",
-                                                     reason=reason, stuck_on=stuck_obj.id,
-                                                     completed=list(completed_objectives),
-                                                     iteration=iteration,
-                                                     tool_calls_made=tool_call_count,
-                                                     scroll=scroll, shadow=shadow,
-                                                     execution_id=execution_id,
-                                                     exec_start=exec_start,
-                                                     total_objectives=total_objectives)
-
-            else:
-                logger.warning("[Runtime] Unknown action: %s — treating as THINK", action)
-                context.add_thought(f"Unrecognised action type: {action}", current_ab)
-
-        # ── Max iterations hit ─────────────────────────────────────────────────
-        logger.warning("[Runtime] Max iterations (%d) reached without COMPLETE.", MAX_ITERATIONS)
-        self._append_to_shadow_log(
-            shadow, execution_id, "partial",
-            f"Reached max iterations ({MAX_ITERATIONS}).",
-            iteration_count=iteration, tool_calls_made=tool_call_count,
-            objectives_completed=len(completed_objectives) if use_objectives else current_ab - 1,
-            objectives_total=total_objectives if use_objectives else len(scroll_json),
-            duration_seconds=__import__("time").time() - exec_start,
-        )
-        _record_terminal_telemetry(
-            shadow=shadow, execution_id=execution_id, scroll=scroll,
-            status="partial", iteration=iteration,
-            extra={"reason": "MaxIterationsExceeded"},
-        )
-        return context.build_result(
-            status="partial",
-            final_summary=f"Execution reached max iterations ({MAX_ITERATIONS}). Task may be incomplete.",
-            error="MaxIterationsExceeded",
-        )
+            # ── Max iterations hit ─────────────────────────────────────────────────
+            logger.warning("[Runtime] Max iterations (%d) reached without COMPLETE.", MAX_ITERATIONS)
+            self._append_to_shadow_log(
+                shadow, execution_id, "partial",
+                f"Reached max iterations ({MAX_ITERATIONS}).",
+                iteration_count=iteration, tool_calls_made=tool_call_count,
+                objectives_completed=len(completed_objectives) if use_objectives else current_ab - 1,
+                objectives_total=total_objectives if use_objectives else len(scroll_json),
+                duration_seconds=__import__("time").time() - exec_start,
+            )
+            _record_terminal_telemetry(
+                shadow=shadow, execution_id=execution_id, scroll=scroll,
+                status="partial", iteration=iteration,
+                extra={"reason": "MaxIterationsExceeded"},
+            )
+            return context.build_result(
+                status="partial",
+                final_summary=f"Execution reached max iterations ({MAX_ITERATIONS}). Task may be incomplete.",
+                error="MaxIterationsExceeded",
+            )
+        finally:
+            try:
+                from systemu.runtime.chat_submission_ctx import set_chat_submission_id
+                set_chat_submission_id(None, reset_token=self._chat_submission_token)
+            except Exception:
+                pass
 
     # ─── Private helpers ──────────────────────────────────────────────────────
 
