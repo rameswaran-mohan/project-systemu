@@ -273,6 +273,7 @@ class Supervisor:
         consult_affinity_log: bool = True,
         resume_from_execution_id: Optional[str] = None,
         origin: Optional[str] = None,
+        chat_submission_id: Optional[str] = None,
     ) -> str:
         """Queue an activity for execution.
 
@@ -366,6 +367,10 @@ class Supervisor:
             # can rebuild its context from the snapshot persisted by
             # RECALIBRATE_TOOL.  When None, runtime starts fresh.
             "resume_from_execution_id": resume_from_execution_id,
+            # v0.8.22.1 (Fix 2): carry chat_submission_id so the worker can thread
+            # it into runtime.execute — enables the inline decision card + resume
+            # for queued chat tasks (not just the sync path).
+            "chat_submission_id": chat_submission_id,
         }
         # [A.2] Persist to SQLite BEFORE the in-memory put.  If the process crashes
         # between these two writes, the DB row stays in 'queued' state and
@@ -790,6 +795,7 @@ class Supervisor:
                         cancel_event=cancel_event,
                         resume_from_execution_id=resume_from,
                         origin=payload.get("origin"),   # v0.8.16: thread trigger origin
+                        chat_submission_id=payload.get("chat_submission_id"),  # v0.8.22.1 (Fix 2)
                     )
                 )
             finally:

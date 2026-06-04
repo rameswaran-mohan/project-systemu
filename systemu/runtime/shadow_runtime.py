@@ -1125,14 +1125,19 @@ class ShadowRuntime:
             return (True, f"tool '{worst[0]}' failed {worst[1]} consecutive times")
         return (False, "")
 
-    def _ask_stuck_or_degrade(self, *, execution_id: str, current_objective,
-                                 tools_tried, reason: str):
+    def _ask_stuck_or_degrade(self, *, execution_id, current_objective,
+                                 tools_tried, reason: str,
+                                 scroll_id: str = "", activity_id: str = "",
+                                 shadow_id: str = ""):
         """v0.8.21: post stuck-loop decision via v0.8.19 R3 request_choice.
         Returns the answer dict on resume, None when no queue (headless),
-        raises PendingChoiceRequest while awaiting operator."""
+        raises PendingChoiceRequest while awaiting operator.
+        v0.8.22.1 (R2): dedup_key is execution-INDEPENDENT (keyed by scroll +
+        objective + round) so a resumed run reaches the same decision. (R4):
+        the decision context carries the resume coordinates."""
         round_n = self._stuck_round_for_obj.get(current_objective.id, 0) + 1
         self._stuck_round_for_obj[current_objective.id] = round_n
-        dedup = f"stuck:{execution_id}:obj_{current_objective.id}:r{round_n}"
+        dedup = f"stuck:{scroll_id or execution_id}:obj_{current_objective.id}:r{round_n}"
         goal_short = (getattr(current_objective, "goal", "") or "")[:120]
         tried = ", ".join(sorted(set(tools_tried or [])))
         qs = [{
@@ -1148,7 +1153,14 @@ class ShadowRuntime:
           "allow_free_text": True,
         }]
         from systemu.interface.notifications import request_choice
-        return request_choice(qs, dedup_key=dedup)
+        return request_choice(qs, dedup_key=dedup, extra_context={
+            "execution_id": execution_id,
+            "activity_id":  activity_id,
+            "scroll_id":    scroll_id,
+            "shadow_id":    shadow_id,
+            "objective_id": current_objective.id,
+            "stuck_round":  round_n,
+        })
 
     def _finalize_stuck(self, *, context, status: str, reason: str,
                           stuck_on: int, completed, iteration: int,
@@ -1168,10 +1180,18 @@ class ShadowRuntime:
             )
         except Exception:
             pass
+        # v0.8.22.1 (Fix 3): a deliberate operator cancel is not a system "stuck"
+        # failure — don't mislabel it or stamp it with the StuckLoopDetected error.
+        if status == "cancelled":
+            _summary = f"Run cancelled by operator (was working on objective {stuck_on})."
+            _err = None
+        else:
+            _summary = f"Stuck on objective {stuck_on}: {reason}"
+            _err = "StuckLoopDetected"
         res = context.build_result(
             status=status,
-            final_summary=f"Stuck on objective {stuck_on}: {reason}",
-            error="StuckLoopDetected",
+            final_summary=_summary,
+            error=_err,
         )
         try:
             _record_terminal_telemetry(
@@ -1187,6 +1207,33 @@ class ShadowRuntime:
         except Exception:
             pass
         return res
+
+    def _apply_stuck_answer(self, stuck_obj, ans: dict, *, finalize):
+        """v0.8.22.1 (R6): map a resolved stuck answer to an action.
+        Returns ("continue", None) to keep looping (hint applied), or
+        ("finalize", <result>) when the answer is partial/cancel.
+        `finalize` is a callable(**kwargs) -> result (the caller binds the
+        _finalize_stuck context/scroll/shadow/etc.)."""
+        action_choice = (ans or {}).get("action") or ""
+        _canonical = {"Provide hint", "Accept partial", "Cancel run"}
+        if action_choice in _canonical:
+            hint_text = ""
+        else:
+            hint_text = action_choice.strip()
+            action_choice = "Provide hint" if hint_text else action_choice
+        if action_choice == "Provide hint" and hint_text:
+            self._operator_hint = (
+                f"## Operator hint (use to retry Objective {stuck_obj.id})\n{hint_text}"
+            )
+            self._iters_since_obj_credit = 0
+            self._same_tool_fail_streak.clear()
+            return ("continue", None)
+        if action_choice == "Accept partial":
+            return ("finalize", finalize(status="partial"))
+        if action_choice == "Cancel run":
+            return ("finalize", finalize(status="cancelled"))
+        # ambiguous → treat as partial
+        return ("finalize", finalize(status="partial"))
 
     def _build_memory_context_for_prompt(self) -> str:
         """LLM-facing memory view (consolidated, not the raw execution_log).
@@ -1252,6 +1299,7 @@ class ShadowRuntime:
         self._same_tool_fail_streak.clear()
         self._stuck_round_for_obj.clear()
         self._operator_hint = None
+        self._resume_stuck_answer = None  # v0.8.22.1 (R6): (obj_id, answer) lifted from snapshot
         # v0.8.22 (C): carry chat_submission_id for the run so the R3 producers
         # can thread it into OperatorDecision.context, enabling the chat UI to
         # surface decisions inline.
@@ -1365,6 +1413,30 @@ class ShadowRuntime:
                             completed_objectives.update(snap.completed_objective_ids)
                         if not use_objectives and snap.current_action_block:
                             current_ab = max(current_ab, int(snap.current_action_block))
+                        # v0.8.22.1 (R6): if the operator answered a stuck decision,
+                        # lift it (and the round counters) from the snapshot stickies
+                        # so we can apply it at resume-start instead of re-triggering.
+                        try:
+                            import json as _json
+                            _ans_note = next((n for n in snap.sticky_notes
+                                              if n.startswith("__STUCK_ANSWER__::")), None)
+                            _rounds_note = next((n for n in snap.sticky_notes
+                                                 if n.startswith("__STUCK_ROUNDS__::")), None)
+                            if _rounds_note:
+                                self._stuck_round_for_obj = {
+                                    int(k): v for k, v in
+                                    _json.loads(_rounds_note.split("::", 1)[1]).items()
+                                }
+                            if _ans_note:
+                                _parts = _ans_note.split("::", 2)  # __STUCK_ANSWER__::obj_<id>::<choice_json>
+                                _obj_id = int(_parts[1].replace("obj_", ""))
+                                try:
+                                    _ans = _json.loads(_parts[2])
+                                except Exception:
+                                    _ans = {"action": _parts[2]}
+                                self._resume_stuck_answer = (_obj_id, _ans)
+                        except Exception:
+                            logger.debug("[Runtime] resume stuck-answer parse failed", exc_info=True)
                         logger.info(
                             "[Runtime] resumed from snapshot of %s — restored %d completed objective(s), %d sticky note(s)",
                             resume_from_execution_id,
@@ -1379,6 +1451,28 @@ class ShadowRuntime:
                         )
                 except Exception:
                     logger.exception("[Runtime] resume hook crashed — starting fresh")
+
+            # v0.8.22.1 (R6): consume a resume-start stuck answer if present.
+            _pending = getattr(self, "_resume_stuck_answer", None)
+            if _pending and use_objectives:
+                _obj_id, _ans = _pending
+                self._resume_stuck_answer = None
+                _stuck_obj = next((o for o in objectives if o.id == _obj_id),
+                                  objectives[-1] if objectives else None)
+                if _stuck_obj is not None:
+                    from functools import partial as _partial
+                    _fin = _partial(self._finalize_stuck, context=context,
+                                    reason="resumed", stuck_on=_stuck_obj.id,
+                                    completed=list(completed_objectives),
+                                    iteration=int(getattr(context, "_resume_iteration", 0)),
+                                    tool_calls_made=0, scroll=scroll, shadow=shadow,
+                                    execution_id=execution_id, exec_start=exec_start,
+                                    total_objectives=len(objectives))
+                    _action, _res = self._apply_stuck_answer(_stuck_obj, _ans, finalize=_fin)
+                    if _action == "finalize":
+                        return _res
+                    # else "continue": hint is now in self._operator_hint; loop retries
+
             last_snap_ab = 0
             iteration    = 0
             consecutive_thinks = 0  # throttle THINK storms
@@ -2007,10 +2101,43 @@ class ShadowRuntime:
                         pending = [o for o in objectives if o.id not in completed_objectives
                                    and all(d in completed_objectives for d in (o.depends_on or []))]
                         stuck_obj = pending[0] if pending else objectives[-1]
-                        tools_tried = sorted(self._same_tool_fail_streak.keys())
+                        # v0.8.22.1 (Fix 4): exclude tools that ultimately succeeded.
+                        # _update_progress_counters sets a succeeded tool's streak to 0
+                        # but keeps the key; only tools with an active failure streak
+                        # belong in the operator's "tools tried" line.
+                        tools_tried = sorted(k for k, v in self._same_tool_fail_streak.items() if v > 0)
+                        # v0.8.22.1 (R1): persist a resume snapshot at stuck-park so
+                        # the operator's answer (via the daemon re-dispatch handler)
+                        # can resume this run with completed objectives intact.
+                        try:
+                            from systemu.runtime.execution_snapshot import (
+                                capture_from_context, write_snapshot,
+                            )
+                            _snap = capture_from_context(
+                                execution_id=execution_id,
+                                shadow_id=getattr(shadow, "id", ""),
+                                scroll_id=getattr(scroll, "id", ""),
+                                iteration=iteration,
+                                current_action_block=current_ab,
+                                completed_objectives=set(completed_objectives),
+                                context=context,
+                                activity_id=getattr(activity, "id", ""),
+                            )
+                            # R3: persist the per-objective stuck round counters so
+                            # rounds accumulate across resumes (carried as a sticky tag).
+                            import json as _json
+                            _snap.sticky_notes.append(
+                                "__STUCK_ROUNDS__::" + _json.dumps(self._stuck_round_for_obj)
+                            )
+                            write_snapshot(_snap)
+                        except Exception:
+                            logger.debug("[Runtime] stuck-park snapshot failed", exc_info=True)
                         ans = self._ask_stuck_or_degrade(execution_id=execution_id,
                                                            current_objective=stuck_obj,
-                                                           tools_tried=tools_tried, reason=reason)
+                                                           tools_tried=tools_tried, reason=reason,
+                                                           scroll_id=getattr(scroll, "id", ""),
+                                                           activity_id=getattr(activity, "id", ""),
+                                                           shadow_id=getattr(shadow, "id", ""))
                         if ans is None:
                             # headless — degrade as 'partial' (closest to MaxIterations semantics)
                             return self._finalize_stuck(context=context, status="partial",
@@ -2022,56 +2149,18 @@ class ShadowRuntime:
                                                          execution_id=execution_id,
                                                          exec_start=exec_start,
                                                          total_objectives=total_objectives)
-                        action_choice = ans.get("action") or ""
-                        # v0.8.21 fix: the /insights Submit handler collapses radio choice + free text
-                        # into ONE value (`{"action": <ftext or label>}`); there is no `action__free` key.
-                        # So: if the answer isn't one of the canonical labels, treat it as a hint string
-                        # (operator typed free text → implicit "Provide hint").
-                        _canonical = {"Provide hint", "Accept partial", "Cancel run"}
-                        if action_choice in _canonical:
-                            hint_text = ""
-                        else:
-                            hint_text = action_choice.strip()
-                            action_choice = "Provide hint" if hint_text else action_choice
-                        if action_choice == "Provide hint" and hint_text:
-                            self._operator_hint = (
-                                f"## Operator hint (use to retry Objective {stuck_obj.id})\n{hint_text}"
-                            )
-                            self._iters_since_obj_credit = 0
-                            self._same_tool_fail_streak.clear()
-                            # loop continues with hint in context for next iteration
-                        elif action_choice == "Accept partial":
-                            return self._finalize_stuck(context=context, status="partial",
-                                                         reason=reason, stuck_on=stuck_obj.id,
-                                                         completed=list(completed_objectives),
-                                                         iteration=iteration,
-                                                         tool_calls_made=tool_call_count,
-                                                         scroll=scroll, shadow=shadow,
-                                                         execution_id=execution_id,
-                                                         exec_start=exec_start,
-                                                         total_objectives=total_objectives)
-                        elif action_choice == "Cancel run":
-                            return self._finalize_stuck(context=context, status="cancelled",
-                                                         reason="operator cancelled",
-                                                         stuck_on=stuck_obj.id,
-                                                         completed=list(completed_objectives),
-                                                         iteration=iteration,
-                                                         tool_calls_made=tool_call_count,
-                                                         scroll=scroll, shadow=shadow,
-                                                         execution_id=execution_id,
-                                                         exec_start=exec_start,
-                                                         total_objectives=total_objectives)
-                        else:
-                            # ambiguous answer → treat as Accept partial
-                            return self._finalize_stuck(context=context, status="partial",
-                                                         reason=reason, stuck_on=stuck_obj.id,
-                                                         completed=list(completed_objectives),
-                                                         iteration=iteration,
-                                                         tool_calls_made=tool_call_count,
-                                                         scroll=scroll, shadow=shadow,
-                                                         execution_id=execution_id,
-                                                         exec_start=exec_start,
-                                                         total_objectives=total_objectives)
+                        from functools import partial as _partial
+                        _fin = _partial(self._finalize_stuck, context=context,
+                                        reason=reason, stuck_on=stuck_obj.id,
+                                        completed=list(completed_objectives),
+                                        iteration=iteration, tool_calls_made=tool_call_count,
+                                        scroll=scroll, shadow=shadow,
+                                        execution_id=execution_id, exec_start=exec_start,
+                                        total_objectives=total_objectives)
+                        _action, _res = self._apply_stuck_answer(stuck_obj, ans, finalize=_fin)
+                        if _action == "finalize":
+                            return _res
+                        # else "continue": hint applied, loop proceeds
 
                 else:
                     logger.warning("[Runtime] Unknown action: %s — treating as THINK", action)

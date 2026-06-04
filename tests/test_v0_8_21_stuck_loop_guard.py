@@ -423,8 +423,9 @@ class TestStuckHelpers:
         from systemu.runtime import shadow_runtime as sr
         from systemu.core.models import Objective
         obj = Objective(id=2, goal="Search for bakeries", success_criteria="5+ listings")
-        def _fake_request_choice(qs, *, dedup_key):
+        def _fake_request_choice(qs, *, dedup_key, extra_context=None):
             assert "Stuck on Objective 2" in qs[0]["prompt"]
+            # v0.8.22.1 (R2): dedup_key falls back to execution_id when no scroll_id passed
             assert dedup_key == "stuck:exec_X:obj_2:r1"
             return {"action": "Accept partial"}
         # patch where the helper imports it from
@@ -442,7 +443,7 @@ class TestStuckHelpers:
         from systemu.core.models import Objective
         obj = Objective(id=2, goal="Search", success_criteria="ok")
         import systemu.interface.notifications as nf
-        monkeypatch.setattr(nf, "request_choice", lambda qs, *, dedup_key: None)
+        monkeypatch.setattr(nf, "request_choice", lambda qs, *, dedup_key, extra_context=None: None)
         ans = rt._ask_stuck_or_degrade(execution_id="exec_Y",
                                         current_objective=obj, tools_tried=[],
                                         reason="no progress for 5 iterations")

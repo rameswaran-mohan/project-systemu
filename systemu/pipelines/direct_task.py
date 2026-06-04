@@ -28,6 +28,23 @@ from systemu.vault.vault import Vault
 logger = logging.getLogger(__name__)
 
 
+def _waiting_on_tools_message(not_ready_names, not_ready_tools) -> str:
+    """v0.8.22.1 (Fix 1c): adapt the waiting-on-tools wording to the blocker.
+    If every not-ready tool already has code (forged/deployed/tested) and is
+    merely disabled, the operator just needs to ENABLE it — not forge it."""
+    from systemu.core.models import ToolStatus
+    names = ", ".join(not_ready_names)
+    only_disabled = bool(not_ready_tools) and all(
+        getattr(t, "status", None) != ToolStatus.PROPOSED for t in not_ready_tools
+    )
+    if only_disabled:
+        return (f"Waiting on tools: {names}. Enable them in the Tools Registry "
+                f"(toggle ON); the task runs automatically once enabled.")
+    return (f"Waiting on tools: {names}. Approve their dependencies "
+            f"(Notifications → Approve & install) or forge them; the task runs "
+            f"automatically once they deploy.")
+
+
 def _handle_pending_decision_in_chat(vault, ts, *, decision_id, dedup_key, options) -> None:
     """v0.8.22 (C): when a chat-submitted run pauses on PendingOperatorDecision,
     update the chat history entry to status='pending_decision' so the chat UI
@@ -238,18 +255,21 @@ def run_direct_task(
     # Park it as waiting_on_tools; recovery Pass 2 auto-runs it once tools deploy.
     from systemu.runtime.shadow_runtime import tool_is_runtime_ready
     not_ready = []
+    not_ready_tools = []
     for tid in activity.required_tool_ids:
         try:
             t = vault.get_tool(tid)
         except KeyError:
             not_ready.append(tid)
             continue
-        if not tool_is_runtime_ready(t.status):
+        # v0.8.22.1 (Fix 1b): a disabled tool can't be invoked (Gate 3) — treat it
+        # as not-ready so the activity parks instead of burning iterations failing
+        # GATE_3_DISABLED at invocation.
+        if not tool_is_runtime_ready(t.status) or not getattr(t, "enabled", False):
             not_ready.append(t.name)
+            not_ready_tools.append(t)
     if not_ready:
-        msg = ("Waiting on tools: " + ", ".join(not_ready)
-               + ". Approve their dependencies (Notifications → Approve & install) "
-                 "or forge them; the task runs automatically once they deploy.")
+        msg = _waiting_on_tools_message(not_ready, not_ready_tools)
         # v0.8.13 Fix 6a: re-mark the activity PARTIAL so the heal sweeps
         # (tool_service._heal_partial_activities + recovery Pass 2) always cover
         # it — even when a reused tool left it UNASSIGNED.
@@ -298,6 +318,7 @@ def run_direct_task(
             sub_id = supervisor.submit(
                 activity.id, shadow.id,
                 priority=2, reason="chat", origin="chat",
+                chat_submission_id=ts,  # v0.8.22.1 (Fix 2)
             )
             vault.update_chat_history_entry(ts, {
                 "status": "queued",
