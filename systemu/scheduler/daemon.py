@@ -396,6 +396,14 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # pattern — best-effort; daemon boots even on migrator failure.
     _v0822_run_vault_migrator(vault, logger_=logger)
 
+    # v0.8.22.1 (R5): resume chat tasks when their stuck-loop decision is resolved.
+    try:
+        from systemu.runtime.resume_on_decision import register as _register_resume
+        from systemu.runtime.supervisor import Supervisor
+        _register_resume(vault, Supervisor.get(), data_dir=Path("data"))
+    except Exception:
+        logger.exception("[Daemon] v0.8.22.1: resume-on-decision registration failed — continuing boot")
+
     # Build scheduler
     scheduler = BackgroundScheduler()
     scheduler.add_job(

@@ -476,12 +476,22 @@ def _upsert_tool(spec: dict, vlt: Vault) -> tuple[str, bool]:
         except KeyError:
             logger.warning("[Extract] existing_id %s not found — creating new tool", existing_id)
 
-    # Deterministic name guard: if a deployed+enabled tool with this name already exists,
-    # reuse it unconditionally — the LLM cannot create duplicates of starter pack tools.
+    # v0.8.22.1 (Fix 1a): reuse ANY existing same-name tool, regardless of
+    # enabled/status, so the activity converges on a single tool id and the
+    # forge flow never spawns duplicates. is_new only when the tool genuinely
+    # still needs forging (PROPOSED with no code yet). A forged/deployed-but-
+    # disabled tool is NOT "missing" — direct_task's readiness gate (Fix 1b)
+    # parks the activity as waiting_on_tools so the operator enables it.
     name_match = vlt.find_tool_by_name(spec.get("name", ""))
-    if name_match and name_match.enabled and name_match.status in (ToolStatus.DEPLOYED, ToolStatus.UPGRADED):
-        logger.debug("[Extract] Name dedup: reusing existing tool %s (%s)", name_match.id, name_match.name)
-        return name_match.id, False
+    if name_match:
+        still_needs_forge = (
+            name_match.status == ToolStatus.PROPOSED
+            and not getattr(name_match, "implementation_path", None)
+        )
+        logger.debug("[Extract] Name dedup: reusing %s (%s) status=%s enabled=%s needs_forge=%s",
+                     name_match.id, name_match.name, name_match.status,
+                     name_match.enabled, still_needs_forge)
+        return name_match.id, still_needs_forge
 
     tool = Tool(
         id=generate_id("tool"),

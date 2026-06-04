@@ -506,7 +506,7 @@ def request_credential(req, *, resolver=None) -> Optional[str]:
                                    options=actions, credential_key=req.key)
 
 
-def request_choice(questions, *, dedup_key) -> Optional[dict]:
+def request_choice(questions, *, dedup_key, extra_context=None) -> Optional[dict]:
     """v0.8.19 — ask the operator a structured question (multi-option + free-text).
 
     questions: [{id, prompt, multi: bool, options: [{label, desc}], allow_free_text: bool}]
@@ -536,6 +536,9 @@ def request_choice(questions, *, dedup_key) -> Optional[dict]:
         context=_v0822_merge_chat_id({
             "kind": "structured_question",
             "questions": questions,
+            # v0.8.22.1 (R4): resume coordinates so the daemon re-dispatch handler
+            # can recover execution_id / activity_id / objective_id on resolve.
+            **(extra_context or {}),
         }),
         dedup_key=dedup_key,
     )
