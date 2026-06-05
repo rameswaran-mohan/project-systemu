@@ -68,6 +68,91 @@ def _resume_waiting_chat_entry(vault, activity_id: str) -> None:
         logger.debug("[Job] _resume_waiting_chat_entry failed for %s", activity_id, exc_info=True)
 
 
+def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
+    """Cross-process safety net for v0.8.22.1 resume-after-decision.
+
+    The EventBus subscriber registered by ``resume_on_decision.register``
+    only fires for resolutions that happen IN the daemon process. The CLI
+    command ``sharing_on decisions resolve`` runs in a separate process
+    and its publish never reaches the daemon. Without this poll, a CLI
+    resolution would mark the decision resolved but leave the chat task
+    parked forever.
+
+    Walks the decisions index, filters to resolved structured_question
+    decisions that carry resume coords and haven't been dispatched yet
+    (per the persisted ``decision.context["resume_dispatched"]`` flag),
+    and calls ``resume_on_decision._dispatch_resume`` for each. The
+    persisted marker ensures we never double-dispatch even if the
+    EventBus subscriber already handled the same decision earlier.
+
+    Returns the number of decisions actually re-dispatched.
+    Best-effort: per-decision failures are logged and the loop continues.
+    """
+    from systemu.runtime import resume_on_decision as _rod
+
+    try:
+        headers = vault.load_index("decisions") or []
+    except Exception:
+        logger.debug("[ResumeReconciler] could not load decisions index", exc_info=True)
+        return 0
+
+    candidate_ids = [h["id"] for h in headers if h.get("status") == "resolved"]
+    if not candidate_ids:
+        return 0
+
+    dispatched = 0
+    for did in candidate_ids:
+        try:
+            decision = vault.get_decision(did)
+        except Exception:
+            logger.debug("[ResumeReconciler] could not load decision %s", did, exc_info=True)
+            continue
+        dctx = decision.context or {}
+        # Cheap filters before touching the dispatcher
+        if dctx.get("kind") != "structured_question":
+            continue
+        if dctx.get("resume_dispatched"):
+            continue
+        if not dctx.get("chat_submission_id"):
+            continue
+        if not (dctx.get("execution_id") and dctx.get("activity_id") and dctx.get("shadow_id")):
+            continue
+        try:
+            if _rod._dispatch_resume(
+                decision, vault=vault, supervisor=supervisor, data_dir=data_dir,
+            ):
+                dispatched += 1
+        except Exception:
+            logger.exception(
+                "[ResumeReconciler] _dispatch_resume failed for decision %s", did,
+            )
+
+    if dispatched:
+        logger.info(
+            "[ResumeReconciler] re-dispatched %d resolved stuck-decision(s) "
+            "via cross-process poll", dispatched,
+        )
+    return dispatched
+
+
+def _resume_on_decision_reconciler_job() -> None:
+    """APScheduler entry: thin wrapper around ``reconcile_resolved_stuck_decisions``
+    using the daemon-initialised globals.  Pulls the live Supervisor on demand."""
+    if _vault is None:
+        return
+    try:
+        from systemu.runtime.supervisor import Supervisor
+        supervisor = Supervisor.get()
+    except Exception:
+        # Supervisor not started yet (very early boot) — try again next tick.
+        return
+    try:
+        from pathlib import Path
+        reconcile_resolved_stuck_decisions(_vault, supervisor, data_dir=Path("data"))
+    except Exception:
+        logger.exception("[ResumeReconciler] job crashed")
+
+
 def startup_recovery_sweep() -> None:
     """Run once at daemon start: audit the vault for pipeline states left incomplete
     by a prior crash. Safe to call multiple times — every step is idempotent.

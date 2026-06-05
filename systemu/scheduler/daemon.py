@@ -463,6 +463,24 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # v0.8.22.1 follow-up: cross-process safety net for resume-after-decision.
+    # The EventBus subscriber registered above only fires for in-daemon
+    # resolutions. CLI `sharing_on decisions resolve` runs in a separate
+    # process — its EventBus publish never reaches the daemon. This poll
+    # catches those out-of-process resolutions and triggers the same
+    # re-dispatch. Cheap (one index read per tick) and idempotent
+    # (persisted decision.context["resume_dispatched"] flag prevents
+    # double-dispatch across both paths and across restarts).
+    from systemu.scheduler.jobs import _resume_on_decision_reconciler_job
+    scheduler.add_job(
+        _resume_on_decision_reconciler_job,
+        trigger="interval",
+        seconds=15,
+        id="resume_on_decision_reconciler",
+        name="Resume-on-Decision Cross-Process Reconciler",
+        replace_existing=True,
+    )
+
     scheduler.start()
 
     # One-shot recovery sweep — fires 5 seconds after startup to heal any
@@ -491,7 +509,8 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     logger.info(
         "[Daemon] Jobs: shadow sweep (hourly) | memory consolidation (02:00) | "
         "evolution check (03:00) | tool reconciler (every 30s) | "
-        "scheduled execute (every 1min)",
+        "scheduled execute (every 1min) | "
+        "resume-on-decision reconciler (every 15s)",
     )
 
     # ── Start NiceGUI dashboard in a background thread ─────────────────────
