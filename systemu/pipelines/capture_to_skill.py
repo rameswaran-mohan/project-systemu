@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from sharing_on.config import Config
+from systemu.core.models import Activity
 from systemu.pipelines.activity_extractor import extract_and_process
 from systemu.pipelines.scroll_refiner import refine_scroll
 from systemu.pipelines.skill_exporter import export_skill
@@ -89,8 +90,13 @@ def export_skill_from_capture(
         )
     else:
         logger.info("[capture_to_skill] extracting skills from scroll %s", scroll.id)
-        result: Dict[str, Any] = extract_and_process(scroll, config, vault)
-        skill_ids: List[str] = result.get("skill_ids", []) if isinstance(result, dict) else []
+        activity: Optional[Activity] = extract_and_process(scroll, config, vault)
+        if activity is None:
+            raise RuntimeError(
+                f"extract_and_process failed for scroll {scroll.id} — "
+                f"see logs; scroll was reset to PENDING_APPROVAL."
+            )
+        skill_ids: List[str] = list(activity.required_skill_ids or [])
         if not skill_ids:
             raise RuntimeError(
                 f"extract_and_process produced no Skill for scroll {scroll.id} — "
