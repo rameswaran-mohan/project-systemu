@@ -641,10 +641,11 @@
   {
     "id": "tool_web_extract",
     "name": "web_extract",
-    "description": "Fetch a URL and extract structured records from it in one step. Prefer this over chaining fetch_html/web_read + extract_records when you start from a URL.",
+    "description": "Fetch a URL and extract structured records from it in one step. Pass `fields=[\"name\",\"url\",\"rating\"]` for the simple case; the runtime builds the JSON Schema for you. Prefer this over chaining fetch_html/web_read + extract_records when you start from a URL.",
     "tool_type": "web",
     "parameter_names": [
       "url",
+      "fields",
       "schema",
       "max_records",
       "max_pages",

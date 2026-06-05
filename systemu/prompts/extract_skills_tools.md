@@ -156,6 +156,28 @@ has. Before describing a new tool, check this list carefully.
 - "summarize this URL" → use `web_extract` or `web_read` + `extract_records`.
   Do NOT invent `summarize_url`.
 
+### Calling `web_extract` (LLM ergonomics)
+
+`web_extract` accepts a **simple `fields` list** so you do not have to build a
+JSON Schema yourself. Prefer this form for typical list-of-cards pages:
+
+```json
+{
+  "tool": "web_extract",
+  "arguments": {
+    "url": "https://example.com/burritos-near-me",
+    "fields": ["name", "url", "rating", "price"]
+  }
+}
+```
+
+Type inference: names like `rating`, `price`, `count`, `score`, `votes`,
+`stars`, `year`, `amount` are auto-typed as numbers; everything else is a
+string. Use the advanced `schema` parameter only when you need nested objects
+or non-string/non-number types. Calling `web_extract` with neither `fields`
+nor `schema` is also legal — the tool falls back to a best-effort heuristic
+that returns `{name, url, price, rating, description}` records.
+
 ---
 
 ## Deduplication Rules
