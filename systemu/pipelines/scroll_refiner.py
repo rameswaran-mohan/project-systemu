@@ -773,6 +773,23 @@ def refine_from_text(
     if prior_task:
         user_payload["prior_task"] = prior_task
 
+    # v0.9.0 (Layer 1): inject user profile + recent/relevant facts so the
+    # LLM can resolve "near me" / "for me" without asking the user.
+    try:
+        _prof = vault.get_user_profile()
+        if _prof is not None:
+            user_payload["user_profile"] = _prof.model_dump(mode="json")
+        # Keep the fact budget tight: recent 20, no superseded.
+        _facts = vault.load_user_facts(recent=20, include_superseded=False)
+        if _facts:
+            user_payload["user_facts"] = [
+                {"fact": f.fact, "tags": f.tags, "confidence": f.confidence}
+                for f in _facts
+            ]
+    except Exception:
+        logger.debug("[Scroll] could not enrich user_payload with profile/facts",
+                     exc_info=True)
+
     logger.info("[Scroll] Refining chat prompt via elder_intake.md ...")
     intake_prompt = load_prompt("elder_intake.md")
     try:

@@ -1523,3 +1523,150 @@ def decisions_resolve(ctx, decision_id: str, choice: str):
         ctx.exit(2)
         return
     console.print(f"[green]Resolved {decision_id} -> {resolved.choice}[/green]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 (Layer 1): user profile + facts
+# ─────────────────────────────────────────────────────────────────────────────
+
+@click.group("user")
+def user_group():
+    """Manage your persistent user profile (name, location, timezone, output dir)
+    and the freeform fact log systemu uses to personalize tasks."""
+
+
+@user_group.command("init")
+@click.pass_context
+def user_init(ctx):
+    """First-run wizard: capture name, location, timezone, output dir."""
+    import getpass
+    from systemu.core.models import UserProfile
+    _cfg, vault = _get_vault_and_config(ctx)
+    existing = vault.get_user_profile()
+    if existing is not None:
+        click.echo("A user profile already exists. Use `sharing_on user show` to view "
+                   "or `sharing_on user set <field> <value>` to update.")
+        return
+    default_name = getpass.getuser()
+    name = click.prompt("Your name", default=default_name)
+    location = click.prompt("Where are you? (e.g. 'Bangalore, India')")
+    try:
+        from time import tzname
+        default_tz = tzname[0] or "UTC"
+    except Exception:
+        default_tz = "UTC"
+    tz = click.prompt("Your timezone (IANA, e.g. 'Asia/Kolkata')", default=default_tz)
+    default_out = str(Path.home() / "systemu-output")
+    out = click.prompt("Default output directory", default=default_out)
+    prof = UserProfile(name=name, location_text=location, timezone=tz,
+                       default_output_dir=out)
+    vault.save_user_profile(prof)
+    click.echo(f"✓ Profile saved to {Path(vault.root) / 'user_profile.json'}")
+    click.echo("\nNext: `sharing_on chat submit \"...\"` — systemu now knows you.")
+
+
+@user_group.command("show")
+@click.pass_context
+def user_show(ctx):
+    """Display the current profile + a summary of facts."""
+    _cfg, vault = _get_vault_and_config(ctx)
+    prof = vault.get_user_profile()
+    if prof is None:
+        click.echo("No profile set. Run `sharing_on user init` to create one.")
+        return
+    click.echo("─ User profile ───────────────────────────")
+    click.echo(f"  name:              {prof.name}")
+    click.echo(f"  location_text:     {prof.location_text}")
+    click.echo(f"  timezone:          {prof.timezone}")
+    click.echo(f"  default_output_dir: {prof.default_output_dir}")
+    facts = vault.load_user_facts()
+    click.echo(f"\n─ Facts ({len(facts)} active) ─────────────")
+    for f in facts[-5:]:
+        click.echo(f"  [{f.id}] ({f.source}) {f.fact}")
+    if len(facts) > 5:
+        click.echo(f"  ... ({len(facts) - 5} more — `sharing_on user facts list` for all)")
+
+
+@user_group.command("set")
+@click.argument("field", type=click.Choice(["name", "location_text", "timezone",
+                                            "default_output_dir"]))
+@click.argument("value")
+@click.pass_context
+def user_set(ctx, field: str, value: str):
+    """Update one typed field on the profile."""
+    _cfg, vault = _get_vault_and_config(ctx)
+    prof = vault.get_user_profile()
+    if prof is None:
+        click.echo("No profile set. Run `sharing_on user init` first.")
+        ctx.exit(1)
+    updated = prof.model_copy(update={field: value})
+    vault.save_user_profile(updated)
+    click.echo(f"✓ {field} = {value}")
+
+
+@user_group.command("remember")
+@click.argument("fact_text")
+@click.option("--tag", "-t", multiple=True, help="Tag for this fact (repeatable).")
+@click.pass_context
+def user_remember(ctx, fact_text: str, tag):
+    """Add an explicit fact about you to the freeform fact log."""
+    _cfg, vault = _get_vault_and_config(ctx)
+    f = vault.append_user_fact(fact=fact_text, source="explicit_user",
+                                tags=list(tag), source_ref="cli:user_remember")
+    click.echo(f"✓ remembered: [{f.id}] {f.fact}")
+
+
+@user_group.group("facts")
+def user_facts_group():
+    """Inspect the freeform fact log."""
+
+
+@user_facts_group.command("list")
+@click.option("--tag", "-t", multiple=True, help="Filter by tag (repeatable).")
+@click.option("--recent", "-n", type=int, default=None,
+              help="Show only the most recent N facts.")
+@click.option("--include-superseded", is_flag=True, default=False,
+              help="Include facts that were forgotten or replaced.")
+@click.pass_context
+def user_facts_list(ctx, tag, recent, include_superseded):
+    """List facts, newest-last."""
+    _cfg, vault = _get_vault_and_config(ctx)
+    facts = vault.load_user_facts(tags=list(tag) or None, recent=recent,
+                                  include_superseded=include_superseded)
+    if not facts:
+        click.echo("(no facts)")
+        return
+    for f in facts:
+        marker = " [SUPERSEDED]" if f.superseded_by else ""
+        tags_s = f" #{' #'.join(f.tags)}" if f.tags else ""
+        click.echo(f"  [{f.id}] ({f.source}, conf={f.confidence:.2f}){tags_s}{marker}\n    {f.fact}")
+
+
+@user_group.command("forget")
+@click.argument("fact_id")
+@click.pass_context
+def user_forget(ctx, fact_id: str):
+    """Mark a fact as superseded (the fact stays in the audit log)."""
+    _cfg, vault = _get_vault_and_config(ctx)
+    ok = vault.load_user_facts(include_superseded=True)
+    if not any(f.id == fact_id for f in ok):
+        click.echo(f"No fact with id {fact_id!r}.")
+        ctx.exit(1)
+    from systemu.runtime.user_profile import forget_fact
+    forget_fact(vault, fact_id, reason="forgotten")
+    click.echo(f"✓ forgot {fact_id}")
+
+
+@user_group.command("wipe")
+@click.option("--confirm", is_flag=True, default=False,
+              help="Required. Without this, the command refuses.")
+@click.pass_context
+def user_wipe(ctx, confirm: bool):
+    """Delete the profile + all facts. Irreversible."""
+    if not confirm:
+        click.echo("Refusing to wipe without --confirm.")
+        ctx.exit(1)
+    _cfg, vault = _get_vault_and_config(ctx)
+    from systemu.runtime.user_profile import wipe
+    wipe(vault)
+    click.echo("✓ user profile and facts wiped")

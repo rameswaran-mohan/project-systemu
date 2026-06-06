@@ -1152,6 +1152,7 @@ try:
         chat_group,
         debug_group,
         decisions_group,
+        user_group,
     )
     cli.add_command(scrolls_group,   name="scrolls")
     cli.add_command(army_group,      name="army")
@@ -1163,6 +1164,7 @@ try:
     cli.add_command(chat_group,      name="chat")
     cli.add_command(debug_group,     name="debug")
     cli.add_command(decisions_group, name="decisions")
+    cli.add_command(user_group,      name="user")
 except ImportError:
     # systemu package not yet installed — sharing_on still works standalone
     pass

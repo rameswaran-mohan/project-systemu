@@ -604,4 +604,42 @@ class Schedule(BaseModel):
     missed_fires_count: int = 0
     """RECURRING schedules: cumulative number of fires skipped due to staleness."""
     last_missed_at:     Optional[datetime] = None
-    """Wall-clock UTC timestamp of the most recent missed-fire detection."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 (Layer 1): User model + persistent context
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UserProfile(BaseModel):
+    """v0.9.0 (Layer 1): the typed spine of what systemu knows about the user.
+
+    Four fields, intentionally minimal. Everything else lives in user_facts.
+    Consumers (scroll_refiner, activity_extractor, shadow_runtime) may rely on
+    every field being present and well-typed.
+    """
+    schema_version: int = 1
+    name: str
+    location_text: str
+    timezone: str
+    default_output_dir: str
+
+    model_config = {"extra": "forbid"}
+
+
+class UserFact(BaseModel):
+    """v0.9.0 (Layer 1): one freeform fact about the user.
+
+    Facts accumulate in vault/user_facts.jsonl with full provenance. The
+    `superseded_by` field lets consolidation mark stale facts without
+    rewriting the log (audit trail preserved).
+    """
+    id: str
+    ts: str
+    fact: str
+    tags: List[str] = Field(default_factory=list)
+    source: str
+    source_ref: Optional[str] = None
+    confidence: float = 1.0
+    superseded_by: Optional[str] = None
+
+    model_config = {"extra": "forbid"}

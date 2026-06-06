@@ -110,6 +110,10 @@ You now receive **richer catalog entries** than prior versions:
 * **Existing tools** include `parameters_schema` + `return_schema` (summarised as `{field: type}` pairs).
 * **Existing skills** include `target_outcomes` (what intents they serve) and `produces` (output types they yield).
 * The scroll payload now carries `intent` AND `expected_outcome` AND per-objective `output_type`.
+* `default_output_dir` *(optional)*: the user's preferred output directory. If a
+  generated tool or skill writes files, prefer this directory in the
+  `parameters_schema` defaults or example values. Reflect it in
+  `implementation_notes` so the LLM later picks paths under it.
 
 Use this richer information to do **data-flow reasoning**, not keyword matching:
 

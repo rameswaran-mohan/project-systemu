@@ -126,6 +126,35 @@ def _stuck_thresholds() -> tuple[int, int, bool]:
     return (no_progress, tool_fails, guard_on)
 
 
+def _build_user_context_block(vault) -> str:
+    """v0.9.0 (Layer 1): compact one-block summary of the user profile + up to
+    5 most-recent facts. Returns "" when no profile is set.
+
+    The block is <= ~10 lines so it fits comfortably in a system prompt without
+    risk to the token budget. Layer 2 (episodic memory) will expand this.
+    """
+    try:
+        prof = vault.get_user_profile()
+        if prof is None:
+            return ""
+        lines = [
+            "## What you know about the user",
+            f"- name: {prof.name}",
+            f"- location: {prof.location_text}",
+            f"- timezone: {prof.timezone}",
+            f"- default_output_dir: {prof.default_output_dir}",
+        ]
+        facts = vault.load_user_facts(recent=5, include_superseded=False)
+        if facts:
+            lines.append("- facts (most recent):")
+            for f in facts[-5:]:
+                conf = f"{f.confidence:.2f}"
+                lines.append(f"  - ({conf}) {f.fact}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def _build_boot_memory(shadow: Any, vault: Any) -> str:
     """Build the boot-time memory block for a shadow.
 
@@ -1300,6 +1329,10 @@ class ShadowRuntime:
         self._stuck_round_for_obj.clear()
         self._operator_hint = None
         self._resume_stuck_answer = None  # v0.8.22.1 (R6): (obj_id, answer) lifted from snapshot
+        # v0.9.0 (Layer 1): one-block user context computed once per run.
+        # Prompt assembly can read self._user_context_block; Layer 2 will
+        # extend this with episodic memory.
+        self._user_context_block = _build_user_context_block(self.vault)
         # v0.8.22 (C): carry chat_submission_id for the run so the R3 producers
         # can thread it into OperatorDecision.context, enabling the chat UI to
         # surface decisions inline.

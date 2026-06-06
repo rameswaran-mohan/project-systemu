@@ -117,6 +117,15 @@ def extract_and_process(
             "narrative":     scroll.narrative_md,
             "action_blocks": [ab.model_dump(mode="json") for ab in scroll.action_blocks],
         }
+    # v0.9.0 (Layer 1): pre-populate the user's default output directory so
+    # extracted objectives can reference concrete write paths.
+    try:
+        _prof = vlt.get_user_profile()
+        if _prof is not None:
+            task_spec["default_output_dir"] = _prof.default_output_dir
+    except Exception:
+        pass
+
     task_spec["existing_skills"] = existing_skills
     task_spec["existing_tools"]  = existing_tools
 
