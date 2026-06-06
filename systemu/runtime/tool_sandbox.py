@@ -112,6 +112,8 @@ class ToolSandbox:
         registry: Optional["ToolRegistry"] = None,
         install_mode=None,
         approvals=None,
+        vault=None,
+        config=None,
     ):
         self.vault_root    = Path(vault_root)
         self.timeout       = default_timeout
@@ -119,6 +121,8 @@ class ToolSandbox:
         self._registry     = registry   # ToolRegistry for the fast direct-call path
         self._install_mode = install_mode
         self._approvals    = approvals
+        self._vault        = vault      # v0.9.1: for action-tool audit writes
+        self._config       = config     # v0.9.1: for audit_log_enabled check
 
         # Resolve the canonical backend name from env or explicit kwarg.
         from systemu.runtime.backend import (
@@ -134,6 +138,47 @@ class ToolSandbox:
             install_mode=install_mode,
             approvals=approvals,
         )
+
+    def _after_successful_call(
+        self,
+        *,
+        tool,
+        params,
+        execution_id,
+        objective_id,
+        user_id=None,
+    ):
+        """v0.9.1: action-tool audit hook. Called from the post-call success
+        path after a tool returns ToolResult(success=True). No-op for
+        non-action tools or when audit_log_enabled is False.
+        """
+        if not getattr(tool, "is_action_tool", False):
+            return
+        cfg = self._config
+        if cfg is not None and not getattr(cfg, "audit_log_enabled", True):
+            return
+        vault = self._vault
+        if vault is None:
+            return  # no vault → can't audit; degrade silently
+
+        from systemu.runtime import audit_log
+        try:
+            audit_log.append_action(
+                vault,
+                execution_id=execution_id,
+                objective_id=objective_id,
+                action=tool.name,
+                params=params or {},
+                success=True,
+                error=None,
+                user_id=user_id,
+            )
+        except Exception as exc:  # pragma: no cover — best-effort
+            import logging
+            logging.getLogger(__name__).warning(
+                "[ToolSandbox] action audit write failed for %s: %s",
+                tool.name, exc,
+            )
 
     def attach_registry(self, registry: "ToolRegistry") -> None:
         """Attach a ToolRegistry so execute_tool() uses the direct-call fast path."""
@@ -189,6 +234,9 @@ class ToolSandbox:
                     tool_name, parameters, timeout=float(effective_timeout)
                 )
                 success = result_dict.get("success", True)
+                # v0.9.1: truncate_result is called here by callers that have
+                # the Tool object in scope (e.g. shadow_runtime in T12).
+                # execute_tool only has the impl path, not the Tool model.
                 return ToolResult(
                     success=success,
                     parsed=result_dict,
@@ -268,3 +316,23 @@ class ToolSandbox:
             return True
 
         return False
+
+
+def truncate_result(result: "ToolResult", tool) -> "ToolResult":
+    """Cap the ToolResult's stdout to ``tool.max_result_size_chars``.
+
+    Returns the same ToolResult (mutated in-place) when truncation fires,
+    with a "[... truncated by tool.max_result_size_chars=N]" marker appended.
+    None / 0 cap = passthrough (no truncation).
+
+    Works with the actual ToolResult dataclass which stores stdout as a direct
+    str field (``result.stdout``), not nested in an ``output`` dict.
+    """
+    cap = getattr(tool, "max_result_size_chars", None)
+    if not cap or cap <= 0:
+        return result
+    stdout = result.stdout or ""
+    if len(stdout) <= cap:
+        return result
+    result.stdout = stdout[:cap] + f"\n[... truncated by tool.max_result_size_chars={cap}]"
+    return result

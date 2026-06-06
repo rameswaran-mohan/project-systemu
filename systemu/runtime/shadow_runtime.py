@@ -45,6 +45,132 @@ from systemu.pipelines.skill_recalibrator import (
     recalibrate_skill,
 )
 
+# ─────────────────────────────────────────────────────────────────────────
+#  v0.9.1 (Layer 4) — Durable-outcome verifier hook surface
+# ─────────────────────────────────────────────────────────────────────────
+from dataclasses import dataclass, field as _dataclass_field
+
+from systemu.runtime import objective_verifier, state_delta
+
+
+@dataclass
+class ObjectiveState:
+    """Per-objective verifier bookkeeping carried across iterations."""
+    rejection_count: int = 0
+    calls_this_turn: int = 0
+    baseline: Optional[object] = None  # state_delta._Baseline
+
+
+@dataclass
+class CompletionOutcome:
+    """Result of one process_completion_claim call."""
+    credited: bool
+    state: ObjectiveState
+    feedback_message: Optional[str] = None
+    escalate_stuck: bool = False
+    bypassed_verifier: bool = False
+
+
+def process_completion_claim(
+    *,
+    objective,
+    vault,
+    config,
+    execution_id: str,
+    default_output_dir: str,
+    chat_result: Optional[str],
+    state: ObjectiveState,
+    fresh_work_since_last_call: bool = True,
+    user_id: Optional[str] = None,
+    extensions: Optional[dict] = None,
+) -> CompletionOutcome:
+    """Judge one completion claim. Returns the credit decision + updated state.
+
+    - If state.calls_this_turn >= config.verifier_per_turn_cap AND no fresh
+      effectful work landed → bypass verifier (claim cannot be re-judged this
+      turn; runtime should keep iterating). Returns ``bypassed_verifier=True``.
+    - Otherwise calls the verifier and credits/rejects accordingly.
+    - On reject: increments rejection_count, returns feedback_message, and if
+      rejection_count >= config.verifier_rejection_budget sets escalate_stuck.
+    """
+    cap = int(getattr(config, "verifier_per_turn_cap", 2))
+    if state.calls_this_turn >= cap and not fresh_work_since_last_call:
+        return CompletionOutcome(
+            credited=False, state=state, bypassed_verifier=True,
+            feedback_message=(
+                "Verifier per-turn cap reached without fresh effectful work. "
+                "Produce new durable evidence (write the file, send the action) "
+                "before claiming completion again."
+            ),
+        )
+
+    # Build the state delta against this objective's baseline.
+    baseline = state.baseline or state_delta.capture_baseline(
+        vault=vault, execution_id=execution_id,
+        objective_id=objective.id, default_output_dir=default_output_dir,
+    )
+    delta = state_delta.compute_delta(
+        baseline=baseline, vault=vault, default_output_dir=default_output_dir,
+        chat_result=chat_result, config=config,
+        execution_id=execution_id, user_id=user_id,
+        extensions=extensions or {},
+    )
+
+    verdict = objective_verifier.run(objective=objective, delta=delta, config=config)
+    state.calls_this_turn += 1
+
+    if verdict["verified"]:
+        # Reset rejection counter on success.
+        state.rejection_count = 0
+        return CompletionOutcome(credited=True, state=state)
+
+    state.rejection_count += 1
+    feedback = (
+        f"Objective {objective.id} claim REJECTED. Verifier said: "
+        f"{verdict['reason']}. Produce the declared evidence before claiming "
+        f"completion again."
+    )
+    budget = int(getattr(config, "verifier_rejection_budget", 3))
+    escalate = state.rejection_count >= budget
+    return CompletionOutcome(
+        credited=False, state=state,
+        feedback_message=feedback, escalate_stuck=escalate,
+    )
+
+
+def recredit_on_resume(
+    *,
+    objective,
+    vault,
+    config,
+    execution_id: str,
+    default_output_dir: str,
+    chat_result: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> CompletionOutcome:
+    """Resume hook: judge an uncredited objective against current durable state.
+
+    Baseline is the unix epoch — we want EVERYTHING currently present to count
+    as evidence. If the verifier passes, the objective is re-credited without
+    re-running its tool path.
+    """
+    baseline = state_delta._Baseline(iteration_start_ts="1970-01-01T00:00:00Z")
+    delta = state_delta.compute_delta(
+        baseline=baseline, vault=vault, default_output_dir=default_output_dir,
+        chat_result=chat_result, config=config,
+        execution_id=execution_id, user_id=user_id,
+    )
+    verdict = objective_verifier.run(objective=objective, delta=delta, config=config)
+    if verdict["verified"]:
+        return CompletionOutcome(credited=True, state=ObjectiveState())
+    return CompletionOutcome(
+        credited=False, state=ObjectiveState(rejection_count=0),
+        feedback_message=verdict["reason"],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+
 # Deferred refinery dispatch
 def _dispatch_refinery(shadow, scroll, result_dict, context, config, vault):
     try:
@@ -973,6 +1099,8 @@ class ShadowRuntime:
             ),
             install_mode=install_mode,
             approvals=approvals,
+            vault=vault,         # v0.9.1: T8 must-wire — enables _after_successful_call audit hook
+            config=config,       # v0.9.1: T8 must-wire — enables max_result_size_chars truncation
         )
         # Attach ToolRegistry for the direct-call fast path (avoids subprocess overhead
         # and fixes path-resolution issues with relative vault_dir configurations).
@@ -1011,6 +1139,10 @@ class ShadowRuntime:
         self._same_tool_fail_streak: dict[str, int] = {}
         self._stuck_round_for_obj: dict[int, int] = {}
         self._operator_hint: "str | None" = None
+        # v0.9.1 (Layer 4): per-objective verifier state + fresh-work flag.
+        # Reset per run in execute(); mutated during completes_objective path.
+        self._objective_states: dict[int, ObjectiveState] = {}
+        self._fresh_work_since_last_verifier_call: bool = False
         # Directory is created lazily when the vault's prune_old_executions needs it;
         # we no longer eagerly create it since snapshot/SKILL.md disk writes are removed.
 
@@ -1329,6 +1461,9 @@ class ShadowRuntime:
         self._stuck_round_for_obj.clear()
         self._operator_hint = None
         self._resume_stuck_answer = None  # v0.8.22.1 (R6): (obj_id, answer) lifted from snapshot
+        # v0.9.1 (Layer 4): reset verifier bookkeeping per run.
+        self._objective_states.clear()
+        self._fresh_work_since_last_verifier_call = False
         # v0.9.0 (Layer 1): one-block user context computed once per run.
         # Prompt assembly can read self._user_context_block; Layer 2 will
         # extend this with episodic memory.
@@ -1444,6 +1579,39 @@ class ShadowRuntime:
                             # Restore completed objective ids — the runtime won't
                             # ask the LLM to redo them.
                             completed_objectives.update(snap.completed_objective_ids)
+                            # v0.9.1 (Layer 4): re-credit any objectives NOT in the snapshot
+                            # that already have durable evidence on disk.  This covers the
+                            # case where the shadow completed work but the snapshot was taken
+                            # before the verifier ran (e.g., mid-run restart).
+                            try:
+                                _uncredited = [
+                                    o for o in objectives
+                                    if o.id not in completed_objectives
+                                ]
+                                for _uc_obj in _uncredited:
+                                    _rc = recredit_on_resume(
+                                        objective=_uc_obj,
+                                        vault=self.vault,
+                                        config=self.config,
+                                        execution_id=resume_from_execution_id or execution_id,
+                                        default_output_dir=getattr(
+                                            self.config, "output_dir", str(
+                                                Path(getattr(self.config, "vault_dir", ".")) / "outputs"
+                                            )
+                                        ),
+                                    )
+                                    if _rc.credited:
+                                        completed_objectives.add(_uc_obj.id)
+                                        logger.info(
+                                            "[Runtime] recredit_on_resume: obj=%d re-credited "
+                                            "from existing durable evidence.",
+                                            _uc_obj.id,
+                                        )
+                            except Exception:
+                                logger.debug(
+                                    "[Runtime] recredit_on_resume hook crashed — skipping",
+                                    exc_info=True,
+                                )
                         if not use_objectives and snap.current_action_block:
                             current_ab = max(current_ab, int(snap.current_action_block))
                         # v0.8.22.1 (R6): if the operator answered a stuck decision,
@@ -1559,6 +1727,11 @@ class ShadowRuntime:
             # ─── THE AGENTIC LOOP ─────────────────────────────────────────────────
             while iteration < MAX_ITERATIONS:
                 iteration += 1
+
+                # v0.9.1 (Layer 4): reset per-turn verifier call counter for all objectives
+                # at the start of each new LLM turn so the cap is per-turn, not per-run.
+                for _vs in self._objective_states.values():
+                    _vs.calls_this_turn = 0
 
                 # ── v0.4.0-d: drain supervisor directive inbox and apply ─────────
                 # ExecutionMind populates this asynchronously; we apply pending
@@ -2055,44 +2228,106 @@ class ShadowRuntime:
                         completed_obj = decision.get("completes_objective")
                         if isinstance(completed_obj, int) and completed_obj not in completed_objectives:
                             if result is not None and result.success:
-                                completed_objectives.add(completed_obj)
-                                # v0.8.19 (R2): publish updated objective_state so the
-                                # live pane ticks the checklist.  Best-effort.
+                                # v0.9.1 (Layer 4): run the durable-outcome verifier before
+                                # crediting.  Best-effort: verifier errors fall through to the
+                                # legacy credit so a bad verifier config can't stall the run.
+                                _do_credit = True
                                 try:
-                                    from systemu.interface.event_bus import EventBus
-                                    EventBus.get().publish(_objective_state_event(
-                                        objectives, completed_objectives, execution_id, stamp=self._stamp))
+                                    _obj_for_verify = next(
+                                        (o for o in objectives if o.id == completed_obj), None)
+                                    if _obj_for_verify is not None:
+                                        _vstate = self._objective_states.setdefault(
+                                            completed_obj, ObjectiveState())
+                                        _v_outcome = process_completion_claim(
+                                            objective=_obj_for_verify,
+                                            vault=self.vault,
+                                            config=self.config,
+                                            execution_id=execution_id,
+                                            default_output_dir=getattr(
+                                                self.config, "output_dir", str(
+                                                    Path(getattr(self.config, "vault_dir", ".")) / "outputs"
+                                                )
+                                            ),
+                                            chat_result=None,
+                                            state=_vstate,
+                                            fresh_work_since_last_call=self._fresh_work_since_last_verifier_call,
+                                            user_id=None,
+                                        )
+                                        self._objective_states[completed_obj] = _v_outcome.state
+                                        self._fresh_work_since_last_verifier_call = False
+                                        _do_credit = _v_outcome.credited
+                                        if not _v_outcome.credited:
+                                            if _v_outcome.bypassed_verifier:
+                                                logger.debug(
+                                                    "[Runtime] Verifier per-turn cap hit for obj=%d "
+                                                    "— bypassed, not crediting this turn.",
+                                                    completed_obj,
+                                                )
+                                            else:
+                                                logger.warning(
+                                                    "[Runtime] Verifier rejected obj=%d: %s",
+                                                    completed_obj, _v_outcome.feedback_message,
+                                                )
+                                            if _v_outcome.feedback_message:
+                                                context.add_observation(
+                                                    {
+                                                        "type": "verifier_rejection",
+                                                        "objective_id": completed_obj,
+                                                        "message": _v_outcome.feedback_message,
+                                                    },
+                                                    current_ab,
+                                                )
+                                            if _v_outcome.escalate_stuck:
+                                                # Treat budget-exceeded rejection as a stuck event.
+                                                self._iters_since_obj_credit = max(
+                                                    self._iters_since_obj_credit,
+                                                    _stuck_thresholds()[0],
+                                                )
                                 except Exception:
-                                    pass
-                                # v0.8.21: stuck-guard — credit resets BOTH counters.
-                                self._update_stuck_counters(
-                                    action="TOOL_CALL",
-                                    tool_name=decision.get("tool_name") or "?",
-                                    tool_success=True,
-                                    credited_obj_id=completed_obj,
-                                )
-                                logger.info("[Runtime] Objective %d complete. %d/%d done.",
-                                            completed_obj, len(completed_objectives), total_objectives)
-
-                                if (len(completed_objectives) % SNAPSHOT_INTERVAL) == 0:
-                                    context.take_snapshot(len(completed_objectives), self.config)
-
-                                if len(completed_objectives) >= total_objectives:
-                                    logger.info("[Runtime] All objectives complete via advancement.")
-                                    self._append_to_shadow_log(
-                                        shadow, execution_id, "success", "All objectives completed.",
-                                        iteration_count=iteration, tool_calls_made=tool_call_count,
-                                        objectives_completed=len(completed_objectives),
-                                        objectives_total=total_objectives,
-                                        duration_seconds=__import__("time").time() - exec_start,
+                                    logger.debug(
+                                        "[Runtime] v0.9.1 verifier hook crashed — crediting without verify",
+                                        exc_info=True,
                                     )
-                                    res = context.build_result(
-                                        status="success",
-                                        final_summary="All objectives completed successfully.",
+
+                                if _do_credit:
+                                    completed_objectives.add(completed_obj)
+                                    # v0.8.19 (R2): publish updated objective_state so the
+                                    # live pane ticks the checklist.  Best-effort.
+                                    try:
+                                        from systemu.interface.event_bus import EventBus
+                                        EventBus.get().publish(_objective_state_event(
+                                            objectives, completed_objectives, execution_id, stamp=self._stamp))
+                                    except Exception:
+                                        pass
+                                    # v0.8.21: stuck-guard — credit resets BOTH counters.
+                                    self._update_stuck_counters(
+                                        action="TOOL_CALL",
+                                        tool_name=decision.get("tool_name") or "?",
+                                        tool_success=True,
+                                        credited_obj_id=completed_obj,
                                     )
-                                    _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
-                                    _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
-                                    return res
+                                    logger.info("[Runtime] Objective %d complete. %d/%d done.",
+                                                completed_obj, len(completed_objectives), total_objectives)
+
+                                    if (len(completed_objectives) % SNAPSHOT_INTERVAL) == 0:
+                                        context.take_snapshot(len(completed_objectives), self.config)
+
+                                    if len(completed_objectives) >= total_objectives:
+                                        logger.info("[Runtime] All objectives complete via advancement.")
+                                        self._append_to_shadow_log(
+                                            shadow, execution_id, "success", "All objectives completed.",
+                                            iteration_count=iteration, tool_calls_made=tool_call_count,
+                                            objectives_completed=len(completed_objectives),
+                                            objectives_total=total_objectives,
+                                            duration_seconds=__import__("time").time() - exec_start,
+                                        )
+                                        res = context.build_result(
+                                            status="success",
+                                            final_summary="All objectives completed successfully.",
+                                        )
+                                        _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
+                                        _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+                                        return res
                             else:
                                 logger.warning(
                                     "[Runtime] TOOL_CALL claimed completes_objective=%d "
@@ -2344,6 +2579,15 @@ class ShadowRuntime:
             tool_type=getattr(tool_obj.tool_type, "value", tool_obj.tool_type),
         )
 
+        # v0.9.1 (T8 must-wire): apply max_result_size_chars truncation.
+        # truncate_result is a module-level function in tool_sandbox; it is a
+        # no-op when tool_obj.max_result_size_chars is None.
+        try:
+            from systemu.runtime.tool_sandbox import truncate_result as _truncate_result
+            result = _truncate_result(result, tool_obj)
+        except Exception:
+            logger.debug("[Runtime] truncate_result hook skipped", exc_info=True)
+
         # Detect dependency-related result types and suppress retries.
         # Four error_types map to a single behaviour ("don't call this tool
         # again in this run") but trigger distinct operator-facing event-log
@@ -2502,6 +2746,23 @@ class ShadowRuntime:
         else:
             # Reset the per-tool failure counter on success.
             self._consec_tool_fails.pop(tool_name, None)
+            # v0.9.1 (Layer 4): mark that fresh effectful work has landed so the
+            # verifier per-turn cap clears for the next completion claim.
+            self._fresh_work_since_last_verifier_call = True
+            # v0.9.1 (final-review fix): invoke action-tool audit hook.
+            # _after_successful_call was implemented in T8 (tool_sandbox) but
+            # never called from production; without this wire, action-tool audit
+            # is dead code and audit_log verifier hints always return verified=False.
+            try:
+                self.sandbox._after_successful_call(
+                    tool=tool_obj,
+                    params=parameters or {},
+                    execution_id=execution_id,
+                    objective_id=int(decision.get("completes_objective") or 0),
+                    user_id=None,
+                )
+            except Exception:
+                logger.debug("[Runtime] action-audit hook skipped", exc_info=True)
             # v0.4.4-a: record success in tool metrics.
             try:
                 from systemu.runtime.tool_metrics import get_tool_metrics

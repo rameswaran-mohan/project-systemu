@@ -116,6 +116,12 @@ class Objective(BaseModel):
     output_type:      str = ""          # file | data | state_change | side_effect
     hints:            Dict[str, Any] = {}   # observed details: urls, paths, formats, naming
     depends_on:       List[int] = []    # objective IDs that must complete first
+    # v0.9.1 (Layer 4): free-text description of what durable evidence proves
+    # this objective complete. Tier-1 LLM generates this during scroll
+    # refinement; runtime hands it to a fresh-context Tier-1 verifier along
+    # with a StateDelta to judge whether the work happened. None = legacy
+    # behavior (credit on tool success).
+    verifier:         Optional[str] = None
 
 
 class Scroll(BaseModel):
@@ -283,6 +289,25 @@ class Tool(BaseModel):
     evolution_history:   List[Dict[str, Any]] = []
     created_at:          datetime = Field(default_factory=_now)
     updated_at:          datetime = Field(default_factory=_now)
+
+    # v0.9.1 (Layer 4): durable-action audit gate. When True, tool_sandbox
+    # writes one entry to vault/audit/actions.jsonl on each successful
+    # invocation. Read tools stay False; action tools (chat_submit,
+    # write_csv_file, email.send, etc.) opt in.
+    is_action_tool: bool = False
+
+    # v0.9.1 rev 4 (L3-readiness slot): toolset membership for the future
+    # tool-registry layer (Hermes ToolEntry pattern). No enforcement in
+    # v0.9.1 — slot reserved so v0.9.3 doesn't need a model migration.
+    # Examples (post-L3): "file", "vault", "web", "memory", "delegate",
+    # "session", "skill", "clarify", "time", "chat".
+    toolset: Optional[str] = None
+
+    # v0.9.1 rev 4: per-tool output cap, in characters. None = no cap
+    # (current behavior). tool_sandbox truncates ToolResult.stdout to this
+    # bound and logs at DEBUG when truncation fires. Prevents runaway shell
+    # output from blowing the LLM context window.
+    max_result_size_chars: Optional[int] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

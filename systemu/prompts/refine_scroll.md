@@ -55,6 +55,7 @@ If any objective fails this check (e.g., the objective is a GUI step that the us
     "id": 1,
     "goal": "Obtain the current NYSE index value and supporting context",
     "success_criteria": "Have structured NYSE index data (price, change, timestamp) in memory",
+    "verifier": "An audit_log entry with action=fetch_nyse_data exists for this execution",
     "output_type": "data",
     "hints": {"source_url_observed": "https://www.google.com/search?q=NYSE+index+today",
               "format_observed": "screenshot — better: structured data"},
@@ -64,12 +65,35 @@ If any objective fails this check (e.g., the objective is a GUI step that the us
     "id": 2,
     "goal": "Persist the captured data to a dated document at the observed output path",
     "success_criteria": "File ~/Documents/03042026 NYSE.docx exists and contains the index data",
+    "verifier": "A file at ~/Documents/03042026 NYSE.docx exists with size ≥ 5KB and contains NYSE index figures",
     "output_type": "file",
     "hints": {"output_path": "~/Documents/", "naming_pattern": "MMDDYYYY NYSE.docx", "format": "docx"},
     "depends_on": [1]
   }
 ]
 ```
+
+### Per-objective `verifier` field (v0.9.1)
+
+For each objective, set a `verifier` field describing what durable evidence
+will prove this objective complete. Be concrete — name file paths,
+audit-log actions, or chat-reply expectations. The verifier text is read
+by an independent Tier-1 model that checks actual durable state, so make
+it specific enough that a stranger could judge whether the work is done.
+
+Three examples:
+
+1. File outcome:
+   `"A file at {default_output_dir}/burritos-raw.json exists with at least 5 distinct restaurant entries (each with at least a name field)"`
+
+2. Action outcome:
+   `"An audit_log entry with action=email.send exists matching the user's wife's email address from user_facts"`
+
+3. Conversational outcome:
+   `"The chat reply summary (≥100 chars) references the ranked list and points the user at the markdown file"`
+
+When in doubt about which surface a stranger could check, prefer file
+outcomes over conversational ones — files survive across sessions.
 
 ## Objective schema
 
@@ -78,6 +102,7 @@ If any objective fails this check (e.g., the objective is a GUI step that the us
   "id": 1,
   "goal": "Imperative outcome statement (what to achieve, not how)",
   "success_criteria": "Verifiable condition that proves this objective is complete",
+  "verifier": "Durable evidence a stranger could check: file path that must exist, audit-log action that must appear, or chat reply expectation",
   "output_type": "file | data | state_change | side_effect",
   "hints": {
     "source_url_observed": "URL observed if relevant (agent may use better source)",
@@ -129,6 +154,7 @@ Return **only** valid JSON in this exact structure. No markdown fences, no expla
       "id": 1,
       "goal": "...",
       "success_criteria": "...",
+      "verifier": "Durable evidence a stranger could check: file path that must exist, audit-log action that must appear, or chat reply expectation",
       "output_type": "file",
       "hints": {},
       "depends_on": []
