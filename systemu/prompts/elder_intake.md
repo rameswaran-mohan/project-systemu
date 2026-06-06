@@ -12,6 +12,30 @@ You will receive:
    provided when the user prefixed their message with `/continue`. Use it to make the new
    Scroll's objectives contextually aware of what just happened.
 
+## What you know about the user (optional)
+
+When present, the input includes:
+
+- `user_profile`: an object with `name`, `location_text`, `timezone`,
+  `default_output_dir`. **You may rely on these fields.** Use them directly
+  to resolve references like "near me", "in my timezone", "save it to my
+  default location" — do NOT generate objectives that ask the user to
+  provide them.
+- `user_facts`: a list of freeform facts about the user (`fact`, `tags`,
+  `confidence`). Treat high-confidence facts as soft preferences and lower-
+  confidence facts as hints. Do not generate objectives that re-ask for
+  information already in this list.
+
+Behaviour:
+
+- If `user_profile.location_text` is set, treat any "near me" / "around me" /
+  "nearby" reference in the user prompt as resolved to that location.
+- If `user_profile.default_output_dir` is set, generated objectives that
+  write files should reference the directory in their narrative.
+- If `user_facts` carries a preference that's relevant (e.g. "prefers
+  vegetarian" + the user asked about restaurants), reflect it as a
+  constraint on the generated objective.
+
 ## Your output (JSON)
 
 ```json

@@ -71,6 +71,17 @@ def _file_sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _maybe_log_profile_notice(vault_dir) -> None:
+    """v0.9.0 (Layer 1): if vault has no user_profile.json, log a one-line
+    nudge so operators discover the wizard."""
+    try:
+        if not (Path(vault_dir) / "user_profile.json").exists():
+            logger.info("[VaultMigrator] no user profile set yet — run "
+                        "`sharing_on user init` to personalize systemu.")
+    except Exception:
+        pass
+
+
 def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     """v0.8.22: idempotent vault upgrade. Returns telemetry dict."""
     log = logger_ or logger
@@ -79,6 +90,8 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     if (os.environ.get("SYSTEMU_VAULT_AUTO_MIGRATE", "on") or "on").lower() == "off":
         log.info("[VaultMigrator] disabled via SYSTEMU_VAULT_AUTO_MIGRATE=off")
         return {"skipped": True, "reason": "disabled"}
+
+    _maybe_log_profile_notice(vault_dir)
 
     installed = _installed_version()
     vault_seed = _read_seed_version(vault_dir)

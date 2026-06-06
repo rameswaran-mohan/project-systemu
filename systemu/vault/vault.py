@@ -1088,6 +1088,30 @@ class Vault:
         except OSError as exc:
             logger.warning("[Vault] clear_chat_history failed: %s", exc)
 
+    # ── User profile + facts (v0.9.0 Layer 1) ───────────────────────────────
+    def get_user_profile(self):
+        """v0.9.0: return the user profile, or None if not set."""
+        from systemu.runtime.user_profile import get_profile
+        return get_profile(self)
+
+    def save_user_profile(self, profile) -> None:
+        """v0.9.0: write the user profile (atomic)."""
+        from systemu.runtime.user_profile import save_profile
+        save_profile(self, profile)
+
+    def load_user_facts(self, *, tags=None, include_superseded: bool = False,
+                          recent=None):
+        """v0.9.0: return facts (newest-last). Filters: tags, include_superseded, recent."""
+        from systemu.runtime.user_profile import get_facts
+        return get_facts(self, tags=tags, include_superseded=include_superseded, recent=recent)
+
+    def append_user_fact(self, *, fact: str, source: str, tags=None,
+                           source_ref=None, confidence: float = 1.0):
+        """v0.9.0: append a new fact, return the created UserFact."""
+        from systemu.runtime.user_profile import add_fact
+        return add_fact(self, fact, source=source, tags=tags,
+                         source_ref=source_ref, confidence=confidence)
+
     def get_latest_chat_scroll(self) -> Optional["Scroll"]:
         """Return the most recent Scroll created from a direct chat task, or None."""
         history = self.load_chat_history(limit=1)

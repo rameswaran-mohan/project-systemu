@@ -58,6 +58,26 @@ def _handle_pending_decision_in_chat(vault, ts, *, decision_id, dedup_key, optio
     })
 
 
+def _maybe_trigger_fact_extraction(vault, config, ts: str) -> None:
+    """v0.9.0 (Layer 1): after a chat task resolves to a terminal status, run
+    LLM-driven fact extraction on the entry — gated by config flag,
+    best-effort, never raises."""
+    try:
+        if not getattr(config, "auto_extract_user_facts", True):
+            return
+        entries = vault.load_chat_history(limit=200)
+        entry = next((e for e in entries if e.get("ts") == ts), None)
+        if entry is None:
+            return
+        terminal = {"completed", "failed", "pending_decision", "partial", "cancelled"}
+        if entry.get("status") not in terminal:
+            return
+        from systemu.pipelines import fact_extractor as fe
+        fe.extract_from_chat(entry, vault, config)
+    except Exception:
+        logger.debug("[DirectTask] fact-extraction hook swallowed error", exc_info=True)
+
+
 def _wire_chat_history_completion(
     vault: Vault,
     chat_ts: str,
@@ -216,12 +236,14 @@ def run_direct_task(
     except Exception as exc:
         logger.error("[DirectTask] Activity extraction failed: %s", exc)
         vault.update_chat_history_entry(ts, {"status": "failed", "error": str(exc)})
+        _maybe_trigger_fact_extraction(vault, config, ts)
         return None
 
     if activity is None:
         vault.update_chat_history_entry(ts, {
             "status": "failed", "error": "extraction returned no activity",
         })
+        _maybe_trigger_fact_extraction(vault, config, ts)
         return None
 
     # v0.8.16: this is a chat-originated task — stamp the trigger origin so
@@ -242,6 +264,7 @@ def run_direct_task(
     except Exception as exc:
         logger.error("[DirectTask] Shadow decision failed: %s", exc)
         vault.update_chat_history_entry(ts, {"status": "failed", "error": str(exc)})
+        _maybe_trigger_fact_extraction(vault, config, ts)
         return activity
 
     if shadow is None:
@@ -356,12 +379,14 @@ def run_direct_task(
         )
         logger.info("[DirectTask] chat task %r parked on decision %s — surfaced inline",
                     ts, pd.decision_id)
+        _maybe_trigger_fact_extraction(vault, config, ts)
         return activity
     except Exception as exc:
         logger.error("[DirectTask] Execution failed: %s", exc)
         vault.update_chat_history_entry(ts, {
             "status": "failed", "error": str(exc), "shadow_id": shadow.id,
         })
+        _maybe_trigger_fact_extraction(vault, config, ts)
         return activity
 
     vault.update_chat_history_entry(ts, {
@@ -369,6 +394,7 @@ def run_direct_task(
         "shadow_id":    shadow.id,
         "execution_id": result.get("execution_id"),
     })
+    _maybe_trigger_fact_extraction(vault, config, ts)
 
     # ── Stage 5: Wild Card reflection (best-effort) ───────────────────────
     if shadow.name == "Wild Card":

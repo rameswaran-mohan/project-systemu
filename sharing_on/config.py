@@ -201,6 +201,13 @@ class Config:
     # so operators stay in the loop.  Mirrors the tool-recal knob above.
     auto_approve_low_risk_skill_recalibrations: bool = False
 
+    # v0.9.0 (Layer 1): auto-extract user facts from chat conversations
+    # via a Tier-1 LLM call after each chat task resolves. Default ON;
+    # operators can opt out with SYSTEMU_AUTO_EXTRACT_USER_FACTS=false.
+    auto_extract_user_facts: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_AUTO_EXTRACT_USER_FACTS", "true").lower() != "false"
+    )
+
     @classmethod
     def from_env(cls) -> "Config":
         """Build config from environment variables with sensible defaults."""
