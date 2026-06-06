@@ -60,7 +60,7 @@ def _is_network_retriable(exc: BaseException) -> bool:
 def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:
     """Return a new AsyncOpenAI client bound to the current event loop.
 
-    dispatch via the provider registry instead of inline model-name
+    v0.7-e: dispatch via the provider registry instead of inline model-name
     checks.  The function still returns an AsyncOpenAI client so existing
     call paths that consume ``resp.choices[0].message.content`` keep
     working; providers with non-OpenAI shape (Anthropic, Ollama) are
@@ -73,7 +73,7 @@ def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:
 
     Historical context (v0.6.8-h): the prior logic routed tier-1/2 to
     Google whenever a google key was set, regardless of model.  After
-    pinned tiers to deepseek/deepseek-v4-flash, that misroute
+    v0.6.7 pinned tiers to deepseek/deepseek-v4-flash, that misroute
     sent deepseek requests to Google and 400'd with "API key not
     valid" because the OpenRouter model name isn't a valid Google
     model.  The registry-based dispatch below is now the single source
@@ -117,7 +117,7 @@ def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:
 
 
 def _get_provider(config: Config, tier: int):
-    """return a BaseLLMProvider instance for LLMResponse-shape callers.
+    """v0.7-e: return a BaseLLMProvider instance for LLMResponse-shape callers.
 
     This is the new entry point that supports every registered provider
     (OpenRouter, Google, Anthropic, OpenAI, Ollama).  ``_get_client`` is
@@ -415,10 +415,16 @@ async def async_llm_call_json(
          the model already knows the answer; it just needs to re-format it.
          Temperature=0.0 for deterministic extraction.
     """
+    # v0.9.1 hotfix (pre-existing): callers like extractor.py pass timeout=
+    # but llm_call's signature doesn't accept it. Pop it out of kwargs and
+    # apply via asyncio.wait_for() so the caller's intent (cap wall-clock)
+    # is preserved without breaking llm_call's strict keyword-only API.
+    timeout_s = kwargs.pop("timeout", None)
+
     result: Dict[str, Any] = {}
     for _attempt in range(_NETWORK_MAX_RETRIES + 1):
         try:
-            result = await llm_call(
+            _coro = llm_call(
                 tier=tier,
                 system=system,
                 user=user,
@@ -426,6 +432,10 @@ async def async_llm_call_json(
                 response_format={"type": "json_object"},
                 **kwargs,
             )
+            if timeout_s is not None:
+                result = await asyncio.wait_for(_coro, timeout=timeout_s)
+            else:
+                result = await _coro
             break  # success — exit retry loop
         except Exception as exc:
             if _is_network_retriable(exc) and _attempt < _NETWORK_MAX_RETRIES:
@@ -456,7 +466,7 @@ async def async_llm_call_json(
         f"Start with {{ and end with }}. No prose, no explanation."
     )
     retry_kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
-    retry_result = await llm_call(
+    _retry_coro = llm_call(
         tier=tier,
         system=system,
         user=repair_user,
@@ -465,6 +475,10 @@ async def async_llm_call_json(
         temperature=0.0,
         **retry_kwargs,
     )
+    if timeout_s is not None:
+        retry_result = await asyncio.wait_for(_retry_coro, timeout=timeout_s)
+    else:
+        retry_result = await _retry_coro
     content = retry_result["content"]
     if isinstance(content, dict):
         logger.info("[LLM] tier=%d JSON repair succeeded", tier)

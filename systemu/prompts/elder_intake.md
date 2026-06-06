@@ -48,6 +48,7 @@ Behaviour:
       "id":               1,
       "goal":             "What must be accomplished (concise, action-verb phrase)",
       "success_criteria": "Observable proof that this objective is done",
+      "verifier":         "Durable evidence a stranger could check: file path that must exist, audit-log action that must appear, or chat reply expectation",
       "tools_hint":       ["tool_name_1", "tool_name_2"]
     }
   ],
@@ -71,6 +72,28 @@ Behaviour:
 - Honour **global_memory** silently: apply known preferences (output paths, date formats,
   naming conventions) in the objectives and constraints without mentioning the memory itself.
 
+### Per-objective `verifier` field (v0.9.1)
+
+For each objective, set a `verifier` field describing what durable evidence
+will prove this objective complete. Be concrete — name file paths,
+audit-log actions, or chat-reply expectations. The verifier text is read
+by an independent Tier-1 model that checks actual durable state, so make
+it specific enough that a stranger could judge whether the work is done.
+
+Three examples:
+
+1. File outcome:
+   `"A file at {default_output_dir}/burritos-raw.json exists with at least 5 distinct restaurant entries (each with at least a name field)"`
+
+2. Action outcome:
+   `"An audit_log entry with action=email.send exists matching the user's wife's email address from user_facts"`
+
+3. Conversational outcome:
+   `"The chat reply summary (≥100 chars) references the ranked list and points the user at the markdown file"`
+
+When in doubt about which surface a stranger could check, prefer file
+outcomes over conversational ones — files survive across sessions.
+
 ## Example
 
 User prompt: `"take a screenshot of example.com and save it as a PDF in my Documents folder"`
@@ -85,12 +108,14 @@ User prompt: `"take a screenshot of example.com and save it as a PDF in my Docum
       "id": 1,
       "goal": "Navigate to example.com and capture a full-page screenshot",
       "success_criteria": "Screenshot file exists in a temporary location",
+      "verifier": "A file at /tmp/example_com_screenshot.png exists and is non-empty",
       "tools_hint": ["browser_screenshot", "take_screenshot"]
     },
     {
       "id": 2,
       "goal": "Convert the screenshot to PDF and save to ~/Documents/",
       "success_criteria": "PDF file exists at ~/Documents/<filename>.pdf",
+      "verifier": "A file at ~/Documents/example_com.pdf exists with size ≥ 10KB",
       "tools_hint": ["convert_to_pdf", "save_file"]
     }
   ],

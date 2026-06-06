@@ -677,6 +677,19 @@ class SqliteVault:
         self._upgrade_schema()
         self._ensure_elder_memory()
         self._seed_from_file_vault_if_empty()
+
+        # v0.9.1 (Layer 4): expose backend identity for the action-audit dispatch
+        # layer in systemu/vault/backend/. The parent Vault.append_action_audit
+        # reads these attrs via getattr(self, "_storage_backend", "file") to route
+        # the call. SqliteVault handles both sqlite:// and postgresql:// URLs via
+        # SQLAlchemy — parse the scheme to set the correct backend identity.
+        if database_url.startswith("postgresql") or database_url.startswith("postgres"):
+            self._storage_backend = "postgres"
+            self._postgres_url = database_url
+        else:
+            self._storage_backend = "sqlite"
+            self._sqlite_url = database_url  # mirrors self._url for the dispatch layer
+
         logger.info("[SqliteVault] Ready — %s", database_url)
 
     # ── First-boot seed ───────────────────────────────────────────────────────
@@ -1542,6 +1555,40 @@ class SqliteVault:
                 select(NotificationRow).where(NotificationRow.status == NotificationStatus.PENDING.value)
             ).scalars().all()
         return [_notification_header(r) for r in rows]
+
+    # ── v0.9.1 action-audit dispatch ─────────────────────────────────────────
+
+    def append_action_audit(self, entry: dict) -> None:
+        """Route one audit entry to the sqlite or postgres dispatch layer.
+
+        SqliteVault handles both backends (SQLAlchemy supports both); the
+        correct dispatch module is selected from self._storage_backend which
+        is set in __init__ based on the URL scheme.
+
+        ``entry`` MUST contain: ts (ISO), execution_id, objective_id, action,
+        params (dict), success (bool), error (Optional[str]).
+        ``user_id`` is optional.
+        """
+        from systemu.vault.backend import dispatch_append_action_audit
+        dispatch_append_action_audit(self, entry)
+
+    def query_action_audit(
+        self,
+        *,
+        execution_id: str,
+        since_ts: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> list:
+        """Return audit entries matching the given filters, in append order.
+
+        Delegates to the sqlite or postgres dispatch backend. Filters are
+        AND-combined. Returns [] if no audit log exists yet.
+        """
+        from systemu.vault.backend import dispatch_query_action_audit
+        return dispatch_query_action_audit(
+            self, execution_id=execution_id,
+            since_ts=since_ts, user_id=user_id,
+        )
 
     # ── Dispose (cleanup) ─────────────────────────────────────────────────────
 

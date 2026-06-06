@@ -3,11 +3,17 @@
 Best-effort: never raises to the caller. The auto-extract trigger
 (direct_task after a chat task resolves) calls extract_from_chat(entry,
 vault, config) and continues regardless of outcome.
+
+v0.9.1: SHA256 fingerprint short-circuit — skips the LLM call when the
+chat_entry is unchanged from the last extraction (Odysseus memory_extractor.py
+_fingerprint_entries pattern).
 """
 from __future__ import annotations
 
-import json
+import hashlib
+import json as _json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
 from systemu.core.llm_router import llm_call_json
@@ -18,6 +24,23 @@ if TYPE_CHECKING:
     from sharing_on.config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def _fingerprint_entry(chat_entry: Dict[str, Any]) -> str:
+    """SHA256 of canonical-JSON of the prompt+ts+status fields. Stable across runs.
+
+    Prior art: Odysseus memory_extractor.py _fingerprint_entries pattern.
+    """
+    canon = _json.dumps(
+        {
+            "prompt": chat_entry.get("prompt"),
+            "status": chat_entry.get("status"),
+            "ts": chat_entry.get("ts"),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
 def extract_from_chat(
@@ -31,6 +54,20 @@ def extract_from_chat(
         prompt_text = (chat_entry.get("prompt") or "").strip()
         if not prompt_text:
             return 0
+
+        # v0.9.1: SHA256 fingerprint short-circuit. Skip the LLM when the
+        # chat_entry content is unchanged from the last extraction's fingerprint.
+        # Prior art: Odysseus memory_extractor.py _fingerprint_entries pattern.
+        fp = _fingerprint_entry(chat_entry)
+        fp_path = Path(vault.root) / "_fact_extractor.fp"
+        try:
+            prev_fp = fp_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            prev_fp = ""
+        if fp and fp == prev_fp:
+            logger.debug("[FactExtractor] chat fingerprint unchanged; skipping LLM call")
+            return 0
+
         user_payload = {
             "user_prompt": prompt_text,
             "status": chat_entry.get("status"),
@@ -39,7 +76,7 @@ def extract_from_chat(
         result = llm_call_json(
             tier=1,
             system=system_prompt,
-            user=json.dumps(user_payload),
+            user=_json.dumps(user_payload),
             config=config,
             temperature=0.1,
             max_tokens=1500,
@@ -74,6 +111,13 @@ def extract_from_chat(
         if n > 0:
             logger.info("[FactExtractor] persisted %d fact(s) from chat:%s",
                         n, chat_entry.get("ts"))
+
+        # Stamp the fingerprint after a successful LLM extraction.
+        try:
+            fp_path.write_text(fp, encoding="utf-8")
+        except Exception:
+            logger.debug("[FactExtractor] could not write fingerprint file", exc_info=True)
+
         return n
     except Exception:
         logger.debug("[FactExtractor] extract_from_chat swallowed error", exc_info=True)

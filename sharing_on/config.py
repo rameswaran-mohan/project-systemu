@@ -208,6 +208,35 @@ class Config:
         default_factory=lambda: os.getenv("SYSTEMU_AUTO_EXTRACT_USER_FACTS", "true").lower() != "false"
     )
 
+    # v0.9.1 (Layer 4): Durable-outcome contract via fresh-context verifier.
+    # Each completion claim is judged by an independent Tier-1 LLM against a
+    # state delta. Magic constants live here so each deployment mode can tune
+    # without code edits.
+    verifier_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_VERIFIER_ENABLED", "true").lower() != "false"
+    )
+    verifier_per_turn_cap: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_VERIFIER_PER_TURN_CAP", "2"))
+    )  # max verifier calls per LLM turn before "fresh effectful work" gate engages
+    verifier_rejection_budget: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_VERIFIER_REJECTION_BUDGET", "3"))
+    )  # consecutive verifier rejections per objective before stuck-loop escalation
+    verifier_max_calls_per_run: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_VERIFIER_MAX_CALLS_PER_RUN", "50"))
+    )  # safety cap on total verifier calls per execution (enterprise budget control)
+    verifier_tier: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_VERIFIER_TIER", "1"))
+    )  # 1 = Tier-1 (cheap, default) | 2 = Tier-2 | 3 = Tier-3; sets SYSTEMU_VERIFIER_TIER
+    audit_log_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_AUDIT_LOG_ENABLED", "true").lower() != "false"
+    )  # global on/off for the action-audit log at vault/audit/actions.jsonl (NOT system logging)
+    state_delta_file_preview_chars: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_STATE_DELTA_FILE_PREVIEW_CHARS", "200"))
+    )
+    state_delta_max_files_per_section: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_STATE_DELTA_MAX_FILES_PER_SECTION", "50"))
+    )
+
     @classmethod
     def from_env(cls) -> "Config":
         """Build config from environment variables with sensible defaults."""

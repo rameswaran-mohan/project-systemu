@@ -1112,6 +1112,73 @@ class Vault:
         return add_fact(self, fact, source=source, tags=tags,
                          source_ref=source_ref, confidence=confidence)
 
+    # v0.9.1 (Layer 4) — action-audit log writer + reader.
+    def append_action_audit(self, entry: Dict[str, Any]) -> None:
+        """Append one audit entry to the action audit log.
+
+        File backend: appends a JSON line to vault/audit/actions.jsonl.
+        Non-file backends route to the storage layer (sqlite/postgres).
+
+        ``entry`` MUST contain: ts (ISO), execution_id, objective_id,
+        action, params (dict), success (bool), error (Optional[str]).
+        ``user_id`` is optional (set in multi-user docker-enterprise mode).
+        """
+        backend = getattr(self, "_storage_backend", "file")
+        if backend != "file":
+            from systemu.vault.backend import dispatch_append_action_audit
+            return dispatch_append_action_audit(self, entry)
+
+        audit_dir = self.root / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / "actions.jsonl"
+        with audit_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+
+    def query_action_audit(
+        self,
+        *,
+        execution_id: str,
+        since_ts: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return audit entries matching the given filters, in append order.
+
+        File backend: reads vault/audit/actions.jsonl line by line and filters in Python.
+        Non-file backends route to the storage layer.
+
+        Filters are AND-combined. ``since_ts`` is an ISO timestamp inclusive
+        from. Returns [] if no audit log exists yet.
+        """
+        backend = getattr(self, "_storage_backend", "file")
+        if backend != "file":
+            from systemu.vault.backend import dispatch_query_action_audit
+            return dispatch_query_action_audit(
+                self, execution_id=execution_id,
+                since_ts=since_ts, user_id=user_id,
+            )
+
+        audit_path = self.root / "audit" / "actions.jsonl"
+        if not audit_path.exists():
+            return []
+        rows: List[Dict[str, Any]] = []
+        for line in audit_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("[Vault] skipping malformed audit line: %s", line[:100])
+                continue
+            if entry.get("execution_id") != execution_id:
+                continue
+            if user_id is not None and entry.get("user_id") != user_id:
+                continue
+            if since_ts is not None and entry.get("ts", "") < since_ts:
+                continue
+            rows.append(entry)
+        return rows
+
     def get_latest_chat_scroll(self) -> Optional["Scroll"]:
         """Return the most recent Scroll created from a direct chat task, or None."""
         history = self.load_chat_history(limit=1)
