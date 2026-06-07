@@ -1750,3 +1750,84 @@ def session_search_cmd(query, limit):
     for r in results:
         click.echo(f"  [{r['status']:7}] {r['session_id']}: {r['intent'][:60]}")
         click.echo(f"    outcome: {r['outcome_summary'][:80]}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.3: capability ledger CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+@click.group(name="capability")
+def capability_cli():
+    """Inspect the capability ledger (what systemu knows it can do)."""
+    pass
+
+
+@capability_cli.command("list")
+@click.option("--kind", default=None, help="Filter by 'tool' or 'skill'")
+def capability_list(kind):
+    from sharing_on.config import Config
+    from systemu.vault.vault import Vault
+    from systemu.runtime.tools.capability_tools import capability_list_my_capabilities
+    from pathlib import Path
+    cfg = Config.from_env()
+    v = Vault(root=Path(cfg.vault_dir))
+    results = capability_list_my_capabilities(vault=v, kind=kind)
+    if not results:
+        click.echo("(no capabilities registered yet)")
+        return
+    for c in results:
+        last = c.get("last_used_at") or "(never)"
+        click.echo(f"  [{c['kind']:5}] {c['name']:30}  invocations={c['invocations']:5}  last_used={last}")
+
+
+@capability_cli.command("show")
+@click.argument("name")
+def capability_show(name):
+    from sharing_on.config import Config
+    from systemu.vault.vault import Vault
+    from systemu.runtime.tools.capability_tools import capability_get_stats
+    from pathlib import Path
+    cfg = Config.from_env()
+    v = Vault(root=Path(cfg.vault_dir))
+    stats = capability_get_stats(vault=v, name=name)
+    if stats is None:
+        click.echo(f"No capability found with name={name!r}")
+        return
+    click.echo(f"name:         {stats['name']}")
+    click.echo(f"kind:         {stats['kind']}")
+    click.echo(f"invocations:  {stats['invocations']}")
+    click.echo(f"successes:    {stats['successes']}")
+    click.echo(f"failures:     {stats['failures']}")
+    click.echo(f"success_rate: {stats['success_rate']:.1%}")
+    click.echo(f"last_used_at: {stats['last_used_at'] or '(never)'}")
+    if stats['last_error']:
+        click.echo(f"last_error:   {stats['last_error']}")
+
+
+@capability_cli.command("stats")
+def capability_stats():
+    """Aggregate stats across all registered capabilities."""
+    from sharing_on.config import Config
+    from systemu.vault.vault import Vault
+    from systemu.runtime import capability_ledger as cl
+    from pathlib import Path
+    cfg = Config.from_env()
+    v = Vault(root=Path(cfg.vault_dir))
+    caps = cl.list_capabilities(v)
+    if not caps:
+        click.echo("(no capabilities registered yet)")
+        return
+    total_inv = sum(c.invocations for c in caps)
+    total_succ = sum(c.successes for c in caps)
+    total_fail = sum(c.failures for c in caps)
+    by_kind = {}
+    for c in caps:
+        by_kind[c.kind] = by_kind.get(c.kind, 0) + 1
+    click.echo(f"capabilities:    {len(caps)}")
+    for k, n in sorted(by_kind.items()):
+        click.echo(f"  {k:8} {n}")
+    click.echo(f"invocations:     {total_inv}")
+    click.echo(f"successes:       {total_succ}")
+    click.echo(f"failures:        {total_fail}")
+    if total_inv:
+        click.echo(f"overall_rate:    {total_succ / total_inv:.1%}")

@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 _SUBPROCESS_ONLY_DEPS = {"playwright", "playwright-stealth", "selenium"}
 
 
+def _build_empty_config():
+    """Return a default Config instance (used as fallback when self._config is None)."""
+    from sharing_on.config import Config
+    return Config()
+
+
 def _must_use_subprocess(tool_type, dependencies) -> bool:
     """Playwright/Selenium use a sync API that cannot run inside the asyncio
     loop the in-process fast path uses, so such tools must run in a fresh
@@ -104,7 +110,7 @@ class ToolSandbox:
 
     def __init__(
         self,
-        vault_root: str | Path,
+        vault_root: str | Path | None = None,
         *,
         default_timeout: int = 30,  # [A.1] 30s intentional — per-call overridable via execute_tool(timeout=)
         max_output_bytes: int = 65_536,  # 64 KB
@@ -115,6 +121,11 @@ class ToolSandbox:
         vault=None,
         config=None,
     ):
+        # v0.9.3: vault_root is now optional — fall back to vault.root when available.
+        if vault_root is None and vault is not None:
+            vault_root = getattr(vault, "root", None)
+        if vault_root is None:
+            vault_root = Path(".")
         self.vault_root    = Path(vault_root)
         self.timeout       = default_timeout
         self.max_output    = max_output_bytes
@@ -179,6 +190,151 @@ class ToolSandbox:
                 "[ToolSandbox] action audit write failed for %s: %s",
                 tool.name, exc,
             )
+
+    def _record_capability_outcome(
+        self,
+        *,
+        tool,
+        success: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        """v0.9.3 hook: every tool invocation (success or failure) bumps
+        the capability ledger. Gated by config.capability_track_outcomes.
+        Best-effort — failures degrade silently."""
+        cfg = self._config
+        if cfg is not None and not getattr(cfg, "capability_track_outcomes", True):
+            return
+        vault = self._vault
+        if vault is None:
+            return
+        try:
+            from systemu.runtime import capability_ledger
+            capability_ledger.record_invocation(
+                vault, tool.name, success=success, error=error, kind="tool",
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[ToolSandbox] capability ledger write failed for %s: %s",
+                getattr(tool, "name", "?"), exc,
+            )
+
+    def _record_capability_outcome_by_name(
+        self,
+        *,
+        name: str,
+        success: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        """v0.9.3 v2-dispatch hook: record by name (no Tool object available
+        in the v2 path). Same gating + best-effort as _record_capability_outcome."""
+        cfg = self._config
+        if cfg is not None and not getattr(cfg, "capability_track_outcomes", True):
+            return
+        vault = self._vault
+        if vault is None:
+            return
+        try:
+            from systemu.runtime import capability_ledger
+            capability_ledger.record_invocation(
+                vault, name, success=success, error=error, kind="tool",
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[ToolSandbox] v2 capability ledger write failed for %s: %s",
+                name, exc,
+            )
+
+    async def execute(
+        self,
+        name: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """v0.9.3: High-level tool dispatch by name.
+
+        Consults the v2 (code-registered) registry FIRST; if the tool is
+        registered there AND its check_fn passes, the v2 handler is called
+        directly (sync handlers are run in a thread executor so the async
+        loop is not blocked).
+
+        Falls back to the v1 (vault-based) path for any tool that is not in
+        the v2 registry or whose check_fn reports unavailable.
+
+        v1 fallback: with vault=None the v1 path returns
+        ``{"success": False, "error": "..."}`` for any unknown tool name.
+        """
+        # ── v2 registry (code-registered tools) ──────────────────────────
+        try:
+            from systemu.runtime.tool_registry_v2 import registry as _v2_registry
+            entry = _v2_registry.get(name)
+            if entry is not None and _v2_registry.available(
+                name, self._config or _build_empty_config()
+            ):
+                import asyncio as _asyncio
+                loop = _asyncio.get_running_loop()
+                try:
+                    if entry.is_async:
+                        result = await entry.handler(**(params or {}))
+                    else:
+                        result = await loop.run_in_executor(
+                            None, lambda: entry.handler(**(params or {}))
+                        )
+                except Exception as exc:
+                    # Capability ledger: record failure too (best-effort).
+                    try:
+                        self._record_capability_outcome_by_name(
+                            name=name, success=False, error=str(exc),
+                        )
+                    except Exception:
+                        pass
+                    return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+                # Capability ledger record (best-effort).
+                try:
+                    self._record_capability_outcome_by_name(
+                        name=name,
+                        success=bool(result.get("success", True))
+                        if isinstance(result, dict) else True,
+                        error=None,
+                    )
+                except Exception:
+                    pass
+                # If the v2 handler returned a dict, return it as-is.
+                # Otherwise wrap as {success: True, value: result}.
+                if isinstance(result, dict):
+                    return result
+                return {"success": True, "value": result}
+        except Exception as exc:
+            logger.debug(
+                "[ToolSandbox] v2 dispatch raised, falling back to v1 for %s: %s",
+                name, exc,
+            )
+        # ── fall through to v1 vault-based dispatch ───────────────────────
+        # The v1 path operates on implementation_path + vault. Without a vault
+        # or a known implementation path we return a structured failure to
+        # match the API contract expected by callers.
+        vault = self._vault
+        if vault is None:
+            return {"success": False, "error": f"Tool not found: {name!r} (not in v2 registry and no vault attached)"}
+        # Try to find the tool in the vault and delegate to execute_tool().
+        try:
+            tool = vault.find_tool_by_name(name)
+        except Exception:
+            tool = None
+        if tool is None:
+            return {"success": False, "error": f"Tool not found: {name!r}"}
+        impl_path = getattr(tool, "implementation_path", None) or getattr(tool, "impl_path", None)
+        if not impl_path:
+            return {"success": False, "error": f"Tool {name!r} has no implementation path"}
+        tr = await self.execute_tool(
+            str(impl_path),
+            params or {},
+            timeout=timeout,
+            tool_type=getattr(tool, "tool_type", None),
+        )
+        return tr.to_dict()
 
     def attach_registry(self, registry: "ToolRegistry") -> None:
         """Attach a ToolRegistry so execute_tool() uses the direct-call fast path."""

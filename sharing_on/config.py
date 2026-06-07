@@ -140,6 +140,20 @@ class Config:
         default_factory=lambda: int(os.getenv("SYSTEMU_EPISODIC_TAGS_MAX_COUNT", "8"))
     )
 
+    # v0.9.3 (Layer 3 — Capability Ledger + Tool Registry v2):
+    capability_ledger_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_CAPABILITY_LEDGER_ENABLED", "true").lower() != "false"
+    )
+    capability_track_outcomes: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_CAPABILITY_TRACK_OUTCOMES", "true").lower() != "false"
+    )
+    check_fn_cache_ttl_seconds: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_CHECK_FN_CACHE_TTL_SECONDS", "30"))
+    )
+    tool_output_max_chars_default: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_TOOL_OUTPUT_MAX_CHARS_DEFAULT", "100000"))
+    )
+
     execution_retention_count: int = 50                  # max execution dirs kept in vault/executions/
 
     # --- Capture ---

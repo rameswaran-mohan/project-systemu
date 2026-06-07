@@ -195,6 +195,62 @@ def _resolve_verifier_output_dir(config, user_profile) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+#  v0.9.3 (Layer 3) — Tool registry v2 startup discovery + whitelist resolver
+# ─────────────────────────────────────────────────────────────────────────
+
+_V2_DISCOVERED: bool = False
+
+
+def _discover_v2_tools() -> None:
+    """Populate the v2 tool registry singleton by AST-scanning the
+    ``systemu.runtime.tools`` package for modules that call
+    ``registry.register(...)`` at top level.
+
+    Idempotent — only runs once per process. ShadowRuntime calls this at
+    init so v2 tools are available without each tool module needing to be
+    imported explicitly by name.
+    """
+    global _V2_DISCOVERED
+    if _V2_DISCOVERED:
+        return
+    try:
+        from systemu.runtime.tool_registry_v2 import registry as _v2_registry
+        _v2_registry.discover_modules("systemu.runtime.tools")
+        _V2_DISCOVERED = True
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[Runtime] v2 tool discovery failed: %s", exc,
+        )
+
+
+def _resolve_tool_whitelist(context: str) -> set:
+    """Resolve the set of tool names allowed in ``context``.
+
+    Wraps the registry's whitelist_for_context() with a safe fallback:
+    unknown contexts return an empty set rather than raising, so the
+    runtime can ask about novel contexts without crashing.
+
+    Known contexts:
+      - "main"          → every registered tool
+      - "verifier_fork" → read-only subset (vault.get_audit_log, file.read, ...)
+      - "curator"       → skill/memory lifecycle subset
+      - "fact_extractor" → write_user_fact only
+      - "delegate_child" → empty (runtime composes parent_whitelist - {delegate})
+    """
+    from systemu.runtime.tool_registry_v2 import registry as _v2_registry
+    try:
+        return _v2_registry.whitelist_for_context(context)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).debug(
+            "[Runtime] unknown whitelist context %r — returning empty set",
+            context,
+        )
+        return set()
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #  v0.9.2 (Layer 2) — Episodic memory capture hook
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -1224,6 +1280,10 @@ class ShadowRuntime:
         self._fresh_work_since_last_verifier_call: bool = False
         # Directory is created lazily when the vault's prune_old_executions needs it;
         # we no longer eagerly create it since snapshot/SKILL.md disk writes are removed.
+
+        # v0.9.3: discover code-registered tools at runtime startup so the
+        # main loop + verifier fork can use them.
+        _discover_v2_tools()
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -2794,6 +2854,15 @@ class ShadowRuntime:
                 )
             except Exception:
                 logger.debug("[Runtime] tool_metrics record skipped", exc_info=True)
+            # v0.9.3: capability ledger — record failed invocation.
+            try:
+                self.sandbox._record_capability_outcome(
+                    tool=tool_obj,
+                    success=False,
+                    error=str(result.error or result.stderr[:200] if result.stderr else result.error or ""),
+                )
+            except Exception:
+                logger.debug("[Runtime] capability ledger (failure) skipped", exc_info=True)
 
             # v0.4.0-b: in-loop reflection.  Classify cheaply, count
             # consecutive failures for THIS tool, and queue a reflection
@@ -2871,6 +2940,13 @@ class ShadowRuntime:
                 )
             except Exception:
                 logger.debug("[Runtime] action-audit hook skipped", exc_info=True)
+            # v0.9.3: capability ledger — record successful invocation.
+            try:
+                self.sandbox._record_capability_outcome(
+                    tool=tool_obj, success=True, error=None,
+                )
+            except Exception:
+                logger.debug("[Runtime] capability ledger (success) skipped", exc_info=True)
             # v0.4.4-a: record success in tool metrics.
             try:
                 from systemu.runtime.tool_metrics import get_tool_metrics
