@@ -314,6 +314,13 @@ class Tool(BaseModel):
     # Web tools should set ~90s; quick file tools can leave it None.
     timeout_seconds: Optional[int] = None
 
+    # v0.9.3 (Layer 3): name of a check_fn for vault-stored tools. The
+    # runtime looks up the actual callable from a name->fn registry at
+    # invocation time. Code-registered v2 tools pass the callable directly
+    # to registry.register(check_fn=...); this slot is only for v1
+    # vault-stored tools to opt into the same availability gating.
+    check_fn_name: Optional[str] = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Skill  (Agent Skills Standard)
@@ -700,3 +707,25 @@ class UserFact(BaseModel):
     superseded_by: Optional[str] = None
 
     model_config = {"extra": "forbid"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Capability  (v0.9.3 — Layer 3 Capability Ledger)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Capability(BaseModel):
+    """One row in the capability ledger — tracks what systemu knows it can do.
+
+    Both code-registered tools (v0.9.3 ToolRegistry v2) and auto-forged
+    vault tools surface here once they've been seen by the runtime.
+    The ledger is consulted by the agent for self-check ("do I know how
+    to do this before I promise it?") and by the operator via CLI.
+    """
+    name:            str
+    kind:            str               # "tool" | "skill"
+    registered_at:   datetime
+    last_used_at:    Optional[datetime] = None
+    invocations:     int = 0
+    successes:       int = 0
+    failures:        int = 0
+    last_error:      Optional[str] = None
