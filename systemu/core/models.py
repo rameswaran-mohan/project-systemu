@@ -309,6 +309,11 @@ class Tool(BaseModel):
     # output from blowing the LLM context window.
     max_result_size_chars: Optional[int] = None
 
+    # v0.9.1.1 hotfix: per-tool wall-clock budget, in seconds. None = use
+    # config.tool_default_timeout_seconds. Honored by tool_registry.execute.
+    # Web tools should set ~90s; quick file tools can leave it None.
+    timeout_seconds: Optional[int] = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Skill  (Agent Skills Standard)

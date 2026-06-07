@@ -29,8 +29,20 @@ TOOL_META = {
     "dependencies": ["requests", "jsonschema"],
 }
 
-_DEFAULT_UA = "systemu/0.8 (+https://github.com/rameswaran-mohan/project-systemu)"
-_DEFAULT_ACCEPT = "text/html,application/json,*/*"
+# v0.9.1.1: browser-realistic UA + headers so sites that block scrapers
+# (Yelp, Reddit, TripAdvisor, Google, etc.) actually return content. The
+# old "systemu/0.8 (+github.com/...)" UA was a dead giveaway and was being
+# 403'd by every major site — surfaced by the v0.9.1 burrito live test.
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+_DEFAULT_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,*/*;q=0.8"
+)
+_DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 _MIN_BODY_CHARS = 100
 _MIN_TEXT_CHARS = 50
 
@@ -38,13 +50,35 @@ _MIN_TEXT_CHARS = 50
 def _fetch(url: str, headers: dict, params: dict, timeout: int):
     import requests
     h = dict(headers or {})
+    # setdefault — caller-supplied headers always win.
     h.setdefault("User-Agent", _DEFAULT_UA)
     h.setdefault("Accept", _DEFAULT_ACCEPT)
+    h.setdefault("Accept-Language", _DEFAULT_ACCEPT_LANGUAGE)
+    h.setdefault("DNT", "1")
+    h.setdefault("Connection", "keep-alive")
+    h.setdefault("Upgrade-Insecure-Requests", "1")
     r = requests.get(url, headers=h, params=params or {}, timeout=timeout)
     return r
 
 
 _HARD_MAX_PAGES = 5
+
+# v0.9.1.1: status codes that almost certainly mean "anti-bot detection
+# blocked us." When we hit one of these, the error message tells the LLM
+# to retry against a search engine instead of banging on the same URL.
+# We can't bypass Cloudflare / PerimeterX / Akamai Bot Manager from
+# requests alone — that needs JS rendering (Playwright, deferred to L6).
+_ANTI_BOT_STATUS = frozenset({401, 403, 406, 429, 451})
+
+_ANTI_BOT_HINT = (
+    "Looks like anti-bot/scraper detection (Cloudflare, PerimeterX, etc.). "
+    "This site requires a real browser with JavaScript. "
+    "Retry with a search-engine URL — these usually work: "
+    "https://duckduckgo.com/html/?q=<your+query> or "
+    "https://www.google.com/search?q=<your+query>. "
+    "Then web_extract the search-result page and follow promising links "
+    "to general directories or Wikipedia pages."
+)
 
 _REL_NEXT_HREF_RE = _re.compile(
     r'<(?:link|a)[^>]*\brel=["\']?next["\']?[^>]*\bhref=["\']([^"\']+)["\']',
@@ -273,7 +307,18 @@ def run(**kwargs) -> dict:
         last_status = resp.status_code
 
         if resp.status_code >= 400:
-            last_err = ("http_error", f"HTTP {resp.status_code}", resp.status_code)
+            # v0.9.1.1: anti-bot status codes get a concrete retry hint so
+            # the LLM doesn't sit and re-extract the same URL. Returns a
+            # different error_type so the integrity guard's downstream
+            # logging can distinguish "site is offline" from "site refuses bots."
+            if resp.status_code in _ANTI_BOT_STATUS:
+                last_err = (
+                    "anti_bot_blocked",
+                    f"HTTP {resp.status_code}. {_ANTI_BOT_HINT}",
+                    resp.status_code,
+                )
+            else:
+                last_err = ("http_error", f"HTTP {resp.status_code}", resp.status_code)
             break
 
         body = resp.text or ""

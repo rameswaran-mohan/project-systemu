@@ -230,8 +230,14 @@ class ToolSandbox:
             try:
                 from systemu.runtime.tool_registry import ToolDependencyError, ToolNotEnabledError
                 from systemu.approval.exceptions import PendingOperatorDecision
+                # v0.9.1.1 fix: pass the raw caller-side `timeout` (None when
+                # no explicit override was given) so _resolve_timeout in the
+                # registry can prefer tool.timeout_seconds and
+                # config.tool_default_timeout_seconds over the hardcoded 30s
+                # sandbox default.  effective_timeout is still used for the
+                # subprocess fallback path below.
                 result_dict = await self._registry.execute(
-                    tool_name, parameters, timeout=float(effective_timeout)
+                    tool_name, parameters, timeout=float(timeout) if timeout is not None else None
                 )
                 success = result_dict.get("success", True)
                 # v0.9.1: truncate_result is called here by callers that have
