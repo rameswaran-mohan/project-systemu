@@ -396,6 +396,23 @@ def run_direct_task(
     })
     _maybe_trigger_fact_extraction(vault, config, ts)
 
+    # v0.9.2: episodic capture — best-effort hook at chat-resolve
+    try:
+        from systemu.runtime.shadow_runtime import _trigger_episodic_capture
+        _trigger_episodic_capture(
+            vault=vault,
+            config=config,
+            session_id=ts,
+            intent=getattr(scroll, "intent", ""),
+            chat_result=result.get("final_summary"),
+            files_produced=[],
+            status=result.get("status", "unknown"),
+            execution_id=result.get("execution_id"),
+            raw_chat_id=ts,
+        )
+    except Exception:
+        logger.debug("[DirectTask] episodic capture hook swallowed error", exc_info=True)
+
     # ── Stage 5: Wild Card reflection (best-effort) ───────────────────────
     if shadow.name == "Wild Card":
         try:

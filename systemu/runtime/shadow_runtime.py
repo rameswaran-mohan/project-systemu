@@ -195,6 +195,54 @@ def _resolve_verifier_output_dir(config, user_profile) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+#  v0.9.2 (Layer 2) — Episodic memory capture hook
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _trigger_episodic_capture(
+    *,
+    vault,
+    config,
+    session_id: str,
+    intent: str,
+    chat_result: Optional[str],
+    files_produced: list,
+    status: str,
+    execution_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    raw_chat_id: Optional[str] = None,
+) -> None:
+    """v0.9.2 hook: summarize+persist the finished run.
+
+    Gated by config.summarize_after_run. Best-effort — failures degrade silently
+    so a flaky LLM never blocks the user's task from completing.
+    """
+    if vault is None or config is None:
+        return  # nothing to capture against (e.g. __new__-constructed ShadowRuntime)
+    if not getattr(config, "summarize_after_run", True):
+        return
+    try:
+        from systemu.runtime import episodic_memory
+        episodic_memory.capture(
+            vault=vault,
+            session_id=session_id,
+            intent=intent,
+            chat_result=chat_result,
+            files_produced=files_produced,
+            status=status,
+            config=config,
+            execution_id=execution_id,
+            user_id=user_id,
+            raw_chat_id=raw_chat_id,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "[Runtime] episodic capture failed for session %s: %s",
+            session_id, exc,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 
 # Deferred refinery dispatch
 def _dispatch_refinery(shadow, scroll, result_dict, context, config, vault):
@@ -1398,6 +1446,17 @@ class ShadowRuntime:
             _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
         except Exception:
             pass
+        # v0.9.2: episodic capture — best-effort, never raises
+        _trigger_episodic_capture(
+            vault=getattr(self, 'vault', None),
+            config=getattr(self, 'config', None),
+            session_id=execution_id,
+            intent=getattr(scroll, "intent", ""),
+            chat_result=None,
+            files_produced=[],
+            status=status,
+            execution_id=execution_id,
+        )
         return res
 
     def _apply_stuck_answer(self, stuck_obj, ans: dict, *, finalize):
@@ -2010,6 +2069,17 @@ class ShadowRuntime:
                     # handles this intent_hash well.
                     _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
                     _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+                    # v0.9.2: episodic capture — best-effort, never raises
+                    _trigger_episodic_capture(
+                        vault=getattr(self, 'vault', None),
+                        config=getattr(self, 'config', None),
+                        session_id=execution_id,
+                        intent=getattr(scroll, "intent", ""),
+                        chat_result=summary,
+                        files_produced=[],
+                        status="success",
+                        execution_id=execution_id,
+                    )
                     return res
 
                 # ── FAIL ───────────────────────────────────────────────────────────
@@ -2033,6 +2103,17 @@ class ShadowRuntime:
                         status="failure", iteration=iteration,
                     )
                     _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+                    # v0.9.2: episodic capture — best-effort, never raises
+                    _trigger_episodic_capture(
+                        vault=getattr(self, 'vault', None),
+                        config=getattr(self, 'config', None),
+                        session_id=execution_id,
+                        intent=getattr(scroll, "intent", ""),
+                        chat_result=reason,
+                        files_produced=[],
+                        status="failure",
+                        execution_id=execution_id,
+                    )
                     return res
 
                 # ── THINK ──────────────────────────────────────────────────────────

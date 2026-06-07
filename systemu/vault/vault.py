@@ -1179,6 +1179,105 @@ class Vault:
             rows.append(entry)
         return rows
 
+    # v0.9.2 (Layer 2 Episodic Memory) — session summary writer/reader/search.
+    def append_session_summary(self, summary) -> None:
+        """Append one session summary to vault/episodic/sessions.jsonl (file
+        backend) or the session_summaries table (sqlite/postgres dispatch).
+
+        ``summary`` is a SessionSummary Pydantic model. Serialized via model_dump_json.
+        """
+        backend = getattr(self, "_storage_backend", "file")
+        if backend != "file":
+            from systemu.vault.backend import dispatch_append_session_summary
+            return dispatch_append_session_summary(self, summary)
+
+        ep_dir = self.root / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        path = ep_dir / "sessions.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(summary.model_dump_json() + "\n")
+
+    def query_session_summaries(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+        since_ts: Optional[datetime] = None,
+        limit: Optional[int] = None,
+    ) -> List[Any]:
+        """Return session summaries in append order, AND-filtered.
+
+        File backend reads + filters in Python. sqlite/postgres dispatch.
+        """
+        backend = getattr(self, "_storage_backend", "file")
+        if backend != "file":
+            from systemu.vault.backend import dispatch_query_session_summaries
+            return dispatch_query_session_summaries(
+                self, user_id=user_id, status=status,
+                since_ts=since_ts, limit=limit,
+            )
+
+        from systemu.core.models import SessionSummary
+        path = self.root / "episodic" / "sessions.jsonl"
+        if not path.exists():
+            return []
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                s = SessionSummary.model_validate_json(line)
+            except Exception:
+                logger.warning("[Vault] skipping malformed session summary: %s", line[:100])
+                continue
+            if user_id is not None and s.user_id != user_id:
+                continue
+            if status is not None and s.status != status:
+                continue
+            if since_ts is not None and s.completed_at < since_ts:
+                continue
+            out.append(s)
+            if limit is not None and len(out) >= limit:
+                break
+        return out
+
+    def search_session_summaries(
+        self,
+        query: str,
+        *,
+        user_id: Optional[str] = None,
+        limit: int = 5,
+    ) -> List[Any]:
+        """Keyword search over intent + outcome_summary + tags.
+
+        File backend: case-insensitive substring scan. sqlite uses FTS5,
+        postgres uses tsvector — both via dispatch.
+        """
+        backend = getattr(self, "_storage_backend", "file")
+        if backend != "file":
+            from systemu.vault.backend import dispatch_search_session_summaries
+            return dispatch_search_session_summaries(
+                self, query=query, user_id=user_id, limit=limit,
+            )
+
+        q = (query or "").lower().strip()
+        if not q:
+            return []
+        all_sessions = self.query_session_summaries(user_id=user_id, limit=None)
+        out = []
+        for s in all_sessions:
+            haystack = " ".join([
+                s.intent or "",
+                s.outcome_summary or "",
+                " ".join(s.tags or []),
+            ]).lower()
+            if q in haystack:
+                out.append(s)
+                if len(out) >= limit:
+                    break
+        return out
+
     def get_latest_chat_scroll(self) -> Optional["Scroll"]:
         """Return the most recent Scroll created from a direct chat task, or None."""
         history = self.load_chat_history(limit=1)
