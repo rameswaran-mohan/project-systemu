@@ -1,4 +1,4 @@
-"""regression: ``scripts/copy_shadow_scenario.py`` must also copy
+"""v0.6.8-f regression: ``scripts/copy_shadow_scenario.py`` must also copy
 the skills referenced by the source shadow / activity.
 
 Previously the script copied the shadow, scroll, activity, and required tools,

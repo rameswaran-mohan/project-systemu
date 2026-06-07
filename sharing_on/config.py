@@ -154,6 +154,62 @@ class Config:
         default_factory=lambda: int(os.getenv("SYSTEMU_TOOL_OUTPUT_MAX_CHARS_DEFAULT", "100000"))
     )
 
+    # v0.9.4 (Layer 5 — Recipe Fast-Paths): bundled + user SKILL.md catalogs.
+    skill_loader_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_SKILL_LOADER_ENABLED", "true").lower() != "false"
+    )
+    skills_bundled_dir: str = field(
+        default_factory=lambda: os.getenv(
+            "SYSTEMU_SKILLS_BUNDLED_DIR",
+            os.path.join(os.path.dirname(__file__), "..", "systemu", "skills").replace("\\", "/"),
+        )
+    )
+    skills_user_dir: str = field(
+        default_factory=lambda: os.getenv("SYSTEMU_SKILLS_USER_DIR", "")
+    )
+
+    # v0.9.5 (Layer 6 — Goal-Level Orchestration): delegate.spawn_subagent caps.
+    delegate_max_depth: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_DELEGATE_MAX_DEPTH", "3"))
+    )
+    delegate_max_concurrent_children: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_DELEGATE_MAX_CONCURRENT_CHILDREN", "2"))
+    )
+    delegate_max_turns_per_child: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_DELEGATE_MAX_TURNS_PER_CHILD", "20"))
+    )
+
+    # v0.9.5 (Layer 6 — MCP integration): comma-separated MCP server URLs.
+    # Empty by default — operator opts in by setting SYSTEMU_MCP_SERVER_URLS.
+    # OAuth-protected servers deferred to v0.9.6+.
+    mcp_server_urls: str = field(
+        default_factory=lambda: os.getenv("SYSTEMU_MCP_SERVER_URLS", "")
+    )
+
+    # v0.9.6 (Layer 7 — Proactive Surfacing): inactivity-triggered curator.
+    curator_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_CURATOR_ENABLED", "true").lower() != "false"
+    )
+    curator_interval_hours: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_CURATOR_INTERVAL_HOURS", "168"))  # 7 days
+    )
+    curator_min_idle_minutes: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_CURATOR_MIN_IDLE_MINUTES", "120"))  # 2 hours
+    )
+
+    # v0.9.6 (Layer 7 — Proactive Surfacing): auto-skill-extraction (Odysseus).
+    auto_skill_extract_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_AUTO_SKILL_EXTRACT_ENABLED", "true").lower() != "false"
+    )
+    auto_skill_extract_min_confidence: float = field(
+        default_factory=lambda: float(os.getenv("SYSTEMU_AUTO_SKILL_EXTRACT_MIN_CONFIDENCE", "0.6"))
+    )
+
+    # v0.9.6 (Layer 7 — Proactive Surfacing): memory consolidation pass.
+    memory_consolidation_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_MEMORY_CONSOLIDATION_ENABLED", "true").lower() != "false"
+    )
+
     execution_retention_count: int = 50                  # max execution dirs kept in vault/executions/
 
     # --- Capture ---

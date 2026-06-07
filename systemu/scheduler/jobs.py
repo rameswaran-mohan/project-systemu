@@ -871,6 +871,56 @@ def consolidate_shadow_memory() -> None:
     run_consolidation_for_all(_config, _vault)
 
 
+def curator_review_job() -> None:
+    """v0.9.6 L7 — inactivity-triggered curator review (Hermes pattern).
+
+    Registered in the daemon on a frequent interval (hourly), but the heavy
+    lifecycle pass only fires when ``curator.should_run()`` says the
+    configured interval (default 168h / weekly) has elapsed AND the curator
+    is enabled + not paused.  This is the *idle-triggered* lifecycle review —
+    distinct in TRIGGER from ``consolidate_shadow_memory`` (which runs
+    unconditionally daily at 02:00).
+
+    The pass action reuses the proven ``run_consolidation_for_all`` machinery
+    (memory consolidation + skill-graduation) — genuine skill-lifecycle work.
+    Richer pin/archive lifecycle (the forked review agent) remains future work
+    (Task 5); when it lands it slots in here ahead of mark_run_complete.
+
+    Wrapped end-to-end so a curator failure can NEVER crash the scheduler.
+    """
+    from systemu.runtime import curator
+    if _config is None or _vault is None:
+        logger.warning("[Job] curator_review_job called before init_jobs()")
+        return
+    vault_root = getattr(_config, "vault_dir", None)
+    if not vault_root:
+        return
+    try:
+        if not curator.should_run(vault_root, _config):
+            return
+    except Exception as exc:  # never let the gate crash the tick
+        logger.warning("[Curator] should_run() check failed (non-fatal): %s", exc)
+        return
+    import time as _time
+    _t0 = _time.time()
+    try:
+        count = run_consolidation_for_all(_config, _vault)
+    except Exception as exc:
+        logger.warning("[Curator] review pass failed (non-fatal): %s", exc)
+        count = -1
+    try:
+        summary = (
+            f"curator review: consolidated {count} shadow(s)"
+            if count >= 0 else "curator review: consolidation errored"
+        )
+        curator.mark_run_complete(
+            vault_root, summary=summary, duration_seconds=_time.time() - _t0,
+        )
+        logger.info("[Curator] idle-triggered review complete — %s", summary)
+    except Exception as exc:
+        logger.warning("[Curator] mark_run_complete failed (non-fatal): %s", exc)
+
+
 def run_consolidation_for_all(config, vault) -> int:
     """Consolidate every shadow that needs it.  Returns the count updated.
 

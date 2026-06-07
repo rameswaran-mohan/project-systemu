@@ -1,4 +1,4 @@
-"""regression: docker-compose outputs mount must use
+"""v0.6.8-f regression: docker-compose outputs mount must use
 ${SYSTEMU_HOST_OUTPUTS_DIR} so install.py can supply an absolute host path.
 
 On Docker Desktop for Windows, a relative path like ``./outputs`` silently

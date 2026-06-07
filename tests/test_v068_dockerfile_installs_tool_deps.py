@@ -4,7 +4,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def _runtime_dockerfile() -> Path:
-    """this project's runtime image is the repo-root ``Dockerfile``
+    """v0.6.8-d: this project's runtime image is the repo-root ``Dockerfile``
     (referenced as ``build: .`` from every service in docker-compose.yml).
     Prefer ``docker/Dockerfile.runtime`` if a future split lands."""
     split = REPO / "docker" / "Dockerfile.runtime"

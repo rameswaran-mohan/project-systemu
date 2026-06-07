@@ -1,4 +1,4 @@
-"""Google AI Studio provider (Gemini models via OpenAI-compat endpoint)."""
+"""v0.7-e: Google AI Studio provider (Gemini models via OpenAI-compat endpoint)."""
 from __future__ import annotations
 from openai import AsyncOpenAI
 

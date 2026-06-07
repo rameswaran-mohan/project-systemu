@@ -1,4 +1,4 @@
-"""docker-mode outputs default to ~/SystemuOutputs on Windows
+"""v0.6.9: docker-mode outputs default to ~/SystemuOutputs on Windows
 (auto-shared by Docker Desktop), not project-local ./outputs."""
 from pathlib import Path
 import platform

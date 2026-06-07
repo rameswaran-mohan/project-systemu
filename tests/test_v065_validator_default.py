@@ -1,4 +1,4 @@
-"""— Stage 6 validator on by default + VALIDATOR_BLOCKED status."""
+"""v0.6.5-d — Stage 6 validator on by default + VALIDATOR_BLOCKED status."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock

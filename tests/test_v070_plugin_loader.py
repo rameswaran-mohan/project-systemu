@@ -1,4 +1,4 @@
-"""tool registry discovers plugins from `plugins/` dir + entry-points."""
+"""v0.7-f: tool registry discovers plugins from `plugins/` dir + entry-points."""
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock

@@ -1,4 +1,4 @@
-"""— Stage 2 GUI-verb post-processor + re-prompt loop."""
+"""v0.6.5-c — Stage 2 GUI-verb post-processor + re-prompt loop."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock

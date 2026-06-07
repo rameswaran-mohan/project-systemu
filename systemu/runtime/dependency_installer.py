@@ -79,7 +79,7 @@ class InstallMode(str, Enum):
     PROMPT    = "prompt"      # install only if the package is in the approval store
     ALWAYS    = "always"      # install on demand without approval check
     AUTO      = "auto"        # resolve from systemu_mode at call time
-    ALLOWLIST = "allow-list"  # install only if package is in tool_dep_approvals (docker-* default)
+    ALLOWLIST = "allow-list"  # v0.6.8-e: install only if package is in tool_dep_approvals (docker-* default)
 
 
 def resolve_install_mode(
@@ -156,7 +156,7 @@ class InvalidPackageSpecError(ValueError):
 
 
 class DepApprovalPending(RuntimeError):
-    """raised when ``allow-list`` mode encounters a not-yet-approved
+    """v0.6.8-e: raised when ``allow-list`` mode encounters a not-yet-approved
     package.  ``.packages`` carries the list of unapproved package names so
     the caller can surface them to the operator (typically by linking to
     /recover/tool/<id>)."""
@@ -359,7 +359,7 @@ def ensure_satisfied(
                 except Exception:
                     logger.exception("[DepInstaller] record_pending failed for %s", p)
 
-            # surface the request in the Systemu Chat supervisor feed
+            # v0.3.6: surface the request in the Systemu Chat supervisor feed
             # so the operator sees it without having to navigate to /tools first.
             # EventBus.publish_dep_approval_request handles its own dedup so
             # 50 shadows hitting the same missing dep produce ONE card.
@@ -406,7 +406,7 @@ def ensure_satisfied(
             )
         to_install = approved
     elif mode is InstallMode.ALLOWLIST:
-        # docker-* default.  Allow-list lives in the
+        # v0.6.8-e: docker-* default.  Allow-list lives in the
         # ``tool_dep_approvals`` SQLAlchemy table (operator-approved via
         # the dashboard recovery panel or the install wizard).  Unlike
         # PROMPT mode this raises an exception so the caller surfaces a

@@ -1,4 +1,4 @@
-"""— PipelineTrace + has_warnings index flag."""
+"""v0.6.5-a — PipelineTrace + has_warnings index flag."""
 from __future__ import annotations
 
 import pytest

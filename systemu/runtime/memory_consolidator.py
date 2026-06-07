@@ -3,6 +3,11 @@
 The audit log on `shadow.execution_log` is the source of truth.  This
 module produces only the *view* fed back to the LLM, so failures whose
 root cause has been resolved don't poison future iterations.
+
+v0.9.6 (Layer 7 — Proactive Surfacing): adds `consolidate_run` — a
+post-run LLM pass that surfaces "things learned" (facts + patterns)
+beyond the per-user fact extraction from v0.9.0/v0.9.1. Idempotent via
+SHA256 fingerprint cache.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -102,7 +107,7 @@ class MemoryConsolidator:
         buffer_entries: list,
         vault,
     ) -> str:
-        """produce the LLM-facing memory view from BOTH channels —
+        """v0.6.9: produce the LLM-facing memory view from BOTH channels —
         execution_log (recent runs, filtered for resolved causes) and
         memory_buffer (refined lessons, also filtered).
 
@@ -154,6 +159,117 @@ class MemoryConsolidator:
             tool_name = entry.get("tool_name") or "?"
             out_lines.append(f"- [{category}] {tool_name}: {text}")
         return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# v0.9.6 (Layer 7 — Proactive Surfacing): consolidate_run
+# ---------------------------------------------------------------------------
+
+import hashlib
+import json as _json
+import logging as _logging
+from pathlib import Path as _Path
+from typing import Any as _Any, Dict as _Dict, Optional as _Optional
+
+from systemu.core.llm_router import llm_call_json
+
+_consolidate_logger = _logging.getLogger(__name__ + ".consolidate_run")
+
+_CONSOLIDATE_SYSTEM_PROMPT = """You are a memory consolidation agent. Given a chat history,
+extract NEW knowledge worth remembering across sessions.
+
+Return strict JSON:
+{
+  "facts_learned": ["<short fact>", ...],
+  "patterns_observed": ["<recurring pattern>", ...]
+}
+
+Conservative: only surface NEW things. Empty lists are fine.
+"""
+
+
+def _fingerprint(chat_history: list) -> str:
+    """SHA256 of canonical-JSON form of role+content pairs."""
+    canon = _json.dumps(
+        [{"role": h.get("role"), "content": h.get("content")} for h in (chat_history or [])],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _cache_dir(root: "_Optional[_Path]") -> "_Optional[_Path]":
+    if root is None:
+        return None
+    p = _Path(root) / "memory_cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def consolidate_run(
+    *,
+    chat_history: "list[_Dict[str, _Any]]",
+    config: "_Any",
+    cache_root: "_Optional[_Path]" = None,
+) -> "_Optional[_Dict[str, _Any]]":
+    """Consolidate memory from a chat history.
+
+    Returns dict with facts_learned + patterns_observed lists. None when:
+    - config.memory_consolidation_enabled is False
+    - LLM exception (degrades silently)
+
+    Idempotent via SHA256 fingerprint cache when cache_root is provided.
+    """
+    if not getattr(config, "memory_consolidation_enabled", True):
+        return None
+
+    fp = _fingerprint(chat_history)
+    cache = _cache_dir(cache_root)
+    if cache is not None:
+        cached = cache / f"{fp}.json"
+        if cached.exists():
+            try:
+                return _json.loads(cached.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    try:
+        result = llm_call_json(
+            tier=1,
+            system=_CONSOLIDATE_SYSTEM_PROMPT,
+            user=_json.dumps({"chat_history": chat_history}, separators=(",", ":")),
+            config=config,
+            max_tokens=400,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        _consolidate_logger.warning("[MemoryConsolidator] LLM failed: %s", exc)
+        return None
+
+    if not isinstance(result, dict):
+        return None
+
+    facts = result.get("facts_learned") or []
+    patterns = result.get("patterns_observed") or []
+    if not isinstance(facts, list):
+        facts = []
+    if not isinstance(patterns, list):
+        patterns = []
+
+    consolidated = {
+        "facts_learned": [str(f) for f in facts][:20],
+        "patterns_observed": [str(p) for p in patterns][:10],
+    }
+
+    if cache is not None:
+        try:
+            (cache / f"{fp}.json").write_text(
+                _json.dumps(consolidated, indent=2), encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    return consolidated
 
 
 def reset_shadow_memory(*, shadow_id: str, keep_successes: bool, vault) -> None:

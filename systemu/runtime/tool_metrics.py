@@ -116,7 +116,7 @@ class ToolMetrics:
         """Record one invocation outcome.
 
         ``error_type`` should be the ``parsed.error_type`` field from the
-        ToolResult when set (classifier output or installer
+        ToolResult when set (v0.4.0-b classifier output or installer
         diagnostic).  When it's one of the dependency-failure values,
         we bump ``dependency_blocked`` instead of ``failures`` so the
         tool's success_rate isn't penalised for missing packages.

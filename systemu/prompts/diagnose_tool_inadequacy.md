@@ -23,7 +23,7 @@ Your job: determine whether the right response is **bump_version** (fix the tool
   "failing_objective":   "...",       // the specific objective the tool can't satisfy
   "recent_failures":     [ ... ],     // last 3 failure observations
   "other_shadows_using_tool": [ ... ], // [{shadow_id, recent_success_count}, ...]
-  "cluster_signal": {                  // cross-shadow inadequacy data
+  "cluster_signal": {                  // v0.5.1-d cross-shadow inadequacy data
     "is_cluster":        true|false,
     "distinct_shadows":  <int>,
     "total_flags":       <int>,

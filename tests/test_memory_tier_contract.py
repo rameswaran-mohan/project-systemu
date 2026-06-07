@@ -1,4 +1,4 @@
-"""Unit tests for the memory-tier write contract (+ v0.2.2).
+"""Unit tests for the memory-tier write contract (v0.2 + v0.2.2).
 
 Covers:
     * The vault gate-keeper helpers (append_shadow_memory_buffer /

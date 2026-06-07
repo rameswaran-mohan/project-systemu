@@ -1,4 +1,4 @@
-"""— `memory_dir` defaults to `$SYSTEMU_VAULT_DIR/memory` for Postgres URLs.
+"""v0.6.6-d — `memory_dir` defaults to `$SYSTEMU_VAULT_DIR/memory` for Postgres URLs.
 
 Before v0.6.6, every non-SQLite database URL fell through to
 `/tmp/systemu_memory`.  In docker modes that path lives in the container's
@@ -67,5 +67,5 @@ class TestResolveMemoryDir:
         monkeypatch.setenv("SYSTEMU_VAULT_DIR", str(tmp_path / "vault"))
         with caplog.at_level(logging.WARNING, logger="systemu.storage.sqlite.vault"):
             _resolve_memory_dir("postgresql://u:p@h/db", None)
-        # Postgres URLs no longer warn — they have a proper default
+        # v0.6.6-d: Postgres URLs no longer warn — they have a proper default
         assert not any("memory_dir" in r.message for r in caplog.records)

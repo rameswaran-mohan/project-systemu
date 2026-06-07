@@ -1,4 +1,4 @@
-"""Mem0 backend wraps the mem0ai Python client.
+"""v0.7-g: Mem0 backend wraps the mem0ai Python client.
 
 Mem0 is a third-party long-term memory layer used widely by agent
 frameworks.  Adding it as a swap-in lets operators who already invested

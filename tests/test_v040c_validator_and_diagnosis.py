@@ -35,7 +35,7 @@ def vault(tmp_path):
 def _config(*, supervisor_on=False, scroll_validator=False):
     c = MagicMock()
     c.intelligent_supervisor_enabled = supervisor_on
-    # tests in this file pre-date the dedicated scroll_validator
+    # v0.6.5-d: tests in this file pre-date the dedicated scroll_validator
     # config field — default it False here to preserve the legacy semantics
     # they're asserting (off-by-default-without-supervisor).
     c.scroll_validator = scroll_validator

@@ -1,4 +1,4 @@
-"""dashboard renders a persistent security banner when
+"""v0.6.9: dashboard renders a persistent security banner when
 SYSTEMU_AUTO_FORGE_TOOLS=true."""
 
 

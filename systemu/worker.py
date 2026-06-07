@@ -193,7 +193,7 @@ def main() -> None:
         mode, queue or "(default)", broker or "(default)",
     )
 
-    # / v0.3.5 — Verify we share the daemon's Python interpreter.
+    # v0.3.3 / v0.3.5 — Verify we share the daemon's Python interpreter.
     # In strict mode (SYSTEMU_STRICT_INTERPRETER=1) a mismatch exits the
     # worker before it processes any task; otherwise we log loudly and
     # continue, matching the existing fail-open posture.

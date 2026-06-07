@@ -1,4 +1,4 @@
-"""refinery only writes a 'failure_patterns' lesson after N>=3
+"""v0.6.9: refinery only writes a 'failure_patterns' lesson after N>=3
 distinct executions corroborate the same signature.
 
 Single-incident "failure_patterns" lessons were causing memory poisoning:

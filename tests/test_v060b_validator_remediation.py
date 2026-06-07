@@ -63,7 +63,7 @@ def _scroll_ns(objectives=None, *, intent="document weather data", expected_outc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — expanded catalog: parameters_schema + return_schema
+# v0.6.0-b — expanded catalog: parameters_schema + return_schema
 
 class TestCatalogExpansion:
     def test_catalog_includes_tool_schemas(self, vault):
@@ -109,7 +109,7 @@ class TestCatalogExpansion:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — ProposedRevision propagates through ValidationResult
+# v0.6.0-b — ProposedRevision propagates through ValidationResult
 
 class TestProposedRevisionParse:
     def test_revision_parsed_on_satisfiable_false(self, vault, monkeypatch):
@@ -192,7 +192,7 @@ class TestProposedRevisionParse:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — new intent-aware blocker categories
+# v0.6.0-b — new intent-aware blocker categories
 
 class TestNewBlockerCategories:
     def test_intent_mismatch_category_parses(self, vault, monkeypatch):
@@ -216,7 +216,7 @@ class TestNewBlockerCategories:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — Remediator: accept_revision applies + re-validates
+# v0.6.0-b — Remediator: accept_revision applies + re-validates
 
 class TestAcceptRevision:
     def test_accept_replaces_objectives_and_revalidates(self, vault, tmp_path, monkeypatch):
@@ -312,7 +312,7 @@ class TestAcceptRevision:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — Remediator: override + workshop audit
+# v0.6.0-b — Remediator: override + workshop audit
 
 class TestOverrideAndWorkshop:
     def test_override_writes_audit_row(self, vault, tmp_path):
@@ -348,7 +348,7 @@ class TestOverrideAndWorkshop:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — publish_remediation_card no-ops without revision
+# v0.6.0-b — publish_remediation_card no-ops without revision
 
 class TestPublishCard:
     def test_no_op_when_no_revision(self, vault):

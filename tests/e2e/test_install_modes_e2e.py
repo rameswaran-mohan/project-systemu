@@ -99,12 +99,12 @@ def test_install_docker_enterprise_mode_writes_expected_env(tmp_path):
     assert env["POSTGRES_PASSWORD"] == "pg-secret"
     assert env["REDIS_PASSWORD"] == "redis-secret"
     assert "redis-secret" in env["SYSTEMU_REDIS_URL"]
-    # enterprise must NOT expose Postgres by default
+    # v0.6.6-a: enterprise must NOT expose Postgres by default
     assert env["SYSTEMU_DB_BIND"] == ""
 
 
 def test_install_docker_local_writes_db_bind_for_capture_flow(tmp_path):
-    """docker-local exposes Postgres on 127.0.0.1:5432 by default so
+    """v0.6.6-a: docker-local exposes Postgres on 127.0.0.1:5432 by default so
     `sharing_on record` on the host can reach the container's vault."""
     stage = _stage(tmp_path)
     _run_install(
@@ -120,11 +120,11 @@ def test_install_docker_local_writes_db_bind_for_capture_flow(tmp_path):
     assert env["SYSTEMU_MODE"] == "docker-local"
     assert env["SYSTEMU_STORAGE"] == "postgres"
     assert env["SYSTEMU_QUEUE_BROKER"] == "sqlite"
-    # The killer assertion:
+    # The killer assertion for v0.6.6-a:
     assert env["SYSTEMU_DB_BIND"] == "127.0.0.1:5432"
-    # docker-local must write an absolute outputs host dir so Docker
+    # v0.6.8-f: docker-local must write an absolute outputs host dir so Docker
     # Desktop on Windows doesn't degrade the bind mount to a named volume.
-    # on Windows the default is ~/SystemuOutputs (auto-shared by
+    # v0.6.9: on Windows the default is ~/SystemuOutputs (auto-shared by
     # Docker Desktop); on Linux/macOS it remains project-relative ./outputs.
     assert "SYSTEMU_HOST_OUTPUTS_DIR" in env
     assert "outputs" in env["SYSTEMU_HOST_OUTPUTS_DIR"].lower()
@@ -169,7 +169,7 @@ def test_install_non_interactive_without_mode_exits_nonzero(tmp_path):
 
 
 def test_install_docker_local_sets_dep_install_mode_allowlist(tmp_path):
-    """docker-local defaults to allow-list dep install mode."""
+    """v0.6.8-e: docker-local defaults to allow-list dep install mode."""
     stage = _stage(tmp_path)
     _run_install(
         stage,
@@ -186,7 +186,7 @@ def test_install_docker_local_sets_dep_install_mode_allowlist(tmp_path):
 
 
 def test_install_local_keeps_auto_mode_v068(tmp_path):
-    """local mode keeps auto (unchanged from v0.6.7)."""
+    """v0.6.8-e: local mode keeps auto (unchanged from v0.6.7)."""
     stage = _stage(tmp_path)
     _run_install(
         stage,
@@ -220,7 +220,7 @@ def test_install_docker_enterprise_sets_dep_install_mode_allowlist(tmp_path):
 
 
 def test_install_docker_local_writes_requirements_tools(tmp_path):
-    """wizard scans tool deps and writes tools/requirements-tools.txt
+    """v0.6.8-d: wizard scans tool deps and writes tools/requirements-tools.txt
     when --approve-tool-deps is set."""
     stage = _stage(tmp_path)
     impl = stage / "systemu" / "vault" / "tools" / "implementations"

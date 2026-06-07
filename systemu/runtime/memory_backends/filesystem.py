@@ -1,4 +1,4 @@
-"""filesystem backend — lifts existing JSONL + SHADOW_MEMORY.md
+"""v0.7-g: filesystem backend — lifts existing JSONL + SHADOW_MEMORY.md
 logic from vault.load_shadow_memory() into the BaseMemoryBackend interface."""
 from __future__ import annotations
 import json
@@ -9,7 +9,7 @@ from .base import BaseMemoryBackend
 
 class FilesystemMemoryBackend(BaseMemoryBackend):
     """JSONL buffer + SHADOW_MEMORY.md consolidated, in the layout that
-    matched the pre-vault.  Default backend."""
+    matched the pre-v0.7 vault.  Default backend."""
 
     def __init__(self, memory_root: Path):
         self._root = Path(memory_root)

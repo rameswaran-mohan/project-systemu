@@ -729,3 +729,37 @@ class Capability(BaseModel):
     successes:       int = 0
     failures:        int = 0
     last_error:      Optional[str] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SkillManifest  (v0.9.4 — Layer 5 Recipe Fast-Paths)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SkillManifest(BaseModel):
+    """Parsed SKILL.md (Hermes/Odysseus format) — a loadable workflow recipe.
+
+    Distinct from the legacy ``Skill`` model: SkillManifest captures the
+    on-disk SKILL.md shape (YAML frontmatter + markdown body), while
+    ``Skill`` is the runtime-evolved abstract proficiency the agent tracks
+    over time. The skill_loader bridges between them.
+
+    Hermes prior art: ``skills/<category>/<name>/SKILL.md`` with YAML
+    frontmatter (name, description, version, platforms, prerequisites,
+    metadata.tags, metadata.related_skills) and a body with sections
+    (## When to Use, ## When NOT to Use, ## Procedure, ## Quick Reference).
+
+    Odysseus additions: ``requires_toolsets`` (skill declares what it
+    needs) + ``fallback_for_toolsets`` (skill replaces when preferred
+    toolset is missing).
+    """
+    name:                  str
+    description:           str
+    version:               str
+    platforms:             List[str] = Field(default_factory=list)
+    tags:                  List[str] = Field(default_factory=list)
+    related_skills:        List[str] = Field(default_factory=list)
+    prerequisites_commands: List[str] = Field(default_factory=list)
+    requires_toolsets:     List[str] = Field(default_factory=list)
+    fallback_for_toolsets: List[str] = Field(default_factory=list)
+    body:                  str
+    source_path:           Optional[str] = None

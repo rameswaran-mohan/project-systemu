@@ -25,7 +25,7 @@ from systemu.core.models import Shadow, ShadowStatus
 # ── Pydantic model behaviour ────────────────────────────────────────────
 
 def test_legacy_system_prompt_migrates_to_identity_block():
-    """Pre-JSON had only a ``system_prompt`` field.  Loading such a
+    """Pre-v0.3 JSON had only a ``system_prompt`` field.  Loading such a
     Shadow today must transfer that value into ``identity_block`` and
     leave ``accumulated_voice`` empty."""
     s = Shadow.model_validate({
@@ -142,7 +142,7 @@ def test_file_vault_round_trip(tmp_path: Path):
 
 
 def test_file_vault_handles_legacy_shadow_json(tmp_path: Path):
-    """Pre-shadow.json files (only system_prompt) must still load."""
+    """Pre-v0.3 shadow.json files (only system_prompt) must still load."""
     from systemu.vault.vault import Vault
     for sub in ("scrolls", "activities", "shadow_army", "skills",
                 "tools", "evolutions", "elder"):

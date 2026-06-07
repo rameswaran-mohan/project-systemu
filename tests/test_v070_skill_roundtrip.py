@@ -1,4 +1,4 @@
-"""skills exported by Systemu must pass the upstream agentskills.io
+"""v0.7-d: skills exported by Systemu must pass the upstream agentskills.io
 spec validator (skills-ref)."""
 import shutil
 import subprocess

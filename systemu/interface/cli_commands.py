@@ -1831,3 +1831,59 @@ def capability_stats():
     click.echo(f"failures:        {total_fail}")
     if total_inv:
         click.echo(f"overall_rate:    {total_succ / total_inv:.1%}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.4: skill recipe CLI — browse bundled + user-installed SKILL.md recipes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@click.group(name="skill")
+def skill_cli():
+    """Inspect bundled + user-installed SKILL.md recipes."""
+    pass
+
+
+@skill_cli.command("list")
+def skill_list():
+    """List all loadable skills with their description and required toolsets."""
+    from sharing_on.config import Config
+    from systemu.runtime.tools.skill_tools import skill_list_skills
+    cfg = Config.from_env()
+    skills = skill_list_skills(config=cfg)
+    if not skills:
+        click.echo("(no skills found — check SYSTEMU_SKILLS_BUNDLED_DIR / SYSTEMU_SKILLS_USER_DIR)")
+        return
+    for s in skills:
+        toolsets = ", ".join(s.get("requires_toolsets") or []) or "—"
+        click.echo(f"  [{s['version']:6}] {s['name']:30}  toolsets={toolsets}")
+        if s.get("description"):
+            click.echo(f"     {s['description'][:80]}")
+
+
+@skill_cli.command("view")
+@click.argument("name")
+def skill_view(name):
+    """Show the full SKILL.md body + metadata for one named skill."""
+    from sharing_on.config import Config
+    from systemu.runtime.tools.skill_tools import skill_view_skill
+    cfg = Config.from_env()
+    result = skill_view_skill(name=name, config=cfg)
+    if result is None:
+        click.echo(f"No skill found with name={name!r}")
+        return
+    click.echo(f"name:        {result['name']}")
+    click.echo(f"description: {result['description']}")
+    click.echo(f"version:     {result['version']}")
+    if result.get("tags"):
+        click.echo(f"tags:        {', '.join(result['tags'])}")
+    if result.get("requires_toolsets"):
+        click.echo(f"toolsets:    {', '.join(result['requires_toolsets'])}")
+    if result.get("prerequisites_commands"):
+        click.echo(f"prereqs:     {', '.join(result['prerequisites_commands'])}")
+    if result.get("related_skills"):
+        click.echo(f"related:     {', '.join(result['related_skills'])}")
+    if result.get("source_path"):
+        click.echo(f"source:      {result['source_path']}")
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo(result.get("body", ""))

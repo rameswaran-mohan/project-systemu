@@ -1,5 +1,5 @@
 # tests/test_v062_cross_platform_hardening.py
-"""— cross-platform hardening: install.py + config.py warnings."""
+"""v0.6.2 — cross-platform hardening: install.py + config.py warnings."""
 from __future__ import annotations
 
 import sys
@@ -39,7 +39,7 @@ class TestLinuxCaptureDeps:
 
 
 class TestPlaywrightInstallArgs:
-    """--with-deps on Linux pulls Chromium's OS-level libraries
+    """v0.6.2: --with-deps on Linux pulls Chromium's OS-level libraries
     (libnss3, libatk1.0-0, etc.) via sudo apt.  Without it, the browser
     binary downloads OK but fails to launch when sharing_on tries to use it."""
 
@@ -60,7 +60,7 @@ class TestPlaywrightInstallArgs:
 
 
 class TestWaylandDetection:
-    """pynput requires X11.  On Wayland sessions (Ubuntu 22+ default,
+    """v0.6.2: pynput requires X11.  On Wayland sessions (Ubuntu 22+ default,
     Fedora Workstation default), capture features produce empty event streams.
     Daemon itself is unaffected, but the operator should know upfront."""
 
@@ -91,7 +91,7 @@ class TestWaylandDetection:
 
 
 class TestStaleEnvVarDetection:
-    """SYSTEMU_AUTO_APPROVE_SCROLLS was renamed to
+    """v0.6.2: SYSTEMU_AUTO_APPROVE_SCROLLS was renamed to
     SYSTEMU_NON_INTERACTIVE in v0.6.1 (hard cut, no alias).  Operators
     who git pull but don't re-run install.py keep the old key in .env
     — it gets silently ignored.  detect_stale_env_vars() returns a
@@ -130,7 +130,7 @@ class TestStaleEnvVarDetection:
 
 
 class TestConfigStaleEnvWarning:
-    """sharing_on.config.Config.from_env() prints a stderr warning
+    """v0.6.2: sharing_on.config.Config.from_env() prints a stderr warning
     when SYSTEMU_AUTO_APPROVE_SCROLLS is set.  Runtime safety net for
     operators who didn't re-run install.py."""
 

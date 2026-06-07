@@ -1,4 +1,4 @@
-"""dry_run_one_tool works without prior init_jobs(),
+"""v0.6.9: dry_run_one_tool works without prior init_jobs(),
 lazy-initializing its dependencies from env."""
 from unittest.mock import MagicMock
 from sqlalchemy import create_engine

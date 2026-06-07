@@ -1,4 +1,4 @@
-"""regression: validates that the 5 recurring workarounds documented
+"""v0.6.8-f regression: validates that the 5 recurring workarounds documented
 in captures/SHADOW_EXECUTION_VERDICT_3MODES.md no longer require manual
 intervention.
 
@@ -69,7 +69,7 @@ def _run_doctor(scope_id: str, db_url: str):
 
 
 def test_doctor_surfaces_dep_pending_with_recovery_url(tmp_path):
-    """contract: a tool whose dep is missing is NOT auto-disabled.
+    """v0.6.8 contract: a tool whose dep is missing is NOT auto-disabled.
     Doctor surfaces a DEP_PENDING action with the /recover/tool/<id> URL.
     No manual SQL or docker exec required to find the issue."""
     db_path = tmp_path / "vault.db"
@@ -85,7 +85,7 @@ def test_doctor_surfaces_dep_pending_with_recovery_url(tmp_path):
 
 
 def test_doctor_surfaces_memory_poisoning_warning(tmp_path):
-    """contract: a shadow with >=3 identical failures in execution_log
+    """v0.6.8 contract: a shadow with >=3 identical failures in execution_log
     surfaces a MEMORY_POISONED warning with a fix command — no manual UPDATE
     shadows SET execution_log='[]' SQL required."""
     db_path = tmp_path / "vault.db"
@@ -124,7 +124,7 @@ def test_doctor_clean_scope_says_no_pending_actions(tmp_path):
 )
 @pytest.mark.slow
 def test_full_local_shadow_runs_with_zero_workarounds(tmp_path):
-    """contract — operator runs shadow with no manual workarounds.
+    """v0.6.8 contract — operator runs shadow with no manual workarounds.
     Requires real LLM + Open-Meteo API. Gated; skipped by default."""
     pytest.skip("scaffold: real-execution path is documented in "
                 "captures/SHADOW_EXECUTION_VERDICT_3MODES.md v0.6.8 section")

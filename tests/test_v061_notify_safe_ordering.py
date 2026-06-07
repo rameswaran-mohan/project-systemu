@@ -1,4 +1,4 @@
-"""— `SYSTEMU_NON_INTERACTIVE` + safe-action ordering contract.
+"""v0.6.1-b — `SYSTEMU_NON_INTERACTIVE` + safe-action ordering contract.
 
 Closes review issue #2.  Two assertions:
 

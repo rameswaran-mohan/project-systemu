@@ -91,7 +91,7 @@ class ExecutionContext:
         self._history:   List[ExecutionEvent] = []
         self._snapshots: List[Snapshot]       = []
 
-        # persistent across rollback (rollback rewinds _history;
+        # v0.4.0-b: persistent across rollback (rollback rewinds _history;
         # sticky notes survive so the LLM doesn't replay failed paths with
         # amnesia).  Reflection blocks are also stored here so they end up
         # in the very next iteration's system prompt regardless of where
@@ -132,7 +132,7 @@ class ExecutionContext:
             if self.recalled_memory else ""
         )
 
-        # sticky notes survive rollback so the rolled-back LLM
+        # v0.4.0-b: sticky notes survive rollback so the rolled-back LLM
         # doesn't replay the exact same failed path.  Empty by default.
         sticky_block = ""
         if self._sticky_notes:
@@ -142,7 +142,7 @@ class ExecutionContext:
                 f"{sticky_lines}"
             )
 
-        # pending reflection block (one-shot — consumed here).
+        # v0.4.0-b: pending reflection block (one-shot — consumed here).
         reflection_block = ""
         pending = self._consume_pending_reflection()
         if pending:
@@ -402,7 +402,7 @@ class ExecutionContext:
         )
         return last.action_block_num
 
-    # ── Sticky notes + reflection blocks ──────────────────────────
+    # ── v0.4.0-b: Sticky notes + reflection blocks ──────────────────────────
     #
     # These are deliberately stored OUTSIDE ``_history`` so they survive a
     # :meth:`rollback_to_last_snapshot` call.  Without this safeguard a
@@ -456,7 +456,30 @@ class ExecutionContext:
         final_summary: str,
         error: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Build the final ExecutionResult dict."""
+        """Build the final ExecutionResult dict.
+
+        v0.9.6 (L7): additionally surfaces run metadata derived from the
+        history — ``tools_called`` / ``tool_calls`` / ``rounds`` — so the
+        post-run auto-skill-extraction hook can decide whether the run is worth
+        capturing as a SKILL.md (Odysseus threshold: >=2 rounds OR >=2 tool
+        calls).  Additive keys only; existing callers read by name.
+        """
+        tool_events = [e for e in self._history if e.event_type == "tool_call"]
+        tools_called: List[str] = []
+        for e in tool_events:
+            content = e.content if isinstance(e.content, dict) else {}
+            tname = content.get("tool_name") or content.get("tool")
+            if tname:
+                tools_called.append(str(tname))
+        # rounds ≈ number of distinct action blocks the run actually touched
+        # (snapshots excluded). Falls back to tool-call count if action-block
+        # numbers are unavailable.
+        block_nums = {
+            getattr(e, "action_block_num", None)
+            for e in self._history if e.event_type != "snapshot"
+        }
+        block_nums.discard(None)
+        rounds = len(block_nums) if block_nums else len(tool_events)
         return {
             "execution_id":   self.execution_id,
             "status":         status,      # "success" | "failure" | "partial"
@@ -464,5 +487,8 @@ class ExecutionContext:
             "error":          error,
             "snapshots_taken": len(self._snapshots),
             "total_events":   len(self._history),
+            "tools_called":   tools_called,
+            "tool_calls":     len(tool_events),
+            "rounds":         rounds,
             "timestamp":      utcnow().isoformat(),
         }

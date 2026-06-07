@@ -1,4 +1,4 @@
-"""— `_create_postgres_backend` requires Redis only when broker=redis.
+"""v0.6.6-c — `_create_postgres_backend` requires Redis only when broker=redis.
 
 Before v0.6.6 the dashboard's AppState rejected the docker-local combo of
 (storage=postgres, queue_broker=sqlite, no Redis) and silently fell back to

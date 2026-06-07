@@ -114,7 +114,7 @@ def test_non_dict_entries_ignored():
 
 
 def test_reset_shadow_memory_keep_successes():
-    """prefers vault.get_shadow (Pydantic) over find_shadow (ORM row)
+    """v0.6.8: prefers vault.get_shadow (Pydantic) over find_shadow (ORM row)
     because save_shadow expects Pydantic."""
     from systemu.runtime.memory_consolidator import reset_shadow_memory
     shadow = MagicMock()

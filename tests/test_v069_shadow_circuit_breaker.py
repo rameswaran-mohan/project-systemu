@@ -1,4 +1,4 @@
-"""shadow iteration loop bails after N=3 consecutive same-tool
+"""v0.6.9: shadow iteration loop bails after N=3 consecutive same-tool
 same-reason failures."""
 from systemu.runtime.shadow_runtime import ShadowRuntime
 

@@ -54,7 +54,7 @@ def build_settings_page() -> None:
             f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
             f"border-radius: 12px; padding: 20px; gap: 14px;"
         ):
-            # renamed control + env var.  See notify_user's
+            # v0.6.1-b: renamed control + env var.  See notify_user's
             # action-ordering contract — this flag auto-picks actions[0] in
             # EVERY prompt, not just scroll approval.
             auto_approve = ui.checkbox(

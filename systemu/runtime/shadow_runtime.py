@@ -251,6 +251,87 @@ def _resolve_tool_whitelist(context: str) -> set:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+#  v0.9.5 T0 — LLM-visible tool catalog builder (v1 + v2 unified)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _build_llm_tool_catalog(vault=None, config=None) -> List[Dict[str, Any]]:
+    """Build the LLM-visible tool catalog, combining v1 vault tools and v2
+    code-registered tools.
+
+    v2 tools whose check_fn returns False are EXCLUDED (so the LLM doesn't
+    waste turns calling unavailable tools). v1 vault tools are filtered
+    by the existing enabled/dry_run gates (passed in already-filtered via
+    the ``vault`` arg — caller responsibility).
+
+    For the test path (vault=None), only v2 tools are returned.
+
+    Each entry has at minimum: name, description, parameters_schema.
+    v1 entries also carry id and parameter_names (preserved for backward
+    compat with the existing prompt template).
+    """
+    catalog: List[Dict[str, Any]] = []
+
+    # Ensure v2 tool modules are imported before listing.
+    _discover_v2_tools()
+
+    # Resolve config for check_fn availability checks.
+    _cfg = config
+    if _cfg is None:
+        try:
+            from sharing_on.config import Config as _Config
+            _cfg = _Config.from_env()
+        except Exception:
+            _cfg = None
+
+    # ── v2 tools ──────────────────────────────────────────────────────────
+    from systemu.runtime.tool_registry_v2 import registry as _v2
+
+    for entry in _v2.list():
+        # check_fn gating: exclude when unavailable.
+        if entry.check_fn is not None:
+            if not _v2.available(entry.name, _cfg):
+                continue
+        catalog.append({
+            "name": entry.name,
+            "description": entry.description or f"v2 tool: {entry.name}",
+            "parameters_schema": dict(entry.schema or {}),
+            "toolset": entry.toolset,
+            "is_action_tool": entry.is_action_tool,
+        })
+
+    # ── v1 vault tools (preserve existing shape) ─────────────────────────
+    if vault is not None:
+        try:
+            from systemu.core.models import ToolStatus as _ToolStatus
+            v1_tools = (
+                vault.list_tools(status=_ToolStatus.DEPLOYED)
+                if hasattr(vault, "list_tools")
+                else []
+            )
+        except Exception:
+            v1_tools = []
+
+        _existing_names = {e["name"] for e in catalog}
+        for t in (v1_tools or []):
+            if t.name in _existing_names:
+                continue  # v2 wins on conflict (code-registered tools are
+                           # intentional replacements of vault auto-forged stubs)
+            catalog.append({
+                "id": t.id,
+                "name": t.name,
+                "description": t.description,
+                "parameter_names": list(getattr(t, "parameter_names", []) or []),
+                # v1 tools expose parameter_names, not a full JSON schema;
+                # add an empty parameters_schema so all entries satisfy the
+                # uniform contract the tests (and future prompt templates) expect.
+                "parameters_schema": {},
+            })
+
+    return catalog
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #  v0.9.2 (Layer 2) — Episodic memory capture hook
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -1666,9 +1747,23 @@ class ShadowRuntime:
                     "name": t.name,
                     "description": t.description,
                     "parameter_names": list(getattr(t, "parameter_names", []) or []),
+                    # Uniform contract: all entries have parameters_schema.
+                    "parameters_schema": {},
                 }
                 for t in tools
             ]
+            # v0.9.5 T0: augment v1 tool_index with v2-registered tools so the
+            # LLM can actually call them (file_tools, skill_tools, capability_tools,
+            # etc.). Without this, all L3/L5/L6 LLM tools are dead code.
+            _existing_names = {t["name"] for t in tool_index}
+            _v2_entries = _build_llm_tool_catalog(
+                vault=None,  # v2 portion only — v1 already in tool_index above
+                config=getattr(self, "config", None),
+            )
+            for _entry in _v2_entries:
+                if _entry["name"] not in _existing_names:
+                    tool_index.append(_entry)
+                    _existing_names.add(_entry["name"])
             skill_index = [
                 {"id": s.id, "name": s.name, "category": s.category, "description": s.description}
                 for s in skills
@@ -1990,6 +2085,21 @@ class ShadowRuntime:
                     "history":         _build_history_slice(context),
                     "last_snapshot":   context._snapshots[-1].summary if context._snapshots else None,
                 }
+                # v0.9.6 T0: per-iteration guard — ensure v2 tools are always
+                # present in the LLM's available_tools even if tool_index was
+                # assembled before v2 discovery completed, or if a future code
+                # path resets/filters tool_index between the boot-time augmentation
+                # (v0.9.5 T0, ~line 1759) and here.  This closes the gap observed
+                # in the v0.9.5 live burrito test where the LLM never saw v2 tools.
+                _v2_live = _build_llm_tool_catalog(
+                    vault=None,  # v2 portion only — v1 already in tool_index
+                    config=getattr(self, "config", None),
+                )
+                _at_live_names = {t.get("name") for t in _user_payload["available_tools"]}
+                for _at_entry in _v2_live:
+                    if _at_entry["name"] not in _at_live_names:
+                        _user_payload["available_tools"].append(_at_entry)
+                        _at_live_names.add(_at_entry["name"])
                 # v0.8.21: one-shot operator hint fold-back (cleared after this iteration).
                 if self._operator_hint:
                     _user_payload["operator_hint"] = self._operator_hint

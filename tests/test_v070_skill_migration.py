@@ -1,4 +1,4 @@
-"""skill layout migrator transforms Systemu-internal skills to
+"""v0.7-c: skill layout migrator transforms Systemu-internal skills to
 spec-conformant Anthropic Agent Skills format."""
 from pathlib import Path
 import pytest

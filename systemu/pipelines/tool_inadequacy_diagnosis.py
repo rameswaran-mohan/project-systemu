@@ -80,7 +80,7 @@ def diagnose_tool_inadequacy(
     if cached is not None:
         return cached
 
-    # register the inadequacy flag and check for cluster signal.
+    # v0.5.1-d: register the inadequacy flag and check for cluster signal.
     cluster_summary: Optional[Dict[str, Any]] = None
     try:
         from systemu.runtime.inadequacy_tracker import get_inadequacy_tracker
@@ -142,7 +142,7 @@ def diagnose_tool_inadequacy(
         "failing_objective":      (failing_objective or "")[:400],
         "recent_failures":        recent_failures[-3:],
         "other_shadows_using_tool": other_shadows,
-        # cluster signal — when ≥3 distinct shadows have flagged
+        # v0.5.1-d: cluster signal — when ≥3 distinct shadows have flagged
         # this tool inadequate within the recent window, the prompt is told
         # to bias toward bump_version (universal flaw, not specialised need).
         "cluster_signal":         cluster_summary or {},

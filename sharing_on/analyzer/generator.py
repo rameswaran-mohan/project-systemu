@@ -120,7 +120,7 @@ def generate_instructions(
         step_desc = _format_step_for_llm(step)
         step_descriptions.append(step_desc)
 
-    # when intent is pre-extracted, surface it explicitly so the
+    # v0.6.0-a: when intent is pre-extracted, surface it explicitly so the
     # narrative LLM doesn't have to re-derive it from clicks (which is the
     # whole reason the click-mirroring failure mode exists).
     intent_block = ""

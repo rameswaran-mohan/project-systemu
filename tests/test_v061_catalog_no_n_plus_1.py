@@ -1,4 +1,4 @@
-"""— `_build_catalog` + `_enrich_tool_for_catalog` read schemas
+"""v0.6.1-d — `_build_catalog` + `_enrich_tool_for_catalog` read schemas
 from the index header alone, no per-tool `vault.get_tool()` fetch.
 
 Closes review issue #4.  Verifies both:

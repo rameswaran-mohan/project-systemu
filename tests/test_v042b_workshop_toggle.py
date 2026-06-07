@@ -66,7 +66,7 @@ class TestWorkshopChangeDetection:
 
     The save handler compares form values to current shadow state and
     only triggers a vault write when something actually changed.  The
-    addition: supervisor_enabled toggles count as changes.
+    v0.4.2-b addition: supervisor_enabled toggles count as changes.
     """
 
     def _detect(self, *, shadow_supervisor: bool, form_supervisor: bool) -> Dict[str, Any]:

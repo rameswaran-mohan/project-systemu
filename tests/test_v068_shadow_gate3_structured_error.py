@@ -67,7 +67,7 @@ def test_shadow_gate3_fallback_kind_when_no_evidence():
 
 
 def test_shadow_gate3_message_points_to_recovery_url():
-    """Gate 3 error messages must reference the recovery URL,
+    """v0.6.9: Gate 3 error messages must reference the recovery URL,
     NOT 'Re-forge with feedback' (the v0.6.8 message was misleading)."""
     from unittest.mock import MagicMock
     from systemu.runtime.shadow_runtime import ShadowRuntime
