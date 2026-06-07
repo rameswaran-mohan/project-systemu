@@ -116,6 +116,12 @@ class Config:
     vault_dir: str = "systemu/vault"                     # path to vault root
     tool_backend: str = "local"                          # "local" | "docker" | "ssh" | "wsl"; resolved from env at load time
     docker_tool_timeout: int = 300                       # per-tool timeout (s) in Docker mode; covers image pull + pip install + run
+    # v0.9.1.1 hotfix: default per-tool wall-clock budget when the Tool
+    # itself doesn't override via timeout_seconds. Bumped from the
+    # historical hardcoded 30s — too aggressive for web tools.
+    tool_default_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_TOOL_DEFAULT_TIMEOUT_SECONDS", "60"))
+    )
     execution_retention_count: int = 50                  # max execution dirs kept in vault/executions/
 
     # --- Capture ---

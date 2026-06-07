@@ -171,6 +171,31 @@ def recredit_on_resume(
 
 # ─────────────────────────────────────────────────────────────────────────
 
+
+def _resolve_verifier_output_dir(config, user_profile) -> str:
+    """v0.9.1.1 hotfix: precedence for the verifier's default_output_dir.
+
+    1. user_profile.default_output_dir (if non-empty)  — user's explicit choice
+    2. config.output_dir (if non-empty)                — env-var SYSTEMU_OUTPUT_DIR
+    3. {vault_dir}/outputs                             — last-resort default
+
+    Without this, a user who runs `sharing_on user init` with a non-default
+    output dir but no SYSTEMU_OUTPUT_DIR env var would see the verifier check
+    ~/Documents while the LLM wrote files to the profile path → false rejection.
+    """
+    if user_profile is not None:
+        prof_dir = getattr(user_profile, "default_output_dir", None) or ""
+        if prof_dir:
+            return prof_dir
+    cfg_dir = getattr(config, "output_dir", None) or ""
+    if cfg_dir:
+        return cfg_dir
+    vault_dir = getattr(config, "vault_dir", ".")
+    return str(Path(vault_dir) / "outputs")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+
 # Deferred refinery dispatch
 def _dispatch_refinery(shadow, scroll, result_dict, context, config, vault):
     try:
@@ -1071,6 +1096,12 @@ class ShadowRuntime:
     ):
         self.config        = config
         self.vault         = vault
+        # v0.9.1.1 fix: load user_profile once at init so _resolve_verifier_output_dir
+        # can actually prefer user_profile.default_output_dir over config.output_dir.
+        try:
+            self.user_profile = vault.get_user_profile() if vault is not None else None
+        except Exception:
+            self.user_profile = None
         _vault_root = Path(config.vault_dir).resolve()
         # Pick the backend from config (resolved at Config.from_env() time
         # from SYSTEMU_TOOL_BACKEND; defaults to "local").
@@ -1594,10 +1625,8 @@ class ShadowRuntime:
                                         vault=self.vault,
                                         config=self.config,
                                         execution_id=resume_from_execution_id or execution_id,
-                                        default_output_dir=getattr(
-                                            self.config, "output_dir", str(
-                                                Path(getattr(self.config, "vault_dir", ".")) / "outputs"
-                                            )
+                                        default_output_dir=_resolve_verifier_output_dir(
+                                            self.config, getattr(self, "user_profile", None)
                                         ),
                                     )
                                     if _rc.credited:
@@ -2243,10 +2272,8 @@ class ShadowRuntime:
                                             vault=self.vault,
                                             config=self.config,
                                             execution_id=execution_id,
-                                            default_output_dir=getattr(
-                                                self.config, "output_dir", str(
-                                                    Path(getattr(self.config, "vault_dir", ".")) / "outputs"
-                                                )
+                                            default_output_dir=_resolve_verifier_output_dir(
+                                                self.config, getattr(self, "user_profile", None)
                                             ),
                                             chat_result=None,
                                             state=_vstate,

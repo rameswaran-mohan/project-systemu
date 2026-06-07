@@ -169,7 +169,7 @@ def _install_failed_dict(
 
 
 def _discover_plugin_tools(registry, plugins_root: "Path | None" = None) -> None:
-    """discover + register out-of-tree tool plugins.
+    """v0.7-f: discover + register out-of-tree tool plugins.
 
     Two discovery channels:
 
@@ -245,6 +245,19 @@ def _discover_plugin_tools(registry, plugins_root: "Path | None" = None) -> None
         pass
 
 
+def _resolve_timeout(tool, config, *, explicit):
+    """v0.9.1.1: resolve effective tool timeout.
+
+    Precedence: explicit > tool.timeout_seconds > config.tool_default_timeout_seconds > 30s.
+    """
+    if explicit is not None:
+        return explicit
+    tool_t = getattr(tool, "timeout_seconds", None)
+    if tool_t is not None:
+        return tool_t
+    return int(getattr(config, "tool_default_timeout_seconds", 30))
+
+
 class ToolRegistry:
     """Dynamic importer + direct-call dispatcher.
 
@@ -278,12 +291,12 @@ class ToolRegistry:
         from systemu.runtime.dependency_installer import InstallMode as _InstallMode
         self._install_mode: "_InstallMode" = install_mode or _InstallMode.PROMPT
         self._approvals = approvals
-        # out-of-tree plugin specs (filesystem dir + entry-points).
+        # v0.7-f: out-of-tree plugin specs (filesystem dir + entry-points).
         # Plugin authors call ``registry.register(spec_dict)``; we stash the
         # specs here for the runtime to surface alongside in-tree tools.
         self._plugin_specs: list[dict] = []
 
-        # discover out-of-tree plugins (fs `plugins/` dir + entry points).
+        # v0.7-f: discover out-of-tree plugins (fs `plugins/` dir + entry points).
         # Per-plugin failures are isolated; any catastrophic failure of the loader
         # itself must not block the in-tree registry from coming up.
         try:
@@ -296,7 +309,7 @@ class ToolRegistry:
     # ── Plugin registration hook (v0.7-f) ─────────────────────────────────────
 
     def register(self, spec: dict) -> None:
-        """callback invoked by plugin ``register_tools(registry)``.
+        """v0.7-f: callback invoked by plugin ``register_tools(registry)``.
 
         Accepts a tool spec dict (must contain at least ``name``) and stores it
         on ``self._plugin_specs``.  The dispatcher in :py:meth:`execute` is
@@ -314,7 +327,7 @@ class ToolRegistry:
         self,
         name: str,
         params: dict,
-        timeout: float = 30.0,
+        timeout: Optional[float] = None,   # v0.9.1.1: None = resolve via _resolve_timeout
     ) -> dict:
         """Gate 3 check → import module → call run(**params) in a thread.
 
@@ -325,6 +338,13 @@ class ToolRegistry:
         tool = self._vault.find_tool_by_name(name)
         if tool is None:
             return {"success": False, "error": f"Tool '{name}' not found in vault"}
+        # v0.9.1.1: resolve effective timeout (explicit > tool field > config default > 30s)
+        from sharing_on.config import Config as _Config
+        effective_timeout = _resolve_timeout(
+            tool,
+            getattr(self, "_config", None) or _Config(),
+            explicit=timeout,
+        )
         # ── Gate 2.5 (v0.8.19): validate params against the declared schema ──
         from systemu.runtime.param_validation import validate_params
         _perr = validate_params(getattr(tool, "parameters_schema", {}) or {}, params or {})
@@ -341,7 +361,7 @@ class ToolRegistry:
         # A tool whose dry-run failed cannot be called even if the operator
         # accidentally toggled it on.  ``skipped`` is allowed (destructive
         # tools the operator verified manually).  ``not_run`` is allowed
-        # for backward-compat with pre-tools.
+        # for backward-compat with pre-v0.5.0 tools.
         dr_status = getattr(tool, "dry_run_status", "not_run") or "not_run"
         if dr_status == "failed":
             return {
@@ -399,7 +419,7 @@ class ToolRegistry:
             try:
                 result = await asyncio.wait_for(
                     loop.run_in_executor(_executor, _call, mod),
-                    timeout=timeout,
+                    timeout=effective_timeout,
                 )
             except ToolDependencyError as exc:
                 # Lazy ImportError surfaced from inside run().  Try self-heal
@@ -414,13 +434,13 @@ class ToolRegistry:
                 mod = reload_result
                 result = await asyncio.wait_for(
                     loop.run_in_executor(_executor, _call, mod),
-                    timeout=timeout,
+                    timeout=effective_timeout,
                 )
             logger.debug("[Registry] '%s' → success=%s", name, result.get("success"))
             return result
         except asyncio.TimeoutError:
-            logger.warning("[Registry] Tool '%s' timed out after %.0fs", name, timeout)
-            return {"success": False, "error": f"Tool '{name}' timed out after {timeout:.0f}s"}
+            logger.warning("[Registry] Tool '%s' timed out after %.0fs", name, effective_timeout)
+            return {"success": False, "error": f"Tool '{name}' timed out after {effective_timeout:.0f}s"}
         except ToolDependencyError as exc:
             # Lazy ImportError on the retry — give up and surface the
             # current dep-error dict.  Tools that import a third package
