@@ -1670,3 +1670,83 @@ def user_wipe(ctx, confirm: bool):
     from systemu.runtime.user_profile import wipe
     wipe(vault)
     click.echo("✓ user profile and facts wiped")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.2: session episodic-memory CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+@click.group(name="session")
+def session_cli():
+    """Inspect the freeform episodic-memory log (cross-session recall)."""
+    pass
+
+
+@session_cli.command("list")
+@click.option("--limit", default=20, show_default=True)
+def session_list(limit):
+    """List recent sessions from the episodic-memory log."""
+    from sharing_on.config import Config
+    from systemu.vault.vault import Vault
+    from pathlib import Path
+    cfg = Config.from_env()
+    v = Vault(root=Path(cfg.vault_dir))
+    summaries = v.query_session_summaries(limit=limit)
+    if not summaries:
+        click.echo("(no sessions yet)")
+        return
+    for s in summaries:
+        click.echo(f"  {s.completed_at.strftime('%Y-%m-%d %H:%M')} "
+                   f"[{s.status:7}] {s.session_id}: {s.intent[:60]}")
+
+
+@session_cli.command("show")
+@click.argument("session_id")
+def session_show(session_id):
+    """Show full detail of an episodic-memory session record."""
+    from sharing_on.config import Config
+    from systemu.vault.vault import Vault
+    from systemu.runtime.tools.session_tools import session_recall
+    from pathlib import Path
+    cfg = Config.from_env()
+    v = Vault(root=Path(cfg.vault_dir))
+    result = session_recall(vault=v, session_id=session_id)
+    if result is None:
+        click.echo(f"No session found with id={session_id!r}")
+        return
+    click.echo(f"session_id:   {result['session_id']}")
+    click.echo(f"status:       {result['status']}")
+    click.echo(f"started_at:   {result['started_at']}")
+    click.echo(f"completed_at: {result['completed_at']}")
+    click.echo(f"intent:       {result['intent']}")
+    click.echo(f"outcome:      {result['outcome_summary']}")
+    if result['tags']:
+        click.echo(f"tags:         {', '.join(result['tags'])}")
+    if result['key_facts_learned']:
+        click.echo("facts learned:")
+        for f in result['key_facts_learned']:
+            click.echo(f"  - {f}")
+    if result['files_produced']:
+        click.echo("files produced:")
+        for f in result['files_produced']:
+            click.echo(f"  - {f}")
+
+
+@session_cli.command("search")
+@click.argument("query")
+@click.option("--limit", default=5, show_default=True)
+def session_search_cmd(query, limit):
+    """Search the episodic-memory log by keyword."""
+    from sharing_on.config import Config
+    from systemu.vault.vault import Vault
+    from systemu.runtime.tools.session_tools import session_search
+    from pathlib import Path
+    cfg = Config.from_env()
+    v = Vault(root=Path(cfg.vault_dir))
+    results = session_search(vault=v, query=query, limit=limit)
+    if not results:
+        click.echo(f"No sessions match query {query!r}")
+        return
+    for r in results:
+        click.echo(f"  [{r['status']:7}] {r['session_id']}: {r['intent'][:60]}")
+        click.echo(f"    outcome: {r['outcome_summary'][:80]}")

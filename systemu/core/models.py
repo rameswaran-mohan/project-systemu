@@ -355,6 +355,33 @@ class Skill(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  SessionSummary  (v0.9.2 — Layer 2 Episodic Memory)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SessionSummary(BaseModel):
+    """One persistent record per completed run, written by episodic_memory.
+
+    Tier-1 generates ``outcome_summary``, ``key_facts_learned``, and ``tags``
+    at run-end. The search index (FTS5 in sqlite, tsvector in postgres) is
+    built over ``intent + outcome_summary + tags`` so the LLM can ask
+    "have I done this before?" across sessions.
+    """
+    id:                  str
+    session_id:          str
+    execution_id:        Optional[str] = None
+    user_id:             Optional[str] = None
+    started_at:          datetime
+    completed_at:        datetime
+    status:              str               # success | partial | failed | stuck
+    intent:              str
+    outcome_summary:     str
+    key_facts_learned:   List[str] = Field(default_factory=list)
+    files_produced:      List[str] = Field(default_factory=list)
+    tags:                List[str] = Field(default_factory=list)
+    raw_chat_id:         Optional[str] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Activity
 # ─────────────────────────────────────────────────────────────────────────────
 

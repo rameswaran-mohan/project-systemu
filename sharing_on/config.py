@@ -122,6 +122,24 @@ class Config:
     tool_default_timeout_seconds: int = field(
         default_factory=lambda: int(os.getenv("SYSTEMU_TOOL_DEFAULT_TIMEOUT_SECONDS", "60"))
     )
+
+    # v0.9.2 (Layer 2 — Episodic Memory): per-run summarization + cross-session recall.
+    episodic_memory_enabled: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_EPISODIC_MEMORY_ENABLED", "true").lower() != "false"
+    )
+    summarize_after_run: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_SUMMARIZE_AFTER_RUN", "true").lower() != "false"
+    )
+    episodic_search_default_limit: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_EPISODIC_SEARCH_DEFAULT_LIMIT", "5"))
+    )
+    episodic_summary_max_chars: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_EPISODIC_SUMMARY_MAX_CHARS", "800"))
+    )
+    episodic_tags_max_count: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_EPISODIC_TAGS_MAX_COUNT", "8"))
+    )
+
     execution_retention_count: int = 50                  # max execution dirs kept in vault/executions/
 
     # --- Capture ---
