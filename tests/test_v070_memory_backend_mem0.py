@@ -1,4 +1,4 @@
-"""Mem0MemoryBackend — tests use monkeypatch instead of `patch().return_value`
+"""v0.7-g: Mem0MemoryBackend — tests use monkeypatch instead of `patch().return_value`
 chaining so they're CI-stable across pytest / mock library versions."""
 from unittest.mock import MagicMock
 

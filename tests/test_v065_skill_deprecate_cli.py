@@ -1,4 +1,4 @@
-"""— sharing_on skills deprecate CLI."""
+"""v0.6.5-e — sharing_on skills deprecate CLI."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

@@ -129,7 +129,7 @@ class TestRobustness:
         ]) == []
 
     def test_accepts_pydantic_tool_instances(self):
-        # names must match ^[a-z][a-z0-9_]{0,63}$ — use snake_case
+        # v0.6.1-a: names must match ^[a-z][a-z0-9_]{0,63}$ — use snake_case
         t = Tool(
             id="tool_x", name="tool_a", description="-",
             tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.DEPLOYED,

@@ -1,10 +1,10 @@
 """Tests for v0.5.1 — deferred recalibration items.
 
-  Override actions  — exercised at the recalibrator helper level
-  Spec diff          — compute_spec_diff
-  Auto-approve risk  — is_low_risk_recalibration
-  Cross-shadow tracker — InadequacyTracker
-  Snapshot resume    — write/read/apply
+  v0.5.1-a Override actions  — exercised at the recalibrator helper level
+  v0.5.1-b Spec diff          — compute_spec_diff
+  v0.5.1-c Auto-approve risk  — is_low_risk_recalibration
+  v0.5.1-d Cross-shadow tracker — InadequacyTracker
+  v0.5.1-e Snapshot resume    — write/read/apply
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from systemu.pipelines.tool_inadequacy_diagnosis import InadequacyDiagnosis
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — compute_spec_diff
+# v0.5.1-b — compute_spec_diff
 
 class TestSpecDiff:
     def test_no_changes_returns_empty(self):
@@ -61,7 +61,7 @@ class TestSpecDiff:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — is_low_risk_recalibration
+# v0.5.1-c — is_low_risk_recalibration
 
 class TestRiskClassifier:
     def _result(self, **kw):
@@ -146,7 +146,7 @@ class TestRiskClassifier:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — InadequacyTracker
+# v0.5.1-d — InadequacyTracker
 
 class TestInadequacyTracker:
     def test_flag_then_query(self, tmp_path):
@@ -200,7 +200,7 @@ class TestInadequacyTracker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — execution snapshot persistence
+# v0.5.1-e — execution snapshot persistence
 
 @pytest.fixture
 def context_for_snapshot(tmp_path):
@@ -290,7 +290,7 @@ class TestSnapshotPersistence:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (config knob round-trip)
+# v0.5.1-c (config knob round-trip)
 
 class TestConfigKnob:
     def test_default_off(self, monkeypatch):

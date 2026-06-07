@@ -1,4 +1,4 @@
-"""provider plugin interface.
+"""v0.7-e: provider plugin interface.
 
 Every provider claims model names via ``matches(model_name)`` and implements
 ``async call(messages, model, **kwargs) -> LLMResponse``.  The registry uses

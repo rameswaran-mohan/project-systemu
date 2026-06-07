@@ -267,12 +267,12 @@ def _extract_memory_candidates(
     from datetime import datetime
     exec_id = execution_result.get("execution_id", "")
     written = 0
-    # dedup against signature-bearing entries already in the
+    # v0.4.0-e: dedup against signature-bearing entries already in the
     # shadow's buffer.  This stops the refinery from creating duplicate
     # lessons when the supervisor (or _analyze_failure) has already
     # written the same pattern live.
     #
-    # also count prior occurrences per signature so we can gate
+    # v0.6.9: also count prior occurrences per signature so we can gate
     # `failure_patterns` lessons behind an N>=3 recurrence threshold.
     # A single failed run was previously enough to write "tool fails
     # persistently" to the buffer; the next run would then read that
@@ -292,7 +292,7 @@ def _extract_memory_candidates(
             existing_sigs.add(_s)
             sig_count[_s] = sig_count.get(_s, 0) + 1
 
-    # failure_patterns require N>=3 corroborating executions
+    # v0.6.9: failure_patterns require N>=3 corroborating executions
     # before promotion to the buffer.  Observational categories
     # (tool_quirks, heuristics, domain_glossary, self_assessment) still
     # write on first occurrence — they describe stable facts, not a
@@ -314,7 +314,7 @@ def _extract_memory_candidates(
             error_message=text,
             top_keyword=lesson.get("keyword"),
         )
-        # failure_patterns use the N>=3 occurrence gate instead
+        # v0.6.9: failure_patterns use the N>=3 occurrence gate instead
         # of the strict 1-and-done dedup.  The supervisor and
         # _analyze_failure write raw failure observations to the buffer
         # live (one per occurrence); the refinery distills the recurring
@@ -326,7 +326,7 @@ def _extract_memory_candidates(
             occurrences_with_current = sig_count.get(sig, 0) + 1
             if occurrences_with_current < FAILURE_RECURRENCE_THRESHOLD:
                 logger.debug(
-                    "[Refinery] deferring failure_patterns lesson "
+                    "[Refinery] v0.6.9: deferring failure_patterns lesson "
                     "for shadow %s sig=%r — %d/%d occurrences",
                     shadow.id, sig, occurrences_with_current,
                     FAILURE_RECURRENCE_THRESHOLD,
@@ -351,7 +351,7 @@ def _extract_memory_candidates(
         # rejects cross-tier writes per docs/memory-model.md.
         vault.append_shadow_memory_buffer(shadow.id, entry, source="refinery")
         existing_sigs.add(sig)
-        # include this write in subsequent threshold checks so
+        # v0.6.9: include this write in subsequent threshold checks so
         # multiple lessons in the same extraction call don't double-count.
         sig_count[sig] = sig_count.get(sig, 0) + 1
         written += 1

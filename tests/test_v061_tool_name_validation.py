@@ -1,4 +1,4 @@
-"""— Tool.name validator rejects unsafe values before any disk write.
+"""v0.6.1-a — Tool.name validator rejects unsafe values before any disk write.
 
 Closes review issue #1.  The LLM-supplied tool name was previously written
 to disk via ``impl_dir / f"{tool.name}.py"`` BEFORE any validation, so a

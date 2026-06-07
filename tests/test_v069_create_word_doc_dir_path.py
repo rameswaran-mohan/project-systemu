@@ -1,4 +1,4 @@
-"""create_word_doc gracefully handles a directory output_path by
+"""v0.6.9: create_word_doc gracefully handles a directory output_path by
 appending a default filename derived from the title.
 
 These tests exercise the real ``python-docx`` write path so they only run

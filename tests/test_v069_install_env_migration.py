@@ -1,4 +1,4 @@
-"""install.py auto-renames SYSTEMU_AUTO_APPROVE_SCROLLS to
+"""v0.6.9: install.py auto-renames SYSTEMU_AUTO_APPROVE_SCROLLS to
 SYSTEMU_NON_INTERACTIVE during merge_existing_env."""
 from pathlib import Path
 

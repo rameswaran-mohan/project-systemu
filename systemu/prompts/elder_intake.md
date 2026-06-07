@@ -127,4 +127,20 @@ User prompt: `"take a screenshot of example.com and save it as a PDF in my Docum
 }
 ```
 
+## Handling tool errors with hints
+
+Some tool errors carry **actionable retry hints** in their error message — follow them rather than declaring completion.
+
+- **`web_extract` `error_type="anti_bot_blocked"`** (HTTP 401/403/406/429/451 from sites with Cloudflare/PerimeterX/Akamai bot detection): the error message explicitly tells you to retry with a search-engine URL (DuckDuckGo, Google). **DO NOT** claim the objective is complete after one of these failures. Issue ANOTHER `web_extract` call to a URL like `https://duckduckgo.com/html/?q=<your+query>` or `https://www.google.com/search?q=<your+query>`, then web_extract the search-result page and follow promising links to general directories or Wikipedia pages.
+- **In general**: if a tool's error message names a specific next action ("retry with X", "increase Y", "use Z instead"), the agent should follow it before reporting completion.
+- The verifier subsystem will reject completion claims that contradict the durable state. Faking completion just causes a verifier rejection and burns iterations.
+
+## Use bundled recipes before improvising
+
+systemu ships bundled SKILL.md recipes for common workflows (e.g. `burrito-delivery`, `find-nearby`, `summarize-page`). Before generating objectives from scratch, call `skill_list_skills` to see what's available. If the user's intent matches a bundled skill (or a user-installed one in `SYSTEMU_SKILLS_USER_DIR`), call `skill_view_skill(name=...)` to load the full recipe and follow its **Procedure** section step by step.
+
+A skill's procedure embeds proven workflows that the operator has already validated. Following an existing recipe is faster, more reliable, and more accountable than re-deriving the plan every run. Following the recipe also closes the verifier loop — recipes prescribe explicit file writes, so the verifier will credit completion.
+
+Don't load every skill — just `skill_list_skills` to scan, then `skill_view_skill` only on the most relevant match.
+
 Output only valid JSON. No surrounding prose, no markdown fences.

@@ -39,6 +39,10 @@ class ToolEntry:
     is_action_tool: bool = False
     max_result_size_chars: Optional[int] = None
     timeout_seconds: Optional[int] = None
+    # v0.9.5 (Hermes pattern): zero-arg callable returning dict overrides
+    # applied to the schema at LLM-rendering time. Used by delegate_task to
+    # surface live config (current max_depth, etc.) in its description.
+    dynamic_schema_overrides: Optional[Callable[[], Dict[str, Any]]] = None
 
 
 def _module_registers_tools(module_path: Path) -> bool:
@@ -84,6 +88,7 @@ class ToolRegistry:
         is_action_tool: bool = False,
         max_result_size_chars: Optional[int] = None,
         timeout_seconds: Optional[int] = None,
+        dynamic_schema_overrides: Optional[Callable[[], Dict[str, Any]]] = None,
     ) -> None:
         with self._lock:
             self._tools[name] = ToolEntry(
@@ -95,6 +100,7 @@ class ToolRegistry:
                 is_action_tool=is_action_tool,
                 max_result_size_chars=max_result_size_chars,
                 timeout_seconds=timeout_seconds,
+                dynamic_schema_overrides=dynamic_schema_overrides,
             )
 
     def get(self, name: str) -> Optional[ToolEntry]:

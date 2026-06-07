@@ -49,7 +49,7 @@ Downstream systems will read your output and use it to design automated workflow
 }
 ```
 
-## Confidence rules
+## Confidence rules (v0.6.5: tightened — be less conservative on clear outcomes)
 
 Use this rubric to pick `confidence`:
 

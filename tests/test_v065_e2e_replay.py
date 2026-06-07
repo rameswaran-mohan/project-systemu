@@ -1,4 +1,4 @@
-"""— replays cap_20260517_145110 to confirm the fix would have caught
+"""v0.6.5-h — replays cap_20260517_145110 to confirm the fix would have caught
 the regression.
 
 The 2026-05-17 weather E2E (verdict in captures/...145110/E2E_VERDICT.md) showed:

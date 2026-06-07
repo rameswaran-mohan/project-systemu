@@ -1,4 +1,4 @@
-"""native Anthropic provider with OpenAI-message bridge.
+"""v0.7-e: native Anthropic provider with OpenAI-message bridge.
 
 The Anthropic Messages API splits ``system`` off from the messages list
 and requires ``max_tokens``.  This provider accepts standard OpenAI-shape

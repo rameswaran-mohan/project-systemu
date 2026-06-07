@@ -1,4 +1,4 @@
-"""memory backend interface — abstracts the filesystem from the
+"""v0.7-g: memory backend interface — abstracts the filesystem from the
 consolidator path so Mem0 (or other backends) can plug in via env var."""
 from __future__ import annotations
 from abc import ABC, abstractmethod

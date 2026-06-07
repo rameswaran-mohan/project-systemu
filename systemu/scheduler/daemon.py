@@ -242,6 +242,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     from systemu.scheduler.jobs import (
         init_jobs, set_scheduler,
         hourly_shadow_sweep, daily_evolution_check, consolidate_shadow_memory,
+        curator_review_job,
         startup_recovery_sweep,
     )
 
@@ -432,6 +433,17 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         name="Daily Evolution Check",
         replace_existing=True,
     )
+    # v0.9.6 L7: inactivity-triggered curator. Checked hourly; the heavy
+    # lifecycle pass only fires when curator.should_run() says the configured
+    # interval (default weekly) has elapsed AND curator is enabled + unpaused.
+    scheduler.add_job(
+        curator_review_job,
+        trigger="interval",
+        hours=1,
+        id="curator_review",
+        name="Idle-Triggered Curator Review",
+        replace_existing=True,
+    )
 
     # v0.7.4 Pattern 2: tool lifecycle reconciler — advance FORGED tools
     # to DEPLOYED via dry-run on a short interval. Closes the Bug #22 gap
@@ -508,7 +520,8 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     logger.info("[Daemon] Scheduler started. PID=%d | Port=%d", os.getpid(), port)
     logger.info(
         "[Daemon] Jobs: shadow sweep (hourly) | memory consolidation (02:00) | "
-        "evolution check (03:00) | tool reconciler (every 30s) | "
+        "evolution check (03:00) | curator review (hourly check, weekly pass) | "
+        "tool reconciler (every 30s) | "
         "scheduled execute (every 1min) | "
         "resume-on-decision reconciler (every 15s)",
     )

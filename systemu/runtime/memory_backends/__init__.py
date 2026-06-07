@@ -1,4 +1,4 @@
-"""pluggable memory backends."""
+"""v0.7-g: pluggable memory backends."""
 from .base import BaseMemoryBackend  # noqa: F401
 
 

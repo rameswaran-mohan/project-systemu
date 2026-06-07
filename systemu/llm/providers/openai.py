@@ -1,4 +1,4 @@
-"""native OpenAI provider (api.openai.com, not via OpenRouter)."""
+"""v0.7-e: native OpenAI provider (api.openai.com, not via OpenRouter)."""
 from __future__ import annotations
 from openai import AsyncOpenAI
 

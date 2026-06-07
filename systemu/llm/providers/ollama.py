@@ -1,4 +1,4 @@
-"""Ollama provider (local REST, no SDK dep — uses httpx)."""
+"""v0.7-e: Ollama provider (local REST, no SDK dep — uses httpx)."""
 from __future__ import annotations
 import httpx
 from .base import BaseLLMProvider, LLMResponse

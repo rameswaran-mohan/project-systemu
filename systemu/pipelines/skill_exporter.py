@@ -1,4 +1,4 @@
-"""export an internal Skill record as a spec-conformant Agent Skills bundle.
+"""v0.7-d: export an internal Skill record as a spec-conformant Agent Skills bundle.
 
 Reads a Skill via ``vault.get_skill(skill_id)`` and writes a portable
 ``SKILL.md`` (Anthropic Agent Skills Standard) into

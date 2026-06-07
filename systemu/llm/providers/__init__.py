@@ -1,4 +1,4 @@
-"""provider registry + dispatcher."""
+"""v0.7-e: provider registry + dispatcher."""
 from .base import BaseLLMProvider, LLMResponse  # noqa: F401
 from .openrouter import OpenRouterProvider
 from .google import GoogleProvider

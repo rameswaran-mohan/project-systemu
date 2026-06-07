@@ -1,4 +1,4 @@
-"""OpenRouter provider — catch-all for non-claimed models."""
+"""v0.7-e: OpenRouter provider — catch-all for non-claimed models."""
 from __future__ import annotations
 from openai import AsyncOpenAI
 

@@ -78,6 +78,74 @@ def _maybe_trigger_fact_extraction(vault, config, ts: str) -> None:
         logger.debug("[DirectTask] fact-extraction hook swallowed error", exc_info=True)
 
 
+def _maybe_extract_skill_and_consolidate(*, vault, config, scroll, shadow, result) -> None:
+    """v0.9.6 (Layer 7): after a real chat run completes, run two best-effort,
+    never-raising post-processing passes:
+
+    1. **Auto-skill extraction** (Odysseus pattern) — ONLY on a successful,
+       multi-step run (>=2 rounds OR >=2 tool calls). Tier-1 LLM decides
+       whether the workflow is worth capturing as a SKILL.md; if confidence is
+       high enough the recipe is persisted to the user skills dir. This is the
+       PRIMARY way the skill library grows — skills are EARNED, not bundled.
+    2. **Memory consolidation** — folds the run's intent + outcome into the
+       run-level consolidated memory cache (facts_learned / patterns_observed),
+       idempotent via SHA256 fingerprint.
+
+    Both are config-gated inside their respective modules and wrapped so a
+    failure can NEVER affect the user-visible run outcome.
+    """
+    from pathlib import Path as _Path
+    try:
+        res = result or {}
+        status = res.get("status", "")
+        intent = getattr(scroll, "intent", "") or ""
+        summary = res.get("summary") or res.get("final_summary") or ""
+
+        # ── (1) auto-skill extraction — success + threshold gated ──────────
+        if status == "success":
+            try:
+                from systemu.runtime import auto_skill_extractor as _ase
+                tools_called = list(res.get("tools_called") or [])
+                n_tool_calls = int(res.get("tool_calls", len(tools_called)) or 0)
+                n_rounds = int(res.get("rounds", res.get("total_events", 0)) or 0)
+                candidate = _ase.extract_skill_candidate(
+                    intent=intent,
+                    chat_result=summary,
+                    n_rounds=n_rounds,
+                    n_tool_calls=n_tool_calls,
+                    tools_called=tools_called,
+                    config=config,
+                )
+                if candidate:
+                    skills_dir = getattr(config, "skills_user_dir", "") or ""
+                    if not skills_dir:
+                        # No operator-configured user dir → keep earned skills
+                        # in a vault-local directory so they're still discovered.
+                        skills_dir = str(_Path(getattr(vault, "root", ".")) / "skills" / "earned")
+                    path = _ase.persist_skill_candidate(candidate, skills_dir=skills_dir)
+                    if path:
+                        logger.info("[L7] auto-extracted SKILL.md → %s", path)
+            except Exception:
+                logger.debug("[L7] auto-skill extraction swallowed error", exc_info=True)
+
+        # ── (2) memory consolidation — config-gated, fingerprint-cached ────
+        try:
+            from systemu.runtime.memory_consolidator import consolidate_run
+            chat_history = [
+                {"role": "user", "content": intent},
+                {"role": "assistant", "content": summary},
+            ]
+            consolidate_run(
+                chat_history=chat_history,
+                config=config,
+                cache_root=_Path(getattr(vault, "root", ".")),
+            )
+        except Exception:
+            logger.debug("[L7] memory consolidation swallowed error", exc_info=True)
+    except Exception:
+        logger.debug("[L7] post-run hook swallowed error", exc_info=True)
+
+
 def _wire_chat_history_completion(
     vault: Vault,
     chat_ts: str,
@@ -412,6 +480,13 @@ def run_direct_task(
         )
     except Exception:
         logger.debug("[DirectTask] episodic capture hook swallowed error", exc_info=True)
+
+    # v0.9.6 (Layer 7): auto-skill extraction + memory consolidation.
+    # Best-effort, never raises. This is where the skill library EARNS new
+    # SKILL.md recipes from successful multi-step runs (Odysseus pattern).
+    _maybe_extract_skill_and_consolidate(
+        vault=vault, config=config, scroll=scroll, shadow=shadow, result=result,
+    )
 
     # ── Stage 5: Wild Card reflection (best-effort) ───────────────────────
     if shadow.name == "Wild Card":

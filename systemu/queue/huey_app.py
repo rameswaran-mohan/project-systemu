@@ -279,7 +279,7 @@ def _make_execute_shadow_task(huey_instance: Any):  # type: ignore[return]
             from sharing_on.config import Config
             from systemu.interface.dashboard_state import AppState
 
-            # read .env / process env so SYSTEMU_TIER{1,2}_MODEL
+            # v0.6.8-g: read .env / process env so SYSTEMU_TIER{1,2}_MODEL
             # actually reaches the worker.  Bare Config() picked dataclass
             # defaults and ignored the operator's tier-model overrides.
             config = Config.from_env()

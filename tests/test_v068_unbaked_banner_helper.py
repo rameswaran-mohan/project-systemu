@@ -1,4 +1,4 @@
-"""list_unbaked_approvals helper backs the /tools banner."""
+"""v0.6.8-e: list_unbaked_approvals helper backs the /tools banner."""
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session

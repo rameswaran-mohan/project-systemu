@@ -56,7 +56,7 @@ CATEGORIES = (
 )
 
 
-# error categories that signal an environment / param issue
+# v0.5.0-c: error categories that signal an environment / param issue
 # rather than a structural tool flaw.  When ≥3 consecutive failures
 # happen and NONE of them fall into these buckets, the supervisor's
 # diagnostic LLM is invoked to decide whether the tool itself is

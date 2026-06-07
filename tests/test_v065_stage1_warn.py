@@ -1,4 +1,4 @@
-"""— Stage 1 emits trace warnings on low confidence."""
+"""v0.6.5-b — Stage 1 emits trace warnings on low confidence."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock

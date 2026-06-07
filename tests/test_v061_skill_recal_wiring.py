@@ -1,4 +1,4 @@
-"""— RECALIBRATE_SKILL action wires through shadow_runtime.
+"""v0.6.1-c — RECALIBRATE_SKILL action wires through shadow_runtime.
 
 Closes review issue #3.  Verifies the three integration points:
 

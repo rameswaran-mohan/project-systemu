@@ -1,4 +1,4 @@
-"""MemoryConsolidator.consolidate_with_buffer filters memory_buffer
+"""v0.6.9: MemoryConsolidator.consolidate_with_buffer filters memory_buffer
 lessons whose referenced tool is now healthy (cause resolved)."""
 from unittest.mock import MagicMock
 from systemu.runtime.memory_consolidator import MemoryConsolidator

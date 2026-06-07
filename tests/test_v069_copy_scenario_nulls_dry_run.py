@@ -1,4 +1,4 @@
-"""copying a scenario from one vault to another must NULL out
+"""v0.6.9: copying a scenario from one vault to another must NULL out
 dry_run_status + dry_run_evidence (env-specific fields)."""
 import subprocess
 import sys

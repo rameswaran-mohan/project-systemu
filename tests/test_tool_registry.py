@@ -86,7 +86,7 @@ async def test_tool_not_enabled_error(tmp_vault, implementations_dir, registry):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# — Self-heal on missing dependency
+# v0.3.3 — Self-heal on missing dependency
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # The registry must recover from ImportError when the tool's manifest declares
@@ -269,3 +269,54 @@ async def test_self_heal_does_not_retry_more_than_once(tmp_vault, implementation
     # missing_dependency (manifest is wrong / incomplete) and pip ran exactly once.
     assert install_calls["count"] == 1
     assert result.get("error_type") == "missing_dependency"
+
+
+@pytest.mark.asyncio
+async def test_param_name_mismatch_is_reconciled(tmp_vault, implementations_dir, registry):
+    """v0.9.6 regression: the exact bug behind 3 consecutive live-run parks.
+
+    The tool's run() declares (output_path, content); the LLM (or a forge
+    schema/code drift) calls it with (path, text). Before reconciliation this
+    returned {'success': False, 'error': "Parameter mismatch ..."}. Now the
+    params are remapped onto the real signature and the tool executes.
+    """
+    tool = Tool(
+        id="tool_pm", name="write_text_file", description="write text",
+        tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.DEPLOYED,
+        enabled=True,
+    )
+    tmp_vault.save_tool(tool)
+    code = """
+def run(output_path, content):
+    return {"success": True, "wrote_to": output_path, "len": len(content)}
+"""
+    (implementations_dir / "write_text_file.py").write_text(code, encoding="utf-8")
+
+    # LLM used training-prior names: path / text
+    result = await registry.execute(
+        "write_text_file", {"path": "/tmp/poem.txt", "text": "four lines"},
+    )
+    assert result["success"] is True, result
+    assert result["wrote_to"] == "/tmp/poem.txt"
+    assert result["len"] == len("four lines")
+
+
+@pytest.mark.asyncio
+async def test_extra_hallucinated_param_is_dropped(tmp_vault, implementations_dir, registry):
+    """An LLM-hallucinated extra kwarg must not crash the tool."""
+    tool = Tool(
+        id="tool_h", name="reader", description="read",
+        tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.DEPLOYED,
+        enabled=True,
+    )
+    tmp_vault.save_tool(tool)
+    code = """
+def run(path):
+    return {"success": True, "read": path}
+"""
+    (implementations_dir / "reader.py").write_text(code, encoding="utf-8")
+    result = await registry.execute(
+        "reader", {"path": "/tmp/x", "encoding": "utf-8", "mode": "r"},
+    )
+    assert result["success"] is True, result
+    assert result["read"] == "/tmp/x"

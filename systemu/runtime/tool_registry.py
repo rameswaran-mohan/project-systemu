@@ -258,6 +258,105 @@ def _resolve_timeout(tool, config, *, explicit):
     return int(getattr(config, "tool_default_timeout_seconds", 30))
 
 
+# v0.9.6 — parameter-name reconciliation.
+#
+# Synonym groups: parameter names that mean the same thing across naming
+# conventions. LLMs use training-prior names (``path``) while a forged tool may
+# declare another (``output_path``); the forge itself sometimes drifts between
+# its generated schema and its generated ``run()`` code. Either way the call
+# would raise ``TypeError`` at ``run(**params)`` and park the run. We reconcile
+# supplied params onto the tool's REAL ``run()`` signature.
+_PARAM_SYNONYMS = [
+    {"path", "file_path", "filepath", "output_path", "out_path", "outpath",
+     "filename", "file_name", "fname", "target_path", "target", "dest",
+     "destination", "dest_path", "save_path", "save_to", "output_file",
+     "output", "to"},
+    {"content", "contents", "text", "data", "body", "payload", "value",
+     "file_content", "file_contents", "input", "input_text", "string"},
+    {"url", "uri", "link", "address", "endpoint", "href", "web_url", "page_url"},
+    {"query", "q", "search", "search_query", "term", "terms", "keywords", "keyword"},
+    {"dir", "directory", "folder", "dir_path", "directory_path", "folder_path", "root"},
+    {"name", "title", "label", "key", "id", "identifier"},
+]
+
+
+def _synonym_group(param_name: str):
+    for grp in _PARAM_SYNONYMS:
+        if param_name in grp:
+            return grp
+    return None
+
+
+def _reconcile_params(run_fn, params):
+    """Map supplied parameter names onto ``run_fn``'s real signature.
+
+    Returns ``(reconciled_params, notes)`` where ``notes`` is a list of
+    human-readable remap descriptions (for logging). Strategy:
+
+    1. Non-dict params or unintrospectable callables → return unchanged.
+    2. ``run()`` accepts ``**kwargs`` → pass everything through.
+    3. Keep params whose names already match accepted parameters.
+    4. Map each unrecognised param to an unfilled accepted param that shares a
+       synonym group.
+    5. If exactly one unrecognised param and one unfilled slot remain, map by
+       position (covers genuinely novel names).
+    6. Drop any still-unmappable params — strictly better than a hard
+       ``TypeError`` that parks the whole run.
+    """
+    import inspect
+
+    if not isinstance(params, dict):
+        return params, []
+    try:
+        sig = inspect.signature(run_fn)
+    except (ValueError, TypeError):
+        return params, []
+
+    fn_params = sig.parameters
+    if any(p.kind == p.VAR_KEYWORD for p in fn_params.values()):
+        return params, []  # run(**kwargs) — accepts anything
+
+    accepted = [
+        n for n, p in fn_params.items()
+        if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    ]
+    accepted_set = set(accepted)
+
+    recognized = {k: v for k, v in params.items() if k in accepted_set}
+    unknown = {k: v for k, v in params.items() if k not in accepted_set}
+    if not unknown:
+        return recognized, []
+
+    notes: List[str] = []
+    unfilled = [n for n in accepted if n not in recognized]
+
+    # (4) synonym-based mapping
+    for uname in list(unknown):
+        grp = _synonym_group(uname)
+        if not grp:
+            continue
+        match = next((a for a in unfilled if a in grp), None)
+        if match is not None:
+            recognized[match] = unknown.pop(uname)
+            unfilled.remove(match)
+            notes.append(f"{uname}->{match}")
+
+    # (5) single-unknown / single-unfilled positional fallback
+    if len(unknown) == 1 and len(unfilled) == 1:
+        uname, uval = next(iter(unknown.items()))
+        target = unfilled[0]
+        recognized[target] = uval
+        unknown.pop(uname)
+        unfilled.pop(0)
+        notes.append(f"{uname}->{target}(pos)")
+
+    # (6) anything still unknown is dropped (logged by caller)
+    if unknown:
+        notes.append("dropped:" + ",".join(sorted(unknown)))
+
+    return recognized, notes
+
+
 class ToolRegistry:
     """Dynamic importer + direct-call dispatcher.
 
@@ -400,7 +499,16 @@ class ToolRegistry:
         # ── Call run(**params) in thread pool ──────────────────────────────
         def _call(_mod) -> dict:
             try:
-                return _mod.run(**params)
+                # v0.9.6: reconcile supplied param names onto run()'s real
+                # signature. LLM/forge naming drift (path vs output_path) would
+                # otherwise raise TypeError here and park the whole run.
+                _params, _notes = _reconcile_params(getattr(_mod, "run", None), params)
+                if _notes:
+                    logger.info(
+                        "[Registry] reconciled params for '%s': %s",
+                        name, "; ".join(_notes),
+                    )
+                return _mod.run(**_params)
             except ImportError as exc:
                 # Lazy/conditional import inside run().  Re-raised to the
                 # outer await so we can self-heal once, then retry.

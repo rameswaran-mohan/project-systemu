@@ -1,4 +1,4 @@
-"""— install-time blocker fixes: OS-specific Python upgrade guidance,
+"""v0.6.3 — install-time blocker fixes: OS-specific Python upgrade guidance,
 proxy detection, OpenRouter key validation, macOS permissions guide."""
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import install  # noqa: E402
 
 
 class TestPythonVersionGuidance:
-    """— pre-3.10 Python bails with OS-specific upgrade hint."""
+    """v0.6.3-a — pre-3.10 Python bails with OS-specific upgrade hint."""
 
     def _old_version_info(self):
         return _FakeVersionInfo(3, 9, 7, "final", 0)
@@ -63,7 +63,7 @@ class TestPythonVersionGuidance:
 
 
 class TestProxyDetection:
-    """— detect_proxy_config reads HTTP_PROXY / HTTPS_PROXY."""
+    """v0.6.3-b — detect_proxy_config reads HTTP_PROXY / HTTPS_PROXY."""
 
     _PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
                    "http_proxy", "https_proxy", "no_proxy")
@@ -113,7 +113,7 @@ class TestProxyDetection:
 
 
 class TestOpenRouterValidation:
-    """— validate_openrouter_key probes /api/v1/models endpoint."""
+    """v0.6.3-c — validate_openrouter_key probes /api/v1/models endpoint."""
 
     def _mock_response(self, status: int, body: bytes = b"{}"):
         m = MagicMock()
@@ -173,7 +173,7 @@ class TestOpenRouterValidation:
 
 
 class TestMacOSPermissionsGuide:
-    """— print_macos_permissions_guide echoes System Settings paths."""
+    """v0.6.3-d — print_macos_permissions_guide echoes System Settings paths."""
 
     def test_non_macos_prints_nothing(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "platform", "linux")
@@ -211,7 +211,7 @@ class TestMacOSPermissionsGuide:
 
 
 class TestPyatspiCheck:
-    """— check_linux_pyatspi detects missing UI introspection bindings."""
+    """v0.6.4-b — check_linux_pyatspi detects missing UI introspection bindings."""
 
     def test_non_linux_returns_true(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -248,7 +248,7 @@ class TestPyatspiCheck:
 
 
 class TestAppleSilicon:
-    """— is_apple_silicon detects ARM64 Mac."""
+    """v0.6.4-c — is_apple_silicon detects ARM64 Mac."""
 
     def test_intel_mac_returns_false(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")

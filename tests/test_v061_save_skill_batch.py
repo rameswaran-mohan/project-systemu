@@ -1,4 +1,4 @@
-"""— ``save_skill`` resolves ``required_tool_names`` in a single
+"""v0.6.1-e — ``save_skill`` resolves ``required_tool_names`` in a single
 batch lookup, not N separate ``find_tool_by_name`` calls.
 
 Closes review issue #5.  The previous implementation opened one SQLAlchemy

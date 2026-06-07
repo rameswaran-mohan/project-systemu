@@ -3,7 +3,7 @@
 Covers:
   * Shadow model gains specialty (defaults to "")
   * Vault round-trip preserves specialty
-  * Pre-shadow JSON without the field defaults to ""
+  * Pre-v0.4.3 shadow JSON without the field defaults to ""
   * Affinity router prefers candidates with matching specialty as a
     third-tier ranking (after skill_overlap, after specialty match,
     success_rate becomes the next tiebreaker)
