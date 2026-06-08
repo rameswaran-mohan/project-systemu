@@ -64,6 +64,85 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# ── Harness suspend contract (v0.9.7) ─────────────────────────────────────────
+HARNESS_SUSPEND_CONTRACT = """
+Harness Escalation Suspend Contract — v0.9.7
+============================================
+
+When shadow_runtime receives a HARNESS ESCALATE (or ASK_OPERATOR) verdict from the
+Governor it MUST do the following before returning control to the Supervisor:
+
+1. SNAPSHOT — write an ExecutionSnapshot via ``execution_snapshot.write_snapshot``:
+
+   Required fields in the snapshot
+   --------------------------------
+   execution_id           str   The current run's execution_id (already known).
+   shadow_id              str   The running shadow's id.
+   scroll_id              str   The scroll under execution.
+   activity_id            str   The activity id (from the payload / context).
+   iteration              int   The iteration index at suspension point.
+   current_action_block   int   The action-block pointer at suspension point.
+   completed_objective_ids list  All objectives completed SO FAR (do NOT re-do on resume).
+   recent_history_slice   list  Last ≤12 events (tool_call/observation/thought) for LLM
+                                 continuity — use ``capture_from_context`` or
+                                 ``_build_history_slice`` (same helper used by recalibrate).
+   sticky_notes           list  Existing sticky notes at suspension time.
+   original_tool_id       str | None  Set only when the escalation is for a specific tool.
+                                      None for ASK_OPERATOR / INPUT escalations.
+   pending_harness_request dict  The serialised HarnessRequest that triggered the ESCALATE,
+                                 stored as an ADDITIONAL sticky note with the key pattern:
+                                     ``__HARNESS_PENDING__::<execution_id>::<json>``
+                                 This lets resume_after_grant verify the request kind before
+                                 injecting the grant payload.
+
+2. SURFACE — post an operator-visible record so the dashboard can display a
+   "Grant / Deny" decision card.  This is the controller's responsibility (not
+   Supervisor's), but the snapshot must be written BEFORE the operator card is
+   surfaced to avoid a race where the operator resolves faster than the snapshot
+   lands.
+
+3. SUSPEND — return a structured ``{"status": "suspended_harness_escalation",
+   "execution_id": <id>, "activity_id": <id>, "shadow_id": <id>}`` result dict
+   from ``runtime.execute()``.  The Supervisor's ``_handle_result`` will see
+   ``status != "success"`` and NOT mark the activity COMPLETED — the activity
+   stays ASSIGNED, waiting for ``resume_after_grant`` to re-queue it.
+
+What resume_after_grant hands back
+-----------------------------------
+After the operator (or auto-grant logic) resolves the escalation,
+``Supervisor.resume_after_grant(...)`` is called.  It:
+
+  a. Reads the snapshot from disk.
+  b. Appends a sticky note: ``__HARNESS_GRANT__::<execution_id>::<json>``
+     where <json> is the ``grant_payload`` dict, e.g.:
+       - TOOL grant:    ``{"granted_tool": "<name>", "tool_id": "<id>"}``
+       - INPUT answer:  ``{"operator_answer": "<free text>"}``
+       - DENY:          ``{"denied": true, "rationale": "<reason>"}``
+  c. Re-writes the snapshot.
+  d. Calls ``supervisor.submit(..., resume_from_execution_id=<execution_id>)``
+     with ``priority=1`` so the resumed run jumps the queue.
+
+On resume, shadow_runtime's existing ``resume_from_execution_id`` path applies
+the snapshot (restored objectives, sticky notes, history slice) and then calls
+``_apply_harness_grant`` to peel the ``__HARNESS_GRANT__`` sticky note and inject
+the granted capability or operator answer into the live context before the LLM
+iteration continues.
+
+What shadow_runtime must NOT do
+---------------------------------
+- Do NOT re-raise a Python exception to terminate the thread — return a structured
+  result dict so the Supervisor handles the suspension gracefully.
+- Do NOT mark the activity COMPLETED or FAILED — leave status as ASSIGNED.
+- Do NOT write the snapshot AFTER surfacing the operator card — write it FIRST
+  (snapshot → surface → suspend, in that order).
+
+Idempotency
+-----------
+``resume_after_grant`` checks for an existing ``__HARNESS_GRANT__`` sticky note on
+the snapshot before re-submitting.  Double-call returns a sentinel string and does
+NOT double-queue.  The snapshot write is atomic (temp-file swap via ``os.replace``).
+"""
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_CONCURRENT_SHADOWS  = 3      # max parallel shadow executions
 MAX_RETRIES             = 2      # how many times to retry a failed activity
@@ -643,6 +722,135 @@ class Supervisor:
             consult_affinity_log=False,
             resume_from_execution_id=execution_id,
         )
+
+    # ── Harness-grant resume (v0.9.7) ─────────────────────────────────────────
+
+    def resume_after_grant(
+        self,
+        *,
+        execution_id: str,
+        activity_id: str,
+        shadow_id: str,
+        grant_payload: Dict[str, Any],
+        origin: Optional[str] = None,
+        chat_submission_id: Optional[str] = None,
+    ) -> str:
+        """v0.9.7: operator (or auto-grant) resolved a harness ESCALATE — re-queue.
+
+        This is the MECHANICAL re-dispatch path for ESCALATE (and ASK_OPERATOR)
+        harness decisions.  It is intentionally symmetric with
+        ``resume_after_recalibration`` and ``resume_on_decision._dispatch_resume``:
+        all three ultimately call ``self.submit()`` with ``resume_from_execution_id``,
+        so the existing snapshot → context-rebuild path in ``shadow_runtime.execute``
+        applies unchanged.
+
+        Parameters
+        ----------
+        execution_id:
+            The ``execution_id`` of the suspended run whose snapshot was written
+            by shadow_runtime when it raised the harness escalation.
+        activity_id:
+            The activity that was running.  Callers obtain this from the snapshot
+            or from the persisted ``HarnessEscalation`` record.
+        shadow_id:
+            The shadow that was running.
+        grant_payload:
+            Operator answer or granted capability — written as a sticky note into
+            the snapshot so the resumed run can recover it deterministically.
+            For TOOL grants: ``{"granted_tool": "<tool_name>", "tool_id": "<id>"}``.
+            For INPUT (ASK_OPERATOR): ``{"operator_answer": "<free text>"}``.
+            For DENY/skip: ``{"denied": True, "rationale": "..."}``.
+            The key ``__HARNESS_GRANT__::<execution_id>`` is used; shadow_runtime
+            peels it off at resume-start via ``_apply_harness_grant``.
+        origin:
+            Trigger origin to carry through (defaults to ``"chat"``).
+        chat_submission_id:
+            Threading key for the chat resume card (same value the original run
+            carried; lets the inline decision card close correctly).
+
+        Returns
+        -------
+        str
+            submission_id of the re-queued activity, or a ``"sub_no_dispatch_*"``
+            sentinel when the call is a no-op (already dispatched or bad coords).
+
+        Idempotency
+        -----------
+        The snapshot carries a ``__HARNESS_GRANT__`` sticky note stamped BEFORE
+        the submit, keyed by ``execution_id``.  A double-call returns the sentinel
+        ``"sub_already_dispatched_*"`` instead of double-queueing.
+
+        Suspend contract (what shadow_runtime must do)
+        -----------------------------------------------
+        See the module-level ``HARNESS_SUSPEND_CONTRACT`` docstring in this file
+        for the full specification of what shadow_runtime must write into the
+        snapshot and what this method hands back.
+        """
+        # ── Idempotency guard — read snapshot; check for existing grant stamp ──
+        try:
+            from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
+            snap = read_snapshot(execution_id)
+            if snap is None:
+                logger.warning(
+                    "[Supervisor] resume_after_grant: no snapshot for execution_id=%s "
+                    "— cannot resume (shadow_runtime must write snapshot before suspending)",
+                    execution_id,
+                )
+                return f"sub_no_dispatch_{execution_id[:8]}"
+
+            grant_key = f"__HARNESS_GRANT__::{execution_id}"
+            already = any(n.startswith(grant_key) for n in snap.sticky_notes)
+            if already:
+                logger.info(
+                    "[Supervisor] resume_after_grant: already dispatched for execution_id=%s — skipping",
+                    execution_id,
+                )
+                return f"sub_already_dispatched_{execution_id[:8]}"
+
+            # ── Stash the grant payload as a sticky note ───────────────────────
+            # Encode as JSON so shadow_runtime can unpack it without parsing ambiguity.
+            import json as _json
+            snap.sticky_notes.append(
+                f"{grant_key}::{_json.dumps(grant_payload, separators=(',', ':'))}"
+            )
+            write_snapshot(snap)
+        except Exception:
+            logger.exception(
+                "[Supervisor] resume_after_grant: snapshot read/write failed for %s "
+                "— proceeding with re-submit anyway (best-effort)",
+                execution_id,
+            )
+
+        # ── Re-submit with elevated priority — same shadow, skip affinity log ─
+        resolved_origin = origin or "chat"
+        reason = f"harness_grant:{execution_id}"[:120]
+        sub_id = self.submit(
+            activity_id=activity_id,
+            shadow_id=shadow_id,
+            priority=1,
+            reason=reason,
+            retry_count=1,            # treat like a retry so dedup guard allows it
+            consult_affinity_log=False,
+            resume_from_execution_id=execution_id,
+            origin=resolved_origin,
+            chat_submission_id=chat_submission_id,
+        )
+        logger.info(
+            "[Supervisor] resume_after_grant: re-dispatched activity=%s shadow=%s "
+            "execution_id=%s → submission=%s",
+            activity_id, shadow_id, execution_id, sub_id,
+        )
+        self._publish(
+            f"▶️ Harness grant resume: {self._aname(activity_id)} (exec={execution_id[:8]}…)",
+            context={
+                "activity_id":  activity_id,
+                "shadow_id":    shadow_id,
+                "execution_id": execution_id,
+                "submission_id": sub_id,
+            },
+            origin=resolved_origin,
+        )
+        return sub_id
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of supervisor state for the UI."""

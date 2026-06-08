@@ -21,7 +21,47 @@ Exported:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def _postgres_available() -> bool:
+    """Return True if the postgres backend can actually be used.
+
+    The postgres backend depends on the optional ``psycopg2`` driver.  Importing
+    ``postgres_backend`` is always safe (it guards the psycopg2 import), but the
+    driver itself may be absent.  When it is, callers must degrade to sqlite
+    rather than crash with ModuleNotFoundError on a web/action-audit path.
+    """
+    try:
+        from systemu.vault.backend import postgres_backend
+    except Exception:  # pragma: no cover - import is import-safe by construction
+        return False
+    return getattr(postgres_backend, "psycopg2", None) is not None
+
+
+def _resolve_backend(vault) -> str:
+    """Resolve the effective backend name, degrading postgres -> sqlite when
+    psycopg2 is unavailable.
+
+    Logs a single clear warning on the first degrade so the fallback is visible
+    in logs without spamming on every audit write.
+    """
+    backend = getattr(vault, "_storage_backend", "file")
+    if backend == "postgres" and not _postgres_available():
+        if not getattr(vault, "_postgres_degraded_warned", False):
+            logger.warning(
+                "[VaultBackend] psycopg2 not available — degrading postgres "
+                "storage backend to sqlite for this vault"
+            )
+            try:
+                vault._postgres_degraded_warned = True
+            except Exception:
+                pass
+        return "sqlite"
+    return backend
 
 
 def dispatch_append_action_audit(vault, entry: Dict[str, Any]) -> None:
@@ -30,7 +70,7 @@ def dispatch_append_action_audit(vault, entry: Dict[str, Any]) -> None:
     Reads vault._storage_backend to select the implementation module,
     then delegates. Raises NotImplementedError for unknown backends.
     """
-    backend = getattr(vault, "_storage_backend", "file")
+    backend = _resolve_backend(vault)
     if backend == "sqlite":
         from systemu.vault.backend.sqlite_backend import (
             dispatch_append_action_audit as _sqlite,
@@ -56,7 +96,7 @@ def dispatch_query_action_audit(
     Reads vault._storage_backend to select the implementation module,
     then delegates. Raises NotImplementedError for unknown backends.
     """
-    backend = getattr(vault, "_storage_backend", "file")
+    backend = _resolve_backend(vault)
     if backend == "sqlite":
         from systemu.vault.backend.sqlite_backend import (
             dispatch_query_action_audit as _sqlite,
@@ -74,7 +114,7 @@ def dispatch_query_action_audit(
 
 def dispatch_append_session_summary(vault, summary) -> None:
     """Route an append_session_summary call to the appropriate backend."""
-    backend = getattr(vault, "_storage_backend", "file")
+    backend = _resolve_backend(vault)
     if backend == "sqlite":
         from systemu.vault.backend.sqlite_backend import (
             dispatch_append_session_summary as _sqlite,
@@ -91,7 +131,7 @@ def dispatch_append_session_summary(vault, summary) -> None:
 def dispatch_query_session_summaries(vault, *, user_id=None, status=None,
                                       since_ts=None, limit=None):
     """Route a query_session_summaries call to the appropriate backend."""
-    backend = getattr(vault, "_storage_backend", "file")
+    backend = _resolve_backend(vault)
     if backend == "sqlite":
         from systemu.vault.backend.sqlite_backend import (
             dispatch_query_session_summaries as _sqlite,
@@ -109,7 +149,7 @@ def dispatch_query_session_summaries(vault, *, user_id=None, status=None,
 
 def dispatch_search_session_summaries(vault, *, query, user_id=None, limit=5):
     """Route a search_session_summaries call to the appropriate backend."""
-    backend = getattr(vault, "_storage_backend", "file")
+    backend = _resolve_backend(vault)
     if backend == "sqlite":
         from systemu.vault.backend.sqlite_backend import (
             dispatch_search_session_summaries as _sqlite,

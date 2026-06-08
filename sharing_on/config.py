@@ -55,6 +55,14 @@ def _load_auto_forge_tools() -> bool:
     return enabled
 
 
+def _resolve_execution_adherence() -> str:
+    """Read SYSTEMU_EXECUTION_ADHERENCE; fall back to 'auto' for invalid values."""
+    raw = (os.getenv("SYSTEMU_EXECUTION_ADHERENCE") or "").strip().lower()
+    if raw in {"auto", "free", "guided", "strict"}:
+        return raw
+    return "auto"
+
+
 def _resolve_tool_backend() -> str:
     """Resolve the canonical tool-backend name from SYSTEMU_TOOL_BACKEND.
 
@@ -208,6 +216,15 @@ class Config:
     # v0.9.6 (Layer 7 — Proactive Surfacing): memory consolidation pass.
     memory_consolidation_enabled: bool = field(
         default_factory=lambda: os.getenv("SYSTEMU_MEMORY_CONSOLIDATION_ENABLED", "true").lower() != "false"
+    )
+
+    # v0.9.7 (Phase 3.2 — Intent Engine): execution-adherence dial.
+    # Controls how tightly the agent follows recorded SOPs vs. exercising
+    # autonomous judgment.  One of auto|free|guided|strict.
+    # "auto" (default): chat→free, record/sop→guided (or the SOP's saved value).
+    # Invalid values silently fall back to "auto".
+    execution_adherence: str = field(
+        default_factory=lambda: _resolve_execution_adherence()
     )
 
     execution_retention_count: int = 50                  # max execution dirs kept in vault/executions/
@@ -399,6 +416,7 @@ class Config:
                 "SYSTEMU_AUTO_APPROVE_LOW_RISK_RECAL", "false").lower() == "true",
             auto_approve_low_risk_skill_recalibrations=os.getenv(
                 "SYSTEMU_AUTO_APPROVE_LOW_RISK_SKILL_RECAL", "false").lower() == "true",
+            execution_adherence=_resolve_execution_adherence(),
         )
         cls._warn_environment_issues()
         return instance

@@ -14,6 +14,7 @@ Entities:
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
@@ -158,6 +159,21 @@ class Scroll(BaseModel):
     # v0.6.5-a: pipeline observability — each stage appends a TraceEvent.
     # Read by /scrolls UI for the warning badge + Pipeline Trace panel.
     pipeline_trace:        List[TraceEvent] = Field(default_factory=list)
+
+    # v0.9.7 (Phase 3.3): verbatim user message that originated this scroll.
+    # Decision 0.1 #2: the authoritative GOAL is the raw user text, not the
+    # refiner's restatement. The runtime goal-verifier reads this field to
+    # check work against the original intent rather than the LLM paraphrase.
+    # None for scrolls created before v0.9.7 or from non-chat origins.
+    raw_request:           Optional[str] = None
+
+    # v0.9.7 (Phase 3.3): per-SOP adherence level chosen at save time.
+    # Controls how strictly the runtime follows the SOP vs. allowing
+    # contextual adaptation. Values: "free" | "guided" | "strict" | None.
+    # None means "use system default" (backward-compatible with pre-v0.9.7
+    # scrolls). Set by the save-SOP UI/CLI when a recording is promoted to a
+    # reusable SOP.
+    adherence:             Optional[str] = None
 
     @computed_field
     @property
@@ -763,3 +779,64 @@ class SkillManifest(BaseModel):
     fallback_for_toolsets: List[str] = Field(default_factory=list)
     body:                  str
     source_path:           Optional[str] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  v0.9.7 — Reverse-Harness: runtime, agent-initiated capability provisioning
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HarnessKind(str, Enum):
+    """Families of capability the executing agent can request at runtime."""
+    TOOL     = "tool"       # forge / recalibrate a tool
+    SKILL    = "skill"      # procedural knowledge
+    ACCESS   = "access"     # read a resource/secret; escalate the sandbox
+    COMPUTE  = "compute"    # more iterations / think-budget / spend
+    SUBAGENT = "subagent"   # spawn a helper sub-Shadow for a sub-objective
+    INPUT    = "input"      # ASK_OPERATOR — request info/decision (not a capability)
+
+
+class HarnessRequest(BaseModel):
+    """A runtime request from the executing agent to provision a capability it
+    lacks — the inverse of ``TOOL_CALL`` (the ``REQUEST_HARNESS`` loop verb).
+
+    ``spec`` is a kind-specific payload. For ``TOOL`` it mirrors a forge spec
+    (name, parameters_schema, return_schema, implementation_notes); for
+    ``INPUT`` it carries ``{"question": ..., "options": [...]}``.
+    """
+    request_id: str = Field(default_factory=lambda: "hreq_" + uuid.uuid4().hex[:8])
+    kind:       HarnessKind
+    spec:       Dict[str, Any] = Field(default_factory=dict)
+    rationale:  str = ""
+    fallback:   str = ""        # what the agent will do if denied
+    urgency:    Literal["low", "normal", "high"] = "normal"
+    # blocking semantics (spec §7): True → escalate+suspend when not
+    # auto-grantable; False → downgrade to deny (the run proceeds without it).
+    blocking:   bool = True
+    created_at: datetime = Field(default_factory=_now)
+    model_config = {"extra": "forbid"}
+
+
+class RiskBand(str, Enum):
+    LOW    = "low"
+    MEDIUM = "medium"
+    HIGH   = "high"
+
+
+class HarnessDecision(str, Enum):
+    GRANT    = "grant"
+    DENY     = "deny"
+    ESCALATE = "escalate"
+
+
+class HarnessVerdict(BaseModel):
+    """The Governor's arbitration result for a HarnessRequest."""
+    request_id:   str = ""
+    decision:     HarnessDecision
+    risk_band:    RiskBand = RiskBand.LOW
+    rationale:    str = ""
+    # set when a GRANT materialises a scoped capability lease
+    lease_id:     Optional[str] = None
+    # structured alternatives handed back to the agent on DENY (so it adapts)
+    alternatives: List[str] = Field(default_factory=list)
+    created_at:   datetime = Field(default_factory=_now)
+    model_config = {"extra": "forbid"}

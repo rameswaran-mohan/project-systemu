@@ -1,0 +1,850 @@
+"""Governor — always-on PULL authority for the Reverse-Harness (Phase 1.3).
+
+The Governor is the single arbitration + materialisation authority for every
+``HarnessRequest`` the executing agent emits via ``REQUEST_HARNESS``.
+
+Responsibilities
+----------------
+arbitrate(request, context) → HarnessVerdict
+    Delegates to the pure, deterministic ``harness_arbiter.arbitrate()``.
+    For Phase 1 the arbiter's ESCALATE verdict is kept as-is when the arbiter
+    flags ``needs_llm_judgment=True`` (LLM judgment is deferred to Phase 4).
+    Every (request, verdict) pair is appended to the harness ledger.
+
+materialise(request, verdict, *, vault, config, execution_id) → dict
+    Acts **only** on ``verdict.decision == GRANT``.
+    Phase 1 implements the TOOL provisioner (forge spine) only.  All other
+    kinds (SKILL / ACCESS / COMPUTE / SUBAGENT / INPUT) return a stub
+    "not-implemented" dict and are never raised as exceptions.
+
+Harness ledger
+    Append-only JSONL at ``<vault_root>/harness_ledger/<execution_id>.jsonl``.
+    Each line records the request, the verdict, the materialisation outcome,
+    and any lease info.  Use ``ledger_path(execution_id)`` to locate it.
+
+Leases
+    In-process dict keyed by ``lease_id``.  Each lease carries
+    ``{request_id, kind, execution_id, granted_at, revoked}``.
+    Call ``revoke_leases(execution_id)`` at the execution's terminal state.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from systemu.core.models import (
+    HarnessDecision,
+    HarnessKind,
+    HarnessRequest,
+    HarnessVerdict,
+)
+from systemu.runtime import harness_arbiter
+from systemu.runtime.harness_judge import judge_harness_request
+from systemu.runtime.harness_policy import HarnessPolicy
+from systemu.pipelines.tool_forge import forge_proposed_tools
+from systemu.runtime.auto_skill_extractor import persist_skill_candidate
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _mint_lease_id() -> str:
+    return "lease_" + uuid.uuid4().hex[:10]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Governor
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Governor:
+    """Always-on PULL authority that arbitrates and materialises HarnessRequests.
+
+    Parameters
+    ----------
+    config:
+        Runtime config object, dict, or None.  Forwarded to
+        ``HarnessPolicy.from_config()`` — accepts whatever form the caller has.
+    """
+
+    def __init__(self, config=None) -> None:
+        self.policy: HarnessPolicy = HarnessPolicy.from_config(config)
+        # Keep the raw config so the LLM judge (Phase 4.1) can acquire the
+        # LLM client the same way goal_verifier does.
+        self.config = config
+        # In-process lease registry.  key = lease_id, value = lease dict.
+        self._leases: Dict[str, Dict[str, Any]] = {}
+        self._lease_lock = threading.RLock()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def arbitrate(
+        self,
+        request: HarnessRequest,
+        context: dict | None = None,
+    ) -> HarnessVerdict:
+        """Arbitrate a HarnessRequest and return a HarnessVerdict.
+
+        Delegates to the pure ``harness_arbiter.arbitrate()``.  When the
+        arbiter sets ``needs_llm_judgment=True`` (a genuinely-ambiguous
+        MEDIUM-risk case) AND ``policy.llm_judge_enabled`` is True, the
+        request is handed to the conservative LLM judge
+        (``harness_judge.judge_harness_request``):
+          * judge GRANT (confident) → GRANT verdict with a freshly minted
+            lease_id + the judge's rationale;
+          * judge DENY              → DENY verdict;
+          * judge ESCALATE / any error / low confidence → ESCALATE kept.
+        When ``policy.llm_judge_enabled`` is False the arbiter's ESCALATE
+        verdict is kept unchanged (legacy behaviour).
+
+        Every (request, verdict) is recorded to the harness ledger via the
+        vault if ``_active_ledger_vault`` is set, or deferred until the
+        next ``materialise()`` / explicit ``_ledger_append()`` call that
+        supplies a vault.  When no vault is available the entry is queued
+        in-process and written on the next opportunity.
+
+        Notes
+        -----
+        The ledger write in ``arbitrate()`` uses vault=None (no ledger path
+        available yet — vault is optional at arbitrate time).  Callers that
+        want a ledger record at arbitrate time should call
+        ``_ledger_append(entry, vault, execution_id)`` manually, or use
+        ``materialise()`` which always appends.
+        """
+        arb_result = harness_arbiter.arbitrate(request, self.policy, context)
+        verdict: HarnessVerdict = arb_result["verdict"]
+
+        if arb_result.get("needs_llm_judgment"):
+            if self.policy.llm_judge_enabled:
+                verdict = self._apply_llm_judgment(request, arb_result, context)
+            else:
+                logger.debug(
+                    "[Governor] request %s flagged needs_llm_judgment but "
+                    "llm_judge_enabled=False — keeping ESCALATE verdict",
+                    request.request_id,
+                )
+
+        logger.info(
+            "[Governor] arbitrated request=%s kind=%s decision=%s band=%s",
+            request.request_id,
+            request.kind.value,
+            verdict.decision.value,
+            verdict.risk_band.value,
+        )
+
+        return verdict
+
+    def _apply_llm_judgment(
+        self,
+        request: HarnessRequest,
+        arb_result: Dict[str, Any],
+        context: dict | None,
+    ) -> HarnessVerdict:
+        """Resolve an ambiguous MEDIUM-risk request via the LLM judge.
+
+        Translates the judge's result into a HarnessVerdict:
+          * GRANT (confident) → GRANT with a freshly minted lease_id + the
+            judge's rationale (tagged ``judged_by=llm``);
+          * DENY              → DENY verdict carrying the judge's rationale;
+          * ESCALATE / error  → the arbiter's original ESCALATE verdict, with
+            the judge's rationale appended so the operator sees why.
+
+        Never raises — the judge itself is fail-safe (returns ESCALATE on any
+        error), and we keep the arbiter's ESCALATE verdict as the floor.
+        """
+        original: HarnessVerdict = arb_result["verdict"]
+        judged = judge_harness_request(
+            request=request,
+            arb_result=arb_result,
+            policy=self.policy,
+            context=context,
+            config=self.config,
+        )
+        decision: HarnessDecision = judged["decision"]
+        rationale: str = judged.get("rationale", "")
+
+        logger.info(
+            "[Governor] LLM judge resolved request=%s → decision=%s confidence=%.2f",
+            request.request_id,
+            decision.value,
+            float(judged.get("confidence", 0.0)),
+        )
+
+        if decision == HarnessDecision.GRANT:
+            lease_id = _mint_lease_id()
+            return HarnessVerdict(
+                request_id=request.request_id,
+                decision=HarnessDecision.GRANT,
+                risk_band=original.risk_band,
+                rationale=f"[judged_by=llm] {rationale}".strip(),
+                lease_id=lease_id,
+                alternatives=original.alternatives,
+            )
+
+        if decision == HarnessDecision.DENY:
+            return HarnessVerdict(
+                request_id=request.request_id,
+                decision=HarnessDecision.DENY,
+                risk_band=original.risk_band,
+                rationale=f"[judged_by=llm] {rationale}".strip(),
+                lease_id=None,
+                alternatives=original.alternatives,
+            )
+
+        # ESCALATE (or any non-grant/deny) — keep the arbiter's ESCALATE
+        # verdict but record the judge's reasoning for the operator.
+        appended = original.rationale
+        if rationale:
+            appended = f"{original.rationale} [judged_by=llm: {rationale}]".strip()
+        return HarnessVerdict(
+            request_id=original.request_id,
+            decision=original.decision,
+            risk_band=original.risk_band,
+            rationale=appended,
+            lease_id=original.lease_id,
+            alternatives=original.alternatives,
+        )
+
+    def materialise(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """Materialise a GRANTed HarnessRequest into a real capability.
+
+        Only acts on ``verdict.decision == GRANT``.  Non-GRANT decisions are
+        always a no-op (return ``{"materialised": False, ...}``).
+
+        Phase 1 implements the TOOL provisioner only.  All other kinds return
+        a stub "not implemented in Phase 1" dict.
+
+        Never raises — forge failures are caught and returned as
+        ``{"materialised": False, "reason": "forge failed: ..."}``.
+
+        The outcome (request, verdict, materialisation, lease) is appended to
+        the harness ledger for ``execution_id``.
+
+        Parameters
+        ----------
+        request:   The original HarnessRequest.
+        verdict:   The HarnessVerdict from ``arbitrate()``.
+        vault:     A Vault instance (used for ledger writes and tool forge).
+        config:    Runtime config (forwarded to tool_forge).
+        execution_id:
+            Scopes the ledger entry and any lease created.
+
+        Returns
+        -------
+        dict with at least ``{"materialised": bool}``.  On success also carries
+        ``{"lease_id": str, "tool": str}``.  On failure also carries
+        ``{"reason": str}``.
+        """
+        # ── Non-GRANT: no-op ─────────────────────────────────────────────────
+        if verdict.decision != HarnessDecision.GRANT:
+            outcome = {
+                "materialised": False,
+                "reason": f"verdict is {verdict.decision.value} — not materialising",
+            }
+            self._ledger_append(
+                self._ledger_entry(request, verdict, outcome, execution_id),
+                vault=vault,
+                execution_id=execution_id,
+            )
+            return outcome
+
+        # ── GRANT: dispatch by kind ───────────────────────────────────────────
+        outcome = self._dispatch(request, verdict, vault=vault, config=config, execution_id=execution_id)
+
+        self._ledger_append(
+            self._ledger_entry(request, verdict, outcome, execution_id),
+            vault=vault,
+            execution_id=execution_id,
+        )
+        return outcome
+
+    def revoke_leases(self, execution_id: str) -> int:
+        """Mark all leases belonging to ``execution_id`` as revoked.
+
+        Called by the execution engine at the terminal state (COMPLETE / FAIL).
+        Returns the number of leases revoked.
+        """
+        count = 0
+        with self._lease_lock:
+            for lease in self._leases.values():
+                if lease["execution_id"] == execution_id and not lease["revoked"]:
+                    lease["revoked"] = True
+                    lease["revoked_at"] = _utcnow_iso()
+                    count += 1
+        if count:
+            logger.info(
+                "[Governor] revoked %d lease(s) for execution_id=%s",
+                count,
+                execution_id,
+            )
+        return count
+
+    def ledger_path(self, execution_id: str, vault=None) -> Path:
+        """Return the JSONL ledger path for ``execution_id``.
+
+        When ``vault`` is supplied the path is rooted under the vault's root
+        directory.  Falls back to ``data/systemu/vault`` when vault is None.
+        """
+        root = self._vault_root(vault)
+        return root / "harness_ledger" / f"{execution_id}.jsonl"
+
+    # ── Kind dispatchers ──────────────────────────────────────────────────────
+
+    def _dispatch(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """Route a GRANTed request to its kind-specific provisioner."""
+        if request.kind == HarnessKind.TOOL:
+            return self._provision_tool(request, verdict, vault=vault, config=config, execution_id=execution_id)
+        if request.kind == HarnessKind.SKILL:
+            return self._provision_skill(request, verdict, vault=vault, config=config, execution_id=execution_id)
+        if request.kind == HarnessKind.ACCESS:
+            return self._provision_access(request, verdict, vault=vault, config=config, execution_id=execution_id)
+        if request.kind == HarnessKind.COMPUTE:
+            return self._provision_compute(request, verdict, vault=vault, config=config, execution_id=execution_id)
+        if request.kind == HarnessKind.SUBAGENT:
+            return self._provision_subagent(request, verdict, vault=vault, config=config, execution_id=execution_id)
+        # Remaining kinds (INPUT, etc.) — not materialised
+        return {
+            "materialised": False,
+            "reason": f"provisioner not implemented (kind={request.kind.value})",
+        }
+
+    def _provision_tool(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """TOOL provisioner — calls the tool_forge spine to forge/register the tool.
+
+        Reuses ``forge_proposed_tools`` from the existing tool_forge pipeline.
+        The request spec mirrors a forge spec:
+          ``{name, description, tool_type, parameters_schema, return_schema,
+             implementation_notes, dependencies}``
+
+        A stub Activity and stub Scroll are synthesised so ``forge_proposed_tools``
+        has enough context to run.  This is consistent with how ``forge_tool_by_name``
+        and ``forge_proposed_tools_from_specs`` operate when they lack a real scroll.
+
+        A capability lease is created and registered in the in-process lease dict.
+        The lease_id is taken from the verdict if already set, or minted here.
+        """
+        from systemu.core.models import (
+            Activity,
+            ActivityStatus,
+            Scroll,
+            Tool,
+            ToolStatus,
+            ToolType,
+        )
+        from systemu.core.utils import generate_id
+
+        spec = request.spec or {}
+        tool_name = spec.get("name", "")
+
+        try:
+            # Build a minimal Tool record with PROPOSED status so forge_proposed_tools
+            # can pick it up and generate code.
+            raw_type = spec.get("tool_type", "python_function")
+            try:
+                tool_type = ToolType(raw_type)
+            except ValueError:
+                tool_type = ToolType.PYTHON_FUNCTION
+
+            tool = Tool(
+                id=generate_id("tool"),
+                name=tool_name,
+                description=spec.get("description", f"Tool requested at runtime: {tool_name}"),
+                tool_type=tool_type,
+                parameters_schema=spec.get("parameters_schema", {}),
+                return_schema=spec.get("return_schema", {}),
+                implementation_notes=spec.get("implementation_notes", ""),
+                dependencies=spec.get("dependencies", []),
+                status=ToolStatus.PROPOSED,
+                forged_by_systemu=True,
+            )
+            vault.save_tool(tool)
+
+            # Build a stub scroll for context
+            stub_scroll = Scroll(
+                id="stub",
+                name=tool_name,
+                source_session_id=execution_id,
+                raw_instructions_path="",
+                narrative_md=spec.get("implementation_notes", request.rationale or tool.description),
+            )
+
+            # Build a stub activity linking the tool
+            activity = Activity(
+                id=generate_id("activity"),
+                name=f"governor-harness-{tool_name}",
+                scroll_id=stub_scroll.id,
+                required_tool_ids=[tool.id],
+                status=ActivityStatus.UNASSIGNED,
+            )
+
+            # Forge — this calls _generate_and_save_code internally
+            forged = forge_proposed_tools(activity, config, vault)
+
+        except Exception as exc:
+            logger.error(
+                "[Governor] forge failed for tool '%s': %s",
+                tool_name,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "materialised": False,
+                "reason": f"forge failed: {exc}",
+            }
+
+        if not forged:
+            return {
+                "materialised": False,
+                "reason": f"forge returned no tools for '{tool_name}'",
+            }
+
+        forged_tool = forged[0]
+
+        # Mint or reuse the lease_id from the verdict
+        lease_id: str = verdict.lease_id or _mint_lease_id()
+        self._register_lease(lease_id, request, execution_id)
+
+        logger.info(
+            "[Governor] materialised TOOL '%s' (id=%s) lease_id=%s execution_id=%s",
+            forged_tool.name,
+            forged_tool.id,
+            lease_id,
+            execution_id,
+        )
+
+        return {
+            "materialised": True,
+            "lease_id": lease_id,
+            "tool": forged_tool.name,
+            "tool_id": forged_tool.id,
+        }
+
+    def _provision_skill(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """SKILL provisioner — author a SKILL.md from request.spec and persist it.
+
+        Calls ``auto_skill_extractor.persist_skill_candidate`` with the spec as
+        the candidate.  Resolves skills_dir from config.skills_user_dir or a
+        vault-local fallback (``<vault_root>/skills``).
+
+        Returns
+        -------
+        {"materialised": True, "skill": <path>, "lease_id": ...}
+        or {"materialised": False, "reason": ...}
+        """
+        spec = request.spec or {}
+        try:
+            # Resolve skills directory
+            skills_dir: Optional[str] = None
+            if config is not None:
+                skills_dir = getattr(config, "skills_user_dir", None)
+            if not skills_dir:
+                vault_root = self._vault_root(vault)
+                skills_dir = str(vault_root / "skills")
+
+            # Build candidate dict from the request spec
+            candidate: Dict[str, Any] = {
+                "name": spec.get("name", ""),
+                "description": spec.get("description", ""),
+                "procedure": spec.get("procedure", []),
+                "pitfalls": spec.get("pitfalls", []),
+                "confidence": spec.get("confidence", 1.0),
+            }
+
+            skill_path = persist_skill_candidate(candidate, skills_dir=skills_dir)
+            if not skill_path:
+                return {
+                    "materialised": False,
+                    "reason": "persist_skill_candidate returned None (invalid candidate)",
+                }
+
+        except Exception as exc:
+            logger.error(
+                "[Governor] skill persist failed for '%s': %s",
+                spec.get("name", "<unknown>"),
+                exc,
+                exc_info=True,
+            )
+            return {
+                "materialised": False,
+                "reason": f"skill persist failed: {exc}",
+            }
+
+        lease_id: str = verdict.lease_id or _mint_lease_id()
+        self._register_lease(lease_id, request, execution_id)
+
+        logger.info(
+            "[Governor] materialised SKILL '%s' → %s  lease_id=%s execution_id=%s",
+            spec.get("name", ""),
+            skill_path,
+            lease_id,
+            execution_id,
+        )
+
+        return {
+            "materialised": True,
+            "skill": skill_path,
+            "lease_id": lease_id,
+        }
+
+    def _provision_access(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """ACCESS provisioner — issue a scoped capability lease for a resource.
+
+        Phase 3 behaviour: record the lease and return the access spec + a
+        policy patch dict the loop/sandbox will apply.  Does NOT open any
+        network or filesystem resource here.
+
+        The ``apply`` dict mirrors the sandbox-policy patch format:
+          {"network_host": <host>} or {"fs_read": <path>} etc.
+        taken directly from request.spec (the agent declares what it needs).
+
+        Returns
+        -------
+        {"materialised": True, "lease_id": ..., "access": <spec>, "apply": <patch>}
+        or {"materialised": False, "reason": ...}
+        """
+        spec = request.spec or {}
+        try:
+            # Build the sandbox-policy patch from spec fields
+            patch: Dict[str, Any] = {}
+            for field_name in ("network_host", "fs_read", "fs_write", "env_var"):
+                if field_name in spec:
+                    patch[field_name] = spec[field_name]
+            if not patch:
+                # Fall back to exposing the resource identifier
+                resource = spec.get("resource", "")
+                access_type = spec.get("access_type", "read")
+                if resource:
+                    patch = {access_type: resource}
+
+        except Exception as exc:
+            logger.error(
+                "[Governor] access provision failed: %s", exc, exc_info=True,
+            )
+            return {
+                "materialised": False,
+                "reason": f"access provision failed: {exc}",
+            }
+
+        lease_id: str = verdict.lease_id or _mint_lease_id()
+        self._register_lease(lease_id, request, execution_id)
+
+        logger.info(
+            "[Governor] materialised ACCESS lease_id=%s patch=%s execution_id=%s",
+            lease_id,
+            patch,
+            execution_id,
+        )
+
+        return {
+            "materialised": True,
+            "lease_id": lease_id,
+            "access": dict(spec),
+            "apply": patch,
+        }
+
+    def _provision_compute(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """COMPUTE provisioner — return a budget grant the loop applies.
+
+        Clamps requested values against ``HarnessPolicy.max_compute_ceiling``
+        (for budget_fraction) and sensible per-field caps.
+
+        Returns
+        -------
+        {"materialised": True, "compute_grant": {"extra_iterations": N, "extra_think": M}, "lease_id": ...}
+        or {"materialised": False, "reason": ...}
+        """
+        spec = request.spec or {}
+        try:
+            ceiling: float = self.policy.max_compute_ceiling
+
+            # extra_iterations: integer, capped at ceiling * 100 (reasonable upper bound)
+            raw_iterations = spec.get("extra_iterations", 0)
+            try:
+                raw_iterations = int(raw_iterations)
+            except (TypeError, ValueError):
+                raw_iterations = 0
+            max_iterations = max(1, int(ceiling * 100))
+            extra_iterations = max(0, min(raw_iterations, max_iterations))
+
+            # extra_think: integer tokens, capped at ceiling * 32000
+            raw_think = spec.get("extra_think", 0)
+            try:
+                raw_think = int(raw_think)
+            except (TypeError, ValueError):
+                raw_think = 0
+            max_think = max(0, int(ceiling * 32_000))
+            extra_think = max(0, min(raw_think, max_think))
+
+            compute_grant = {
+                "extra_iterations": extra_iterations,
+                "extra_think": extra_think,
+            }
+
+        except Exception as exc:
+            logger.error(
+                "[Governor] compute provision failed: %s", exc, exc_info=True,
+            )
+            return {
+                "materialised": False,
+                "reason": f"compute provision failed: {exc}",
+            }
+
+        lease_id: str = verdict.lease_id or _mint_lease_id()
+        self._register_lease(lease_id, request, execution_id)
+
+        logger.info(
+            "[Governor] materialised COMPUTE grant=%s lease_id=%s execution_id=%s",
+            compute_grant,
+            lease_id,
+            execution_id,
+        )
+
+        return {
+            "materialised": True,
+            "compute_grant": compute_grant,
+            "lease_id": lease_id,
+        }
+
+    def _provision_subagent(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """SUBAGENT provisioner — return a spawn directive the loop executes.
+
+        Does NOT spawn the subagent here (materialise is sync + pure-ish).
+        Returns a directive dict the async loop hands to ``spawn_subagent``.
+        Parameter names match ``delegate.spawn_subagent`` so the loop can
+        call it directly:
+          spawn_subagent(task=..., config=..., parent_depth=..., max_turns=...)
+
+        Depth and budget fraction are clamped to policy limits.
+
+        Returns
+        -------
+        {"materialised": True, "subagent": {"task": ..., "depth_cap": ...,
+         "budget_fraction": ...}, "lease_id": ...}
+        or {"materialised": False, "reason": ...}
+        """
+        spec = request.spec or {}
+        try:
+            max_depth: int = self.policy.max_subagent_depth
+            max_budget: float = self.policy.max_subagent_budget_fraction
+
+            task = spec.get("task", request.rationale or "")
+
+            # depth_cap: requested depth capped at policy max
+            raw_depth = spec.get("depth", 1)
+            try:
+                raw_depth = int(raw_depth)
+            except (TypeError, ValueError):
+                raw_depth = 1
+            depth_cap = max(1, min(raw_depth, max_depth))
+
+            # budget_fraction: requested fraction capped at policy max
+            raw_budget = spec.get("budget_fraction", max_budget)
+            try:
+                raw_budget = float(raw_budget)
+            except (TypeError, ValueError):
+                raw_budget = max_budget
+            budget_fraction = max(0.0, min(raw_budget, max_budget))
+
+            if not task:
+                return {
+                    "materialised": False,
+                    "reason": "subagent request missing 'task' in spec",
+                }
+
+        except Exception as exc:
+            logger.error(
+                "[Governor] subagent provision failed: %s", exc, exc_info=True,
+            )
+            return {
+                "materialised": False,
+                "reason": f"subagent provision failed: {exc}",
+            }
+
+        lease_id: str = verdict.lease_id or _mint_lease_id()
+        self._register_lease(lease_id, request, execution_id)
+
+        logger.info(
+            "[Governor] materialised SUBAGENT task=%r depth_cap=%d budget=%.2f "
+            "lease_id=%s execution_id=%s",
+            task[:80],
+            depth_cap,
+            budget_fraction,
+            lease_id,
+            execution_id,
+        )
+
+        return {
+            "materialised": True,
+            "subagent": {
+                "task": task,
+                "depth_cap": depth_cap,
+                "budget_fraction": budget_fraction,
+            },
+            "lease_id": lease_id,
+        }
+
+    # ── Lease registry ────────────────────────────────────────────────────────
+
+    def _register_lease(
+        self,
+        lease_id: str,
+        request: HarnessRequest,
+        execution_id: str,
+    ) -> Dict[str, Any]:
+        lease = {
+            "lease_id": lease_id,
+            "request_id": request.request_id,
+            "kind": request.kind.value,
+            "execution_id": execution_id,
+            "granted_at": _utcnow_iso(),
+            "revoked": False,
+            "revoked_at": None,
+        }
+        with self._lease_lock:
+            self._leases[lease_id] = lease
+        return lease
+
+    def get_lease(self, lease_id: str) -> Optional[Dict[str, Any]]:
+        """Return the lease dict for ``lease_id``, or None if unknown."""
+        return self._leases.get(lease_id)
+
+    def list_leases(self, execution_id: str | None = None) -> list:
+        """Return all leases, optionally filtered by execution_id."""
+        with self._lease_lock:
+            leases = list(self._leases.values())
+        if execution_id is not None:
+            leases = [l for l in leases if l["execution_id"] == execution_id]
+        return leases
+
+    # ── Ledger ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _vault_root(vault) -> Path:
+        """Extract the vault root Path from a Vault instance or fall back."""
+        if vault is not None:
+            root_attr = getattr(vault, "root", None)
+            if root_attr:
+                return Path(root_attr)
+        return Path("data") / "systemu" / "vault"
+
+    def ledger_path(self, execution_id: str, vault=None) -> Path:  # noqa: F811
+        root = self._vault_root(vault)
+        return root / "harness_ledger" / f"{execution_id}.jsonl"
+
+    @staticmethod
+    def _ledger_entry(
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        outcome: dict,
+        execution_id: str,
+    ) -> dict:
+        return {
+            "ts": _utcnow_iso(),
+            "execution_id": execution_id,
+            "request": {
+                "request_id": request.request_id,
+                "kind": request.kind.value,
+                "spec": request.spec,
+                "rationale": request.rationale,
+                "urgency": request.urgency,
+                "blocking": request.blocking,
+            },
+            "verdict": {
+                "decision": verdict.decision.value,
+                "risk_band": verdict.risk_band.value,
+                "rationale": verdict.rationale,
+                "lease_id": verdict.lease_id,
+            },
+            "outcome": outcome,
+        }
+
+    def _ledger_append(
+        self,
+        entry: dict,
+        vault,
+        execution_id: str,
+    ) -> None:
+        """Append ``entry`` to the JSONL ledger for ``execution_id``.
+
+        Uses the vault root to determine the ledger directory.  Creates the
+        directory and file if they don't exist.  Failures are logged but never
+        raised — a ledger write failure must never abort the calling operation.
+        """
+        try:
+            ledger = self.ledger_path(execution_id, vault)
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            with ledger.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, default=str) + "\n")
+        except Exception as exc:
+            logger.error(
+                "[Governor] ledger write failed for execution_id=%s: %s",
+                execution_id,
+                exc,
+            )

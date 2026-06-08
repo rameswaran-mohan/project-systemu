@@ -77,6 +77,14 @@ def build_settings_page() -> None:
         ):
             stuck_settings_card()
 
+        # ── Execution Mode (v0.9.7 Phase 3.2) ────────────────────────────
+        _section_header("Execution Mode")
+        with ui.column().style(
+            f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+            f"border-radius: 12px; padding: 20px; gap: 14px;"
+        ):
+            adherence_card()
+
         # ── Vault ──────────────────────────────────────────────────────────
         _section_header("Storage")
         with ui.column().style(
@@ -313,6 +321,116 @@ def _update_env_var(key: str, value: str) -> None:
     if not found:
         updated.append(f"{key}={value}\n")
     env_path.write_text("".join(updated), encoding="utf-8")
+
+
+def get_adherence_settings() -> dict:
+    """v0.9.7: read the current execution-adherence value from env."""
+    import os
+    raw = (os.environ.get("SYSTEMU_EXECUTION_ADHERENCE") or "auto").strip().lower()
+    if raw not in ("auto", "free", "guided", "strict"):
+        raw = "auto"
+    return {"execution_adherence": raw}
+
+
+def save_adherence_settings(*, execution_adherence: str) -> None:
+    """v0.9.7: validate + persist execution_adherence to .env; patch live os.environ."""
+    import os
+    if execution_adherence not in ("auto", "free", "guided", "strict"):
+        raise ValueError(
+            f"execution_adherence must be one of auto/free/guided/strict, got {execution_adherence!r}"
+        )
+    _update_env_var("SYSTEMU_EXECUTION_ADHERENCE", execution_adherence)
+    os.environ["SYSTEMU_EXECUTION_ADHERENCE"] = execution_adherence
+
+
+def save_adherence_preset(preset_name: str) -> None:
+    """v0.9.7: apply a named preset — writes all preset env vars to .env + os.environ."""
+    import os
+    from systemu.runtime.adherence import apply_preset
+    env_map = apply_preset(preset_name)  # raises KeyError for unknown names
+    for key, value in env_map.items():
+        _update_env_var(key, value)
+        os.environ[key] = value
+
+
+def adherence_card() -> None:
+    """v0.9.7: render the Execution Mode section. Caller wraps it in `with ui.column():`."""
+    state = get_adherence_settings()
+
+    _ADHERENCE_OPTIONS = [
+        ("auto", "Auto — infer from request kind (chat→free, SOP→guided)"),
+        ("free", "Free Agent — first-principles reasoning, SOP is advisory"),
+        ("guided", "Guided Autonomy — follow intent + key steps, adapt details"),
+        ("strict", "Strict Replay — follow SOP step-by-step, no deviation"),
+    ]
+    _PRESET_OPTIONS = [
+        ("", "— apply a preset —"),
+        ("locked_sop", "Locked SOP — strict adherence, no auto-grants"),
+        ("assisted", "Assisted — guided adherence, conservative auto-grants"),
+        ("autonomous", "Autonomous — free agent, broad auto-grants (dev/testing)"),
+    ]
+
+    ui.label(
+        "Controls how tightly the agent follows recorded SOPs vs. exercising "
+        "autonomous judgment. 'Auto' defers to the request kind; explicit values "
+        "override globally. Presets set adherence + harness auto-grant flags together."
+    ).style(f"font-size: 12px; color: {THEME['text_muted']};")
+
+    with ui.row().style("gap: 16px; align-items: center; flex-wrap: wrap;"):
+        ui.label("Adherence level:").style(f"font-size: 13px; color: {THEME['text']};")
+        adherence_sel = ui.select(
+            options={k: v for k, v in _ADHERENCE_OPTIONS},
+            value=state["execution_adherence"],
+        ).style("min-width: 320px;")
+
+    with ui.row().style("gap: 16px; align-items: center; flex-wrap: wrap; margin-top: 8px;"):
+        ui.label("Quick preset:").style(f"font-size: 13px; color: {THEME['text']};")
+        preset_sel = ui.select(
+            options={k: v for k, v in _PRESET_OPTIONS},
+            value="",
+        ).style("min-width: 320px;")
+        ui.label(
+            "Applying a preset overwrites adherence + all harness auto-grant flags."
+        ).style(f"font-size: 11px; color: {THEME['text_muted']};")
+
+    def _save_adherence():
+        try:
+            save_adherence_settings(execution_adherence=adherence_sel.value)
+            ui.notify(
+                f"Execution mode set to '{adherence_sel.value}'. "
+                "Restart daemon to fully apply.",
+                type="positive",
+            )
+        except (ValueError, Exception) as exc:
+            ui.notify(f"Error saving execution mode: {exc}", type="negative")
+
+    def _apply_preset():
+        pname = preset_sel.value
+        if not pname:
+            ui.notify("Select a preset first.", type="warning")
+            return
+        try:
+            save_adherence_preset(pname)
+            # Update the adherence selector to reflect the preset's level
+            from systemu.runtime.adherence import ADHERENCE_PRESETS
+            new_level = ADHERENCE_PRESETS[pname].get("SYSTEMU_EXECUTION_ADHERENCE", "auto")
+            adherence_sel.value = new_level
+            preset_sel.value = ""
+            ui.notify(
+                f"Preset '{pname}' applied. Restart daemon to fully apply.",
+                type="positive",
+            )
+        except (KeyError, Exception) as exc:
+            ui.notify(f"Error applying preset: {exc}", type="negative")
+
+    with ui.row().style("gap: 8px; margin-top: 8px;"):
+        ui.button("Save Adherence", on_click=_save_adherence).style(
+            f"background: {THEME['primary']}; color: white; border-radius: 8px;"
+        )
+        ui.button("Apply Preset", on_click=_apply_preset).style(
+            f"background: transparent; color: {THEME['primary']}; "
+            f"border: 1px solid {THEME['primary']}; border-radius: 8px;"
+        )
 
 
 def get_stuck_settings() -> dict:

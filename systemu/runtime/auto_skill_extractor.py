@@ -18,11 +18,18 @@ from systemu.core.llm_router import llm_call_json
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "extract_skill_from_run.md"
+_CORRECTIVE_PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent / "prompts" / "extract_corrective_skill.md"
+)
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]+$")
 
 
 def _load_system_prompt() -> str:
     return _PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def _load_corrective_system_prompt() -> str:
+    return _CORRECTIVE_PROMPT_PATH.read_text(encoding="utf-8")
 
 
 def extract_skill_candidate(
@@ -93,6 +100,82 @@ def extract_skill_candidate(
     }
 
 
+def extract_corrective_candidate(
+    *,
+    intent: str,
+    failure_reason: Optional[str],
+    n_rounds: int,
+    n_tool_calls: int,
+    tools_called: List[str],
+    config,
+) -> Optional[Dict[str, Any]]:
+    """Tier-1 extract a CORRECTIVE (anti-pattern) SKILL.md candidate from a
+    FAILED or PARTIAL run.
+
+    Mirrors :func:`extract_skill_candidate` but uses the corrective prompt: the
+    lesson captured is what was attempted, what went wrong, and the corrective
+    approach to try next time. The returned candidate carries
+    ``"_type": "anti_pattern"`` so persistence can tag it.
+
+    Returns None when:
+    - config.auto_skill_extract_enabled is False
+    - Neither threshold met (n_rounds<2 AND n_tool_calls<2)
+    - LLM exception
+    - confidence below threshold
+    """
+    if not getattr(config, "auto_skill_extract_enabled", True):
+        return None
+    if n_rounds < 2 and n_tool_calls < 2:
+        return None
+
+    payload = {
+        "intent": intent,
+        "failure_reason": failure_reason,
+        "n_rounds": n_rounds,
+        "n_tool_calls": n_tool_calls,
+        "tools_called": tools_called,
+    }
+
+    try:
+        result = llm_call_json(
+            tier=1,
+            system=_load_corrective_system_prompt(),
+            user=json.dumps(payload, separators=(",", ":")),
+            config=config,
+            max_tokens=600,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        logger.warning("[AutoSkill] corrective LLM failed: %s", exc)
+        return None
+
+    if not isinstance(result, dict):
+        return None
+
+    confidence = float(result.get("confidence", 0.0) or 0.0)
+    min_conf = float(getattr(config, "auto_skill_extract_min_confidence", 0.6))
+    if confidence < min_conf:
+        logger.info(
+            "[AutoSkill] corrective rejected (confidence=%.2f < %.2f)",
+            confidence, min_conf,
+        )
+        return None
+
+    name = str(result.get("name", "")).strip().lower()
+    if not _NAME_RE.match(name):
+        logger.info("[AutoSkill] corrective rejected (bad name=%r)", name)
+        return None
+
+    return {
+        "name": name,
+        "description": str(result.get("description", ""))[:200],
+        "procedure": [str(s) for s in (result.get("procedure") or [])][:20],
+        "pitfalls": [str(p) for p in (result.get("pitfalls") or [])][:10],
+        "confidence": confidence,
+        "_type": "anti_pattern",
+    }
+
+
 def persist_skill_candidate(candidate: Dict[str, Any], *, skills_dir: str) -> Optional[str]:
     """Write a candidate as a SKILL.md file under ``skills_dir``.
 
@@ -124,11 +207,18 @@ def persist_skill_candidate(candidate: Dict[str, Any], *, skills_dir: str) -> Op
             body_lines.append(f"- {p}\n")
     body_lines.append("")
 
+    # v0.9.7 (Phase 4.2): corrective (anti-pattern) candidates carry a
+    # ``_type`` marker so the persisted SKILL.md is tagged as a warning. The
+    # success path leaves the marker absent and its frontmatter unchanged.
+    type_marker = candidate.get("_type")
+    type_line = f"_type: {type_marker}\n" if type_marker else ""
+
     frontmatter = (
         "---\n"
         f"name: {name}\n"
         f"description: {json.dumps(candidate.get('description', ''))}\n"
         "version: 0.1.0\n"
+        f"{type_line}"
         "metadata:\n"
         "  systemu:\n"
         f"    confidence: {candidate.get('confidence', 0.0)}\n"

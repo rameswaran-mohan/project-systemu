@@ -1,7 +1,7 @@
 {
   "id": "tool_a1f69543",
   "name": "fetch_json",
-  "description": "HTTP GET a JSON API endpoint and return the parsed response data",
+  "description": "HTTP GET a JSON API endpoint and return the parsed response data. USE THIS — not web_search — to resolve the user's location/city from their IP (GET http://ip-api.com/json/ or https://ipinfo.io/json), to geocode/reverse-geocode via Nominatim, and for any REST/JSON API. web_search finds web pages; it does NOT call APIs or do IP geolocation.",
   "tool_type": "api_call",
   "parameters_schema": {
     "url": {
