@@ -634,13 +634,32 @@ def propose_tools_from_specs(
     except Exception:
         logger.debug("[Forge] could not read tool index for de-dup", exc_info=True)
 
+    # v0.9.7 (B3): also collect v2 code-registered names so forging a spec
+    # whose name shadows a v2 tool is treated as a collision and skipped.
+    _v2_names: set = set()
+    try:
+        from systemu.runtime.tool_registry_v2 import registry as _v2_registry
+        _v2_registry.discover_modules("systemu.runtime.tools")
+        _v2_names = {e.name for e in _v2_registry.list()}
+    except Exception:
+        logger.debug("[Forge] could not collect v2 tool names for de-dup", exc_info=True)
+
     for spec in specs:
         name = getattr(spec, "name", "") or ""
         if not name:
             logger.debug("[Forge] skipping spec with empty name")
             continue
         if name in existing_names:
-            logger.info("[Forge] skipping spec '%s' — tool already exists", name)
+            logger.info("[Forge] skipping spec '%s' — tool already exists in vault", name)
+            continue
+        # v0.9.7 (B3): v2-registry collision guard.
+        if name in _v2_names:
+            logger.warning(
+                "[Forge] skipping spec '%s' — name already registered as a v2 "
+                "code-side tool; creating a new vault artefact would cause a "
+                "name collision and signature mismatch.",
+                name,
+            )
             continue
 
         # Generate spec via LLM (Tier 2) and save with status=PROPOSED.

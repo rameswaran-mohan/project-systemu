@@ -112,6 +112,35 @@ Use this after several consecutive tool failures, OR whenever a "Failure Reflect
 - `strategy` MUST be one of: `RETRY_WITH_DIFFERENT_PARAMS`, `TRY_DIFFERENT_TOOL`, `LOAD_RESOURCE`, `ROLLBACK_AND_REPLAN`, `DECOMPOSE_OBJECTIVE`, `FAIL`.
 - Set `rollback: true` (or use strategy `ROLLBACK_AND_REPLAN`) to rewind the context window to the last snapshot.  Sticky notes — including this REFLECT — survive the rollback.  Use rollback when context has become noisy with failed attempts and you want a clean slate without losing memory of what was tried.
 
+### 7. REQUEST_HARNESS — Provision a capability you LACK *(only when capability provisioning is enabled)*
+The inverse of `TOOL_CALL`: when **no available tool fits the objective**, ask the system to provision one instead of flailing or `FAIL`-ing. An authority (the Governor) arbitrates by risk — safe requests are granted inline, risky ones are escalated. Prefer this over giving up when you've identified a concrete missing capability.
+```json
+{
+  "action": "REQUEST_HARNESS",
+  "kind": "tool",
+  "spec": {"name": "ip_geolocate", "description": "Resolve the user's city from their public IP", "parameters_schema": {}, "return_schema": {}, "implementation_notes": "GET http://ip-api.com/json/ and return the city field"},
+  "rationale": "No existing tool resolves location from IP; I need one to satisfy this objective.",
+  "fallback": "If denied, try fetch_json against an IP-geolocation API directly.",
+  "completes_objective": null,
+  "is_destructive": false
+}
+```
+- `kind` ∈ `tool` | `skill` | `access` | `compute` | `subagent` (phase 1 materialises `tool`).
+- If GRANTED, the new capability is offered back to you as an observation — then call it via `TOOL_CALL`. If DENIED, the observation carries alternatives — adapt.
+
+### 8. ASK_OPERATOR — Ask the operator a question *(only when capability provisioning is enabled)*
+Use when you genuinely need information or a decision only the human operator can provide. Prefer acting autonomously; use this sparingly for true blockers.
+```json
+{
+  "action": "ASK_OPERATOR",
+  "question": "Which output format do you want — CSV or XLSX?",
+  "rationale": "The request is ambiguous about format and the choice changes the deliverable.",
+  "fallback": "If no answer, default to CSV.",
+  "completes_objective": null,
+  "is_destructive": false
+}
+```
+
 ## Decision Rules
 
 1. **Solve objectives, don't mimic user actions** — choose the most reliable programmatic approach, not the same GUI steps the user took.
@@ -128,6 +157,9 @@ Use this after several consecutive tool failures, OR whenever a "Failure Reflect
     Never use `~/Documents/`, `C:\Users\...`, or any hardcoded path.
     Correct: `{output_dir}/MMDDYYYY_report.docx`
     Wrong:   `~/Documents/report.docx`
+12. **Every decision must make progress or finish.** A valid turn is either a `TOOL_CALL` that advances the task, a short `THINK`/`REFLECT` that changes your plan, or a terminal `COMPLETE`/`FAIL`. Do **not** restate the same intention turn after turn without acting — that is not progress.
+13. **Heed `loop_guard_notice`.** If your context contains a `loop_guard_notice`, you have repeated the same action without progress. Do something *different*: different arguments, a different tool, or `REFLECT` on a new strategy. Repeating the same call again is not allowed.
+14. **`loop_guard_force_finalize`.** If your context contains `loop_guard_force_finalize: true` (and `available_tools` is empty), you MUST end the turn now with `COMPLETE` (if the goal is met from evidence already gathered) or `FAIL` (stating plainly what blocked you). Do not attempt another tool call.
 
 ## Preference: Programmatic over GUI
 

@@ -547,8 +547,18 @@ def request_choice(questions, *, dedup_key, extra_context=None) -> Optional[dict
 
 
 def confirm(prompt_text: str, default: bool = True) -> bool:
-    """Simple yes/no confirmation wrapper."""
+    """Simple yes/no confirmation wrapper.
+
+    Headless-safe: when stdin is not a TTY, ``SYSTEMU_HEADLESS=1`` is set, or
+    the prompt cannot actually be read (a daemon may inherit a *dead*
+    controlling terminal so ``isatty()`` is True yet ``input()`` hits EOF),
+    fall back to ``default`` instead of crashing the run.  For destructive
+    gates the caller passes ``default=False`` so EOF means "deny".
+    """
     import sys, os
     if not sys.stdin.isatty() or os.environ.get("SYSTEMU_HEADLESS") == "1":
         return default
-    return click.confirm(f"  {prompt_text}", default=default)
+    try:
+        return click.confirm(f"  {prompt_text}", default=default)
+    except (EOFError, click.Abort):
+        return default

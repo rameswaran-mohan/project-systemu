@@ -51,6 +51,7 @@ from systemu.pipelines.skill_recalibrator import (
 from dataclasses import dataclass, field as _dataclass_field
 
 from systemu.runtime import objective_verifier, state_delta
+from systemu.runtime.loop_guard import LoopGuard
 
 
 @dataclass
@@ -194,6 +195,52 @@ def _resolve_verifier_output_dir(config, user_profile) -> str:
     return str(Path(vault_dir) / "outputs")
 
 
+def _intent_engine_enabled(config) -> bool:
+    """v0.9.7: master flag for the intent-driven engine behaviours.
+
+    Phase 4.4 (graduated): the intent engine is now **default ON**. When on,
+    COMPLETE is accepted on GOAL-level verification even if some refiner-baked
+    per-objective criteria weren't individually credited; REQUEST_HARNESS /
+    ASK_OPERATOR provisioning, adherence resolution, and the LLM judge are
+    active. Set ``SYSTEMU_INTENT_ENGINE=false`` (or ``config.intent_engine_enabled
+    = False``) to fall back to the legacy per-objective engine.
+    """
+    if hasattr(config, "intent_engine_enabled"):
+        return bool(config.intent_engine_enabled)
+    return os.getenv("SYSTEMU_INTENT_ENGINE", "true").lower() == "true"
+
+
+def _intent_goal_success(*, vault, config, user_profile, scroll, execution_id,
+                         summary=None) -> bool:
+    """v0.9.7: goal-level acceptance from CURRENT durable evidence.
+
+    Uses an epoch baseline so EVERYTHING present counts (sidesteps per-objective
+    state-delta baseline/timing fragility). Returns True iff the goal verifier
+    judges the goal met. Never raises.
+    """
+    try:
+        from systemu.runtime import goal_verifier as _gv
+        _gbaseline = state_delta._Baseline(iteration_start_ts="1970-01-01T00:00:00Z")
+        _gdelta = state_delta.compute_delta(
+            baseline=_gbaseline, vault=vault,
+            default_output_dir=_resolve_verifier_output_dir(config, user_profile),
+            chat_result=summary, config=config, execution_id=execution_id,
+        )
+        _gres = _gv.verify_goal(
+            goal=(getattr(scroll, "raw_request", None) or getattr(scroll, "intent", "") or ""),
+            delta=_gdelta, config=config, chat_result=summary,
+        )
+        ok = bool(_gres.get("verified"))
+        logger.info(
+            "[Runtime] intent-engine goal-verify: %s — %s",
+            "PASS" if ok else "no-pass", str(_gres.get("reason", ""))[:160],
+        )
+        return ok
+    except Exception:
+        logger.debug("[Runtime] goal-level check errored", exc_info=True)
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────
 #  v0.9.3 (Layer 3) — Tool registry v2 startup discovery + whitelist resolver
 # ─────────────────────────────────────────────────────────────────────────
@@ -322,10 +369,11 @@ def _build_llm_tool_catalog(vault=None, config=None) -> List[Dict[str, Any]]:
                 "name": t.name,
                 "description": t.description,
                 "parameter_names": list(getattr(t, "parameter_names", []) or []),
-                # v1 tools expose parameter_names, not a full JSON schema;
-                # add an empty parameters_schema so all entries satisfy the
-                # uniform contract the tests (and future prompt templates) expect.
-                "parameters_schema": {},
+                # v0.9.7: surface the tool's REAL parameter schema so the LLM
+                # emits correctly-shaped {param: value} args instead of guessing.
+                # The old hardcoded {} left the model blind to v1 params → it
+                # emitted bare-string args (e.g. "http://…/json/") and crashed.
+                "parameters_schema": dict(getattr(t, "parameters_schema", {}) or {}),
             })
 
     return catalog
@@ -1149,9 +1197,17 @@ def _record_shadow_metric(*, shadow, scroll, status: str) -> None:
 
 
 def _build_history_slice(context, max_events: int = 30) -> list:
-    """Return the last N tool-call/observation/thought events as a compact list for LLM context."""
+    """Return the LAST N tool-call/observation/thought events (in chronological
+    order) as a compact list for LLM context.
+
+    v0.9.7 fix (round-about-loop root cause): collect from the NEWEST event
+    backward, then restore chronological order. The previous implementation
+    iterated the recent window oldest-first and ``break``-ed after N, so on longer
+    runs it returned the OLDEST N events and silently dropped the most recent
+    ones — the model could not see what it had just done and re-proposed it.
+    """
     recent = []
-    for event in context._history[-max_events * 2:]:   # scan extra to get N useful events
+    for event in reversed(context._history):   # newest-first so we never drop recent events
         if event.event_type == "tool_call":
             recent.append({
                 "role": "tool_call",
@@ -1172,7 +1228,31 @@ def _build_history_slice(context, max_events: int = 30) -> list:
             recent.append({"role": "thought", "thought": event.content.get("thought", "")[:300]})
         if len(recent) >= max_events:
             break
+    recent.reverse()   # restore chronological (oldest→newest) order for the prompt
     return recent
+
+
+def _coerce_scalar_parameter(value, tool_name: str, tools) -> dict:
+    """v0.9.7: coerce a non-dict tool-call ``parameters`` into a kwargs dict.
+
+    Some LLMs emit a bare scalar (e.g. ``"http://ip-api.com/json/"``) instead of
+    ``{param: value}`` for a single-argument tool. If the named tool declares
+    exactly one parameter, wrap the scalar as ``{that_param: value}``; otherwise
+    return ``{}`` (the tool's required-arg guard will then surface a clear error
+    rather than the runtime crashing on ``parameters.keys()``).
+    """
+    names: list = []
+    for t in (tools or []):
+        if getattr(t, "name", None) == tool_name:
+            names = list(getattr(t, "parameter_names", []) or [])
+            if not names:
+                schema = getattr(t, "parameters_schema", {}) or {}
+                if isinstance(schema, dict):
+                    names = list(schema.keys())
+            break
+    if len(names) == 1:
+        return {names[0]: value}
+    return {}
 
 
 import re as _re
@@ -1747,8 +1827,10 @@ class ShadowRuntime:
                     "name": t.name,
                     "description": t.description,
                     "parameter_names": list(getattr(t, "parameter_names", []) or []),
-                    # Uniform contract: all entries have parameters_schema.
-                    "parameters_schema": {},
+                    # v0.9.7: surface the REAL parameter schema (was hardcoded {},
+                    # which left the executor LLM blind to v1 params → bare-string
+                    # args → AttributeError on parameters.keys()).
+                    "parameters_schema": dict(getattr(t, "parameters_schema", {}) or {}),
                 }
                 for t in tools
             ]
@@ -1968,7 +2050,52 @@ class ShadowRuntime:
             import asyncio
 
             # ─── THE AGENTIC LOOP ─────────────────────────────────────────────────
-            while iteration < MAX_ITERATIONS:
+            # v0.9.7: deterministic stall corrector — detects round-about repetition
+            # (same tool+args+result, or A↔B ping-pong) and nudges/forces a finish.
+            loop_guard = LoopGuard(self.config)
+            loop_guard_nudge = None  # pending verdict to inject next iteration
+            # v0.9.7 Phase 2: one Governor per execution so harness leases + the
+            # ledger stay coherent across REQUEST_HARNESS calls; leases are
+            # revoked at terminal state (default-deny never leaks across runs).
+            governor = None
+            if _intent_engine_enabled(self.config):
+                try:
+                    from systemu.runtime.governor import Governor as _GovernorCls
+                    governor = _GovernorCls(self.config)
+                except Exception:
+                    governor = None
+
+            def _revoke_harness_leases():
+                if governor is not None:
+                    try:
+                        governor.revoke_leases(execution_id)
+                    except Exception:
+                        logger.debug("[Runtime] lease revocation failed", exc_info=True)
+
+            # v0.9.7 Phase 3: resolve execution-adherence + a mutable iteration
+            # budget for THIS run.
+            #   • A COMPUTE harness grant can extend ``_iter_budget`` at runtime.
+            #   • ``_adherence`` (free/guided/strict) is resolved from the operator
+            #     pin (config.execution_adherence) → else auto: records honor the
+            #     per-SOP adherence saved at save-time, chat → free. Under "strict"
+            #     the lenient goal-level acceptance shortcut is suppressed so the
+            #     per-objective / SOP contract is honored verbatim.
+            # All adherence-conditioned behavior remains behind the intent-engine
+            # flag (the resolver itself is side-effect-free).
+            _iter_budget = MAX_ITERATIONS
+            _sop_adherence = (getattr(scroll, "adherence", None) or "").strip() or None
+            _origin_l = (origin or getattr(self, "_origin", "") or "").strip().lower()
+            _req_kind = "record" if (_origin_l in {"record", "sop", "replay"} or _sop_adherence) else "chat"
+            _adherence = "free"
+            try:
+                from systemu.runtime.adherence import resolve_adherence as _resolve_adh
+                _adherence = _resolve_adh(self.config, request_kind=_req_kind, sop_adherence=_sop_adherence)
+            except Exception:
+                _adherence = "free"
+            if _intent_engine_enabled(self.config):
+                logger.info("[Runtime] intent-engine: execution adherence=%s (kind=%s).", _adherence, _req_kind)
+
+            while iteration < _iter_budget:
                 iteration += 1
 
                 # v0.9.1 (Layer 4): reset per-turn verifier call counter for all objectives
@@ -2104,6 +2231,14 @@ class ShadowRuntime:
                 if self._operator_hint:
                     _user_payload["operator_hint"] = self._operator_hint
                     self._operator_hint = None
+                # v0.9.7: inject the loop-guard verdict (round-about detection).
+                # On 'block', strip tools so the agent MUST COMPLETE or FAIL.
+                if loop_guard_nudge is not None:
+                    _user_payload["loop_guard_notice"] = loop_guard_nudge.get("message", "")
+                    if loop_guard_nudge.get("level") == "block":
+                        _user_payload["available_tools"] = []
+                        _user_payload["loop_guard_force_finalize"] = True
+                    loop_guard_nudge = None
                 _llm_user = json.dumps(_user_payload)
                 loop = asyncio.get_event_loop()
                 try:
@@ -2202,9 +2337,44 @@ class ShadowRuntime:
 
                 # ── COMPLETE ───────────────────────────────────────────────────────
                 if action == "COMPLETE":
-                    # Reject premature COMPLETE when objectives are still pending.
-                    # This prevents false-success when the LLM declares done too early.
-                    if use_objectives and len(completed_objectives) < total_objectives:
+                    # v0.9.7 intent-engine (flagged, default OFF): GOAL-level
+                    # acceptance. Accept COMPLETE when the GOAL is verified from
+                    # durable evidence, even if some refiner-baked per-objective
+                    # criteria (possibly mis-framed — e.g. a durable-evidence
+                    # check on an in-memory "determine X" step) weren't credited.
+                    _goal_ok = False
+                    if (_intent_engine_enabled(self.config)
+                            and _adherence != "strict"
+                            and use_objectives
+                            and len(completed_objectives) < total_objectives):
+                        try:
+                            from systemu.runtime import goal_verifier as _gv
+                            _gbaseline = state_delta._Baseline(
+                                iteration_start_ts="1970-01-01T00:00:00Z")
+                            _gdelta = state_delta.compute_delta(
+                                baseline=_gbaseline, vault=self.vault,
+                                default_output_dir=_resolve_verifier_output_dir(
+                                    self.config, getattr(self, "user_profile", None)),
+                                chat_result=decision.get("summary"),
+                                config=self.config, execution_id=execution_id,
+                            )
+                            _gres = _gv.verify_goal(
+                                goal=(getattr(scroll, "raw_request", None) or getattr(scroll, "intent", "") or ""),
+                                delta=_gdelta, config=self.config,
+                                chat_result=decision.get("summary"),
+                            )
+                            _goal_ok = bool(_gres.get("verified"))
+                            logger.info(
+                                "[Runtime] intent-engine goal-verify: %s — %s",
+                                "PASS" if _goal_ok else "no-pass",
+                                str(_gres.get("reason", ""))[:160],
+                            )
+                        except Exception:
+                            logger.debug("[Runtime] goal-level verify errored", exc_info=True)
+
+                    # Reject premature COMPLETE when objectives are still pending,
+                    # UNLESS goal-level verification accepted it.
+                    if use_objectives and len(completed_objectives) < total_objectives and not _goal_ok:
                         missing = [obj.id for obj in objectives if obj.id not in completed_objectives]
                         logger.warning(
                             "[Runtime] COMPLETE rejected — %d/%d objectives still pending: %s",
@@ -2399,6 +2569,187 @@ class ShadowRuntime:
                                 context._loaded_skill_ids = loaded
                             loaded.add(resource_id)
 
+                # ── REQUEST_HARNESS / ASK_OPERATOR (v0.9.7 Reverse-Harness) ─────────
+                # The inverse of TOOL_CALL: the agent asks the Governor to provision
+                # a capability it lacks (forge a tool) or to ask the operator. Phase
+                # 1: GRANT materialises inline + the new tool is offered to the
+                # executor; DENY/ESCALATE return a structured observation (full
+                # snapshot/suspend/resume operator round-trip is Phase 2).
+                elif action in ("REQUEST_HARNESS", "ASK_OPERATOR"):
+                    if not _intent_engine_enabled(self.config):
+                        context.add_observation({
+                            "type": "harness_disabled",
+                            "message": "Capability provisioning is not enabled; use an available tool or FAIL.",
+                        }, current_ab)
+                        continue
+                    try:
+                        from systemu.runtime.governor import Governor
+                        from systemu.core.models import (
+                            HarnessRequest, HarnessKind, HarnessDecision,
+                        )
+                        if action == "ASK_OPERATOR":
+                            _req = HarnessRequest(
+                                kind=HarnessKind.INPUT,
+                                spec={"question": decision.get("question") or decision.get("rationale", "")},
+                                rationale=decision.get("rationale", ""),
+                                fallback=decision.get("fallback", ""),
+                            )
+                        else:
+                            try:
+                                _hk = HarnessKind((decision.get("kind") or "tool").lower())
+                            except Exception:
+                                _hk = HarnessKind.TOOL
+                            _req = HarnessRequest(
+                                kind=_hk, spec=decision.get("spec") or {},
+                                rationale=decision.get("rationale", ""),
+                                fallback=decision.get("fallback", ""),
+                            )
+                        _gov = governor or Governor(self.config)
+                        _verdict = _gov.arbitrate(_req)
+                        if _verdict.decision == HarnessDecision.GRANT:
+                            _mat = _gov.materialise(
+                                _req, _verdict, vault=self.vault,
+                                config=self.config, execution_id=execution_id,
+                            )
+                            if _mat.get("materialised"):
+                                # v0.9.7 Phase 3: the Governor materialises one of
+                                # several harness KINDs; apply each into THIS run.
+                                if _mat.get("tool") is not None:
+                                    # ── TOOL: resolve → deploy inline → offer back ──
+                                    _tref = _mat.get("tool")
+                                    _nt = None
+                                    for _resolve in (
+                                        lambda: self.vault.get_tool(_tref),
+                                        lambda: self.vault.find_tool_by_name(_tref),
+                                    ):
+                                        try:
+                                            _nt = _resolve()
+                                            if _nt is not None:
+                                                break
+                                        except Exception:
+                                            _nt = None
+                                    # v0.9.7 Phase 2: deploy the freshly-forged tool
+                                    # synchronously (dry-run → DEPLOYED + enabled) so it
+                                    # is callable in THIS run, not just a future one.
+                                    if _nt is not None and not getattr(_nt, "enabled", False):
+                                        try:
+                                            from systemu.pipelines.tool_deploy import deploy_forged_tool
+                                            if deploy_forged_tool(_nt.id, self.vault, self.config).get("deployed"):
+                                                try:
+                                                    _nt = self.vault.get_tool(_nt.id)
+                                                except Exception:
+                                                    pass
+                                        except Exception:
+                                            logger.debug("[Runtime] forge-deploy failed", exc_info=True)
+                                    if _nt is not None and getattr(_nt, "enabled", False):
+                                        tools.append(_nt)
+                                        tool_index.append({
+                                            "id": _nt.id, "name": _nt.name,
+                                            "description": _nt.description,
+                                            "parameter_names": list(getattr(_nt, "parameter_names", []) or []),
+                                            "parameters_schema": dict(getattr(_nt, "parameters_schema", {}) or {}),
+                                        })
+                                        context.add_observation({
+                                            "type": "harness_granted",
+                                            "message": f"Capability provisioned and ready: '{_nt.name}'. You may call it now.",
+                                            "tool": _nt.name,
+                                        }, current_ab)
+                                    else:
+                                        context.add_observation({
+                                            "type": "harness_granted_pending",
+                                            "message": (
+                                                f"Capability '{getattr(_nt, 'name', _tref)}' was forged but is pending "
+                                                "enablement/dry-run; it is not callable this run. Use an existing tool or FAIL."
+                                            ),
+                                        }, current_ab)
+                                elif _mat.get("compute_grant"):
+                                    # ── COMPUTE: extend THIS run's iteration budget ──
+                                    _cg = _mat.get("compute_grant") or {}
+                                    _extra_it = max(0, min(int(_cg.get("extra_iterations", 0) or 0), 100))
+                                    if _extra_it:
+                                        _iter_budget += _extra_it
+                                    context.add_observation({
+                                        "type": "harness_granted",
+                                        "message": (
+                                            f"Compute granted: +{_extra_it} iteration(s) "
+                                            f"(budget now {_iter_budget}). Continue toward the goal."
+                                        ),
+                                    }, current_ab)
+                                elif _mat.get("skill"):
+                                    # ── SKILL: procedure authored to the vault ──
+                                    context.add_observation({
+                                        "type": "harness_granted",
+                                        "message": (
+                                            f"Skill provisioned: {_mat.get('skill')}. Its procedure is now "
+                                            "available — follow it to complete the task."
+                                        ),
+                                    }, current_ab)
+                                elif _mat.get("access"):
+                                    # ── ACCESS: a scoped capability lease was granted ──
+                                    context.add_observation({
+                                        "type": "harness_granted",
+                                        "message": (
+                                            f"Access granted (scoped lease): {_mat.get('access')}. "
+                                            "Proceed with the operation it authorizes."
+                                        ),
+                                    }, current_ab)
+                                elif _mat.get("subagent"):
+                                    # ── SUBAGENT: delegation capability granted ──
+                                    _sa = _mat.get("subagent") or {}
+                                    context.add_observation({
+                                        "type": "harness_granted",
+                                        "message": (
+                                            "Sub-agent delegation granted for: "
+                                            f"{str(_sa.get('task', ''))[:160]}. Decompose and proceed within "
+                                            "the granted depth/budget."
+                                        ),
+                                    }, current_ab)
+                                else:
+                                    context.add_observation({
+                                        "type": "harness_granted",
+                                        "message": "Capability provisioned. Proceed toward the goal.",
+                                    }, current_ab)
+                            else:
+                                context.add_observation({
+                                    "type": "harness_grant_failed",
+                                    "message": f"Provisioning failed: {_mat.get('reason')}. {_req.fallback or 'Try an alternative or FAIL.'}",
+                                }, current_ab)
+                        else:
+                            # ESCALATE / DENY. v0.9.7 Phase 2: an ESCALATE surfaces an
+                            # operator decision card (the operator can approve/deny it
+                            # on the Pending Actions tab). The agent is told to proceed
+                            # with its fallback meanwhile. The full async suspend →
+                            # resume_after_grant → resume-injection round-trip is the
+                            # remaining P2.3 integration (building blocks committed:
+                            # supervisor.resume_after_grant + the suspend contract +
+                            # surface_harness_request).
+                            if _verdict.decision == HarnessDecision.ESCALATE:
+                                try:
+                                    from systemu.interface.harness_review import surface_harness_request
+                                    _did = surface_harness_request(
+                                        _req, _verdict, execution_id=execution_id, vault=self.vault,
+                                    )
+                                    logger.info("[Runtime] harness ESCALATE surfaced to operator: %s", _did)
+                                except Exception:
+                                    logger.debug("[Runtime] surface_harness_request failed", exc_info=True)
+                            _alts = ", ".join(_verdict.alternatives) if _verdict.alternatives else ""
+                            context.add_observation({
+                                "type": "harness_" + _verdict.decision.value,
+                                "message": (
+                                    f"Harness request {_verdict.decision.value}: {_verdict.rationale}. "
+                                    f"{('Alternatives: ' + _alts + '. ') if _alts else ''}"
+                                    f"{_req.fallback or 'Proceed with an alternative approach or FAIL.'}"
+                                    + (" (An operator approval card was raised; proceed with your fallback meanwhile.)"
+                                       if _verdict.decision == HarnessDecision.ESCALATE else "")
+                                ),
+                            }, current_ab)
+                    except Exception:
+                        logger.debug("[Runtime] REQUEST_HARNESS handling errored", exc_info=True)
+                        context.add_observation({
+                            "type": "harness_error",
+                            "message": "Harness request could not be processed; proceed with available tools or FAIL.",
+                        }, current_ab)
+
                 # ── TOOL_CALL ──────────────────────────────────────────────────────
                 elif action == "TOOL_CALL":
                     result = await self._handle_tool_call(
@@ -2417,6 +2768,22 @@ class ShadowRuntime:
                         tool_success=bool(getattr(result, "success", False)),
                         credited_obj_id=None,
                     )
+
+                    # v0.9.7: deterministic loop-guard — signature is
+                    # (tool, args, success-class), so a tool repeatedly called
+                    # with the same args and the same outcome escalates to a
+                    # corrective nudge (warn) then a forced finish (block) on the
+                    # NEXT iteration. Never let it crash the loop.
+                    try:
+                        _lg = loop_guard.record(
+                            decision.get("tool_name", "") or "",
+                            decision.get("parameters") or {},
+                            bool(getattr(result, "success", False)),
+                        )
+                        if _lg:
+                            loop_guard_nudge = _lg
+                    except Exception:
+                        logger.debug("[Runtime] loop_guard.record failed", exc_info=True)
 
                     # v0.8.16: per-iteration detail event AFTER the tool runs, so
                     # the bounded `details` dict carries the tool result the live
@@ -2643,6 +3010,37 @@ class ShadowRuntime:
                     # v0.8.21: stuck-guard — check after this iteration's effects are recorded.
                     triggered, reason = self._stuck_trigger()
                     if triggered and use_objectives:
+                        # v0.9.7 intent-engine: before parking on per-objective stuck,
+                        # accept on GOAL-level success. The per-objective contract is
+                        # fragile (impl-path / path-mangling / delta-timing all reject
+                        # legitimate work); the goal verifier (epoch baseline) just
+                        # checks whether the GOAL's artifact exists. Default OFF.
+                        if _intent_engine_enabled(self.config) and _adherence != "strict" and _intent_goal_success(
+                                vault=self.vault, config=self.config,
+                                user_profile=getattr(self, "user_profile", None),
+                                scroll=scroll, execution_id=execution_id,
+                                summary=(decision.get("summary") if isinstance(decision, dict) else None)):
+                            logger.info(
+                                "[Runtime] intent-engine: goal met at stuck-park — "
+                                "finalizing SUCCESS instead of parking (%d/%d objectives credited).",
+                                len(completed_objectives), total_objectives,
+                            )
+                            self._append_to_shadow_log(
+                                shadow, execution_id, "success",
+                                "Goal completed (goal-level verification at stuck-park).",
+                                iteration_count=iteration, tool_calls_made=tool_call_count,
+                                objectives_completed=len(completed_objectives),
+                                objectives_total=total_objectives,
+                                duration_seconds=__import__("time").time() - exec_start,
+                            )
+                            res = context.build_result(
+                                status="success",
+                                final_summary="Goal completed (verified at goal level).",
+                            )
+                            _revoke_harness_leases()
+                            _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
+                            _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
+                            return res
                         # which objective are we stuck on? the first pending (lowest id whose deps are met & not done)
                         pending = [o for o in objectives if o.id not in completed_objectives
                                    and all(d in completed_objectives for d in (o.depends_on or []))]
@@ -2778,6 +3176,16 @@ class ShadowRuntime:
                     )
                     break
         parameters = parameters or {}
+        # v0.9.7: some LLMs emit a bare scalar (e.g. a URL string) instead of a
+        # {param: value} dict for single-argument tools. Without this guard the
+        # next line crashes on ``parameters.keys()`` (AttributeError on str).
+        if not isinstance(parameters, dict):
+            _orig_params = parameters
+            parameters = _coerce_scalar_parameter(parameters, tool_name, tools)
+            logger.warning(
+                "[Runtime] tool=%s received non-dict parameters %r — coerced to %s",
+                tool_name, _orig_params, list(parameters.keys()) or "{}",
+            )
         logger.debug("[Runtime] TOOL_CALL tool=%s args=%s",
                      tool_name, list(parameters.keys()))
         reasoning  = decision.get("reasoning", "")

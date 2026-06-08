@@ -825,6 +825,12 @@ def refine_from_text(
         tags=result.get("tags", []),
         action_blocks=[],
         status=ScrollStatus.APPROVED,   # chat tasks skip the approval gate
+        # v0.9.7 (Phase 3.3): Decision 0.1 #2 — store the verbatim user
+        # message so the runtime goal-verifier can check work against the
+        # original request rather than the refiner's paraphrase.
+        # Use `prompt` (the raw arg) not `clean_prompt` from direct_task —
+        # this function receives exactly the text to treat as authoritative.
+        raw_request=prompt,
     )
     vault.save_scroll(scroll)
     logger.info(

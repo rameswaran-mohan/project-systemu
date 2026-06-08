@@ -24,6 +24,17 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+# psycopg2 is an optional dependency: the postgres backend is only exercised when
+# vault._storage_backend == 'postgres'.  Import it defensively so that merely
+# importing this module (e.g. via the systemu.vault.backend dispatch layer on a
+# sqlite/file deployment) never raises ModuleNotFoundError.  Functions that
+# actually need psycopg2 raise a clear, catchable RuntimeError when it is None,
+# which the dispatch layer turns into a graceful sqlite fallback.
+try:
+    import psycopg2  # noqa: F401 — re-exported for availability checks
+except Exception:  # pragma: no cover - exercised only when psycopg2 is absent
+    psycopg2 = None
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -143,7 +154,8 @@ def dispatch_append_action_audit(vault, entry: Dict[str, Any]) -> None:
     params is stored as JSONB — psycopg2 uses Json() adapter so the dict
     round-trips through the DB as native JSON rather than an escaped string.
     """
-    import psycopg2.extras  # noqa: F401 — ensure DictCursor available
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 not available")
     conn = _connect(vault)
     try:
         cur = conn.cursor()
@@ -405,8 +417,12 @@ def _connect(vault):
 
     In production SqliteVault.__init__ sets _postgres_url when the
     database_url scheme is postgresql:// (v0.9.1 wiring fix).
+
+    Raises RuntimeError if psycopg2 is not installed — callers (the dispatch
+    layer) catch this and degrade to the sqlite backend rather than crashing.
     """
-    import psycopg2
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 not available")
 
     url = getattr(vault, "_postgres_url", None)
     if not url:

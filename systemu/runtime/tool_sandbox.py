@@ -34,6 +34,76 @@ logger = logging.getLogger(__name__)
 
 _SUBPROCESS_ONLY_DEPS = {"playwright", "playwright-stealth", "selenium"}
 
+# ── v0.9.7: output-path robustness ───────────────────────────────────────────
+# LLMs sometimes mangle a long absolute output path (e.g. drop a path segment),
+# sending a deliverable into a sibling tree the verifier never scans. We redirect
+# such writes back into the configured output_dir so the deliverable always lands
+# where it's expected — and reads are left alone unless their parent is missing.
+_PATH_PARAM_KEYS = (
+    "path", "output_path", "file_path", "filepath", "out_path", "output",
+    "save_path", "dest", "destination", "target_path", "write_path", "output_file",
+)
+_WRITE_NAME_TOKENS = (
+    "write", "save", "create", "export", "dump", "append", "output", "generate", "render",
+)
+
+
+def _is_write_ish(name: str, params: Dict[str, Any]) -> bool:
+    """Heuristic: does this tool call write/produce a file?"""
+    n = (name or "").lower()
+    if any(tok in n for tok in _WRITE_NAME_TOKENS):
+        return True
+    try:
+        return ToolSandbox.is_destructive_call(name, params)
+    except Exception:
+        return False
+
+
+def _normalize_output_paths(name: str, params: Any, output_dir: Optional[str]) -> Any:
+    """Redirect path-like params into ``output_dir`` to survive LLM path slips.
+
+    A path param is redirected to ``output_dir/<basename>`` when EITHER:
+      * its parent directory does not exist (mangled-path signature — safe for
+        reads, which would fail on a missing parent anyway), OR
+      * the tool is write-ish AND the path resolves outside ``output_dir``
+        (enforces the deliverables-stay-in-output-dir contract).
+
+    Reads to existing locations outside output_dir are left untouched.
+    Returns a (possibly new) params dict; never raises.
+    """
+    if not isinstance(params, dict) or not output_dir:
+        return params
+    try:
+        out = Path(output_dir).resolve()
+    except Exception:
+        return params
+    write_ish = _is_write_ish(name, params)
+    new_params = None
+    for k, v in params.items():
+        if k not in _PATH_PARAM_KEYS or not isinstance(v, str) or not v.strip():
+            continue
+        try:
+            p = Path(v)
+            rp = p.resolve()
+            parent_missing = not p.parent.exists()
+            try:
+                outside = not rp.is_relative_to(out)
+            except AttributeError:  # py<3.9 fallback
+                outside = out not in rp.parents and rp.parent != out
+        except Exception:
+            continue
+        if parent_missing or (write_ish and outside):
+            redirected = str(out / p.name)
+            if redirected != str(rp):
+                if new_params is None:
+                    new_params = dict(params)
+                new_params[k] = redirected
+                logger.warning(
+                    "[Sandbox] %s: redirected path %r -> %r (parent_missing=%s, write_outside=%s)",
+                    name, v, redirected, parent_missing, write_ish and outside,
+                )
+    return new_params if new_params is not None else params
+
 
 def _build_empty_config():
     """Return a default Config instance (used as fallback when self._config is None)."""
@@ -266,6 +336,11 @@ class ToolSandbox:
         v1 fallback: with vault=None the v1 path returns
         ``{"success": False, "error": "..."}`` for any unknown tool name.
         """
+        # ── v0.9.7: keep deliverables in output_dir despite LLM path slips ──
+        _od = (getattr(self._config, "output_dir", "") if self._config else "") \
+            or str(self.vault_root / "output")
+        params = _normalize_output_paths(name, params, _od)
+
         # ── v2 registry (code-registered tools) ──────────────────────────
         try:
             from systemu.runtime.tool_registry_v2 import registry as _v2_registry

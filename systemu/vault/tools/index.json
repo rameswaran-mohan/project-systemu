@@ -2,7 +2,7 @@
   {
     "id": "tool_web_search",
     "name": "web_search",
-    "description": "Search the web and return results with title, URL, and snippet. Multi-provider: keyed (Brave/Serper) preferred, free DuckDuckGo-lite fallback.",
+    "description": "Search the web and return results with title, URL, and snippet. Multi-provider: keyed (Brave/Serper) preferred, free DuckDuckGo-lite fallback. Do NOT use for IP→location lookups or for calling JSON APIs — use fetch_json against an IP-geolocation API (e.g. http://ip-api.com/json/) for those.",
     "tool_type": "web",
     "parameter_names": [
       "query",
@@ -68,7 +68,7 @@
   {
     "id": "tool_a1f69543",
     "name": "fetch_json",
-    "description": "HTTP GET a JSON API endpoint and return the parsed response data",
+    "description": "HTTP GET a JSON API endpoint and return the parsed response data. USE THIS — not web_search — to resolve the user's location/city from their IP (GET http://ip-api.com/json/ or https://ipinfo.io/json), to geocode/reverse-geocode via Nominatim, and for any REST/JSON API. web_search finds web pages; it does NOT call APIs or do IP geolocation.",
     "tool_type": "api_call",
     "parameter_names": [
       "url",

@@ -1,7 +1,7 @@
 {
   "id": "tool_web_search",
   "name": "web_search",
-  "description": "Search the web and return results with title, URL, and snippet. Multi-provider: keyed (Brave/Serper) preferred when an API key is set, free DuckDuckGo-lite fallback otherwise.",
+  "description": "Search the web and return results with title, URL, and snippet. Multi-provider: keyed (Brave/Serper) preferred when an API key is set, free DuckDuckGo-lite fallback otherwise. Do NOT use for IP→location lookups or for calling JSON APIs — use fetch_json against an IP-geolocation API (e.g. http://ip-api.com/json/) for those.",
   "tool_type": "web",
   "parameters_schema": {
     "query": {

@@ -157,6 +157,9 @@ def extract_and_process(
     for spec in result.get("tools", []):
         _log_forge_rationale(spec)  # v0.8.22 (B): diagnostic
         tid, is_new = _upsert_tool(spec, vlt)
+        # v0.9.7 (B3): empty sentinel means a v2-collision was detected — skip.
+        if not tid:
+            continue
         tool_ids.append(tid)
         if is_new:
             missing_tool_ids.append(tid)
@@ -204,6 +207,9 @@ def extract_and_process(
             skill_ids         = []
             for spec in result.get("tools", []):
                 tid, is_new = _upsert_tool(spec, vlt)
+                # v0.9.7 (B3): empty sentinel — v2-collision; skip.
+                if not tid:
+                    continue
                 tool_ids.append(tid)
                 if is_new:
                     missing_tool_ids.append(tid)
@@ -461,8 +467,31 @@ def _upsert_skill(spec: dict, scroll_id: str, vlt: Vault) -> str:
 
 
 
+def _is_v2_registered_name(name: str) -> bool:
+    """Return True if *name* is already registered in the v2 tool registry.
+
+    Discovers v2 tool modules (idempotent) so the check works even before the
+    ShadowRuntime has been initialised.  Fail-quiet: import errors return False
+    so a broken tool module never aborts the extraction pipeline.
+    """
+    try:
+        from systemu.runtime.tool_registry_v2 import registry as _v2_registry
+        # Trigger AST-scan discovery so runtime.tools modules are loaded.
+        _v2_registry.discover_modules("systemu.runtime.tools")
+        return _v2_registry.get(name) is not None
+    except Exception:
+        logger.debug("[Extract] v2 registry check failed for %r — treating as not-registered", name)
+        return False
+
+
 def _upsert_tool(spec: dict, vlt: Vault) -> tuple[str, bool]:
-    """Return (tool_id, is_new): reuse existing or register as PROPOSED."""
+    """Return (tool_id, is_new): reuse existing or register as PROPOSED.
+
+    v0.9.7 (B3): name-collision guard.  If the proposed tool name matches a
+    v2-registered tool (code-side registry), skip creating a new vault record —
+    the executor reaches v2 tools via the code path, not via the vault.  A
+    warning is logged so operators can trace the decision.
+    """
     existing_id = spec.get("existing_id")
     is_new      = spec.get("is_new", True)
 
@@ -501,6 +530,21 @@ def _upsert_tool(spec: dict, vlt: Vault) -> tuple[str, bool]:
                      name_match.id, name_match.name, name_match.status,
                      name_match.enabled, still_needs_forge)
         return name_match.id, still_needs_forge
+
+    # v0.9.7 (B3): v2-registry collision guard.  A name that shadows a
+    # code-registered v2 tool must not become a new vault artefact — the
+    # executor reaches the real implementation via the v2 path, and a
+    # duplicate vault record would cause signature mismatches.
+    proposed_name = spec.get("name", "")
+    if proposed_name and _is_v2_registered_name(proposed_name):
+        logger.warning(
+            "[Extract] Skipping new vault tool for %r — name already registered "
+            "as a v2 code-side tool.  The executor will use the v2 implementation.",
+            proposed_name,
+        )
+        # Return a sentinel: empty string signals the caller that no vault id
+        # was created; is_new=False so the activity doesn't treat it as missing.
+        return "", False
 
     tool = Tool(
         id=generate_id("tool"),

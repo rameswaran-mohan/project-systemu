@@ -128,6 +128,37 @@ def _maybe_extract_skill_and_consolidate(*, vault, config, scroll, shadow, resul
             except Exception:
                 logger.debug("[L7] auto-skill extraction swallowed error", exc_info=True)
 
+        # ── (1b) corrective (anti-pattern) extraction — failure/partial ────
+        # v0.9.7 (Phase 4.2): learn-from-failure. When a run with real activity
+        # fails or only partially succeeds, extract an anti-pattern SKILL.md so
+        # future runs are warned about what went wrong. Same config/threshold
+        # guards as the success path; never raises.
+        elif status in ("failure", "partial"):
+            try:
+                from systemu.runtime import auto_skill_extractor as _ase
+                tools_called = list(res.get("tools_called") or [])
+                n_tool_calls = int(res.get("tool_calls", len(tools_called)) or 0)
+                n_rounds = int(res.get("rounds", res.get("total_events", 0)) or 0)
+                if n_rounds >= 2 or n_tool_calls >= 2:
+                    failure_reason = summary or res.get("error") or ""
+                    candidate = _ase.extract_corrective_candidate(
+                        intent=intent,
+                        failure_reason=failure_reason,
+                        n_rounds=n_rounds,
+                        n_tool_calls=n_tool_calls,
+                        tools_called=tools_called,
+                        config=config,
+                    )
+                    if candidate:
+                        skills_dir = getattr(config, "skills_user_dir", "") or ""
+                        if not skills_dir:
+                            skills_dir = str(_Path(getattr(vault, "root", ".")) / "skills" / "earned")
+                        path = _ase.persist_skill_candidate(candidate, skills_dir=skills_dir)
+                        if path:
+                            logger.info("[L7] corrective (anti-pattern) SKILL.md → %s", path)
+            except Exception:
+                logger.debug("[L7] corrective skill extraction swallowed error", exc_info=True)
+
         # ── (2) memory consolidation — config-gated, fingerprint-cached ────
         try:
             from systemu.runtime.memory_consolidator import consolidate_run
