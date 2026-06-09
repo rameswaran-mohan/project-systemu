@@ -19,9 +19,17 @@ and the runtime builds the JSON Schema internally.
 from __future__ import annotations
 
 import logging
+import os
 import re as _re
 
 logger = logging.getLogger(__name__)
+
+# v0.9.8 Phase 1 Task 7: when the keyless web_access stack is on (default), the
+# initial page FETCH is delegated to systemu.runtime.web_access.read_url — that
+# layer beats most anti-bot 403s via Jina Reader without an API key. Extraction
+# (schema/fields/heuristic) is unchanged; only how we obtain the HTML changes.
+# Gate purely on the env var so we don't need a Config object.
+_V2 = os.getenv("SYSTEMU_WEB_STACK_V2", "true").lower() != "false"
 
 TOOL_META = {
     "name": "web_extract",
@@ -47,7 +55,32 @@ _MIN_BODY_CHARS = 100
 _MIN_TEXT_CHARS = 50
 
 
+class _AccessResponse:
+    """Adapts a web_access.read_url result into the minimal requests.Response
+    shape the rest of run() consumes (``.status_code`` + ``.text``). Keeps the
+    pagination / extraction loop completely unchanged under the v0.9.8 stack."""
+
+    __slots__ = ("status_code", "text")
+
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+
 def _fetch(url: str, headers: dict, params: dict, timeout: int):
+    # Re-read the flag at CALL time (not import time) so it can be toggled at
+    # runtime / in tests via SYSTEMU_WEB_STACK_V2.
+    if os.getenv("SYSTEMU_WEB_STACK_V2", "true").lower() != "false":
+        from systemu.runtime import web_access
+        res = web_access.read_url(url, timeout=timeout)
+        content = res.get("content") or ""
+        if content:
+            return _AccessResponse(200, content)
+        # No content — surface the upstream status so the loop's anti-bot/http
+        # error handling kicks in just like the legacy path. read_url maps a
+        # hard block to status None, so fall back to a 403 in that case.
+        status = res.get("status") or 403
+        return _AccessResponse(int(status), "")
     import requests
     h = dict(headers or {})
     # setdefault — caller-supplied headers always win.
@@ -289,6 +322,14 @@ def run(**kwargs) -> dict:
         mode = "heuristic"
 
     from systemu.runtime.extractor import _sanitize_html
+
+    # v0.9.8 Phase 1 Task 7: under SYSTEMU_WEB_STACK_V2 (default on), the page
+    # FETCH is delegated to systemu.runtime.web_access.read_url (keyless Jina
+    # Reader → raw GET escalation) instead of the legacy requests path. The
+    # extraction pipeline + return shape below are identical either way.
+    use_v2 = os.getenv("SYSTEMU_WEB_STACK_V2", "true").lower() != "false"
+    if use_v2:
+        from systemu.runtime import web_access as _web_access  # noqa: F401
 
     accumulated: list = []
     seen_keys: set = set()

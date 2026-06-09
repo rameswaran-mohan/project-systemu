@@ -24,7 +24,7 @@ class TestConfigFields:
         assert cfg.verifier_per_turn_cap == 2
         assert cfg.verifier_rejection_budget == 3
         assert cfg.verifier_max_calls_per_run == 50
-        assert cfg.verifier_tier == 1
+        assert cfg.verifier_tier == 3  # v0.9.8 (B6): default 1 -> 3 (free, JSON-reliable)
         assert cfg.audit_log_enabled is True
         assert cfg.state_delta_file_preview_chars == 200
         assert cfg.state_delta_max_files_per_section == 50
@@ -392,25 +392,31 @@ class TestObjectiveVerifierRun:
         assert result["verified"] is False
         assert "expected path" in result["reason"]
 
-    def test_malformed_json_returns_false(self, monkeypatch):
+    def test_malformed_json_soft_passes(self, monkeypatch):
+        # v0.9.8 (B5): malformed verifier output must SOFT-PASS, not reject —
+        # blocking the user's task over our own parse failure caused max-iteration
+        # loops (the goal-level verifier is the real backstop for the deliverable).
         def fake_call(**kw):
             return {"not_the_right_shape": True}
         monkeypatch.setattr(
             "systemu.runtime.objective_verifier.llm_call_json", fake_call)
         result = objective_verifier.run(
             objective=self._obj(), delta=self._delta(), config=Config())
-        assert result["verified"] is False
+        assert result["verified"] is True
         assert "unparsable" in result["reason"] or "malformed" in result["reason"]
+        assert "soft-pass" in result["reason"]
 
-    def test_llm_exception_returns_false(self, monkeypatch):
+    def test_llm_exception_soft_passes(self, monkeypatch):
+        # v0.9.8 (B5): a verifier-LLM infra failure must SOFT-PASS, not reject.
         def fake_call(**kw):
             raise RuntimeError("network down")
         monkeypatch.setattr(
             "systemu.runtime.objective_verifier.llm_call_json", fake_call)
         result = objective_verifier.run(
             objective=self._obj(), delta=self._delta(), config=Config())
-        assert result["verified"] is False
+        assert result["verified"] is True
         assert "verifier unavailable" in result["reason"]
+        assert "soft-pass" in result["reason"]
 
     def test_verifier_disabled_short_circuits_to_true(self, monkeypatch):
         called = []
@@ -457,7 +463,7 @@ class TestObjectiveVerifierRun:
         result = objective_verifier.run(
             objective=self._obj(), delta=self._delta(), config=cfg)
         assert result["verified"] is True
-        assert captured["tier"] == 1
+        assert captured["tier"] == 3  # v0.9.8 (B6): verifier_tier default 1 -> 3
         assert captured["has_system"] is True
         assert captured["user_is_json"] is True
         assert captured["has_config"] is True

@@ -102,6 +102,12 @@ class TestSearchCache:
 
 
 class TestWebSearchNote:
+    # v0.9.8: legacy free-search path (monkeypatched providers). The v0.9.8 web
+    # stack is default-ON, so pin the legacy path here.
+    @pytest.fixture(autouse=True)
+    def _legacy_web(self, monkeypatch):
+        monkeypatch.setenv("SYSTEMU_WEB_STACK_V2", "false")
+
     def test_note_present_when_degraded_empty(self, monkeypatch):
         import importlib.util, pathlib, systemu
         ws_path = pathlib.Path(systemu.__file__).parent / "vault" / "tools" / "implementations" / "web_search.py"

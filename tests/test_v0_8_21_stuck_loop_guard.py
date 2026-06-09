@@ -135,6 +135,10 @@ class TestExtractRecordsSeed:
 
 
 class TestWebExtractSinglePage:
+    @pytest.fixture(autouse=True)
+    def _legacy_web(self, monkeypatch):  # v0.9.8: exercise the legacy raw-fetch path
+        monkeypatch.setenv("SYSTEMU_WEB_STACK_V2", "false")
+
     def _fake_get_factory(self, status_code=200, html="<html><body>" + ("Real bakery content. " * 50) + "</body></html>"):
         class _R:
             def __init__(s): s.status_code = status_code; s.text = html; s.headers = {}
@@ -238,6 +242,10 @@ class TestWebExtractSinglePage:
 
 
 class TestWebExtractPagination:
+    @pytest.fixture(autouse=True)
+    def _legacy_web(self, monkeypatch):  # v0.9.8: exercise the legacy raw-fetch path
+        monkeypatch.setenv("SYSTEMU_WEB_STACK_V2", "false")
+
     def _page(self, idx, count_per_page=2, next_link=True):
         items = "".join(f"<div>Bakery {idx}-{i}</div>" for i in range(count_per_page))
         nxt = f'<link rel="next" href="https://x.example/list?page={idx+1}">' if next_link else ""

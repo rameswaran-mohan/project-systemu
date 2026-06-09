@@ -130,7 +130,10 @@ def verify_goal(
             system=_load_system_prompt(),
             user=json.dumps(user_payload, separators=(",", ":")),
             config=config,
-            max_tokens=300,
+            # v0.9.8 (B7): reasoning models consume a 300-token budget on visible
+            # chain-of-thought before emitting the JSON verdict — with 300 the
+            # response truncated mid-thought and goal verification always failed.
+            max_tokens=1500,
             temperature=0.0,
         )
     except Exception as exc:

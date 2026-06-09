@@ -117,6 +117,10 @@ class TestOutputDirPrecedence:
 
 
 class TestWebExtractBrowserHeaders:
+    @pytest.fixture(autouse=True)
+    def _legacy_web(self, monkeypatch):  # v0.9.8: legacy raw-fetch header path
+        monkeypatch.setenv("SYSTEMU_WEB_STACK_V2", "false")
+
     """v0.9.1.1: web_extract must look like a real browser so sites that
     block scrapers (Yelp, Reddit, Google, TripAdvisor) actually serve
     content. The old systemu/0.8 UA was being 403'd everywhere."""
@@ -175,6 +179,12 @@ class TestWebExtractBrowserHeaders:
 
 
 class TestWebExtractAntiBotHint:
+    # v0.9.8: legacy raw-fetch anti-bot mapping. The v0.9.8 web stack (Jina first)
+    # is default-ON, so pin the legacy path here.
+    @pytest.fixture(autouse=True)
+    def _legacy_web(self, monkeypatch):
+        monkeypatch.setenv("SYSTEMU_WEB_STACK_V2", "false")
+
     """v0.9.1.1: when a site returns 401/403/406/429/451 (anti-bot
     detection), web_extract returns error_type='anti_bot_blocked' with a
     concrete hint pointing the LLM at search engine URLs. Without this,

@@ -337,19 +337,49 @@ def is_allowlisted(package: str) -> bool:
     return package in _load_allowlist()
 
 
+def _dep_engine():
+    """Return a SQLAlchemy engine for the dep-approvals store, or ``None`` if the
+    configured database is unreachable.
+
+    ``SYSTEMU_DATABASE_URL`` may be unset, or point at Postgres while the driver
+    (psycopg2) isn't installed — SQLAlchemy then raises ``ModuleNotFoundError``
+    on first connect. Rather than crash the caller (a tool's dependency check
+    via ``is_allowlisted``, or the /tools banner), we degrade: callers treat the
+    allowlist as empty and skip persistence. Logged once at WARNING.
+    """
+    url = os.environ.get("SYSTEMU_DATABASE_URL", "") or ""
+    if not url:
+        return None
+    try:
+        from sqlalchemy import create_engine
+        engine = create_engine(url)
+        # Force driver import / connectivity now so a raw ModuleNotFoundError
+        # can't surface from a query site deep in the run.
+        with engine.connect():
+            pass
+        return engine
+    except Exception as exc:  # noqa: BLE001 — any driver/connectivity failure degrades
+        logger.warning(
+            "[dep_approvals] database unavailable (%s: %s) — degrading: dependency "
+            "allowlist treated as empty, approvals not persisted.",
+            (url.split("://", 1)[0] or "?"), exc.__class__.__name__,
+        )
+        return None
+
+
 def list_unbaked_approvals():
     """Return ToolDepApproval rows that are runtime-approved but not yet
     baked into the docker image (``baked_in_image=False``).
 
     Used by the /tools page banner (v0.6.8-e) to remind operators to run
     ``docker compose build`` so freshly-approved deps survive the next
-    container rebuild.
+    container rebuild. Degrades to ``[]`` when the database is unreachable.
     """
-    import os
-    from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
     from systemu.storage.sqlite.models import ToolDepApproval
-    engine = create_engine(os.environ["SYSTEMU_DATABASE_URL"])
+    engine = _dep_engine()
+    if engine is None:
+        return []
     with Session(engine) as s:
         rows = s.query(ToolDepApproval).filter_by(baked_in_image=False).all()
         for r in rows:
@@ -370,21 +400,23 @@ def _make_approval(*, package: str, source: str):
 
 
 def _persist_approval(approval) -> None:
-    import os
-    from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
-    engine = create_engine(os.environ["SYSTEMU_DATABASE_URL"])
+    engine = _dep_engine()
+    if engine is None:
+        logger.warning("[dep_approvals] skipping persist of %s — database unavailable.",
+                       getattr(approval, "package_name", "?"))
+        return
     with Session(engine) as s:
         s.add(approval)
         s.commit()
 
 
 def _load_allowlist() -> set:
-    import os
-    from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
     from systemu.storage.sqlite.models import ToolDepApproval
-    engine = create_engine(os.environ["SYSTEMU_DATABASE_URL"])
+    engine = _dep_engine()
+    if engine is None:
+        return set()
     with Session(engine) as s:
         return {r.package_name for r in s.query(ToolDepApproval).all()}
 
