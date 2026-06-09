@@ -188,12 +188,43 @@ def _store_proposal(prop: Dict[str, Any], vault: Vault) -> Evolution:
         status=EvolutionStatus.PROPOSED,
     )
     vault.save_evolution(evolution)
+    # v0.9: surface the proposal in the unified Decisions Inbox (dedup
+    # evolution:<id> → idempotent). Best-effort: never break the producer.
+    # ``InboxQueue``/``GateDescriptor`` are resolved from module globals so they
+    # remain monkeypatchable in tests; lazy-imported on first use otherwise.
+    try:
+        inbox_cls = globals().get("InboxQueue")
+        gate_cls  = globals().get("GateDescriptor")
+        if inbox_cls is None:
+            from systemu.interface.command.inbox import InboxQueue as inbox_cls
+        if gate_cls is None:
+            from systemu.interface.command.gate import GateDescriptor as gate_cls
+        inbox_cls(vault).enqueue(
+            gate_cls.from_evolution(evolution), gate_type="evolution")
+    except Exception:
+        logger.debug("[Evolution] gate enqueue skipped", exc_info=True)
     return evolution
 
 
 def _notify_evolution(evolution: Evolution, config: Config, vault: Vault) -> None:
     """Notify user about a new evolution proposal and handle approval."""
     from systemu.interface.name_resolver import resolve_names
+
+    # v0.9: in queue mode (SYSTEMU_DECISION_QUEUE=true — the SAME predicate
+    # notify_user uses to route into the OperatorDecisionQueue) the unified
+    # Decisions Inbox already owns this proposal: _store_proposal enqueued an
+    # `evolution` gate, and resolving it (Approve & Apply) runs apply_evolution.
+    # Posting notify_user here too would raise PendingOperatorDecision and leave
+    # a PARALLEL non-gate operator decision beside the gate for the same
+    # proposal. So skip the notify in queue mode — the gate is the surface.
+    # The TTY/interactive (CLI, no dashboard) path below is preserved unchanged.
+    import os as _os
+    if (_os.environ.get("SYSTEMU_DECISION_QUEUE") or "").lower() == "true":
+        logger.debug(
+            "[Evolution] queue mode — proposal %s surfaced as an Inbox gate; "
+            "skipping the parallel notify_user decision.", evolution.id,
+        )
+        return
 
     priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
         getattr(evolution, "priority", "medium"), "🟡"

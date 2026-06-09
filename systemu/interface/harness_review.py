@@ -135,19 +135,24 @@ def surface_harness_request(
     ]
     body = "\n".join(body_lines)
 
-    title = f"Harness request escalated: {kind_val} [{request_id}]"
-
-    context: Dict[str, Any] = {
-        "kind":           "harness_review",
-        "execution_id":   execution_id,
-        "request_id":     request_id,
-        "harness_kind":   kind_val,
-        "risk_band":      verdict_risk,
-        "urgency":        urgency,
-        "blocking":       blocking,
-        "verdict":        verdict_decision,
-        "spec":           spec,
-        "rationale":      rationale,
+    # ── Harness-specific context preserved across the re-tag ──────────────────
+    # The row is re-tagged to a kind="gate" / gate_type="harness" descriptor so
+    # InboxQueue.list_descriptors() surfaces it (it filters ctx["kind"]=="gate").
+    # These extras ride alongside the descriptor's serialized context via
+    # enqueue(context_extras=...) so the FUTURE grant-resume executor (and the
+    # current renderers) still have execution_id / request_id / harness_kind /
+    # spec / verdict / rationale to work with. (`kind`/`gate_type` are NOT placed
+    # here — to_decision_context owns them, and enqueue makes them win regardless.)
+    context_extras: Dict[str, Any] = {
+        "execution_id":      execution_id,
+        "request_id":        request_id,
+        "harness_kind":      kind_val,
+        "risk_band":         verdict_risk,
+        "urgency":           urgency,
+        "blocking":          blocking,
+        "verdict":           verdict_decision,
+        "spec":              spec,
+        "rationale":         rationale,
         "verdict_rationale": verdict_rationale,
     }
 
@@ -156,20 +161,26 @@ def surface_harness_request(
         from systemu.runtime.chat_submission_ctx import current_chat_submission_id
         cid = current_chat_submission_id()
         if cid:
-            context["chat_submission_id"] = cid
+            context_extras["chat_submission_id"] = cid
     except Exception:
         pass
 
-    # ── Post to OperatorDecisionQueue ─────────────────────────────────────────
-    from systemu.approval.decision_queue import OperatorDecisionQueue
+    # ── Surface as a gate via the Inbox facade ────────────────────────────────
+    # GateDescriptor.from_harness mirrors this surface's options / safe-default
+    # ("Deny") / dedup-key format verbatim (gate.py:94); enqueue posts through the
+    # SAME OperatorDecisionQueue and stamps kind="gate"/gate_type="harness", which
+    # is what list_descriptors() needs to show the harness review card.
+    from systemu.interface.command.gate import GateDescriptor
+    from systemu.interface.command.inbox import InboxQueue
 
-    queue = OperatorDecisionQueue(vault)
-    decision_id = queue.post(
-        title=title,
+    descriptor = GateDescriptor.from_harness(
+        request, verdict, execution_id=execution_id
+    )
+    decision_id = InboxQueue(vault).enqueue(
+        descriptor,
+        gate_type="harness",
         body=body,
-        options=_HARNESS_OPTIONS,
-        context=context,
-        dedup_key=dedup_key,
+        context_extras=context_extras,
     )
 
     logger.info(

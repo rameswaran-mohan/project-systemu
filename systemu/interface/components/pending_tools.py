@@ -75,6 +75,12 @@ def build_pending_tools() -> None:
                     f"background: color-mix(in srgb, {THEME['warning']} 15%, transparent); "
                     f"border-radius: 999px;"
                 )
+                # v0.9: this is a *review* entry point — it deep-links to the
+                # /tools rich spec→code review dialog (Gate 1 spec edit → Gate 2
+                # human code review → sign-off). That dialog now resolves the
+                # matching forge: Inbox gate on its terminal decision
+                # (_resolve_forge_gate_silently), so the proposed tool is forged
+                # exactly once regardless of which surface the operator uses.
                 ui.button(
                     "Review & forge →",
                     on_click=lambda tid=t.get("id"): ui.navigate.to(_forge_link(tid)),

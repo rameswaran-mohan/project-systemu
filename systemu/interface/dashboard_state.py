@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Optional
 from sharing_on.config import Config
 
 from systemu.abstractions import IApprovalGate, IEventBroker, ITaskQueue, IVault
+from systemu.interface.design.tokens import TOKENS as _TOKENS, build_global_css as _build_css
+from systemu.interface.design.primitives import status_pill_html as _status_pill_html
 
 if TYPE_CHECKING:
     pass
@@ -427,243 +429,20 @@ class _NoOpTaskQueue:
 #  Theme constants (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Back-compat: legacy flat THEME keys mapped onto the single-source tokens.
 THEME = {
-    # Base palette
-    "bg":           "#0f1117",
-    "surface":      "#1a1d27",
-    "surface2":     "#22263a",
-    "border":       "#2d3148",
-    "text":         "#e8eaf6",
-    "text_muted":   "#6b7280",
-
-    # Accent
-    "primary":      "#6366f1",   # indigo-500
-    "primary_dim":  "#4f52c8",
-    "success":      "#22c55e",
-    "warning":      "#f59e0b",
-    "danger":       "#ef4444",
-    "info":         "#38bdf8",
-
-    # Status colours
-    "status_colors": {
-        "pending_approval":  "#f59e0b",
-        "approved":          "#22c55e",
-        "linked":            "#6366f1",
-        "proposed":          "#f59e0b",
-        "forged":            "#38bdf8",
-        "deployed":          "#22c55e",
-        "awakened":          "#6366f1",
-        "dormant":           "#6b7280",
-        "retired":           "#ef4444",
-        "unassigned":        "#f59e0b",
-        "assigned":          "#6366f1",
-        "partial":           "#f97316",
-    },
+    "bg": _TOKENS["color"]["bg"], "surface": _TOKENS["color"]["surface"],
+    "surface2": _TOKENS["color"]["surface2"], "border": _TOKENS["color"]["border"],
+    "text": _TOKENS["color"]["text"], "text_muted": _TOKENS["color"]["muted"],
+    "primary": _TOKENS["color"]["accent"], "primary_dim": _TOKENS["color"]["accent2"],
+    "success": _TOKENS["color"]["success"], "warning": _TOKENS["color"]["warn"],
+    "danger": _TOKENS["color"]["danger"], "info": _TOKENS["color"]["info"],
+    "status_colors": {s: _TOKENS["color"][tok] for s, tok in _TOKENS["status"].items()},
 }
 
-GLOBAL_CSS = f"""
-:root {{
-    --bg:           {THEME['bg']};
-    --surface:      {THEME['surface']};
-    --surface2:     {THEME['surface2']};
-    --border:       {THEME['border']};
-    --text:         {THEME['text']};
-    --text-muted:   {THEME['text_muted']};
-    --primary:      {THEME['primary']};
-    --success:      {THEME['success']};
-    --warning:      {THEME['warning']};
-    --danger:       {THEME['danger']};
-    --info:         {THEME['info']};
-}}
-
-body, html {{
-    background: var(--bg) !important;
-    color: var(--text) !important;
-    font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
-    margin: 0;
-}}
-
-.nicegui-content {{
-    background: var(--bg) !important;
-    min-height: 100vh;
-}}
-
-/* Card */
-.s-card {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px;
-    transition: border-color 0.2s, box-shadow 0.2s;
-}}
-.s-card:hover {{
-    border-color: var(--primary);
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent);
-}}
-
-/* Stat card */
-.stat-card {{
-    background: linear-gradient(135deg, var(--surface) 60%, var(--surface2));
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 24px;
-    min-width: 160px;
-    text-align: center;
-}}
-
-/* Badge */
-.badge {{
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-}}
-
-/* Table */
-.s-table {{
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 14px;
-}}
-.s-table th {{
-    background: var(--surface2);
-    color: var(--text-muted);
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-}}
-.s-table td {{
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-    color: var(--text);
-}}
-.s-table tr:hover td {{
-    background: var(--surface2);
-}}
-
-/* Nav sidebar */
-.nav-link {{
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 16px;
-    border-radius: 8px;
-    cursor: pointer;
-    color: var(--text-muted);
-    font-weight: 500;
-    transition: background 0.15s, color 0.15s;
-    text-decoration: none;
-}}
-.nav-link:hover, .nav-link.active {{
-    background: color-mix(in srgb, var(--primary) 15%, transparent);
-    color: var(--text);
-}}
-
-/* Button overrides */
-.q-btn.primary-btn {{
-    background: var(--primary) !important;
-    color: white !important;
-    border-radius: 8px;
-}}
-.q-btn.danger-btn {{
-    background: var(--danger) !important;
-    color: white !important;
-    border-radius: 8px;
-}}
-.q-btn.success-btn {{
-    background: var(--success) !important;
-    color: white !important;
-    border-radius: 8px;
-}}
-
-/* Responsive sidebar — collapses to icons on narrow viewports.
-   The sidebar element gets .s-sidebar; the brand text + nav-link labels
-   get .s-sidebar-label so they hide on collapse.  On narrow viewports a
-   .s-sidebar-toggle hamburger button appears top-left; tapping it adds
-   .s-sidebar-open to <body>, which:
-     * expands the sidebar back to full width
-     * shows a backdrop overlay so the sidebar floats above content
-     * reveals the labels again
-   Tapping the backdrop dismisses. */
-
-/* Hamburger button — hidden on desktop, fixed top-left on mobile. */
-.s-sidebar-toggle {{
-    display: none;
-    position: fixed;
-    top: 12px;
-    left: 12px;
-    z-index: 1100;
-    width: 36px;
-    height: 36px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 18px;
-    cursor: pointer;
-    transition: background 0.15s;
-}}
-.s-sidebar-toggle:hover {{
-    background: var(--surface2);
-}}
-
-/* Backdrop — hidden by default, shown when sidebar is open on mobile. */
-.s-sidebar-backdrop {{
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 999;
-    cursor: pointer;
-}}
-
-@media (max-width: 768px) {{
-    .s-sidebar {{
-        width: 64px !important;
-        min-width: 64px !important;
-        padding-left: 4px !important;
-        padding-right: 4px !important;
-        z-index: 1000;
-        transition: width 0.2s ease, min-width 0.2s ease;
-    }}
-    .s-sidebar-label,
-    .s-sidebar-footer {{
-        display: none !important;
-    }}
-    .s-sidebar-toggle {{
-        display: block;
-    }}
-
-    /* Tap the hamburger -> body gets .s-sidebar-open, sidebar expands. */
-    body.s-sidebar-open .s-sidebar {{
-        width: 220px !important;
-        min-width: 220px !important;
-        padding-left: 12px !important;
-        padding-right: 12px !important;
-    }}
-    body.s-sidebar-open .s-sidebar-label,
-    body.s-sidebar-open .s-sidebar-footer {{
-        display: revert !important;
-    }}
-    body.s-sidebar-open .s-sidebar-backdrop {{
-        display: block;
-    }}
-}}
-"""
+GLOBAL_CSS = _build_css()
 
 
 def status_badge_html(status: str) -> str:
-    """Return a coloured HTML badge for a status string."""
-    color = THEME["status_colors"].get(status.lower(), "#6b7280")
-    return (
-        f'<span class="badge" style="background: color-mix(in srgb, {color} 20%, transparent); '
-        f'color: {color}; border: 1px solid color-mix(in srgb, {color} 40%, transparent);">'
-        f'{status}</span>'
-    )
+    """Deprecated alias — delegates to the class-only design primitive."""
+    return _status_pill_html(status)

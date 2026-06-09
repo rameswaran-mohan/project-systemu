@@ -87,6 +87,7 @@ NAV_GROUPS = [
         ("/evolutions",     "🧬",  "Evolutions"),
     ]),
     ("System", False, [
+        ("/inbox",          "📥",  "Inbox"),
         ("/insights",       "📊",  "Insights"),
         ("/settings",       "⚙️",  "Settings"),
     ]),
@@ -95,11 +96,39 @@ NAV_GROUPS = [
 # Back-compat flat list — Console first, then all grouped items.
 NAV_ITEMS = [NAV_TOP] + [item for _, _, items in NAV_GROUPS for item in items]
 
+# Deep detail pages have no nav entry of their own; they highlight their
+# spine parent.  (Exact active-route — fixes the P11 startswith sub-item.)
+NAV_DEEP_PARENT = {
+    "/workflow": "/activities",
+    "/memory":   "/army",
+}
+
+
+def active_nav_path(current_path: str, nav_paths: list) -> str:
+    """Return the ONE nav path that should render active for current_path.
+
+    Exact match wins; a deep detail page (/workflow/{id}, /memory/{id}) maps
+    to its spine parent; a path whose first segment is itself a nav root
+    (e.g. /scrolls/abc -> /scrolls) highlights that root.  Returns "" when no
+    nav entry should be active — no char-prefix false positives (the old
+    `startswith` lit /tools for /toolsmith).
+    """
+    if current_path in nav_paths:
+        return current_path
+    first = "/" + current_path.lstrip("/").split("/", 1)[0]
+    parent = NAV_DEEP_PARENT.get(first)
+    if parent and parent in nav_paths:
+        return parent
+    if first != "/" and first in nav_paths:
+        return first
+    return ""
+
 
 def _build_layout(page_title: str, current_path: str):
     """Return a NiceGUI context manager that renders the sidebar + header."""
     from nicegui import ui
     from systemu.interface.dashboard_state import THEME, GLOBAL_CSS
+    from systemu.interface.design.primitives import button as ds_button
 
     ui.add_css(GLOBAL_CSS)
     # Google Font
@@ -149,8 +178,11 @@ def _build_layout(page_title: str, current_path: str):
             # always sees the current page even if the group is collapsed
             # by default.  Group state is per-page-load (no persistence
             # this release — visual reorg only per the design).
+            nav_paths = [p for p, _, _ in NAV_ITEMS]
+            active_path = active_nav_path(current_path, nav_paths)
+
             def _render_nav_link(path: str, icon: str, label: str) -> None:
-                is_active = current_path == path or (path != "/" and current_path.startswith(path))
+                is_active = active_path == path
                 bg = f"color-mix(in srgb, {THEME['primary']} 15%, transparent)" if is_active else "transparent"
                 text_color = THEME["text"] if is_active else THEME["text_muted"]
                 with ui.element("a").props(f'href="{path}"').style(
@@ -163,10 +195,7 @@ def _build_layout(page_title: str, current_path: str):
                     ui.label(label).classes("s-sidebar-label")
 
             def _group_contains_active(items) -> bool:
-                for path, _icon, _label in items:
-                    if current_path == path or (path != "/" and current_path.startswith(path)):
-                        return True
-                return False
+                return any(active_path == path for path, _icon, _label in items)
 
             # v0.8.8: standalone Console link, above the grouped nav
             _render_nav_link(*NAV_TOP)
@@ -243,12 +272,12 @@ def _build_layout(page_title: str, current_path: str):
                             ui.notify("A capture session is already running!", type="negative")
                             return
                         task_name = name_input.value.strip() or "Unnamed Task"
-                        import sys
+                        from systemu.interface.command.dispatch import dispatch
                         from systemu.interface.dashboard_state import AppState
                         cwd = AppState.get().project_root   # Always absolute
-                        cmd = [sys.executable, "-m", "sharing_on", "record",
-                               "--name", task_name, "--no-analyze"]
-                        jm.start_job(f"Recording: {task_name}", "capture", cmd, cwd)
+                        dispatch("record", ["--name", task_name, "--no-analyze"],
+                                 cwd=cwd, stream=True, job_type="capture",
+                                 dedup_key=f"record:{task_name}")
                         ui.notify("Recording started!", type="positive")
                         dlg.close()
                         
@@ -270,10 +299,18 @@ def _build_layout(page_title: str, current_path: str):
                 )
                 
                 with ui.row().style("gap: 12px; align-items: center;"):
-                    # Record button references the local closure — always in valid slot context
-                    ui.button("🔴 Record Session", on_click=_open_record_dialog).style(
-                        f"background: #ef4444; color: white; border-radius: 8px; font-weight: 600; padding: 6px 12px; font-size: 13px;"
-                    )
+                    # ＋New — the global creation menu (Record session / Submit
+                    # task).  Trigger uses the design-system primitive (token
+                    # classes, no inline f-style); the dropdown uses the
+                    # `.s-menu` token class — net-zero new inline styles vs the
+                    # single styled Record button this replaces.
+                    with ds_button("＋ New", variant="primary"):
+                        with ui.menu().classes("s-menu"):
+                            ui.menu_item("🔴 Record session", on_click=_open_record_dialog)
+                            ui.menu_item(
+                                "📝 Submit task",
+                                on_click=lambda: ui.navigate.to("/chat?tab=compose"),
+                            )
 
                     # Active Tasks button — count badge sits next to button, menu uses @ui.refreshable
                     with ui.row().style("align-items: center; gap: 4px;"):
@@ -395,8 +432,43 @@ def _build_layout(page_title: str, current_path: str):
 
             from systemu.interface.ui_helpers import safe_timer
             safe_timer(1.0, _update_jobs)
-            
-            return content_area
+
+        # ── Right rail (persistent) — sibling of main content, inside root row.
+        #    Same on every page; rebuilt per route (the EventBus ring buffer
+        #    replays history so "Live" repopulates seamlessly).
+        with ui.column().classes("s-rail").style("position: sticky; top: 0;"):
+            _render_persistent_right_rail()
+
+        return content_area
+
+
+def _render_persistent_right_rail() -> None:
+    """Render the persistent right rail (Needs-you inbox glance + Live runs).
+
+    Defensive: the rail must NEVER break the page shell — any failure to reach
+    the vault or render a pane is swallowed (logged), exactly like the
+    health-banner block.
+    """
+    try:
+        from systemu.interface.dashboard_state import AppState
+        from systemu.interface.components.right_rail import render_right_rail
+        state = AppState.get()
+        vault = getattr(state, "vault", None) if state else None
+    except Exception:
+        return
+    if vault is None:
+        return
+    try:
+        render_right_rail(vault)
+    except Exception:
+        logger.exception("[Dashboard] right-rail render error")
+
+
+def plus_new_menu_items() -> list:
+    """The global ＋New action's items (spec §4.2): a global capture-session
+    recorder and a task submission.  Pure so the menu contents are testable.
+    """
+    return ["Record session", "Submit task"]
 
 
 # ── Dashboard Global Job Management Buttons ──
@@ -412,7 +484,6 @@ def _show_record_dialog():
 
 def _stop_capture(jm):
     import os
-    import sys
     from nicegui import ui
     from pathlib import Path
     from systemu.interface.dashboard_state import AppState
@@ -468,20 +539,14 @@ def _stop_capture(jm):
                     pass
                 return
             latest = dirs[-1]
-            refine_cmd = [
-                sys.executable, "-m", "sharing_on",
-                "scrolls", "refine", str(latest),
-            ]
+            from systemu.interface.command.dispatch import dispatch
             # v0.6.1-b: --auto when running non-interactively (env var
             # SYSTEMU_NON_INTERACTIVE — renamed from the misleading
             # SYSTEMU_AUTO_APPROVE_SCROLLS).
-            if state.config.non_interactive:
-                refine_cmd.append("--auto")
-            jm.start_job(
-                f"Refining: {captured_name}",
-                "refine",
-                refine_cmd,
-                cwd,
+            args = [str(latest)] + (["--auto"] if state.config.non_interactive else [])
+            dispatch(
+                "scrolls refine", args, cwd=cwd, stream=True,
+                job_type="refine", dedup_key=f"refine:{latest}",
             )
             logger.info("[Dashboard] Refine job dispatched for: %s", latest)
             try:
@@ -553,6 +618,7 @@ def register_routes() -> None:
     from systemu.interface.pages.shadow_memory_page        import build_shadow_memory_page
     from systemu.interface.pages.chat_page                 import build_chat_tabs
     from systemu.interface.pages.insights                  import build_insights_page
+    from systemu.interface.pages.inbox_page                 import build_inbox_page
     from systemu.interface.pages.workflow_detail           import build_workflow_detail_page
     from systemu.interface.pages import recover as _recover_page_module  # noqa: F401  # registers /recover/<scope>/<id>
 
@@ -622,6 +688,12 @@ def register_routes() -> None:
     def page_settings():
         with _build_layout("⚙️ Settings", "/settings"):
             build_settings_page()
+
+    # ── Inbox (Phase 3 Batch 3: the one decisions surface — unified cards) ─
+    @ui.page("/inbox")
+    def page_inbox():
+        with _build_layout("📥 Inbox", "/inbox"):
+            build_inbox_page()
 
     # ── Chat (v0.7.2: now tabbed — Compose + Live Events) ─────────────────
     @ui.page("/chat")

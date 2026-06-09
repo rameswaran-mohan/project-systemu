@@ -2,7 +2,7 @@ from systemu.recovery.engine import RecoveryEngine, RecoveryAction
 
 
 class FakeTool:
-    def __init__(self, id, name, status="approved", enabled=True,
+    def __init__(self, id, name, status="deployed", enabled=True,
                  dry_run_status="passed", dry_run_evidence=None):
         self.id = id
         self.name = name

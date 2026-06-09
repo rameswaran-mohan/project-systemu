@@ -17,17 +17,30 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict
+import os
+from typing import Any, Callable, Dict
 
 logger = logging.getLogger(__name__)
 
 
-def install_bridge_writer(bridge_file_path: str) -> None:
-    """Subscribe to EventBus and mirror every event to bridge_file_path."""
+def install_bridge_writer(bridge_file_path: str) -> Callable[[], None]:
+    """Subscribe to EventBus and mirror every event to bridge_file_path.
+
+    Each mirrored event is stamped with ``SYSTEMU_STREAM_REF`` (the spawning
+    job's id) so a dashboard rail can follow one specific run. An event that
+    already carries its own ``stream_ref`` is left untouched.
+
+    Returns the EventBus unsubscribe callable so callers/tests can detach.
+    """
     from systemu.interface.event_bus import EventBus
+
+    # Read the stream ref once at install time (set by JobManager._child_env).
+    stream_ref = os.getenv("SYSTEMU_STREAM_REF", "")
 
     def _on_event(event: Dict[str, Any]) -> None:
         try:
+            if stream_ref and not event.get("stream_ref"):
+                event = {**event, "stream_ref": stream_ref}
             line = json.dumps(event, default=str) + "\n"
             with open(bridge_file_path, "a", encoding="utf-8") as f:
                 f.write(line)
@@ -35,5 +48,7 @@ def install_bridge_writer(bridge_file_path: str) -> None:
             # Subprocess must continue even if bridge file is unwritable.
             pass
 
-    EventBus.get().subscribe(_on_event, replay=False)
-    logger.debug("[EventBridgeWriter] installed for %s", bridge_file_path)
+    unsubscribe = EventBus.get().subscribe(_on_event, replay=False)
+    logger.debug("[EventBridgeWriter] installed for %s (stream_ref=%s)",
+                 bridge_file_path, stream_ref or "—")
+    return unsubscribe

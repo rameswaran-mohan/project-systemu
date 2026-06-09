@@ -327,12 +327,10 @@ def _trigger_record_dialog() -> None:
 
 def _run_evolution() -> None:
     """Trigger the evolution engine as a background job to avoid blocking the UI."""
-    from systemu.interface.jobs import JobManager
-    import sys
+    from systemu.interface.command.dispatch import dispatch
 
     state = AppState.get()
-    jm = JobManager.get()
     cwd = state.project_root
-    cmd = [sys.executable, "-m", "sharing_on", "evolve", "run"]
-    jm.start_job("Evolution Check", "evolve", cmd, cwd)
+    dispatch("evolve run", [], cwd=cwd, stream=True, job_type="evolve",
+             dedup_key="evolve:run")
     ui.notify("Evolution check dispatched as background job.", type="positive")

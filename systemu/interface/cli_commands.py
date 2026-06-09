@@ -555,10 +555,9 @@ def skills_list(ctx, category: Optional[str]):
 #  settings command
 # ─────────────────────────────────────────────────────────────────────────────
 
-@click.command("settings")
-@click.pass_context
-def settings_cmd(ctx):
-    """Show current Systemu configuration (models, vault dir, etc.)."""
+def _settings_show_body(ctx):
+    """Render the read-only settings panel. Shared by `settings show` and the
+    bare-`settings` back-compat fallback (Phase 2 Task 7)."""
     config, vault = _get_vault_and_config(ctx)
 
     console.print(Panel(
@@ -574,6 +573,41 @@ def settings_cmd(ctx):
         title="⚙️  Systemu Settings",
         border_style="blue",
     ))
+
+
+@click.group("settings", invoke_without_command=True)
+@click.pass_context
+def settings_cmd(ctx):
+    """Show or set Systemu configuration (models, vault dir, etc.).
+
+    Bare ``settings`` shows the read-only view (back-compat); ``settings set``
+    writes an allow-listed setting via the shared command layer (Phase 2)."""
+    if ctx.invoked_subcommand is None:
+        _settings_show_body(ctx)
+
+
+@settings_cmd.command("show")
+@click.pass_context
+def settings_show_cmd(ctx):
+    """Show current Systemu configuration (models, vault dir, etc.)."""
+    _settings_show_body(ctx)
+
+
+@settings_cmd.command("set")
+@click.argument("key")
+@click.argument("value")
+@click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
+@click.pass_context
+def settings_set_cmd(ctx, key: str, value: str, as_json: bool):
+    """Set an allow-listed setting (canonical CLI-owned write — Phase 2)."""
+    from systemu.interface.command import verbs as _verbs
+    _, vault = _get_vault_and_config(ctx)
+    result = _verbs.settings_set(key, value, vault=vault)
+    if as_json:
+        click.echo(result.to_json())
+    else:
+        console.print(result.to_rich())
+    ctx.exit(result.exit_code)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -662,6 +696,65 @@ def tools_dryrun(ctx, tool_id: str):
         console.print(
             f"[red]✗ Tool '{tool.name}' dry-run failed: {result.error}[/red]"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  tools enable — Gate-3 enable via the shared command layer (Phase 2 Task 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tools_group.command("enable")
+@click.argument("tool_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
+@click.pass_context
+def tools_enable_cmd(ctx, tool_id: str, as_json: bool):
+    """Gate-3 enable a tool (canonical CLI-owned write — Phase 2)."""
+    from systemu.interface.command import dispatch as _dispatch
+    _, vault = _get_vault_and_config(ctx)
+    result = _dispatch.dispatch("tools enable", [tool_id], vault=vault)
+    if as_json:
+        click.echo(result.to_json())
+    else:
+        console.print(result.to_rich())
+    ctx.exit(result.exit_code)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  tools show / recalibrate — shared-layer verbs (Phase 2 Task 7)
+#  Direct verb calls (not dispatch-routed) per the Task 7 plan; a uniform
+#  dispatch-routing decision is deferred to a later coherence pass.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tools_group.command("show")
+@click.argument("tool_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
+@click.pass_context
+def tools_show_cmd(ctx, tool_id: str, as_json: bool):
+    """Show a single tool's detail (read-only, via the shared view-model)."""
+    from systemu.interface.command import verbs as _verbs
+    _, vault = _get_vault_and_config(ctx)
+    result = _verbs.tools_show(tool_id, vault=vault)
+    if as_json:
+        click.echo(result.to_json())
+    else:
+        console.print(result.to_rich())
+    ctx.exit(result.exit_code)
+
+
+@tools_group.command("recalibrate")
+@click.argument("tool_id")
+@click.option("--reason", "-r", required=True, help="Why this tool is being recalibrated.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
+@click.pass_context
+def tools_recalibrate_cmd(ctx, tool_id: str, reason: str, as_json: bool):
+    """Bump a tool's version + record a recalibration entry (canonical write)."""
+    from systemu.interface.command import verbs as _verbs
+    _, vault = _get_vault_and_config(ctx)
+    result = _verbs.tools_recalibrate(tool_id, reason=reason, vault=vault)
+    if as_json:
+        click.echo(result.to_json())
+    else:
+        console.print(result.to_rich())
+    ctx.exit(result.exit_code)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1486,21 +1579,84 @@ def decisions_list(ctx):
         return
 
     table = Table(title="Pending Operator Decisions", show_lines=True)
-    table.add_column("ID",         style="dim",   no_wrap=True)
-    table.add_column("Title",      style="bold")
-    table.add_column("Options",    style="cyan")
-    table.add_column("Dedup key",  style="dim")
-    table.add_column("Created",    style="dim")
+    table.add_column("ID",                style="dim",   no_wrap=True)
+    table.add_column("Title",             style="bold")
+    table.add_column("Risk",              style="yellow")
+    table.add_column("Options",           style="cyan")
+    table.add_column("What Approve does", style="green")
+    table.add_column("Dedup key",         style="dim")
+    table.add_column("Created",           style="dim")
     for d in pending:
         ts = d.created_at.isoformat(timespec="seconds") if d.created_at else ""
+        ctx = getattr(d, "context", None) or {}
+        risk = str(ctx.get("risk", "") or "").upper()
+        what = str(ctx.get("what_approve_does", "") or "")[:60]
         table.add_row(
             d.id,
-            (d.title or "")[:60],
+            (d.title or "")[:50],
+            risk,
             ", ".join(d.options),
+            what,
             d.dedup_key or "",
             ts,
         )
-    console.print(table)
+    # Render to a wide console so the extra columns don't wrap/truncate the
+    # risk + what-Approve-does cells in non-TTY contexts (default width 80).
+    from rich.console import Console as _Console
+    _Console(width=200).print(table)
+
+
+@decisions_group.command("mode")
+@click.option("--set", "set_mode", default=None,
+              type=click.Choice(["bypass", "risk_tiered", "approve_only"]),
+              help="Set the gate mode dial (persisted to .env).")
+@click.pass_context
+def decisions_mode(ctx, set_mode):
+    """Show or set the gate-mode dial (spec §4.3 / D4).
+
+    Modes:
+      bypass        auto-grant every gate EXCEPT the safety floor (dep/recovery
+                    + floor capabilities). DANGEROUS — most gates run unattended.
+      risk_tiered   the Governor (default): auto-grant low risk, ask otherwise.
+      approve_only  always ask the operator.
+
+    With no --set, prints the current mode + per-type overrides + floor state.
+    """
+    from systemu.runtime.gate_mode_settings import (
+        get_gate_mode_settings, save_gate_mode_settings)
+
+    if set_mode is not None:
+        try:
+            save_gate_mode_settings(mode=set_mode)
+        except ValueError as exc:
+            console.print(f"[red]Invalid mode:[/red] {exc}")
+            ctx.exit(2)
+            return
+        console.print(f"[green]Gate mode set to[/green] [bold]{set_mode}[/bold].")
+
+    state = get_gate_mode_settings()
+    mode = state["mode"]
+    overrides = state.get("overrides") or {}
+    no_floor = bool(state.get("no_floor"))
+
+    if set_mode is None:
+        console.print(f"Gate mode: [bold]{mode}[/bold]")
+    overrides_str = (
+        ", ".join(f"{k}={v}" for k, v in sorted(overrides.items()))
+        if overrides else "(none)")
+    console.print(f"  Per-type overrides: {overrides_str}")
+    console.print(
+        f"  Safety floor: {'DISABLED (no_floor)' if no_floor else 'ON'} "
+        f"— dep/recovery + floor capabilities always ask"
+        + (" UNLESS no_floor is set" if no_floor else ""))
+
+    # Console twin of the persistent banner — never silent about Bypass.
+    if mode == "bypass":
+        console.print(
+            "[bold red]DANGER:[/bold red] Bypass auto-grants gates without "
+            "asking (except the safety floor"
+            + (", which is DISABLED" if no_floor else "")
+            + "). Most actions will run unattended.")
 
 
 @decisions_group.command("resolve")
@@ -1523,6 +1679,21 @@ def decisions_resolve(ctx, decision_id: str, choice: str):
         ctx.exit(2)
         return
     console.print(f"[green]Resolved {decision_id} -> {resolved.choice}[/green]")
+
+    # Approve EXECUTES (spec §4.3): for Inbox gate rows, run the authorized
+    # action. queue.resolve() returns the decision with .choice already set, so
+    # resolve_gate's Approve-label check sees the operator's choice. Non-gate
+    # (legacy harness/credential/etc.) rows are untouched — resolve_gate is only
+    # invoked for context kind=="gate", so their resolve path is byte-identical.
+    try:
+        if (getattr(resolved, "context", None) or {}).get("kind") == "gate":
+            from systemu.interface.command.inbox import resolve_gate
+            result = resolve_gate(resolved, vault=vault)
+            console.print(result.to_rich())
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "[decisions] resolve_gate execution failed for %s", decision_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -28,13 +28,18 @@ def test_nav_groups_shape():
 
 
 def test_nav_groups_items():
-    from systemu.interface.dashboard import NAV_GROUPS
+    from systemu.interface.dashboard import NAV_GROUPS, NAV_TOP
 
     by_group = {label: [p for p, _, _ in items] for label, _, items in NAV_GROUPS}
 
-    assert by_group["Run"] == ["/", "/chat", "/scrolls", "/army", "/activities"]
+    # v0.8.8: Console (/) is the standalone NAV_TOP item, no longer inside the
+    # Run group.  The Run group holds the remaining daily-driver routes.
+    assert NAV_TOP[0] == "/"
+    assert by_group["Run"] == ["/chat", "/scrolls", "/army", "/activities"]
     assert by_group["Build"] == ["/tools", "/skills", "/workshop", "/evolutions"]
-    assert by_group["System"] == ["/insights", "/settings"]
+    # Phase 3 Batch 3: the unified Decisions Inbox (/inbox) joins the System
+    # group as the one decisions surface.
+    assert by_group["System"] == ["/inbox", "/insights", "/settings"]
 
 
 def test_nav_items_no_duplicates_and_reduced_count():
@@ -44,7 +49,8 @@ def test_nav_items_no_duplicates_and_reduced_count():
     assert len(paths) == len(set(paths)), "duplicate path in NAV_ITEMS"
     # 14 flat items in v0.7.1 -> 11 grouped destinations in v0.7.2
     # (Chat absorbs Systemu Chat; Insights absorbs Memory + Flywheel + Notifications.)
-    assert len(NAV_ITEMS) == 11
+    # Phase 3 Batch 3 adds the unified Decisions Inbox (/inbox) -> 12.
+    assert len(NAV_ITEMS) == 12
 
 
 def test_no_duplicate_settings_emoji_in_sidebar():

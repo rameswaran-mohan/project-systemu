@@ -505,17 +505,11 @@ def _show_execute_dialog(shadow_id: str) -> None:
             if not scroll_select.value:
                 ui.notify("Please select a scroll.", type="warning")
                 return
-            from systemu.interface.jobs import JobManager
-            import sys
-            jm = JobManager.get()
+            from systemu.interface.command.dispatch import dispatch
             cwd = state.project_root
-            cmd = [
-                sys.executable, "-m", "sharing_on",
-                "army", "execute", shadow_id, scroll_select.value,
-            ]
-            if dry_run.value:
-                cmd.append("--dry-run")
-            jm.start_job(f"Execute: {scroll_select.value[:12]}", "execute", cmd, cwd)
+            args = [shadow_id, scroll_select.value] + (["--dry-run"] if dry_run.value else [])
+            dispatch("army execute", args, cwd=cwd, stream=True,
+                     job_type="execute", dedup_key=f"army-execute:{shadow_id}")
             ui.notify("Shadow execution dispatched in background.", type="positive")
             dlg.close()
 
@@ -715,13 +709,9 @@ def _show_awaken_dialog() -> None:
             if not name_input.value.strip():
                 ui.notify("Please enter a shadow name.", type="warning")
                 return
-            from systemu.interface.jobs import JobManager
-            import sys
-            jm = JobManager.get()
+            from systemu.interface.command.dispatch import dispatch
             cwd = state.project_root
-            cmd = [
-                sys.executable, "-m", "sharing_on",
-                "army", "awaken",
+            args = [
                 "--name",            name_input.value.strip(),
                 "--creativity",      str(int(sl_creativity.value)),
                 "--professionalism", str(int(sl_professionalism.value)),
@@ -729,8 +719,9 @@ def _show_awaken_dialog() -> None:
                 "--thinking",        str(int(sl_thinking.value)),
             ]
             if act_select.value:
-                cmd.extend(["--activity", act_select.value])
-            jm.start_job(f"Awaken: {name_input.value.strip()}", "awaken", cmd, cwd)
+                args.extend(["--activity", act_select.value])
+            dispatch("army awaken", args, cwd=cwd, stream=True,
+                     job_type="awaken", dedup_key=f"army-awaken:{name_input.value.strip()}")
             ui.notify(f"Shadow '{name_input.value.strip()}' awakening dispatched.", type="positive")
             dlg.close()
 
