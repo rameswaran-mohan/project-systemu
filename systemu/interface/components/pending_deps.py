@@ -174,11 +174,48 @@ def _approved_row(entry: Dict, *, on_change=None) -> None:
 
 
 def _on_approve(package: str, tool_name: str, on_change=None) -> None:
-    store = _store()
-    if store.approve(package, approved_by="operator (dashboard)", tool_name=tool_name):
-        ui.notify(f"Approved {package}", type="positive")
-    else:
-        ui.notify(f"{package} was already approved", type="info")
+    # v0.9: the unified Decisions Inbox is now the primary surface for dep
+    # approvals. Resolving the matching ``dep:<package>`` gate runs the SAME
+    # executor the Inbox uses (resolve_gate → approve_and_install), so Approve
+    # here actually pip-installs and re-runs the requesting tool's dry-run —
+    # fixing the legacy divergence where this button only allow-listed the
+    # package (store.approve) and never installed it.
+    try:
+        from systemu.interface.dashboard_state import AppState
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.interface.command.inbox import resolve_gate
+
+        vault = AppState.get().vault
+        queue = OperatorDecisionQueue(vault)
+        dedup = f"dep:{package}"
+        match = next(
+            (d for d in queue.list_pending() if d.dedup_key == dedup),
+            None,
+        )
+        if match is not None:
+            resolved = queue.resolve(match.id, choice="Approve & Install")
+            resolve_gate(resolved, vault=vault)
+            ui.notify(f"Approved {package}; install started", type="positive")
+            if on_change:
+                try:
+                    on_change()
+                except Exception:
+                    pass
+            return
+    except Exception as exc:
+        # Fall through to the legacy install-once path below.
+        ui.notify(f"Inbox approve failed ({exc}); using direct install",
+                  type="warning")
+
+    # Fallback (no gate row, or Inbox path errored): install once directly via
+    # the same approve_and_install the resolve branch calls — never the
+    # allow-list-only store.approve (which left the package un-installed).
+    try:
+        from systemu.runtime.dep_approvals import approve_and_install
+        approve_and_install(tool_id="", package=package, source="dashboard")
+        ui.notify(f"Approved {package}; install started", type="positive")
+    except Exception as exc:
+        ui.notify(f"Could not approve {package}: {exc}", type="negative")
     if on_change:
         try:
             on_change()

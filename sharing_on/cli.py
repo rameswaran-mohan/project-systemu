@@ -951,7 +951,9 @@ def _infer_scope(scope_id: str):
 @cli.command()
 @click.argument("scope_id")
 @click.option("--apply", "apply_mode", is_flag=True,
-              help="Interactive walkthrough mode (prompts y/N for each action).")
+              help="Apply auto-recoverable actions (install-dep / enable-tool / "
+                   "reset-memory) via the shared recovery dispatchers — the same "
+                   "apply path the web recovery panel uses. Gate reviews are skipped.")
 def doctor(scope_id: str, apply_mode: bool):
     """Diagnose pending gates for a scroll/activity/shadow/tool.
 
@@ -1011,7 +1013,21 @@ def doctor(scope_id: str, apply_mode: bool):
         click.echo(f"      Fix:  {a.fix_url}")
         if a.fix_command:
             click.echo(f"            OR: {a.fix_command}")
-    sys.exit(0)
+
+    if not apply_mode:
+        sys.exit(0)
+
+    # --apply: route through the SAME shared recovery dispatchers the web
+    # recovery panel uses (verbs.doctor_apply -> recover.py:_handle_action),
+    # threading this CLI's own vault (AppState is not initialised headless).
+    from systemu.interface.command import verbs
+
+    click.echo("Applying recoverable actions...")
+    result = verbs.doctor_apply(actions, vault=vault)
+    for line in result.data.get("log", []):
+        click.echo(f"  {line}")
+    click.echo(result.summary)
+    sys.exit(result.exit_code)
 
 
 # ---------------------------------------------------------------------------

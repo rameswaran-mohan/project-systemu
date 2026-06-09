@@ -30,6 +30,40 @@ JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH = int(
 )
 
 
+def _child_env(base_env: Dict[str, str], vault_dir: str, job_id: str) -> Dict[str, str]:
+    """Build the environment for a spawned job's subprocess.
+
+    Pure helper (no I/O) so the env wiring is unit-testable.
+
+    Every spawned job — not just ``execute`` jobs — gets:
+      • the encoding/headless/pythonpath baseline, and
+      • the event-bridge file so the subprocess can publish its events back to
+        the dashboard's EventBus (via ``manual_events.jsonl``), and
+      • ``SYSTEMU_STREAM_REF`` set to the job id so a rail can follow one run.
+
+    (Was execute-only; broadened so the migrated evolve/approve/capture/awaken/
+    refine jobs stream too. The execute *concurrency cap* logic is separate and
+    intentionally untouched.)
+    """
+    import systemu
+
+    env = dict(base_env)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"]       = "1"
+    # Subprocesses spawned by the dashboard job manager are always headless —
+    # stdout/stderr are redirected to a log file, no user at a terminal.
+    # Setting this explicitly prevents notify_user() from blocking on input
+    # even when the daemon itself runs in foreground/interactive mode.
+    env["SYSTEMU_HEADLESS"] = "1"
+    env["PYTHONPATH"] = str(Path(systemu.__file__).parent.parent.absolute())
+
+    # Stream every spawned job's events back to the dashboard EventBus, tagged
+    # with the job id so a rail can follow one specific run.
+    env["SYSTEMU_EVENT_BRIDGE_FILE"] = str(Path(vault_dir) / "manual_events.jsonl")
+    env["SYSTEMU_STREAM_REF"] = job_id
+    return env
+
+
 class JobStatus(Enum):
     QUEUED    = "queued"      # v0.8.6: waiting for an execute slot
     RUNNING   = "running"
@@ -153,17 +187,6 @@ class JobManager:
 
     def _spawn_job(self, job_id, name, job_type, cmd, cwd, on_cancel, output_dir, dedup_key):
         """Inner helper: build child env, Popen, register, start poll thread."""
-        child_env = os.environ.copy()
-        child_env["PYTHONIOENCODING"] = "utf-8"
-        child_env["PYTHONUTF8"]       = "1"
-        # Subprocesses spawned by the dashboard job manager are always headless —
-        # stdout/stderr are redirected to a log file, no user at a terminal.
-        # Setting this explicitly prevents notify_user() from blocking on input
-        # even when the daemon itself runs in foreground/interactive mode.
-        child_env["SYSTEMU_HEADLESS"] = "1"
-        import systemu
-        child_env["PYTHONPATH"] = str(Path(systemu.__file__).parent.parent.absolute())
-
         # New process group on Windows so CTRL_BREAK is scoped to the child only
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
 
@@ -177,10 +200,7 @@ class JobManager:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fp = open(log_path, "a", encoding="utf-8")
 
-        # v0.8.6: execute jobs get a bridge file env so the subprocess can publish
-        # events back to the dashboard's EventBus via manual_events.jsonl
-        if job_type == "execute":
-            child_env["SYSTEMU_EVENT_BRIDGE_FILE"] = str(Path(vault_dir) / "manual_events.jsonl")
+        child_env = _child_env(os.environ.copy(), vault_dir, job_id)
 
         proc = subprocess.Popen(
             cmd,

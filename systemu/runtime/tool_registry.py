@@ -149,6 +149,36 @@ def _install_pending_dict(tool_name: str, packages: List[str], reason: str) -> d
     }
 
 
+def _maybe_enqueue_dep_gate(*, vault, tool_id: str, tool_name: str,
+                            package: str, request_count: int = 1) -> None:
+    """Best-effort: surface a pending package install as a dep gate in the
+    unified Inbox (dedup dep:<package> → idempotent; OperatorDecisionQueue
+    short-circuits a duplicate pending row).  Never raises into the tool run.
+
+    ``InboxQueue``/``GateDescriptor`` are resolved from this module's globals so
+    they remain monkeypatchable in tests; on first use they are lazy-imported
+    and bound, keeping the import graph minimal at module-load time.
+    """
+    if not vault or not package:
+        return
+    try:
+        inbox_cls = globals().get("InboxQueue")
+        gate_cls  = globals().get("GateDescriptor")
+        if inbox_cls is None:
+            from systemu.interface.command.inbox import InboxQueue as inbox_cls
+        if gate_cls is None:
+            from systemu.interface.command.gate import GateDescriptor as gate_cls
+        entry = {
+            "package": package,
+            "first_seen_tool_id": tool_id,
+            "first_seen_tool": tool_name,
+            "request_count": request_count,
+        }
+        inbox_cls(vault).enqueue(gate_cls.from_dep(entry), gate_type="dep")
+    except Exception:
+        logger.debug("[Registry] dep gate enqueue skipped", exc_info=True)
+
+
 def _install_failed_dict(
     tool_name: str,
     packages: List[str],
@@ -649,6 +679,12 @@ class ToolRegistry:
         if result.status is InstallStatus.BLOCKED_DISABLED:
             return _install_blocked_dict(tool.name, declared, result.error or "")
         if result.status is InstallStatus.BLOCKED_PENDING_APPROVAL:
+            _maybe_enqueue_dep_gate(
+                vault=self._vault,
+                tool_id=tool.id, tool_name=tool.name,
+                package=str(result.pending_approval or declared),
+                request_count=1,
+            )
             return _install_pending_dict(
                 tool.name, result.pending_approval or declared, result.error or "",
             )

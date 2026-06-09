@@ -82,52 +82,71 @@ def _extract_missing_package(reason: str) -> str:
     return ""
 
 
-def _dispatch_install_dep(tool_id: str, package: str):
+def _dispatch_install_dep(tool_id: str, package: str, *, vault=None):
+    # ``vault`` accepted for signature uniformity (the headless CLI apply path
+    # threads its own vault through ``_handle_action``); dep approval resolves
+    # the backing store itself, so it is unused here.
+    # v0.9: the unified Decisions Inbox is now the primary dep-approval surface;
+    # this remains a working install-once fallback for the /recover apply path
+    # (the gate dedups on dep:<package>, so it won't double-install).
     from systemu.runtime.dep_approvals import approve_and_install
     approve_and_install(tool_id=tool_id, package=package, source="dashboard")
 
 
-def _dispatch_enable_tool(tool_id: str):
-    """Flip Gate 3 to enabled.
+def _dispatch_enable_tool(tool_id: str, *, vault=None):
+    """Flip Gate 3 to enabled — routed through the ONE gated policy (P2-T11).
 
-    ``vault.save_tool`` expects the Pydantic ``Tool`` model, not a raw
-    ``ToolRow``. Prefer ``get_tool`` (Pydantic) over ``find_tool`` (ORM row)
-    when both exist."""
-    vault = _get_vault()
-    tool = None
-    if hasattr(vault, "get_tool"):
-        try:
-            tool = vault.get_tool(tool_id)
-        except KeyError:
-            return
-    if tool is None and hasattr(vault, "find_tool"):
-        tool = vault.find_tool(tool_id)
-    if tool is None:
-        return
-    tool.enabled = True
-    if hasattr(vault, "save_tool"):
-        vault.save_tool(tool)
-    elif hasattr(vault, "update_tool"):
-        vault.update_tool(tool)
-    else:
-        raise NotImplementedError("vault has no save_tool/update_tool method")
+    Consolidation: instead of mutating the vault directly, this dispatcher now
+    calls ``verbs.tools_enable`` (the single gated policy, which delegates to the
+    single mechanism ``tool_service.enable_tool``). So the recovery apply path
+    gets the SAME Gate-3.5 dry-run gate + FORGED→DEPLOYED advance + event log as
+    the CLI and the dashboard toggle — no fourth divergent writer.
+
+    GATE_3_DISABLED is only emitted for runtime-ready tools (deployed / tested /
+    upgraded), and every writer that reaches those statuses requires a passed
+    dry-run, so the gate is a no-op for the legitimate recovery case. A genuinely
+    un-dry-run-passed tool is now correctly refused rather than silently enabled.
+
+    ``vault`` defaults to ``_get_vault()`` (the dashboard ``AppState`` vault) so
+    existing web callers are unchanged; the headless ``doctor --apply`` path
+    passes its own vault since ``AppState`` is not initialised in a CLI
+    subprocess. Behaviour-equivalent for ``_handle_action`` (which ignores the
+    return value and only surfaces exceptions)."""
+    if vault is None:
+        vault = _get_vault()
+    from systemu.interface.command import verbs
+    return verbs.tools_enable(tool_id, vault=vault)
 
 
-def _dispatch_reset_memory(shadow_id: str, keep_successes: bool):
+def _dispatch_reset_memory(shadow_id: str, keep_successes: bool, *, vault=None):
+    if vault is None:
+        vault = _get_vault()
     from systemu.runtime.memory_consolidator import reset_shadow_memory
     reset_shadow_memory(shadow_id=shadow_id, keep_successes=keep_successes,
-                        vault=_get_vault())
+                        vault=vault)
 
 
-def _handle_action(a: RecoveryAction) -> None:
+def _handle_action(a: RecoveryAction, *, vault=None) -> None:
+    """Apply one RecoveryAction. THE single apply path for both surfaces.
+
+    ``vault`` defaults to ``None`` so the web recovery panel keeps its current
+    behaviour: when no vault is injected the dispatchers are called with their
+    original positional signature (and each falls back to ``_get_vault()``).
+    The headless ``doctor --apply`` path passes its own vault — ``AppState`` is
+    not initialised in a CLI subprocess, so ``_get_vault()`` would raise.
+
+    The ``vault=`` kwarg is threaded through only when a vault was injected so
+    that existing callers/tests that patch the dispatchers with the old
+    positional-only signature keep working unchanged."""
+    kw = {} if vault is None else {"vault": vault}
     if a.kind == "DEP_PENDING":
         pkg = _extract_missing_package(a.reason)
         if pkg:
-            _dispatch_install_dep(a.scope_id, pkg)
+            _dispatch_install_dep(a.scope_id, pkg, **kw)
     elif a.kind == "GATE_3_DISABLED":
-        _dispatch_enable_tool(a.scope_id)
+        _dispatch_enable_tool(a.scope_id, **kw)
     elif a.kind == "MEMORY_POISONED":
-        _dispatch_reset_memory(a.scope_id, keep_successes=True)
+        _dispatch_reset_memory(a.scope_id, keep_successes=True, **kw)
     # GATE_1_PENDING / GATE_2_PENDING route via fix_url, not handled here.
 
 

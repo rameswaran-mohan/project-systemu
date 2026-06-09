@@ -188,7 +188,10 @@ class TestSurfaceHarnessRequest:
                     request, verdict, execution_id="exec_ctx", vault=vault
                 )
 
-        assert captured_context["kind"] == "harness_review"
+        # Re-tagged to a gate (Task 4) so InboxQueue.list_descriptors() surfaces
+        # it; the harness-specific fields are preserved alongside the gate marker.
+        assert captured_context["kind"] == "gate"
+        assert captured_context["gate_type"] == "harness"
         assert captured_context["execution_id"] == "exec_ctx"
         assert captured_context["request_id"] == "hreq_ctx01"
         assert captured_context["harness_kind"] == "tool"

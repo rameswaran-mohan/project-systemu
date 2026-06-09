@@ -85,6 +85,13 @@ def build_settings_page() -> None:
         ):
             adherence_card()
 
+        # ── Gate Mode dial (Phase 3 Batch 3 / spec §4.3 · D4-D5) ──────────
+        # Uses the tokenized .s-card class (no new inline f-string style —
+        # keeps the UI-style lint gate clean for this Phase-3 render).
+        _section_header("Gate Mode")
+        with ui.column().classes("s-card").style("gap: 14px; padding: 20px;"):
+            gate_mode_card()
+
         # ── Vault ──────────────────────────────────────────────────────────
         _section_header("Storage")
         with ui.column().style(
@@ -431,6 +438,155 @@ def adherence_card() -> None:
             f"background: transparent; color: {THEME['primary']}; "
             f"border: 1px solid {THEME['primary']}; border-radius: 8px;"
         )
+
+
+# ── Gate Mode dial (Phase 3 Batch 3 / spec §4.3 · D4-D5) ─────────────────────
+
+# The three modes, in dial order, with human-readable labels.
+_GATE_MODE_OPTIONS = {
+    "bypass":       "Bypass — auto-grant everything except the floor (DANGER)",
+    "risk_tiered":  "Risk-tiered — the Governor (grant low-risk, ask the rest)",
+    "approve_only": "Approve-only — always ask, never auto-grant",
+}
+
+# Per-gate-type override verdicts an operator may pin in the advanced grid.
+_GATE_OVERRIDE_VERDICTS = {
+    "":     "— mode default —",
+    "allow": "Always allow (auto-grant)",
+    "ask":   "Always ask",
+    "deny":  "Always deny (audit-only)",
+}
+
+# Gate types the override grid exposes (the adapters that flow into the queue).
+_GATE_TYPES = ("scroll", "dep", "forge", "evolution", "recovery", "harness")
+
+
+def _gate_mode_card_model(settings: dict) -> dict:
+    """Pure, NiceGUI-free model for the gate_mode_card.
+
+    Decides whether the persistent Bypass DANGER banner is shown (D4/P12 — we
+    are NEVER silent about Bypass) and exposes the mode option list so the
+    rendering logic is unit-testable without standing up NiceGUI.
+    """
+    mode = (settings or {}).get("mode", "risk_tiered")
+    return {
+        "mode": mode,
+        "mode_options": dict(_GATE_MODE_OPTIONS),
+        # The danger banner is shown IFF the active mode is Bypass.
+        "show_danger_banner": mode == "bypass",
+        "overrides": dict((settings or {}).get("overrides") or {}),
+        "no_floor": bool((settings or {}).get("no_floor", False)),
+    }
+
+
+def gate_mode_card() -> None:
+    """Render the always-visible Gate-Mode dial. Caller wraps it in a column.
+
+    Mirrors ``adherence_card``: a mode select bound to the persisted setting,
+    an advanced expander with a per-gate-type override grid + floor editor, and
+    a PERSISTENT danger banner whenever the dial is on Bypass (D4/P12)."""
+    from systemu.runtime.gate_mode_settings import (
+        get_gate_mode_settings,
+        save_gate_mode_settings,
+    )
+    from systemu.interface.command.gate_mode import (
+        FLOOR_GATE_TYPES,
+        FLOOR_CAPABILITIES,
+    )
+
+    model = _gate_mode_card_model(get_gate_mode_settings())
+
+    ui.label(
+        "Controls whether reverse-harness gates (scroll/dep/forge/evolution/"
+        "recovery/harness) are auto-granted, asked, or denied. Risk-tiered is "
+        "the Governor; Bypass auto-grants everything except the safety floor."
+    ).classes("s-muted").style("font-size: 12px;")
+
+    # ── Persistent Bypass danger banner (D4 / P12 — never silent) ─────────────
+    @ui.refreshable
+    def _danger_banner(mode_value: str) -> None:
+        if mode_value != "bypass":
+            return
+        with ui.element("div").classes("s-banner s-banner--danger").style(
+            "margin: 4px 0;"
+        ):
+            ui.icon("warning")
+            ui.label(
+                "BYPASS is ON — gates are auto-granted (except the safety floor). "
+                "Destructive actions can run without your approval."
+            )
+
+    _danger_banner(model["mode"])
+
+    with ui.row().style("gap: 16px; align-items: center; flex-wrap: wrap;"):
+        ui.label("Gate mode:").style("font-size: 13px;")
+        mode_sel = ui.select(
+            options=model["mode_options"],
+            value=model["mode"],
+        ).style("min-width: 360px;")
+        mode_sel.on(
+            "update:model-value",
+            lambda _: _danger_banner.refresh(mode_sel.value),
+        )
+
+    # ── Advanced: per-gate-type override grid + floor editor ──────────────────
+    override_sels: dict = {}
+    no_floor_box = None
+    with ui.expansion("Advanced — per-gate overrides & floor", icon="tune").style(
+        "margin-top: 4px;"
+    ):
+        ui.label(
+            "Pin a verdict per gate type (overrides the mode AND the floor)."
+        ).classes("s-muted").style("font-size: 12px;")
+        for gate_type in _GATE_TYPES:
+            with ui.row().style("gap: 12px; align-items: center; flex-wrap: wrap;"):
+                ui.label(gate_type).style("font-size: 13px; min-width: 110px;")
+                override_sels[gate_type] = ui.select(
+                    options=dict(_GATE_OVERRIDE_VERDICTS),
+                    value=model["overrides"].get(gate_type, ""),
+                ).style("min-width: 240px;")
+
+        ui.separator().classes("s-sep")
+        ui.label("Safety floor (D5)").classes("s-field-label").style(
+            "margin-top: 8px;"
+        )
+        ui.label(
+            "These gate types / capabilities ALWAYS ask, even under Bypass — "
+            "unless you disable the floor entirely."
+        ).classes("s-muted").style("font-size: 12px;")
+        with ui.row().style("gap: 8px; flex-wrap: wrap;"):
+            for gt in sorted(FLOOR_GATE_TYPES):
+                ui.html(f'<span class="s-pill s-pill--warn">{gt}</span>')
+            for cap in sorted(FLOOR_CAPABILITIES):
+                ui.html(f'<span class="s-pill s-pill--muted">{cap}</span>')
+        no_floor_box = ui.checkbox(
+            "Disable the safety floor (no_floor) — NOT recommended",
+            value=model["no_floor"],
+        )
+
+    def _save_gate_mode():
+        try:
+            overrides = {
+                gt: sel.value
+                for gt, sel in override_sels.items()
+                if sel.value  # skip "" (= mode default)
+            }
+            save_gate_mode_settings(
+                mode=mode_sel.value,
+                overrides=overrides,
+                no_floor=bool(no_floor_box.value) if no_floor_box else False,
+            )
+            _danger_banner.refresh(mode_sel.value)
+            ui.notify(
+                f"Gate mode set to '{mode_sel.value}'. Restart daemon to fully apply.",
+                type="positive",
+            )
+        except (ValueError, Exception) as exc:
+            ui.notify(f"Error saving gate mode: {exc}", type="negative")
+
+    with ui.row().style("gap: 8px; margin-top: 8px;"):
+        from systemu.interface.design.primitives import button as _s_button
+        _s_button("Save Gate Mode", variant="primary", on_click=_save_gate_mode)
 
 
 def get_stuck_settings() -> dict:

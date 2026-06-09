@@ -284,6 +284,39 @@ class OperatorDecisionQueue:
             pass
         return decision
 
+    def expire_by_dedup_key(self, dedup_key: str) -> bool:
+        """Mark a PENDING decision (by dedup key) as expired so it drops out of
+        list_pending()/the Inbox. Idempotent: returns False if none pending.
+
+        Used by the recovery reconciler when a diagnosed action self-heals — the
+        Inbox row is no longer actionable, so it is retired (not resolved: the
+        operator never chose anything). Mirrors ``resolve``'s save call, the
+        now-helper, and the EventBus publish shape (a best-effort emit that
+        never blocks the vault-saved status change)."""
+        decision = self._find_pending_by_dedup_key(dedup_key)
+        if decision is None:
+            return False
+        decision.status = "expired"
+        decision.resolved_at = datetime.now(tz=timezone.utc)
+        self._vault.save_decision(decision)
+        logger.info(
+            "[DecisionQueue] expired %s (dedup_key=%r) — diagnosed action self-healed",
+            decision.id, dedup_key,
+        )
+        try:
+            from systemu.interface.event_bus import EventBus
+            EventBus.get().publish({
+                "category": "operator_decision_expired",
+                "context": {
+                    "decision_id": decision.id,
+                    "dedup_key": decision.dedup_key,
+                    "chat_submission_id": (decision.context or {}).get("chat_submission_id"),
+                },
+            })
+        except Exception:
+            pass
+        return True
+
     # ── Private helpers ──────────────────────────────────────────────
 
     def _find_pending_by_dedup_key(self, dedup_key: str) -> Optional[OperatorDecision]:

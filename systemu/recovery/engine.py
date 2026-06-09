@@ -85,7 +85,15 @@ class RecoveryEngine:
                     "blocker",
                 ))
 
-        if not tool.enabled and tool.status == "approved":
+        # GATE_3_DISABLED: a runtime-ready tool that is gate-3 disabled.
+        # Runtime-ready statuses are deployed/tested/upgraded (the real
+        # ToolStatus lifecycle — see shadow_runtime._RUNTIME_READY_STATUSES).
+        # The original "approved" string is NOT a member of ToolStatus, so it
+        # (a) never matched a real SqliteVault tool and (b) was unloadable by
+        # the enable dispatcher's get_tool(). Matching real statuses makes the
+        # GATE_3 recovery path actually apply on both the web panel and
+        # `doctor --apply` — the one shared apply path.
+        if not tool.enabled and (tool.status or "") in {"deployed", "tested", "upgraded"}:
             actions.append(self._make(
                 "tool", tool_id, "GATE_3_DISABLED",
                 f"Tool {tool.name} is disabled (Gate 3). Enable to use.",
@@ -162,6 +170,48 @@ class RecoveryEngine:
         if activity is None:
             return []
         return self.diagnose_activity(activity.id)
+
+    def scan_all(self) -> List[RecoveryAction]:
+        """Aggregate per-scope diagnosis across the whole vault, deduped.
+
+        Walks every entity index (tools/shadows/activities/scrolls), runs the
+        matching ``diagnose_*`` for each id, collects all RecoveryActions, then
+        ``_dedupe``s on (scope_kind, scope_id, kind). A daemon job calls this on
+        an interval, so it is fully defensive: each per-scope loop AND each
+        per-entity diagnose is wrapped so one bad index/entity can't abort the
+        whole scan (it logs nothing here — callers own logging).
+
+        Vault contract grounded against ``systemu/vault/vault.py``:
+          - tools index headers:      ``vault.load_index("tools")`` -> [{"id": ...}]
+          - shadow headers:           ``vault.list_shadows()``      -> [{"id": ...}]
+          - activity headers:         ``vault.list_activities()``   -> [{"id": ...}]
+          - scroll headers:           ``vault.list_scrolls()``      -> [{"id": ...}]
+        Each header is a lightweight dict keyed on ``"id"``.
+        """
+        actions: List[RecoveryAction] = []
+
+        scopes = (
+            (lambda: self.vault.load_index("tools"), self.diagnose_tool),
+            (lambda: self.vault.list_shadows(), self.diagnose_shadow),
+            (lambda: self.vault.list_activities(), self.diagnose_activity),
+            (lambda: self.vault.list_scrolls(), self.diagnose_scroll),
+        )
+        for lister, diagnose in scopes:
+            try:
+                headers = lister() or []
+            except Exception:
+                continue
+            for header in headers:
+                try:
+                    entity_id = header.get("id") if isinstance(header, dict) else header
+                    if not entity_id:
+                        continue
+                    actions.extend(diagnose(entity_id) or [])
+                except Exception:
+                    # one bad entity must never abort the scan
+                    continue
+
+        return self._dedupe(actions)
 
     @staticmethod
     def _dedupe(actions: List[RecoveryAction]) -> List[RecoveryAction]:

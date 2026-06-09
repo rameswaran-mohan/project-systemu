@@ -298,11 +298,23 @@ def _render_pending_decisions() -> None:
         )
         return
 
-    # view is a list of card dicts — render each via the shared helper so the
-    # resolve + v0.8.5 dispatch behavior lives in exactly one place.
+    # view is a list of card dicts. Phase 3 Batch 3 (render unification):
+    # gate-owned rows (context.kind=="gate") render via the UNIFIED Inbox card
+    # so the /insights actions tab is no longer split-brained from /inbox.
+    # Non-gate rows (legacy harness_review / structured_question / credential /
+    # operator-notify posts) keep the legacy render_decision_card fallback so
+    # nothing vanishes mid-migration.
     from systemu.approval.decision_queue import OperatorDecisionQueue
+    from systemu.interface.pages.inbox_page import render_inbox_gate_cards
 
     queue = OperatorDecisionQueue(state.vault)
 
+    # 1) Unified gate cards (one render path, shared with /inbox).
+    render_inbox_gate_cards(
+        state.vault, on_resolved=_render_pending_decisions.refresh)
+
+    # 2) Legacy-context fallback for non-gate rows.
     for card in view:
+        if (card.get("context") or {}).get("kind") == "gate":
+            continue  # already rendered above as a unified card
         render_decision_card(card, queue, _render_pending_decisions.refresh)

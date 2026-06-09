@@ -464,6 +464,21 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # Recovery scan-to-queue + stale-gate reconciler: recovery has no persisted
+    # producer (diagnoses are on-demand scans), so this daemon job IS the
+    # producer — it scans the vault, enqueues a recovery gate for every current
+    # diagnosed action (idempotent via dedup) and expires pending recovery gates
+    # whose action has self-healed. Best-effort (never crashes the tick).
+    from systemu.scheduler.jobs import _recovery_gate_reconciler_job
+    scheduler.add_job(
+        _recovery_gate_reconciler_job,
+        trigger="interval",
+        seconds=45,
+        id="recovery_gate_reconciler",
+        name="Recovery Gate Scan-to-Queue Reconciler",
+        replace_existing=True,
+    )
+
     # v0.8.6: scheduled execute dispatcher — fires due schedules through JobManager
     from systemu.scheduler.jobs import _scheduled_execute_job
     scheduler.add_job(

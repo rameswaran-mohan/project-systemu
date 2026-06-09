@@ -46,22 +46,50 @@ def _row_actions_for(header):
 
 
 def _dispatch_dryrun(tool_id: str) -> None:
-    """Dashboard [Dry-Run] button → spawn `sharing_on tools dry-run <id>` via JobManager.
+    """Dashboard [Dry-Run] button → stream `tools dry-run <id>` through dispatch().
 
-    Mirrors the existing pattern used by /scrolls page approve button: dispatch
-    the same CLI command the operator could run manually.
+    Phase 2 P2-reduction: the hand-built ``[sys.executable, '-m', 'sharing_on',
+    ...]`` argv is gone — the dashboard caller now goes through the single
+    ``dispatch()`` contract (stream=True spawns via JobManager and returns a
+    CommandResult whose ``stream_ref`` is the Job.id the rail can follow).
     """
-    import sys
-    from systemu.interface.jobs import JobManager
-    from systemu.interface.dashboard_state import AppState
-    jm = JobManager.get()
+    from systemu.interface.command.dispatch import dispatch
     state = AppState.get()
-    cmd = [sys.executable, "-m", "sharing_on", "tools", "dry-run", tool_id]
-    try:
-        jm.start_job(f"Dry-Run: {tool_id[:8]}", "tool_dryrun", cmd, state.project_root)
-        ui.notify(f"Dry-run dispatched for {tool_id[:8]}", type="positive")
-    except Exception as exc:
-        ui.notify(f"Failed to dispatch dry-run: {exc}", type="negative")
+    result = dispatch(
+        "tools dry-run", [tool_id],
+        cwd=state.project_root, stream=True,
+        dedup_key=f"dryrun:{tool_id}",
+    )
+    if result.status.value == "ok":
+        ui.notify(
+            f"Dry-run dispatched for {tool_id[:8]} (stream {result.stream_ref})",
+            type="positive",
+        )
+    else:
+        ui.notify(f"Failed to dispatch dry-run: {result.summary}", type="negative")
+
+
+def _dispatch_enable(tool_id: str) -> None:
+    """Dashboard [Enable] button → stream `tools enable <id>` through dispatch().
+
+    Same single-entry contract as the dry-run caller: ``dispatch(stream=True)``
+    spawns the verb via JobManager and returns a CommandResult whose
+    ``stream_ref`` (= Job.id) the right-rail follows.
+    """
+    from systemu.interface.command.dispatch import dispatch
+    state = AppState.get()
+    result = dispatch(
+        "tools enable", [tool_id],
+        cwd=state.project_root, stream=True,
+        dedup_key=f"enable:{tool_id}",
+    )
+    if result.status.value == "ok":
+        ui.notify(
+            f"Enable dispatched for {tool_id[:8]} (stream {result.stream_ref})",
+            type="positive",
+        )
+    else:
+        ui.notify(f"Failed to dispatch enable: {result.summary}", type="negative")
 
 
 # Dangerous patterns the risk checker scans for in generated code
@@ -193,13 +221,14 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
                             sw = ui.switch("", value=enabled).props("dense")
                             sw.on(
                                 "update:model-value",
-                                lambda e, i=tid: _toggle_enabled(
+                                lambda e, i=tid, s=sw: _toggle_enabled(
                                     i,
                                     # NiceGUI may deliver args as a raw bool OR as a
                                     # list/tuple wrapping the bool — normalise both.
                                     e.args if isinstance(e.args, bool)
                                     else bool(e.args[0]) if isinstance(e.args, (list, tuple)) and e.args
                                     else bool(e.args),
+                                    switch=s,
                                 ),
                             )
                         else:
@@ -269,6 +298,24 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
                                             f"border: 1px solid {THEME['border']}; border-radius: 6px; "
                                             f"font-size: 12px; padding: 4px 10px;"
                                         )
+                                # P2-T10: Enable streams `tools enable <id>` through
+                                # dispatch() — only offered for reviewed-but-disabled
+                                # tools (Gate 3 lives at the toggle; this is a shortcut).
+                                # Gate 3.5 (verbs.tools_enable / models.py:295): the verb
+                                # rejects unless dry_run_status == 'passed'. Because the
+                                # dispatch is stream=True (fire-and-forget), surfacing the
+                                # button before dry-run passes shows a misleading green
+                                # "dispatched ok" toast while the tool stays disabled — so
+                                # gate the render on dry_run_status == 'passed' too.
+                                if (
+                                    status in ("forged", "deployed", "tested", "upgraded")
+                                    and not enabled
+                                    and t.get("dry_run_status") == "passed"
+                                ):
+                                    ui.button(
+                                        "Enable",
+                                        on_click=lambda _, i=tid: _dispatch_enable(i),
+                                    ).props("no-caps").classes("s-btn s-btn--success")
                             # v0.8.8: deep-link into Workshop Tools tab (auto-opens editor)
                             ui.button(
                                 "✏️ Edit",
@@ -628,6 +675,32 @@ def _approve_install_and_enable(tool_id, vault, config) -> None:
     heal_activities_for_tool(tool_id, config, vault)
 
 
+def _resolve_forge_gate_silently(tool_id: str, vault, *, choice: str) -> None:
+    """Best-effort: resolve the matching ``forge:<tool_id>`` Inbox gate row so it
+    can no longer be Approved from the Inbox after this dialog has already taken
+    a terminal decision (forged via Gate-2 review, or rejected).
+
+    This is the double-forge guard for the rich review path: the dialog uses the
+    interactive ``preview_tool_code``→``save_approved_code`` flow (human reads
+    the code before sign-off), NOT the gate's one-shot ``forge_tool_from_spec``.
+    Without this, a lingering ``forge:`` gate could later be resolved via the
+    Inbox and re-run code generation, overwriting the human-reviewed code.
+
+    We only RESOLVE the existing row (recording the operator's choice); we never
+    execute resolve_gate here, so no forge is triggered. Never raises into the
+    dialog flow."""
+    try:
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        queue = OperatorDecisionQueue(vault)
+        dedup = f"forge:{tool_id}"
+        match = next(
+            (d for d in queue.list_pending() if d.dedup_key == dedup), None)
+        if match is not None:
+            queue.resolve(match.id, choice=choice)
+    except Exception:
+        logger.debug("[Tools UI] forge gate cleanup skipped", exc_info=True)
+
+
 def _show_spec_review_dialog(tool_id: str) -> None:
     """Opens the two-gate spec→code review dialog for a PROPOSED tool."""
     state = AppState.get()
@@ -827,6 +900,11 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                     return
                 try:
                     save_approved_code(tool, _pending_code[0], state.config, state.vault)
+                    # Double-forge guard: this rich review path just forged the
+                    # tool (human-reviewed code). Resolve the matching forge:
+                    # Inbox gate as "Forge" so it can't be Approved again from
+                    # the Inbox and re-run forge_tool_from_spec over this code.
+                    _resolve_forge_gate_silently(tool.id, state.vault, choice="Forge")
                     ui.notify(
                         f"✓ '{tool.name}' forged. Installing deps & enabling…",
                         type="positive",
@@ -942,6 +1020,9 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                 _edit_mode[0] = False
 
             def _on_reject():
+                # Resolve the matching forge: Inbox gate as "Skip" so the
+                # rejected tool no longer surfaces an actionable forge card.
+                _resolve_forge_gate_silently(tool.id, state.vault, choice="Skip")
                 ui.notify(f"'{tool.name}' rejected — remains PROPOSED.", type="info")
                 dlg.close()
 
@@ -958,23 +1039,47 @@ def _show_spec_review_dialog(tool_id: str) -> None:
 #  Gate 3 — enable/disable toggle handler
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _toggle_enabled(tool_id: str, enabled: bool) -> None:
+def _toggle_enabled(tool_id: str, enabled: bool, *, switch=None) -> None:
     """Gate 3: persist the user's enable/disable decision for a forged tool.
 
-    Delegates state changes to tool_service so the FORGED ↔ DEPLOYED
-    transition and heal chain are never skipped regardless of call site.
-    The heal chain (LLM calls) runs in a background thread to avoid
-    blocking the NiceGUI event loop.
+    P2-T11 consolidation: the **enable** branch routes through the ONE gated
+    policy ``verbs.tools_enable`` (which itself delegates to the ONE mechanism
+    ``tool_service.enable_tool`` — flip + FORGED→DEPLOYED + log). This means the
+    toggle now ALSO enforces the Gate-3.5 dry-run gate; if the verb refuses
+    (e.g. the tool's dry-run has not passed) we notify the verb's summary and
+    revert the switch UI so it reflects the unchanged backing state.
+
+    The **disable** branch is unchanged — it calls ``tool_service.disable_tool``
+    directly (disable carries no gate). The heal chain (LLM calls) runs in a
+    background thread to avoid blocking the NiceGUI event loop.
     """
     from nicegui import context as _nicegui_ctx
-    from systemu.pipelines.tool_service import enable_tool, disable_tool, heal_activities_for_tool
+    from systemu.pipelines.tool_service import disable_tool, heal_activities_for_tool
+    from systemu.interface.command import verbs
     state = AppState.get()
     try:
         tool = state.vault.get_tool(tool_id)
         tool_name = tool.name
 
         if enabled:
-            enable_tool(tool_id, state.vault)
+            # Route the enable through the single gated policy.
+            result = verbs.tools_enable(tool_id, vault=state.vault)
+            status = result.status.value
+            if status == "noop":
+                # Already enabled — the switch's ON state is already correct;
+                # just report and skip the heal (nothing changed).
+                ui.notify(result.summary, type="info")
+                return
+            if status != "ok":
+                # Gate refused (ERROR/QUEUED) — surface the reason and revert
+                # the toggle so the UI matches the unchanged (disabled) record.
+                ui.notify(result.summary, type="negative")
+                if switch is not None:
+                    try:
+                        switch.value = False
+                    except Exception:
+                        pass
+                return
 
             # Dismiss stale forge notification and queue dependency advisory
             _resolve_forge_notification(tool_id, state.vault)

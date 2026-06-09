@@ -153,6 +153,70 @@ def _resume_on_decision_reconciler_job() -> None:
         logger.exception("[ResumeReconciler] job crashed")
 
 
+def reconcile_recovery_gates(*, vault, engine=None, inbox_cls=None, queue_cls=None) -> None:
+    """Scan recovery diagnoses → keep the Inbox's recovery gates in sync.
+
+    recovery has no persisted producer (diagnoses are on-demand scans), so this
+    daemon job IS the producer: it enqueues a recovery gate for every currently
+    diagnosed action (``InboxQueue.enqueue`` posts on a dedup so re-enqueue is
+    idempotent) and expires any pending recovery gate whose action has
+    self-healed (no longer in the scan), so a stale row can't be applied to a
+    fixed entity.
+
+    Params are injectable for unit tests; they default to the real
+    ``RecoveryEngine`` / ``InboxQueue`` / ``OperatorDecisionQueue`` via lazy
+    import. Fully defensive — every step is best-effort so a single failure can
+    never crash the daemon tick (a scan failure logs + returns; per-action
+    enqueue / expire failures are logged at debug and skipped)."""
+    from systemu.recovery.engine import RecoveryEngine
+    from systemu.interface.command.inbox import InboxQueue
+    from systemu.interface.command.gate import GateDescriptor
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    engine = engine or RecoveryEngine(vault)
+    inbox_cls = inbox_cls or InboxQueue
+    queue_cls = queue_cls or OperatorDecisionQueue
+    try:
+        actions = engine.scan_all()
+    except Exception:
+        logger.exception("[Recovery] scan_all failed")
+        return
+    current = {
+        f"recovery:{a.scope_kind}:{a.scope_id}:{a.kind}": a for a in actions
+    }
+    inbox = inbox_cls(vault)
+    for a in current.values():
+        try:
+            inbox.enqueue(GateDescriptor.from_recovery_action(a), gate_type="recovery")
+        except Exception:
+            logger.debug("[Recovery] enqueue skipped", exc_info=True)
+    q = queue_cls(vault)
+    try:
+        pending = q.list_pending()
+    except Exception:
+        logger.debug("[Recovery] list_pending failed", exc_info=True)
+        return
+    for d in pending:
+        ctx = getattr(d, "context", {}) or {}
+        if ctx.get("kind") == "gate" and ctx.get("gate_type") == "recovery":
+            if getattr(d, "dedup_key", "") not in current:
+                try:
+                    q.expire_by_dedup_key(d.dedup_key)
+                except Exception:
+                    logger.debug("[Recovery] expire skipped", exc_info=True)
+
+
+def _recovery_gate_reconciler_job() -> None:
+    """APScheduler entry: thin wrapper around ``reconcile_recovery_gates`` using
+    the daemon-initialised ``_vault`` global. Mirrors
+    ``_resume_on_decision_reconciler_job``. Best-effort: never crashes the tick."""
+    if _vault is None:
+        return
+    try:
+        reconcile_recovery_gates(vault=_vault)
+    except Exception:
+        logger.exception("[Recovery] gate reconciler job crashed")
+
+
 def startup_recovery_sweep() -> None:
     """Run once at daemon start: audit the vault for pipeline states left incomplete
     by a prior crash. Safe to call multiple times — every step is idempotent.

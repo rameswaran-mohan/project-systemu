@@ -24,6 +24,8 @@ from sharing_on.config import Config
 from systemu.core.llm_router import llm_call_json
 from systemu.core.models import ActionBlock, Objective, Scroll, ScrollStatus, TraceEvent
 from systemu.core.utils import generate_id, load_prompt
+from systemu.interface.command.gate import GateDescriptor
+from systemu.interface.command.inbox import InboxQueue
 from systemu.interface.notifications import notify_user, log_event
 from systemu.vault.vault import Vault
 
@@ -692,30 +694,22 @@ def revalidate_blocked_scrolls_for_tool(
 
 
 def _queue_ready_for_reapproval_notification(scroll: Scroll, vault: Vault) -> None:
-    """Queue a scroll_approval card when a blocked scroll auto-unblocks."""
-    from systemu.core.models import Notification
+    """Enqueue the scroll-approve gate as a GateDescriptor (spec §4.3).
 
-    notif = Notification(
-        id=generate_id("notif"),
-        title=f"Tools Deployed - Scroll Ready for Approval: {scroll.name}",
-        message=(
-            f"All required tools for scroll \"{scroll.name}\" are now deployed. "
-            f"Review and approve to run skill/tool extraction and create the activity."
-        ),
-        actions=["Reject", "Approve"],
-        context={
-            "notification_type": "scroll_approval",
-            "scroll_id":         scroll.id,
-            "auto_unblocked":    True,
-        },
-    )
+    Routed through the gate-mode dial (load_default_policy): under Bypass a
+    non-floor scroll gate auto-approves (extraction runs); under Risk-tiered a
+    medium-risk scroll asks; under Approve-only it always asks. Scroll is NOT a
+    render-only/parking gate, so it's safe to carry a policy here (per the
+    contract caveat — operator/credential paths stay policy=None)."""
     try:
-        vault.queue_notification(notif)
-    except Exception as exc:
-        logger.warning(
-            "[ScrollRefiner] could not queue auto-unblock notification for %s: %s",
-            scroll.id, exc,
-        )
+        from systemu.interface.command.gate_mode import load_default_policy
+        desc = GateDescriptor.from_scroll(
+            scroll, summary="All required tools are deployed; ready to extract.")
+        InboxQueue(vault).enqueue(
+            desc, gate_type="scroll", policy=load_default_policy())
+    except Exception:
+        logger.exception("[ScrollRefiner] could not enqueue scroll gate %s",
+                         getattr(scroll, "id", "?"))
 
 
 def _approve_scroll(scroll: Scroll, vault: Vault) -> None:

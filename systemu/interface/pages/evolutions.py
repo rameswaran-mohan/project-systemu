@@ -137,12 +137,41 @@ def _proposal_card(evo: dict) -> None:
 
 def _approve_evolution(evolution_id: str) -> None:
     state = AppState.get()
+    vault = state.vault
+    # v0.9: resolve the matching `evolution:<id>` gate via the unified Decisions
+    # Inbox so Approve here actually APPLIES the proposal (resolve_gate →
+    # apply_evolution), mirroring the Inbox — instead of the old dead-end that
+    # only flipped status to APPROVED and told the operator to run the CLI.
+    try:
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.interface.command.inbox import resolve_gate
+        from systemu.interface.command.result import CommandStatus
+
+        queue = OperatorDecisionQueue(vault)
+        dedup = f"evolution:{evolution_id}"
+        match = next(
+            (d for d in queue.list_pending() if d.dedup_key == dedup),
+            None,
+        )
+        if match is not None:
+            resolved = queue.resolve(match.id, choice="Approve & Apply")
+            result = resolve_gate(resolved, vault=vault)
+            if result.status == CommandStatus.OK:
+                ui.notify(f"Evolution approved and applied. {result.summary}",
+                          type="positive")
+            else:
+                ui.notify(f"Evolution approve: {result.summary}", type="warning")
+            return
+    except Exception as exc:
+        ui.notify(f"Inbox approve failed ({exc}); falling back", type="warning")
+
+    # Fallback (no gate row, or Inbox path errored): preserve the legacy
+    # status-flip so nothing breaks mid-migration.
     try:
         from systemu.core.models import EvolutionStatus
-        from datetime import datetime
-        evo = state.vault.get_evolution(evolution_id)
+        evo = vault.get_evolution(evolution_id)
         evo.status = EvolutionStatus.APPROVED
-        state.vault.save_evolution(evo)
+        vault.save_evolution(evo)
         ui.notify(f"Evolution approved. Use 'evolve apply {evolution_id}' to apply.", type="positive")
     except Exception as exc:
         ui.notify(f"Error: {exc}", type="negative")
@@ -164,14 +193,11 @@ def _reject_evolution(evolution_id: str) -> None:
 
 def _run_evolution() -> None:
     """Dispatch evolution check as background job to avoid blocking the UI."""
-    from systemu.interface.jobs import JobManager
-    import sys
-    from pathlib import Path
+    from systemu.interface.command.dispatch import dispatch
     state = AppState.get()
-    jm = JobManager.get()
     cwd = state.project_root
-    cmd = [sys.executable, "-m", "sharing_on", "evolve", "run"]
-    jm.start_job("Evolution Check", "evolve", cmd, cwd)
+    dispatch("evolve run", [], cwd=cwd, stream=True, job_type="evolve",
+             dedup_key="evolve:run")
     ui.notify("Evolution check running in background — check Active Tasks.", type="positive")
 
 

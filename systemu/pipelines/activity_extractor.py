@@ -591,6 +591,39 @@ def _upsert_tool(spec: dict, vlt: Vault) -> tuple[str, bool]:
     return tool.id, True
 
 
+def _maybe_enqueue_forge_gate(vault, tool) -> None:
+    """Best-effort: surface a PROPOSED tool as a ``forge`` gate in the unified
+    Decisions Inbox (dedup ``forge:<id>`` → idempotent; OperatorDecisionQueue
+    short-circuits a duplicate pending row).  Never raises into the producer.
+
+    SINGLE-OWNER contract (no double-forge): this routing seam owns the
+    auto-proposed (activity-extractor) tools.  It enqueues a ``forge:`` gate
+    whose ``resolve_gate`` branch runs ``forge_tool_from_spec`` on Approve, and
+    it does NOT post a ``notify_user(dedup_key="tool_forge:<id>")`` decision —
+    so the competing ``decision_dispatcher._handle_resolved_forge_tool`` (which
+    only fires for ``tool_forge:`` rows, posted by the CLI ``forge_tool`` path)
+    never re-runs the same tool.  The two executors therefore target disjoint
+    tool sets: the gate owns auto-proposed tools; the dispatcher owns CLI
+    ``forge_tool`` tools.
+
+    ``InboxQueue``/``GateDescriptor`` are resolved from module globals so they
+    stay monkeypatchable in tests; lazy-imported on first use otherwise.
+    """
+    if vault is None or tool is None:
+        return
+    try:
+        inbox_cls = globals().get("InboxQueue")
+        gate_cls  = globals().get("GateDescriptor")
+        if inbox_cls is None:
+            from systemu.interface.command.inbox import InboxQueue as inbox_cls
+        if gate_cls is None:
+            from systemu.interface.command.gate import GateDescriptor as gate_cls
+        inbox_cls(vault).enqueue(
+            gate_cls.from_forge(tool), gate_type="forge")
+    except Exception:
+        logger.debug("[Extract] forge gate enqueue skipped", exc_info=True)
+
+
 def _queue_forge_notifications(
     tool_ids: List[str],
     activity: "Activity",
@@ -602,6 +635,12 @@ def _queue_forge_notifications(
     Each notification carries the full tool spec in its context dict so
     the UI can render an editable JSON card and trigger forge on approval.
     No blocking I/O — returns immediately.
+
+    v0.9 routing: each PROPOSED tool is ALSO surfaced as a ``forge`` gate in
+    the unified Decisions Inbox (best-effort, dedup ``forge:<id>``).  The gate
+    is the single forge-on-approve executor for auto-proposed tools — we never
+    post a ``tool_forge:`` decision here, so the legacy dispatcher cannot also
+    forge the same tool (see ``_maybe_enqueue_forge_gate``).
     """
     from systemu.core.models import Notification
     from systemu.core.utils import generate_id
@@ -612,6 +651,11 @@ def _queue_forge_notifications(
             tool = vlt.get_tool(tid)
         except KeyError:
             continue
+
+        # Route the proposed tool into the unified Inbox (single owner of
+        # forge-on-approve for auto-proposed tools).  Best-effort: a gate
+        # failure must never block the legacy notification below.
+        _maybe_enqueue_forge_gate(vlt, tool)
 
         # Build a human-readable summary of the tool spec
         param_names = list(tool.parameters_schema.keys()) if tool.parameters_schema else []

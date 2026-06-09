@@ -194,9 +194,22 @@ def build_notifications_page() -> None:
         with ui.tab_panel(tab_pending):
             @ui.refreshable
             def _pending_panel():
+                # Phase 3 Batch 3 (render unification): gate rows owned by the
+                # Inbox (decisions queue, context.kind=="gate") render via the
+                # UNIFIED card so this surface is no longer split-brained from
+                # /inbox. The legacy `notifications` index (scroll/forge/dep
+                # notifications) is a SEPARATE store — those rows keep the
+                # legacy `_pending_card` fallback so nothing vanishes mid-
+                # migration.
+                from systemu.interface.pages.inbox_page import (
+                    render_inbox_gate_cards,
+                )
+                n_gates = render_inbox_gate_cards(
+                    vault, on_resolved=_pending_panel.refresh)
+
                 pending = _load_pending_notifications(vault)
 
-                if not pending:
+                if not pending and not n_gates:
                     ui.label("No pending actions. Everything is up to date.").style(
                         f"color: {THEME['text_muted']}; font-style: italic; padding: 20px;"
                     )
@@ -384,7 +397,14 @@ def _dispatch_notification_action(action: str, ctx: dict, vault, refresh_fn) -> 
         if not tool_id:
             ui.notify("Notification missing tool_id — cannot open forge.", type="negative")
             return
-        _open_forge_dialog(tool_id)
+        # v0.9: the unified Decisions Inbox is the single forge-on-approve
+        # executor for auto-proposed tools. Resolving the matching forge:<id>
+        # gate runs the SAME executor the Inbox uses (resolve_gate ->
+        # forge_tool_from_spec), so Forge here genuinely generates the code
+        # exactly once. Fall back to the legacy spec-review dialog when no gate
+        # row exists (e.g. a pre-migration proposed tool).
+        if not _forge_via_inbox(tool_id, vault):
+            _open_forge_dialog(tool_id)
 
     elif notif_type == "dep_approval" and action.startswith("Install "):
         package = action[len("Install "):].strip()
@@ -392,6 +412,9 @@ def _dispatch_notification_action(action: str, ctx: dict, vault, refresh_fn) -> 
         if not tool_id:
             ui.notify(f"No tool mapped for package '{package}'.", type="negative")
             return
+        # v0.9: the unified Decisions Inbox is now the primary dep-approval
+        # surface; this remains a working install-once fallback (the gate
+        # dedups on dep:<package>, so it won't double-install).
         from systemu.runtime.dep_approvals import approve_and_install
         try:
             approve_and_install(tool_id=tool_id, package=package, source="dashboard")
@@ -452,6 +475,36 @@ def _approve_scroll_from_ui(scroll_id: str, vault) -> None:
             _safe_notify(f"Approval failed: {exc}", type="negative")
 
     asyncio.create_task(_run())
+
+
+def _forge_via_inbox(tool_id: str, vault) -> bool:
+    """Resolve the matching ``forge:<tool_id>`` gate via the unified Inbox.
+
+    Returns True if a gate row was found and resolved (the SAME executor the
+    Inbox uses runs: resolve_gate -> forge_tool_from_spec), so the tool forges
+    exactly once. Returns False (no gate row / error) so the caller can fall
+    back to the legacy spec-review dialog without double-forging."""
+    try:
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.interface.command.inbox import resolve_gate
+
+        queue = OperatorDecisionQueue(vault)
+        dedup = f"forge:{tool_id}"
+        match = next(
+            (d for d in queue.list_pending() if d.dedup_key == dedup),
+            None,
+        )
+        if match is None:
+            return False
+        resolved = queue.resolve(match.id, choice="Forge")
+        resolve_gate(resolved, vault=vault)
+        ui.notify("Forge approved; code generation started.", type="positive")
+        return True
+    except Exception as exc:
+        logger.exception("[Notifications] Inbox forge resolve failed")
+        ui.notify(f"Inbox forge failed ({exc}); opening review dialog",
+                  type="warning")
+        return False
 
 
 def _open_forge_dialog(tool_id: str) -> None:
