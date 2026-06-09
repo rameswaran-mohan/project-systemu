@@ -1,0 +1,59 @@
+{
+  "id": "tool_find_places",
+  "name": "find_places",
+  "description": "Structured local business / point-of-interest lookup near a location (OpenStreetMap). Use for 'X shops/gyms/restaurants near me' — returns names, addresses, hours. NOT for general web search.",
+  "tool_type": "web",
+  "parameters_schema": {
+    "query": {
+      "type": "string",
+      "description": "What to look for, e.g. 'gym', 'pharmacy', 'coffee shop'"
+    },
+    "near": {
+      "type": "string",
+      "description": "Place name to center the search on (geocoded via OSM), e.g. 'Chennai' or 'Indiranagar, Bangalore'. Optional if lat/lon are supplied."
+    },
+    "lat": {
+      "type": "number",
+      "description": "Latitude of the search center. Optional alternative to `near`."
+    },
+    "lon": {
+      "type": "number",
+      "description": "Longitude of the search center. Optional alternative to `near`."
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Maximum number of places to return",
+      "default": 10
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "places": {
+      "type": "array",
+      "description": "List of {name, opening_hours, address, phone, lat, lon}"
+    },
+    "attribution": {
+      "type": "string",
+      "description": "Required ODbL attribution for OpenStreetMap data"
+    },
+    "center": {
+      "type": "object",
+      "description": "Resolved {lat, lon} the search was centered on"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Routes to systemu.runtime.web_access.find_places — keyless OSM Nominatim geocode + Overpass POI lookup, ODbL-attributed. Returns named local businesses only (unnamed nodes are dropped). Always surface the `attribution` field when displaying results.",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/find_places.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_find_places\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-06-09T00:00:00",
+  "updated_at": "2026-06-09T00:00:00"
+}

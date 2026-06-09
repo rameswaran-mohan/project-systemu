@@ -453,6 +453,19 @@ class ToolSandbox:
         effective_timeout = timeout or self.timeout
         tool_name = impl_path.stem   # derive name from filename, e.g. "browser_navigate"
 
+        # ── v0.9.8: keep deliverables in output_dir despite LLM path slips ──
+        # The v0.9.7 redirect lived ONLY in execute(); the agentic loop dispatches
+        # tools via execute_tool(), so without this every file_write to "/tmp/x.txt"
+        # or a bare filename escaped output_dir → the verifier (which scans
+        # output_dir) never saw the deliverable → the run looped to MAX_ITERATIONS.
+        # Idempotent: a path already inside output_dir is left untouched.
+        try:
+            _od = (getattr(self._config, "output_dir", "") if self._config else "") \
+                or str(self.vault_root / "output")
+            parameters = _normalize_output_paths(tool_name, parameters, _od)
+        except Exception:
+            logger.debug("[Sandbox] execute_tool output-path normalise failed", exc_info=True)
+
         # ── Fast path: ToolRegistry (direct Python function call) ─────────
         # Browser/Playwright tools MUST go through the subprocess path — their
         # sync API cannot run inside the in-process async fast path (v0.8.15).

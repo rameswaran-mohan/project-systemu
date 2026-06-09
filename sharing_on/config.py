@@ -287,6 +287,30 @@ class Config:
     # Set via SYSTEMU_PREWARM_TOOL_DEPS=true.
     prewarm_tool_deps: bool = False
 
+    # --- v0.9.8: keyless layered web stack (systemu/runtime/web_access.py) ---
+    # Jina Reader (extract) + Jina-on-DDG (search) + OSM Overpass (local POIs),
+    # all keyless with rate-limit/cache/attribution guardrails. Optional key/
+    # self-host backends are OFF by default.
+    web_stack_v2_enabled: bool = True        # SYSTEMU_WEB_STACK_V2 — master flag
+    web_reader_backend: str = "auto"         # auto | jina | raw
+    web_search_backend: str = "auto"         # auto | ddg | brave | tavily | searxng
+    web_cache_ttl_seconds: int = 900
+    nominatim_user_agent: str = "systemu/0.9.8 (+https://github.com/rameswaran-mohan/project-systemu)"
+    brave_api_key: str = ""                  # optional — OFF by default
+    tavily_api_key: str = ""                 # optional — OFF by default
+    searxng_url: str = ""                     # optional self-host — OFF by default
+
+    # --- v0.9.8: autonomous mid-run coach ---
+    # On a no-progress stall, generate a corrective steer via the supervisor/
+    # governor LLM and inject it, escalating to a human only after N self-steers.
+    auto_coach_enabled: bool = True          # SYSTEMU_AUTO_COACH
+    auto_coach_max_steers: int = 2           # self-steers before operator escalation
+    # v0.9.8 (B2): research-loop convergence steer — force the agent to write its
+    # deliverable after N consecutive read-only research calls (web_search/web_read/
+    # web_extract/fetch_json) with nothing produced, capped per run.
+    research_loop_threshold: int = 5         # SYSTEMU_RESEARCH_LOOP_THRESHOLD
+    research_loop_max_steers: int = 2        # SYSTEMU_RESEARCH_LOOP_MAX_STEERS
+
     # --- v0.4.0 Intelligent Supervisor (plumbing only at this phase) ---
     # The supervisor itself ships in v0.4.0-d; these knobs are read by code
     # added in subsequent phases.  All inert when intelligent_supervisor_enabled
@@ -336,8 +360,12 @@ class Config:
         default_factory=lambda: int(os.getenv("SYSTEMU_VERIFIER_MAX_CALLS_PER_RUN", "50"))
     )  # safety cap on total verifier calls per execution (enterprise budget control)
     verifier_tier: int = field(
-        default_factory=lambda: int(os.getenv("SYSTEMU_VERIFIER_TIER", "1"))
-    )  # 1 = Tier-1 (cheap, default) | 2 = Tier-2 | 3 = Tier-3; sets SYSTEMU_VERIFIER_TIER
+        default_factory=lambda: int(os.getenv("SYSTEMU_VERIFIER_TIER", "3"))
+    )  # 1 = Tier-1 (deep reasoning) | 2 = Tier-2 | 3 = Tier-3 (default).
+    # v0.9.8 (B6): default Tier-3. The verdict task (judge a StateDelta yes/no) does
+    # NOT need deep reasoning, and Tier-1 reasoning models wrap output in prose so the
+    # JSON parser fails (-> spurious soft-passes that disable the verifier). Tier-3
+    # (z-ai/glm-4.5-air:free) follows "return strict JSON" reliably AND is free.
     audit_log_enabled: bool = field(
         default_factory=lambda: os.getenv("SYSTEMU_AUDIT_LOG_ENABLED", "true").lower() != "false"
     )  # global on/off for the action-audit log at vault/audit/actions.jsonl (NOT system logging)
@@ -394,6 +422,22 @@ class Config:
             tool_dep_install_mode=os.getenv("SYSTEMU_TOOL_DEP_INSTALL_MODE", "auto").lower(),
             credential_policy=os.getenv("SYSTEMU_CREDENTIAL_POLICY", "prompt").lower(),
             prewarm_tool_deps=os.getenv("SYSTEMU_PREWARM_TOOL_DEPS", "false").lower() == "true",
+            # v0.9.8 keyless web stack
+            web_stack_v2_enabled=os.getenv("SYSTEMU_WEB_STACK_V2", "true").lower() == "true",
+            web_reader_backend=os.getenv("SYSTEMU_WEB_READER_BACKEND", "auto").lower(),
+            web_search_backend=os.getenv("SYSTEMU_WEB_SEARCH_BACKEND", "auto").lower(),
+            web_cache_ttl_seconds=int(os.getenv("SYSTEMU_WEB_CACHE_TTL", "900")),
+            nominatim_user_agent=os.getenv(
+                "SYSTEMU_NOMINATIM_UA",
+                "systemu/0.9.8 (+https://github.com/rameswaran-mohan/project-systemu)"),
+            brave_api_key=os.getenv("SYSTEMU_BRAVE_API_KEY", ""),
+            tavily_api_key=os.getenv("SYSTEMU_TAVILY_API_KEY", ""),
+            searxng_url=os.getenv("SYSTEMU_SEARXNG_URL", ""),
+            # v0.9.8 autonomous coach
+            auto_coach_enabled=os.getenv("SYSTEMU_AUTO_COACH", "true").lower() == "true",
+            auto_coach_max_steers=int(os.getenv("SYSTEMU_AUTO_COACH_MAX_STEERS", "2")),
+            research_loop_threshold=int(os.getenv("SYSTEMU_RESEARCH_LOOP_THRESHOLD", "5")),
+            research_loop_max_steers=int(os.getenv("SYSTEMU_RESEARCH_LOOP_MAX_STEERS", "2")),
             # v0.4.0 supervisor knobs (env overrides)
             max_consecutive_think=int(os.getenv("SYSTEMU_MAX_CONSECUTIVE_THINK", "5")),
             intelligent_supervisor_enabled=os.getenv(

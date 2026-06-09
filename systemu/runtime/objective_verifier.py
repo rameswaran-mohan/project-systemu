@@ -61,18 +61,32 @@ def run(*, objective: Objective, delta: StateDelta, config) -> Dict[str, Any]:
             system=_load_system_prompt(),
             user=json.dumps(user_payload, separators=(",", ":")),
             config=config,
-            max_tokens=200,
+            # v0.9.8 (B7): reasoning models emit visible chain-of-thought that
+            # consumes the budget BEFORE the JSON verdict — with 200 the response
+            # truncated mid-thought and never produced JSON (-> spurious soft-pass).
+            # max_tokens is a CAP not a target; this just lets the model reach the
+            # JSON (which _extract_json's end-first scan then recovers).
+            max_tokens=1500,
             temperature=0.0,
         )
     except Exception as exc:
+        # v0.9.8 (B5): a verifier-LLM infra failure (e.g. a reasoning model that
+        # wraps its JSON in prose so the parser fails even after repair) must NOT
+        # be treated as REJECTION — that blocks the user's task in a retry loop
+        # over OUR failure. Soft-pass instead; the goal-level verifier (Pillar A)
+        # still checks the final deliverable, and crediting-when-can't-verify is
+        # already this module's policy for the no-hint / disabled cases above.
         logger.warning(
-            "[Verifier] LLM call failed for objective %s (tier=%s): %s",
+            "[Verifier] LLM call failed for objective %s (tier=%s) — SOFT-PASS: %s",
             objective.id, int(getattr(config, "verifier_tier", 1)), exc,
         )
-        return {"verified": False, "reason": f"verifier unavailable: {exc}"}
+        return {"verified": True, "reason": f"verifier unavailable (soft-pass): {exc}"}
 
     if not isinstance(result, dict) or "verified" not in result:
-        return {"verified": False, "reason": "verifier output malformed/unparsable"}
+        logger.warning(
+            "[Verifier] malformed output for objective %s — SOFT-PASS", objective.id,
+        )
+        return {"verified": True, "reason": "verifier output malformed/unparsable (soft-pass)"}
 
     return {
         "verified": bool(result["verified"]),

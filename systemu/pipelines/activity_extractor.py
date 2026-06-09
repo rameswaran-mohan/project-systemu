@@ -150,6 +150,11 @@ def extract_and_process(
         vlt.save_scroll(scroll)
         return None
 
+    # v0.9.8 (minimal Phase 3): guard against the LLM returning a non-dict
+    # (bare string / list) — prevents "'str' object has no attribute 'get'".
+    if not isinstance(result, dict):
+        result = {}
+
     # ── Stage 3c: Store Tools FIRST — IDs must exist before skills link them ─
     tool_ids:         List[str] = []
     missing_tool_ids: List[str] = []
@@ -182,7 +187,7 @@ def extract_and_process(
     # misinterprets the deduplication rule as "don't return tools that already
     # exist". Retry with an empty index so the model proposes tools freely,
     # then we deduplicate programmatically by name.
-    if not skill_ids and not tool_ids:
+    if not any(skill_ids) and not tool_ids:
         logger.warning(
             "[Extract] First extraction pass returned empty for scroll '%s' — "
             "retrying without existing indexes (deduplication confusion guard).",
@@ -225,22 +230,39 @@ def extract_and_process(
         except Exception as exc:
             logger.error("[Extract] Retry extraction also failed for '%s': %s", scroll.name, exc)
 
-    if not skill_ids and not tool_ids:
-        logger.error(
-            "[Extract] Extraction returned empty skills and tools for scroll '%s' "
-            "after both primary and retry passes. Scroll reset to PENDING_APPROVAL.",
-            scroll.name,
-        )
-        from systemu.interface.notifications import log_event as _log_event
-        _log_event(
-            "ERROR", "scroll",
-            f"Extraction failed for '{scroll.name}': LLM returned no skills or tools "
-            "after retry. Review the scroll's narrative/objectives and re-approve.",
-            {"scroll_id": scroll.id},
-        )
-        scroll.status = ScrollStatus.PENDING_APPROVAL
-        vlt.save_scroll(scroll)
-        return None
+    if not any(skill_ids) and not tool_ids:
+        # v0.9.8 (minimal Phase 3): an empty extraction must NOT silently abort the
+        # run. The agentic loop selects tools per-objective at runtime, so fall back
+        # to the full curated toolset and proceed; pre-assignment is an optimization,
+        # not a requirement. Only abort if even the curated index is unreadable
+        # (a truly broken vault).
+        try:
+            _idx = json.loads((Path(vlt.root) / "tools" / "index.json").read_text(encoding="utf-8"))
+            tool_ids = [e["id"] for e in _idx
+                        if isinstance(e, dict) and e.get("enabled", True) and e.get("id")]
+        except Exception:
+            tool_ids = []
+        if tool_ids:
+            logger.warning(
+                "[Extract] Empty extraction for '%s' — proceeding with the full curated "
+                "toolset (%d tools); the agent selects the right tool at runtime.",
+                scroll.name, len(tool_ids),
+            )
+            skill_ids = [s for s in skill_ids if s]   # drop any empty sentinels
+        else:
+            logger.error(
+                "[Extract] Empty extraction AND the curated tool index is unreadable "
+                "for scroll '%s'. Scroll reset to PENDING_APPROVAL.", scroll.name,
+            )
+            from systemu.interface.notifications import log_event as _log_event
+            _log_event(
+                "ERROR", "scroll",
+                f"Extraction failed for '{scroll.name}': no tools available. Re-approve.",
+                {"scroll_id": scroll.id},
+            )
+            scroll.status = ScrollStatus.PENDING_APPROVAL
+            vlt.save_scroll(scroll)
+            return None
 
     # ── Stage 4: Create Activity ───────────────────────────────────────────
     # v0.8.16: stamp the trigger origin from the scroll source so every
@@ -400,6 +422,8 @@ def _enrich_skill_for_catalog(s: dict) -> dict:
 
 
 def _upsert_skill(spec: dict, scroll_id: str, vlt: Vault) -> str:
+    if not isinstance(spec, dict):  # v0.9.8: skip malformed (non-dict) LLM specs
+        return ""
     """Return skill_id: reuse existing or create new following Anthropic Agent Skills standard."""
     existing_id = spec.get("existing_id")
     is_new      = spec.get("is_new", True)
@@ -485,6 +509,8 @@ def _is_v2_registered_name(name: str) -> bool:
 
 
 def _upsert_tool(spec: dict, vlt: Vault) -> tuple[str, bool]:
+    if not isinstance(spec, dict):  # v0.9.8: skip malformed (non-dict) LLM specs
+        return "", False
     """Return (tool_id, is_new): reuse existing or register as PROPOSED.
 
     v0.9.7 (B3): name-collision guard.  If the proposed tool name matches a

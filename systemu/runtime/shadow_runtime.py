@@ -475,6 +475,121 @@ def _gen_execution_id() -> str:
     return f"exec_{secrets.token_hex(4)}"
 
 
+# ── v0.9.8 KEYSTONE: tool-success auto-audit helpers ─────────────────────────
+_AUDIT_PARAM_VALUE_CAP = 200  # max chars per stringified param value in the audit row
+
+
+def _truncate_audit_params(params: Any) -> Dict[str, Any]:
+    """Return a shallow, length-capped copy of ``params`` safe for the audit log.
+
+    Each value is stringified and clipped to ``_AUDIT_PARAM_VALUE_CAP`` chars so a
+    huge ``content=`` blob can't bloat the audit JSONL (and the verifier prompt).
+    Never raises — returns ``{}`` for non-dict / unserialisable input.
+    """
+    out: Dict[str, Any] = {}
+    if not isinstance(params, dict):
+        return out
+    for k, v in params.items():
+        try:
+            sv = v if isinstance(v, (int, float, bool)) or v is None else str(v)
+            if isinstance(sv, str) and len(sv) > _AUDIT_PARAM_VALUE_CAP:
+                sv = sv[:_AUDIT_PARAM_VALUE_CAP] + "…[truncated]"
+            out[str(k)] = sv
+        except Exception:
+            continue
+    return out
+
+
+def _build_tool_audit_entry(
+    *,
+    execution_id: str,
+    objective_id: Any,
+    tool_name: str,
+    params: Any,
+) -> Dict[str, Any]:
+    """Build the compact audit row written for every successful tool call.
+
+    Matches the shape ``vault.append_action_audit`` documents (vault.py:1116):
+    keys ``ts`` (ISO), ``execution_id``, ``objective_id``, ``action``, ``params``
+    (truncated dict), ``success`` (True), ``error`` (None). The ``ts`` format
+    (``...Z``) matches state_delta's baseline ``iteration_start_ts`` so the
+    verifier's ``query_action_audit(since_ts=...)`` filter surfaces the row.
+    """
+    try:
+        oid = int(objective_id)
+    except (TypeError, ValueError):
+        oid = 0
+    return {
+        "ts": utcnow().isoformat() + "Z",
+        "execution_id": execution_id,
+        "objective_id": oid,
+        "action": tool_name or "?",
+        "params": _truncate_audit_params(params),
+        "success": True,
+        "error": None,
+    }
+
+
+def _current_objective_id_for_audit(objectives, completed) -> int:
+    """Best-effort current-objective id for an audit row when the decision did
+    not declare ``completes_objective``: the first not-yet-completed objective
+    whose dependencies are all satisfied, else 0. Never raises."""
+    try:
+        if not objectives:
+            return 0
+        done = set(completed or [])
+        for o in objectives:
+            if o.id in done:
+                continue
+            if all(dep in done for dep in (getattr(o, "depends_on", None) or [])):
+                return int(o.id)
+        return 0
+    except Exception:
+        return 0
+
+
+# v0.9.8 (B2): read-only research tools that, when called repeatedly with nothing
+# produced, signal a "research forever, never write" loop.
+_RESEARCH_TOOLS_B2 = ("web_search", "web_read", "web_extract", "fetch_json")
+_PRODUCE_TOKENS_B2 = ("file_write", "write_file", "save")
+
+
+def _research_loop_steer(*, tool_name, success, consec_reads, steers_used,
+                         threshold, cap):
+    """Pure B2 bookkeeping for the research-loop convergence steer.
+
+    Returns ``(consec_reads, steers_used, steer_or_None)``:
+      * a successful PRODUCE call (file_write/…) resets ``consec_reads`` to 0;
+      * a successful read-only RESEARCH call increments it;
+      * when ``consec_reads >= threshold`` and ``steers_used < cap``, emit a
+        forceful "stop searching, write now" steer, reset the counter, and bump
+        ``steers_used``.
+    Independent of objective-credit (which audit evidence keeps resetting), so it
+    catches the loop the stall path misses. Never raises.
+    """
+    tn = (tool_name or "").lower()
+    if success:
+        if any(t in tn for t in _PRODUCE_TOKENS_B2):
+            consec_reads = 0
+        elif tn in _RESEARCH_TOOLS_B2:
+            consec_reads += 1
+    steer = None
+    if consec_reads >= threshold and steers_used < cap:
+        steers_used += 1
+        consec_reads = 0
+        steer = (
+            "## Convergence steer\n"
+            f"You have made {threshold}+ research/search calls in a row without "
+            "producing a deliverable. You very likely already have enough to "
+            "answer. STOP searching now: synthesize your best answer from what you "
+            "have gathered and call the file-write tool to SAVE it to the requested "
+            "output file THIS turn (or give your final answer if no file was "
+            "requested). Only search again if you are missing one specific, named "
+            "fact you cannot answer without."
+        )
+    return consec_reads, steers_used, steer
+
+
 def _objective_items(objectives, completed) -> list:
     """v0.8.19 (R2): derive per-objective status for the live checklist.
     done = in completed; in_progress = deps satisfied but not done; else pending."""
@@ -1435,6 +1550,8 @@ class ShadowRuntime:
         self._same_tool_fail_streak: dict[str, int] = {}
         self._stuck_round_for_obj: dict[int, int] = {}
         self._operator_hint: "str | None" = None
+        # v0.9.8 Phase 2: autonomous-coach self-steer counter; reset per run in execute().
+        self._coach_steers_used: int = 0
         # v0.9.1 (Layer 4): per-objective verifier state + fresh-work flag.
         # Reset per run in execute(); mutated during completes_objective path.
         self._objective_states: dict[int, ObjectiveState] = {}
@@ -1771,6 +1888,14 @@ class ShadowRuntime:
         self._same_tool_fail_streak.clear()
         self._stuck_round_for_obj.clear()
         self._operator_hint = None
+        # v0.9.8 Phase 2: reset the autonomous-coach self-steer counter per run.
+        self._coach_steers_used = 0
+        # v0.9.8 (B2): consecutive read-only research tool calls (web_search/
+        # web_read/web_extract/fetch_json) with NO deliverable written. Independent
+        # of objective-credit (which audit evidence keeps resetting), so it catches
+        # the "research forever, never write" loop that loops to MAX_ITERATIONS.
+        self._consec_research_reads = 0
+        self._research_loop_steers_used = 0
         self._resume_stuck_answer = None  # v0.8.22.1 (R6): (obj_id, answer) lifted from snapshot
         # v0.9.1 (Layer 4): reset verifier bookkeeping per run.
         self._objective_states.clear()
@@ -2094,6 +2219,30 @@ class ShadowRuntime:
                 _adherence = "free"
             if _intent_engine_enabled(self.config):
                 logger.info("[Runtime] intent-engine: execution adherence=%s (kind=%s).", _adherence, _req_kind)
+
+            # ── RCA fix: per-objective verifier baseline timing ──────────────
+            # Capture the verifier baseline ONCE here, at run start, BEFORE the
+            # agent writes any deliverable. ObjectiveState.baseline was never
+            # populated, so process_completion_claim fell through to
+            # capture_baseline() at verify-time — i.e. AFTER the tool call had
+            # already written the file that same turn. The baseline absorbed the
+            # deliverable → empty StateDelta → false "no durable evidence"
+            # rejection that trapped the agent re-proving a finished objective
+            # (so it never reached later objectives). A run-start snapshot lets
+            # compute_delta see everything the run produces. Applies to BOTH
+            # engines — this is the v0.9.1 Layer-4 contract, not new-engine-only.
+            _run_verifier_baseline = None
+            if use_objectives:
+                try:
+                    _run_verifier_baseline = state_delta.capture_baseline(
+                        vault=self.vault, execution_id=execution_id, objective_id=0,
+                        default_output_dir=_resolve_verifier_output_dir(
+                            self.config, getattr(self, "user_profile", None)),
+                    )
+                except Exception:
+                    logger.debug("[Runtime] run-start verifier baseline capture failed",
+                                 exc_info=True)
+                    _run_verifier_baseline = None
 
             while iteration < _iter_budget:
                 iteration += 1
@@ -2785,6 +2934,61 @@ class ShadowRuntime:
                     except Exception:
                         logger.debug("[Runtime] loop_guard.record failed", exc_info=True)
 
+                    # ── v0.9.8 KEYSTONE: auto-audit successful tool calls ──────────
+                    # The objective verifier only sees the StateDelta (files +
+                    # audit_entries + chat_result). The runtime never wrote an audit
+                    # entry for ordinary tool calls, so an intermediate "obtain X"
+                    # objective had ZERO durable evidence and got rejected. Write one
+                    # compact audit row for every tool that SUCCEEDS so that
+                    # state_delta.compute_delta (which calls query_action_audit) can
+                    # surface it to the verifier. Best-effort — must NEVER break the run.
+                    if result is not None and getattr(result, "success", False):
+                        try:
+                            _audit_obj_id = decision.get("completes_objective")
+                            if not isinstance(_audit_obj_id, int):
+                                _audit_obj_id = _current_objective_id_for_audit(
+                                    objectives if use_objectives else None,
+                                    completed_objectives if use_objectives else None,
+                                )
+                            _audit_entry = _build_tool_audit_entry(
+                                execution_id=execution_id,
+                                objective_id=_audit_obj_id,
+                                tool_name=decision.get("tool_name", "") or "?",
+                                params=decision.get("parameters") or {},
+                            )
+                            self.vault.append_action_audit(_audit_entry)
+                        except Exception:
+                            logger.debug("[Runtime] v0.9.8 tool-success auto-audit failed", exc_info=True)
+
+                    # ── v0.9.8 (B2): research-loop convergence steer ───────────────
+                    # The keystone credits "search/obtain" objectives from audit
+                    # evidence, which resets _iters_since_obj_credit — so the stall
+                    # path never fires on a "research forever, never write" loop
+                    # (observed live: 9 web_search/web_read calls, no file, MAX_ITER).
+                    # This counter is INDEPENDENT of objective-credit: it counts
+                    # consecutive read-only research calls and force-steers the agent
+                    # to produce its deliverable once it has clearly gathered enough.
+                    try:
+                        _rl_thresh = int(getattr(self.config, "research_loop_threshold", 5) or 5)
+                        _rl_cap = int(getattr(self.config, "research_loop_max_steers", 2) or 2)
+                        self._consec_research_reads, self._research_loop_steers_used, _rl_steer = \
+                            _research_loop_steer(
+                                tool_name=decision.get("tool_name", "") or "",
+                                success=(result is not None and getattr(result, "success", False)),
+                                consec_reads=self._consec_research_reads,
+                                steers_used=self._research_loop_steers_used,
+                                threshold=_rl_thresh, cap=_rl_cap,
+                            )
+                        if _rl_steer:
+                            self._operator_hint = _rl_steer
+                            logger.info(
+                                "[Runtime] B2 research-loop convergence steer %d/%d "
+                                "(>=%d consecutive read-only research calls, no deliverable)",
+                                self._research_loop_steers_used, _rl_cap, _rl_thresh,
+                            )
+                    except Exception:
+                        logger.debug("[Runtime] B2 research-loop steer failed", exc_info=True)
+
                     # v0.8.16: per-iteration detail event AFTER the tool runs, so
                     # the bounded `details` dict carries the tool result the live
                     # panes render on expand.  Raw LLM is referenced via llm_ref.
@@ -2885,6 +3089,12 @@ class ShadowRuntime:
                                     if _obj_for_verify is not None:
                                         _vstate = self._objective_states.setdefault(
                                             completed_obj, ObjectiveState())
+                                        # RCA fix: use the run-start baseline (captured
+                                        # before any deliverable was written) instead of
+                                        # the lazy post-write capture that absorbs it.
+                                        if (getattr(_vstate, "baseline", None) is None
+                                                and _run_verifier_baseline is not None):
+                                            _vstate.baseline = _run_verifier_baseline
                                         _v_outcome = process_completion_claim(
                                             objective=_obj_for_verify,
                                             vault=self.vault,
@@ -3050,6 +3260,50 @@ class ShadowRuntime:
                         # but keeps the key; only tools with an active failure streak
                         # belong in the operator's "tools tried" line.
                         tools_tried = sorted(k for k, v in self._same_tool_fail_streak.items() if v > 0)
+                        # v0.9.8 Phase 2: autonomous mid-run steering coach. Before
+                        # escalating to a human operator, FIRST try to self-steer:
+                        # ask an LLM for one concrete corrective instruction and inject
+                        # it as a hint, then retry the loop. Only after
+                        # auto_coach_max_steers self-steers fail do we fall through to
+                        # the operator escalation below.
+                        if getattr(self.config, "auto_coach_enabled", True) and \
+                                self._coach_steers_used < int(getattr(self.config, "auto_coach_max_steers", 2)):
+                            try:
+                                from systemu.runtime.coach import generate_steer
+                                _steer = generate_steer(
+                                    objective=stuck_obj,
+                                    reason=reason,
+                                    tools_tried=tools_tried,
+                                    history=_build_history_slice(context),
+                                    config=self.config,
+                                )
+                            except Exception:
+                                logger.debug("[Runtime] coach generate_steer raised — no steer",
+                                             exc_info=True)
+                                _steer = ""
+                            if _steer:
+                                self._operator_hint = (
+                                    f"## Coach steer (Objective {stuck_obj.id})\n{_steer}"
+                                )
+                                self._iters_since_obj_credit = 0
+                                self._same_tool_fail_streak.clear()
+                                self._coach_steers_used += 1
+                                logger.info(
+                                    "[Runtime] auto-coach steer %d/%d on Objective %s: %s",
+                                    self._coach_steers_used,
+                                    int(getattr(self.config, "auto_coach_max_steers", 2)),
+                                    stuck_obj.id, _steer,
+                                )
+                                try:
+                                    context.add_thought(
+                                        f"Auto-coach self-steer {self._coach_steers_used}: {_steer}",
+                                        current_ab,
+                                    )
+                                except Exception:
+                                    pass
+                                # Retry the loop with the steer applied; do NOT escalate
+                                # to the operator this round.
+                                continue
                         # v0.8.22.1 (R1): persist a resume snapshot at stuck-park so
                         # the operator's answer (via the daemon re-dispatch handler)
                         # can resume this run with completed objectives intact.
