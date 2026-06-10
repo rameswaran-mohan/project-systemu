@@ -13,7 +13,6 @@ from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
 from systemu.interface.name_resolver import resolve_name, short_id
-from systemu.interface.nav_helpers import workshop_deeplink
 # v0.9 Phase-5 3a: the canonical skill-row renderer lives in entity_rows
 # (ONE renderer per entity). The page-local _skill_row/_skill_detail below now
 # delegate to it; they stay importable for back-compat.

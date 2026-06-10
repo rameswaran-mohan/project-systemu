@@ -26,9 +26,10 @@ def test_six_spines_in_order():
 
 def test_nav_items_is_the_six_spines():
     paths = [p for p, _i, _l in NAV_ITEMS]
-    assert paths == ["/", "/work", "/army", "/tools", "/insights", "/settings"]
+    assert paths == ["/", "/work", "/shadows", "/tools", "/insights", "/settings"]
     assert "/inbox" not in paths          # demoted to the right rail + page
     assert "/scrolls" not in paths        # Slice 2a: Work spine → /work
+    assert "/army" not in paths           # 6h: /army is now the legacy redirect alias
 
 
 def test_sub_routes_map_to_their_spine():
@@ -39,8 +40,9 @@ def test_sub_routes_map_to_their_spine():
     assert spine_of("/chat") == "/work"              # Work (task creation)
     assert spine_of("/skills") == "/tools"           # Build
     assert spine_of("/evolutions") == "/tools"       # Build
-    assert spine_of("/workshop") == "/tools"         # Build
-    assert spine_of("/memory/sh_1") == "/army"       # Shadows (deep)
+    assert spine_of("/shadows") == "/shadows"        # Shadows (identity, 6h)
+    assert spine_of("/memory/sh_1") == "/shadows"    # Shadows (deep)
+    assert spine_of("/army") == "/shadows"           # 6h: stray /army still lights Shadows
 
 
 def test_active_nav_path_resolves_to_spine():
@@ -61,20 +63,26 @@ def test_nav_no_duplicate_paths():
 # ── Slice 2a contract: repoint the nav WITHOUT deleting routes ───────────────
 
 def test_folded_routes_still_registered():
-    """/work must be registered, and /scrolls,/activities,/skills,/workshop,
-    /evolutions,/chat,/inbox must all stay reachable by URL — the nav
-    repoints, the routes live on.  (Full redirects land in later slices.)"""
+    """/work must be registered, and /scrolls,/activities,/skills,/evolutions,
+    /chat,/inbox must all stay reachable by URL — the nav repoints, the routes
+    live on.  (Full redirects land in later slices.)
+
+    Phase 6 Slice 6f: /workshop is no longer registered — its last surface (the
+    Scrolls rebuild) is now an in-place dialog (scroll_rebuild.open_scroll_rebuild_dialog).
+    """
     from systemu.interface import dashboard
 
     src = inspect.getsource(dashboard.register_routes)
-    for route in ("/work", "/scrolls", "/activities", "/skills", "/workshop",
+    for route in ("/work", "/scrolls", "/activities", "/skills",
                   "/evolutions", "/chat", "/inbox"):
         assert f'@ui.page("{route}")' in src, f"{route} route not registered"
+    # /workshop is dissolved — its route must NOT come back
+    assert '@ui.page("/workshop")' not in src, "/workshop route should be removed"
 
 
 def test_folded_routes_not_in_sidebar_but_spine_mapped():
     paths = [p for p, _i, _l in NAV_ITEMS]
-    for folded in ("/scrolls", "/chat", "/activities", "/skills", "/workshop",
+    for folded in ("/scrolls", "/chat", "/activities", "/skills",
                    "/evolutions"):
         assert folded not in paths
         assert spine_of(folded) != "", f"{folded} lost its spine mapping"
@@ -93,7 +101,7 @@ def test_legacy_paths_not_in_sidebar():
     paths = [p for p, _i, _l in NAV_ITEMS]
     labels = [label for _p, _i, label in NAV_ITEMS]
     for legacy in ("/systemu-chat", "/memory", "/flywheel", "/notifications",
-                   "/shadows"):
+                   "/army"):   # 6h: /army is now the legacy redirect alias (/shadows is the spine)
         assert legacy not in paths
     assert "Systemu Chat" not in labels
 

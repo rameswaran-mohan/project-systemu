@@ -1,4 +1,4 @@
-"""NiceGUI Dashboard — Shadows page (route /army, storage key shadow_army).
+"""NiceGUI Dashboard — Shadows page (route /shadows, storage key shadow_army).
 
 Card grid of all Shadows with:
   * Status badge, avatar emoji, description preview

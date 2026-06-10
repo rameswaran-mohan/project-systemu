@@ -169,7 +169,7 @@ def surface_harness_request(
         if cid:
             context_extras["chat_submission_id"] = cid
     except Exception:
-        pass
+        pass  # chat-submission linkage is best-effort enrichment — never block surfacing
 
     # ── Surface as a gate via the Inbox facade ────────────────────────────────
     # GateDescriptor.from_harness mirrors this surface's options / safe-default

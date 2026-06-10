@@ -7,7 +7,7 @@ class TestNavHelpers:
     def test_tile_nav_target_known_labels(self):
         from systemu.interface.nav_helpers import tile_nav_target
         assert tile_nav_target("Scrolls") == "/scrolls"
-        assert tile_nav_target("Shadows") == "/army"
+        assert tile_nav_target("Shadows") == "/shadows"
         assert tile_nav_target("Tools") == "/tools"
         assert tile_nav_target("Skills") == "/skills"
         assert tile_nav_target("Activities") == "/activities"
@@ -17,27 +17,10 @@ class TestNavHelpers:
         from systemu.interface.nav_helpers import tile_nav_target
         assert tile_nav_target("Bogus") is None
 
-    def test_workshop_deeplink_builds_query_url(self):
-        from systemu.interface.nav_helpers import workshop_deeplink
-        assert workshop_deeplink("scroll", "scroll_abc") == "/workshop?type=scroll&id=scroll_abc"
-        assert workshop_deeplink("shadow", "shadow_x") == "/workshop?type=shadow&id=shadow_x"
-
-    def test_resolve_deeplink_tab_known_types(self):
-        from systemu.interface.nav_helpers import resolve_deeplink_tab
-        assert resolve_deeplink_tab("scroll") == "Scrolls"
-
-    def test_resolve_deeplink_tab_default_scrolls(self):
-        # Phase 5 Slice 3c: tool/skill folded out of the Workshop (edit-in-place
-        # from the Build registry rows), so they fall back to the Scrolls tab.
-        # Phase 5 Slice 4c: "shadow" likewise folded out (edit-in-place from the
-        # Shadows /army cards), so it too falls back to the Scrolls tab.
-        from systemu.interface.nav_helpers import resolve_deeplink_tab
-        assert resolve_deeplink_tab(None) == "Scrolls"
-        assert resolve_deeplink_tab("") == "Scrolls"
-        assert resolve_deeplink_tab("unknown") == "Scrolls"
-        assert resolve_deeplink_tab("tool") == "Scrolls"
-        assert resolve_deeplink_tab("skill") == "Scrolls"
-        assert resolve_deeplink_tab("shadow") == "Scrolls"
+    # Phase 6 Slice 6f: workshop_deeplink / resolve_deeplink_tab were deleted
+    # with the /workshop route — the Scrolls rebuild is now an in-place dialog
+    # (scroll_rebuild.open_scroll_rebuild_dialog), so there's no deeplink to
+    # build or tab to resolve.  Their tests are retired here.
 
 
 class TestNavGroups:
@@ -104,12 +87,6 @@ class TestConsolePage:
         from systemu.interface.pages.console import build_console_page
         assert callable(build_console_page)
 
-    def test_overview_reexports_console(self):
-        # Back-compat: build_overview_page must still be importable + identical
-        from systemu.interface.pages.overview import build_overview_page
-        from systemu.interface.pages.console import build_console_page
-        assert build_overview_page is build_console_page
-
     def test_stat_card_accepts_nav_target(self):
         # _stat_card must accept the new nav_target kwarg without error at
         # import/signature level
@@ -119,18 +96,6 @@ class TestConsolePage:
         assert "nav_target" in sig.parameters
 
 
-class TestWorkshopDeeplinkHandler:
-    def test_build_workshop_page_accepts_deeplink_kwargs(self):
-        import inspect
-        from systemu.interface.pages.workshop import build_workshop_page
-        sig = inspect.signature(build_workshop_page)
-        assert "deeplink_type" in sig.parameters
-        assert "deeplink_id" in sig.parameters
-
-    def test_resolve_deeplink_tab_used_by_workshop(self):
-        # Workshop must resolve the initial tab via the shared helper. After
-        # Slice 4c only the Scrolls tab remains, so the surviving "scroll" type
-        # is asserted here; folded-out types fall back to Scrolls.
-        from systemu.interface.nav_helpers import resolve_deeplink_tab
-        assert resolve_deeplink_tab("scroll") == "Scrolls"
-        assert resolve_deeplink_tab("shadow") == "Scrolls"
+# Phase 6 Slice 6f: TestWorkshopDeeplinkHandler is retired with the /workshop
+# route + page.  build_workshop_page no longer exists; the Scrolls rebuild
+# (Workshop's last surface) is covered by tests/test_scroll_rebuild.py.

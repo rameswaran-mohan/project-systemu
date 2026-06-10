@@ -1,21 +1,93 @@
-"""Console page (v0.8.8) — single-screen operator console.
+"""Home spine (Phase 6) — the at-a-glance command center.
 
-Layout (top to bottom):
-  1. Header: "🖥️ Console" + horizontal Quick Actions row
-  2. Six clickable stat tiles (navigate to list pages)
-  3. Pending Actions mini-pane (scrollable, capped height)
-  4. Two live event panes: Supervisor=chat (left) + Manual Logs=capture/manual/scheduled (right)
-  5. "More" — five collapsed lazy-loaded expansion cards
+Route: ``/`` (the Home spine).  Spec §5: "At-a-glance: what's running, what
+needs me.  Cards are LINKS, not re-renders of other pages."
 
-Replaces the v0.7.2 Overview. build_overview_page is re-exported from
-overview.py for back-compat.
+This page is a DASHBOARD OF LINKS to the six spines plus two at-a-glance
+summaries — it never re-renders another page's content in place:
+
+  1. "What needs you" — a SUMMARY of pending operator gates (count + the top
+     2-3 gate titles), each linking to ``/inbox``.  The full resolvable cards
+     live in the Inbox page + the persistent right rail; Home only glances.
+  2. "What's running" — the shared ``workflow_pipeline`` card (capture→…→done
+     counts + active jobs), linking to ``/work``.
+  3. Spine quick-links — the clickable stat tiles (``_stat_card``), each a
+     link to its spine.
+  4. "Recent activity" — a short list of recent workflows, each linking to
+     ``/workflow/{id}``.  NOT a re-render of the Work list.
+  5. "Pending approvals" — the tool/dep approval queue (a Home-owned surface,
+     not a foreign page) and the header quick-actions are kept.
+
+What was REMOVED (the spec gap this rebuild closes):
+  * the "Pending Actions" pane that re-rendered the unified decision cards (a
+    duplicate decision surface; its old link target ``/insights?tab=actions``
+    no longer even exists) → replaced by the "What needs you" summary → /inbox.
+  * the "More" expansions that re-rendered Learning Curves / Memory Status /
+    Skills Snapshot (duplicates of Insights / Shadows) → replaced by a single
+    "View analytics → /insights" + "Shadows memory → /shadows" link row.
+
+The pure summary models (``home_needs_you_summary`` /
+``home_recent_workflows``) are unit-tested without a NiceGUI runtime; the
+NiceGUI builders compose them with design-system token classes only (lint
+``test_ui_style_no_new_violations`` stays at 0 new).
 """
 from __future__ import annotations
 
-from nicegui import ui
+from typing import Any, Dict, List
 
-from systemu.interface.dashboard_state import AppState, THEME
 from systemu.interface.nav_helpers import tile_nav_target
+
+# ``_UNTITLED`` keeps an option-less / malformed gate readable in the glance
+# rather than rendering a blank line.
+_UNTITLED = "(untitled gate)"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Pure summary models (unit-tested in tests/test_home_page.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def home_needs_you_summary(descriptors, *, top_n: int = 3) -> Dict[str, Any]:
+    """SUMMARY of pending operator gates for the Home glance card (pure).
+
+    ``descriptors`` is exactly what ``InboxQueue.list_descriptors()`` returns:
+    a list of ``(decision_id, GateDescriptor)`` tuples.  Returns the total
+    ``count``, the leading ``top_n`` gate ``titles`` (so the operator sees what
+    is waiting without leaving Home), and the ``link`` to the full Inbox where
+    gates are actually resolved.  Empty input → ``count 0 / top []``.
+
+    Defensive: a malformed row (no ``.title``) yields the ``_UNTITLED``
+    placeholder rather than crashing the glance.
+    """
+    rows = list(descriptors or [])
+    titles: List[str] = []
+    for _dec_id, d in rows[:top_n]:
+        title = (getattr(d, "title", "") or "").strip()
+        titles.append(title or _UNTITLED)
+    return {"count": len(rows), "top": titles, "link": "/inbox"}
+
+
+def home_recent_workflows(snapshots, *, limit: int = 5) -> List[Dict[str, Any]]:
+    """Recent workflows for the Home "Recent activity" list (pure, testable).
+
+    Maps ``WorkflowSnapshot`` objects → lightweight row dicts (newest first),
+    each carrying a LINK to ``/workflow/{id}`` — a glance that points at the
+    Work spine, NOT a re-render of the Work list.  Missing ``updated_at`` sorts
+    last (treated as the empty string).
+    """
+    snaps = list(snapshots or [])
+    snaps.sort(key=lambda s: getattr(s, "updated_at", "") or "", reverse=True)
+    rows: List[Dict[str, Any]] = []
+    for s in snaps[:limit]:
+        wid = getattr(s, "workflow_id", "")
+        rows.append({
+            "workflow_id": wid,
+            "title": getattr(s, "title", "") or wid,
+            "status": getattr(s, "status", ""),
+            "stage": getattr(s, "stage", ""),
+            "link": f"/workflow/{wid}",
+        })
+    return rows
 
 
 def _pending_approvals_count(vault) -> int:
@@ -38,7 +110,46 @@ def _pending_approvals_count(vault) -> int:
     return proposed + deps
 
 
-def build_console_page() -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+#  Data loaders (vault / tracker → pure-model inputs).  Defensive: any failure
+#  yields an empty result so the Home shell never breaks.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_needs_you_summary(vault) -> Dict[str, Any]:
+    try:
+        from systemu.interface.command.inbox import InboxQueue
+        descriptors = InboxQueue(vault).list_descriptors()
+    except Exception:
+        descriptors = []
+    return home_needs_you_summary(descriptors)
+
+
+def _load_recent_workflows() -> List[Dict[str, Any]]:
+    try:
+        from systemu.runtime.workflow_tracker import WorkflowTracker
+        tracker = WorkflowTracker.get()
+        tracker.refresh_from_vault()
+        return home_recent_workflows(tracker.list_all())
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Page
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def build_home_page() -> None:
+    """Render the Home spine: a dashboard of LINKS + two at-a-glance summaries.
+
+    Token classes / plain-string styles only (lint stays at 0 new). The order
+    follows the operator's question: what needs me → what's running → where do
+    I go → what just happened → what's awaiting approval.
+    """
+    from nicegui import ui
+
+    from systemu.interface.dashboard_state import AppState
     state = AppState.get()
     vault = state.vault
 
@@ -52,257 +163,185 @@ def build_console_page() -> None:
     pending_evolutions = [e for e in evolutions if e.get("status") == "proposed"]
     pending_scrolls    = [s for s in scrolls    if s.get("status") == "pending_approval"]
 
-    # ── Header + Quick Actions ─────────────────────────────────────────
-    with ui.row().style("width: 100%; align-items: center; justify-content: space-between; margin-bottom: 16px;"):
-        ui.label("🖥️ Console").style(
-            f"font-size: 20px; font-weight: 800; color: {THEME['text']};"
-        )
-        with ui.row().style("gap: 8px;"):
-            ui.button("⚡ Record", on_click=_trigger_record_dialog).style(
-                f"background: {THEME['primary']}; color: white; border-radius: 8px; font-size: 13px;"
-            )
-            ui.button("🧬 Evolve", on_click=_run_evolution).style(
-                f"background: {THEME['surface2']}; color: {THEME['text']}; "
-                f"border: 1px solid {THEME['border']}; border-radius: 8px; font-size: 13px;"
-            )
-            ui.button("🔔 Notifications", on_click=lambda: ui.navigate.to("/notifications")).style(
-                f"background: {THEME['surface2']}; color: {THEME['text']}; "
-                f"border: 1px solid {THEME['border']}; border-radius: 8px; font-size: 13px;"
-            )
-            ui.button("🔧 Forge", on_click=lambda: ui.navigate.to("/tools")).style(
-                f"background: {THEME['surface2']}; color: {THEME['text']}; "
-                f"border: 1px solid {THEME['border']}; border-radius: 8px; font-size: 13px;"
-            )
-            ui.button("↻ Restart Workers", on_click=_force_restart_workers).style(
-                f"background: {THEME['surface2']}; color: {THEME['warning']}; "
-                f"border: 1px solid {THEME['warning']}; border-radius: 8px; font-size: 13px;"
-            ).tooltip("Restart Supervisor threads — use when a shadow appears stuck")
+    # ── Header + quick actions ─────────────────────────────────────────
+    with ui.row().classes("w-full items-center justify-between q-mb-md"):
+        ui.label("🏠 Home").classes("s-page-title")
+        with ui.row().classes("items-center q-gutter-sm"):
+            ui.button("⚡ Record", on_click=_trigger_record_dialog) \
+                .props("flat no-caps").classes("s-btn s-btn--primary")
+            ui.button("🧬 Evolve", on_click=_run_evolution) \
+                .props("flat no-caps").classes("s-btn s-btn--ghost")
+            ui.button("🔔 Notifications", on_click=lambda: ui.navigate.to("/notifications")) \
+                .props("flat no-caps").classes("s-btn s-btn--ghost")
+            ui.button("🔧 Forge", on_click=lambda: ui.navigate.to("/tools")) \
+                .props("flat no-caps").classes("s-btn s-btn--ghost")
+            ui.button("↻ Restart Workers", on_click=_force_restart_workers) \
+                .props("flat no-caps").classes("s-btn s-btn--warn") \
+                .tooltip("Restart Supervisor threads — use when a shadow appears stuck")
 
-    # ── Overview (clickable stat tiles) — collapsed ────────────────────
-    with ui.expansion("Overview", value=False).classes("w-full").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; margin-bottom: 8px;"
-    ):
-        with ui.row().classes("w-full gap-4 flex-wrap").style("padding: 8px;"):
-            _stat_card("📜", "Scrolls", len(scrolls), THEME["primary"],
-                       f"{len(pending_scrolls)} pending", nav_target=tile_nav_target("Scrolls"))
-            _stat_card("👥", "Shadows", len(shadows), THEME["info"],
-                       f"{len([s for s in shadows if s.get('status')=='awakened'])} active",
-                       nav_target=tile_nav_target("Shadows"))
-            _stat_card("🔧", "Tools", len(tools), THEME["success"],
-                       f"{len([t for t in tools if t.get('status')=='forged'])} forged",
-                       nav_target=tile_nav_target("Tools"))
-            _stat_card("🧠", "Skills", len(skills), "#a78bfa",
-                       "across all shadows", nav_target=tile_nav_target("Skills"))
-            _stat_card("📋", "Activities", len(activities), THEME["info"],
-                       f"{len([a for a in activities if a.get('status')=='unassigned'])} unassigned",
-                       nav_target=tile_nav_target("Activities"))
-            _stat_card("🧬", "Evolutions", len(pending_evolutions), THEME["warning"],
-                       "pending review", nav_target=tile_nav_target("Evolutions"))
+    # ── Two at-a-glance summaries: needs-you + what's running ───────────
+    with ui.row().classes("w-full q-gutter-md q-mb-md").style("flex-wrap: wrap;"):
+        with ui.column().style("flex: 1; min-width: 320px;"):
+            _build_needs_you_card(vault)
+        with ui.column().style("flex: 1; min-width: 320px;"):
+            _build_whats_running_card()
 
-    # ── Pending Actions — collapsed ────────────────────────────────────
-    with ui.expansion("Pending Actions", value=False).classes("w-full").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; margin-bottom: 8px;"
-    ):
-        with ui.column().style("width: 100%; padding: 8px;"):
-            with ui.row().style("align-items: center; gap: 8px;"):
-                ui.link("→ Insights", "/insights?tab=actions").style(
-                    f"font-size: 12px; color: {THEME['primary']}; text-decoration: none;"
-                )
-            _build_pending_actions_minipane(vault)
+    # ── Spine quick-links (clickable stat tiles → each spine) ──────────
+    ui.label("Spines").classes("s-section-head q-mt-sm")
+    with ui.row().classes("w-full q-gutter-sm q-mb-md").style("flex-wrap: wrap;"):
+        _stat_card("📜", "Scrolls", len(scrolls),
+                   f"{len(pending_scrolls)} pending", nav_target=tile_nav_target("Scrolls"))
+        _stat_card("👥", "Shadows", len(shadows),
+                   f"{len([s for s in shadows if s.get('status')=='awakened'])} active",
+                   nav_target=tile_nav_target("Shadows"))
+        _stat_card("🔧", "Tools", len(tools),
+                   f"{len([t for t in tools if t.get('status')=='forged'])} forged",
+                   nav_target=tile_nav_target("Tools"))
+        _stat_card("🧠", "Skills", len(skills),
+                   "across all shadows", nav_target=tile_nav_target("Skills"))
+        _stat_card("📋", "Activities", len(activities),
+                   f"{len([a for a in activities if a.get('status')=='unassigned'])} unassigned",
+                   nav_target=tile_nav_target("Activities"))
+        _stat_card("🧬", "Evolutions", len(pending_evolutions),
+                   "pending review", nav_target=tile_nav_target("Evolutions"))
 
-    # ── Pending Approvals — auto-open when anything is pending ─────────
+    # ── Recent activity (links to /workflow/{id}) ──────────────────────
+    _build_recent_activity_card()
+
+    # ── Pending approvals (Home-owned surface — tools + deps) ──────────
     n_appr = _pending_approvals_count(vault)
-    with ui.expansion(f"Pending Approvals ({n_appr})", value=n_appr > 0).classes("w-full").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; margin-bottom: 8px;"
-    ):
+    with ui.expansion(f"Pending Approvals ({n_appr})", value=n_appr > 0).classes("w-full q-mb-sm s-card"):
         with ui.column().classes("w-full").style("padding: 8px 4px; gap: 12px;"):
             from systemu.interface.components.pending_tools import build_pending_tools
             from systemu.interface.components.pending_deps import build_pending_deps
             build_pending_tools()
             build_pending_deps(compact=True)
 
-    # ── Events (two panes, header arrows) — collapsed ──────────────────
-    with ui.expansion("Events", value=False).classes("w-full").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; margin-bottom: 8px;"
-    ):
-        from systemu.interface.components.live_events_pane import build_supervisor_events_pane
-        with ui.row().classes("w-full gap-4").style("flex-wrap: wrap; padding: 8px;"):
-            # Supervisor (chat) live events (left)
-            with ui.column().style("flex: 1; min-width: 360px;"):
-                with ui.row().style("align-items: center; gap: 6px; margin-bottom: 8px;"):
-                    ui.label("▶️ Supervisor (chat)").style(
-                        f"font-size: 12px; font-weight: 700; color: {THEME['text']};"
-                    )
-                    ui.link("→", "/systemu-chat").style(
-                        f"font-size: 13px; color: {THEME['primary']}; text-decoration: none;"
-                    ).tooltip("Open full supervisor feed")
-                build_supervisor_events_pane(origins=frozenset({"chat"}))
-            # Manual Logs — capture / manual / scheduled (right)
-            with ui.column().style("flex: 1; min-width: 360px;"):
-                with ui.row().style("align-items: center; gap: 6px; margin-bottom: 8px;"):
-                    ui.label("🔔 Manual Logs").style(
-                        f"font-size: 12px; font-weight: 700; color: {THEME['text']};"
-                    )
-                    ui.link("→", "/insights?tab=events").style(
-                        f"font-size: 13px; color: {THEME['primary']}; text-decoration: none;"
-                    ).tooltip("Open full Manual Logs")
-                build_supervisor_events_pane(
-                    origins=frozenset({"capture", "manual", "scheduled"})
-                )
-
-    # ── Live Objectives (v0.8.19) — collapsed ─────────────────────────
-    with ui.expansion("Live Objectives", value=False).classes("w-full").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; margin-bottom: 8px;"
-    ):
-        from systemu.interface.components.live_objectives_pane import build_live_objectives_pane
-        with ui.column().style("padding: 8px; width: 100%;"):
-            build_live_objectives_pane()
-
-    # ── More (collapsed expansion wrapping the lazy cards) ─────────────
-    with ui.expansion("More", value=False).classes("w-full").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; margin-bottom: 8px;"
-    ):
-        with ui.column().style("width: 100%; padding: 8px;"):
-            _build_expansions()
+    # ── Analytics / memory deep-links (replaces the old "More" re-renders) ──
+    with ui.row().classes("w-full items-center q-gutter-md q-mt-sm"):
+        ui.label("Go deeper:").classes("s-muted")
+        ui.link("📈 View analytics", "/insights").classes("s-cell s-cell--bold") \
+            .style("text-decoration: none;")
+        ui.link("🧠 Shadows memory", "/shadows").classes("s-cell s-cell--bold") \
+            .style("text-decoration: none;")
 
 
-def _build_pending_actions_minipane(vault) -> None:
-    """Compact pending-decisions list reusing the shared render helper."""
-    from systemu.interface.pages.insights import (
-        _build_pending_decision_view_model, render_decision_card,
-    )
-    from systemu.approval.decision_queue import OperatorDecisionQueue
-
-    view = _build_pending_decision_view_model(vault)
-
-    @ui.refreshable
-    def _mini():
-        if isinstance(view, dict) and (view.get("_empty") or view.get("_no_vault")):
-            ui.label("No pending actions.").style(f"color: {THEME['text_muted']}; font-size: 12px;")
-            return
-        if isinstance(view, dict) and "_error" in view:
-            ui.label(f"Error: {view['_error']}").style(f"color: {THEME['danger']}; font-size: 12px;")
-            return
-        queue = OperatorDecisionQueue(vault)
-        for card in view:
-            render_decision_card(card, queue, _mini.refresh)
-
-    with ui.scroll_area().style("max-height: 160px; width: 100%;"):
-        _mini()
+# Back-compat alias: the route + importers historically reference
+# build_console_page; Home is its content now (the page was retitled in Phase 6
+# and rebuilt as an at-a-glance spine here). Keep the old name importable.
+build_console_page = build_home_page
 
 
-# ── Stat card (now nav-aware) ──────────────────────────────────────────
-
-def _stat_card(icon: str, label: str, value: int, color: str, subtitle: str,
-               nav_target: str | None = None) -> None:
-    base = (
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; padding: 20px 24px; min-width: 140px; "
-        f"align-items: center; gap: 4px; flex: 1;"
-    )
-    if nav_target:
-        base += " cursor: pointer;"
-    card = ui.column().style(base)
-    if nav_target:
-        card.on("click", lambda t=nav_target: ui.navigate.to(t))
-        card.classes("s-tile-clickable")
-    with card:
-        ui.label(icon).style("font-size: 28px;")
-        ui.label(str(value)).style(f"font-size: 36px; font-weight: 800; color: {color};")
-        ui.label(label).style(f"font-size: 14px; font-weight: 600; color: {THEME['text']};")
-        ui.label(subtitle).style(f"font-size: 11px; color: {THEME['text_muted']};")
+# ─────────────────────────────────────────────────────────────────────────────
+#  Glance cards
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-# ── Expansions + handlers (carried over verbatim from overview.py) ─────
-# The activity-feed helpers _activity_row / _build_activity_feed are NOT
-# carried over — the feed is removed in v0.8.8 (the event panes supersede it).
+def _build_needs_you_card(vault) -> None:
+    """"What needs you" — a SUMMARY (count + top gate titles) linking to /inbox.
 
-def _build_expansions() -> None:
-    """Render the collapsed-by-default Console "More" expansion cards.
+    NOT the full resolvable cards (those live in /inbox + the right rail). Live
+    via a 2s poll, mirroring the rail's cadence."""
+    from nicegui import ui
+    from systemu.interface.design.primitives import card
+    from systemu.interface.ui_helpers import safe_timer
 
-    Lazy-load each card body on expansion open — keeps the initial
-    Console render cheap. (Pending Tools / Tool Dependencies now live in the
-    top-level "Pending Approvals" section, so they are no longer rendered here.)
-    """
-    _expansion("📈", "Learning Curves",
-               "Compact view of Shadow execution metrics and the data flywheel.",
-               _load_learning_curves)
+    with card(classes="w-full"):
+        with ui.row().classes("w-full items-center justify-between q-mb-sm"):
+            ui.label("📥 What needs you").classes("s-cell s-cell--bold")
+            ui.link("Open Inbox →", "/inbox").classes("s-muted").style("text-decoration: none;")
 
-    _expansion("🧠", "Memory Status",
-               "Per-Shadow memory buffer health and consolidation readiness.",
-               _load_memory_status)
-
-    _expansion("🧩", "Skills Snapshot",
-               "Top skills by usage, with a link to the full skill registry.",
-               _load_skills_snapshot)
-
-
-def _expansion(icon: str, title: str, subtitle: str, body_loader) -> None:
-    """Wrap a lazy-loaded expansion card.  body_loader is called on first open."""
-    with ui.expansion(
-        title,
-        icon="",  # we render our own glyph
-    ).classes("w-full").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 12px; margin-bottom: 12px;"
-    ) as exp:
-        with exp.add_slot("header"):
-            with ui.row().style("align-items: center; gap: 10px;"):
-                ui.label(icon).style("font-size: 18px;")
-                with ui.column().style("gap: 0;"):
-                    ui.label(title).style(
-                        f"font-size: 14px; font-weight: 700; color: {THEME['text']};"
-                    )
-                    ui.label(subtitle).style(
-                        f"font-size: 11px; color: {THEME['text_muted']};"
-                    )
-
-        # Lazy body: build once on first open, then keep.
-        body_state = {"built": False}
-        body_container = ui.column().classes("w-full").style("padding: 6px 12px 12px;")
-
-        def _build_body() -> None:
-            if body_state["built"]:
+        @ui.refreshable
+        def _summary() -> None:
+            s = _load_needs_you_summary(vault)
+            if s["count"] == 0:
+                ui.label("Nothing waiting on you.").classes("s-muted")
                 return
-            with body_container:
-                try:
-                    body_loader()
-                except Exception as exc:
-                    ui.label(f"Error loading: {exc}").style(
-                        f"color: {THEME['danger']}; font-size: 12px;"
-                    )
-            body_state["built"] = True
+            ui.label(f"{s['count']} pending").classes("s-pill s-pill--warn q-mb-sm")
+            for title in s["top"]:
+                ui.link(f"• {title}", s["link"]).classes("s-cell") \
+                    .style("text-decoration: none; display: block;")
+            extra = s["count"] - len(s["top"])
+            if extra > 0:
+                ui.link(f"+{extra} more in Inbox →", s["link"]).classes("s-muted") \
+                    .style("text-decoration: none;")
 
-        exp.on("update:model-value", lambda _e: _build_body())
-
-
-# ── Body loaders ───────────────────────────────────────────────────────
-
-def _load_learning_curves() -> None:
-    from systemu.interface.components.learning_curves import build_learning_curves
-    build_learning_curves()
+        _summary()
+        safe_timer(2.0, _summary.refresh)
 
 
-def _load_memory_status() -> None:
-    from systemu.interface.components.memory_status import build_memory_status
-    build_memory_status()
+def _build_whats_running_card() -> None:
+    """"What's running" — the shared workflow_pipeline card + active jobs count,
+    linking to /work. Reuses components/workflow_pipeline (no re-implementation)."""
+    from nicegui import ui
+    from systemu.interface.design.primitives import card
+    from systemu.interface.components.workflow_pipeline import build_workflow_pipeline
+
+    with card(classes="w-full"):
+        with ui.row().classes("w-full items-center justify-between q-mb-sm"):
+            ui.label("⚙️ What's running").classes("s-cell s-cell--bold")
+            ui.link("Open Work →", "/work").classes("s-muted").style("text-decoration: none;")
+        # Compact pipeline: stage chips only (the active list is the Work page).
+        build_workflow_pipeline(compact=True)
 
 
-def _load_skills_snapshot() -> None:
-    from systemu.interface.components.skills_snapshot import build_skills_snapshot
-    build_skills_snapshot()
+def _build_recent_activity_card() -> None:
+    """"Recent activity" — recent workflows, each a LINK to /workflow/{id}.
+    NOT a re-render of the Work list (it shows ≤5 rows, title + stage only)."""
+    from nicegui import ui
+    from systemu.interface.design.primitives import card
+    from systemu.interface.ui_helpers import safe_timer
+
+    ui.label("Recent activity").classes("s-section-head q-mt-sm")
+    with card(classes="w-full q-mb-sm"):
+        @ui.refreshable
+        def _list() -> None:
+            rows = _load_recent_workflows()
+            if not rows:
+                ui.label("No recent workflows.").classes("s-muted")
+                return
+            for row in rows:
+                with ui.row().classes("w-full items-center q-gutter-sm"):
+                    ui.link(row["title"], row["link"]).classes("s-cell s-cell--bold col-grow") \
+                        .style("text-decoration: none;")
+                    ui.label(row["stage"]).classes("s-pill s-pill--accent")
+                    ui.label(row["status"]).classes("s-pill s-pill--muted")
+
+        _list()
+        safe_timer(2.0, _list.refresh)
 
 
-# ── Quick-action handlers ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Spine stat tile (a LINK to its spine — token-class clean)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _stat_card(icon: str, label: str, value: int, subtitle: str,
+               nav_target: str | None = None) -> None:
+    """Clickable stat tile that navigates to a spine list page."""
+    from nicegui import ui
+    from systemu.interface.design.primitives import card
+
+    tile = card()
+    tile.style("min-width: 140px; flex: 1; cursor: pointer; align-items: center;"
+               if nav_target else "min-width: 140px; flex: 1; align-items: center;")
+    if nav_target:
+        tile.on("click", lambda t=nav_target: ui.navigate.to(t))
+    with tile:
+        ui.label(icon).style("font-size: 26px;")
+        ui.label(str(value)).classes("s-page-title")
+        ui.label(label).classes("s-cell s-cell--bold")
+        ui.label(subtitle).classes("s-muted")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Quick-action handlers (carried over — header buttons must keep working)
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def _force_restart_workers() -> None:
     """Gracefully restart the Supervisor background threads."""
+    from nicegui import ui
     try:
         from systemu.runtime.supervisor import Supervisor
         import time as _time
@@ -318,6 +357,7 @@ def _force_restart_workers() -> None:
 
 def _trigger_record_dialog() -> None:
     """Open the record session dialog (reuses dashboard.py handler)."""
+    from nicegui import ui
     try:
         from systemu.interface.dashboard import _show_record_dialog
         _show_record_dialog()
@@ -327,7 +367,9 @@ def _trigger_record_dialog() -> None:
 
 def _run_evolution() -> None:
     """Trigger the evolution engine as a background job to avoid blocking the UI."""
+    from nicegui import ui
     from systemu.interface.command.dispatch import dispatch
+    from systemu.interface.dashboard_state import AppState
 
     state = AppState.get()
     cwd = state.project_root

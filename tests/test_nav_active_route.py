@@ -19,7 +19,7 @@ The no-false-positive and unknown-route guarantees are unchanged.
 from systemu.interface.dashboard import active_nav_path
 
 
-PATHS = ["/", "/work", "/army", "/tools", "/insights", "/settings"]
+PATHS = ["/", "/work", "/shadows", "/tools", "/insights", "/settings"]
 
 
 def test_exact_match_wins():
@@ -41,7 +41,7 @@ def test_deep_detail_page_maps_to_spine_parent():
     # /workflow/{id} and /memory/{id} have no nav entry of their own.
     # Phase 5 Slice 2a: workflows belong to the Work spine (/work).
     assert active_nav_path("/workflow/wf_42", PATHS) == "/work"
-    assert active_nav_path("/memory/shadow_7", PATHS) == "/army"
+    assert active_nav_path("/memory/shadow_7", PATHS) == "/shadows"
 
 
 def test_folded_sub_route_highlights_its_spine():

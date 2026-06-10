@@ -29,6 +29,21 @@ logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = {"success", "failure", "failed", "partial", "skipped_no_shadow", "cancelled"}
 
 
+def _work_link_for(activity) -> str:
+    """Phase 6 Batch 2 (6g): the live Work-spine deep link for a completed task.
+
+    ``run_direct_task`` returns the Activity (or None on early pipeline
+    failure); the Activity's ``scroll_id`` doubles as its workflow_id, so the
+    workflow detail page lives at ``/workflow/<scroll_id>``.  Falls back to the
+    Work list ``/work`` when there is no scroll_id (None activity, or a shape
+    without the field) so the link is always safe to render.
+    """
+    scroll_id = getattr(activity, "scroll_id", None)
+    if scroll_id:
+        return f"/workflow/{scroll_id}"
+    return "/work"
+
+
 def _stale_terminal_ts(entries) -> set:
     """Timestamps of terminal entries that are NOT the newest entry — i.e. old,
     finished tasks that should not read as the current state. `entries` are in
@@ -248,10 +263,16 @@ def build_chat_page() -> None:
         # empty.`
         client = ui.context.client
 
+        # Phase 6 Batch 2 (6g): capture the run_direct_task return (the
+        # Activity) so the completion handler can surface a live Work link.
+        # A 1-slot list lets the daemon thread hand the result to _on_done
+        # without a nonlocal/closure-rebind dance.
+        result_holder: list = [None]
+
         def _run() -> None:
             try:
                 from systemu.pipelines.direct_task import run_direct_task
-                run_direct_task(
+                result_holder[0] = run_direct_task(
                     raw, config, vault,
                     route_through_supervisor=queue_mode,
                 )
@@ -272,6 +293,22 @@ def build_chat_page() -> None:
             status_label.set_text("")
             submit_btn.set_enabled(True)
             _render_history()
+            # 6g: surface a live link into the Work spine for the task we just
+            # created. Synchronous runs return the finished Activity; queued
+            # runs return the queued Activity too (scroll_id known either way).
+            # Skipped only when run_direct_task returned None (early failure).
+            activity = result_holder[0]
+            if activity is not None:
+                link = _work_link_for(activity)
+                ui.notify(
+                    "Task submitted — open it in Work.",
+                    type="positive",
+                    actions=[{
+                        "label": "View in Work",
+                        "color": "white",
+                        "handler": lambda: ui.navigate.to(link),
+                    }],
+                )
 
         threading.Thread(target=_run, daemon=True).start()
 

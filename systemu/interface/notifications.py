@@ -209,8 +209,11 @@ def queue_dependency_reminder(tool: Any, vault: Any) -> None:
             },
         )
         vault.queue_notification(notif)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Never block enabling a tool on a notification-queue hiccup, but make
+        # the swallowed failure observable instead of vanishing silently.
+        logger.warning("Failed to queue dependency reminder for %s: %s",
+                       getattr(tool, "id", "?"), exc)
 
 
 def _make_id() -> str:

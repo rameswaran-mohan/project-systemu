@@ -9,8 +9,8 @@
 ## Install
 
 ```bash
-pip install systemu                                                       # PyPI (post-v0.7.0 tag)
-docker run -p 8765:8765 ghcr.io/rameswaran-mohan/systemu:0.7.0            # Docker (post-v0.7.0 tag)
+pip install systemu                                                       # PyPI
+docker run -p 8765:8765 ghcr.io/rameswaran-mohan/systemu:0.9.11           # Docker
 ```
 
 ### First run (after `pip install`)
@@ -42,8 +42,14 @@ Systemu combines two components:
   and converts the recording into a structured workflow specification
   using an LLM.
 - **Systemu runtime** executes that specification autonomously through
-  AI **Shadow** agents, a curated tool registry, and a NiceGUI
-  dashboard.
+  AI **Shadow** agents, a curated tool registry, an intent-aware
+  governance layer, and a NiceGUI dashboard.
+
+The dashboard is a **command center** organised around six spines —
+**Home**, **Work**, **Shadows**, **Build**, **Insights**, and
+**Settings** — with a persistent right rail (what *Needs you* + a *Live*
+run feed) and a single **Decisions Inbox** where every approval gate
+lands in one place. See [Dashboard](#dashboard) below.
 
 **📚 Read these first:**
 [Getting Started](docs/getting-started.md) ·
@@ -97,16 +103,71 @@ Supervisor dispatches the Shadow.  Intelligent
   Supervisor (opt-in) intervenes between
   iterations with bounded actions including
   RECALIBRATE_TOOL / RECALIBRATE_SKILL when
-  capabilities are structurally inadequate      (v0.5.0 + v0.6.0)
+  capabilities are structurally inadequate
+          │
+          ▼
+Reverse-Harness Governor arbitrates capability
+  requests the running Shadow PULLs (a missing
+  tool, a dependency, an escalation).  Under the
+  default risk-tiered gate mode it auto-grants
+  low-risk requests and escalates the rest to the
+  Decisions Inbox; on approval the run resumes
           │
           ▼
 Dashboard shows live progress, results,
-  per-shadow + per-tool metrics, memory, and
-  approval cards for any operator decisions
+  per-shadow + per-tool metrics, memory, and the
+  Decisions Inbox for every operator gate
 ```
 
 A deeper walkthrough of every stage lives in
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+---
+
+## Dashboard
+
+The web dashboard (default <http://localhost:8765>) is organised as a
+six-spine command center. The left sidebar has exactly six entries:
+
+| Spine | Route | What it holds |
+|---|---|---|
+| **Home** | `/` | Overview — stat cards, the workflow pipeline, and the live activity feed |
+| **Work** | `/work` | The workflow-centric view; Scrolls + Activities fold in here |
+| **Shadows** | `/shadows` | The Shadow roster (agent personas) and their per-shadow memory |
+| **Build** | `/tools` | Tool registry; Skills and Evolution proposals fold in here |
+| **Insights** | `/insights` | Memory, the capability flywheel, and the event stream (tabbed) |
+| **Settings** | `/settings` | LLM tier config, the gate-mode dial, and approval defaults |
+
+Two surfaces are present on **every** page:
+
+- **Right rail** — a persistent panel showing what *Needs you* (a glance
+  at pending gates) and *Live* (a feed of in-flight runs). On narrow
+  viewports it collapses to a "Needs you (N)" badge in the header.
+- **Decisions Inbox** (`/inbox`) — the single place every approval gate
+  lands as one unified card: scroll-approval, dependency, tool-forge,
+  evolution, harness-escalation, and recovery gates. **Approve executes**
+  — approving a card runs the same action the CLI would (e.g. approving a
+  scroll triggers activity extraction).
+
+### Gate modes
+
+Settings exposes a gate-mode dial that controls how the runtime handles
+approval gates:
+
+| Mode | Behaviour |
+|---|---|
+| **Risk-tiered** (default) | The Governor auto-grants low-risk requests and escalates the rest to the Inbox |
+| **Approve-only** | Every gate waits for the operator |
+| **Bypass** | Auto-grants every gate **except** the safety floor (dependency/recovery gates) — dev/test only |
+
+A safety **floor** keeps dependency and recovery gates interactive even
+under Bypass unless explicitly disabled. The same dial is available from
+the CLI via `sharing_on decisions mode`.
+
+> **Legacy URLs still work.** `/army` redirects to `/shadows`;
+> `/systemu-chat`, `/memory`, `/flywheel`, and `/notifications` redirect
+> into their merged tabs. The old `/workshop` route is gone — its scroll
+> rebuild is now an in-place dialog on the Scrolls view.
 
 ---
 
@@ -465,10 +526,15 @@ project-systemu-pro/
 │   │   ├── affinity_log.py                 — Activity-shadow routing memory
 │   │   ├── inadequacy_tracker.py           — Cross-shadow tool-inadequacy clustering
 │   │   ├── rejection_store.py              — Operator-feedback learning
+│   │   ├── governor.py                      — Reverse-Harness Governor (arbitrate + materialise capability PULLs)
+│   │   ├── harness_arbiter.py               — Deterministic GRANT/DENY/ESCALATE policy
+│   │   ├── gate_mode_settings.py            — Gate-mode dial (bypass / risk-tiered / approve-only) + floor
 │   │   ├── tool_sandbox.py                 — Subprocess / docker / wsl / ssh exec
 │   │   └── tool_registry.py                — Runtime tool loader
 │   ├── interface/                        — NiceGUI dashboard + REST API
-│   │   └── pages/                          — /chat, /scrolls, /tools, /skills, /workflow
+│   │   ├── pages/                          — Home, Work, Shadows, Build, Insights, Settings, Inbox, Chat
+│   │   ├── command/                         — Shared command layer (Inbox queue, gates, verbs)
+│   │   └── cli_commands.py                  — Systemu CLI groups (scrolls/army/tools/skills/decisions/…)
 │   ├── messaging/                        — Optional Telegram gateway
 │   ├── prompts/                          — Tier-1/2/3 prompt library
 │   ├── queue/                            — In-process / SQLite / Redis priority queues
@@ -481,10 +547,10 @@ project-systemu-pro/
 │   ├── scheduler/                        — Daemon + recurring jobs
 │   └── worker.py                         — Background worker entry point
 │
-├── alembic/versions/                   — DB schema migrations (0001–0007)
+├── alembic/versions/                   — DB schema migrations (0001–0010)
 ├── extension/                          — Chrome extension for web-event capture
 ├── docs/                               — Architecture, getting-started, messaging
-├── tests/                              — pytest suite (840 passed at v0.6.1)
+├── tests/                              — pytest suite
 ├── docker-compose.yml
 ├── Dockerfile
 ├── install.py / install.sh / install.bat
@@ -510,6 +576,30 @@ captures/
 The `instructions.md` is converted into a Systemu **Scroll** when you submit the capture to the dashboard.
 
 **Privacy:** keystrokes are NOT recorded; clipboard auto-redacts secrets; no data leaves your machine until the LLM analysis step.
+
+---
+
+## CLI reference
+
+Everything in the dashboard is also driven from the `sharing_on` CLI.
+Run `sharing_on --help` (or `sharing_on <group> --help`) for the full
+surface; the headline groups:
+
+| Command | Purpose |
+|---|---|
+| `sharing_on record` / `analyze` | Capture a workflow / re-analyze a recorded session |
+| `sharing_on init` | Seed the working-directory vault from the bundled starter catalog |
+| `sharing_on daemon start` / `stop` / `status` | Run the background daemon + web dashboard |
+| `sharing_on doctor <id>` | Diagnose pending gates/blockers for a scroll/activity/shadow/tool (`--apply` to auto-fix) |
+| `sharing_on scrolls list` / `show` / `refine` / `approve` | Manage Scrolls (refined SOPs) |
+| `sharing_on army list` / `show` / `awaken` / `execute` | Manage and run Shadows |
+| `sharing_on tools list` / `forge` / `dry-run` / `enable` / `recalibrate` | Manage the tool registry + its forge gates |
+| `sharing_on skills list` / `export` / `deprecate` | Manage Skills (export to a portable Agent Skill) |
+| `sharing_on evolve run` / `show-pending` / `apply` | Run and apply the Evolution Engine |
+| `sharing_on decisions list` / `mode` / `resolve` | The Decisions Inbox from the terminal; `mode` sets the gate-mode dial |
+| `sharing_on chat submit` / `history` | Run a free-text task through the full pipeline |
+| `sharing_on settings show` / `set` | Inspect / write allow-listed configuration |
+| `sharing_on session` · `capability` · `skill` · `user` | Inspect episodic memory, the capability ledger, bundled skills, and your profile |
 
 ---
 
@@ -546,7 +636,7 @@ including the explicit guidelines for AI-authored PRs.
 
 ## Project status
 
-Pre-1.0.  Current release: **v0.7.0** (see [CHANGELOG](CHANGELOG.md) for what's new).  The table below summarises what's shipped vs. what's next.
+Pre-1.0.  Current release: **v0.9.11** (see [CHANGELOG](CHANGELOG.md) for what's new).  The table below summarises what's shipped vs. what's next.
 
 ### Shipped
 
@@ -563,13 +653,16 @@ Pre-1.0.  Current release: **v0.7.0** (see [CHANGELOG](CHANGELOG.md) for what's 
 | **v0.5.1** | Recalibration deferred items — override actions, spec-diff visualisation, low-risk auto-approve, cross-shadow inadequacy clustering, true snapshot-based resume |
 | **v0.6.0** | Intent-aware extraction pipeline (root-cause fix) — capture intent extractor, intent-aware scroll validator + remediation, schema-aware tool/skill selection, skill intent contracts + recalibration, intent-driven tool forge, intent-aware shadow tiebreak |
 | **v0.6.1** | Post-v0.6.0 hardening — `Tool.name` path-traversal guard, `SYSTEMU_AUTO_APPROVE_SCROLLS` → `SYSTEMU_NON_INTERACTIVE` rename with safe-action ordering, `RECALIBRATE_SKILL` runtime wiring, catalog N+1 fix, batched `save_skill` resolution |
+| **v0.7.x** | PyPI/Docker packaging, native LLM provider plugins (Anthropic/OpenAI), `export-skill` wedge + spec-conformant `SKILL.md` writer, episodic-memory + capability ledger |
+| **v0.8.x** | Decisions Inbox + gate-mode dial, `SYSTEMU_DECISION_QUEUE` for dashboard-driven approvals, wheel-bundled starter vault (`sharing_on init`) |
+| **v0.9.x** | Reverse-Harness Governor (capability PULL arbitration, TOOL provisioner + escalate→approve→resume) and the six-spine command-center dashboard (Home/Work/Shadows/Build/Insights/Settings) with the persistent right rail |
 
 ### What's next
 
 The next-phase work is open for design.  Likely candidates (not yet scheduled):
 
 - Auto-recalibration without operator approval for low-risk **skill** patterns (telemetry-gated promotion)
-- Visual workflow editor on the dashboard (today's UI is read-mostly)
+- Harness provisioners beyond TOOL (SKILL / ACCESS / COMPUTE / SUBAGENT are currently arbitration + observation only)
 - Multi-tenant deployment + per-operator vaults
 - Hosted catalog of community-contributed tools / skills
 
