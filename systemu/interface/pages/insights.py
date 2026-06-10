@@ -1,15 +1,18 @@
-"""Insights — tabbed parent page hosting Memory, Flywheel, Events, and Pending
-Actions panels.
+"""Insights — tabbed parent page hosting Memory, Flywheel, and Events panels.
 
 v0.7.2 sidebar consolidation: three small read-only analytics surfaces that
 used to live as separate top-level routes (/memory, /flywheel,
 /notifications) are now tabs inside one /insights destination.  The
 underlying page builders are unchanged — this module only composes them.
 
-v0.8.0 adds a fourth "actions" tab that renders pending OperatorDecision
-cards from the decision queue (Pattern 1).
+Phase 5 Slice 4d: the former "actions" tab (a 4th OperatorDecision surface)
+is REMOVED.  Decisions now live in EXACTLY one place — the Inbox (right rail
++ /inbox page + Console mini-pane).  ``/insights?tab=actions`` deep-links
+redirect to /inbox so bookmarks + notification links don't 404.  The shared
+helpers ``_build_pending_decision_view_model`` and ``render_decision_card``
+remain — the Console pending-actions mini-pane imports the latter.
 
-Direct-link to a specific tab via ``/insights?tab=memory|flywheel|events|actions``.
+Direct-link to a specific tab via ``/insights?tab=memory|flywheel|events``.
 The legacy URLs (/memory, /flywheel, /notifications) are preserved as
 redirect handlers in ``dashboard.py`` so bookmarks + notification deep
 links continue to work.
@@ -30,7 +33,26 @@ from systemu.interface.pages.notifications_page import build_notifications_page
 
 logger = logging.getLogger(__name__)
 
-_VALID_TABS = ("memory", "flywheel", "events", "actions")
+_VALID_TABS = ("memory", "flywheel", "events")
+
+#: Sentinel returned by ``_resolve_tab`` when the requested tab is the removed
+#: decision-surface ("actions") — the caller redirects to /inbox instead.
+REDIRECT_INBOX = "REDIRECT_INBOX"
+
+
+def _resolve_tab(tab: str | None) -> str:
+    """Pure tab-normalizer for the Insights query string.
+
+    Returns one of ``_VALID_TABS``, or the ``REDIRECT_INBOX`` sentinel when
+    the caller asked for the removed ``actions`` decision-surface (Slice 4d).
+    Anything else (unknown / empty / None) normalizes to the default tab so a
+    stale deep-link lands somewhere sensible instead of 404-ing.
+    """
+    if tab == "actions":
+        return REDIRECT_INBOX
+    if tab in _VALID_TABS:
+        return tab
+    return "memory"
 
 
 def build_structured_answer(questions: list, values: dict) -> str:
@@ -40,14 +62,19 @@ def build_structured_answer(questions: list, values: dict) -> str:
 
 
 def build_insights_page(default_tab: str = "memory") -> None:
-    """Render the Insights page with four tabs.
+    """Render the Insights page with three tabs (Memory / Flywheel / Events).
 
     Args:
         default_tab: Which tab is active on load.  Falls back to ``memory``
                      when the query string supplies anything unrecognised.
+                     ``?tab=actions`` (the removed decision-surface) redirects
+                     to /inbox — decisions live only in the Inbox now.
     """
-    if default_tab not in _VALID_TABS:
-        default_tab = "memory"
+    resolved = _resolve_tab(default_tab)
+    if resolved == REDIRECT_INBOX:
+        ui.navigate.to("/inbox")
+        return
+    default_tab = resolved
 
     ui.label("Insights").style(
         f"font-size: 28px; font-weight: 800; color: {THEME['text']}; margin-bottom: 4px;"
@@ -65,7 +92,6 @@ def build_insights_page(default_tab: str = "memory") -> None:
         ui.tab("memory", label="💡 Memory")
         ui.tab("flywheel", label="🔁 Flywheel")
         ui.tab("events", label="🔔 Manual Logs")
-        ui.tab("actions", label="⏳ Pending Actions")
 
     # ── Tab panels ──────────────────────────────────────────────────────────
     # Each panel calls the existing page builder verbatim — no logic moves.
@@ -93,8 +119,6 @@ def build_insights_page(default_tab: str = "memory") -> None:
             )
             ui.separator().style("margin: 16px 0;")
             build_notifications_page()
-        with ui.tab_panel("actions"):
-            _render_pending_decisions()
 
 
 def _build_pending_decision_view_model(vault):
@@ -260,61 +284,10 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                 )
 
 
-@ui.refreshable
-def _render_pending_decisions() -> None:
-    """Render the Pending Actions tab — OperatorDecision cards from
-    the v0.8.0 queue (Pattern 1).
-
-    For each pending decision, draws one card with:
-      - Title + body
-      - Action buttons (one per option) wired to queue.resolve(...)
-      - Context (collapsed) for the operator to inspect.
-
-    Decorated with @ui.refreshable so resolve button handlers can call
-    _render_pending_decisions.refresh() to drop the card in-place without
-    a full page reload.
-    """
-    from systemu.interface.dashboard_state import AppState
-
-    state = AppState.get()
-    view = _build_pending_decision_view_model(state.vault)
-
-    if isinstance(view, dict) and view.get("_no_vault"):
-        ui.label("Vault unavailable.").style(
-            f"color: {THEME['text_muted']}; padding: 16px;"
-        )
-        return
-    if isinstance(view, dict) and "_error" in view:
-        ui.label(f"Failed to load pending decisions: {view['_error']}").style(
-            f"color: {THEME['danger']}; padding: 16px;"
-        )
-        return
-    if isinstance(view, dict) and view.get("_empty"):
-        ui.label(
-            "No pending operator decisions. (When a CLI subprocess "
-            "asks for a decision in queue-mode, it will appear here.)"
-        ).style(
-            f"color: {THEME['text_muted']}; padding: 16px;"
-        )
-        return
-
-    # view is a list of card dicts. Phase 3 Batch 3 (render unification):
-    # gate-owned rows (context.kind=="gate") render via the UNIFIED Inbox card
-    # so the /insights actions tab is no longer split-brained from /inbox.
-    # Non-gate rows (legacy harness_review / structured_question / credential /
-    # operator-notify posts) keep the legacy render_decision_card fallback so
-    # nothing vanishes mid-migration.
-    from systemu.approval.decision_queue import OperatorDecisionQueue
-    from systemu.interface.pages.inbox_page import render_inbox_gate_cards
-
-    queue = OperatorDecisionQueue(state.vault)
-
-    # 1) Unified gate cards (one render path, shared with /inbox).
-    render_inbox_gate_cards(
-        state.vault, on_resolved=_render_pending_decisions.refresh)
-
-    # 2) Legacy-context fallback for non-gate rows.
-    for card in view:
-        if (card.get("context") or {}).get("kind") == "gate":
-            continue  # already rendered above as a unified card
-        render_decision_card(card, queue, _render_pending_decisions.refresh)
+# NOTE (Phase 5 Slice 4d): the former ``_render_pending_decisions`` Insights
+# "actions" tab renderer was removed.  It was a 4th OperatorDecision surface
+# that re-rendered the SAME unified gate cards as the Inbox (via
+# ``render_inbox_gate_cards``) — a split-brain the Inbox now owns alone.  The
+# pure helper ``_build_pending_decision_view_model`` and the shared
+# ``render_decision_card`` above intentionally remain: the Console
+# pending-actions mini-pane imports ``render_decision_card``.

@@ -772,3 +772,26 @@ class TestEventsFilter:
         ]
         out = _filter_events(all_events, "all")
         assert len(out) == 2
+
+
+class TestShadowsConsolidationEntryPoint:
+    """Phase 5 Slice 4d-2 — consolidation belongs to Shadows (per IA §5).
+
+    The memory-consolidation surface (build_memory_consolidation_page) still
+    lives at /insights?tab=memory; the Shadows page just surfaces it.
+    """
+
+    def test_consolidation_route_helper(self):
+        from systemu.interface.pages.army import _memory_consolidation_route
+
+        # The current home of build_memory_consolidation_page.
+        assert _memory_consolidation_route() == "/insights?tab=memory"
+
+    def test_army_page_surfaces_consolidation(self):
+        import inspect
+        from systemu.interface.pages import army
+
+        src = inspect.getsource(army.build_army_page)
+        # The Shadows page must reference the consolidation entry point.
+        assert "_memory_consolidation_route" in src
+        assert "Memory consolidation" in src

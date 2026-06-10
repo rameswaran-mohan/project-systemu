@@ -18,13 +18,16 @@ _TILE_NAV = {
     "Evolutions":  "/evolutions",
 }
 
-# Edit deeplink entity type → Workshop tab label
+# Edit deeplink entity type → Workshop tab label.
+# Phase 5 Slice 2c: "activity" was dropped with the Workshop Activities tab
+# (it duplicated the /activities route).
+# Phase 5 Slice 3c: "tool" / "skill" were dropped with the Workshop Tools/Skills
+# tabs — those edits now happen in-page from the Build registry rows.
+# Phase 5 Slice 4c: "shadow" was dropped with the Workshop Shadows tab — shadow
+# edit now happens in-page from the Shadows (/army) cards.
+# Unknown types fall back to "Scrolls".
 _DEEPLINK_TAB = {
     "scroll":  "Scrolls",
-    "shadow":  "Shadows",
-    "tool":    "Tools",
-    "skill":   "Skills",
-    "activity": "Activities",
 }
 
 

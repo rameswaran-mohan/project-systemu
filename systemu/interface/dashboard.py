@@ -4,7 +4,7 @@ Starts a NiceGUI app on localhost:<port> (default 8765).
 Provides a persistent sidebar navigation and six page routes:
   /              Overview (stat cards + activity feed)
   /scrolls       Scroll list + detail
-  /army          Shadow Army card grid
+  /army          Shadows card grid
   /tools         Tool registry
   /evolutions    Evolution proposals + history
   /settings      LLM tier config + auto-approve
@@ -55,73 +55,53 @@ def _autoforge_banner_message() -> "str | None":
 #  Nav layout helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-# v0.7.2: side-nav reorganised into 3 collapsible groups.  Each group is
-# (group_label, default_open, [(path, icon, label), ...]).  See the
-# "Sidebar Consolidation" design at
-# docs/superpowers/specs/2026-05-23-sidebar-consolidation-design.md
-# (or the inline plan at C:\Users\…\.claude\plans\velvet-sparking-dusk.md)
-# for the rationale.  Daily-driver routes ("Run") stay expanded; the
-# "Build" and "System" groups collapse to a single header line on load.
+# v0.9.11 Phase 5: the 6-spine command-center nav (flat — no groups).
+# Each spine points at its current primary route; sub-routes fold in over
+# Slices 2-4 (repoint + redirect then). Inbox is NOT a spine — it lives in
+# the persistent right rail + the /inbox page (plus the header "Needs you"
+# badge for narrow viewports).
 #
 # URL routes for the merged pages (/systemu-chat → /chat?tab=live,
 # /memory|/flywheel|/notifications → /insights?tab=…) are preserved as
 # redirect handlers in register_routes() below — bookmarks and email
 # deep-links continue to work.
-
-# v0.8.8: Console is a standalone top item (ungrouped), rendered above the
-# grouped nav. Overview was removed from the Run group — Console at "/" is
-# the new home/console surface.
-NAV_TOP = ("/", "🖥️", "Console")
-
-NAV_GROUPS = [
-    ("Run", True, [
-        ("/chat",           "💬",  "Chat"),
-        ("/scrolls",        "📜",  "Scrolls"),
-        ("/army",           "👥",  "Shadows"),
-        ("/activities",     "📋",  "Activities"),
-    ]),
-    ("Build", False, [
-        ("/tools",          "🔧",  "Tools"),
-        ("/skills",         "🧠",  "Skills"),
-        ("/workshop",       "🛠️",  "Workshop"),
-        ("/evolutions",     "🧬",  "Evolutions"),
-    ]),
-    ("System", False, [
-        ("/inbox",          "📥",  "Inbox"),
-        ("/insights",       "📊",  "Insights"),
-        ("/settings",       "⚙️",  "Settings"),
-    ]),
+NAV_SPINES = [
+    ("/",         "🏠", "Home"),
+    ("/work",     "📋", "Work"),      # Slice 2a: workflow-centric list (scrolls+activities fold in)
+    ("/army",     "👥", "Shadows"),
+    ("/tools",    "🔧", "Build"),     # tools+skills+evolutions fold in (Slice 3)
+    ("/insights", "📊", "Insights"),
+    ("/settings", "⚙️", "Settings"),
 ]
+NAV_ITEMS = NAV_SPINES   # back-compat alias (callers iterate (path, icon, label))
 
-# Back-compat flat list — Console first, then all grouped items.
-NAV_ITEMS = [NAV_TOP] + [item for _, _, items in NAV_GROUPS for item in items]
-
-# Deep detail pages have no nav entry of their own; they highlight their
-# spine parent.  (Exact active-route — fixes the P11 startswith sub-item.)
-NAV_DEEP_PARENT = {
-    "/workflow": "/activities",
-    "/memory":   "/army",
+# Every current route → its spine (for exact active-route highlighting).
+SPINE_OF = {
+    "/": "/",
+    "/work": "/work", "/scrolls": "/work", "/activities": "/work", "/workflow": "/work", "/chat": "/work",
+    "/army": "/army", "/memory": "/army",
+    "/tools": "/tools", "/skills": "/tools", "/workshop": "/tools", "/evolutions": "/tools",
+    "/insights": "/insights",
+    "/settings": "/settings",
+    # /inbox intentionally absent → no left-nav highlight (right rail owns it)
 }
 
 
-def active_nav_path(current_path: str, nav_paths: list) -> str:
-    """Return the ONE nav path that should render active for current_path.
-
-    Exact match wins; a deep detail page (/workflow/{id}, /memory/{id}) maps
-    to its spine parent; a path whose first segment is itself a nav root
-    (e.g. /scrolls/abc -> /scrolls) highlights that root.  Returns "" when no
-    nav entry should be active — no char-prefix false positives (the old
-    `startswith` lit /tools for /toolsmith).
-    """
-    if current_path in nav_paths:
-        return current_path
+def spine_of(current_path: str) -> str:
+    """Return the 6-spine nav path a given route belongs to ("" if none —
+    e.g. /inbox, which lives in the right rail)."""
+    if current_path in SPINE_OF:
+        return SPINE_OF[current_path]
     first = "/" + current_path.lstrip("/").split("/", 1)[0]
-    parent = NAV_DEEP_PARENT.get(first)
-    if parent and parent in nav_paths:
-        return parent
-    if first != "/" and first in nav_paths:
-        return first
-    return ""
+    return SPINE_OF.get(first, "")
+
+
+def active_nav_path(current_path: str, nav_paths: list) -> str:
+    """The nav spine to render active for current_path (exact via spine_of);
+    "" when no spine owns it — no char-prefix false positives (the old
+    `startswith` lit /tools for /toolsmith)."""
+    sp = spine_of(current_path)
+    return sp if sp in nav_paths else ""
 
 
 def _build_layout(page_title: str, current_path: str):
@@ -173,12 +153,11 @@ def _build_layout(page_title: str, current_path: str):
                     f"font-size: 18px; font-weight: 800; color: {THEME['text']};"
                 )
 
-            # v0.7.2: Nav links rendered in 3 collapsible groups.
-            # The active route's group is force-expanded so the operator
-            # always sees the current page even if the group is collapsed
-            # by default.  Group state is per-page-load (no persistence
-            # this release — visual reorg only per the design).
-            nav_paths = [p for p, _, _ in NAV_ITEMS]
+            # v0.9.11 Phase 5: flat 6-spine nav — no groups, no expansion.
+            # The active spine is resolved once via spine_of (exact, then
+            # first-segment), so folded sub-routes (/activities, /skills,
+            # /workflow/{id}, …) highlight their owning spine.
+            nav_paths = [p for p, _i, _l in NAV_SPINES]
             active_path = active_nav_path(current_path, nav_paths)
 
             def _render_nav_link(path: str, icon: str, label: str) -> None:
@@ -194,26 +173,8 @@ def _build_layout(page_title: str, current_path: str):
                     ui.label(icon).style("min-width: 22px; text-align: center;")
                     ui.label(label).classes("s-sidebar-label")
 
-            def _group_contains_active(items) -> bool:
-                return any(active_path == path for path, _icon, _label in items)
-
-            # v0.8.8: standalone Console link, above the grouped nav
-            _render_nav_link(*NAV_TOP)
-
-            for group_label, default_open, items in NAV_GROUPS:
-                # Force-expand the group containing the active route — even
-                # if its default is collapsed — so the operator never loses
-                # sight of where they currently are.
-                open_now = default_open or _group_contains_active(items)
-                with ui.expansion(group_label, value=open_now).classes(
-                    "s-sidebar-group"
-                ).style(
-                    f"width: 100%; color: {THEME['text_muted']}; "
-                    f"font-size: 11px; font-weight: 700; letter-spacing: 0.08em; "
-                    f"text-transform: uppercase;"
-                ):
-                    for path, icon, label in items:
-                        _render_nav_link(path, icon, label)
+            for path, icon, label in NAV_SPINES:
+                _render_nav_link(path, icon, label)
 
             # Spacer + daemon status
             ui.space()
@@ -299,6 +260,34 @@ def _build_layout(page_title: str, current_path: str):
                 )
                 
                 with ui.row().style("gap: 12px; align-items: center;"):
+                    # "Needs you (N)" — Phase 5 amendment A1: the always-
+                    # visible Inbox fallback.  The right rail dies <1100px and
+                    # the sidebar collapses at 768px; this HEADER badge is the
+                    # narrow-viewport path to parked harness gates.  Token
+                    # classes only (s-pill tint) — zero new inline f-styles.
+                    try:
+                        from systemu.interface.dashboard_state import AppState as _NyState
+                        _ny_state = _NyState.get()
+                        _ny_vault = getattr(_ny_state, "vault", None) if _ny_state else None
+                    except Exception:
+                        _ny_vault = None
+                    _ny_model = needs_you_badge_model(_ny_vault)
+                    needs_you_badge = ui.link(
+                        f"📥 Needs you ({_ny_model['count']})",
+                        _ny_model["target"],
+                    ).classes("s-pill s-pill--warn").style(
+                        "text-decoration: none; cursor: pointer;"
+                    )
+                    needs_you_badge.set_visibility(_ny_model["visible"])
+
+                    def _update_needs_you():
+                        m = needs_you_badge_model(_ny_vault)
+                        needs_you_badge.set_text(f"📥 Needs you ({m['count']})")
+                        needs_you_badge.set_visibility(m["visible"])
+
+                    from systemu.interface.ui_helpers import safe_timer as _ny_timer
+                    _ny_timer(2.0, _update_needs_you)
+
                     # ＋New — the global creation menu (Record session / Submit
                     # task).  Trigger uses the design-system primitive (token
                     # classes, no inline f-style); the dropdown uses the
@@ -471,6 +460,26 @@ def plus_new_menu_items() -> list:
     return ["Record session", "Submit task"]
 
 
+def needs_you_badge_model(vault) -> dict:
+    """Pure model for the header "Needs you (N)" badge (Phase 5, amendment A1).
+
+    Counts pending gates via ``InboxQueue(vault).list_descriptors()``.  The
+    Phase-4 right rail hides below 1100px and the sidebar collapses at 768px,
+    so this header badge is the narrow-viewport path to parked harness gates
+    — it always targets ``/inbox`` (demoted from the left nav in Slice 1).
+
+    Defensive: ANY failure (no vault, unreadable decision store, …) yields
+    ``count 0 / hidden`` — the badge must never break the page shell.
+    """
+    count = 0
+    try:
+        from systemu.interface.command.inbox import InboxQueue
+        count = len(InboxQueue(vault).list_descriptors())
+    except Exception:
+        count = 0
+    return {"count": count, "visible": count > 0, "target": "/inbox"}
+
+
 # ── Dashboard Global Job Management Buttons ──
 
 # NOTE: _show_record_dialog is kept for backward compatibility with overview.py imports
@@ -620,6 +629,7 @@ def register_routes() -> None:
     from systemu.interface.pages.insights                  import build_insights_page
     from systemu.interface.pages.inbox_page                 import build_inbox_page
     from systemu.interface.pages.workflow_detail           import build_workflow_detail_page
+    from systemu.interface.pages.work                      import build_work_page
     from systemu.interface.pages import recover as _recover_page_module  # noqa: F401  # registers /recover/<scope>/<id>
 
     @ui.page("/")
@@ -627,9 +637,19 @@ def register_routes() -> None:
         with _build_layout("🖥️ Console", "/"):
             build_console_page()
 
+    # ── Work (Phase 5 Slice 2a: the workflow-centric Work spine page) ─────
+    # /scrolls and /activities stay registered below — they fold into /work
+    # via redirects in a later slice; for now only the nav repoints here.
+    @ui.page("/work")
+    def page_work():
+        with _build_layout("📋 Work", "/work"):
+            build_work_page()
+
     @ui.page("/workflow/{workflow_id}")
     def page_workflow_detail(workflow_id: str):
-        with _build_layout(f"🔄 Workflow — {workflow_id}", "/"):
+        # Pass the REAL path so spine_of highlights the Work spine
+        # (/scrolls) — this page used to claim "/" and lit Home.
+        with _build_layout(f"🔄 Workflow — {workflow_id}", f"/workflow/{workflow_id}"):
             build_workflow_detail_page(workflow_id)
 
     @ui.page("/scrolls")
@@ -639,7 +659,7 @@ def register_routes() -> None:
 
     @ui.page("/army")
     def page_army():
-        with _build_layout("👥 Shadow Army", "/army"):
+        with _build_layout("👥 Shadows", "/army"):
             build_army_page()
 
     # ── Insights (v0.7.2: tabbed parent for Memory / Flywheel / Events) ───
@@ -653,8 +673,10 @@ def register_routes() -> None:
     @ui.page("/memory/{shadow_id}")
     def page_shadow_memory(shadow_id: str):
         # Per-shadow memory view stays its own page — it's deep-linked from
-        # the Insights → Memory tab's "View memory" buttons.
-        with _build_layout(f"🧠 Memory — {shadow_id}", "/insights"):
+        # the Insights → Memory tab's "View memory" buttons.  Pass the REAL
+        # path so spine_of highlights the Shadows spine (/army) — this page
+        # used to claim "/insights".
+        with _build_layout(f"🧠 Memory — {shadow_id}", f"/memory/{shadow_id}"):
             build_shadow_memory_page(shadow_id)
 
     @ui.page("/activities")

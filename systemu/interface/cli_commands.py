@@ -439,49 +439,26 @@ def skills_deprecate(ctx, skill_id, reason, reactivate):
     effectiveness_score < 0.5.  Use this command when the v0.6.0-d.5 startup
     deprecation sweep hasn't gated a known-bad skill (e.g., weather_report_creation).
     """
-    import json
-    from datetime import datetime, timezone
-    from pathlib import Path
+    # v0.9 Phase-5 3b: one mechanism — both the CLI and the Skills-page buttons
+    # call skill_lifecycle.deprecate_skill (score flip + history append +
+    # save_skill + audit jsonl). Keeps the CLI's get_skill error contract.
+    from systemu.pipelines.skill_lifecycle import deprecate_skill
 
     _, vault = _get_vault_and_config(ctx)
     try:
-        skill = vault.get_skill(skill_id)
+        result = deprecate_skill(
+            skill_id, reason=reason, reactivate=reactivate, vault=vault,
+        )
     except Exception as exc:
         console.print(f"[red]× skill {skill_id} not found: {exc}[/red]")
         ctx.exit(1)
-
-    new_score = 1.0 if reactivate else 0.0
-    action = "reactivate" if reactivate else "deprecate"
-
-    skill.effectiveness_score = new_score
-    if not hasattr(skill, "evolution_history") or skill.evolution_history is None:
-        skill.evolution_history = []
-    skill.evolution_history.append({
-        "ts": datetime.now(tz=timezone.utc).isoformat(),
-        "action": action,
-        "reason": reason,
-    })
-    vault.save_skill(skill)
-
-    # Audit log — append to data/skill_deprecations.jsonl
-    try:
-        log_path = Path("data/skill_deprecations.jsonl")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "skill_id": skill_id,
-                "name": getattr(skill, "name", ""),
-                "action": action,
-                "reason": reason,
-                "ts": datetime.now(tz=timezone.utc).isoformat(),
-            }) + "\n")
-    except Exception:
-        pass  # audit is best-effort
+        return
 
     icon = "▲" if reactivate else "▼"
     console.print(
-        f"[green]{icon} {action.title()}d {skill_id} "
-        f"({getattr(skill, 'name', '?')}) — effectiveness_score={new_score}[/green]"
+        f"[green]{icon} {result['action'].title()}d {skill_id} "
+        f"({result['name'] or '?'}) — "
+        f"effectiveness_score={result['effectiveness_score']}[/green]"
     )
 
 

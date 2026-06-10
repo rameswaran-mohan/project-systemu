@@ -59,6 +59,7 @@ body, html {{ background: var(--color-bg) !important; color: var(--color-text) !
 .s-btn--ghost {{ background: transparent; color: var(--color-text); border-color: var(--color-border); }}
 .s-btn--danger {{ background: var(--color-danger); color: #fff; }}
 .s-btn--success {{ background: var(--color-success); color: #fff; }}
+.s-btn--warn {{ background: var(--color-warn); color: #fff; }}
 
 .s-input {{ background: var(--color-surface2); color: var(--color-text); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 6px 10px; font-size: var(--type-md); }}
 
@@ -98,6 +99,18 @@ body, html {{ background: var(--color-bg) !important; color: var(--color-text) !
 .s-safe-default {{ background: color-mix(in srgb, var(--color-success) 14%, transparent); border: 1px solid color-mix(in srgb, var(--color-success) 40%, transparent); border-radius: var(--radius-sm); padding: var(--space-1) var(--space-2); color: var(--color-success); font-size: var(--type-sm); font-weight: 600; }}
 .s-field-label {{ color: var(--color-muted); font-size: var(--type-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
 .s-mono {{ font-family: 'SF Mono','Consolas',monospace; font-size: var(--type-xs); color: var(--color-muted); }}
+
+/* ── entity rows (shared tool/skill renderers — Phase 5 Slice 3) ── */
+.s-text-success {{ color: var(--color-success); }}
+.s-dryrun-cell {{ font-size: var(--type-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }}
+.s-dep-badge {{ display: inline-block; background: var(--color-surface2); color: var(--color-text); font-family: 'SF Mono','Consolas',monospace; font-size: 11px; padding: 2px 8px; border-radius: var(--radius-sm); border: 1px solid var(--color-border); white-space: nowrap; }}
+.s-tool-chip {{ display: inline-block; background: var(--color-surface2); color: var(--color-text); font-family: 'SF Mono','Consolas',monospace; font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--color-border); }}
+.s-skill-header {{ padding: 14px 18px; cursor: pointer; gap: 14px; }}
+.s-skill-row {{ }}
+.s-skill-row--deprecated {{ opacity: 0.72; }}
+.s-skill-cat {{ display: inline-block; background: color-mix(in srgb, var(--cat, var(--color-muted)) 20%, transparent); color: var(--cat, var(--color-muted)); font-size: 10px; font-weight: 700; padding: 3px 10px; border-radius: 12px; letter-spacing: 0.06em; white-space: nowrap; }}
+.s-skill-evidence {{ font-size: 11px; white-space: nowrap; }}
+.s-skill-md {{ background: var(--color-surface2); }}
 {_legacy_compat_css()}"""
 
 

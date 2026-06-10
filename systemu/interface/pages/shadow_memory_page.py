@@ -49,7 +49,7 @@ def build_shadow_memory_page(shadow_id: str) -> None:
                 f"background: {THEME['primary']}; color: white; border-radius: 8px; font-size: 13px;"
             )
             ui.button(
-                "← Back to Army",
+                "← Back to Shadows",
                 on_click=lambda _: ui.navigate.to("/army"),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
@@ -125,40 +125,17 @@ def _last_consolidated_label(md_text: str) -> str:
 
 
 def _trigger_consolidation(shadow_id: str) -> None:
-    """Run consolidation for one shadow synchronously and show the result."""
+    """Run consolidation for one shadow OFF-LOOP and refresh on completion.
+
+    P11: delegates to the shared async action (worker thread + ui.timer
+    marshal-back) so the multi-second LLM call never blocks the event loop.
+    The same helper backs the /insights Memory tab's per-shadow + run-all
+    buttons, so all three surfaces share one (off-loop) consolidation action.
+    """
     state = AppState.get()
-    vault = state.vault
-    config = state.config
+    from systemu.interface.memory_actions import run_one_async
 
-    try:
-        shadow = vault.get_shadow(shadow_id)
-    except KeyError:
-        ui.notify("Shadow not found.", type="negative")
-        return
-
-    md_text, buffer_entries = vault.load_shadow_memory(shadow_id)
-    if not buffer_entries:
-        ui.notify("No buffered lessons to consolidate.", type="warning")
-        return
-
-    ui.notify(f"Consolidating {len(buffer_entries)} lesson(s)…", type="info")
-
-    try:
-        # Reuse the scheduler's consolidation primitive so behaviour stays in sync
-        from systemu.scheduler.jobs import _consolidate_one, _graduate_memory_to_skills
-        new_md = _consolidate_one(shadow, md_text, buffer_entries, config)
-        if not new_md or not new_md.lstrip().startswith("---"):
-            ui.notify("Consolidation produced invalid output — buffer left intact.", type="negative")
-            return
-        vault.save_shadow_memory(shadow_id, new_md)
-        vault.clear_memory_buffer(shadow_id)
-        try:
-            _graduate_memory_to_skills(shadow, new_md, vault)
-        except Exception as exc:
-            logger.warning("Skill graduation failed: %s", exc)
-        ui.notify("Memory consolidated.", type="positive")
-        # Force the page to re-render with new state
-        ui.navigate.to(f"/memory/{shadow_id}")
-    except Exception as exc:
-        logger.error("Manual consolidation failed: %s", exc)
-        ui.notify(f"Consolidation failed: {exc}", type="negative")
+    run_one_async(
+        shadow_id, state.config, state.vault,
+        on_done=lambda: ui.navigate.to(f"/memory/{shadow_id}"),
+    )

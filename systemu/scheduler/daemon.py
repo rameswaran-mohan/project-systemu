@@ -424,10 +424,20 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         name="Daily Memory Consolidation",
         replace_existing=True,
     )
+    # v0.9 Phase-5 3f: cadence is operator-tunable via SYSTEMU_EVOLUTION_HOUR
+    # (Settings → Evolution schedule). Default 03:00 UTC — after memory
+    # consolidation. The cron trigger is fixed at boot, so a changed hour needs
+    # a daemon restart (the Settings card says so).
+    try:
+        _evolution_hour = int(os.environ.get("SYSTEMU_EVOLUTION_HOUR", "3"))
+        if not (0 <= _evolution_hour <= 23):
+            _evolution_hour = 3
+    except (TypeError, ValueError):
+        _evolution_hour = 3
     scheduler.add_job(
         daily_evolution_check,
         trigger="cron",
-        hour=3,     # 03:00 UTC — evolution runs after memory is consolidated
+        hour=_evolution_hour,   # default 03:00 UTC — after memory consolidation
         minute=0,
         id="evolution_check",
         name="Daily Evolution Check",

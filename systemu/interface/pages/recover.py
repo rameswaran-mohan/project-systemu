@@ -25,13 +25,17 @@ def _diagnose(scope: str, scope_id: str) -> List[RecoveryAction]:
     return method(scope_id)
 
 
-def _severity_color(sev: str) -> str:
-    return {"blocker": "red", "warning": "amber", "info": "blue"}.get(sev, "grey")
-
-
 def render_recovery_panel(scope: str, scope_id: str) -> None:
-    """Reusable component — embed inside any page."""
+    """Reusable component — embed inside any page.
+
+    Phase 5 Slice 2c: each row is the side-by-side remediation card
+    (Problem | Fix).  Apply-kinds run ``_handle_action`` below (THE single
+    shared apply path); gate-kinds open the unified Inbox card via an
+    on-demand recovery gate.  The old gate-review button that redirected to
+    ``fix_url`` (always this very panel — a self-referential loop) is
+    retired."""
     from systemu.interface.name_resolver import resolve_name, short_id
+    from systemu.interface.components.remediation_card import render_remediation_card
 
     actions = _diagnose(scope, scope_id)
     _v = _get_vault()
@@ -44,34 +48,7 @@ def render_recovery_panel(scope: str, scope_id: str) -> None:
             ui.label("No pending actions").classes("text-green-700")
             return
         for a in actions:
-            _render_action_row(a)
-
-
-def _render_action_row(a: RecoveryAction) -> None:
-    with ui.row().classes("w-full items-center"):
-        ui.icon("warning", color=_severity_color(a.severity)).classes("text-2xl")
-        with ui.column().classes("flex-grow"):
-            ui.label(f"{a.kind} - {a.reason}").classes("text-body1")
-            if a.fix_command:
-                ui.label(a.fix_command).classes("text-mono text-caption")
-        if a.kind in {"DEP_PENDING", "GATE_3_DISABLED", "MEMORY_POISONED"}:
-            ui.button(
-                "Approve & Apply",
-                on_click=lambda act=a: _handle_action_and_notify(act),
-            ).props("color=primary")
-        else:
-            ui.button(
-                "Open Gate Review",
-                on_click=lambda url=a.fix_url: ui.navigate.to(url),
-            )
-
-
-def _handle_action_and_notify(a: RecoveryAction) -> None:
-    try:
-        _handle_action(a)
-        ui.notify(f"Applied: {a.kind}", type="positive")
-    except Exception as e:
-        ui.notify(f"Failed: {e}", type="negative")
+            render_remediation_card(a, vault=_v)
 
 
 # ---- per-kind dispatch (Task 8) ----
@@ -147,7 +124,9 @@ def _handle_action(a: RecoveryAction, *, vault=None) -> None:
         _dispatch_enable_tool(a.scope_id, **kw)
     elif a.kind == "MEMORY_POISONED":
         _dispatch_reset_memory(a.scope_id, keep_successes=True, **kw)
-    # GATE_1_PENDING / GATE_2_PENDING route via fix_url, not handled here.
+    # GATE_1_PENDING / GATE_2_PENDING route via the on-demand recovery gate
+    # (remediation_card.ensure_recovery_gate -> unified Inbox card), whose
+    # resolve chain re-enters here through verbs.doctor_apply.
 
 
 @ui.page("/recover/{scope}/{scope_id}")

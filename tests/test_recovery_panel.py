@@ -39,12 +39,10 @@ def test_diagnose_unknown_scope_returns_empty(monkeypatch):
     assert recover._diagnose("widget", "w1") == []
 
 
-def test_severity_color_mapping():
-    from systemu.interface.pages import recover
-    assert recover._severity_color("blocker") == "red"
-    assert recover._severity_color("warning") == "amber"
-    assert recover._severity_color("info") == "blue"
-    assert recover._severity_color("nonsense") == "grey"
+# NOTE (Phase 5 Slice 2c): test_severity_color_mapping was removed with the
+# old flat row layout (_severity_color / _render_action_row).  The panel rows
+# are now the side-by-side remediation card; the severity→risk mapping is
+# covered by tests/test_remediation_card.py::TestSeverityRisk.
 
 
 def test_action_handler_routes_dep_pending_to_install(monkeypatch):

@@ -14,6 +14,7 @@ from typing import Dict, List
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME
+from systemu.runtime.memory_rules import needs_consolidation
 
 
 def build_memory_status() -> None:
@@ -89,12 +90,21 @@ def build_memory_status() -> None:
 def _collect_shadow_memory_stats(state, shadow: Dict) -> Dict:
     name      = shadow.get("name") or shadow.get("id", "?")
     shadow_id = shadow.get("id", "")
-    vault_dir = Path(state.config.vault_dir)
-    base      = vault_dir / "shadow_army" / shadow_id
+    vault     = state.vault
 
-    buffer_lines = _count_lines(base / "memory_buffer.jsonl")
-    memory_lines = _count_lines(base / "SHADOW_MEMORY.md")
-    pending      = buffer_lines >= 5  # current consolidator trigger
+    # Use the *parsed* buffer entries + memory text (the canonical inputs the
+    # consolidation page and the engine see) rather than raw file lines, and
+    # route the pending flag through the ONE shared needs_consolidation rule.
+    try:
+        md_text, buf = vault.load_shadow_memory(shadow_id)
+    except Exception:
+        md_text, buf = "", []
+
+    buffer_lines = len(buf)
+    memory_lines = _count_lines(
+        Path(state.config.vault_dir) / "shadow_army" / shadow_id / "SHADOW_MEMORY.md"
+    )
+    pending      = needs_consolidation(buf, md_text)
     return {
         "name":                  name,
         "shadow_id":             shadow_id,
