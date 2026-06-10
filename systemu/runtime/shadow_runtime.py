@@ -1824,6 +1824,229 @@ class ShadowRuntime:
         # ambiguous → treat as partial
         return ("finalize", finalize(status="partial"))
 
+    def _apply_materialised_grant(
+        self,
+        mat: Dict[str, Any],
+        *,
+        context,
+        tools,
+        tool_index,
+        current_ab,
+        iter_budget: int,
+    ) -> int:
+        """Apply a Governor ``materialise()`` outcome into THIS run.
+
+        Shared between the autonomous Governor GRANT path and the (deferred)
+        harness grant-resume replay so the two are byte-identical — resume
+        *applies* the operator's authoritative verdict, it never re-arbitrates.
+
+        Branches on the materialise dict's discriminating key:
+          * TOOL (``mat["tool"]``) — resolve → deploy inline (dry-run →
+            DEPLOYED+enabled) → append to the live ``tools`` / ``tool_index`` so
+            it is callable in THIS run; observation.
+          * COMPUTE (``mat["compute_grant"]``) — extend ``iter_budget`` by the
+            granted ``extra_iterations`` (clamped 0..100); observation.
+          * SKILL / ACCESS / SUBAGENT — observation only (parity with the
+            autonomous path, which narrates these today).
+          * failure (``mat["materialised"]`` falsy) — harness_grant_failed
+            observation carrying ``mat["reason"]`` and the request's fallback
+            (the caller stamps ``mat["fallback"]`` before calling).
+
+        Returns the possibly-updated ``iter_budget``.
+        """
+        if mat.get("materialised"):
+            # v0.9.7 Phase 3: the Governor materialises one of
+            # several harness KINDs; apply each into THIS run.
+            if mat.get("tool") is not None:
+                # ── TOOL: resolve → deploy inline → offer back ──
+                _tref = mat.get("tool")
+                _nt = None
+                for _resolve in (
+                    lambda: self.vault.get_tool(_tref),
+                    lambda: self.vault.find_tool_by_name(_tref),
+                ):
+                    try:
+                        _nt = _resolve()
+                        if _nt is not None:
+                            break
+                    except Exception:
+                        _nt = None
+                # v0.9.7 Phase 2: deploy the freshly-forged tool
+                # synchronously (dry-run → DEPLOYED + enabled) so it
+                # is callable in THIS run, not just a future one.
+                if _nt is not None and not getattr(_nt, "enabled", False):
+                    try:
+                        from systemu.pipelines.tool_deploy import deploy_forged_tool
+                        if deploy_forged_tool(_nt.id, self.vault, self.config).get("deployed"):
+                            try:
+                                _nt = self.vault.get_tool(_nt.id)
+                            except Exception:
+                                pass
+                    except Exception:
+                        logger.debug("[Runtime] forge-deploy failed", exc_info=True)
+                if _nt is not None and getattr(_nt, "enabled", False):
+                    tools.append(_nt)
+                    tool_index.append({
+                        "id": _nt.id, "name": _nt.name,
+                        "description": _nt.description,
+                        "parameter_names": list(getattr(_nt, "parameter_names", []) or []),
+                        "parameters_schema": dict(getattr(_nt, "parameters_schema", {}) or {}),
+                    })
+                    context.add_observation({
+                        "type": "harness_granted",
+                        "message": f"Capability provisioned and ready: '{_nt.name}'. You may call it now.",
+                        "tool": _nt.name,
+                    }, current_ab)
+                else:
+                    context.add_observation({
+                        "type": "harness_granted_pending",
+                        "message": (
+                            f"Capability '{getattr(_nt, 'name', _tref)}' was forged but is pending "
+                            "enablement/dry-run; it is not callable this run. Use an existing tool or FAIL."
+                        ),
+                    }, current_ab)
+            elif mat.get("compute_grant"):
+                # ── COMPUTE: extend THIS run's iteration budget ──
+                _cg = mat.get("compute_grant") or {}
+                _extra_it = max(0, min(int(_cg.get("extra_iterations", 0) or 0), 100))
+                if _extra_it:
+                    iter_budget += _extra_it
+                context.add_observation({
+                    "type": "harness_granted",
+                    "message": (
+                        f"Compute granted: +{_extra_it} iteration(s) "
+                        f"(budget now {iter_budget}). Continue toward the goal."
+                    ),
+                }, current_ab)
+            elif mat.get("skill"):
+                # ── SKILL: procedure authored to the vault ──
+                context.add_observation({
+                    "type": "harness_granted",
+                    "message": (
+                        f"Skill provisioned: {mat.get('skill')}. Its procedure is now "
+                        "available — follow it to complete the task."
+                    ),
+                }, current_ab)
+            elif mat.get("access"):
+                # ── ACCESS: a scoped capability lease was granted ──
+                context.add_observation({
+                    "type": "harness_granted",
+                    "message": (
+                        f"Access granted (scoped lease): {mat.get('access')}. "
+                        "Proceed with the operation it authorizes."
+                    ),
+                }, current_ab)
+            elif mat.get("subagent"):
+                # ── SUBAGENT: delegation capability granted ──
+                _sa = mat.get("subagent") or {}
+                context.add_observation({
+                    "type": "harness_granted",
+                    "message": (
+                        "Sub-agent delegation granted for: "
+                        f"{str(_sa.get('task', ''))[:160]}. Decompose and proceed within "
+                        "the granted depth/budget."
+                    ),
+                }, current_ab)
+            else:
+                context.add_observation({
+                    "type": "harness_granted",
+                    "message": "Capability provisioned. Proceed toward the goal.",
+                }, current_ab)
+        else:
+            _fallback = mat.get("fallback") or ""
+            context.add_observation({
+                "type": "harness_grant_failed",
+                "message": f"Provisioning failed: {mat.get('reason')}. {_fallback or 'Try an alternative or FAIL.'}",
+            }, current_ab)
+        return iter_budget
+
+    def _apply_harness_grant(
+        self,
+        payload: Dict[str, Any],
+        *,
+        context,
+        tools,
+        tool_index,
+        current_ab,
+        iter_budget: int,
+    ) -> int:
+        """Replay an operator-resolved harness grant into THIS (resumed) run.
+
+        ``payload`` is the ``grant_payload`` the daemon harness-grant reconciler
+        built once on Approve/Deny (Task 5) and ``resume_after_grant`` stamped onto
+        the snapshot as a ``__HARNESS_GRANT__`` note (peeled at resume-start). The
+        operator's verdict is AUTHORITATIVE — this method APPLIES it; it never
+        re-arbitrates and never re-calls the Governor.
+
+        Routing:
+          * DENY  (``payload["denied"]``) → a ``harness_grant_failed``-style
+            observation carrying the original request ``fallback`` (peeled from the
+            ``__HARNESS_PENDING__`` note); the run proceeds with its fallback.
+          * INPUT (kind == "input" / an ``operator_answer`` present) → inject the
+            answer as an observation; no helper call (INPUT is not a capability).
+          * else → reconstruct a per-kind *materialise dict* from ``payload`` and
+            route through the SHARED ``_apply_materialised_grant`` so resume is
+            byte-identical to an autonomous GRANT (TOOL deploy+register, COMPUTE
+            budget bump, SKILL/ACCESS/SUBAGENT observation).
+
+        Returns the possibly-updated ``iter_budget``.
+        """
+        payload = payload or {}
+        _kind = str(payload.get("kind", "") or "").lower()
+        _fallback = payload.get("fallback", "") or ""
+
+        # ── DENY: proceed with the agent's fallback (no re-escalate) ──────────
+        if payload.get("denied"):
+            context.add_observation({
+                "type": "harness_grant_failed",
+                "message": (
+                    "Operator denied the capability request: "
+                    f"{payload.get('rationale') or 'no reason given'}. "
+                    f"{_fallback or 'Proceed with an alternative approach or FAIL.'}"
+                ),
+            }, current_ab)
+            return iter_budget
+
+        # ── INPUT / ASK_OPERATOR: inject the operator's answer ────────────────
+        if _kind == "input" or payload.get("operator_answer") is not None:
+            _ans = payload.get("operator_answer", "")
+            context.add_observation({
+                "type": "harness_granted",
+                "message": (
+                    "Operator provided the requested input: "
+                    f"{_ans}. Use it to continue toward the goal."
+                ),
+            }, current_ab)
+            return iter_budget
+
+        # ── Capability kinds: reconstruct a materialise dict + reuse the helper ─
+        mat: Dict[str, Any] = {"materialised": True, "fallback": _fallback}
+        if _kind == "tool" or payload.get("granted_tool") or payload.get("tool_id"):
+            # _apply_materialised_grant resolves the tool ref via vault.get_tool /
+            # find_tool_by_name — prefer the id, fall back to the name.
+            mat["tool"] = payload.get("tool_id") or payload.get("granted_tool")
+            mat["tool_id"] = payload.get("tool_id")
+            mat["lease_id"] = payload.get("lease_id")
+        elif _kind == "compute" or payload.get("compute_grant"):
+            mat["compute_grant"] = payload.get("compute_grant") or {}
+            mat["lease_id"] = payload.get("lease_id")
+        elif _kind == "skill" or payload.get("skill"):
+            mat["skill"] = payload.get("skill")
+            mat["lease_id"] = payload.get("lease_id")
+        elif _kind == "access" or payload.get("access"):
+            mat["access"] = payload.get("access")
+            mat["apply"] = payload.get("apply")
+        elif _kind == "subagent" or payload.get("subagent"):
+            mat["subagent"] = payload.get("subagent")
+        else:
+            # Unknown/empty grant — narrate generically (helper's no-key branch).
+            pass
+
+        return self._apply_materialised_grant(
+            mat, context=context, tools=tools, tool_index=tool_index,
+            current_ab=current_ab, iter_budget=iter_budget,
+        )
+
     def _build_memory_context_for_prompt(self) -> str:
         """LLM-facing memory view (consolidated, not the raw execution_log).
         v0.6.9: also includes refined lessons from memory_buffer, filtered
@@ -1897,6 +2120,7 @@ class ShadowRuntime:
         self._consec_research_reads = 0
         self._research_loop_steers_used = 0
         self._resume_stuck_answer = None  # v0.8.22.1 (R6): (obj_id, answer) lifted from snapshot
+        self._resume_harness_grant = None  # v0.9.7 grant-resume: payload lifted from snapshot
         # v0.9.1 (Layer 4): reset verifier bookkeeping per run.
         self._objective_states.clear()
         self._fresh_work_since_last_verifier_call = False
@@ -2088,6 +2312,38 @@ class ShadowRuntime:
                                 self._resume_stuck_answer = (_obj_id, _ans)
                         except Exception:
                             logger.debug("[Runtime] resume stuck-answer parse failed", exc_info=True)
+                        # v0.9.7 grant-resume: peel a __HARNESS_GRANT__ note (the
+                        # operator's resolved grant, written by resume_after_grant)
+                        # plus the original __HARNESS_PENDING__ (carries the request
+                        # fallback/kind for the deny branch). Consumed at resume-start
+                        # via _apply_harness_grant → _apply_materialised_grant (the
+                        # SAME helper the autonomous GRANT path uses — no re-arbitrate).
+                        try:
+                            import json as _json
+                            _grant_note = next(
+                                (n for n in snap.sticky_notes
+                                 if n.startswith("__HARNESS_GRANT__::")), None)
+                            _pending_note = next(
+                                (n for n in snap.sticky_notes
+                                 if n.startswith("__HARNESS_PENDING__::")), None)
+                            if _grant_note:
+                                _gpayload = _json.loads(_grant_note.split("::", 2)[2])
+                                if _pending_note:
+                                    try:
+                                        _ppayload = _json.loads(
+                                            _pending_note.split("::", 2)[2])
+                                        # carry the original fallback so a DENY can
+                                        # tell the agent what to do instead.
+                                        _gpayload.setdefault(
+                                            "fallback", _ppayload.get("fallback", ""))
+                                        _gpayload.setdefault(
+                                            "kind", _ppayload.get("kind", ""))
+                                    except Exception:
+                                        pass
+                                self._resume_harness_grant = _gpayload
+                        except Exception:
+                            logger.debug("[Runtime] resume harness-grant parse failed",
+                                         exc_info=True)
                         logger.info(
                             "[Runtime] resumed from snapshot of %s — restored %d completed objective(s), %d sticky note(s)",
                             resume_from_execution_id,
@@ -2243,6 +2499,26 @@ class ShadowRuntime:
                     logger.debug("[Runtime] run-start verifier baseline capture failed",
                                  exc_info=True)
                     _run_verifier_baseline = None
+
+            # ── v0.9.7 grant-resume: consume a resume-start harness grant ──────
+            # When the run was parked on a blocking ESCALATE and the operator
+            # resolved it, resume_after_grant stamped a __HARNESS_GRANT__ note we
+            # peeled above into self._resume_harness_grant. Apply it now (BEFORE
+            # the loop), reusing the SAME _apply_materialised_grant the autonomous
+            # GRANT path uses — resume APPLIES the operator's authoritative verdict,
+            # it never re-arbitrates the request.
+            _hgrant = getattr(self, "_resume_harness_grant", None)
+            if _hgrant is not None:
+                self._resume_harness_grant = None
+                try:
+                    _iter_budget = self._apply_harness_grant(
+                        _hgrant, context=context, tools=tools,
+                        tool_index=tool_index, current_ab=current_ab,
+                        iter_budget=_iter_budget,
+                    )
+                except Exception:
+                    logger.debug("[Runtime] _apply_harness_grant failed — proceeding",
+                                 exc_info=True)
 
             while iteration < _iter_budget:
                 iteration += 1
@@ -2752,6 +3028,12 @@ class ShadowRuntime:
                                 kind=_hk, spec=decision.get("spec") or {},
                                 rationale=decision.get("rationale", ""),
                                 fallback=decision.get("fallback", ""),
+                                # v0.9.7 grant-resume: the agent may declare
+                                # blocking semantics — blocking=True parks the run
+                                # on a non-auto-grantable ESCALATE (suspend → resume
+                                # after the operator decides); blocking=False keeps
+                                # the proceed-with-fallback behaviour.
+                                blocking=bool(decision.get("blocking", True)),
                             )
                         _gov = governor or Governor(self.config)
                         _verdict = _gov.arbitrate(_req)
@@ -2760,123 +3042,100 @@ class ShadowRuntime:
                                 _req, _verdict, vault=self.vault,
                                 config=self.config, execution_id=execution_id,
                             )
-                            if _mat.get("materialised"):
-                                # v0.9.7 Phase 3: the Governor materialises one of
-                                # several harness KINDs; apply each into THIS run.
-                                if _mat.get("tool") is not None:
-                                    # ── TOOL: resolve → deploy inline → offer back ──
-                                    _tref = _mat.get("tool")
-                                    _nt = None
-                                    for _resolve in (
-                                        lambda: self.vault.get_tool(_tref),
-                                        lambda: self.vault.find_tool_by_name(_tref),
-                                    ):
-                                        try:
-                                            _nt = _resolve()
-                                            if _nt is not None:
-                                                break
-                                        except Exception:
-                                            _nt = None
-                                    # v0.9.7 Phase 2: deploy the freshly-forged tool
-                                    # synchronously (dry-run → DEPLOYED + enabled) so it
-                                    # is callable in THIS run, not just a future one.
-                                    if _nt is not None and not getattr(_nt, "enabled", False):
-                                        try:
-                                            from systemu.pipelines.tool_deploy import deploy_forged_tool
-                                            if deploy_forged_tool(_nt.id, self.vault, self.config).get("deployed"):
-                                                try:
-                                                    _nt = self.vault.get_tool(_nt.id)
-                                                except Exception:
-                                                    pass
-                                        except Exception:
-                                            logger.debug("[Runtime] forge-deploy failed", exc_info=True)
-                                    if _nt is not None and getattr(_nt, "enabled", False):
-                                        tools.append(_nt)
-                                        tool_index.append({
-                                            "id": _nt.id, "name": _nt.name,
-                                            "description": _nt.description,
-                                            "parameter_names": list(getattr(_nt, "parameter_names", []) or []),
-                                            "parameters_schema": dict(getattr(_nt, "parameters_schema", {}) or {}),
-                                        })
-                                        context.add_observation({
-                                            "type": "harness_granted",
-                                            "message": f"Capability provisioned and ready: '{_nt.name}'. You may call it now.",
-                                            "tool": _nt.name,
-                                        }, current_ab)
-                                    else:
-                                        context.add_observation({
-                                            "type": "harness_granted_pending",
-                                            "message": (
-                                                f"Capability '{getattr(_nt, 'name', _tref)}' was forged but is pending "
-                                                "enablement/dry-run; it is not callable this run. Use an existing tool or FAIL."
-                                            ),
-                                        }, current_ab)
-                                elif _mat.get("compute_grant"):
-                                    # ── COMPUTE: extend THIS run's iteration budget ──
-                                    _cg = _mat.get("compute_grant") or {}
-                                    _extra_it = max(0, min(int(_cg.get("extra_iterations", 0) or 0), 100))
-                                    if _extra_it:
-                                        _iter_budget += _extra_it
-                                    context.add_observation({
-                                        "type": "harness_granted",
-                                        "message": (
-                                            f"Compute granted: +{_extra_it} iteration(s) "
-                                            f"(budget now {_iter_budget}). Continue toward the goal."
-                                        ),
-                                    }, current_ab)
-                                elif _mat.get("skill"):
-                                    # ── SKILL: procedure authored to the vault ──
-                                    context.add_observation({
-                                        "type": "harness_granted",
-                                        "message": (
-                                            f"Skill provisioned: {_mat.get('skill')}. Its procedure is now "
-                                            "available — follow it to complete the task."
-                                        ),
-                                    }, current_ab)
-                                elif _mat.get("access"):
-                                    # ── ACCESS: a scoped capability lease was granted ──
-                                    context.add_observation({
-                                        "type": "harness_granted",
-                                        "message": (
-                                            f"Access granted (scoped lease): {_mat.get('access')}. "
-                                            "Proceed with the operation it authorizes."
-                                        ),
-                                    }, current_ab)
-                                elif _mat.get("subagent"):
-                                    # ── SUBAGENT: delegation capability granted ──
-                                    _sa = _mat.get("subagent") or {}
-                                    context.add_observation({
-                                        "type": "harness_granted",
-                                        "message": (
-                                            "Sub-agent delegation granted for: "
-                                            f"{str(_sa.get('task', ''))[:160]}. Decompose and proceed within "
-                                            "the granted depth/budget."
-                                        ),
-                                    }, current_ab)
-                                else:
-                                    context.add_observation({
-                                        "type": "harness_granted",
-                                        "message": "Capability provisioned. Proceed toward the goal.",
-                                    }, current_ab)
-                            else:
-                                context.add_observation({
-                                    "type": "harness_grant_failed",
-                                    "message": f"Provisioning failed: {_mat.get('reason')}. {_req.fallback or 'Try an alternative or FAIL.'}",
-                                }, current_ab)
+                            # The failure-fallback branch of the shared helper reads
+                            # the request's fallback off the materialise dict (the
+                            # only loop-local the helper signature doesn't carry).
+                            _mat.setdefault("fallback", _req.fallback)
+                            # v0.9.7 Phase 3: apply the materialised grant into THIS
+                            # run via the shared helper (same code the deferred harness
+                            # grant-resume replays → resume is byte-identical to an
+                            # autonomous grant; the helper returns the updated budget).
+                            _iter_budget = self._apply_materialised_grant(
+                                _mat, context=context, tools=tools, tool_index=tool_index,
+                                current_ab=current_ab, iter_budget=_iter_budget,
+                            )
+                        elif (_verdict.decision == HarnessDecision.ESCALATE
+                              and getattr(_req, "blocking", True)):
+                            # ── v0.9.7 grant-resume: BLOCKING ESCALATE → suspend ──
+                            # The Governor can neither auto-grant nor auto-deny a
+                            # blocking request — it needs an operator decision and
+                            # the run cannot proceed without the capability. Mirror
+                            # the stuck-park rail: snapshot the live execution (so a
+                            # resume can restore objectives + history), stamp a
+                            # __HARNESS_PENDING__ note (the daemon reconciler reads
+                            # kind/spec/fallback off it), surface the operator card,
+                            # then RETURN a suspended_harness_escalation result so the
+                            # Supervisor parks the activity (Task 1: _handle_result
+                            # leaves it ASSIGNED, no retry/dead-letter). The operator's
+                            # Approve → reconciler → resume_after_grant → resume-peel
+                            # (4b) replays the grant via _apply_materialised_grant.
+                            try:
+                                from systemu.runtime.execution_snapshot import (
+                                    capture_from_context, write_snapshot,
+                                )
+                                _snap = capture_from_context(
+                                    execution_id=execution_id,
+                                    shadow_id=getattr(shadow, "id", ""),
+                                    scroll_id=getattr(scroll, "id", ""),
+                                    iteration=iteration,
+                                    current_action_block=current_ab,
+                                    completed_objectives=set(completed_objectives),
+                                    context=context,
+                                    activity_id=getattr(activity, "id", ""),
+                                )
+                                import json as _json
+                                _snap.sticky_notes.append(
+                                    f"__HARNESS_PENDING__::{execution_id}::"
+                                    + _json.dumps({
+                                        "request_id": _req.request_id,
+                                        "kind":       _req.kind.value,
+                                        "spec":       _req.spec,
+                                        "fallback":   _req.fallback,
+                                    })
+                                )
+                                write_snapshot(_snap)
+                            except Exception:
+                                logger.debug("[Runtime] harness-escalate snapshot failed",
+                                             exc_info=True)
+                            try:
+                                from systemu.interface.harness_review import surface_harness_request
+                                _did = surface_harness_request(
+                                    _req, _verdict, execution_id=execution_id,
+                                    activity_id=activity.id, shadow_id=shadow.id,
+                                    vault=self.vault,
+                                )
+                                logger.info(
+                                    "[Runtime] harness blocking ESCALATE → parked "
+                                    "(snapshot written, operator card %s)", _did,
+                                )
+                            except Exception:
+                                logger.debug("[Runtime] surface_harness_request failed",
+                                             exc_info=True)
+                            _revoke_harness_leases()
+                            # Suspend-return — match the stuck-park's mechanism
+                            # (context.build_result) + carry the resume coords the
+                            # Supervisor's _handle_result / reconciler read.
+                            _susp = context.build_result(
+                                status="suspended_harness_escalation",
+                                final_summary=(
+                                    "Parked awaiting operator harness decision: "
+                                    f"{_req.kind.value} — {_verdict.rationale}"
+                                ),
+                            )
+                            _susp["activity_id"] = activity.id
+                            _susp["shadow_id"]   = shadow.id
+                            return _susp
                         else:
-                            # ESCALATE / DENY. v0.9.7 Phase 2: an ESCALATE surfaces an
-                            # operator decision card (the operator can approve/deny it
-                            # on the Pending Actions tab). The agent is told to proceed
-                            # with its fallback meanwhile. The full async suspend →
-                            # resume_after_grant → resume-injection round-trip is the
-                            # remaining P2.3 integration (building blocks committed:
-                            # supervisor.resume_after_grant + the suspend contract +
-                            # surface_harness_request).
+                            # Non-blocking ESCALATE or DENY: surface (ESCALATE only)
+                            # + tell the agent to proceed with its fallback; the loop
+                            # CONTINUES. (Non-blocking requests never park.)
                             if _verdict.decision == HarnessDecision.ESCALATE:
                                 try:
                                     from systemu.interface.harness_review import surface_harness_request
                                     _did = surface_harness_request(
-                                        _req, _verdict, execution_id=execution_id, vault=self.vault,
+                                        _req, _verdict, execution_id=execution_id,
+                                        activity_id=activity.id, shadow_id=shadow.id,
+                                        vault=self.vault,
                                     )
                                     logger.info("[Runtime] harness ESCALATE surfaced to operator: %s", _did)
                                 except Exception:

@@ -153,6 +153,244 @@ def _resume_on_decision_reconciler_job() -> None:
         logger.exception("[ResumeReconciler] job crashed")
 
 
+def _map_grant_payload(harness_kind: str, materialise: dict) -> dict:
+    """Map a Governor ``materialise()`` outcome dict → the per-kind
+    ``grant_payload`` that shadow_runtime's ``_apply_harness_grant`` consumes.
+
+    The operator's verdict is AUTHORITATIVE and already materialised here —
+    the payload is the REPLAY instruction the resumed run applies verbatim
+    (it never re-arbitrates, never re-calls the Governor). Keys are matched
+    exactly to ``_apply_harness_grant`` (shadow_runtime.py):
+
+      * TOOL     → reads ``tool_id`` / ``granted_tool`` (name) / ``lease_id``
+      * COMPUTE  → reads ``compute_grant`` (dict) / ``lease_id``
+      * SKILL    → reads ``skill`` / ``lease_id``
+      * ACCESS   → reads ``access`` / ``apply``
+      * SUBAGENT → reads ``subagent``
+      * INPUT    → reads ``operator_answer`` (handled by the caller, not here)
+
+    ``kind`` + ``granted`` are carried through for the helper's kind dispatch.
+    """
+    materialise = materialise or {}
+    kind = (harness_kind or "").lower()
+    payload: dict = {"kind": kind, "granted": True}
+    if kind == "tool":
+        payload["tool_id"] = materialise.get("tool_id")
+        # _apply_harness_grant resolves the tool ref via tool_id first, then
+        # the name — provide both (`tool` and `granted_tool` are aliases).
+        tool_name = materialise.get("tool")
+        payload["tool"] = tool_name
+        payload["granted_tool"] = tool_name
+        payload["lease_id"] = materialise.get("lease_id")
+    elif kind == "compute":
+        payload["compute_grant"] = materialise.get("compute_grant") or {}
+        payload["lease_id"] = materialise.get("lease_id")
+    elif kind == "skill":
+        payload["skill"] = materialise.get("skill")
+        payload["lease_id"] = materialise.get("lease_id")
+    elif kind == "access":
+        payload["access"] = materialise.get("access")
+        payload["apply"] = materialise.get("apply")
+        payload["lease_id"] = materialise.get("lease_id")
+    elif kind == "subagent":
+        payload["subagent"] = materialise.get("subagent")
+        payload["lease_id"] = materialise.get("lease_id")
+    # else: unknown/unmaterialised capability — kind+granted only; the helper
+    # narrates generically via its no-key branch.
+    return payload
+
+
+def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> int:
+    """Daemon-tick EXECUTOR for operator-resolved harness ESCALATE gates.
+
+    ``resolve_gate`` deliberately keeps a harness decision QUEUED — it does NOT
+    materialise the capability or resume the run.  THIS reconciler is the
+    executor: for every decision that is
+
+      * ``status == "resolved"``,
+      * ``context.kind == "gate"`` and ``context.gate_type == "harness"``,
+      * carries ``execution_id`` / ``activity_id`` / ``shadow_id`` resume coords,
+      * and has NOT already been dispatched
+        (per the persisted ``context["harness_grant_dispatched"]`` flag —
+        DISTINCT from the stuck reconciler's ``resume_dispatched`` so the two
+        reconcilers never interfere),
+
+    it acts ONCE:
+
+      * Deny / reject / skip → ``grant_payload = {"kind", "denied": True,
+        "rationale"}`` (no Governor call); the resumed run proceeds with its
+        fallback.
+      * Approve / Edit spec → reconstruct a ``HarnessRequest`` from the gate
+        context, build a forced-GRANT ``HarnessVerdict``, call
+        ``Governor(config).materialise(...)`` exactly ONCE, then map the
+        outcome → the per-kind ``grant_payload`` ``_apply_harness_grant``
+        consumes.  INPUT carries the operator's free-text answer instead.
+      * Call ``supervisor.resume_after_grant(execution_id=, activity_id=,
+        shadow_id=, grant_payload=)`` — the snapshot-stamp inside that method
+        is the second (cross-process) idempotency layer.
+      * Stamp ``context["harness_grant_dispatched"] = True`` + ``save_decision``.
+
+    Fully defensive: a per-row exception (a Governor/materialise failure, a
+    bad context, a resume failure) is logged and that row is skipped WITHOUT
+    stamping the flag (so a later tick can retry) and WITHOUT crashing the
+    tick.  Returns the number of rows actually dispatched.
+    """
+    from systemu.core.models import (
+        HarnessRequest,
+        HarnessVerdict,
+        HarnessKind,
+        HarnessDecision,
+        RiskBand,
+    )
+
+    try:
+        headers = vault.load_index("decisions") or []
+    except Exception:
+        logger.debug("[HarnessGrantReconciler] could not load decisions index", exc_info=True)
+        return 0
+
+    candidate_ids = [h["id"] for h in headers if h.get("status") == "resolved"]
+    if not candidate_ids:
+        return 0
+
+    # Acquire config the same way the stuck reconciler / wrapper does: prefer
+    # the daemon-initialised module global, else build from env.
+    config = _config
+    if config is None:
+        try:
+            from sharing_on.config import Config
+            config = Config.from_env()
+        except Exception:
+            logger.debug(
+                "[HarnessGrantReconciler] Config.from_env() failed — "
+                "proceeding with config=None (Governor tolerates it)",
+                exc_info=True,
+            )
+            config = None
+
+    # Resolve the Governor symbol honouring a test monkeypatch on this module.
+    Governor = globals().get("Governor")
+    if Governor is None:
+        from systemu.runtime.governor import Governor as Governor  # noqa: F811
+
+    dispatched = 0
+    for did in candidate_ids:
+        try:
+            decision = vault.get_decision(did)
+        except Exception:
+            logger.debug("[HarnessGrantReconciler] could not load decision %s", did, exc_info=True)
+            continue
+        dctx = decision.context or {}
+
+        # Cheap filters before any work.
+        if dctx.get("kind") != "gate" or dctx.get("gate_type") != "harness":
+            continue
+        if dctx.get("harness_grant_dispatched"):
+            continue
+        execution_id = dctx.get("execution_id")
+        activity_id = dctx.get("activity_id")
+        shadow_id = dctx.get("shadow_id")
+        if not (execution_id and activity_id and shadow_id):
+            continue
+
+        try:
+            harness_kind = str(dctx.get("harness_kind") or "").lower()
+            choice = str(decision.choice or "").strip().lower()
+
+            if choice in {"deny", "reject", "skip"}:
+                grant_payload = {
+                    "kind": harness_kind,
+                    "denied": True,
+                    "rationale": (
+                        dctx.get("verdict_rationale")
+                        or dctx.get("rationale")
+                        or "Operator denied the capability request."
+                    ),
+                }
+            elif harness_kind == "input":
+                # ASK_OPERATOR — the operator's answer is the choice itself
+                # (or an explicit answer field), not a materialised capability.
+                grant_payload = {
+                    "kind": "input",
+                    "operator_answer": (
+                        dctx.get("operator_answer")
+                        or decision.choice
+                        or ""
+                    ),
+                }
+            else:
+                # Approve / Edit spec → materialise the capability ONCE.
+                request = HarnessRequest(
+                    request_id=dctx.get("request_id", "") or "",
+                    kind=HarnessKind(harness_kind),
+                    spec=dctx.get("spec") or {},
+                    rationale=dctx.get("rationale", "") or "",
+                    fallback=dctx.get("fallback", "") or "",
+                )
+                verdict = HarnessVerdict(
+                    request_id=request.request_id,
+                    decision=HarnessDecision.GRANT,
+                    risk_band=RiskBand(dctx.get("risk_band", "low"))
+                    if dctx.get("risk_band") in ("low", "medium", "high")
+                    else RiskBand.LOW,
+                    rationale="operator approved via harness gate",
+                )
+                materialised = Governor(config).materialise(
+                    request, verdict, vault=vault, config=config,
+                    execution_id=execution_id,
+                )
+                grant_payload = _map_grant_payload(harness_kind, materialised)
+
+            supervisor.resume_after_grant(
+                execution_id=execution_id,
+                activity_id=activity_id,
+                shadow_id=shadow_id,
+                grant_payload=grant_payload,
+                origin=dctx.get("origin"),
+                chat_submission_id=dctx.get("chat_submission_id"),
+            )
+
+            # Stamp the persisted idempotency flag ONLY after a successful
+            # dispatch — a failure above skips this row for a later retry.
+            decision.context["harness_grant_dispatched"] = True
+            vault.save_decision(decision)
+            dispatched += 1
+        except Exception:
+            logger.exception(
+                "[HarnessGrantReconciler] dispatch failed for decision %s "
+                "(execution_id=%s) — skipping this row, will retry next tick",
+                did, execution_id,
+            )
+
+    if dispatched:
+        logger.info(
+            "[HarnessGrantReconciler] materialised + resumed %d harness grant(s)",
+            dispatched,
+        )
+    return dispatched
+
+
+def _harness_grant_reconciler_job() -> None:
+    """APScheduler entry: thin wrapper around ``reconcile_resolved_harness_grants``
+    using the daemon-initialised globals.  Pulls the live Supervisor on demand.
+    Mirrors ``_resume_on_decision_reconciler_job``; never crashes the tick."""
+    if _vault is None:
+        return
+    try:
+        from systemu.runtime.supervisor import Supervisor
+        supervisor = Supervisor.get()
+    except Exception:
+        # Supervisor not started yet (very early boot) — retry next tick.
+        return
+    try:
+        from pathlib import Path
+        reconcile_resolved_harness_grants(
+            vault=_vault, supervisor=supervisor, data_dir=Path("data"),
+        )
+    except Exception:
+        logger.exception("[HarnessGrantReconciler] job crashed")
+
+
 def reconcile_recovery_gates(*, vault, engine=None, inbox_cls=None, queue_cls=None) -> None:
     """Scan recovery diagnoses → keep the Inbox's recovery gates in sync.
 

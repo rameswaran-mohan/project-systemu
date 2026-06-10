@@ -72,6 +72,8 @@ def surface_harness_request(
     verdict,
     *,
     execution_id: str,
+    activity_id: str = "",
+    shadow_id: str = "",
     vault,
 ) -> str:
     """Surface an escalated HarnessRequest as an operator decision card.
@@ -145,6 +147,10 @@ def surface_harness_request(
     # here — to_decision_context owns them, and enqueue makes them win regardless.)
     context_extras: Dict[str, Any] = {
         "execution_id":      execution_id,
+        # Resume coords — the daemon harness-grant reconciler reads these to call
+        # Supervisor.resume_after_grant(execution_id=, activity_id=, shadow_id=).
+        "activity_id":       activity_id,
+        "shadow_id":         shadow_id,
         "request_id":        request_id,
         "harness_kind":      kind_val,
         "risk_band":         verdict_risk,

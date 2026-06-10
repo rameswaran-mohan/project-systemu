@@ -508,6 +508,22 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # Harness grant-resume executor (Task 5/6): resolve_gate keeps an operator-
+    # resolved harness ESCALATE QUEUED — this poll picks it up, materialises the
+    # granted capability ONCE via the Governor (on Approve/Edit spec), and calls
+    # Supervisor.resume_after_grant. Idempotent via a DISTINCT persisted flag
+    # (decision.context["harness_grant_dispatched"]) so it never collides with
+    # the resume-on-decision reconciler above.
+    from systemu.scheduler.jobs import _harness_grant_reconciler_job
+    scheduler.add_job(
+        _harness_grant_reconciler_job,
+        trigger="interval",
+        seconds=15,
+        id="harness_grant_reconciler",
+        name="Harness Grant Reconciler",
+        replace_existing=True,
+    )
+
     scheduler.start()
 
     # One-shot recovery sweep — fires 5 seconds after startup to heal any
