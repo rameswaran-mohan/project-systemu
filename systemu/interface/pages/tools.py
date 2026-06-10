@@ -21,7 +21,6 @@ import logging
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
-from systemu.interface.nav_helpers import workshop_deeplink
 
 logger = logging.getLogger(__name__)
 
@@ -403,8 +402,10 @@ def _on_enable_and_resume(rec: dict, ctx: dict, vault) -> None:
                 "outcome":   "approved",
             },
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        # EventBus publish is best-effort, but log the swallowed approval event
+        # so a missing audit-trail entry is traceable.
+        logger.warning("Failed to publish recalibration-approved event: %s", exc)
     ui.notify(
         f"Tool '{rec.get('new_tool_name', new_tool_id)}' enabled. "
         f"Activity re-queued ({sub_id}).",
@@ -485,8 +486,8 @@ def _on_override_recalibration(
                     "outcome":   "overridden",
                 },
             })
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to publish recalibration-overridden event: %s", exc)
         publish_recalibration_card(
             result=result, shadow_id=shadow_id,
             execution_id=execution_id, scroll_id=scroll_id,
@@ -511,8 +512,10 @@ def _on_reject_recalibration(ctx: dict) -> None:
             sig, dedup_key=ctx.get("dedup_key"), action="RECALIBRATE_TOOL",
             reason="operator_rejected",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Recording the rejection feeds supervisor backoff learning — surface
+        # a failure so a silently-lost rejection is traceable.
+        logger.warning("Failed to record recalibration rejection: %s", exc)
     try:
         from systemu.interface.event_bus import EventBus
         from datetime import datetime, timezone
@@ -526,8 +529,8 @@ def _on_reject_recalibration(ctx: dict) -> None:
                 "outcome":   "rejected",
             },
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to publish recalibration-rejected event: %s", exc)
     ui.notify("Recalibration rejected. Supervisor will avoid similar proposals.",
                type="warning")
 
@@ -1005,8 +1008,8 @@ def _resolve_forge_notification(tool_id: str, vault) -> None:
         for notif in vault.list_pending_notifications():
             if notif.get("context", {}).get("tool_id") == tool_id:
                 vault.resolve_notification(notif["id"], "auto_dismissed")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to auto-resolve forge notification for %s: %s", tool_id, exc)
 
 
 def _queue_dependency_reminder(tool, vault) -> None:
@@ -1128,7 +1131,7 @@ def _find_scroll_for_tool(tool, state) -> object:
                 act    = state.vault.get_activity(a_header["id"])
                 return state.vault.get_scroll(act.scroll_id)
     except Exception:
-        pass
+        pass  # best-effort lookup — falls through to the stub Scroll below
     return ScrollModel(
         id="stub",
         name=tool.name,

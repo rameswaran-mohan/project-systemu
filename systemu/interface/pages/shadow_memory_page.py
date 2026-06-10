@@ -50,7 +50,7 @@ def build_shadow_memory_page(shadow_id: str) -> None:
             )
             ui.button(
                 "← Back to Shadows",
-                on_click=lambda _: ui.navigate.to("/army"),
+                on_click=lambda _: ui.navigate.to("/shadows"),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
                 f"border: 1px solid {THEME['border']}; border-radius: 8px; font-size: 13px;"

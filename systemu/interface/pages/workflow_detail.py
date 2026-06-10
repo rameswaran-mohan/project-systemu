@@ -109,7 +109,7 @@ def build_workflow_detail_page(workflow_id: str) -> None:
         if snap.activity_id:
             _link_row("📋", "Activity", snap.activity_id, "/activities")
         if snap.shadow_id:
-            _link_row("👤", "Shadow", snap.shadow_id, "/army")
+            _link_row("👤", "Shadow", snap.shadow_id, "/shadows")
         if snap.execution_id:
             _link_row("⚙️", "Execution", snap.execution_id, "/systemu-chat")
 

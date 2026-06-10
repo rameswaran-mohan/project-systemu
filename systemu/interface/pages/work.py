@@ -43,7 +43,7 @@ def _chip_link(stage: str, snap: WorkflowSnapshot, reached: bool) -> Optional[st
     """Where a reached stage chip navigates (None → passive chip).
 
     Precedent: pages/workflow_detail.py ``_link_row`` — Scroll → /scrolls,
-    Activity → /activities, Shadow → /army.  Capture is always passive (it
+    Activity → /activities, Shadow → /shadows.  Capture is always passive (it
     has no surface of its own); done points at the workflow detail page.
     """
     if stage == "capture" or not reached:
@@ -53,7 +53,7 @@ def _chip_link(stage: str, snap: WorkflowSnapshot, reached: bool) -> Optional[st
     if stage == "activity":
         return "/activities" if snap.activity_id else None
     if stage == "execution":
-        return "/army" if snap.shadow_id else f"/workflow/{snap.workflow_id}"
+        return "/shadows" if snap.shadow_id else f"/workflow/{snap.workflow_id}"
     if stage == "done":
         return f"/workflow/{snap.workflow_id}"
     return None

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
+from systemu.interface.scroll_gate import open_scroll_review_dialog
 
 logger = logging.getLogger(__name__)
 
@@ -390,7 +391,18 @@ def _dispatch_notification_action(action: str, ctx: dict, vault, refresh_fn) -> 
         if not scroll_id:
             ui.notify("Notification missing scroll_id — cannot approve.", type="negative")
             return
-        _approve_scroll_from_ui(scroll_id, vault)
+        # Phase 6 Batch 2 (6e): route through the unified inspect-before-approve
+        # gate instead of the retired blind approve. open_scroll_review_dialog
+        # renders the SAME unified Inbox card (risk pill, INSPECT,
+        # WHAT-APPROVE-DOES) and resolves through the proven executor chain;
+        # on_resolved re-renders this notifications list after the operator
+        # picks an option. We return here so the trailing refresh_fn.refresh()
+        # (which assumes a synchronous action completed) does not also fire.
+        open_scroll_review_dialog(
+            scroll_id,
+            on_resolved=(lambda: refresh_fn.refresh()) if refresh_fn else None,
+        )
+        return
 
     elif notif_type == "forge_tool" and a == "forge":
         tool_id = ctx.get("tool_id")
@@ -437,44 +449,6 @@ def _dispatch_notification_action(action: str, ctx: dict, vault, refresh_fn) -> 
 
     if refresh_fn:
         refresh_fn.refresh()
-
-
-def _approve_scroll_from_ui(scroll_id: str, vault) -> None:
-    """Approve a PENDING_APPROVAL scroll and run the extraction pipeline in a background thread."""
-    import asyncio
-    from nicegui import context as _nicegui_ctx
-
-    state  = AppState.get()
-    # Capture client NOW while we're still inside the UI event handler context.
-    # After asyncio.to_thread() completes the slot stack for the spawned task is
-    # empty, so ui.notify() crashes unless we re-enter the client explicitly.
-    try:
-        client = _nicegui_ctx.client
-    except Exception:
-        client = None
-
-    def _safe_notify(message: str, type: str = "positive") -> None:
-        try:
-            if client is not None:
-                with client:
-                    ui.notify(message, type=type)
-        except Exception:
-            pass  # Client disconnected between approval and pipeline completion
-
-    async def _run():
-        try:
-            from systemu.pipelines.activity_extractor import init_pipeline
-            from systemu.pipelines.scroll_refiner import approve_pending_scroll
-            init_pipeline(state.config, vault)
-            await asyncio.to_thread(approve_pending_scroll, scroll_id, vault)
-            _safe_notify("Scroll approved — extraction pipeline started. Check the Manual Logs for progress.")
-        except ValueError as exc:
-            _safe_notify(f"Cannot approve: {exc}", type="warning")
-        except Exception as exc:
-            logger.exception("[Notifications] Scroll approval from UI failed")
-            _safe_notify(f"Approval failed: {exc}", type="negative")
-
-    asyncio.create_task(_run())
 
 
 def _forge_via_inbox(tool_id: str, vault) -> bool:

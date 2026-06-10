@@ -1,8 +1,13 @@
 """Pure navigation helpers for the v0.8.8 console revamp.
 
-Kept dependency-free (no NiceGUI imports) so the console page, workshop page,
-and the four list pages can all import them without circular-import risk, and
-so they're trivially unit-testable.
+Kept dependency-free (no NiceGUI imports) so the console page and the list
+pages can all import them without circular-import risk, and so they're
+trivially unit-testable.
+
+Phase 6 Slice 6f: the Workshop deep-link helpers (``workshop_deeplink`` /
+``resolve_deeplink_tab`` / ``_DEEPLINK_TAB``) were removed with the /workshop
+route — the Scrolls rebuild (Workshop's last surface) is now an in-place dialog
+(``scroll_rebuild.open_scroll_rebuild_dialog``).
 """
 from __future__ import annotations
 
@@ -11,41 +16,13 @@ from typing import Optional
 # Tile label → list-page route
 _TILE_NAV = {
     "Scrolls":     "/scrolls",
-    "Shadows":     "/army",
+    "Shadows":     "/shadows",
     "Tools":       "/tools",
     "Skills":      "/skills",
     "Activities":  "/activities",
     "Evolutions":  "/evolutions",
 }
 
-# Edit deeplink entity type → Workshop tab label.
-# Phase 5 Slice 2c: "activity" was dropped with the Workshop Activities tab
-# (it duplicated the /activities route).
-# Phase 5 Slice 3c: "tool" / "skill" were dropped with the Workshop Tools/Skills
-# tabs — those edits now happen in-page from the Build registry rows.
-# Phase 5 Slice 4c: "shadow" was dropped with the Workshop Shadows tab — shadow
-# edit now happens in-page from the Shadows (/army) cards.
-# Unknown types fall back to "Scrolls".
-_DEEPLINK_TAB = {
-    "scroll":  "Scrolls",
-}
-
-
 def tile_nav_target(label: str) -> Optional[str]:
     """Return the list-page route for a Console stat-tile label, or None."""
     return _TILE_NAV.get(label)
-
-
-def workshop_deeplink(entity_type: str, entity_id: str) -> str:
-    """Build a Workshop deep-link URL for an Edit button."""
-    return f"/workshop?type={entity_type}&id={entity_id}"
-
-
-def resolve_deeplink_tab(deeplink_type: Optional[str]) -> str:
-    """Map a deeplink entity type to a Workshop tab label.
-
-    Unknown / None / empty → "Scrolls" (the Workshop default tab).
-    """
-    if not deeplink_type:
-        return "Scrolls"
-    return _DEEPLINK_TAB.get(deeplink_type, "Scrolls")

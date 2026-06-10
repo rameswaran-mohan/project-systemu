@@ -4,7 +4,7 @@ Starts a NiceGUI app on localhost:<port> (default 8765).
 Provides a persistent sidebar navigation and six page routes:
   /              Overview (stat cards + activity feed)
   /scrolls       Scroll list + detail
-  /army          Shadows card grid
+  /shadows       Shadows card grid (storage key: shadow_army)
   /tools         Tool registry
   /evolutions    Evolution proposals + history
   /settings      LLM tier config + auto-approve
@@ -68,7 +68,7 @@ def _autoforge_banner_message() -> "str | None":
 NAV_SPINES = [
     ("/",         "🏠", "Home"),
     ("/work",     "📋", "Work"),      # Slice 2a: workflow-centric list (scrolls+activities fold in)
-    ("/army",     "👥", "Shadows"),
+    ("/shadows",  "👥", "Shadows"),
     ("/tools",    "🔧", "Build"),     # tools+skills+evolutions fold in (Slice 3)
     ("/insights", "📊", "Insights"),
     ("/settings", "⚙️", "Settings"),
@@ -79,8 +79,8 @@ NAV_ITEMS = NAV_SPINES   # back-compat alias (callers iterate (path, icon, label
 SPINE_OF = {
     "/": "/",
     "/work": "/work", "/scrolls": "/work", "/activities": "/work", "/workflow": "/work", "/chat": "/work",
-    "/army": "/army", "/memory": "/army",
-    "/tools": "/tools", "/skills": "/tools", "/workshop": "/tools", "/evolutions": "/tools",
+    "/shadows": "/shadows", "/memory": "/shadows", "/army": "/shadows",  # 6h: /army is the legacy alias, still lights Shadows
+    "/tools": "/tools", "/skills": "/tools", "/evolutions": "/tools",
     "/insights": "/insights",
     "/settings": "/settings",
     # /inbox intentionally absent → no left-nav highlight (right rail owns it)
@@ -482,8 +482,8 @@ def needs_you_badge_model(vault) -> dict:
 
 # ── Dashboard Global Job Management Buttons ──
 
-# NOTE: _show_record_dialog is kept for backward compatibility with overview.py imports
-# but the real dialog is now inlined inside _build_layout() for proper NiceGUI slot context.
+# NOTE: _show_record_dialog is kept as a navigate-based fallback; the real
+# dialog is now inlined inside _build_layout() for proper NiceGUI slot context.
 def _show_record_dialog():
     """Fallback: open the record dialog via page navigate to ensure correct slot context."""
     from nicegui import ui
@@ -607,6 +607,44 @@ def _cancel_capture(jm):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Legacy URL redirects (Phase 6 Batch 2, 6d)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _legacy_redirect_routes() -> "list[tuple[str, str]]":
+    """The single source of truth for the legacy → current URL redirects.
+
+    Each ``(old_path, target)`` pair is registered on the ASGI app in
+    ``register_routes`` as a true HTTP 3xx redirect.  Kept as a pure function
+    (no NiceGUI import) so the mapping is testable headless.
+
+    6h flipped the Shadows rename: ``/army`` -> ``/shadows`` (``/shadows`` is now
+    the canonical route; ``/army`` is the legacy alias preserved for bookmarks).
+    """
+    return [
+        ("/systemu-chat",  "/chat?tab=live"),
+        ("/memory",        "/insights?tab=memory"),
+        ("/flywheel",      "/insights?tab=flywheel"),
+        ("/notifications", "/insights?tab=events"),
+        ("/army",          "/shadows"),
+    ]
+
+
+def _make_redirect(target: str):
+    """Build a Starlette route handler that returns a 307 redirect to ``target``.
+
+    307 (Temporary Redirect) preserves the request method and is non-cacheable,
+    so a future repoint of any legacy URL takes effect immediately (unlike a
+    308/permanent which browsers may cache aggressively).
+    """
+    from starlette.responses import RedirectResponse
+
+    def _redirect(request):  # noqa: ARG001 — Starlette passes the request
+        return RedirectResponse(target, status_code=307)
+
+    return _redirect
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Page route registrations
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -620,7 +658,6 @@ def register_routes() -> None:
     from systemu.interface.pages.army                      import build_army_page
     from systemu.interface.pages.tools                     import build_tools_page
     from systemu.interface.pages.skills_page               import build_skills_page
-    from systemu.interface.pages.workshop                  import build_workshop_page
     from systemu.interface.pages.evolutions                import build_evolutions_page
     from systemu.interface.pages.settings                  import build_settings_page
     from systemu.interface.pages.activities                import build_activities_page
@@ -634,7 +671,7 @@ def register_routes() -> None:
 
     @ui.page("/")
     def page_console():
-        with _build_layout("🖥️ Console", "/"):
+        with _build_layout("🏠 Home", "/"):
             build_console_page()
 
     # ── Work (Phase 5 Slice 2a: the workflow-centric Work spine page) ─────
@@ -657,9 +694,12 @@ def register_routes() -> None:
         with _build_layout("📜 Scrolls", "/scrolls"):
             build_scrolls_page()
 
-    @ui.page("/army")
-    def page_army():
-        with _build_layout("👥 Shadows", "/army"):
+    @ui.page("/shadows")
+    def page_shadows():
+        # 6h: /shadows is canonical; /army now redirects here. The builder
+        # (build_army_page) + the shadow_army storage key are unchanged — this
+        # is a URL rename only.
+        with _build_layout("👥 Shadows", "/shadows"):
             build_army_page()
 
     # ── Insights (v0.7.2: tabbed parent for Memory / Flywheel / Events) ───
@@ -674,7 +714,7 @@ def register_routes() -> None:
     def page_shadow_memory(shadow_id: str):
         # Per-shadow memory view stays its own page — it's deep-linked from
         # the Insights → Memory tab's "View memory" buttons.  Pass the REAL
-        # path so spine_of highlights the Shadows spine (/army) — this page
+        # path so spine_of highlights the Shadows spine (/shadows) — this page
         # used to claim "/insights".
         with _build_layout(f"🧠 Memory — {shadow_id}", f"/memory/{shadow_id}"):
             build_shadow_memory_page(shadow_id)
@@ -688,7 +728,7 @@ def register_routes() -> None:
     def page_tools(forge: str = ""):
         # ?forge=<tool_id> deep-links to a proposed tool and auto-opens its
         # spec/code review dialog (precedent: page_insights(tab=...)).
-        with _build_layout("🔧 Tool Registry", "/tools"):
+        with _build_layout("🔧 Build", "/tools"):
             build_tools_page(forge_tool_id=forge or None)
 
     @ui.page("/skills")
@@ -696,10 +736,9 @@ def register_routes() -> None:
         with _build_layout("🧠 Skills Registry", "/skills"):
             build_skills_page()
 
-    @ui.page("/workshop")
-    def page_workshop(type: str = "", id: str = ""):
-        with _build_layout("🛠️ Workshop", "/workshop"):
-            build_workshop_page(deeplink_type=type or None, deeplink_id=id or None)
+    # Phase 6 Slice 6f: the /workshop route is dissolved.  Its last surface —
+    # the interactive Scrolls rebuild — is now an in-place dialog opened from
+    # the Scrolls page (scroll_rebuild.open_scroll_rebuild_dialog).
 
     @ui.page("/evolutions")
     def page_evolutions():
@@ -725,32 +764,17 @@ def register_routes() -> None:
         with _build_layout("💬 Chat", "/chat"):
             build_chat_tabs(default_tab=tab)
 
-    # ── Legacy URL redirects (v0.7.2) ─────────────────────────────────────
-    # Preserve every old top-level URL so bookmarks, notification emails,
-    # and recovery panel "Fix URL" links continue to land in the right
-    # place after the sidebar merges.
-    @ui.page("/systemu-chat")
-    def _legacy_systemu_chat():
-        ui.navigate.to("/chat?tab=live")
+    # ── Legacy URL redirects (Phase 6 Batch 2, 6d) ────────────────────────
+    # Preserve every old top-level URL so bookmarks, notification emails, and
+    # recovery panel "Fix URL" links continue to land in the right place after
+    # the sidebar merges.  These are TRUE HTTP 3xx redirects (not 200 + a
+    # client-side ui.navigate hop), so curl / bots / link-prefetch resolve them
+    # without executing JS.  NiceGUI 3.x's ``app`` is a Starlette/FastAPI App,
+    # so we register them straight on the ASGI router via ``app.add_route``.
+    from nicegui import app as ng_app
 
-    @ui.page("/memory")
-    def _legacy_memory():
-        ui.navigate.to("/insights?tab=memory")
-
-    @ui.page("/flywheel")
-    def _legacy_flywheel():
-        ui.navigate.to("/insights?tab=flywheel")
-
-    @ui.page("/notifications")
-    def _legacy_notifications():
-        ui.navigate.to("/insights?tab=events")
-
-    @ui.page("/shadows")
-    def _legacy_shadows():
-        # v0.7.3 Bug #3 — sidebar label is "Shadows" but the actual route is
-        # /army (historical naming). Bookmarks / docs / muscle-memory all
-        # expect /shadows to work.
-        ui.navigate.to("/army")
+    for _path, _target in _legacy_redirect_routes():
+        ng_app.add_route(_path, _make_redirect(_target))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

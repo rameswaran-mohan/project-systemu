@@ -15,8 +15,8 @@ from nicegui import ui
 from systemu.interface.dashboard_state import AppState
 from systemu.interface.design import card
 from systemu.interface.design.primitives import status_pill_html
-from systemu.interface.nav_helpers import workshop_deeplink
 from systemu.interface.scroll_gate import open_scroll_review_dialog
+from systemu.interface.scroll_rebuild import open_scroll_rebuild_dialog
 
 
 def build_scrolls_page() -> None:
@@ -90,10 +90,18 @@ def build_scrolls_page() -> None:
                                         "View",
                                         on_click=lambda _, i=sid: _show_scroll_detail(i),
                                     ).classes("s-btn s-btn--ghost")
-                                # v0.8.8: deep-link into Workshop Scrolls tab (pre-selected)
+                                # Phase 6 Slice 6f: edit-in-place — the Workshop
+                                # Scrolls rebuild now opens as a dialog right here
+                                # (the /workshop route is gone).
+                                def _on_edit(_, i=sid):
+                                    open_scroll_rebuild_dialog(
+                                        i,
+                                        on_saved=lambda: _scroll_table
+                                        .refresh(search_input.value),
+                                    )
                                 ui.button(
                                     "✏️ Edit",
-                                    on_click=lambda _, i=sid: ui.navigate.to(workshop_deeplink("scroll", i)),
+                                    on_click=_on_edit,
                                 ).classes("s-btn s-btn--ghost")
 
     search_input.on("input", lambda e: _scroll_table.refresh(

@@ -269,8 +269,10 @@ class JobManager:
                 return
             try:
                 job.process.kill()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Process may already have exited; the status mutation below
+                # still applies. Log for traceability, don't block the cancel.
+                logger.debug("[Jobs] kill() for job %s raised (already exited?): %s", job_id, exc)
             job.status = JobStatus.CANCELLED
 
         # Run rollback outside the lock to prevent deadlock if the callback is slow
@@ -378,8 +380,10 @@ class JobManager:
                 if job.status in (JobStatus.RUNNING, JobStatus.STOPPING):
                     try:
                         job.process.kill()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Watchdog already logged the timeout warning above; the
+                        # process may have exited in the race. Note for traceability.
+                        logger.debug("[Jobs] watchdog kill() for job %s raised: %s", job.id, exc)
                     job.status = JobStatus.FAILED
 
         finally:
@@ -389,7 +393,7 @@ class JobManager:
                     log_fp.flush()
                     log_fp.close()
                 except Exception:
-                    pass
+                    pass  # resource-teardown guard — handle may already be closed
             # Prune old terminal jobs to keep the dict bounded
             with self.lock:
                 self._prune_old_jobs()

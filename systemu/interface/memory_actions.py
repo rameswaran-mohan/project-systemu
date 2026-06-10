@@ -104,7 +104,7 @@ def _run_off_loop(work: Callable[[], Result], *, started_msg: str,
                 if t is not None:
                     t.active = False
             except Exception:
-                pass
+                pass  # UI-timer teardown guard — timer may already be gone
 
     timer_holder["t"] = ui.timer(0.5, _poll)
 

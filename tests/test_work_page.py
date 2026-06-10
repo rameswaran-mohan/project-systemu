@@ -89,7 +89,7 @@ class TestChipLinks:
         assert links["capture"] is None            # passive
         assert links["scroll"] == "/scrolls"
         assert links["activity"] == "/activities"
-        assert links["execution"] == "/army"       # shadow runs it
+        assert links["execution"] == "/shadows"    # shadow runs it (Phase-6: /army→/shadows)
         assert links["done"] == "/workflow/wf_1"
 
     def test_unreached_chips_have_no_link(self):
