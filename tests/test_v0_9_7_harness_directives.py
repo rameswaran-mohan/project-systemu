@@ -12,15 +12,23 @@ import inspect
 
 def test_grant_branch_handles_all_harness_kinds():
     from systemu.runtime.shadow_runtime import ShadowRuntime
-    src = inspect.getsource(ShadowRuntime.execute)
+    # The per-kind apply-branches live in the shared _apply_materialised_grant
+    # helper (extracted from the autonomous GRANT block so the deferred harness
+    # grant-resume replays the exact same code). The execute() GRANT branch calls
+    # it after _gov.materialise(...).
+    exec_src = inspect.getsource(ShadowRuntime.execute)
+    assert ".materialise(" in exec_src
+    assert "self._apply_materialised_grant(" in exec_src
+
+    src = inspect.getsource(ShadowRuntime._apply_materialised_grant)
     # TOOL path still deploys + offers back
-    assert 'if _mat.get("tool") is not None:' in src
+    assert 'if mat.get("tool") is not None:' in src
     assert "deploy_forged_tool" in src
     # the other four kinds each have an explicit branch
-    assert 'elif _mat.get("compute_grant"):' in src
-    assert 'elif _mat.get("skill"):' in src
-    assert 'elif _mat.get("access"):' in src
-    assert 'elif _mat.get("subagent"):' in src
+    assert 'elif mat.get("compute_grant"):' in src
+    assert 'elif mat.get("skill"):' in src
+    assert 'elif mat.get("access"):' in src
+    assert 'elif mat.get("subagent"):' in src
     # every branch surfaces a grant observation back to the executor
     assert src.count('"type": "harness_granted"') >= 5
 
@@ -29,12 +37,16 @@ def test_compute_grant_extends_iteration_budget():
     """COMPUTE must bump the run's *mutable* iteration budget — not the module
     constant — and the loop must iterate against that mutable budget."""
     from systemu.runtime.shadow_runtime import ShadowRuntime
-    src = inspect.getsource(ShadowRuntime.execute)
-    assert "_iter_budget = MAX_ITERATIONS" in src
-    assert "while iteration < _iter_budget:" in src
-    assert "_iter_budget += _extra_it" in src
+    exec_src = inspect.getsource(ShadowRuntime.execute)
+    # the mutable budget is owned by execute() and threaded through the helper
+    assert "_iter_budget = MAX_ITERATIONS" in exec_src
+    assert "while iteration < _iter_budget:" in exec_src
+    assert "_iter_budget = self._apply_materialised_grant(" in exec_src
+    # the COMPUTE bump itself lives in the shared helper, returned to execute()
+    apply_src = inspect.getsource(ShadowRuntime._apply_materialised_grant)
+    assert "iter_budget += _extra_it" in apply_src
     # bump is bounded (no unbounded budget grant)
-    assert "min(int(_cg.get(\"extra_iterations\", 0) or 0), 100)" in src
+    assert "min(int(_cg.get(\"extra_iterations\", 0) or 0), 100)" in apply_src
 
 
 # ── adherence resolved into the loop + gates the goal-level shortcut ────────────

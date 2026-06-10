@@ -13,12 +13,16 @@ def test_execute_handles_request_harness_via_governor():
     assert ".arbitrate(" in src and ".materialise(" in src
     # flag-off path must short-circuit gracefully (no fall-through)
     assert "harness_disabled" in src
-    # granted tool is offered back to the executor
-    assert "harness_granted" in src
-    # a freshly-forged grant is deployed inline so it's callable this run
-    assert "deploy_forged_tool" in src
     # an ESCALATE surfaces an operator decision card
     assert "surface_harness_request" in src
+    # the materialised grant is applied via the shared helper (extracted so the
+    # deferred harness grant-resume replays the same code, byte-identical).
+    assert "self._apply_materialised_grant(" in src
+    # the apply-helper offers the granted tool back + deploys it inline so it's
+    # callable this run
+    apply_src = inspect.getsource(ShadowRuntime._apply_materialised_grant)
+    assert "harness_granted" in apply_src
+    assert "deploy_forged_tool" in apply_src
 
 
 def test_request_harness_branch_is_flag_gated():

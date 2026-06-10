@@ -1089,6 +1089,30 @@ class Supervisor:
             )
             return
 
+        # Parked on a blocking harness ESCALATE — the run snapshotted itself and
+        # returned suspended_harness_escalation awaiting an operator harness
+        # decision. Leave the activity ASSIGNED + its snapshot on disk; the
+        # harness-grant reconciler resumes it via resume_after_grant once the
+        # operator resolves the gate. NO retry, NO dead-letter — mirrors the
+        # cancelled branch above (publish + early return; the running-set slot
+        # and semaphore were already released by the caller's finally block).
+        if status == "suspended_harness_escalation":
+            logger.info(
+                "[Supervisor] activity %s parked on harness escalation %s",
+                activity_id, result.get("execution_id"),
+            )
+            self._publish(
+                f"⏸️ Parked on harness escalation: {self._aname(activity_id)}",
+                level="INFO",
+                context={
+                    "activity_id":  activity_id,
+                    "shadow_id":    shadow_id,
+                    "execution_id": result.get("execution_id"),
+                },
+                origin=payload.get("origin"),   # v0.8.16
+            )
+            return
+
         # Partial or failure — decide retry
         if status in ("failure", "partial") and retry_count < MAX_RETRIES:
             wait_s = 5 * (retry_count + 1)   # back-off: 5s, 10s
