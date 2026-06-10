@@ -2,7 +2,10 @@
 
 Shows a searchable, filterable table of Scrolls.
 Click any row to open a slide-out panel with full Scroll detail
-(narrative, action blocks, linked activity, and an Approve button).
+(narrative, action blocks, linked activity).  Phase 5 Slice 2b: the blind
+✓ Approve is retired — pending scrolls get "Review & Approve", which opens
+the unified Inbox gate card (inspect-before-approve) via
+``scroll_gate.open_scroll_review_dialog``.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from systemu.interface.dashboard_state import AppState
 from systemu.interface.design import card
 from systemu.interface.design.primitives import status_pill_html
 from systemu.interface.nav_helpers import workshop_deeplink
+from systemu.interface.scroll_gate import open_scroll_review_dialog
 
 
 def build_scrolls_page() -> None:
@@ -69,12 +73,17 @@ def build_scrolls_page() -> None:
                             status = s.get("status", "")
                             with ui.row().classes("q-gutter-xs"):
                                 if status == "pending_approval":
-                                    def _on_approve(_, i=sid):
-                                        _approve_scroll(i)
-                                        _scroll_table.refresh(search_input.value)
+                                    # Slice 2b: inspect-before-approve — the
+                                    # unified gate card replaces blind approve.
+                                    def _on_review(_, i=sid):
+                                        open_scroll_review_dialog(
+                                            i,
+                                            on_resolved=lambda: _scroll_table
+                                            .refresh(search_input.value),
+                                        )
                                     ui.button(
-                                        "✓ Approve",
-                                        on_click=_on_approve,
+                                        "Review & Approve",
+                                        on_click=_on_review,
                                     ).classes("s-btn s-btn--primary")
                                 else:
                                     ui.button(
@@ -98,19 +107,6 @@ def _td(text: str, bold: bool = False) -> None:
     classes = "s-cell" + (" s-cell--bold" if bold else "")
     with ui.element("td").classes(classes):
         ui.label(text)
-def _approve_scroll(scroll_id: str) -> None:
-    from systemu.interface.command.dispatch import dispatch
-    from systemu.interface.dashboard_state import AppState
-    from systemu.interface.name_resolver import resolve_name
-    state = AppState.get()
-    try:
-        cwd = state.project_root
-        scroll_name = resolve_name(scroll_id, state.vault)
-        dispatch("scrolls approve", [scroll_id], cwd=cwd, stream=True,
-                 job_type="approve", dedup_key=f"approve:{scroll_id}")
-        ui.notify(f"Dispatched background approval for Scroll {scroll_name}", type="positive")
-    except Exception as exc:
-        ui.notify(f"Error: {exc}", type="negative")
 
 
 def _show_scroll_detail(scroll_id: str) -> None:
@@ -124,6 +120,12 @@ def _show_scroll_detail(scroll_id: str) -> None:
     with ui.dialog() as dlg, card(classes="s-dialog q-pa-lg"):
         ui.label(scroll.name).classes("s-dialog-title")
         ui.html(status_pill_html(scroll.status.value if hasattr(scroll.status, 'value') else str(scroll.status)))
+        # Linked activity, resolved to its name (v0.8.12 names-not-ids).
+        if scroll.activity_id:
+            from systemu.interface.name_resolver import resolve_name
+            ui.label(
+                f"Linked activity: {resolve_name(scroll.activity_id, state.vault)}"
+            ).classes("s-muted")
         ui.separator().classes("s-sep")
 
         ui.label("Narrative").classes("s-section-head")

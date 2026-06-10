@@ -25,37 +25,41 @@ class TestNavHelpers:
     def test_resolve_deeplink_tab_known_types(self):
         from systemu.interface.nav_helpers import resolve_deeplink_tab
         assert resolve_deeplink_tab("scroll") == "Scrolls"
-        assert resolve_deeplink_tab("shadow") == "Shadows"
-        assert resolve_deeplink_tab("tool") == "Tools"
-        assert resolve_deeplink_tab("skill") == "Skills"
 
     def test_resolve_deeplink_tab_default_scrolls(self):
+        # Phase 5 Slice 3c: tool/skill folded out of the Workshop (edit-in-place
+        # from the Build registry rows), so they fall back to the Scrolls tab.
+        # Phase 5 Slice 4c: "shadow" likewise folded out (edit-in-place from the
+        # Shadows /army cards), so it too falls back to the Scrolls tab.
         from systemu.interface.nav_helpers import resolve_deeplink_tab
         assert resolve_deeplink_tab(None) == "Scrolls"
         assert resolve_deeplink_tab("") == "Scrolls"
         assert resolve_deeplink_tab("unknown") == "Scrolls"
+        assert resolve_deeplink_tab("tool") == "Scrolls"
+        assert resolve_deeplink_tab("skill") == "Scrolls"
+        assert resolve_deeplink_tab("shadow") == "Scrolls"
 
 
 class TestNavGroups:
-    def test_nav_top_is_console(self):
-        from systemu.interface.dashboard import NAV_TOP
-        assert NAV_TOP == ("/", "🖥️", "Console")
+    """v0.8.8 asserted the NAV_TOP + 3-group sidebar; Phase 5 (Slice 1)
+    replaced it with the flat 6-spine nav (canary:
+    tests/test_phase5_nav_spines.py). The Console page still serves "/" —
+    it is now the Home spine's surface — so these assert the spine-era
+    equivalents of the v0.8.8 invariants (console at the root, no Overview
+    entry in the nav)."""
 
-    def test_overview_removed_from_groups(self):
-        from systemu.interface.dashboard import NAV_GROUPS
-        all_labels = [label for _, _, items in NAV_GROUPS for _, _, label in items]
-        assert "Overview" not in all_labels
-        # Console is NOT inside a group (it's NAV_TOP)
-        assert "Console" not in all_labels
+    def test_root_spine_serves_console_surface(self):
+        from systemu.interface.dashboard import NAV_SPINES
+        assert NAV_SPINES[0][0] == "/"      # Home spine leads the nav
 
-    def test_run_group_first_item_is_chat(self):
-        from systemu.interface.dashboard import NAV_GROUPS
-        run_group = next(items for label, _, items in NAV_GROUPS if label == "Run")
-        assert run_group[0][2] == "Chat"   # Overview no longer leads Run
+    def test_overview_not_a_nav_label(self):
+        from systemu.interface.dashboard import NAV_SPINES
+        labels = [label for _p, _i, label in NAV_SPINES]
+        assert "Overview" not in labels
 
-    def test_nav_items_includes_console_first(self):
+    def test_nav_items_alias_starts_at_root(self):
         from systemu.interface.dashboard import NAV_ITEMS
-        assert NAV_ITEMS[0] == ("/", "🖥️", "Console")
+        assert NAV_ITEMS[0][0] == "/"
 
 
 class TestSharedHelpers:
@@ -124,6 +128,9 @@ class TestWorkshopDeeplinkHandler:
         assert "deeplink_id" in sig.parameters
 
     def test_resolve_deeplink_tab_used_by_workshop(self):
-        # Workshop must resolve the initial tab via the shared helper
+        # Workshop must resolve the initial tab via the shared helper. After
+        # Slice 4c only the Scrolls tab remains, so the surviving "scroll" type
+        # is asserted here; folded-out types fall back to Scrolls.
         from systemu.interface.nav_helpers import resolve_deeplink_tab
-        assert resolve_deeplink_tab("tool") == "Tools"
+        assert resolve_deeplink_tab("scroll") == "Scrolls"
+        assert resolve_deeplink_tab("shadow") == "Scrolls"

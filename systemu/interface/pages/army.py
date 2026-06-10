@@ -1,4 +1,4 @@
-"""NiceGUI Dashboard — Shadow Army page.
+"""NiceGUI Dashboard — Shadows page (route /army, storage key shadow_army).
 
 Card grid of all Shadows with:
   * Status badge, avatar emoji, description preview
@@ -13,7 +13,7 @@ from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
 from systemu.interface.jobs import JobManager, JobStatus, Job
-from systemu.interface.nav_helpers import workshop_deeplink
+from systemu.interface.components.entity_edit import open_shadow_edit_dialog
 from systemu.interface.name_resolver import resolve_names
 
 
@@ -22,6 +22,16 @@ _STATUS_ICON = {
     "dormant":  "💤",
     "retired":  "🪦",
 }
+
+
+def _memory_consolidation_route() -> str:
+    """Phase 5 Slice 4d-2 — entry point for the memory-consolidation surface.
+
+    Per the IA (spec §5), consolidation belongs to Shadows.  The surface
+    (``build_memory_consolidation_page`` — Run-All + per-shadow Consolidate)
+    still lives at this route; the Shadows page just surfaces it from here.
+    """
+    return "/insights?tab=memory"
 
 
 def _build_execute_jobs_panel_view_model(job_manager) -> dict:
@@ -225,12 +235,23 @@ def build_army_page() -> None:
     vault = state.vault
 
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("👥 Shadow Army").style(
+        ui.label("👥 Shadows").style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
-        ui.button("+ Awaken New Shadow", on_click=_show_awaken_dialog).style(
-            f"background: {THEME['primary']}; color: white; border-radius: 8px;"
-        )
+        with ui.row().style("gap: 8px; align-items: center;"):
+            # Phase 5 Slice 4d-2: consolidation belongs to Shadows (IA §5).
+            # The surface still lives at _memory_consolidation_route(); this
+            # button just makes it discoverable from here.  Uses the token-class
+            # button primitive (no inline f-string style — lint 0 new).
+            from systemu.interface.design.primitives import button as _token_button
+            _token_button(
+                "🧠 Memory consolidation",
+                variant="ghost",
+                on_click=lambda: ui.navigate.to(_memory_consolidation_route()),
+            )
+            ui.button("+ Awaken New Shadow", on_click=_show_awaken_dialog).style(
+                f"background: {THEME['primary']}; color: white; border-radius: 8px;"
+            )
 
     # v0.8.6: recent execute jobs panel
     _render_execute_jobs_panel()
@@ -331,10 +352,13 @@ def _shadow_card(sh: dict) -> None:
                 f"border: 1px solid {THEME['border']}; border-radius: 6px; "
                 f"padding: 4px 10px; font-size: 12px; margin-left: 6px;"
             )
-            # v0.8.8: deep-link into Workshop Shadows tab (auto-opens editor)
+            # Phase 5 Slice 4c: edit-in-place — the Workshop Shadows tab is gone;
+            # open the shared shadow editor (active-lock enforced) right here.
             ui.button(
                 "✏️ Edit",
-                on_click=lambda _, sid=uid: ui.navigate.to(workshop_deeplink("shadow", sid)),
+                on_click=lambda _, sid=uid: open_shadow_edit_dialog(
+                    AppState.get().vault.get_shadow(sid), AppState.get().vault
+                ),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
                 f"border: 1px solid {THEME['border']}; border-radius: 6px; "

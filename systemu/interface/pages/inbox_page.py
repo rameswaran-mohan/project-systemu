@@ -135,6 +135,28 @@ def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None
                     on_resolved()
             return _click
 
+        # Forge gates route to the RICH human-code-review dialog (Slice 3e), NOT
+        # the generic Approve→resolve_gate chain. resolve_gate's forge branch is
+        # the DEGRADED one-shot that re-runs forge_tool_from_spec over the
+        # UNEDITED spec with no human code review — it owns AUTO-PROPOSED tools
+        # only. An operator who finds a forge gate in the Inbox gets the SAME
+        # two-gate spec→code review as the registry "Review & Forge" button by
+        # navigating to the canonical /tools?forge=<id> deep-link (build_tools_page
+        # auto-opens _show_spec_review_dialog for it). The card therefore renders
+        # ONE "Review & Forge" button and NEVER calls resolve_gate for forge, so
+        # it cannot double-forge: the rich dialog's save_approved_code +
+        # _resolve_forge_gate_silently is the single forge executor for this path.
+        dedup = model["dedup"]
+        if dedup.startswith("forge:"):
+            forge_tool_id = dedup.partition(":")[2]
+
+            def _open_review(_=None, tid: str = forge_tool_id) -> None:
+                ui.navigate.to(f"/tools?forge={tid}")
+
+            with ui.row().style("gap: 8px;"):
+                button("Review & Forge", variant="primary", on_click=_open_review)
+            return
+
         # Action buttons: the affirmative (destructive→danger) + the safe-default
         # / Deny rendered as a ghost so the destructive choice is visually
         # distinct from the safe one.

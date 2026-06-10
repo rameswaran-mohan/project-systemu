@@ -77,6 +77,13 @@ def build_settings_page() -> None:
         ):
             stuck_settings_card()
 
+        # ── Evolution schedule (v0.9 Phase-5 3f) ───────────────────────────
+        # Tokenized .s-card wrapper (like Gate Mode) — no new inline f-string
+        # style, keeping the UI-style lint gate clean for this render.
+        _section_header("Evolution schedule")
+        with ui.column().classes("s-card").style("gap: 14px; padding: 20px;"):
+            evolution_schedule_card()
+
         # ── Execution Mode (v0.9.7 Phase 3.2) ────────────────────────────
         _section_header("Execution Mode")
         with ui.column().style(
@@ -649,3 +656,79 @@ def stuck_settings_card() -> None:
 
     ui.button("💾 Save Stuck-loop guard", on_click=_save).style(
         f"background: {THEME['primary']}; color: white; border-radius: 8px; margin-top: 8px;")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Evolution schedule cadence (v0.9 Phase-5 3f / spec §6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EVOLUTION_HOUR_DEFAULT = 3
+
+
+def get_evolution_schedule() -> dict:
+    """v0.9 Phase-5 3f: read the daily evolution-check hour (UTC) from env.
+
+    Mirrors get_stuck_settings — always returns a sane default if the env var
+    is missing, unparseable, or out of the 0-23 range.
+    """
+    import os
+    raw = os.environ.get("SYSTEMU_EVOLUTION_HOUR", str(_EVOLUTION_HOUR_DEFAULT))
+    try:
+        hour = int(raw)
+    except (TypeError, ValueError):
+        return {"hour": _EVOLUTION_HOUR_DEFAULT}
+    if not (0 <= hour <= 23):
+        return {"hour": _EVOLUTION_HOUR_DEFAULT}
+    return {"hour": hour}
+
+
+def save_evolution_schedule(*, hour: int) -> None:
+    """v0.9 Phase-5 3f: validate 0-23; persist to .env; patch live os.environ.
+
+    Raises ValueError on out-of-range input (UI surfaces it via ui.notify).
+    The APScheduler cron trigger is fixed at daemon boot, so changing this only
+    takes effect after a daemon restart (the card notes this).
+    """
+    import os
+    hour = int(hour)
+    if not (0 <= hour <= 23):
+        raise ValueError("hour must be in 0..23")
+    _update_env_var("SYSTEMU_EVOLUTION_HOUR", str(hour))
+    os.environ["SYSTEMU_EVOLUTION_HOUR"] = str(hour)
+
+
+def evolution_schedule_card() -> None:
+    """v0.9 Phase-5 3f: render the evolution-cadence section (mirrors
+    stuck_settings_card). Caller wraps it in `with ui.column():`."""
+    state = get_evolution_schedule()
+    # Token-class / plain-string styling only (keeps the UI-style lint gate at 0
+    # new violations for this Phase-5 render).
+    ui.label(
+        "The daily evolution check (skill/tool effectiveness sweep + recalibration "
+        "proposals) runs once a day at this hour, in UTC. The manual \"Run check now\" "
+        "button on the Evolution page is unaffected by this setting."
+    ).classes("s-muted").style("font-size: 12px;")
+    with ui.row().style("gap: 16px; align-items: center;"):
+        ui.label("Daily run hour (UTC, 0-23):").classes("s-cell").style("font-size: 13px;")
+        hour_input = ui.number(label="", value=state["hour"], min=0, max=23).style("width: 110px;")
+    ui.label(
+        "⚠ The scheduler's cron trigger is fixed when the daemon boots — "
+        "restart the daemon to fully apply a changed hour."
+    ).classes("s-text-warn").style("font-size: 12px;")
+
+    def _save():
+        try:
+            save_evolution_schedule(hour=int(hour_input.value
+                                             if hour_input.value is not None
+                                             else _EVOLUTION_HOUR_DEFAULT))
+            ui.notify(
+                "Evolution schedule saved. Restart daemon to fully apply.",
+                type="positive",
+            )
+        except ValueError as exc:
+            ui.notify(f"Invalid value: {exc}", type="negative")
+        except Exception as exc:
+            ui.notify(f"Save failed: {exc}", type="negative")
+
+    ui.button("💾 Save Evolution Schedule", on_click=_save).props(
+        "no-caps").classes("s-btn s-btn--primary").style("margin-top: 8px;")

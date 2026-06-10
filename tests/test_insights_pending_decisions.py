@@ -63,3 +63,27 @@ def test_view_model_error_handling():
         result = _build_pending_decision_view_model(fake_vault)
     assert "_error" in result
     assert "boom" in result["_error"]
+
+
+# ── Slice 4d: the "actions" tab is gone; tab=actions redirects to /inbox ─────
+
+def test_resolve_tab_valid_tabs_passthrough():
+    from systemu.interface.pages.insights import _resolve_tab
+
+    for tab in ("memory", "flywheel", "events"):
+        assert _resolve_tab(tab) == tab
+
+
+def test_resolve_tab_actions_redirects_to_inbox():
+    from systemu.interface.pages.insights import _resolve_tab
+
+    # The removed decision-surface deep-link must land on /inbox, not 404.
+    assert _resolve_tab("actions") == "REDIRECT_INBOX"
+
+
+def test_resolve_tab_unknown_falls_back_to_memory():
+    from systemu.interface.pages.insights import _resolve_tab
+
+    assert _resolve_tab("bogus") == "memory"
+    assert _resolve_tab("") == "memory"
+    assert _resolve_tab(None) == "memory"

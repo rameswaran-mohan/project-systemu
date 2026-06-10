@@ -30,19 +30,11 @@ logger = logging.getLogger(__name__)
 #  v0.7.4 Pattern 2 — per-row action helpers (pure-data so unit-testable)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _row_actions_for(header):
-    """v0.7.4 Pattern 2: decide which action buttons to render for a tool row.
-
-    Returns a list of dicts: [{"label": str, "kind": str, "tool_id": str}, ...]
-    Kept as pure data so tests can verify the policy without driving NiceGUI.
-    """
-    actions = []
-    status = (header.get("status") or "").lower()
-    dryrun = (header.get("dry_run_status") or "").lower()
-    if status in ("forged", "proposed") and dryrun in ("", "not_run", "failed"):
-        actions.append({"label": "Dry-Run", "kind": "dryrun", "tool_id": header.get("id")})
-    # Future: more action types (delete, retry-forge, etc.) join here.
-    return actions
+# v0.7.4 Pattern 2 policy now lives in the shared renderer module
+# (entity_rows) so the Tools page and any other lister share ONE definition.
+# Re-exported here so existing imports (`from ...pages.tools import
+# _row_actions_for`) and tests keep resolving.
+from systemu.interface.components.entity_rows import _row_actions_for  # noqa: E402,F401
 
 
 def _dispatch_dryrun(tool_id: str) -> None:
@@ -183,13 +175,20 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
         )
         return
 
+    # v0.9 Phase-5 3a: ONE canonical renderer per tool (entity_rows). The page
+    # only owns the table chrome + headers now; each <tr> (cells + actions +
+    # the Gate-3 toggle wiring) comes from render_tool_row so the registry,
+    # workshop and any future lister paint identically.
+    from systemu.interface.components.entity_rows import render_tool_row
+
     with ui.element("table").style(
         f"width: 100%; border-collapse: collapse; background: {THEME['surface']}; "
         f"border: 1px solid {THEME['border']}; border-radius: 12px; overflow: hidden;"
     ):
         with ui.element("thead"):
             with ui.element("tr"):
-                for col in ["Name", "Type", "Status", "Enabled", "Dry-run", "Success", "Description", "Actions"]:
+                for col in ["Name", "Type", "Status", "Enabled", "Dry-run",
+                            "Success", "Deps", "Description", "Actions"]:
                     with ui.element("th").style(
                         f"background: {THEME['surface2']}; color: {THEME['text_muted']}; "
                         f"font-size: 11px; font-weight: 600; text-transform: uppercase; "
@@ -200,131 +199,7 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
 
         with ui.element("tbody"):
             for t in tools:
-                tid     = t["id"]
-                status  = t.get("status", "")
-                enabled = t.get("enabled", False)
-
-                with ui.element("tr"):
-                    _td(t.get("name", tid), bold=True)
-                    _td(t.get("tool_type", "—"))
-
-                    # Status badge — FORGED+enabled gets a green override
-                    with ui.element("td").style("padding: 12px 16px;"):
-                        if status == "forged" and enabled:
-                            ui.html(status_badge_html("enabled"))
-                        else:
-                            ui.html(status_badge_html(status or "?"))
-
-                    # Enabled toggle (Gate 3) — only for tools that have been reviewed
-                    with ui.element("td").style("padding: 12px 16px;"):
-                        if status in ("forged", "deployed", "tested", "upgraded"):
-                            sw = ui.switch("", value=enabled).props("dense")
-                            sw.on(
-                                "update:model-value",
-                                lambda e, i=tid, s=sw: _toggle_enabled(
-                                    i,
-                                    # NiceGUI may deliver args as a raw bool OR as a
-                                    # list/tuple wrapping the bool — normalise both.
-                                    e.args if isinstance(e.args, bool)
-                                    else bool(e.args[0]) if isinstance(e.args, (list, tuple)) and e.args
-                                    else bool(e.args),
-                                    switch=s,
-                                ),
-                            )
-                        else:
-                            ui.label("—").style(f"color: {THEME['text_muted']}; font-size: 12px;")
-
-                    # Dry-run status column (v0.5.0-a) — passed / failed / skipped / not_run.
-                    with ui.element("td").style("padding: 12px 16px;"):
-                        dr_status = t.get("dry_run_status") or "not_run"
-                        dr_color = {
-                            "passed":  THEME["success"],
-                            "failed":  THEME["danger"],
-                            "skipped": THEME["warning"],
-                            "not_run": THEME["text_muted"],
-                        }.get(dr_status, THEME["text_muted"])
-                        ui.label(dr_status).style(
-                            f"font-size: 11px; color: {dr_color}; font-weight: 700; "
-                            f"text-transform: uppercase; letter-spacing: 0.05em;"
-                        )
-
-                    # Success-rate column (v0.4.4-b) — pulls from ToolMetrics.
-                    with ui.element("td").style("padding: 12px 16px;"):
-                        try:
-                            from systemu.runtime.tool_metrics import get_tool_metrics
-                            entry = get_tool_metrics().get(tid)
-                            if entry.has_history and entry.attributable_calls > 0:
-                                rate = entry.success_rate
-                                rate_color = (
-                                    THEME["success"] if rate >= 0.7
-                                    else THEME["warning"] if rate >= 0.4
-                                    else THEME["danger"]
-                                )
-                                ui.label(f"{rate*100:.0f}% ({entry.attributable_calls})").style(
-                                    f"font-size: 12px; color: {rate_color}; "
-                                    f"font-weight: 700;"
-                                )
-                            else:
-                                ui.label("—").style(
-                                    f"color: {THEME['text_muted']}; font-size: 12px;"
-                                )
-                        except Exception:
-                            ui.label("—").style(
-                                f"color: {THEME['text_muted']}; font-size: 12px;"
-                            )
-
-                    desc = t.get("description", "") or ""
-                    _td(desc[:70] + "…" if len(desc) > 70 else desc or "—")
-
-                    # Actions column — v0.7.4 Pattern 2: dynamic per-row buttons
-                    with ui.element("td").style("padding: 12px 16px;"):
-                        with ui.row().style("gap: 6px;"):
-                            if status == "proposed":
-                                ui.button(
-                                    "Review & Forge",
-                                    on_click=lambda _, i=tid: _show_spec_review_dialog(i),
-                                ).style(
-                                    f"background: {THEME['warning']}; color: white; "
-                                    f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
-                                )
-                            else:
-                                for _a in _row_actions_for(t):
-                                    if _a["kind"] == "dryrun":
-                                        ui.button(
-                                            _a["label"],
-                                            on_click=lambda _, tid=_a["tool_id"]: _dispatch_dryrun(tid),
-                                        ).style(
-                                            f"background: {THEME['surface2']}; color: {THEME['text']}; "
-                                            f"border: 1px solid {THEME['border']}; border-radius: 6px; "
-                                            f"font-size: 12px; padding: 4px 10px;"
-                                        )
-                                # P2-T10: Enable streams `tools enable <id>` through
-                                # dispatch() — only offered for reviewed-but-disabled
-                                # tools (Gate 3 lives at the toggle; this is a shortcut).
-                                # Gate 3.5 (verbs.tools_enable / models.py:295): the verb
-                                # rejects unless dry_run_status == 'passed'. Because the
-                                # dispatch is stream=True (fire-and-forget), surfacing the
-                                # button before dry-run passes shows a misleading green
-                                # "dispatched ok" toast while the tool stays disabled — so
-                                # gate the render on dry_run_status == 'passed' too.
-                                if (
-                                    status in ("forged", "deployed", "tested", "upgraded")
-                                    and not enabled
-                                    and t.get("dry_run_status") == "passed"
-                                ):
-                                    ui.button(
-                                        "Enable",
-                                        on_click=lambda _, i=tid: _dispatch_enable(i),
-                                    ).props("no-caps").classes("s-btn s-btn--success")
-                            # v0.8.8: deep-link into Workshop Tools tab (auto-opens editor)
-                            ui.button(
-                                "✏️ Edit",
-                                on_click=lambda _, i=tid: ui.navigate.to(workshop_deeplink("tool", i)),
-                            ).style(
-                                f"background: {THEME['surface2']}; color: {THEME['text']}; "
-                                f"border: 1px solid {THEME['border']}; border-radius: 6px; "
-                                f"font-size: 12px; padding: 4px 10px;"
-                            )
+                render_tool_row(t, vault, editable=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

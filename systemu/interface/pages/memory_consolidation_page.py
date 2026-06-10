@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME
+from systemu.runtime.memory_rules import needs_consolidation
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ def build_memory_consolidation_page() -> None:
 
     # ── Per-shadow table ──────────────────────────────────────────────────────
     if not shadow_rows:
-        ui.label("No shadows found — create one from the Shadow Army page.").style(
+        ui.label("No shadows found — create one from the Shadows page.").style(
             f"color: {THEME['text_muted']}; font-style: italic; padding: 20px 0;"
         )
         return
@@ -161,7 +162,8 @@ def _collect_shadow_rows(vault) -> List[Dict[str, Any]]:
         last_dt  = _parse_last_consolidated(md_text)
         is_stale = (now - last_dt) > timedelta(days=STALE_AFTER_DAYS)
         has_buf  = len(buf) >= BUFFER_THRESHOLD
-        needs    = (has_buf or is_stale) and bool(buf)
+        # ONE needs-consolidation rule, shared with memory_status + the engine.
+        needs    = needs_consolidation(buf, md_text)
 
         rows.append({
             "id":                 sid,
@@ -243,54 +245,21 @@ def _render_shadow_row(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_all(config, vault) -> None:
-    """Trigger consolidation for all eligible shadows and refresh the page."""
-    from systemu.scheduler.jobs import run_consolidation_for_all
+    """Trigger consolidation for all eligible shadows OFF-LOOP and refresh.
 
-    ui.notify("Running consolidation for all shadows…", type="info")
-    try:
-        updated = run_consolidation_for_all(config, vault)
-        if updated:
-            ui.notify(f"✅ {updated} shadow(s) consolidated.", type="positive")
-        else:
-            ui.notify("No shadows needed consolidation.", type="info")
-        ui.navigate.to("/memory")
-    except Exception as exc:
-        logger.error("[MemoryPage] Run-all consolidation failed: %s", exc)
-        ui.notify(f"Consolidation error: {exc}", type="negative")
+    P11: delegates to the shared async action so the multi-second LLM call
+    runs in a worker thread instead of freezing the NiceGUI event loop.
+    """
+    from systemu.interface.memory_actions import run_all_async
+
+    run_all_async(config, vault, on_done=lambda: ui.navigate.to("/memory"))
 
 
 def _run_one(shadow_id: str, config, vault) -> None:
-    """Consolidate a single shadow and refresh the page."""
-    from systemu.scheduler.jobs import _consolidate_one, _graduate_memory_to_skills
+    """Consolidate a single shadow OFF-LOOP and refresh the page (P11)."""
+    from systemu.interface.memory_actions import run_one_async
 
-    try:
-        shadow = vault.get_shadow(shadow_id)
-    except KeyError:
-        ui.notify("Shadow not found.", type="negative")
-        return
-
-    md_text, buffer_entries = vault.load_shadow_memory(shadow_id)
-    if not buffer_entries:
-        ui.notify("No buffered lessons to consolidate.", type="warning")
-        return
-
-    ui.notify(f"Consolidating {len(buffer_entries)} lesson(s) for '{shadow.name}'…", type="info")
-    try:
-        new_md = _consolidate_one(shadow, md_text, buffer_entries, config)
-        if not new_md or not new_md.lstrip().startswith("---"):
-            ui.notify("LLM returned invalid output — buffer left intact.", type="negative")
-            return
-        vault.save_shadow_memory(shadow_id, new_md)
-        vault.clear_memory_buffer(shadow_id)
-        try:
-            _graduate_memory_to_skills(shadow, new_md, vault)
-        except Exception as exc:
-            logger.warning("[MemoryPage] Skill graduation failed for %s: %s", shadow_id, exc)
-        ui.notify(f"✅ '{shadow.name}' memory consolidated.", type="positive")
-        ui.navigate.to("/memory")
-    except Exception as exc:
-        logger.error("[MemoryPage] Consolidation failed for %s: %s", shadow_id, exc)
-        ui.notify(f"Consolidation error: {exc}", type="negative")
+    run_one_async(shadow_id, config, vault, on_done=lambda: ui.navigate.to("/memory"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
