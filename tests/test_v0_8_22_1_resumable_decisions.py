@@ -237,6 +237,7 @@ class TestApplyStuckAnswer:
         rt._operator_hint = None
         rt._iters_since_obj_credit = 5
         rt._same_tool_fail_streak = {"x": 2}
+        rt._tools_since_credit = {"x"}   # W6.3 state (declared in __init__)
 
         class Obj:
             id = 1

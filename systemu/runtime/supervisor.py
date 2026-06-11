@@ -144,7 +144,23 @@ NOT double-queue.  The snapshot write is atomic (temp-file swap via ``os.replace
 """
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MAX_CONCURRENT_SHADOWS  = 3      # max parallel shadow executions
+MAX_CONCURRENT_SHADOWS  = 3      # max parallel shadow executions (default)
+
+
+def _resolve_max_concurrent() -> int:
+    """W7.4: the parallel-execution width, env-tunable.
+
+    ``SYSTEMU_MAX_CONCURRENT_SHADOWS`` overrides the default (3). Invalid or
+    non-positive values fall back to the default — the semaphore must never
+    be created with 0 slots (the queue would deadlock).
+    """
+    import os as _os
+    raw = _os.environ.get("SYSTEMU_MAX_CONCURRENT_SHADOWS", "")
+    try:
+        value = int(raw) if raw else MAX_CONCURRENT_SHADOWS
+    except ValueError:
+        return MAX_CONCURRENT_SHADOWS
+    return value if value >= 1 else MAX_CONCURRENT_SHADOWS
 MAX_RETRIES             = 2      # how many times to retry a failed activity
 STUCK_THRESHOLD_S       = 300    # [FIX-2] raised from 180s — LLM calls can take 130s each
 HEARTBEAT_INTERVAL_S    = 20     # how often the watchdog checks
@@ -208,7 +224,9 @@ class Supervisor:
         self._queue: queue.PriorityQueue[Tuple[int, float, Dict[str, Any]]] = queue.PriorityQueue()
 
         # Concurrency: semaphore limits parallel shadow threads
-        self._semaphore = threading.Semaphore(MAX_CONCURRENT_SHADOWS)
+        # W7.4: width is env-tunable (SYSTEMU_MAX_CONCURRENT_SHADOWS, default 3).
+        self._max_concurrent = _resolve_max_concurrent()
+        self._semaphore = threading.Semaphore(self._max_concurrent)
 
         # Running shadows: execution_key → {thread, cancel_event, last_heartbeat_at, meta}
         # [FIX-3/4/5/6] cancel_event lets watchdog signal clean exit; popping key from
@@ -322,13 +340,13 @@ class Supervisor:
         self._heartbeat_thread.start()
 
         self._publish("🚀 Supervisor started", level="SUCCESS", context={
-            "max_concurrent": MAX_CONCURRENT_SHADOWS,
+            "max_concurrent": self._max_concurrent,
             "max_retries": MAX_RETRIES,
             "stuck_threshold_s": STUCK_THRESHOLD_S,
             "token_bucket_tpm": TOKEN_BUCKET_PER_MINUTE,
         })
         logger.info("[Supervisor] Started — max_concurrent=%d stuck_threshold=%ds",
-                    MAX_CONCURRENT_SHADOWS, STUCK_THRESHOLD_S)
+                    self._max_concurrent, STUCK_THRESHOLD_S)
 
     def shutdown(self) -> None:
         """Graceful shutdown: persist pending queue items, signal threads to stop."""
@@ -877,7 +895,7 @@ class Supervisor:
             "running":           running_list,
             "dead_letters":      dl_list,
             "dead_letter_count": len(self._dead_letters),
-            "max_concurrent":    MAX_CONCURRENT_SHADOWS,
+            "max_concurrent":    self._max_concurrent,
             "stuck_threshold_s": STUCK_THRESHOLD_S,
         }
 

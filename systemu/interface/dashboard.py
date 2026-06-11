@@ -314,8 +314,10 @@ def _build_layout(page_title: str, current_path: str):
                             )
                             render_status_menu(_ny_vault)
                         except Exception:
-                            logger.debug("[Dashboard] status menu unavailable",
-                                         exc_info=True)
+                            # W7.3: loud — a swallowed render error here made the
+                            # button look like it never shipped.
+                            logger.warning("[Dashboard] Status menu failed to render",
+                                           exc_info=True)
                     _ny_model = needs_you_badge_model(_ny_vault)
                     needs_you_badge = ui.link(
                         f"Needs you ({_ny_model['count']})",

@@ -367,6 +367,7 @@ class TestStuckHelpers:
         rt = ShadowRuntime.__new__(ShadowRuntime)
         rt._iters_since_obj_credit = 0
         rt._same_tool_fail_streak = {}
+        rt._tools_since_credit = set()
         rt._stuck_round_for_obj = {}
         rt._operator_hint = None
         return rt
@@ -478,6 +479,7 @@ class TestStuckIntegration:
         rt._stuck_round_for_obj = {}
         rt._iters_since_obj_credit = 0
         rt._same_tool_fail_streak = {}
+        rt._tools_since_credit = set()
         rt._operator_hint = None
         # stub finalize-side-effect helpers so we test only the result shape
         monkeypatch.setattr(rt, "_append_to_shadow_log", lambda *a, **k: None, raising=False)
@@ -503,6 +505,7 @@ class TestStuckIntegration:
         rt._stuck_round_for_obj = {}
         rt._iters_since_obj_credit = 0
         rt._same_tool_fail_streak = {}
+        rt._tools_since_credit = set()
         rt._operator_hint = None
 
         # Mock request_choice to return the REAL serialized shape from /insights

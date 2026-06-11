@@ -164,9 +164,11 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
     # UI-thread timer is the SOLE driver of refresh (slot-error tolerant).
     safe_timer(0.5, _pane.refresh)
 
-    # Detach the subscriber when the client disconnects to avoid leaks.
+    # Detach the subscriber when the client is DELETED (not on disconnect —
+    # W7.2: app.on_disconnect is global, so any client's transient drop
+    # killed this pane's subscription; see live_events_pane).
     try:
-        app.on_disconnect(lambda: unsubscribe())
+        ui.context.client.on_delete(unsubscribe)
     except Exception:
         pass
 

@@ -132,7 +132,16 @@ class LocalBackend:
                     exit_code=-1,
                 )
 
-        cmd = [sys.executable, str(impl_path), "--params", params_json]
+        # W6.1: execute via the runner, NOT the impl file directly. The curated
+        # vault tools are module-style (TOOL_META + run(), no __main__) — direct
+        # script execution defined the functions and exited with code 0 and
+        # empty stdout, which _parse_execution_stdout reported as SUCCESS. All
+        # 41 vault tools were silent no-ops in subprocess mode (the spa/parking
+        # stuck-loop field bug). The runner imports the module and calls
+        # run(**params); script-style tools keep the old contract (it rewrites
+        # sys.argv and lets module-level code print its own JSON).
+        runner = Path(__file__).parent / "tool_runner_script.py"
+        cmd = [sys.executable, str(runner), str(impl_path), "--params", params_json]
         # BUG-4 fix: run the child via a thread + blocking subprocess.run rather
         # than asyncio.create_subprocess_exec. The asyncio child-watcher is
         # NOT implemented on the Windows SelectorEventLoop (which NiceGUI/uvicorn

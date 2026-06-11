@@ -116,10 +116,24 @@ def _resolved_inbox_rows(rows: List[Dict[str, Any]], get_decision) -> List[Dict[
 
 # ─── rendering ────────────────────────────────────────────────────────────────
 
+def _resolve_and_execute_gate(dec_id: str, choice: str, vault):
+    """The blocking half of a gate resolution — runs OFF the UI event loop.
+
+    resolve_gate EXECUTES the approved action (scroll → LLM activity
+    extraction, dep → pip install + dry-run, tools_blocked → Gate-3 enables,
+    forge → LLM code generation). Running it inside the NiceGUI click handler
+    starved the websocket for seconds — the operator saw a connection-lost
+    overlay and a frozen screen on every approve. Pure: no UI calls here.
+    """
+    from systemu.interface.command.inbox import InboxQueue, resolve_gate
+    queue = InboxQueue(vault)._queue
+    resolved = queue.resolve(dec_id, choice=choice)
+    return resolve_gate(resolved, vault=vault)
+
+
 def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None:
     """Render one pending gate as the unified triage card with Approve/Deny."""
     from systemu.interface.design.primitives import status_pill, button
-    from systemu.interface.command.inbox import InboxQueue, resolve_gate
 
     model = _inbox_card_model(descriptor)
     card_classes = "s-card s-card--danger" if model["destructive"] else "s-card"
@@ -162,20 +176,34 @@ def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None
             ui.label(f"dedup: {model['dedup']}").classes("s-mono")
 
         def _resolve_with(choice: str):
-            def _click(_=None):
+            # W7.1: async handler + to_thread — the resolve chain executes the
+            # approved action (LLM/pip/dry-run) and must never run on the UI
+            # event loop (it froze the dashboard + dropped the websocket).
+            async def _click(_=None):
+                import asyncio
+                # Capture the client before the await — the Triage section
+                # refreshes on a 5s timer + on resolve, disposing this slot
+                # while the executor runs; post-await UI ops re-enter it.
                 try:
-                    queue = InboxQueue(vault)._queue
-                    resolved = queue.resolve(dec_id, choice=choice)
-                    result = resolve_gate(resolved, vault=vault)
-                    ui.notify(
-                        getattr(result, "summary", None) or f"Resolved: {choice}",
-                        type="positive",
-                    )
+                    client = ui.context.client
+                except Exception:
+                    client = None
+                ui.notify(f"Working on it: {choice}…", type="info")
+                try:
+                    result = await asyncio.to_thread(
+                        _resolve_and_execute_gate, dec_id, choice, vault)
+                    msg = getattr(result, "summary", None) or f"Resolved: {choice}"
+                    typ = "positive"
                 except Exception as exc:
                     logger.exception("[Inbox] resolve failed for %s", dec_id)
-                    ui.notify(f"Resolve failed: {exc}", type="negative")
-                finally:
-                    on_resolved()
+                    msg, typ = f"Resolve failed: {exc}", "negative"
+                if client is not None:
+                    try:
+                        with client:
+                            ui.notify(msg, type=typ)
+                            on_resolved()
+                    except Exception:
+                        pass
             return _click
 
         # Forge gates route to the RICH human-code-review dialog (Slice 3e), NOT

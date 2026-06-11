@@ -1564,6 +1564,11 @@ class ShadowRuntime:
         self._iters_since_obj_credit: int = 0
         self._same_tool_fail_streak: dict[str, int] = {}
         self._stuck_round_for_obj: dict[int, int] = {}
+        # W6.3: EVERY tool called since the last objective credit — not just
+        # failing ones. The stuck ask reported "Tools tried: (none)" while
+        # fetch_json had been called repeatedly, because lying-success calls
+        # reset the failure streak and vanished from the report.
+        self._tools_since_credit: set[str] = set()
         self._operator_hint: "str | None" = None
         # v0.9.8 Phase 2: autonomous-coach self-steer counter; reset per run in execute().
         self._coach_steers_used: int = 0
@@ -1696,14 +1701,27 @@ class ShadowRuntime:
         if credited_obj_id is not None:
             self._iters_since_obj_credit = 0
             self._same_tool_fail_streak.clear()
+            self._tools_since_credit.clear()
             return
         self._iters_since_obj_credit += 1
         if action == "TOOL_CALL" and tool_name:
+            # W6.3: record the attempt regardless of reported success, so the
+            # stuck ask's "Tools tried" is truthful even for calls that
+            # "succeeded" without producing progress.
+            self._tools_since_credit.add(tool_name)
             if tool_success:
                 self._same_tool_fail_streak[tool_name] = 0
             else:
                 self._same_tool_fail_streak[tool_name] = \
                     self._same_tool_fail_streak.get(tool_name, 0) + 1
+
+    def _tools_tried_since_credit(self) -> "list[str]":
+        """W6.3: every tool attempted since the last objective credit, for the
+        stuck ask's "Tools tried" line — union of the all-attempts set and any
+        active failure streaks (belt-and-braces for resumed runs)."""
+        attempted = set(getattr(self, "_tools_since_credit", set()) or set())
+        attempted |= {k for k, v in self._same_tool_fail_streak.items() if v > 0}
+        return sorted(attempted)
 
     def _stuck_trigger(self) -> "tuple[bool, str]":
         """v0.8.21: hybrid trigger — no-progress OR same-tool-failure streak."""
@@ -1832,6 +1850,7 @@ class ShadowRuntime:
             )
             self._iters_since_obj_credit = 0
             self._same_tool_fail_streak.clear()
+            self._tools_since_credit.clear()
             return ("continue", None)
         if action_choice == "Accept partial":
             return ("finalize", finalize(status="partial"))
@@ -2125,6 +2144,7 @@ class ShadowRuntime:
         # v0.8.21: reset stuck-guard counters per run (declared in __init__).
         self._iters_since_obj_credit = 0
         self._same_tool_fail_streak.clear()
+        self._tools_since_credit.clear()
         self._stuck_round_for_obj.clear()
         self._operator_hint = None
         # v0.9.8 Phase 2: reset the autonomous-coach self-steer counter per run.
@@ -3534,7 +3554,10 @@ class ShadowRuntime:
                         # _update_progress_counters sets a succeeded tool's streak to 0
                         # but keeps the key; only tools with an active failure streak
                         # belong in the operator's "tools tried" line.
-                        tools_tried = sorted(k for k, v in self._same_tool_fail_streak.items() if v > 0)
+                        # W6.3: ALL tools attempted since last credit — failure
+                        # streaks alone hid successful-but-useless calls, so the
+                        # operator read "Tools tried: (none)" mid-loop.
+                        tools_tried = self._tools_tried_since_credit()
                         # v0.9.8 Phase 2: autonomous mid-run steering coach. Before
                         # escalating to a human operator, FIRST try to self-steer:
                         # ask an LLM for one concrete corrective instruction and inject

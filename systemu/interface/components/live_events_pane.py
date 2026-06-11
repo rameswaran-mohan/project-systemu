@@ -294,7 +294,12 @@ def build_supervisor_events_pane(
     from systemu.interface.ui_helpers import safe_timer
     pane_timer = safe_timer(0.5, _tick)
 
-    # Unsubscribe + stop the timer when the client disconnects.
+    # Unsubscribe + stop the timer when the client is DELETED — not on
+    # disconnect. W7.2: app.on_disconnect is GLOBAL (fires for EVERY client's
+    # disconnect), so any navigation or transient websocket drop anywhere
+    # killed this pane's subscription process-wide; NiceGUI then reconnected
+    # the same page WITHOUT rebuilding it → the feed was dead until a manual
+    # refresh. client.on_delete fires only when this page is truly gone.
     def _on_client_gone() -> None:
         try:
             pane_timer.cancel()
@@ -306,7 +311,6 @@ def build_supervisor_events_pane(
             pass
 
     try:
-        from nicegui import app
-        app.on_disconnect(lambda: _on_client_gone())
+        ui.context.client.on_delete(_on_client_gone)
     except Exception:
         pass
