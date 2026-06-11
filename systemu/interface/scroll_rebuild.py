@@ -74,7 +74,7 @@ def open_scroll_rebuild_dialog(
     scroll_name = getattr(scroll, "name", scroll_id)
 
     with ui.dialog() as dlg, card(classes="s-dialog q-pa-lg"):
-        ui.label(f"🛠️ Rebuild Scroll — {scroll_name}").classes("s-dialog-title q-mb-md")
+        ui.label(f"Rebuild Scroll — {scroll_name}").classes("s-dialog-title q-mb-md")
 
         def _show_scroll_data() -> None:
             try:

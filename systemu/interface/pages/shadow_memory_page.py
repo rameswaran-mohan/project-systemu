@@ -34,7 +34,7 @@ def build_shadow_memory_page(shadow_id: str) -> None:
     # ── Header ────────────────────────────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 18px;"):
         with ui.column().style("gap: 4px;"):
-            ui.label(f"🧠 Memory — {shadow.name}").style(
+            ui.label(f"Memory — {shadow.name}").style(
                 f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
             )
             ui.label(shadow.description[:160] + ("…" if len(shadow.description) > 160 else "")).style(
@@ -43,7 +43,7 @@ def build_shadow_memory_page(shadow_id: str) -> None:
 
         with ui.row().style("gap: 8px;"):
             ui.button(
-                "🔄 Consolidate now",
+                "Consolidate now",
                 on_click=lambda _, sid=shadow_id: _trigger_consolidation(sid),
             ).style(
                 f"background: {THEME['primary']}; color: white; border-radius: 8px; font-size: 13px;"
@@ -62,13 +62,13 @@ def build_shadow_memory_page(shadow_id: str) -> None:
         f"border-radius: 10px; padding: 12px 18px; margin-bottom: 16px; width: 100%;"
     ):
         with ui.row().style("gap: 24px; align-items: center;"):
-            _stat("📝", str(len(buffer_entries)), "Buffered lessons")
-            _stat("📜", str(len(shadow.execution_log)), "Execution log entries")
+            _stat("", str(len(buffer_entries)), "Buffered lessons")
+            _stat("", str(len(shadow.execution_log)), "Execution log entries")
             _stat("⏱", _last_consolidated_label(md_text), "Last consolidated")
 
     # ── Buffer preview (collapsible) ──────────────────────────────────────────
     if buffer_entries:
-        with ui.expansion("📥 Pending lesson buffer", icon="inbox").style(
+        with ui.expansion("Pending lesson buffer", icon="inbox").style(
             f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
             f"border-radius: 10px; margin-bottom: 16px; width: 100%;"
         ):
@@ -109,7 +109,7 @@ def build_shadow_memory_page(shadow_id: str) -> None:
 
 def _stat(icon: str, value: str, label: str) -> None:
     with ui.column().style("align-items: flex-start; gap: 1px;"):
-        ui.label(f"{icon} {value}").style(
+        ui.label(f"{icon} {value}".strip()).style(
             f"font-size: 14px; font-weight: 700; color: {THEME['text']};"
         )
         ui.label(label).style(f"font-size: 10px; color: {THEME['text_muted']};")

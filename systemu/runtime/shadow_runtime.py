@@ -3719,6 +3719,25 @@ class ShadowRuntime:
                 default=False,
             )
             if not approved:
+                # Wave 1.1: in headless contexts confirm() auto-denies — make
+                # that VISIBLE (event log + WARNING) instead of a silent
+                # degradation the operator only discovers via a partial result.
+                from systemu.interface.notifications import is_headless
+                if is_headless():
+                    logger.warning(
+                        "[Runtime] destructive tool call AUTO-DENIED "
+                        "(non-interactive context): tool=%s — run interactively "
+                        "or pre-approve to allow it", tool_name,
+                    )
+                    try:
+                        log_event(
+                            "WARNING", "tool",
+                            f"Destructive call to '{tool_name}' auto-denied "
+                            "(non-interactive run). Re-run interactively to allow it.",
+                            context={"tool_name": tool_name},
+                        )
+                    except Exception:
+                        logger.debug("[Runtime] log_event failed for auto-deny notice")
                 context.add_observation(
                     {"type": "user_denied", "tool_name": tool_name,
                      "message": "User denied this destructive action."},
@@ -3771,11 +3790,16 @@ class ShadowRuntime:
                 context.add_observation(obs, current_ab)
                 return ToolResult(success=False, parsed=obs, error=obs["error"])
 
+        # W2.2: forged-and-untrusted tools run OUT-OF-PROCESS (subprocess
+        # backend) — the in-process fast path is reserved for built-ins and
+        # operator-trusted tools.
+        from systemu.runtime.tool_sandbox import requires_subprocess_isolation
         result = await self.sandbox.execute_tool(
             tool_obj.implementation_path,
             parameters,
             extra_packages=tool_obj.dependencies or [],
             tool_type=getattr(tool_obj.tool_type, "value", tool_obj.tool_type),
+            force_subprocess=requires_subprocess_isolation(tool_obj),
         )
 
         # v0.9.1 (T8 must-wire): apply max_result_size_chars truncation.

@@ -36,7 +36,7 @@ def consolidate_all_result(config, vault) -> Result:
 
     updated = run_consolidation_for_all(config, vault)
     if updated:
-        return ("positive", f"✅ {updated} shadow(s) consolidated.")
+        return ("positive", f"✓ {updated} shadow(s) consolidated.")
     return ("info", "No shadows needed consolidation.")
 
 
@@ -59,7 +59,7 @@ def consolidate_one_result(shadow, md_text: str, buffer_entries: Sequence,
         _graduate_memory_to_skills(shadow, new_md, vault)
     except Exception as exc:  # graduation is best-effort
         logger.warning("[MemoryActions] skill graduation failed for %s: %s", shadow_id, exc)
-    return ("positive", f"✅ '{getattr(shadow, 'name', shadow_id)}' memory consolidated.")
+    return ("positive", f"✓ '{getattr(shadow, 'name', shadow_id)}' memory consolidated.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

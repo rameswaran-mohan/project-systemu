@@ -50,6 +50,30 @@ class GateModePolicy(BaseModel):
         return "allow" if str(risk).lower() == "low" else "ask"
 
 
+def floor_pierces(policy: "GateModePolicy") -> list[str]:
+    """Human-readable list of the ways ``policy`` bypasses the safety floor
+    (W2.4 — pure, renderable as a warn banner).
+
+    The escape hatches are DELIBERATE (override-beats-floor is the operator's
+    documented out), but they must be visible: ``no_floor`` disables the floor
+    wholesale, and an ``allow`` override on a floor gate type auto-grants what
+    the floor exists to force into review.  ``ask`` overrides match floor
+    behaviour and non-floor overrides are the dial working as designed —
+    neither is flagged.
+    """
+    out: list[str] = []
+    if policy.no_floor:
+        out.append("no_floor=true — the safety floor is disabled entirely")
+    floor = FLOOR_GATE_TYPES | policy.floor_extra
+    for gate_type, value in sorted(policy.overrides.items()):
+        if gate_type in floor and value == "allow":
+            out.append(
+                f"override {gate_type}→allow auto-grants a floor gate type "
+                f"(pierces the safety floor)"
+            )
+    return out
+
+
 def load_default_policy() -> "GateModePolicy":
     """Build a GateModePolicy from the persisted gate-mode settings (.env).
 

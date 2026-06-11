@@ -375,14 +375,11 @@ def notify_user(
     # any multi-action prompt auto-picks actions[0] — callers MUST order
     # actions so the first entry is the SAFE-by-default choice.  See the
     # action-ordering contract on notify_user above.
-    non_interactive = (os.environ.get("SYSTEMU_NON_INTERACTIVE") or "").lower() == "true"
-    is_headless = (
-        not sys.stdin.isatty()
-        or os.environ.get("SYSTEMU_HEADLESS") == "1"
-        or _console_non_unicode
-        or non_interactive
-    )
-    if is_headless:
+    #
+    # Wave 1.1: the strict signals live in the shared is_headless() (also
+    # used by confirm()); the non-unicode-console heuristic stays HERE only —
+    # it guards rich/emoji display, not promptability.
+    if is_headless() or _console_non_unicode:
         auto_choice = actions[0]
         logger.info(
             "[Notify] Headless mode — auto-selecting '%s' for: %s",
@@ -549,17 +546,43 @@ def request_choice(questions, *, dedup_key, extra_context=None) -> Optional[dict
     raise PendingChoiceRequest(decision_id=decision_id, dedup_key=dedup_key, options=labels)
 
 
+def is_headless() -> bool:
+    """True when this process cannot (or must not) prompt on stdin.
+
+    The ONE detector shared by ``confirm`` and ``notify_user`` (Wave 1.1 —
+    previously the two checked different signals, so the documented
+    ``SYSTEMU_NON_INTERACTIVE`` switch covered multi-action prompts but NOT
+    the destructive-action confirm gate, which could block a server process).
+
+    Signals (any one ⇒ headless):
+      • ``SYSTEMU_NON_INTERACTIVE=true`` — the operator's documented switch;
+      • ``SYSTEMU_HEADLESS=1``           — legacy/daemon-set marker;
+      • no stdin TTY                      — pipes, services, CI.
+
+    Deliberately NOT included: the non-unicode-console heuristic that
+    ``notify_user`` layers on top — that is a *display* concern; treating a
+    cp1252 PowerShell as headless here would silently auto-deny destructive
+    prompts for every default-console Windows user.
+    """
+    import sys, os
+    if (os.environ.get("SYSTEMU_NON_INTERACTIVE") or "").lower() == "true":
+        return True
+    if os.environ.get("SYSTEMU_HEADLESS") == "1":
+        return True
+    return not sys.stdin.isatty()
+
+
 def confirm(prompt_text: str, default: bool = True) -> bool:
     """Simple yes/no confirmation wrapper.
 
-    Headless-safe: when stdin is not a TTY, ``SYSTEMU_HEADLESS=1`` is set, or
-    the prompt cannot actually be read (a daemon may inherit a *dead*
-    controlling terminal so ``isatty()`` is True yet ``input()`` hits EOF),
-    fall back to ``default`` instead of crashing the run.  For destructive
-    gates the caller passes ``default=False`` so EOF means "deny".
+    Headless-safe via ``is_headless()`` (no TTY / SYSTEMU_HEADLESS /
+    SYSTEMU_NON_INTERACTIVE), plus EOF tolerance — a daemon may inherit a
+    *dead* controlling terminal so ``isatty()`` is True yet ``input()`` hits
+    EOF.  Falls back to ``default`` instead of blocking or crashing; for
+    destructive gates the caller passes ``default=False`` so headless means
+    "deny".
     """
-    import sys, os
-    if not sys.stdin.isatty() or os.environ.get("SYSTEMU_HEADLESS") == "1":
+    if is_headless():
         return default
     try:
         return click.confirm(f"  {prompt_text}", default=default)

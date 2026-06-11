@@ -56,3 +56,32 @@ def safe_timer(
             raise
 
     return ui.timer(interval, _wrapped, active=active, once=once)
+
+
+def render_floor_pierce_banner() -> None:
+    """Persistent warn banner when the gate policy pierces the safety floor
+    (W2.4) — rendered on the Inbox and the Settings gate-mode card.
+
+    The escape hatches (no_floor, override→allow on a floor type) are
+    deliberate operator tools, but they must never be invisible. Best-effort:
+    an unreadable policy renders nothing rather than breaking the page.
+    """
+    from nicegui import ui
+
+    try:
+        from systemu.interface.command.gate_mode import (
+            floor_pierces,
+            load_default_policy,
+        )
+        pierces = floor_pierces(load_default_policy())
+    except Exception:
+        return
+    if not pierces:
+        return
+    with ui.element("div").classes("s-banner s-banner--warn").style("margin: 4px 0 12px;"):
+        ui.icon("warning")
+        ui.label(
+            "Safety floor pierced: " + "; ".join(pierces) +
+            ". Floor gates (dep installs, destructive recovery) can now "
+            "auto-grant — review in Settings."
+        )

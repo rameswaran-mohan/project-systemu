@@ -409,6 +409,15 @@ def run_direct_task(
             "missing_tools": not_ready,
             "error":        msg,
         })
+        # W1.2: make the park ACTIONABLE — post the unified Inbox gate naming
+        # the blocking tools ("Enable & run" → Gate-3 enable → heal sweep
+        # re-runs the task). Best-effort: a gate failure must not break the park.
+        try:
+            from systemu.interface.readiness_gate import ensure_tools_blocked_gate
+            ensure_tools_blocked_gate(vault, activity, not_ready_tools)
+        except Exception:
+            logger.debug("[DirectTask] could not enqueue tools_blocked gate",
+                         exc_info=True)
         logger.info("[DirectTask] Parked '%s' as waiting_on_tools — not ready: %s",
                     activity.id, not_ready)
         return activity
@@ -493,6 +502,15 @@ def run_direct_task(
         "shadow_id":    shadow.id,
         "execution_id": result.get("execution_id"),
     })
+
+    # Wave 1.4: persist the terminal activity state on the SYNC path too.
+    # Previously only the Supervisor's queued path flipped the activity to
+    # COMPLETED — a sync-executed task stayed "assigned" in the vault forever,
+    # so the dashboard showed finished work as never-finished.
+    if result.get("status") == "success":
+        from systemu.runtime.activity_completion import mark_activity_completed
+        mark_activity_completed(vault, activity.id)
+
     _maybe_trigger_fact_extraction(vault, config, ts)
 
     # v0.9.2: episodic capture — best-effort hook at chat-resolve

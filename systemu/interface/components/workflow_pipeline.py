@@ -20,12 +20,12 @@ from systemu.runtime.workflow_tracker import STAGES, WorkflowTracker
 
 
 _STAGE_ICONS = {
-    "capture":   "🎙️",
-    "scroll":    "📜",
-    "activity":  "📋",
-    "execution": "⚙️",
-    "done":      "✅",
-    "failed":    "⚠️",
+    "capture":   "mic",
+    "scroll":    "history_edu",
+    "activity":  "assignment",
+    "execution": "settings",
+    "done":      "check_circle",
+    "failed":    "warning",
 }
 
 _STAGE_COLORS = {
@@ -67,7 +67,7 @@ def build_workflow_pipeline(*, compact: bool = False, refresh_seconds: float = 2
         with ui.row().classes("w-full items-center").style(
             "gap: 12px; margin-bottom: 10px;"
         ):
-            ui.label("🔄 Workflows").style(
+            ui.label("Workflows").style(
                 f"font-size: 15px; font-weight: 700; color: {THEME['text']};"
             )
             ui.label(f"{len(active)} in-flight").style(
@@ -109,7 +109,7 @@ def build_workflow_pipeline(*, compact: bool = False, refresh_seconds: float = 2
 
 
 def _stage_chip(stage: str, count: int) -> None:
-    icon  = _STAGE_ICONS.get(stage, "•")
+    icon  = _STAGE_ICONS.get(stage, "circle")
     color = _STAGE_COLORS.get(stage, THEME["text_muted"])
     with ui.row().style(
         f"align-items: center; gap: 6px; padding: 6px 10px; "
@@ -117,7 +117,7 @@ def _stage_chip(stage: str, count: int) -> None:
         f"border: 1px solid color-mix(in srgb, {color} 35%, transparent); "
         f"border-radius: 999px;"
     ):
-        ui.label(icon).style("font-size: 13px;")
+        ui.icon(icon).style("font-size: 13px;")
         ui.label(stage.upper()).style(
             f"font-size: 10px; font-weight: 700; color: {color}; letter-spacing: 0.06em;"
         )
@@ -127,7 +127,7 @@ def _stage_chip(stage: str, count: int) -> None:
 
 
 def _workflow_row(snap) -> None:
-    icon  = _STAGE_ICONS.get(snap.stage, "•")
+    icon  = _STAGE_ICONS.get(snap.stage, "circle")
     color = _STAGE_COLORS.get(snap.stage, THEME["text_muted"])
     with ui.row().style(
         f"width: 100%; gap: 10px; padding: 6px 8px; align-items: center; "
@@ -135,7 +135,7 @@ def _workflow_row(snap) -> None:
     ).on(
         "click", lambda _, wid=snap.workflow_id: ui.navigate.to(f"/workflow/{wid}")
     ):
-        ui.label(icon).style("font-size: 14px; min-width: 18px;")
+        ui.icon(icon).style("font-size: 14px; min-width: 18px;")
         with ui.column().style("flex: 1; gap: 2px;"):
             ui.label(snap.title[:60]).style(
                 f"font-size: 13px; color: {THEME['text']}; font-weight: 600;"

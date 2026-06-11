@@ -111,6 +111,22 @@ def _build_empty_config():
     return Config()
 
 
+def requires_subprocess_isolation(tool) -> bool:
+    """W2.2 isolation policy: LLM-forged code runs OUT-OF-PROCESS unless the
+    operator explicitly trusted it (``trusted_inprocess``).
+
+    The in-process fast path is a direct importlib call inside the daemon —
+    full process privileges (vault, env vars, network). That is fine for
+    built-in tools (repo code), but generated code only earns it explicitly.
+    ``None`` (no Tool context) isolates defensively — we can't prove it's a
+    built-in.
+    """
+    if tool is None:
+        return True
+    return bool(getattr(tool, "forged_by_systemu", False)) and \
+        not bool(getattr(tool, "trusted_inprocess", False))
+
+
 def _must_use_subprocess(tool_type, dependencies) -> bool:
     """Playwright/Selenium use a sync API that cannot run inside the asyncio
     loop the in-process fast path uses, so such tools must run in a fresh
@@ -196,7 +212,13 @@ class ToolSandbox:
             vault_root = getattr(vault, "root", None)
         if vault_root is None:
             vault_root = Path(".")
-        self.vault_root    = Path(vault_root)
+        # Wave 1.3: anchor at construction.  vault_root is often relative
+        # (config default "systemu/vault", or the bare "." fallback above);
+        # implementation paths resolve against vault_root.parent at EXECUTION
+        # time, so an unresolved root floated with whatever CWD the daemon /
+        # worker happened to have — tools forged from the project root broke
+        # when run from anywhere else.
+        self.vault_root    = Path(vault_root).resolve()
         self.timeout       = default_timeout
         self.max_output    = max_output_bytes
         self._registry     = registry   # ToolRegistry for the fast direct-call path
@@ -408,6 +430,7 @@ class ToolSandbox:
             params or {},
             timeout=timeout,
             tool_type=getattr(tool, "tool_type", None),
+            force_subprocess=requires_subprocess_isolation(tool),   # W2.2
         )
         return tr.to_dict()
 
@@ -425,6 +448,7 @@ class ToolSandbox:
         timeout: Optional[int] = None,
         extra_packages: Optional[List[str]] = None,
         tool_type: Optional[str] = None,
+        force_subprocess: bool = False,
     ) -> ToolResult:
         """Execute a tool implementation script with the given parameters.
 
@@ -469,7 +493,12 @@ class ToolSandbox:
         # ── Fast path: ToolRegistry (direct Python function call) ─────────
         # Browser/Playwright tools MUST go through the subprocess path — their
         # sync API cannot run inside the in-process async fast path (v0.8.15).
+        # W2.2: callers with Tool context pass force_subprocess=True for
+        # forged-and-untrusted tools (requires_subprocess_isolation) — the
+        # in-process fast path is full-daemon-privilege and generated code
+        # only earns it via the operator's explicit trusted_inprocess.
         if (self._registry is not None and impl_path.exists()
+                and not force_subprocess
                 and not _must_use_subprocess(tool_type, extra_packages)):
             try:
                 from systemu.runtime.tool_registry import ToolDependencyError, ToolNotEnabledError

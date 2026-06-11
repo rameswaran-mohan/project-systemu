@@ -283,6 +283,34 @@ class ParallelVault:
     def list_pending_notifications(self) -> List[Dict[str, Any]]:
         return self._p.list_pending_notifications()
 
+    # ── Decisions (OperatorDecisionQueue backing) ─────────────────────────────
+    #
+    # Wave 1.5: wrapper drift — the decisions surface (v0.8.0) and the
+    # episodic surface (v0.9.2) were added to the inner Vault + FileVault but
+    # never to this adapter, so in SYSTEMU_STORAGE=parallel mode the Inbox
+    # could not read/write OperatorDecision records and episodic capture
+    # failed with AttributeError.  Writes dual-write (primary + best-effort
+    # secondary); reads come from primary, matching every method above.
+
+    def save_decision(self, decision) -> None:
+        self._p.save_decision(decision)
+        self._write_secondary("save_decision", decision)
+
+    def get_decision(self, decision_id: str):
+        return self._p.get_decision(decision_id)
+
+    # ── Episodic memory (v0.9.2 session summaries) ───────────────────────────
+
+    def append_session_summary(self, summary) -> None:
+        self._p.append_session_summary(summary)
+        self._write_secondary("append_session_summary", summary)
+
+    def query_session_summaries(self, **kwargs):
+        return self._p.query_session_summaries(**kwargs)
+
+    def search_session_summaries(self, query: str, **kwargs):
+        return self._p.search_session_summaries(query, **kwargs)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Diff helpers (non-blocking, best-effort)

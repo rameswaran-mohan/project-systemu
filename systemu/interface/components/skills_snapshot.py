@@ -57,7 +57,7 @@ def build_skills_snapshot(top_n: int = 5) -> None:
                 f"width: 100%; gap: 10px; padding: 8px 12px; align-items: center; "
                 f"border-bottom: 1px solid {THEME['border']};"
             ):
-                ui.label("🧩").style("font-size: 14px; min-width: 18px;")
+                ui.icon("extension").style("font-size: 14px; min-width: 18px;")
                 with ui.column().style("flex: 1; gap: 1px;"):
                     ui.label(s.get("name") or s.get("id", "?")).style(
                         f"font-size: 13px; font-weight: 600; color: {THEME['text']};"

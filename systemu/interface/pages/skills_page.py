@@ -50,7 +50,7 @@ def build_skills_page() -> None:
     vault = state.vault
 
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("🧠 Skills Registry").style(
+        ui.label("Skills Registry").style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
 

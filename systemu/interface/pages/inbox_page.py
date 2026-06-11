@@ -238,6 +238,11 @@ def build_inbox_page() -> None:
         "Approve executes the authorized action."
     ).classes("s-muted").style("font-size: 13px; margin-bottom: 16px;")
 
+    # W2.4: never silent when the gate policy pierces the safety floor
+    # (no_floor / override→allow on dep|recovery) — uses gate_mode.floor_pierces.
+    from systemu.interface.ui_helpers import render_floor_pierce_banner
+    render_floor_pierce_banner()
+
     # ── Triage (pending) ──────────────────────────────────────────────────────
     ui.label("Triage").classes("s-section-head").style("margin-top: 8px;")
 

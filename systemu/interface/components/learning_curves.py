@@ -37,7 +37,7 @@ def build_learning_curves() -> None:
         )
         ui.button(
             "Open Flywheel →",
-            on_click=lambda: ui.navigate.to("/flywheel"),
+            on_click=lambda: ui.navigate.to("/insights?tab=flywheel"),
         ).style(
             f"background: {THEME['surface2']}; color: {THEME['text']}; "
             f"border: 1px solid {THEME['border']}; border-radius: 8px; "
@@ -46,15 +46,15 @@ def build_learning_curves() -> None:
         return
 
     with ui.row().classes("w-full gap-3 flex-wrap"):
-        _tile("⚙️", "Executions",      str(total_execs),     THEME["primary"])
-        _tile("✅", "Success rate",    f"{success_rate}%",   THEME["success"])
-        _tile("📚", "Memory entries",  str(total_mem),       "#a78bfa")
-        _tile("🔥", "High-conf",       str(total_high),      THEME["warning"])
-        _tile("👥", "Shadows tracked", str(len(all_metrics)),THEME["info"])
+        _tile("settings",  "Executions",      str(total_execs),     THEME["primary"])
+        _tile("check_circle", "Success rate", f"{success_rate}%",   THEME["success"])
+        _tile("menu_book", "Memory entries",  str(total_mem),       "#a78bfa")
+        _tile("local_fire_department", "High-conf", str(total_high), THEME["warning"])
+        _tile("groups",    "Shadows tracked", str(len(all_metrics)),THEME["info"])
 
     ui.button(
         "Open Flywheel →",
-        on_click=lambda: ui.navigate.to("/flywheel"),
+        on_click=lambda: ui.navigate.to("/insights?tab=flywheel"),
     ).style(
         f"background: {THEME['surface2']}; color: {THEME['text']}; "
         f"border: 1px solid {THEME['border']}; border-radius: 8px; "
@@ -69,7 +69,7 @@ def _tile(icon: str, label: str, value: str, color: str) -> None:
         f"gap: 2px;"
     ):
         with ui.row().style("align-items: center; gap: 6px;"):
-            ui.label(icon).style("font-size: 16px;")
+            ui.icon(icon).style("font-size: 16px;")
             ui.label(label).style(
                 f"font-size: 11px; color: {THEME['text_muted']}; font-weight: 600; "
                 f"text-transform: uppercase; letter-spacing: 0.06em;"

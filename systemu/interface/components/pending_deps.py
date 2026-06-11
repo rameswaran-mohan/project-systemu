@@ -130,7 +130,7 @@ def _pending_row(entry: Dict, *, on_change=None) -> None:
         f"width: 100%; gap: 10px; padding: 8px 12px; align-items: center; "
         f"border-bottom: 1px solid {THEME['border']};"
     ):
-        ui.label("📦").style("font-size: 14px; min-width: 18px;")
+        ui.icon("inventory_2").style("font-size: 14px; min-width: 18px;")
         with ui.column().style("flex: 1; gap: 1px;"):
             ui.label(package).style(
                 f"font-size: 13px; font-weight: 600; color: {THEME['text']};"
@@ -155,7 +155,7 @@ def _approved_row(entry: Dict, *, on_change=None) -> None:
         f"width: 100%; gap: 10px; padding: 6px 12px; align-items: center; "
         f"border-bottom: 1px solid {THEME['border']};"
     ):
-        ui.label("✅").style("font-size: 13px; min-width: 18px;")
+        ui.label("✓").style("font-size: 13px; min-width: 18px;")
         with ui.column().style("flex: 1; gap: 1px;"):
             ui.label(package).style(
                 f"font-size: 12px; font-weight: 600; color: {THEME['text']};"

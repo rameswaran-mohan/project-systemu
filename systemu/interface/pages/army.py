@@ -18,9 +18,9 @@ from systemu.interface.name_resolver import resolve_names
 
 
 _STATUS_ICON = {
-    "awakened": "⚡",
-    "dormant":  "💤",
-    "retired":  "🪦",
+    "awakened": "bolt",
+    "dormant":  "dark_mode",
+    "retired":  "archive",
 }
 
 
@@ -90,8 +90,8 @@ def _render_execute_jobs_panel() -> None:
 
     with ui.row().style("gap: 12px; width: 100%; margin-bottom: 16px;"):
         for label, key, color in (
-            ("⏳ Queued", "queued", THEME["warning"]),
-            ("▶️ Running", "running", THEME["primary"]),
+            ("Queued", "queued", THEME["warning"]),
+            ("Running", "running", THEME["primary"]),
             ("✓ Completed", "completed", THEME["success"]),
         ):
             with ui.card().style(
@@ -187,7 +187,7 @@ def _render_schedules_list_panel() -> None:
         f"border-radius: 12px; padding: 16px; margin-bottom: 16px;"
     ):
         with ui.row().style("align-items: center; gap: 8px; margin-bottom: 8px;"):
-            ui.label("📅 Active Schedules").style(
+            ui.label("Active Schedules").style(
                 f"font-size: 14px; font-weight: 700; color: {THEME['text']};"
             )
             ui.label(f"({len(vm)})").style(f"color: {THEME['text_muted']};")
@@ -235,7 +235,7 @@ def build_army_page() -> None:
     vault = state.vault
 
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("👥 Shadows").style(
+        ui.label("Shadows").style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
         with ui.row().style("gap: 8px; align-items: center;"):
@@ -245,7 +245,7 @@ def build_army_page() -> None:
             # button primitive (no inline f-string style — lint 0 new).
             from systemu.interface.design.primitives import button as _token_button
             _token_button(
-                "🧠 Memory consolidation",
+                "Memory consolidation",
                 variant="ghost",
                 on_click=lambda: ui.navigate.to(_memory_consolidation_route()),
             )
@@ -277,7 +277,7 @@ def build_army_page() -> None:
 
 def _shadow_card(sh: dict) -> None:
     status  = sh.get("status", "dormant")
-    icon    = _STATUS_ICON.get(status, "🤖")
+    icon    = _STATUS_ICON.get(status, "smart_toy")
     color   = _status_color(status)
     skills  = len(sh.get("skill_ids", []))
     tools   = len(sh.get("tool_ids", []))
@@ -291,7 +291,7 @@ def _shadow_card(sh: dict) -> None:
 
         # Avatar + name row
         with ui.row().style("align-items: center; gap: 12px; margin-bottom: 10px;"):
-            ui.label(icon).style(
+            ui.icon(icon).style(
                 f"font-size: 32px; width: 48px; height: 48px; display: flex; "
                 f"align-items: center; justify-content: center; background: "
                 f"color-mix(in srgb, {color} 15%, transparent); border-radius: 12px;"
@@ -314,15 +314,15 @@ def _shadow_card(sh: dict) -> None:
             f"gap: 16px; padding: 10px 0; border-top: 1px solid {THEME['border']}; "
             f"border-bottom: 1px solid {THEME['border']}; margin-bottom: 12px;"
         ):
-            _mini_stat("🧠", str(skills), "Skills")
-            _mini_stat("🔧", str(tools),  "Tools")
-            _mini_stat("📋", str(acts),   "Activities")
+            _mini_stat(str(skills), "Skills")
+            _mini_stat(str(tools),  "Tools")
+            _mini_stat(str(acts),   "Activities")
 
         # Action buttons
         with ui.row().style("gap: 8px;"):
             uid = sh["id"]
             ui.button(
-                "👁 Details",
+                "Details",
                 on_click=lambda _, i=uid: _show_shadow_detail(i),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
@@ -330,7 +330,7 @@ def _shadow_card(sh: dict) -> None:
                 f"font-size: 12px; flex: 1;"
             )
             ui.button(
-                "🧠 Memory",
+                "Memory",
                 on_click=lambda _, i=uid: ui.navigate.to(f"/memory/{i}"),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
@@ -338,14 +338,14 @@ def _shadow_card(sh: dict) -> None:
                 f"font-size: 12px; flex: 1;"
             )
             ui.button(
-                "⚡ Execute",
+                "Execute",
                 on_click=lambda _, i=uid: _show_execute_dialog(i),
             ).style(
                 f"background: {color}; color: white; border-radius: 8px; "
                 f"font-size: 12px; flex: 1;"
             )
             ui.button(
-                "📅 Schedule",
+                "Schedule",
                 on_click=lambda _, sid=uid: _show_schedule_dialog(sid),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
@@ -355,7 +355,7 @@ def _shadow_card(sh: dict) -> None:
             # Phase 5 Slice 4c: edit-in-place — the Workshop Shadows tab is gone;
             # open the shared shadow editor (active-lock enforced) right here.
             ui.button(
-                "✏️ Edit",
+                "Edit",
                 on_click=lambda _, sid=uid: open_shadow_edit_dialog(
                     AppState.get().vault.get_shadow(sid), AppState.get().vault
                 ),
@@ -366,9 +366,9 @@ def _shadow_card(sh: dict) -> None:
             )
 
 
-def _mini_stat(icon: str, value: str, label: str) -> None:
+def _mini_stat(value: str, label: str) -> None:
     with ui.column().style("align-items: center; gap: 1px;"):
-        ui.label(f"{icon} {value}").style(
+        ui.label(value).style(
             f"font-size: 14px; font-weight: 700; color: {THEME['text']};"
         )
         ui.label(label).style(f"font-size: 10px; color: {THEME['text_muted']};")
@@ -427,7 +427,7 @@ def _show_shadow_detail(shadow_id: str) -> None:
                 f"text-transform: uppercase; letter-spacing: 0.08em;"
             )
             color = THEME["success"] if supervisor_on else THEME["text_muted"]
-            ui.label("🧠 ENABLED" if supervisor_on else "⏸ disabled").style(
+            ui.label("ENABLED" if supervisor_on else "⏸ disabled").style(
                 f"font-size: 12px; font-weight: 700; color: {color}; "
                 f"padding: 2px 8px; border-radius: 999px; "
                 f"background: color-mix(in srgb, {color} 15%, transparent);"
@@ -576,7 +576,7 @@ def _show_schedule_dialog(shadow_id: str) -> None:
         f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
         f"border-radius: 16px; padding: 28px; min-width: 480px;"
     ):
-        ui.label("📅 Schedule Execution").style(
+        ui.label("Schedule Execution").style(
             f"font-size: 18px; font-weight: 700; color: {THEME['text']}; margin-bottom: 16px;"
         )
 
@@ -653,7 +653,7 @@ def _show_schedule_dialog(shadow_id: str) -> None:
                 ui.notify(f"Error: {exc}", type="negative")
 
         with ui.row().style("gap: 10px; margin-top: 20px;"):
-            ui.button("📅 Schedule", on_click=_do_schedule).style(
+            ui.button("Schedule", on_click=_do_schedule).style(
                 f"background: {THEME['primary']}; color: white; border-radius: 8px;"
             )
             ui.button("Cancel", on_click=dlg.close).style(
@@ -674,7 +674,7 @@ def _show_awaken_dialog() -> None:
         f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
         f"border-radius: 16px; padding: 28px; min-width: 560px; max-width: 640px;"
     ):
-        ui.label("⚡ Awaken New Shadow").style(
+        ui.label("Awaken New Shadow").style(
             f"font-size: 18px; font-weight: 700; color: {THEME['text']}; margin-bottom: 6px;"
         )
         ui.label(
@@ -697,18 +697,18 @@ def _show_awaken_dialog() -> None:
 
         # ── Persona Dimension Sliders ────────────────────────────────────────
         ui.separator().style(f"background: {THEME['border']}; margin-bottom: 20px;")
-        ui.label("🎭 Persona Dimensions").style(
+        ui.label("Persona Dimensions").style(
             f"font-size: 14px; font-weight: 700; color: {THEME['text']}; margin-bottom: 4px;"
         )
         ui.label("Each axis is independent (0 = minimum, 100 = maximum). Default 50 = balanced.").style(
             f"font-size: 12px; color: {THEME['text_muted']}; margin-bottom: 16px;"
         )
 
-        def _dim_slider(icon: str, label: str, low_label: str, high_label: str, default: int = 50):
+        def _dim_slider(label: str, low_label: str, high_label: str, default: int = 50):
             """Build a labelled slider returning the slider element."""
             with ui.column().style("width: 100%; margin-bottom: 14px; gap: 4px;"):
                 with ui.row().style("align-items: center; justify-content: space-between;"):
-                    ui.label(f"{icon} {label}").style(
+                    ui.label(label).style(
                         f"font-size: 13px; font-weight: 600; color: {THEME['text']};"
                     )
                     val_lbl = ui.label(str(default)).style(
@@ -722,10 +722,10 @@ def _show_awaken_dialog() -> None:
                     ui.label(high_label).style(f"font-size: 10px; color: {THEME['text_muted']};")
             return sl
 
-        sl_creativity      = _dim_slider("🎨", "Creativity",      "Methodical",    "Highly Creative",    50)
-        sl_professionalism = _dim_slider("🎯", "Professionalism", "Casual",        "Highly Formal",      50)
-        sl_techie          = _dim_slider("💻", "Techie",          "Non-Technical", "Deep Technical",     50)
-        sl_thinking        = _dim_slider("🧠", "Thinking",        "Action-first",  "Deep Deliberative",  50)
+        sl_creativity      = _dim_slider("Creativity",      "Methodical",    "Highly Creative",    50)
+        sl_professionalism = _dim_slider("Professionalism", "Casual",        "Highly Formal",      50)
+        sl_techie          = _dim_slider("Techie",          "Non-Technical", "Deep Technical",     50)
+        sl_thinking        = _dim_slider("Thinking",        "Action-first",  "Deep Deliberative",  50)
 
         ui.separator().style(f"background: {THEME['border']}; margin: 4px 0 20px 0;")
 
@@ -750,7 +750,7 @@ def _show_awaken_dialog() -> None:
             dlg.close()
 
         with ui.row().style("gap: 10px;"):
-            ui.button("⚡ Awaken Shadow", on_click=_do_awaken).style(
+            ui.button("Awaken Shadow", on_click=_do_awaken).style(
                 f"background: {THEME['primary']}; color: white; border-radius: 8px; font-weight: 600;"
             )
             ui.button("Cancel", on_click=dlg.close).style(

@@ -29,13 +29,13 @@ _LEVEL_COLOR = {
     "ERROR":   "#ef4444",   # red
 }
 
-# Category → emoji
+# Category → Material icon name
 _CAT_ICON = {
-    "scroll":  "📜",
-    "shadow":  "👤",
-    "tool":    "🔧",
-    "job":     "⚙️",
-    "system":  "⚡",
+    "scroll":  "description",
+    "shadow":  "person",
+    "tool":    "build",
+    "job":     "settings",
+    "system":  "bolt",
 }
 
 
@@ -65,13 +65,13 @@ def build_notifications_page() -> None:
     state = AppState.get()
     vault = state.vault
 
-    ui.label("🔔 Notifications").style(
+    ui.label("Notifications").style(
         f"font-size: 22px; font-weight: 800; color: {THEME['text']}; margin-bottom: 20px;"
     )
 
     with ui.tabs().classes("w-full") as tabs:
-        tab_log     = ui.tab("📋 Manual Logs")
-        tab_pending = ui.tab("⚠️ Pending Actions")
+        tab_log     = ui.tab("Manual Logs")
+        tab_pending = ui.tab("Pending Actions")
 
     with ui.tab_panels(tabs, value=tab_log).classes("w-full bg-transparent"):
 
@@ -107,7 +107,7 @@ def build_notifications_page() -> None:
                         ui.notify("Manual Logs cleared.", type="positive")
                         _log_table.refresh()
 
-                ui.button("🗑 Clear Log", on_click=_clear_log).style(
+                ui.button("Clear Log", icon="delete", on_click=_clear_log).style(
                     f"background: {THEME['surface2']}; color: {THEME['text']}; "
                     f"border: 1px solid {THEME['border']}; border-radius: 8px; font-size: 12px;"
                 )
@@ -156,7 +156,7 @@ def build_notifications_page() -> None:
                             level    = evt.get("level", "INFO")
                             color    = _LEVEL_COLOR.get(level, THEME["text"])
                             cat      = evt.get("category", "system")
-                            icon     = _CAT_ICON.get(cat, "📌")
+                            icon     = _CAT_ICON.get(cat, "push_pin")
                             ts_raw   = evt.get("ts", "")
                             ts_disp  = ts_raw[11:19] if len(ts_raw) >= 19 else ts_raw  # HH:MM:SS
                             msg      = evt.get("message", "")
@@ -173,9 +173,13 @@ def build_notifications_page() -> None:
                                         f'{level}</span>'
                                     )
                                 with ui.element("td").style("padding: 10px 14px;"):
-                                    ui.label(f"{icon} {cat}").style(
-                                        f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 600;"
-                                    )
+                                    with ui.row().style("gap: 6px; align-items: center; flex-wrap: nowrap;"):
+                                        ui.icon(icon).classes("s-muted").style(
+                                            "font-size: 14px;"
+                                        )
+                                        ui.label(cat).style(
+                                            f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 600;"
+                                        )
                                 _td_cell(msg)
 
             _log_table()
@@ -335,7 +339,7 @@ def _pending_card(notif: Dict[str, Any], vault, refresh_fn) -> None:
         f"border-radius: 12px; padding: 18px; margin-bottom: 12px; width: 100%;"
     ):
         with ui.row().style("align-items: flex-start; gap: 12px;"):
-            ui.label("⚠️").style("font-size: 24px; padding-top: 2px;")
+            ui.label("⚠").style("font-size: 24px; padding-top: 2px;")
             with ui.column().style("flex: 1; gap: 6px;"):
                 ui.label(notif.get("title", "Notification")).style(
                     f"font-size: 15px; font-weight: 700; color: {THEME['text']};"

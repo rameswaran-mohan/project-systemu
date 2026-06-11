@@ -17,12 +17,12 @@ from systemu.runtime.workflow_tracker import STAGES, WorkflowTracker
 
 
 _STAGE_ICONS = {
-    "capture":   "🎙️",
-    "scroll":    "📜",
-    "activity":  "📋",
-    "execution": "⚙️",
-    "done":      "✅",
-    "failed":    "⚠️",
+    "capture":   "mic",
+    "scroll":    "description",
+    "activity":  "assignment",
+    "execution": "settings",
+    "done":      "check_circle",
+    "failed":    "warning",
 }
 
 _STAGE_COLORS = {
@@ -61,11 +61,11 @@ def build_workflow_detail_page(workflow_id: str) -> None:
         return
 
     color = _STAGE_COLORS.get(snap.stage, THEME["text_muted"])
-    icon  = _STAGE_ICONS.get(snap.stage, "•")
+    icon  = _STAGE_ICONS.get(snap.stage, "circle")
 
     # ── Header ─────────────────────────────────────────────────────────
     with ui.row().style("align-items: center; gap: 14px; margin-bottom: 8px;"):
-        ui.label(icon).style("font-size: 28px;")
+        ui.icon(icon).style("font-size: 28px;")
         ui.label(snap.title).style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
@@ -105,13 +105,30 @@ def build_workflow_detail_page(workflow_id: str) -> None:
         f"border-radius: 12px; padding: 4px 0; gap: 0; overflow: hidden;"
     ):
         if snap.scroll_id:
-            _link_row("📜", "Scroll", snap.scroll_id, "/scrolls")
+            _link_row("description", "Scroll", snap.scroll_id, "/scrolls")
         if snap.activity_id:
-            _link_row("📋", "Activity", snap.activity_id, "/activities")
+            _link_row("assignment", "Activity", snap.activity_id, "/activities")
         if snap.shadow_id:
-            _link_row("👤", "Shadow", snap.shadow_id, "/shadows")
+            _link_row("person", "Shadow", snap.shadow_id, "/shadows")
         if snap.execution_id:
-            _link_row("⚙️", "Execution", snap.execution_id, "/systemu-chat")
+            # Wave 1.4 (drive-by): was /systemu-chat — a redirect-only legacy
+            # route since Phase 5; link the live tab directly.
+            _link_row("settings", "Execution", snap.execution_id, "/chat?tab=live")
+
+    # ── Blocked-on-tools panel (Wave 1.2) ──────────────────────────────
+    # A task parked by the Stage-3.5 readiness gate sat invisible here —
+    # the page showed "assigned/partial" with no why and no way forward.
+    if snap.activity_id:
+        _blocked_tools_panel(snap.activity_id)
+
+    # ── Artifacts folder (Wave 1.4) ────────────────────────────────────
+    # Deliverables land in config.output_dir (the sandbox normalises tool
+    # write-paths into it), but nothing in the UI ever said WHERE — operators
+    # hunted for produced files while the run read "partial/assigned".
+    # Per-file tracking doesn't exist yet (files_produced is always []), so
+    # the honest surface is the folder path, shown once execution started.
+    if snap.execution_id:
+        _artifacts_row()
 
     # ── Affinity log entries for this shadow (v0.4.4-b) ───────────────
     # Operator visibility into past TERMINATEs that affect routing.
@@ -143,6 +160,62 @@ def build_workflow_detail_page(workflow_id: str) -> None:
     )
 
 
+def blocked_tools_of(activity) -> list:
+    """The tool names blocking a parked activity (pure — [] when not parked).
+
+    A readiness-parked activity is PARTIAL with ``missing_tools`` set
+    (direct_task Stage 3.5).  Tolerates dicts and models.
+    """
+    status = getattr(getattr(activity, "status", None), "value",
+                     str(getattr(activity, "status", "")))
+    missing = getattr(activity, "missing_tools", None) or []
+    return list(missing) if (status == "partial" and missing) else []
+
+
+def _blocked_tools_panel(activity_id: str) -> None:
+    try:
+        from systemu.interface.dashboard_state import AppState
+        activity = AppState.get().vault.get_activity(activity_id)
+    except Exception:
+        return
+    missing = blocked_tools_of(activity)
+    if not missing:
+        return
+    with ui.row().classes("s-banner s-banner--warn w-full").style("margin-top: 12px;"):
+        ui.icon("warning")
+        ui.label(
+            f"Blocked on {len(missing)} tool(s): {', '.join(str(m) for m in missing)} — "
+            "approve the readiness gate to enable them and re-run."
+        )
+        ui.link("Review in Inbox →", "/inbox").classes("s-text-warn") \
+            .style("text-decoration: none; font-weight: 700; white-space: nowrap;")
+
+
+def artifacts_dir_label() -> str | None:
+    """Absolute output_dir path for display, or None when unavailable (pure-ish
+    — reads AppState but never raises, so the page renders without it)."""
+    try:
+        from pathlib import Path
+        from systemu.interface.dashboard_state import AppState
+        out = getattr(AppState.get().config, "output_dir", "") or ""
+        return str(Path(out).expanduser().resolve()) if out else None
+    except Exception:
+        return None
+
+
+def _artifacts_row() -> None:
+    path = artifacts_dir_label()
+    if not path:
+        return
+    with ui.row().classes("s-card w-full items-center").style(
+        "padding: 12px 16px; margin-top: 12px; gap: 10px;"
+    ):
+        ui.icon("folder").classes("s-muted").style("font-size: 18px;")
+        ui.label("Artifacts folder").classes("s-cell s-cell--bold")
+        ui.label(path).classes("s-mono").style("user-select: all;") \
+            .tooltip("Deliverables are written here (click to select, then copy)")
+
+
 def _stat(label: str, value: str, color: str) -> None:
     with ui.column().style(
         f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
@@ -159,11 +232,11 @@ def _stat(label: str, value: str, color: str) -> None:
 
 def _timeline_row(stage: str, *, reached: bool, entered_at: str | None) -> None:
     color = _STAGE_COLORS.get(stage, THEME["text_muted"]) if reached else THEME["border"]
-    icon  = _STAGE_ICONS.get(stage, "•")
+    icon  = _STAGE_ICONS.get(stage, "circle")
     with ui.row().style(
         f"width: 100%; gap: 16px; padding: 10px 0; align-items: center;"
     ):
-        ui.label(icon).style(f"font-size: 18px; opacity: {'1' if reached else '0.35'};")
+        ui.icon(icon).style(f"font-size: 18px; opacity: {'1' if reached else '0.35'};")
         ui.label(stage.upper()).style(
             f"font-size: 12px; font-weight: 700; color: {color}; "
             f"letter-spacing: 0.06em; min-width: 90px;"
@@ -185,7 +258,7 @@ def _link_row(icon: str, label: str, entity_id: str, route: str) -> None:
         f"width: 100%; gap: 12px; padding: 10px 16px; align-items: center; "
         f"border-bottom: 1px solid {THEME['border']}; cursor: pointer;"
     ).on("click", lambda _: ui.navigate.to(route)):
-        ui.label(icon).style("font-size: 14px; min-width: 18px;")
+        ui.icon(icon).style("font-size: 14px; min-width: 18px;")
         ui.label(label).style(
             f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 700; "
             f"letter-spacing: 0.06em; min-width: 80px; text-transform: uppercase;"
@@ -221,7 +294,7 @@ def _build_affinity_log_panel(shadow_id: str) -> None:
     if not recent:
         return
 
-    ui.label("🔁 Recent affinity exclusions").style(
+    ui.label("Recent affinity exclusions").style(
         f"font-size: 14px; font-weight: 700; color: {THEME['warning']}; "
         f"margin: 24px 0 8px;"
     )
@@ -234,7 +307,7 @@ def _build_affinity_log_panel(shadow_id: str) -> None:
                 f"width: 100%; gap: 12px; padding: 8px 16px; align-items: center; "
                 f"border-bottom: 1px solid {THEME['border']};"
             ):
-                ui.label("⛔").style("font-size: 12px;")
+                ui.icon("block").style("font-size: 12px;")
                 ui.label(f"intent {t.intent_hash}").style(
                     f"font-family: monospace; font-size: 11px; color: {THEME['text_muted']};"
                 )
@@ -293,7 +366,7 @@ def _build_supervisor_decision_panel(
     if not has_terminate:
         return
 
-    ui.label("⚠️ Supervisor Decision").style(
+    ui.label("⚠ Supervisor Decision").style(
         f"font-size: 15px; font-weight: 700; color: {THEME['warning']}; "
         f"margin: 24px 0 12px;"
     )

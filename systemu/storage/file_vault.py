@@ -212,3 +212,20 @@ class FileVault:
 
     def get_decision(self, decision_id: str):
         return self._v.get_decision(decision_id)
+
+    # ── Episodic memory (v0.9.2 session summaries) ───────────────────────────
+    #
+    # Wave 1.5: same wrapper-drift class as the decisions incident above —
+    # these three were added to the inner Vault in v0.9.2 but never proxied,
+    # so in SYSTEMU_STORAGE=file mode (the default) every episodic capture
+    # failed with a non-fatal AttributeError and episodic memory was
+    # silently disabled.
+
+    def append_session_summary(self, summary) -> None:
+        return self._v.append_session_summary(summary)
+
+    def query_session_summaries(self, **kwargs):
+        return self._v.query_session_summaries(**kwargs)
+
+    def search_session_summaries(self, query: str, **kwargs):
+        return self._v.search_session_summaries(query, **kwargs)

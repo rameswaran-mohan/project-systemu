@@ -277,7 +277,7 @@ def render_tool_row(tool: dict, vault, *, editable: bool = True) -> None:
                         ).props("no-caps").classes("s-btn s-btn--success")
                 if editable:
                     ui.button(
-                        "✏️ Edit",
+                        "Edit",
                         on_click=lambda _, i=tid: _edit_tool_in_place(i, vault),
                     ).props("no-caps").classes("s-btn s-btn--ghost")
 
@@ -413,14 +413,14 @@ def render_skill_row(skill: dict, vault, *, editable: bool = True) -> None:
             if m["evidence_count"]:
                 n = m["evidence_count"]
                 ui.html(
-                    f'<span class="s-muted s-skill-evidence">📜 {n} '
+                    f'<span class="s-muted s-skill-evidence">{n} '
                     f'scroll{"s" if n != 1 else ""}</span>'
                 )
 
             if editable:
                 _skill_lifecycle_buttons(skill_id, name, deprecated, vault)
                 ui.button(
-                    "✏️ Edit",
+                    "Edit",
                     on_click=lambda _, i=skill_id: _edit_skill_in_place(i, vault),
                 ).props("@click.stop no-caps").classes("s-btn s-btn--ghost")
 
