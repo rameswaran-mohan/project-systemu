@@ -159,9 +159,15 @@ class OperatorDecisionQueue:
             title, decision.id, dedup_key, options,
         )
         # v0.8.22 (C): emit EventBus event so chat UI can render an inline card.
+        # W5.3: self-describing event — top-level ts/level/message so EVERY
+        # pane (incl. the right-rail Live stream, which reads event["message"])
+        # renders it; the bare-context shape drew a blank "[INFO] " line.
         try:
             from systemu.interface.event_bus import EventBus
             EventBus.get().publish({
+                "ts": decision.created_at.isoformat(),
+                "level": "WARNING",
+                "message": f"Needs you: {decision.title}",
                 "category": "operator_decision_posted",
                 "context": {
                     "decision_id": decision.id,
@@ -270,9 +276,13 @@ class OperatorDecisionQueue:
             decision_id, choice, decision.dedup_key,
         )
         # v0.8.22 (C): emit EventBus event so the chat UI hides the inline card.
+        # W5.3: self-describing (ts/level/message) — see post() note.
         try:
             from systemu.interface.event_bus import EventBus
             EventBus.get().publish({
+                "ts": decision.resolved_at.isoformat(),
+                "level": "INFO",
+                "message": f"Resolved: {decision.title}",
                 "category": "operator_decision_resolved",
                 "context": {
                     "decision_id": decision.id,
@@ -306,6 +316,9 @@ class OperatorDecisionQueue:
         try:
             from systemu.interface.event_bus import EventBus
             EventBus.get().publish({
+                "ts": decision.resolved_at.isoformat(),
+                "level": "INFO",
+                "message": f"Expired: {decision.title}",
                 "category": "operator_decision_expired",
                 "context": {
                     "decision_id": decision.id,

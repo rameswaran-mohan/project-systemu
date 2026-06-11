@@ -232,6 +232,11 @@ def delete_schedule(schedule_id: str, vault: "Vault") -> bool:
             entries = json.loads(idx_path.read_text(encoding="utf-8"))
             entries = [e for e in entries if e.get("id") != schedule_id]
             idx_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as exc:
+            # The schedule file is already gone but the index still references
+            # it — a dangling entry that will fail to load on next boot. Surface
+            # it so the orphan is at least diagnosable.
+            logger.warning(
+                "[Scheduler] deleted schedule %s but failed to prune it from the "
+                "index (%s); the index entry is now orphaned", schedule_id, exc)
     return True

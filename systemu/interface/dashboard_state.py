@@ -117,6 +117,10 @@ class AppState:
         self.queue     = queue        # ITaskQueue — submit / status
         self.events    = events       # IEventBroker — pub/sub + approval gate
         self.approvals = approvals    # IApprovalGate — log_event / notify_user / confirm
+        # W3.3: set by _degraded_fallback when a requested non-file backend was
+        # unavailable and we silently dropped to the file vault. The health
+        # banner reads this so the downgrade is LOUD, not just a log line.
+        self.storage_degraded = None  # Optional[dict]: {requested, actual, reason}
 
         # Resolve project root once — absolute, survives cwd changes in subprocess
         self._project_root = _resolve_project_root(vault, config)
@@ -175,6 +179,34 @@ class AppState:
                     "[AppState] Unknown SYSTEMU_STORAGE=%r — falling back to 'file'", mode
                 )
                 return cls._create_file_backend(config)
+
+    # ── Degraded fallback (W3.3) ────────────────────────────────────────────────
+
+    @classmethod
+    def _degraded_fallback(cls, config: Config, *, requested: str, reason) -> "AppState":
+        """Drop to the file backend after a requested non-file backend failed,
+        and STAMP the downgrade so the health banner surfaces it loudly.
+
+        The prior behaviour logged a WARNING and silently returned the file
+        backend — so a prod box configured for postgres that couldn't reach its
+        DB would quietly run on a local file vault, splitting data across two
+        stores with no visible signal.
+        """
+        logger.error(
+            "[AppState] %s backend unavailable (%s) — DEGRADED to the file vault. "
+            "Records written now will NOT be in your %s store.",
+            requested, reason, requested,
+        )
+        inst = cls._create_file_backend(config)
+        # Advisory marker — must NEVER break the (critical) fallback if the
+        # instance can't take the attribute (e.g. a stubbed sentinel in tests).
+        try:
+            inst.storage_degraded = {
+                "requested": requested, "actual": "file", "reason": str(reason)[:300],
+            }
+        except Exception:
+            logger.debug("[AppState] could not stamp storage_degraded marker")
+        return inst
 
     # ── File backend (current default) ────────────────────────────────────────
 
@@ -270,10 +302,7 @@ class AppState:
             return state
 
         except Exception as exc:
-            logger.error(
-                "[AppState] SQLite backend failed (%s) — falling back to file", exc
-            )
-            return cls._create_file_backend(config)
+            return cls._degraded_fallback(config, requested="sqlite", reason=exc)
 
     # ── PostgreSQL backend (Phase 4 — production/enterprise) ─────────────────
 
@@ -311,11 +340,10 @@ class AppState:
             missing.append("SYSTEMU_REDIS_URL/REDIS_URL")
 
         if missing:
-            logger.error(
-                "[AppState] postgres mode requires %s — falling back to file",
-                " and ".join(missing),
+            return cls._degraded_fallback(
+                config, requested="postgres",
+                reason=f"missing config: {' and '.join(missing)}",
             )
-            return cls._create_file_backend(config)
 
         try:
             from systemu.storage.sqlite.vault import SqliteVault  # reuses SA models
@@ -339,10 +367,7 @@ class AppState:
             return state
 
         except Exception as exc:
-            logger.error(
-                "[AppState] PostgreSQL backend failed (%s) — falling back to file", exc
-            )
-            return cls._create_file_backend(config)
+            return cls._degraded_fallback(config, requested="postgres", reason=exc)
 
     # ── Parallel backend (migration mode — dual-write) ────────────────────────
 
@@ -398,10 +423,7 @@ class AppState:
             return state
 
         except Exception as exc:
-            logger.error(
-                "[AppState] Parallel backend failed (%s) — falling back to file", exc
-            )
-            return cls._create_file_backend(config)
+            return cls._degraded_fallback(config, requested="parallel", reason=exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

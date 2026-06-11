@@ -585,14 +585,20 @@ def create_shadow(
         try:
             required_skills.append(vault.get_skill(sid).model_dump(mode="json"))
         except KeyError:
-            pass
+            logger.warning(
+                "[Shadow] activity '%s' references skill '%s' which is not in the "
+                "vault — omitted from persona context (dangling capability ref)",
+                activity.id, sid)
 
     required_tools = []
     for tid in activity.required_tool_ids:
         try:
             required_tools.append(vault.get_tool(tid).model_dump(mode="json"))
         except KeyError:
-            pass
+            logger.warning(
+                "[Shadow] activity '%s' references tool '%s' which is not in the "
+                "vault — omitted from persona context (dangling capability ref)",
+                activity.id, tid)
 
     try:
         persona = llm_call_json(
@@ -631,7 +637,10 @@ def create_shadow(
             if vault.get_tool(tid).enabled:
                 enabled_tool_ids.append(tid)
         except KeyError:
-            pass
+            # Already surfaced as a WARNING in the persona-context loop above;
+            # debug here avoids double-logging the same dangling reference.
+            logger.debug("[Shadow] dangling tool ref '%s' on activity '%s' "
+                         "skipped from enabled set", tid, activity.id)
 
     # ── Deduplicate shadow name — append suffix if a shadow with this name exists ─
     existing_names = {s.get("name", "") for s in vault.list_shadows()}

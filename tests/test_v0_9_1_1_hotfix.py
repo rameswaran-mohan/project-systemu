@@ -323,9 +323,10 @@ class TestToolSandboxTimeoutWiring:
 
             sandbox.attach_registry(mock_registry)
 
-            asyncio.get_event_loop().run_until_complete(
-                sandbox.execute_tool(str(impl_file), {})
-            )
+            # asyncio.run (not get_event_loop) — order-independent: a prior
+            # test can leave the thread's current loop closed, which made this
+            # fail in the full suite while passing alone.
+            asyncio.run(sandbox.execute_tool(str(impl_file), {}))
 
         # The registry must receive timeout=None so _resolve_timeout can pick
         # up tool.timeout_seconds=120.  If it receives 30.0 the fix is broken.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.9.14"
+version = "0.9.16"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -109,6 +109,8 @@ markers = [
     "linux_only: tests that only run on Linux (playwright, posix-only paths)",
     "docker_required: tests that need a docker daemon",
     "e2e: end-to-end live tests (skipped by default)",
+    "smoke: boot the real dashboard + exercise it on uvicorn's serving loop (opt-in pre-release gate)",
+    "slow: long-running tests",
 ]
 
 [tool.setuptools]
@@ -139,5 +141,10 @@ include = ["sharing_on*", "systemu*"]
     "vault/**/*.json",
     "vault/tools/implementations/*.py",
     "vault/**/*.md",
+    # W4.3: locally-vendored dashboard fonts (Inter + JetBrains Mono woff2)
+    # served at /assets/fonts — must ship in the wheel or the pip-installed
+    # dashboard falls back to system fonts.
+    "interface/assets/fonts/*.woff2",
+    "interface/assets/fonts/*.txt",
 ]
 "systemu.vault" = ["**/*.json", "**/*.md", "**/*.py"]

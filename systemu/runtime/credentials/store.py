@@ -63,8 +63,8 @@ class CredentialStore:
         if self._keyring is not None:
             try:
                 self._keyring.delete_password(_SERVICE, key)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("[Credentials] keyring delete failed: %s", exc)
         data = self._read_file()
         if key in data:
             del data[key]
@@ -80,8 +80,11 @@ class CredentialStore:
         try:
             if self._file.exists():
                 return json.loads(self._file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            # A corrupt/unreadable store must not masquerade as "no credentials"
+            # — that silently hides real secrets and may trigger re-provisioning.
+            logger.warning("[Credentials] failed to read credential file %s: %s",
+                           self._file, exc)
         return {}
 
     def _write_file(self, data: dict) -> None:

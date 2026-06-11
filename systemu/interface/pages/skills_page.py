@@ -72,17 +72,17 @@ def build_skills_page() -> None:
             f"border-radius: 8px; padding: 6px 10px; color: {THEME['text']}; width: 260px;"
         )
 
+    from systemu.interface.components.list_filter import filter_rows
+
     @ui.refreshable
     def _skills_table():
         skills = vault.load_index("skills")
-        q = search_input.value.lower() if search_input.value else ""
-        cat = cat_filter.value or ""
-
-        filtered = [
-            s for s in skills
-            if (not cat or s.get("category", "") == cat)
-            and (not q or q in s.get("name", "").lower() or q in s.get("description", "").lower())
-        ]
+        # Shared listing filter: search over name/description + a category select
+        # (same mechanism as the status select on scrolls/activities/shadows).
+        filtered = filter_rows(
+            skills, search_input.value or "", cat_filter.value or "all",
+            search_keys=("name", "description"), select_key="category",
+        )
 
         if not filtered:
             ui.label("No skills found." if skills else "No skills yet — process a scroll to extract skills.").style(

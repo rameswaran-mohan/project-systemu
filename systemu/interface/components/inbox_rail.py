@@ -92,14 +92,45 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
 
     ui.label("Needs you").classes("s-section-head").style("margin-bottom: 4px;")
 
+    # W5.1: the answer dialog's host lives HERE (stable slot) — creating it
+    # inside the timer-refreshed _pane would race slot disposal (the dialog
+    # silently never opens; see attention.make_answer_host).
+    from systemu.interface.components.attention import make_answer_host
+    _answer_host = make_answer_host()
+
     @ui.refreshable
     def _pane() -> None:
+        from systemu.interface.components.attention import (
+            pending_ask_rows, open_answer_dialog)
+
         rows = _rows()
-        if not rows:
+        asks = pending_ask_rows(vault)
+        if not rows and not asks:
             ui.label("Nothing waiting on you.").classes("s-muted").style(
                 "font-size: 12px;"
             )
             return
+
+        # W5.1: non-gate asks (stuck-run questions, credential requests) used
+        # to be invisible here — a parked run looked like "nothing waiting".
+        # Each ask renders as a glance row with an inline Answer dialog wired
+        # through the proven render_decision_card resolve→resume path.
+        for ask in asks:
+            with ui.element("div").classes("s-row-box").style(
+                "display: flex; align-items: center; gap: 8px; margin-bottom: 6px;"
+            ):
+                status_pill("question")
+                ui.label(ask["title"]).classes("s-cell").style(
+                    "flex: 1; overflow: hidden; text-overflow: ellipsis; "
+                    "white-space: nowrap;"
+                )
+
+                def _on_answer(_=None, did=ask["id"]):
+                    open_answer_dialog(did, vault, on_resolved=_pane.refresh,
+                                       host=_answer_host)
+
+                button("Answer", variant="primary", on_click=_on_answer)
+
         dmap = _descriptor_map()
         for row in rows:
             with ui.element("div").classes("s-row-box").style(

@@ -130,11 +130,9 @@ def _build_layout(page_title: str, current_path: str):
     from systemu.interface.design.primitives import button as ds_button
 
     ui.add_css(GLOBAL_CSS)
-    # Google Font
-    ui.add_head_html(
-        '<link rel="preconnect" href="https://fonts.googleapis.com">'
-        '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">'
-    )
+    # W4.3: fonts are vendored locally now — the @font-face rules in GLOBAL_CSS
+    # point at /assets/fonts (served from systemu/interface/assets/fonts). No
+    # Google Fonts CDN <link> here: offline-safe + no third-party request.
 
     # Root wrapper
     with ui.row().style(
@@ -183,7 +181,13 @@ def _build_layout(page_title: str, current_path: str):
                 is_active = active_path == path
                 bg = f"color-mix(in srgb, {THEME['primary']} 15%, transparent)" if is_active else "transparent"
                 text_color = THEME["text"] if is_active else THEME["text_muted"]
-                with ui.element("a").props(f'href="{path}"').style(
+                # W4.4 a11y: aria-label so the icon-only collapsed nav (narrow
+                # viewports hide .s-sidebar-label) still has an accessible name;
+                # aria-current marks the active spine for assistive tech.
+                _aria_current = ' aria-current="page"' if is_active else ""
+                with ui.element("a").props(
+                    f'href="{path}" aria-label="{label}"{_aria_current}'
+                ).style(
                     f"display: flex; align-items: center; gap: 10px; padding: 10px 14px; "
                     f"border-radius: 8px; background: {bg}; color: {text_color}; "
                     f"font-size: 14px; font-weight: {'600' if is_active else '500'}; "
@@ -299,6 +303,19 @@ def _build_layout(page_title: str, current_path: str):
                         _ny_vault = getattr(_ny_state, "vault", None) if _ny_state else None
                     except Exception:
                         _ny_vault = None
+
+                    # W5.2: "Status" — recent tasks with their outcome message
+                    # + workflow link + artifacts path, so the operator never
+                    # has to hunt for "what happened to my task".
+                    if _ny_vault is not None:
+                        try:
+                            from systemu.interface.components.status_menu import (
+                                render_status_menu,
+                            )
+                            render_status_menu(_ny_vault)
+                        except Exception:
+                            logger.debug("[Dashboard] status menu unavailable",
+                                         exc_info=True)
                     _ny_model = needs_you_badge_model(_ny_vault)
                     needs_you_badge = ui.link(
                         f"Needs you ({_ny_model['count']})",
@@ -487,18 +504,22 @@ def plus_new_menu_items() -> list:
 def needs_you_badge_model(vault) -> dict:
     """Pure model for the header "Needs you (N)" badge (Phase 5, amendment A1).
 
-    Counts pending gates via ``InboxQueue(vault).list_descriptors()``.  The
-    Phase-4 right rail hides below 1100px and the sidebar collapses at 768px,
-    so this header badge is the narrow-viewport path to parked harness gates
-    — it always targets ``/inbox`` (demoted from the left nav in Slice 1).
+    W5.1: counts the COMPLETE pending-attention set — inbox gates AND non-gate
+    asks (stuck-run ``structured_question``s, ``credential`` requests, …) via
+    ``attention.needs_you_total``. The gate-only count left parked runs
+    invisible: a stuck chat task showed badge 0 / "nothing needs you".
+
+    The Phase-4 right rail hides below 1100px and the sidebar collapses at
+    768px, so this header badge is the narrow-viewport path to parked work —
+    it always targets ``/inbox`` (demoted from the left nav in Slice 1).
 
     Defensive: ANY failure (no vault, unreadable decision store, …) yields
     ``count 0 / hidden`` — the badge must never break the page shell.
     """
     count = 0
     try:
-        from systemu.interface.command.inbox import InboxQueue
-        count = len(InboxQueue(vault).list_descriptors())
+        from systemu.interface.components.attention import needs_you_total
+        count = needs_you_total(vault)
     except Exception:
         count = 0
     return {"count": count, "visible": count > 0, "target": "/inbox"}
@@ -836,6 +857,27 @@ def run_dashboard(
             "[Dashboard] NiceGUI not installed. Run: pip install nicegui"
         )
         return
+
+    # W3.1: suppress NiceGUI's benign post-navigation timer traceback spam
+    # ('parent slot of the element has been deleted') — see log_filters.
+    from systemu.interface.log_filters import install_nicegui_log_filters
+    install_nicegui_log_filters()
+
+    # W4.3: serve the locally-vendored fonts (Inter + JetBrains Mono, latin
+    # woff2) at /assets/fonts so the @font-face rules in GLOBAL_CSS resolve
+    # without a Google Fonts CDN round-trip. Registered once at startup.
+    import mimetypes as _mimetypes
+    import pathlib as _pathlib
+    # Python's mimetypes table doesn't know woff2 → StaticFiles would serve it
+    # as text/plain. Register the correct type so the Content-Type is font/woff2.
+    _mimetypes.add_type("font/woff2", ".woff2")
+    _fonts_dir = _pathlib.Path(__file__).parent / "assets" / "fonts"
+    if _fonts_dir.is_dir():
+        try:
+            ng_app.add_static_files("/assets/fonts", str(_fonts_dir))
+        except Exception:
+            logger.warning("[Dashboard] could not register /assets/fonts static route",
+                           exc_info=True)
 
     from systemu.interface.dashboard_state import AppState
     try:

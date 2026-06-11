@@ -71,6 +71,49 @@ def _resolved_gate_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+# W5.1: the kinds the Inbox History section shows. Gates plus the non-gate
+# asks (stuck-run structured questions, credential requests) that Triage now
+# surfaces — a resolved ask must not vanish without a trace.
+_INBOX_HISTORY_KINDS = frozenset({"gate", "structured_question", "credential"})
+
+# History hydration cap — the decisions index can grow unbounded; only the
+# newest N resolved rows are worth a per-decision read.
+_HISTORY_LIMIT = 50
+
+
+def _resolved_inbox_rows(rows: List[Dict[str, Any]], get_decision) -> List[Dict[str, Any]]:
+    """Resolved decision rows the Inbox owns — gates AND asks.
+
+    W5.1 root-cause note: the decisions *index* stores slim headers WITHOUT
+    ``context`` (vault.save_decision), so the old filter
+    ``context.kind == "gate"`` over ``load_index("decisions")`` matched
+    nothing — the History section has been silently empty since it shipped.
+    This hydrates the newest resolved rows via ``get_decision`` (per-decision
+    JSON carries context/choice/resolved_at) and filters by kind there.
+    """
+    resolved = [r for r in rows if r.get("status") == "resolved"]
+    resolved.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    out: List[Dict[str, Any]] = []
+    for r in resolved[:_HISTORY_LIMIT]:
+        ctx = r.get("context") or {}
+        if not ctx:
+            try:
+                d = get_decision(r["id"])
+                ctx = getattr(d, "context", None) or {}
+                resolved_at = getattr(d, "resolved_at", None)
+                r = {**r, "context": ctx,
+                     "choice": getattr(d, "choice", None),
+                     "resolved_at": (resolved_at.isoformat()
+                                     if hasattr(resolved_at, "isoformat")
+                                     else resolved_at)}
+            except Exception:
+                continue
+        if ctx.get("kind") not in _INBOX_HISTORY_KINDS:
+            continue
+        out.append(r)
+    return out
+
+
 # ─── rendering ────────────────────────────────────────────────────────────────
 
 def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None:
@@ -192,7 +235,35 @@ def _load_resolved_gate_rows(vault) -> List[Dict[str, Any]]:
         rows = vault.load_index("decisions")
     except Exception:
         return []
-    return _resolved_gate_rows(rows)
+    return _resolved_inbox_rows(rows, vault.get_decision)
+
+
+def render_inbox_ask_cards(vault, *, on_resolved) -> int:
+    """W5.1: render the pending NON-gate decisions (stuck-run questions,
+    credential asks, …) as full answerable cards via the proven
+    ``render_decision_card`` path. Returns the count rendered.
+
+    These used to be invisible on /inbox (Triage filtered kind=='gate') even
+    though the page's contract is "every decision the agent needs from you —
+    one card, one place"."""
+    if vault is None:
+        return 0
+    from systemu.interface.components.attention import pending_ask_rows
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    from systemu.interface.pages.insights import render_decision_card
+
+    asks = pending_ask_rows(vault)
+    if not asks:
+        return 0
+    queue = OperatorDecisionQueue(vault)
+    for ask in asks:
+        try:
+            render_decision_card(ask["decision"], queue, on_resolved)
+        except Exception as exc:
+            logger.exception("[Inbox] ask card failed for %s", ask["id"])
+            ui.label(f"Could not render decision {ask['id']}: {exc}").classes(
+                "s-text-danger")
+    return len(asks)
 
 
 def render_inbox_gate_cards(vault, *, on_resolved, empty_label: str = "") -> int:
@@ -251,9 +322,13 @@ def build_inbox_page() -> None:
         if vault is None:
             ui.label("Vault unavailable.").classes("s-muted").style("padding: 12px;")
             return
-        render_inbox_gate_cards(
-            vault, on_resolved=_triage.refresh,
-            empty_label="Nothing waiting on you. You're all caught up.")
+        # W5.1: gates + non-gate asks are BOTH Triage; the empty copy only
+        # renders when neither has anything pending.
+        n_gates = render_inbox_gate_cards(vault, on_resolved=_triage.refresh)
+        n_asks = render_inbox_ask_cards(vault, on_resolved=_triage.refresh)
+        if n_gates == 0 and n_asks == 0:
+            ui.label("Nothing waiting on you. You're all caught up.").classes(
+                "s-muted").style("padding: 12px;")
 
     _triage()
 

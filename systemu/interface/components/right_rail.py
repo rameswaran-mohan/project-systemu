@@ -37,6 +37,43 @@ def format_live_run_line(event: Dict[str, Any]) -> str:
     return f"[{level}] {message}"
 
 
+def live_event_row(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Pure row model for one Live-pane event (W5.3).
+
+    Every event becomes a header row — timestamp + event name — and the model
+    decides what sits behind the expand arrow:
+
+      * ``title``       — event["message"], falling back to context.title
+                          (operator_decision_* events used to render as a
+                          blank "[INFO] " line because they carry no message).
+      * ``time``        — HH:MM:SS from the event ts.
+      * ``level``       — for the level tint.
+      * ``details``     — the expand-arrow payload (reasoning / tool params /
+                          tool result / LLM ref / outcome summary / artifacts).
+      * ``decision_id`` — set for pending-decision events so the row can offer
+                          an inline Answer action.
+    """
+    from systemu.interface.components.live_events_pane import (
+        _format_event_time, _has_details)
+
+    ctx = event.get("context") or {}
+    title = str(event.get("message") or "").strip()
+    if not title:
+        title = str(ctx.get("title") or event.get("category") or "(event)")
+    decision_id = (
+        ctx.get("decision_id")
+        if event.get("category") == "operator_decision_posted" else None
+    )
+    return {
+        "time": _format_event_time(event.get("ts")),
+        "level": str(event.get("level") or "INFO").upper(),
+        "title": title[:200],
+        "details": (event.get("details") or {}) if _has_details(event) else {},
+        "decision_id": decision_id,
+        "has_details": _has_details(event) or bool(decision_id),
+    }
+
+
 def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
     """Minimal Live pane: mirror recent streamed EventBus events, newest-first.
 
@@ -57,11 +94,52 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
     # Thread-safe ring buffer (deque.append is atomic under the GIL).
     events: "deque[Dict[str, Any]]" = deque(maxlen=_MAX_LIVE_EVENTS)
 
+    # W5.3: stable-slot host for the inline Answer dialog — creating a dialog
+    # from inside the timer-refreshed _pane races slot disposal (see
+    # attention.make_answer_host).
+    from systemu.interface.components.attention import make_answer_host
+    _answer_host = make_answer_host()
+
     def _visible() -> List[Dict[str, Any]]:
         snapshot = list(events)
         if stream_ref:
             snapshot = events_for_stream(snapshot, stream_ref)
         return list(reversed(snapshot))  # newest-first
+
+    def _render_row(ev: Dict[str, Any]) -> None:
+        """W5.3: one event = one header row (time + name), with an expand
+        arrow when there's a payload behind it (reasoning / tool output /
+        outcome) and an inline Answer action for pending-decision events."""
+        from systemu.interface.components.live_events_pane import (
+            render_event_details_body)
+
+        row = live_event_row(ev)
+        header = (f"{row['time']}  " if row["time"] else "") + row["title"]
+
+        if not row["has_details"]:
+            ui.label(header).style("font-size: 12px; font-family: monospace;")
+            return
+
+        with ui.expansion(header, value=False).classes("w-full").style(
+            "font-size: 12px;"
+        ):
+            if row["details"]:
+                render_event_details_body(row["details"])
+            if row["decision_id"]:
+                def _answer(_=None, did=row["decision_id"]):
+                    from systemu.interface.dashboard_state import AppState
+                    from systemu.interface.components.attention import (
+                        open_answer_dialog)
+                    try:
+                        vault = AppState.get().vault
+                    except Exception:
+                        ui.notify("Vault unavailable.", type="warning")
+                        return
+                    open_answer_dialog(did, vault, on_resolved=_pane.refresh,
+                                       host=_answer_host)
+
+                from systemu.interface.design.primitives import button as _btn
+                _btn("Answer", variant="primary", on_click=_answer)
 
     @ui.refreshable
     def _pane() -> None:
@@ -70,9 +148,7 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
             ui.label("Waiting for streamed run events…").style("font-size: 12px;")
             return
         for ev in rows:
-            ui.label(format_live_run_line(ev)).style(
-                "font-size: 12px; font-family: monospace;"
-            )
+            _render_row(ev)
 
     scroll_style = f"height: {height_px}px; width: 100%;"
     with ui.scroll_area().style(scroll_style):

@@ -84,6 +84,16 @@ def _vault_writable(vault_dir: Optional[Path]) -> bool:
         return False
 
 
+def _storage_degraded() -> Optional[dict]:
+    """The storage-degradation marker set by AppState._degraded_fallback (W3.3),
+    or None. Best-effort — never raises if AppState isn't ready."""
+    try:
+        from systemu.interface.dashboard_state import AppState
+        return getattr(AppState.get(), "storage_degraded", None)
+    except Exception:
+        return None
+
+
 # -- Pure-data state builder (testable) --------------------------------------
 
 def build_health_state(vault_dir: Optional[Path] = None) -> HealthState:
@@ -118,6 +128,19 @@ def build_health_state(vault_dir: Optional[Path] = None) -> HealthState:
             severity="danger",
             message=f"Vault directory {vault_dir} is not writable.",
             cta="Check disk space and file permissions on the vault directory.",
+        ))
+
+    # W3.3: a requested non-file backend that silently downgraded to the file
+    # vault is a data-split hazard — surface it loudly, never just in the log.
+    deg = _storage_degraded()
+    if deg:
+        req = deg.get("requested", "configured")
+        state.issues.append(HealthIssue(
+            severity="danger",
+            message=(f"Storage DEGRADED: the {req} backend was unavailable "
+                     f"({deg.get('reason', 'unknown')}) — running on the local file "
+                     f"vault. Records written now will NOT be in your {req} store."),
+            cta=f"Fix the {req} connection/config and restart the daemon.",
         ))
 
     return state

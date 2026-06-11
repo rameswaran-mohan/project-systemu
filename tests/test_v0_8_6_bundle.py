@@ -83,17 +83,18 @@ class TestJobManagerQueue:
 
     def test_queue_depth_cap_raises(self, monkeypatch):
         """Submitting past JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH raises RuntimeError."""
-        import os
-        from systemu.interface.jobs import JobManager, JobStatus, Job
         from datetime import datetime
-
-        monkeypatch.setenv("JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH", "5")
-        # Reload the module so the new env var is picked up
-        import importlib
         from systemu.interface import jobs as jobs_mod
-        importlib.reload(jobs_mod)
         from systemu.interface.jobs import JobManager
-        JobManager._instance = None
+
+        # Patch the module-level cap directly (start_job reads this constant)
+        # instead of importlib.reload(jobs_mod) — reloading re-defines the
+        # JobStatus enum as a NEW class, which then fails every downstream
+        # test that compares by enum identity (e.g. the army jobs-panel view
+        # model). monkeypatch auto-restores both the constant and the
+        # singleton, so nothing leaks into the rest of the suite.
+        monkeypatch.setattr(jobs_mod, "JOBMANAGER_MAX_EXECUTE_QUEUE_DEPTH", 5)
+        monkeypatch.setattr(JobManager, "_instance", None)
         jm = JobManager.get()
 
         # 3 RUNNING + 2 QUEUED = 5 total. 6th should reject.

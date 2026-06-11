@@ -179,12 +179,18 @@ class TestSingleton:
 class TestFileTools:
     def test_module_load_registers_tools(self):
         """Importing file_tools.py registers 3 tools into the singleton."""
+        import importlib
         from systemu.runtime.tool_registry_v2 import registry as singleton
-        # Reset any prior state on the singleton
+        import systemu.runtime.tools.file_tools as file_tools
+        # Reset any prior state, then RELOAD so the module-level register()
+        # calls actually re-run. A plain re-import is a cached no-op when the
+        # module was already imported earlier in the suite — that order
+        # dependency is why this popped-and-never-restored the tools in the
+        # full run (failing the two downstream FileTools tests too) while
+        # passing in isolation.
         for n in ("read_file", "write_file", "search_files"):
             singleton._tools.pop(n, None)
-        # Importing triggers module-level register() calls
-        import systemu.runtime.tools.file_tools  # noqa: F401
+        importlib.reload(file_tools)
         assert singleton.get("read_file") is not None
         assert singleton.get("write_file") is not None
         assert singleton.get("search_files") is not None

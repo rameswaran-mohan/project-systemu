@@ -261,18 +261,47 @@ def build_army_page() -> None:
     _render_schedules_list_panel()
     ui.timer(30.0, _render_schedules_list_panel.refresh)
 
-    shadows = vault.load_index("shadow_army")
+    _all_shadows = vault.load_index("shadow_army")
 
-    if not shadows:
+    if not _all_shadows:
         ui.label("No shadows yet — process a scroll to create your first shadow.").style(
             f"color: {THEME['text_muted']}; font-style: italic; padding: 20px;"
         )
         return
 
-    # Card grid
-    with ui.row().classes("w-full flex-wrap gap-5"):
-        for sh in shadows:
-            _shadow_card(sh)
+    # board 5a: search + status filter (shared helper — see list_filter).
+    from systemu.interface.components.list_filter import filter_rows, select_options
+    _filt = {"query": "", "status": "all"}
+    with ui.row().classes("w-full items-center q-gutter-sm").style("margin-bottom: 16px;"):
+        _search = ui.input(placeholder="Search shadows...").classes("s-input s-search")
+        _status = ui.select(
+            select_options(_all_shadows, "status"), value="all",
+        ).classes("s-input")
+
+    @ui.refreshable
+    def _shadow_grid() -> None:
+        shadows = filter_rows(
+            vault.load_index("shadow_army"), _filt["query"], _filt["status"],
+            search_keys=("name", "description"), select_key="status",
+        )
+        if not shadows:
+            ui.label("No shadows match the current filter.").classes("s-muted q-pa-md")
+            return
+        with ui.row().classes("w-full flex-wrap gap-5"):
+            for sh in shadows:
+                _shadow_card(sh)
+
+    def _on_search(e) -> None:
+        _filt["query"] = e.value if isinstance(getattr(e, "value", None), str) else ""
+        _shadow_grid.refresh()
+
+    def _on_status(e) -> None:
+        _filt["status"] = e.value or "all"
+        _shadow_grid.refresh()
+
+    _search.on("input", _on_search)
+    _status.on("update:model-value", _on_status)
+    _shadow_grid()
 
 
 def _shadow_card(sh: dict) -> None:

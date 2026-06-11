@@ -115,6 +115,8 @@ def log_event(
     category: str,
     message: str,
     context: Optional[Dict[str, Any]] = None,
+    *,
+    details: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Append a structured event to the real-time event log (event_log.jsonl).
 
@@ -123,6 +125,11 @@ def log_event(
         category: Short tag, e.g. "scroll" | "shadow" | "tool" | "job" | "system"
         message:  Human-readable description of the event.
         context:  Optional dict with any extra data (IDs, paths, etc.)
+        details:  Optional expand-arrow payload (W5.3) — the keys
+                  ``render_event_details_body`` knows how to render
+                  (reasoning / tool_params / tool_result / llm_ref /
+                  summary / output_dir). Events with details get the
+                  collapsible header treatment in the live panes.
     """
     from datetime import datetime
     import json as _json
@@ -139,6 +146,8 @@ def log_event(
         # dict; absent → "manual" (the coerce_origin default).
         "origin": (context or {}).get("origin") or "manual",
     }
+    if details:
+        entry["details"] = details
 
     # Write to logger
     log_fn = {

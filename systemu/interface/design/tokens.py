@@ -14,6 +14,9 @@ TOKENS = {
         "forged": "info", "linked": "accent", "awakened": "accent",
         "assigned": "accent", "dormant": "muted", "retired": "danger",
         "partial": "warn",
+        # W5.1: a pending operator ask (stuck-run question / credential
+        # request) is a needs-attention state — tint it like one.
+        "question": "warn",
     },
     "space": [4, 8, 12, 16, 24, 32],
     "radius": [7, 10, 14, 999],
@@ -23,6 +26,31 @@ TOKENS = {
 
 def _fmt(v):
     return f"{int(v)}" if float(v).is_integer() else f"{v}"
+
+
+# W4.3: Inter + JetBrains Mono are vendored locally (latin-subset woff2 under
+# systemu/interface/assets/fonts, served at /assets/fonts) instead of loaded
+# from the Google Fonts CDN — offline-safe, no third-party request, no FOUT.
+# SIL OFL 1.1 (see assets/fonts/OFL.txt). The route is registered in
+# dashboard.run_dashboard via app.add_static_files.
+_FONT_FILES = [
+    ("Inter", 400, "inter-400.woff2"),
+    ("Inter", 500, "inter-500.woff2"),
+    ("Inter", 600, "inter-600.woff2"),
+    ("Inter", 700, "inter-700.woff2"),
+    ("Inter", 800, "inter-800.woff2"),
+    ("JetBrains Mono", 400, "jetbrains-mono-400.woff2"),
+    ("JetBrains Mono", 600, "jetbrains-mono-600.woff2"),
+]
+
+
+def _font_faces() -> str:
+    return "\n".join(
+        f"@font-face {{ font-family: '{fam}'; font-style: normal; "
+        f"font-weight: {w}; font-display: swap; "
+        f"src: url('/assets/fonts/{fn}') format('woff2'); }}"
+        for fam, w, fn in _FONT_FILES
+    )
 
 
 def build_global_css() -> str:
@@ -38,7 +66,9 @@ def build_global_css() -> str:
         f" border: 1px solid color-mix(in srgb, var(--color-{name}) 40%, transparent); }}"
         for name in TOKENS["color"]
     )
-    return f""":root {{
+    return f"""{_font_faces()}
+
+:root {{
 {color_vars}
 {space_vars}
 {radius_vars}
@@ -47,6 +77,12 @@ def build_global_css() -> str:
 
 body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, var(--color-bg) 55%) !important; color: var(--color-text) !important; font-family: 'Inter','Segoe UI',system-ui,-apple-system,sans-serif; margin: 0; }}
 .nicegui-content {{ background: transparent !important; min-height: 100vh; }}
+
+/* W4.4 a11y: a visible keyboard-focus ring. The Quasar flatten layer strips
+   default outlines, leaving keyboard users with no focus indicator. :focus-visible
+   shows it for keyboard/AT navigation only (not on mouse click). */
+*:focus-visible {{ outline: 2px solid var(--color-accent2); outline-offset: 2px; border-radius: var(--radius-sm); }}
+.q-btn:focus-visible, a:focus-visible, .s-btn:focus-visible, .q-tab:focus-visible {{ outline: 2px solid var(--color-accent2); outline-offset: 2px; }}
 
 .s-card {{ background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-3); transition: border-color .2s, box-shadow .2s; }}
 .s-card:hover {{ border-color: var(--color-accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 30%, transparent); }}
