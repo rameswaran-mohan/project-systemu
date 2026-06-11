@@ -186,6 +186,27 @@ def build_home_page() -> None:
         with ui.column().style("flex: 1; min-width: 320px;"):
             _build_whats_running_card()
 
+    # ── Live activity panes (BUG-2 regression fix) ──────────────────────
+    # The Phase-6 Home rebuild dropped the origin-filtered live panes — the
+    # operator's per-event expand-arrow view (reasoning / tool I/O / lazy LLM
+    # transcript). Restored: Supervisor (origin "chat") + Manual Logs
+    # (origins "capture"/"manual"/"scheduled"), both on the (also fixed)
+    # always-scheduled refresh timer so they stream without a page reload.
+    from systemu.interface.components.live_events_pane import (
+        build_supervisor_events_pane,
+    )
+    with ui.row().classes("w-full q-gutter-md q-mb-md").style("flex-wrap: wrap;"):
+        with ui.column().style("flex: 1; min-width: 320px;"):
+            ui.label("Supervisor (live)").classes("s-section-head")
+            build_supervisor_events_pane(height_px=240,
+                                         origins=frozenset({"chat"}))
+        with ui.column().style("flex: 1; min-width: 320px;"):
+            ui.label("Manual Logs (live)").classes("s-section-head")
+            build_supervisor_events_pane(
+                height_px=240,
+                origins=frozenset({"capture", "manual", "scheduled"}),
+            )
+
     # ── Spine quick-links (clickable stat tiles → each spine) ──────────
     ui.label("Spines").classes("s-section-head q-mt-sm")
     with ui.row().classes("w-full q-gutter-sm q-mb-md").style("flex-wrap: wrap;"):

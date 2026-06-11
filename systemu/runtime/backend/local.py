@@ -133,32 +133,36 @@ class LocalBackend:
                 )
 
         cmd = [sys.executable, str(impl_path), "--params", params_json]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        # BUG-4 fix: run the child via a thread + blocking subprocess.run rather
+        # than asyncio.create_subprocess_exec. The asyncio child-watcher is
+        # NOT implemented on the Windows SelectorEventLoop (which NiceGUI/uvicorn
+        # may serve the dashboard on) — it raised NotImplementedError that this
+        # block swallowed as a silent empty-error failure. Once W2.2 routed
+        # forged tools through this path, every forged-tool call on the
+        # dashboard loop failed silently → "task stuck after activities".
+        # subprocess.run in a worker thread is loop- and platform-agnostic.
+        import subprocess
+
+        def _run_sync():
+            return subprocess.run(
+                cmd,
+                capture_output=True,
                 cwd=str(self.vault_root),
                 env=self._build_restricted_env(),
+                timeout=timeout,
             )
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout,
-                )
-                stdout    = stdout_b.decode(errors="replace")[: self.max_output]
-                stderr    = stderr_b.decode(errors="replace")[: self.max_output]
-                exit_code = proc.returncode
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                    await proc.communicate()
-                except ProcessLookupError:
-                    pass
-                logger.warning("[LocalBackend] Subprocess timed out")
-                return ToolResult(
-                    success=False, error="Subprocess execution timed out",
-                    timed_out=True, exit_code=-1,
-                )
+
+        try:
+            completed = await asyncio.to_thread(_run_sync)
+            stdout    = completed.stdout.decode(errors="replace")[: self.max_output]
+            stderr    = completed.stderr.decode(errors="replace")[: self.max_output]
+            exit_code = completed.returncode
+        except subprocess.TimeoutExpired:
+            logger.warning("[LocalBackend] Subprocess timed out")
+            return ToolResult(
+                success=False, error="Subprocess execution timed out",
+                timed_out=True, exit_code=-1,
+            )
         except Exception as exc:
             logger.error("[LocalBackend] Subprocess failed: %s", exc)
             return ToolResult(success=False, error=str(exc))

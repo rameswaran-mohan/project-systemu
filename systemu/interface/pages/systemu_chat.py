@@ -391,6 +391,19 @@ def build_systemu_chat_page() -> None:
                                     f"font-size: 12px; color: {color}; font-weight: 600;"
                                 )
 
+                    # BUG-2: the expand-arrow for events carrying a details
+                    # payload (reasoning / tool params / tool result / lazy
+                    # LLM transcript) — the same body the /insights live pane
+                    # renders, so the affordance exists on this feed too.
+                    from systemu.interface.components.live_events_pane import (
+                        _has_details, render_event_details_body,
+                    )
+                    if _has_details(event):
+                        with ui.expansion("Details", value=False).classes(
+                            "w-full s-muted"
+                        ).style("font-size: 11px;"):
+                            render_event_details_body(event.get("details") or {})
+
         # Auto-scroll (inject JS — runs in the browser)
         if _auto_scroll[0]:
             ui.run_javascript(
@@ -562,6 +575,16 @@ def build_systemu_chat_page() -> None:
                             f"font-size: 12px; color: {THEME['text']}; "
                             f"word-break: break-word;"
                         )
+                    # BUG-2: strategy ticks carry the richest details
+                    # (reasoning + llm_ref) — give them the expand-arrow too.
+                    from systemu.interface.components.live_events_pane import (
+                        _has_details, render_event_details_body,
+                    )
+                    if _has_details(event):
+                        with ui.expansion("Details", value=False).classes(
+                            "w-full s-muted"
+                        ).style("font-size: 11px;"):
+                            render_event_details_body(event.get("details") or {})
 
     def _handle_approval_dismissed(event: Dict[str, Any]) -> None:
         """Close any open approval card whose dedup_key matches.

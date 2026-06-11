@@ -105,6 +105,66 @@ def _load_llm_text(vault_root, llm_ref) -> str:
         return "(no LLM transcript for this event)"
 
 
+def render_event_details_body(details: Dict[str, Any]) -> None:
+    """Render an event's ``details`` payload (reasoning, tool params/result,
+    lazy LLM transcript) — the body of the expand-arrow row.
+
+    Module-level + surface-agnostic (BUG-2 fix): shared by this pane (the
+    /insights Manual Logs feed) AND the /chat Live Events feed, so the
+    expand-for-details affordance exists wherever events render.
+    """
+    import json as _json
+
+    details = details or {}
+    reasoning = details.get("reasoning")
+    if reasoning:
+        ui.label("Reasoning").style(
+            f"color: {THEME['text_muted']}; font-size: 11px; font-weight: 700;"
+        )
+        ui.label(str(reasoning)).style(
+            f"color: {THEME['text']}; font-size: 12px; white-space: pre-wrap;"
+        )
+    tool_params = details.get("tool_params")
+    if tool_params is not None:
+        ui.label("Tool params").style(
+            f"color: {THEME['text_muted']}; font-size: 11px; font-weight: 700;"
+        )
+        try:
+            _pp = _json.dumps(tool_params, indent=2, default=str)
+        except Exception:
+            _pp = str(tool_params)
+        ui.code(_pp).style("font-size: 11px; width: 100%;")
+    tool_result = details.get("tool_result")
+    if tool_result is not None:
+        ui.label("Tool result").style(
+            f"color: {THEME['text_muted']}; font-size: 11px; font-weight: 700;"
+        )
+        try:
+            _rr = _json.dumps(tool_result, indent=2, default=str)
+        except Exception:
+            _rr = str(tool_result)
+        ui.code(_rr).style("font-size: 11px; width: 100%;")
+
+    # Lazy raw-LLM transcript: only fetched when the button is clicked.
+    llm_ref = details.get("llm_ref")
+    _llm_out = ui.label("").style(
+        f"color: {THEME['text']}; font-size: 11px; white-space: pre-wrap; "
+        f"font-family: monospace;"
+    )
+
+    def _show_llm() -> None:
+        try:
+            from systemu.interface.dashboard_state import AppState
+            vault_root = AppState.get().vault.root
+        except Exception:
+            vault_root = None
+        _llm_out.set_text(_load_llm_text(vault_root, llm_ref))
+
+    ui.button("Show LLM response", on_click=_show_llm).props(
+        "flat dense size=sm"
+    ).style(f"color: {THEME['text_muted']}; font-size: 11px; margin-top: 4px;")
+
+
 def build_supervisor_events_pane(
     height_px: int = 320,
     *,
@@ -123,7 +183,6 @@ def build_supervisor_events_pane(
     `ui.timer` is the only thing that calls `_pane.refresh()`.
     """
     from systemu.interface.event_bus import EventBus
-    from systemu.interface.pages.chat_page import _should_schedule_refresh
 
     # Thread-safe ring buffer (deque.append is atomic under the GIL).
     events: "deque[Dict[str, Any]]" = deque(maxlen=_MAX_EVENTS)
@@ -163,66 +222,17 @@ def build_supervisor_events_pane(
     def _detail_row(ev) -> None:
         """Render one event as an expandable arrow exposing its `details`.
 
-        Header is the usual time / level / message line; the body shows
-        reasoning, tool params (JSON), tool result (JSON), plus a "Show LLM
-        response" button that lazily loads the raw transcript via `llm_ref`.
+        Header is the usual time / level / message line; the body (shared
+        ``render_event_details_body``) shows reasoning, tool params (JSON),
+        tool result (JSON), plus a lazy "Show LLM response" button.
         """
-        import json as _json
-
         level = (ev.get("level") or "INFO").upper()
         tstr = _format_event_time(ev.get("ts"))
         header = (f"{tstr}  " if tstr else "") + f"[{level}] " + str(ev.get("message", ""))[:200]
-        details = ev.get("details") or {}
         with ui.expansion(header, value=False).classes("w-full").style(
             f"font-size: 12px; color: {THEME['text']};"
         ):
-            reasoning = details.get("reasoning")
-            if reasoning:
-                ui.label("Reasoning").style(
-                    f"color: {THEME['text_muted']}; font-size: 11px; font-weight: 700;"
-                )
-                ui.label(str(reasoning)).style(
-                    f"color: {THEME['text']}; font-size: 12px; white-space: pre-wrap;"
-                )
-            tool_params = details.get("tool_params")
-            if tool_params is not None:
-                ui.label("Tool params").style(
-                    f"color: {THEME['text_muted']}; font-size: 11px; font-weight: 700;"
-                )
-                try:
-                    _pp = _json.dumps(tool_params, indent=2, default=str)
-                except Exception:
-                    _pp = str(tool_params)
-                ui.code(_pp).style("font-size: 11px; width: 100%;")
-            tool_result = details.get("tool_result")
-            if tool_result is not None:
-                ui.label("Tool result").style(
-                    f"color: {THEME['text_muted']}; font-size: 11px; font-weight: 700;"
-                )
-                try:
-                    _rr = _json.dumps(tool_result, indent=2, default=str)
-                except Exception:
-                    _rr = str(tool_result)
-                ui.code(_rr).style("font-size: 11px; width: 100%;")
-
-            # Lazy raw-LLM transcript: only fetched when the button is clicked.
-            llm_ref = details.get("llm_ref")
-            _llm_out = ui.label("").style(
-                f"color: {THEME['text']}; font-size: 11px; white-space: pre-wrap; "
-                f"font-family: monospace;"
-            )
-
-            def _show_llm() -> None:
-                try:
-                    from systemu.interface.dashboard_state import AppState
-                    vault_root = AppState.get().vault.root
-                except Exception:
-                    vault_root = None
-                _llm_out.set_text(_load_llm_text(vault_root, llm_ref))
-
-            ui.button("Show LLM response", on_click=_show_llm).props(
-                "flat dense size=sm"
-            ).style(f"color: {THEME['text_muted']}; font-size: 11px; margin-top: 4px;")
+            render_event_details_body(ev.get("details") or {})
 
     @ui.refreshable
     def _pane():
@@ -252,24 +262,36 @@ def build_supervisor_events_pane(
     unsubscribe = EventBus.get().subscribe(_on_event, replay=True)
 
     # UI-thread timer is the SOLE driver of refresh (cheap; diffing is internal
-    # to the @ui.refreshable). Guarded so a disconnected client is skipped.
-    try:
-        client = ui.context.client
-    except Exception:
-        client = None
-
+    # to the @ui.refreshable).
+    #
+    # BUG-1 fix: this used to be gated on _should_schedule_refresh(client)
+    # (has_socket_connection) — but during the initial page BUILD the websocket
+    # is never connected yet, so the timer was NEVER scheduled and the pane
+    # showed only the replay until a manual page refresh. The gate belongs to
+    # POST-RUN refreshes (its v0.8.11 origin), not build-time scheduling.
+    # safe_timer tolerates post-disposal ticks, and we cancel on disconnect.
     def _tick() -> None:
         try:
             _pane.refresh()
         except Exception:
             pass  # client may have disconnected
 
-    if client is None or _should_schedule_refresh(client):
-        ui.timer(0.5, _tick)
+    from systemu.interface.ui_helpers import safe_timer
+    pane_timer = safe_timer(0.5, _tick)
 
-    # Unsubscribe when the client disconnects to avoid leaking callbacks.
+    # Unsubscribe + stop the timer when the client disconnects.
+    def _on_client_gone() -> None:
+        try:
+            pane_timer.cancel()
+        except Exception:
+            pass
+        try:
+            unsubscribe()
+        except Exception:
+            pass
+
     try:
         from nicegui import app
-        app.on_disconnect(lambda: unsubscribe())
+        app.on_disconnect(lambda: _on_client_gone())
     except Exception:
         pass
