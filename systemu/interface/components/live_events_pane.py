@@ -116,6 +116,17 @@ def render_event_details_body(details: Dict[str, Any]) -> None:
     import json as _json
 
     details = details or {}
+    # W5.3: task-outcome payloads — the run's final summary + where produced
+    # files landed. Rendered first: the outcome IS the headline. (Token
+    # classes, not inline f-styles — the lint baseline holds at 0-new.)
+    summary = details.get("summary")
+    if summary:
+        ui.label("Outcome").classes("s-field-label")
+        ui.label(str(summary)).classes("s-cell").style("white-space: pre-wrap;")
+    output_dir = details.get("output_dir")
+    if output_dir:
+        ui.label("Artifacts").classes("s-field-label")
+        ui.label(str(output_dir)).classes("s-mono").style("white-space: pre-wrap;")
     reasoning = details.get("reasoning")
     if reasoning:
         ui.label("Reasoning").style(
@@ -146,7 +157,11 @@ def render_event_details_body(details: Dict[str, Any]) -> None:
         ui.code(_rr).style("font-size: 11px; width: 100%;")
 
     # Lazy raw-LLM transcript: only fetched when the button is clicked.
+    # W5.3: only offered when the event actually carries an llm_ref —
+    # outcome-only payloads (summary/output_dir) skip the dead button.
     llm_ref = details.get("llm_ref")
+    if not llm_ref:
+        return
     _llm_out = ui.label("").style(
         f"color: {THEME['text']}; font-size: 11px; white-space: pre-wrap; "
         f"font-family: monospace;"

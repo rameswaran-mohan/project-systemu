@@ -439,6 +439,21 @@ def _dispatch_refinery(shadow, scroll, result_dict, context, config, vault):
 
 logger = logging.getLogger(__name__)
 
+
+def _observe_best_effort(label: str, fn):
+    """Run a best-effort side-effect, returning its result.
+
+    On failure the exception is logged (WARNING + traceback) instead of being
+    swallowed silently — the step is still non-fatal (returns None), but a
+    failed telemetry/refinery dispatch no longer disappears without a trace.
+    """
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 — deliberate best-effort boundary
+        logger.warning("[Runtime] best-effort step failed: %s", label, exc_info=True)
+        return None
+
+
 MAX_ITERATIONS       = 30     # Hard ceiling on agentic loop iterations
 SNAPSHOT_INTERVAL    = 5      # Compact after every N completed ActionBlocks
 
@@ -1748,16 +1763,16 @@ class ShadowRuntime:
         """v0.8.21: terminal finalize for stuck-loop. Mirrors the MaxIterations path
         (build_result + telemetry + refinery + shadow-log) so downstream consumers
         treat 'partial' / 'cancelled' here identically."""
-        try:
-            self._append_to_shadow_log(
+        _observe_best_effort(
+            "stuck-loop shadow-log append",
+            lambda: self._append_to_shadow_log(
                 shadow, execution_id, status, f"Stuck-loop: {reason}",
                 iteration_count=iteration, tool_calls_made=tool_calls_made,
                 objectives_completed=len(completed or []),
                 objectives_total=total_objectives,
                 duration_seconds=(__import__("time").time() - exec_start),
-            )
-        except Exception:
-            pass
+            ),
+        )
         # v0.8.22.1 (Fix 3): a deliberate operator cancel is not a system "stuck"
         # failure — don't mislabel it or stamp it with the StuckLoopDetected error.
         if status == "cancelled":
@@ -1771,19 +1786,20 @@ class ShadowRuntime:
             final_summary=_summary,
             error=_err,
         )
-        try:
-            _record_terminal_telemetry(
+        _observe_best_effort(
+            "stuck-loop terminal telemetry",
+            lambda: _record_terminal_telemetry(
                 shadow=shadow, execution_id=execution_id, scroll=scroll,
                 status=status, iteration=iteration,
                 extra={"reason": "StuckLoopDetected",
                        "stuck_on_objective": stuck_on},
-            )
-        except Exception:
-            pass
-        try:
-            _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
-        except Exception:
-            pass
+            ),
+        )
+        _observe_best_effort(
+            "stuck-loop refinery dispatch",
+            lambda: _dispatch_refinery(
+                shadow, scroll, res, context, self.config, self.vault),
+        )
         # v0.9.2: episodic capture — best-effort, never raises
         _trigger_episodic_capture(
             vault=getattr(self, 'vault', None),

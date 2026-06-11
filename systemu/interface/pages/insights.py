@@ -55,6 +55,15 @@ def _resolve_tab(tab: str | None) -> str:
     return "memory"
 
 
+def _tab_url(tab: str) -> str:
+    """Pure: the shareable deep-link URL for an Insights tab.
+
+    Mirrors the redirect targets in dashboard.py (``/insights?tab=…``) so the
+    load-direction (URL → tab) and the click-direction (tab → URL) agree.
+    """
+    return f"/insights?tab={tab}"
+
+
 def build_structured_answer(questions: list, values: dict) -> str:
     """v0.8.19 — serialize structured-question answers to the JSON stored as choice."""
     import json
@@ -92,6 +101,15 @@ def build_insights_page(default_tab: str = "memory") -> None:
         ui.tab("memory", label="Memory")
         ui.tab("flywheel", label="Flywheel")
         ui.tab("events", label="Manual Logs")
+
+    # Deep-link round-trip: clicking a tab rewrites the URL (no reload) so the
+    # active tab is shareable/bookmarkable — the mirror of the ?tab= load path.
+    def _sync_tab_url(e) -> None:
+        val = getattr(e, "value", None)
+        if val in _VALID_TABS:
+            ui.run_javascript(f"history.replaceState(null, '', {_tab_url(val)!r})")
+
+    tabs.on_value_change(_sync_tab_url)
 
     # ── Tab panels ──────────────────────────────────────────────────────────
     # Each panel calls the existing page builder verbatim — no logic moves.

@@ -177,9 +177,12 @@ class TestWebExtractSinglePage:
                                                        "count": 2, "error": None})
         out = m.run(url="https://x.example/list",
                     schema={"type": "object", "properties": {"name": {"type": "string"}}})
-        # v0.8.20 polite headers default
+        # v0.9.1.1 browser-realistic polite headers (replaced the old api-style
+        # Accept so bot-walling sites return content). Assert the contract — a
+        # browser-shaped Accept — not the exact q-value string.
         assert "python-requests" not in captured["headers"].get("User-Agent", "")
-        assert captured["headers"].get("Accept") == "text/html,application/json,*/*"
+        _accept = captured["headers"].get("Accept", "")
+        assert _accept.startswith("text/html") and "application/xhtml+xml" in _accept
         assert out["success"] is True and out["count"] == 2
         assert out["pages_fetched"] == 1
 
@@ -219,7 +222,10 @@ class TestWebExtractSinglePage:
                     schema={"type": "object", "properties": {"name": {"type": "string"}}})
         assert out["success"] is False
         assert out["status_code"] == 403
-        assert out["error_type"] == "http_error"
+        # v0.9.1.1: a 403 is classified as an anti-bot block (_ANTI_BOT_STATUS),
+        # distinct from a generic http_error — a deliberate improvement so the
+        # system can react to bot-walls.
+        assert out["error_type"] == "anti_bot_blocked"
 
     def test_empty_body_returns_blocked(self, monkeypatch):
         import importlib.util, pathlib, systemu, requests

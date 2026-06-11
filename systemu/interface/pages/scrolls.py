@@ -28,20 +28,25 @@ def build_scrolls_page() -> None:
         ui.label("Scrolls").classes("s-page-title")
         ui.button("+ Refine New Session", on_click=_show_refine_dialog).classes("s-btn s-btn--primary")
 
-    # Search
-    search_input = ui.input(
-        placeholder="Search scrolls...",
-    ).classes("s-input s-search")
+    # board 5a: live search + status filter (shared helper — see list_filter).
+    from systemu.interface.components.list_filter import filter_rows, select_options
+    _filt = {"query": "", "status": "all"}
+    with ui.row().classes("w-full items-center q-gutter-sm q-mb-md"):
+        search_input = ui.input(
+            placeholder="Search scrolls...",
+        ).classes("s-input s-search")
+        status_select = ui.select(
+            select_options(vault.load_index("scrolls"), "status"), value="all",
+        ).classes("s-input")
 
     # Refreshable table — reloads from vault on every render
     @ui.refreshable
-    def _scroll_table(query: str = ""):
+    def _scroll_table():
         scrolls = vault.load_index("scrolls")  # Fresh read each time
-        filtered = [
-            s for s in scrolls
-            if query.lower() in s.get("name", "").lower()
-            or query.lower() in " ".join(s.get("tags", [])).lower()
-        ]
+        filtered = filter_rows(
+            scrolls, _filt["query"], _filt["status"],
+            search_keys=("name",), list_search_keys=("tags",), select_key="status",
+        )
         if not filtered:
             ui.label("No scrolls found.").classes("s-muted q-pa-md")
             return
@@ -78,8 +83,7 @@ def build_scrolls_page() -> None:
                                     def _on_review(_, i=sid):
                                         open_scroll_review_dialog(
                                             i,
-                                            on_resolved=lambda: _scroll_table
-                                            .refresh(search_input.value),
+                                            on_resolved=lambda: _scroll_table.refresh(),
                                         )
                                     ui.button(
                                         "Review & Approve",
@@ -96,17 +100,23 @@ def build_scrolls_page() -> None:
                                 def _on_edit(_, i=sid):
                                     open_scroll_rebuild_dialog(
                                         i,
-                                        on_saved=lambda: _scroll_table
-                                        .refresh(search_input.value),
+                                        on_saved=lambda: _scroll_table.refresh(),
                                     )
                                 ui.button(
                                     "Edit",
                                     on_click=_on_edit,
                                 ).classes("s-btn s-btn--ghost")
 
-    search_input.on("input", lambda e: _scroll_table.refresh(
-        e.value if hasattr(e, 'value') and isinstance(e.value, str) else ""
-    ))
+    def _on_search(e) -> None:
+        _filt["query"] = e.value if isinstance(getattr(e, "value", None), str) else ""
+        _scroll_table.refresh()
+
+    def _on_status(e) -> None:
+        _filt["status"] = e.value or "all"
+        _scroll_table.refresh()
+
+    search_input.on("input", _on_search)
+    status_select.on("update:model-value", _on_status)
     _scroll_table()
 
 

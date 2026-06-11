@@ -241,6 +241,8 @@ def _wire_chat_history_completion(
                 "submission_id": submission_id,
                 "execution_id": (ctx.get("result") or {}).get("execution_id"),
                 "error":        ctx.get("error") if terminal == "failed" else None,
+                # W5.2: outcome summary for the Status dropdown (queued path).
+                "summary":      (ctx.get("result") or {}).get("final_summary") or "",
             })
         except Exception as exc:
             logger.warning("[DirectTask] chat history update failed: %s", exc)
@@ -501,7 +503,31 @@ def run_direct_task(
         "status":       result.get("status", "unknown"),
         "shadow_id":    shadow.id,
         "execution_id": result.get("execution_id"),
+        # W5.2: persist the run's outcome so the Status dropdown (and any
+        # other task-list surface) can show WHAT happened, not just a badge.
+        "summary":      result.get("final_summary") or "",
     })
+
+    # W5.3: stream the outcome to the live panes — the operator should see
+    # "what happened" in the right-rail Live feed without hunting. The queued
+    # path already emits the worker's "✅ Completed…" event; this covers the
+    # sync path. details carries the expand-arrow payload (Outcome/Artifacts).
+    try:
+        from systemu.interface.notifications import log_event as _log_event
+        _status = result.get("status", "unknown")
+        _level = {"success": "SUCCESS", "partial": "WARNING"}.get(_status, "ERROR")
+        _summary = result.get("final_summary") or ""
+        _log_event(
+            _level, "task_outcome",
+            f"Task {_status}: {prompt[:80]}",
+            {"origin": "chat", "scroll_id": scroll.id,
+             "activity_id": activity.id,
+             "execution_id": result.get("execution_id")},
+            details={"summary": _summary,
+                     "output_dir": getattr(config, "output_dir", "") or ""},
+        )
+    except Exception:
+        logger.debug("[DirectTask] outcome event publish failed", exc_info=True)
 
     # Wave 1.4: persist the terminal activity state on the SYNC path too.
     # Previously only the Supervisor's queued path flipped the activity to

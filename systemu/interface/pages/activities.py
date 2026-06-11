@@ -41,21 +41,26 @@ def build_activities_page() -> None:
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
 
-    # ── Search bar ────────────────────────────────────────────────────────────
-    search_input = ui.input(placeholder="Search activities...").style(
-        f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-        f"border-radius: 8px; padding: 8px 12px; color: {THEME['text']}; width: 360px; "
-        f"margin-bottom: 16px;"
-    )
+    # ── Search + status filter (shared helper — board 5a) ──────────────────────
+    from systemu.interface.components.list_filter import filter_rows, select_options
+    _filt = {"query": "", "status": "all"}
+    with ui.row().classes("w-full items-center q-gutter-sm").style("margin-bottom: 16px;"):
+        search_input = ui.input(placeholder="Search activities...").style(
+            f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+            f"border-radius: 8px; padding: 8px 12px; color: {THEME['text']}; width: 360px;"
+        )
+        status_select = ui.select(
+            select_options(vault.load_index("activities"), "status"), value="all",
+        ).classes("s-input")
 
     # ── Refreshable table ─────────────────────────────────────────────────────
     @ui.refreshable
-    def _activity_table(query: str = ""):
+    def _activity_table():
         activities = vault.load_index("activities")
-        filtered = [
-            a for a in activities
-            if not query or query.lower() in a.get("name", "").lower()
-        ]
+        filtered = filter_rows(
+            activities, _filt["query"], _filt["status"],
+            search_keys=("name",), select_key="status",
+        )
 
         if not filtered:
             ui.label("No activities found.").style(
@@ -175,9 +180,16 @@ def build_activities_page() -> None:
                                     f"font-size: 12px; padding: 4px 10px;"
                                 )
 
-    search_input.on("input", lambda e: _activity_table.refresh(
-        e.value if hasattr(e, "value") and isinstance(e.value, str) else ""
-    ))
+    def _on_search(e) -> None:
+        _filt["query"] = e.value if isinstance(getattr(e, "value", None), str) else ""
+        _activity_table.refresh()
+
+    def _on_status(e) -> None:
+        _filt["status"] = e.value or "all"
+        _activity_table.refresh()
+
+    search_input.on("input", _on_search)
+    status_select.on("update:model-value", _on_status)
     _activity_table()
 
 
