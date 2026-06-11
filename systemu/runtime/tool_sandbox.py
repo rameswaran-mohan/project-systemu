@@ -173,6 +173,15 @@ def _parse_execution_stdout(stdout: str, exit_code: int, impl_name: str) -> (boo
         except json.JSONDecodeError as exc:
             parse_error = f"stdout was not valid JSON: {exc} — raw: {stdout[-200:]}"
             logger.warning("[Sandbox] %s: %s", impl_name, parse_error)
+    elif exit_code == 0:
+        # W6.2 truth-in-results: exit 0 with NO output must not read as
+        # success — that exact shape (module-style tool run as a script) was
+        # reported as `success: true, parsed: {}` for every vault tool, which
+        # both lied to the LLM and disarmed the stuck-loop governor's
+        # same-tool-failure trigger (it only counts success=False calls).
+        parse_error = (f"tool produced no output on stdout (exit 0) — "
+                       f"expected a JSON result from {impl_name}")
+        logger.warning("[Sandbox] %s: %s", impl_name, parse_error)
 
     success = (exit_code == 0) and parse_error is None and parsed.get("success", True)
     return success, parsed, parse_error

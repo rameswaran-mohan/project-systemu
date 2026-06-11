@@ -87,7 +87,9 @@ def render_status_menu(vault) -> None:
     from systemu.interface.design.primitives import button, status_pill
     from systemu.interface.ui_helpers import safe_timer
 
-    with button("Status", variant="ghost"):
+    # W7.3: icon makes the control read as a button at a glance (a bare ghost
+    # "Status" label next to the tinted badges was easy to miss entirely).
+    with button("Status", variant="ghost", icon="monitoring"):
         with ui.menu().classes("s-menu").style("min-width: 380px; padding: 8px;"):
 
             @ui.refreshable

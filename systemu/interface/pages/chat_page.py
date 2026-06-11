@@ -200,9 +200,10 @@ def build_chat_page() -> None:
                 except Exception:
                     pass
         unsubscribe = EventBus.get().subscribe(_on_event, replay=False)
+        # W7.2: per-client on_delete, NOT the global app.on_disconnect (any
+        # client's transient drop killed this subscription process-wide).
         try:
-            from nicegui import app
-            app.on_disconnect(lambda: unsubscribe())
+            ui.context.client.on_delete(unsubscribe)
         except Exception:
             pass
     except Exception:
@@ -252,7 +253,9 @@ def build_chat_page() -> None:
         queue_mode = (dispatch.value == "queue")
         prompt_input.set_value("")
         status_label.set_text("Queued — see Systemu Chat for progress" if queue_mode else "Running…")
-        submit_btn.set_enabled(False)
+        # W7.4: do NOT disable the submit button — each submission runs in its
+        # own thread, so concurrent chat tasks are fine. Disabling it for the
+        # whole sync run made the UI itself serialize task submission.
 
         # Capture the NiceGUI client and target slot in the MAIN UI thread
         # while the slot stack is still set up.  The background thread below
@@ -291,7 +294,6 @@ def build_chat_page() -> None:
 
         def _on_done() -> None:
             status_label.set_text("")
-            submit_btn.set_enabled(True)
             _render_history()
             # 6g: surface a live link into the Work spine for the task we just
             # created. Synchronous runs return the finished Activity; queued

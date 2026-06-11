@@ -54,8 +54,9 @@ def build_live_objectives_pane(height_px: int = 220) -> None:
             pass
 
     ui.timer(0.5, _tick)
+    # W7.2: per-client on_delete, NOT the global app.on_disconnect (any
+    # client's transient drop killed this subscription — see live_events_pane).
     try:
-        from nicegui import app
-        app.on_disconnect(lambda: unsubscribe())
+        ui.context.client.on_delete(unsubscribe)
     except Exception:
         pass

@@ -137,6 +137,11 @@ body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, v
 .s-field-label {{ color: var(--color-muted); font-size: var(--type-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
 .s-mono {{ font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: var(--type-xs); color: var(--color-muted); }}
 
+/* ── right-rail item cards (W7.3 — stacked: pill / wrapping title / actions) ── */
+.s-rail-item {{ display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; margin-bottom: 8px; }}
+.s-rail-title {{ font-size: var(--type-sm); color: var(--color-text); line-height: 1.35; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
+.s-rail-actions {{ display: flex; justify-content: flex-end; gap: 6px; }}
+
 /* ── entity rows (shared tool/skill renderers — Phase 5 Slice 3) ── */
 .s-text-success {{ color: var(--color-success); }}
 .s-dryrun-cell {{ font-size: var(--type-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }}

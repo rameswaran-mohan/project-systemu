@@ -228,6 +228,36 @@ class TestToolExecOnServingLoop:
         assert res.success, f"forged-tool subprocess failed on serving loop: {res.error!r}"
         assert res.parsed.get("echo") == "smoke"
 
+    def test_module_style_vault_tool_on_serving_loop(self, tmp_path):
+        """W6: the gate the 41-tool no-op slipped past. The script-style tool
+        above validated the subprocess TRANSPORT (BUG-4) but not the CONTRACT
+        the real vault pack uses — module-style (TOOL_META + run(), no
+        __main__), which executed as a definitions-only script: exit 0, empty
+        stdout, reported success. This runs the real contract on the real
+        serving loop and demands an actual payload."""
+        from systemu.runtime.tool_sandbox import ToolSandbox
+
+        impl = tmp_path / "vault" / "tools" / "implementations" / "module_tool.py"
+        impl.parent.mkdir(parents=True)
+        impl.write_text(
+            "TOOL_META = {'name': 'module_tool'}\n"
+            "def run(**kwargs):\n"
+            "    return {'success': True, 'data': {'echo': kwargs.get('q')}, 'error': None}\n",
+            encoding="utf-8",
+        )
+        sandbox = ToolSandbox(tmp_path / "vault")
+        loop = self._uvicorn_loop()
+        try:
+            res = loop.run_until_complete(
+                sandbox.execute_tool(str(impl), {"q": "spa"},
+                                     force_subprocess=True, timeout=30)
+            )
+        finally:
+            loop.close()
+        assert res.success, f"module-style tool no-op'd on serving loop: {res.error!r}"
+        assert res.parsed.get("data") == {"echo": "spa"}, \
+            "empty payload reported as success — the silent no-op regression"
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-m", "smoke", "-q"]))

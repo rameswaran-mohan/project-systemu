@@ -726,4 +726,7 @@ def build_systemu_chat_page() -> None:
             pass
         logger.debug("[SystemuChat] Client disconnected — timer cancelled, EventBus unsubscribed.")
 
-    ui.context.client.on_disconnect(_cleanup)
+    # W7.2: cleanup on true client DELETION, not on disconnect — a transient
+    # websocket drop (e.g. during a heavy approve) fired _cleanup, and NiceGUI
+    # reconnected the same page WITHOUT rebuilding it → feed dead until reload.
+    ui.context.client.on_delete(_cleanup)

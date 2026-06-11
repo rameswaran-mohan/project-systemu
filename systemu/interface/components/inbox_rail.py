@@ -69,7 +69,7 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
     (Phase 4 wires the rail to follow one run); it is unused here because the
     inbox follows the vault decision queue, not a single streamed run.
     """
-    from nicegui import ui, app
+    from nicegui import ui
 
     from systemu.interface.command.inbox import InboxQueue
     from systemu.interface.design.primitives import status_pill, button
@@ -113,61 +113,69 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
 
         # W5.1: non-gate asks (stuck-run questions, credential requests) used
         # to be invisible here — a parked run looked like "nothing waiting".
-        # Each ask renders as a glance row with an inline Answer dialog wired
-        # through the proven render_decision_card resolve→resume path.
+        # W7.3 layout: stacked card per item (pill on top, title wrapping to
+        # two lines, action right-aligned below) — the one-line pill+truncated-
+        # title+button cram read as clutter in the ~280px rail.
         for ask in asks:
-            with ui.element("div").classes("s-row-box").style(
-                "display: flex; align-items: center; gap: 8px; margin-bottom: 6px;"
-            ):
-                status_pill("question")
-                ui.label(ask["title"]).classes("s-cell").style(
-                    "flex: 1; overflow: hidden; text-overflow: ellipsis; "
-                    "white-space: nowrap;"
-                )
+            with ui.element("div").classes("s-row-box s-rail-item"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    status_pill("question")
+                ui.label(ask["title"]).classes("s-rail-title")
 
                 def _on_answer(_=None, did=ask["id"]):
                     open_answer_dialog(did, vault, on_resolved=_pane.refresh,
                                        host=_answer_host)
 
-                button("Answer", variant="primary", on_click=_on_answer)
+                with ui.element("div").classes("s-rail-actions"):
+                    button("Answer", variant="primary", on_click=_on_answer)
 
         dmap = _descriptor_map()
         for row in rows:
-            with ui.element("div").classes("s-row-box").style(
-                "display: flex; align-items: center; gap: 8px; margin-bottom: 6px;"
-            ):
-                status_pill(row["risk"])
-                ui.label(row["title"]).classes("s-cell").style(
-                    "flex: 1; overflow: hidden; text-overflow: ellipsis; "
-                    "white-space: nowrap;"
-                )
+            with ui.element("div").classes("s-row-box s-rail-item"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    status_pill(row["risk"])
+                ui.label(row["title"]).classes("s-rail-title")
                 approve_label = row["approve_label"]
                 if approve_label:
-                    def _on_approve(_=None, rid=row["id"]):
+                    # W7.1: async + to_thread — Approve EXECUTES the gate
+                    # action (pip installs, dry-runs, LLM calls); on the UI
+                    # loop it froze the dashboard and dropped the websocket.
+                    async def _on_approve(_=None, rid=row["id"]):
+                        import asyncio
                         descriptor = _descriptor_map().get(rid)
                         if descriptor is None:
                             ui.notify("Gate already resolved.", type="warning")
                             _pane.refresh()
                             return
+                        # Capture the client BEFORE the await — the 2s pane
+                        # timer may dispose this slot while the work runs, so
+                        # post-await UI ops must re-enter the captured client
+                        # (else 'parent slot deleted'). Mirrors tools._heal_async.
                         try:
-                            _approve_descriptor(rid, descriptor, vault=vault)
-                            ui.notify(f"Approved: {descriptor.title}", type="positive")
+                            client = ui.context.client
+                        except Exception:
+                            client = None
+                        ui.notify(f"Working on it: {descriptor.title}", type="info")
+                        try:
+                            await asyncio.to_thread(
+                                _approve_descriptor, rid, descriptor, vault=vault)
+                            msg, typ = f"Approved: {descriptor.title}", "positive"
                         except Exception as exc:
-                            ui.notify(f"Approve failed: {exc}", type="negative")
-                        finally:
-                            _pane.refresh()
+                            msg, typ = f"Approve failed: {exc}", "negative"
+                        if client is not None:
+                            try:
+                                with client:
+                                    ui.notify(msg, type=typ)
+                                    _pane.refresh()
+                            except Exception:
+                                pass
 
-                    button(approve_label, variant="primary", on_click=_on_approve)
+                    with ui.element("div").classes("s-rail-actions"):
+                        button(approve_label, variant="primary",
+                               on_click=_on_approve)
 
     _pane()
 
     # UI-thread timer is the SOLE driver of refresh (slot-error tolerant),
     # mirroring live_runs_pane — the queue is file-backed so a poll is enough.
     safe_timer(2.0, _pane.refresh)
-
-    # Detach on disconnect to avoid leaks (no EventBus subscription here, but
-    # keep the contract symmetric with the other rail panes).
-    try:
-        app.on_disconnect(lambda: None)
-    except Exception:
-        pass
