@@ -251,7 +251,7 @@ def build_chat_page() -> None:
 
         queue_mode = (dispatch.value == "queue")
         prompt_input.set_value("")
-        status_label.set_text("⏳ Queued — see Systemu Chat for progress" if queue_mode else "⏳ Running…")
+        status_label.set_text("Queued — see Systemu Chat for progress" if queue_mode else "Running…")
         submit_btn.set_enabled(False)
 
         # Capture the NiceGUI client and target slot in the MAIN UI thread
@@ -342,8 +342,8 @@ def build_chat_tabs(default_tab: str = "compose") -> None:
     with ui.tabs().style(
         f"background: {THEME['surface']}; border-bottom: 1px solid {THEME['border']};"
     ) as tabs:
-        ui.tab("compose", label="💬 Compose")
-        ui.tab("live", label="📡 Live Events")
+        ui.tab("compose", label="Compose")
+        ui.tab("live", label="Live Events")
 
     with ui.tab_panels(tabs, value=default_tab).classes("w-full").style(
         "padding-top: 16px;"

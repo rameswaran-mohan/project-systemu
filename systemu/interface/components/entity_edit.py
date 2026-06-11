@@ -559,7 +559,9 @@ def _locked_field(label: str, value: str) -> None:
     with ui.card().classes("s-card").style(
         "background: var(--color-surface2); margin-bottom: 6px; padding: 8px; width: 100%;"
     ):
-        ui.label(f"🔒 {label}").classes("s-field-label")
+        with ui.row().style("align-items: center; gap: 4px;"):
+            ui.icon("lock").style("font-size: 13px;")
+            ui.label(label).classes("s-field-label")
         ui.label(value).classes("s-mono").style(
             "white-space: pre-wrap; word-break: break-all;"
         )

@@ -25,7 +25,7 @@ def build_scrolls_page() -> None:
 
     # Header
     with ui.row().classes("w-full items-center justify-between q-mb-md"):
-        ui.label("📜 Scrolls").classes("s-page-title")
+        ui.label("Scrolls").classes("s-page-title")
         ui.button("+ Refine New Session", on_click=_show_refine_dialog).classes("s-btn s-btn--primary")
 
     # Search
@@ -100,7 +100,7 @@ def build_scrolls_page() -> None:
                                         .refresh(search_input.value),
                                     )
                                 ui.button(
-                                    "✏️ Edit",
+                                    "Edit",
                                     on_click=_on_edit,
                                 ).classes("s-btn s-btn--ghost")
 
@@ -152,7 +152,7 @@ def _show_scroll_detail(scroll_id: str) -> None:
         # v0.6.5-g: Pipeline Trace panel — show per-stage decisions/warnings
         trace = list(getattr(scroll, "pipeline_trace", []) or [])
         ui.separator().classes("s-sep")
-        ui.label(f"📋 Pipeline Trace ({len(trace)})").classes("s-section-head")
+        ui.label(f"Pipeline Trace ({len(trace)})").classes("s-section-head")
         if not trace:
             ui.label("(no trace events recorded)").classes("s-muted s-italic")
         else:
@@ -162,7 +162,7 @@ def _show_scroll_detail(scroll_id: str) -> None:
                     "warn":  "s-text-warn",
                     "error": "s-text-danger",
                 }.get(ev.level, "s-cell")
-                level_icon = {"info": "•", "warn": "⚠", "error": "🚫"}.get(ev.level, "·")
+                level_icon = {"info": "•", "warn": "⚠", "error": "✗"}.get(ev.level, "·")
                 with ui.row().classes("s-row-box items-start q-mb-xs"):
                     ui.label(level_icon).classes(f"{level_cls} s-trace-icon")
                     with ui.column().classes("q-gutter-none col-grow"):

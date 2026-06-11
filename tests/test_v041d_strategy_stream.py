@@ -64,7 +64,7 @@ class TestPublishSupervisorAction:
             unsub()
         msg = events[-1]["message"]
         assert "ROLLBACK" in msg
-        assert "🧠" in msg
+        assert "Supervisor" in msg
 
 
 # ─────────────────────────────────────────────────────────────────────────────

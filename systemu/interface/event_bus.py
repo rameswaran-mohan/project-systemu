@@ -227,7 +227,7 @@ class EventBus:
                 request_id, timeout_s, default,
             )
             self.publish_supervisor(
-                f"⏰ Approval timed out — auto-selected '{default}'",
+                f"Approval timed out — auto-selected '{default}'",
                 level="WARNING",
                 context={"request_id": request_id},
             )
@@ -330,7 +330,7 @@ class EventBus:
             "ts":       datetime.now(timezone.utc).isoformat(),
             "level":    "WARNING",
             "category": "approval",
-            "message":  f"📦 Tool dependency awaits approval: {package}",
+            "message":  f"Tool dependency awaits approval: {package}",
             "context": {
                 "approval_message": "\n".join(msg_lines),
                 "options":          [],          # signals "no inline resolve"
@@ -364,7 +364,7 @@ class EventBus:
             "ts":       datetime.now(timezone.utc).isoformat(),
             "level":    "SUCCESS" if outcome == "approved" else "INFO",
             "category": "approval_dismissed",
-            "message":  f"📦 Dep '{package}' {outcome}",
+            "message":  f"Dep '{package}' {outcome}",
             "context": {
                 "dedup_key": f"dep-install:{package}",
                 "package":   package,
@@ -414,7 +414,7 @@ class EventBus:
             "ts":       datetime.now(timezone.utc).isoformat(),
             "level":    "INFO",
             "category": "supervisor_action",
-            "message":  f"🧠 Supervisor → {action}",
+            "message":  f"Supervisor → {action}",
             "origin":   origin,
             "context": {
                 "execution_id":      execution_id,

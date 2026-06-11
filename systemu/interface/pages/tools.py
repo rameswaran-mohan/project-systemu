@@ -83,19 +83,9 @@ def _dispatch_enable(tool_id: str) -> None:
         ui.notify(f"Failed to dispatch enable: {result.summary}", type="negative")
 
 
-# Dangerous patterns the risk checker scans for in generated code
-_RISK_PATTERNS: dict[str, str] = {
-    "shell=True":      "subprocess shell injection (shell=True)",
-    "os.system":       "os.system() call",
-    "os.popen":        "os.popen() call",
-    "eval(":           "eval() — arbitrary code execution",
-    "exec(":           "exec() — arbitrary code execution",
-    "__import__":      "__import__() — dynamic import bypass",
-    "shutil.rmtree":   "recursive directory deletion (shutil.rmtree)",
-    " rm -rf":         "rm -rf in a string literal",
-    "DROP TABLE":      "SQL DROP TABLE",
-    "DELETE FROM":     "SQL DELETE FROM",
-}
+# W2.1: the dangerous-pattern catalogue moved to systemu.runtime.code_risk
+# (AST-based scan; the old substring matching was trivially bypassed by
+# getattr/string concatenation). _detect_risks below delegates to it.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,12 +107,31 @@ def _render_unbaked_banner() -> None:
     if not unbaked:
         return
     names = ", ".join(a.package_name for a in unbaked)
-    with ui.row().classes("w-full bg-blue-50 border-l-4 border-blue-400 p-3 q-mb-md"):
-        ui.icon("info").classes("text-blue-700 text-xl")
+    with ui.row().classes("s-banner s-banner--info w-full q-mb-md"):
+        ui.icon("info")
         ui.label(
             f"{len(unbaked)} runtime-approved dep(s) not yet baked into image "
             f"({names}). Next `docker compose build` picks them up."
-        ).classes("text-blue-900")
+        )
+
+
+def _filter_tools(tools, query, status):
+    """Pure filter for the Tools registry toolbar (board 5a: search + status).
+
+    ``query`` matches name/description case-insensitively; ``status`` is an
+    exact (case-insensitive) match, with ``""``/``"all"`` meaning no status
+    filter.  Tolerant of dicts missing the ``status``/``description`` keys.
+    """
+    q = (query or "").strip().lower()
+    st = (status or "all").strip().lower()
+    out = []
+    for t in tools:
+        if st not in ("", "all") and (t.get("status") or "").lower() != st:
+            continue
+        if q and q not in f"{t.get('name', '')} {t.get('description', '')}".lower():
+            continue
+        out.append(t)
+    return out
 
 
 def build_tools_page(forge_tool_id: str | None = None) -> None:
@@ -143,19 +152,38 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
 
     _render_unbaked_banner()
 
+    # board 5a: live ⌕ search + status ▾ filter over the registry.
+    _all_tools = vault.load_index("tools")
+    _statuses = sorted({(t.get("status") or "") for t in _all_tools if t.get("status")})
+    _filt = {"query": "", "status": "all"}
+
+    def _on_tool_search(e) -> None:
+        _filt["query"] = e.value if isinstance(e.value, str) else ""
+        _tools_table.refresh()
+
+    def _on_tool_status(e) -> None:
+        _filt["status"] = e.value or "all"
+        _tools_table.refresh()
+
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("🔧 Tool Registry").style(
+        ui.label("Tools").style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
-        ui.button("+ New Tool", on_click=_show_forge_dialog).style(
-            f"background: {THEME['primary']}; color: white; border-radius: 8px;"
-        )
+        with ui.row().classes("items-center q-gutter-sm"):
+            if _all_tools:
+                ui.input(placeholder="Search tools...", on_change=_on_tool_search) \
+                    .classes("s-input s-search")
+                ui.select(["all"] + _statuses, value="all", on_change=_on_tool_status) \
+                    .classes("s-input")
+            ui.button("+ New Tool", on_click=_show_forge_dialog).style(
+                f"background: {THEME['primary']}; color: white; border-radius: 8px;"
+            )
 
     # Tool-dependency approval card (v0.3.4).  Appears above the registry
     # table so the operator sees pending pip-install requests before
     # digging through the tool list.
     with ui.column().classes("w-full").style("margin-bottom: 24px;"):
-        ui.label("📦 Tool Dependencies").style(
+        ui.label("Tool Dependencies").style(
             f"font-size: 14px; color: {THEME['text_muted']}; font-weight: 700; "
             f"letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px;"
         )
@@ -167,8 +195,7 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
     # are recalibrations awaiting decision.
     _build_recalibration_cards(vault)
 
-    tools = vault.load_index("tools")
-    if not tools:
+    if not _all_tools:
         ui.label("No tools yet. Process a scroll to auto-discover tools.").style(
             f"color: {THEME['text_muted']}; font-style: italic; padding: 20px;"
         )
@@ -180,25 +207,36 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
     # workshop and any future lister paint identically.
     from systemu.interface.components.entity_rows import render_tool_row
 
-    with ui.element("table").style(
-        f"width: 100%; border-collapse: collapse; background: {THEME['surface']}; "
-        f"border: 1px solid {THEME['border']}; border-radius: 12px; overflow: hidden;"
-    ):
-        with ui.element("thead"):
-            with ui.element("tr"):
-                for col in ["Name", "Type", "Status", "Enabled", "Dry-run",
-                            "Success", "Deps", "Description", "Actions"]:
-                    with ui.element("th").style(
-                        f"background: {THEME['surface2']}; color: {THEME['text_muted']}; "
-                        f"font-size: 11px; font-weight: 600; text-transform: uppercase; "
-                        f"letter-spacing: 0.08em; padding: 10px 16px; text-align: left; "
-                        f"border-bottom: 1px solid {THEME['border']};"
-                    ):
-                        ui.label(col)
+    @ui.refreshable
+    def _tools_table() -> None:
+        rows = _filter_tools(vault.load_index("tools"), _filt["query"], _filt["status"])
+        with ui.element("table").style(
+            f"width: 100%; border-collapse: collapse; background: {THEME['surface']}; "
+            f"border: 1px solid {THEME['border']}; border-radius: 12px; overflow: hidden;"
+        ):
+            with ui.element("thead"):
+                with ui.element("tr"):
+                    for col in ["Name", "Type", "Status", "Enabled", "Dry-run",
+                                "Success", "Deps", "Description", "Actions"]:
+                        with ui.element("th").style(
+                            f"background: {THEME['surface2']}; color: {THEME['text_muted']}; "
+                            f"font-size: 11px; font-weight: 600; text-transform: uppercase; "
+                            f"letter-spacing: 0.08em; padding: 10px 16px; text-align: left; "
+                            f"border-bottom: 1px solid {THEME['border']};"
+                        ):
+                            ui.label(col)
 
-        with ui.element("tbody"):
-            for t in tools:
-                render_tool_row(t, vault, editable=True)
+            with ui.element("tbody"):
+                if not rows:
+                    with ui.element("tr"):
+                        with ui.element("td").props('colspan="9"').style("padding: 18px;"):
+                            ui.label("No tools match the current filter.").style(
+                                f"color: {THEME['text_muted']}; font-style: italic;"
+                            )
+                for t in rows:
+                    render_tool_row(t, vault, editable=True)
+
+    _tools_table()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,7 +286,7 @@ def _build_recalibration_cards(vault) -> None:
     if not active:
         return
 
-    ui.label("🔁 Pending Tool Recalibrations").style(
+    ui.label("Pending Tool Recalibrations").style(
         f"font-size: 14px; color: {THEME['warning']}; font-weight: 700; "
         f"letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px;"
     )
@@ -396,7 +434,7 @@ def _on_enable_and_resume(rec: dict, ctx: dict, vault) -> None:
             "ts":       datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "level":    "SUCCESS",
             "category": "approval_dismissed",
-            "message":  f"🔁 Recalibration approved → submission {sub_id}",
+            "message":  f"Recalibration approved → submission {sub_id}",
             "context": {
                 "dedup_key": ctx.get("dedup_key"),
                 "outcome":   "approved",
@@ -480,7 +518,7 @@ def _on_override_recalibration(
                 "ts":       datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
                 "level":    "INFO",
                 "category": "approval_dismissed",
-                "message":  f"🔁 Original recalibration dismissed (operator overrode → {forced_mode})",
+                "message":  f"Original recalibration dismissed (operator overrode → {forced_mode})",
                 "context": {
                     "dedup_key": ctx.get("dedup_key"),
                     "outcome":   "overridden",
@@ -523,7 +561,7 @@ def _on_reject_recalibration(ctx: dict) -> None:
             "ts":       datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
             "level":    "WARNING",
             "category": "approval_dismissed",
-            "message":  "🔁 Recalibration rejected by operator",
+            "message":  "Recalibration rejected by operator",
             "context": {
                 "dedup_key": ctx.get("dedup_key"),
                 "outcome":   "rejected",
@@ -668,12 +706,12 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                 approve_btn.set_visibility(False)
 
                 # Third option A: edit the generated code inline
-                edit_code_btn = ui.button("✏️ Edit Code")
+                edit_code_btn = ui.button("Edit Code")
                 edit_code_btn.style(f"background: {THEME['warning']}; color: white; border-radius: 8px;")
                 edit_code_btn.set_visibility(False)
 
                 # Third option B: go back to spec and regenerate
-                refine_btn = ui.button("🔄 Refine Spec")
+                refine_btn = ui.button("Refine Spec")
                 refine_btn.style(f"background: {THEME['surface2']}; color: {THEME['text']}; border-radius: 8px;")
                 refine_btn.set_visibility(False)
 
@@ -730,25 +768,30 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                 # Update code panel
                 code_block.content = code
 
-                # Risk checker
+                # Advisory static scan (W2.1: AST-based; honest framing — a
+                # static scan cannot prove code safe, so the empty state must
+                # not read as a green light).
                 risk_row.clear()
                 with risk_row:
                     risks = _detect_risks(code)
                     if risks:
-                        ui.label("⚠ Risk patterns detected — review carefully:").style(
+                        ui.label("⚠ Advisory static scan — flagged patterns (not a security verdict):").style(
                             f"color: {THEME['warning']}; font-size: 12px; font-weight: 600; width: 100%;"
                         )
                         for risk_label in risks:
                             ui.html(
-                                f'<span style="background: rgba(239,68,68,0.15); color: #ef4444; '
-                                f'border: 1px solid rgba(239,68,68,0.4); border-radius: 4px; '
+                                f'<span style="background: color-mix(in srgb, {THEME["danger"]} 15%, transparent); '
+                                f'color: {THEME["danger"]}; '
+                                f'border: 1px solid color-mix(in srgb, {THEME["danger"]} 40%, transparent); '
+                                f'border-radius: 4px; '
                                 f'padding: 2px 8px; font-size: 11px; font-family: monospace;">'
                                 f'{risk_label}</span>'
                             )
                     else:
                         ui.html(
-                            f'<span style="color: {THEME["success"]}; font-size: 12px;">'
-                            f'✓ No dangerous patterns detected.</span>'
+                            f'<span style="color: {THEME["text_muted"]}; font-size: 12px;">'
+                            f'Advisory static scan: no flagged patterns. This does not prove the '
+                            f'code safe — read it before approving.</span>'
                         )
 
                 gate2_col.set_visibility(True)
@@ -760,7 +803,7 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                 code_block.set_visibility(True)
                 code_editor.set_visibility(False)
                 validation_row.set_visibility(False)
-                edit_code_btn.text = "✏️ Edit Code"
+                edit_code_btn.text = "Edit Code"
 
             def _on_approve():
                 from systemu.pipelines.tool_forge import save_approved_code
@@ -829,7 +872,7 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                     code_editor.value = _pending_code[0] if _pending_code else ""
                     code_block.set_visibility(False)
                     code_editor.set_visibility(True)
-                    edit_code_btn.text = "🔒 Lock In Edits"
+                    edit_code_btn.text = "Lock In Edits"
                     g2_subtitle.set_text(
                         "Edit the code below. Click 'Lock In Edits' to validate and apply changes."
                     )
@@ -860,7 +903,7 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                     _edit_mode[0] = False
                     code_block.set_visibility(True)
                     code_editor.set_visibility(False)
-                    edit_code_btn.text = "✏️ Edit Code"
+                    edit_code_btn.text = "Edit Code"
                     g2_subtitle.set_text(
                         "Read the generated code. Approve only if you are satisfied it is safe."
                     )
@@ -1142,8 +1185,14 @@ def _find_scroll_for_tool(tool, state) -> object:
 
 
 def _detect_risks(code: str) -> list[str]:
-    """Scan generated code for dangerous patterns. Returns human-readable labels."""
-    return [label for pattern, label in _RISK_PATTERNS.items() if pattern in code]
+    """ADVISORY scan of generated code (AST-based; W2.1).
+
+    Returns human-readable labels.  Delegates to runtime.code_risk so the
+    CLI / any future surface shares the one scanner.  Advisory by nature —
+    surfaces must not present an empty result as proof of safety.
+    """
+    from systemu.runtime.code_risk import scan_code
+    return scan_code(code)
 
 
 def _validate_tool_code(code: str) -> list[str]:

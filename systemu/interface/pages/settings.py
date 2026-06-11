@@ -20,7 +20,7 @@ def build_settings_page() -> None:
     state = AppState.get()
     config = state.config
 
-    ui.label("⚙️ Settings").style(
+    ui.label("Settings").style(
         f"font-size: 22px; font-weight: 800; color: {THEME['text']}; margin-bottom: 20px;"
     )
 
@@ -120,7 +120,7 @@ def build_settings_page() -> None:
             f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
             f"border-radius: 12px; padding: 20px; gap: 10px;"
         ):
-            key_status = "✅ Set" if config.openrouter_api_key else "❌ Not set — add OPENROUTER_API_KEY to .env"
+            key_status = "✓ Set" if config.openrouter_api_key else "✗ Not set — add OPENROUTER_API_KEY to .env"
             key_color  = THEME["success"] if config.openrouter_api_key else THEME["danger"]
             ui.label(key_status).style(f"font-size: 14px; color: {key_color}; font-weight: 600;")
             ui.label("API key is loaded from the .env file. Editing is not supported live for security — update the .env file and restart.").style(
@@ -174,7 +174,7 @@ def build_settings_page() -> None:
             except Exception as exc:
                 ui.notify(f"Error saving settings: {exc}", type="negative")
 
-        ui.button("💾 Save Settings", on_click=_save).style(
+        ui.button("Save Settings", on_click=_save).style(
             f"background: {THEME['primary']}; color: white; border-radius: 8px; margin-top: 8px;"
         )
 
@@ -253,10 +253,10 @@ def _connection_card(row: dict) -> None:
             if row["present"]:
                 last4 = row.get("last4")
                 masked = f"••••{last4}" if last4 else ""
-                status_text  = f"✅ Connected {masked}".rstrip()
+                status_text  = f"✓ Connected {masked}".rstrip()
                 status_color = THEME["success"]
             else:
-                status_text  = "❌ Not connected"
+                status_text  = "✗ Not connected"
                 status_color = THEME["danger"]
             ui.label(status_text).style(
                 f"font-size: 12px; font-weight: 600; color: {status_color};"
@@ -525,6 +525,11 @@ def gate_mode_card() -> None:
 
     _danger_banner(model["mode"])
 
+    # W2.4: floor-pierce visibility — flags no_floor / override→allow on a
+    # floor gate type (gate_mode.floor_pierces), independent of the dial mode.
+    from systemu.interface.ui_helpers import render_floor_pierce_banner
+    render_floor_pierce_banner()
+
     with ui.row().style("gap: 16px; align-items: center; flex-wrap: wrap;"):
         ui.label("Gate mode:").style("font-size: 13px;")
         mode_sel = ui.select(
@@ -654,7 +659,7 @@ def stuck_settings_card() -> None:
         except Exception as exc:
             ui.notify(f"Save failed: {exc}", type="negative")
 
-    ui.button("💾 Save Stuck-loop guard", on_click=_save).style(
+    ui.button("Save Stuck-loop guard", on_click=_save).style(
         f"background: {THEME['primary']}; color: white; border-radius: 8px; margin-top: 8px;")
 
 
@@ -730,5 +735,5 @@ def evolution_schedule_card() -> None:
         except Exception as exc:
             ui.notify(f"Save failed: {exc}", type="negative")
 
-    ui.button("💾 Save Evolution Schedule", on_click=_save).props(
+    ui.button("Save Evolution Schedule", on_click=_save).props(
         "no-caps").classes("s-btn s-btn--primary").style("margin-top: 8px;")

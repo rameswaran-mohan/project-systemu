@@ -165,15 +165,15 @@ def build_home_page() -> None:
 
     # ── Header + quick actions ─────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between q-mb-md"):
-        ui.label("🏠 Home").classes("s-page-title")
+        ui.label("Home").classes("s-page-title")
         with ui.row().classes("items-center q-gutter-sm"):
-            ui.button("⚡ Record", on_click=_trigger_record_dialog) \
+            ui.button("Record", on_click=_trigger_record_dialog) \
                 .props("flat no-caps").classes("s-btn s-btn--primary")
-            ui.button("🧬 Evolve", on_click=_run_evolution) \
+            ui.button("Evolve", on_click=_run_evolution) \
                 .props("flat no-caps").classes("s-btn s-btn--ghost")
-            ui.button("🔔 Notifications", on_click=lambda: ui.navigate.to("/notifications")) \
+            ui.button("Notifications", on_click=lambda: ui.navigate.to("/insights?tab=events")) \
                 .props("flat no-caps").classes("s-btn s-btn--ghost")
-            ui.button("🔧 Forge", on_click=lambda: ui.navigate.to("/tools")) \
+            ui.button("Forge", on_click=lambda: ui.navigate.to("/tools")) \
                 .props("flat no-caps").classes("s-btn s-btn--ghost")
             ui.button("↻ Restart Workers", on_click=_force_restart_workers) \
                 .props("flat no-caps").classes("s-btn s-btn--warn") \
@@ -189,20 +189,20 @@ def build_home_page() -> None:
     # ── Spine quick-links (clickable stat tiles → each spine) ──────────
     ui.label("Spines").classes("s-section-head q-mt-sm")
     with ui.row().classes("w-full q-gutter-sm q-mb-md").style("flex-wrap: wrap;"):
-        _stat_card("📜", "Scrolls", len(scrolls),
+        _stat_card("description", "Scrolls", len(scrolls),
                    f"{len(pending_scrolls)} pending", nav_target=tile_nav_target("Scrolls"))
-        _stat_card("👥", "Shadows", len(shadows),
+        _stat_card("groups", "Shadows", len(shadows),
                    f"{len([s for s in shadows if s.get('status')=='awakened'])} active",
                    nav_target=tile_nav_target("Shadows"))
-        _stat_card("🔧", "Tools", len(tools),
+        _stat_card("build", "Tools", len(tools),
                    f"{len([t for t in tools if t.get('status')=='forged'])} forged",
                    nav_target=tile_nav_target("Tools"))
-        _stat_card("🧠", "Skills", len(skills),
+        _stat_card("psychology", "Skills", len(skills),
                    "across all shadows", nav_target=tile_nav_target("Skills"))
-        _stat_card("📋", "Activities", len(activities),
+        _stat_card("assignment", "Activities", len(activities),
                    f"{len([a for a in activities if a.get('status')=='unassigned'])} unassigned",
                    nav_target=tile_nav_target("Activities"))
-        _stat_card("🧬", "Evolutions", len(pending_evolutions),
+        _stat_card("biotech", "Evolutions", len(pending_evolutions),
                    "pending review", nav_target=tile_nav_target("Evolutions"))
 
     # ── Recent activity (links to /workflow/{id}) ──────────────────────
@@ -220,9 +220,9 @@ def build_home_page() -> None:
     # ── Analytics / memory deep-links (replaces the old "More" re-renders) ──
     with ui.row().classes("w-full items-center q-gutter-md q-mt-sm"):
         ui.label("Go deeper:").classes("s-muted")
-        ui.link("📈 View analytics", "/insights").classes("s-cell s-cell--bold") \
+        ui.link("View analytics", "/insights").classes("s-cell s-cell--bold") \
             .style("text-decoration: none;")
-        ui.link("🧠 Shadows memory", "/shadows").classes("s-cell s-cell--bold") \
+        ui.link("Shadows memory", "/shadows").classes("s-cell s-cell--bold") \
             .style("text-decoration: none;")
 
 
@@ -248,7 +248,7 @@ def _build_needs_you_card(vault) -> None:
 
     with card(classes="w-full"):
         with ui.row().classes("w-full items-center justify-between q-mb-sm"):
-            ui.label("📥 What needs you").classes("s-cell s-cell--bold")
+            ui.label("What needs you").classes("s-cell s-cell--bold")
             ui.link("Open Inbox →", "/inbox").classes("s-muted").style("text-decoration: none;")
 
         @ui.refreshable
@@ -279,7 +279,7 @@ def _build_whats_running_card() -> None:
 
     with card(classes="w-full"):
         with ui.row().classes("w-full items-center justify-between q-mb-sm"):
-            ui.label("⚙️ What's running").classes("s-cell s-cell--bold")
+            ui.label("What's running").classes("s-cell s-cell--bold")
             ui.link("Open Work →", "/work").classes("s-muted").style("text-decoration: none;")
         # Compact pipeline: stage chips only (the active list is the Work page).
         build_workflow_pipeline(compact=True)
@@ -328,7 +328,7 @@ def _stat_card(icon: str, label: str, value: int, subtitle: str,
     if nav_target:
         tile.on("click", lambda t=nav_target: ui.navigate.to(t))
     with tile:
-        ui.label(icon).style("font-size: 26px;")
+        ui.icon(icon).style("font-size: 26px;")
         ui.label(str(value)).classes("s-page-title")
         ui.label(label).classes("s-cell s-cell--bold")
         ui.label(subtitle).classes("s-muted")

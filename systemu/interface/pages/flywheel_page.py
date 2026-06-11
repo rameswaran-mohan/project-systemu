@@ -40,17 +40,17 @@ def build_flywheel_page() -> None:
     global_sr      = round(total_success / total_execs * 100, 1) if total_execs else 0.0
 
     with ui.row().classes("w-full gap-4 flex-wrap"):
-        _metric_card("⚙️", "Total Executions",       str(total_execs),    THEME["primary"],  "lifetime")
-        _metric_card("✅", "Global Success Rate",    f"{global_sr}%",     THEME["success"],  f"{total_success} successes")
-        _metric_card("📚", "Memory Entries",         str(total_mem),       "#a78bfa",         "across all shadows")
-        _metric_card("🔥", "High-Confidence Lessons",str(total_high_conf), THEME["warning"],  "reinforced by repetition")
-        _metric_card("👥", "Shadows Tracked",        str(len(all_metrics)), THEME["info"],    "with flywheel data")
+        _metric_card("settings", "Total Executions",       str(total_execs),    THEME["primary"],  "lifetime")
+        _metric_card("check_circle", "Global Success Rate",    f"{global_sr}%",     THEME["success"],  f"{total_success} successes")
+        _metric_card("menu_book", "Memory Entries",         str(total_mem),       "#a78bfa",         "across all shadows")
+        _metric_card("local_fire_department", "High-Confidence Lessons",str(total_high_conf), THEME["warning"],  "reinforced by repetition")
+        _metric_card("groups", "Shadows Tracked",        str(len(all_metrics)), THEME["info"],    "with flywheel data")
 
     ui.separator().style(f"background:{THEME['border']}; margin: 24px 0;")
 
     if not all_metrics:
         with ui.column().classes("w-full items-center").style("padding: 60px 0;"):
-            ui.label("⚙️").style("font-size: 64px;")
+            ui.icon("settings").style("font-size: 64px;")
             ui.label("No execution data yet — run a Shadow to start the flywheel.").style(
                 f"color: {THEME['text_muted']}; font-size: 16px; margin-top: 16px; text-align: center;"
             )
@@ -87,7 +87,7 @@ def _metric_card(icon: str, label: str, value: str, color: str, sub: str) -> Non
         f"border-radius: 12px; padding: 20px 24px; min-width: 160px; flex: 1; gap: 4px;"
     ):
         with ui.row().style("align-items: center; gap: 8px;"):
-            ui.label(icon).style("font-size: 20px;")
+            ui.icon(icon).style("font-size: 20px;")
             ui.label(label).style(f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 500;")
         ui.label(value).style(f"font-size: 28px; font-weight: 800; color: {color};")
         ui.label(sub).style(f"font-size: 11px; color: {THEME['text_muted']};")
@@ -126,8 +126,8 @@ def _shadow_flywheel_card(metrics: dict) -> None:
     sr_bar_w = int(min(success_rate, 100))
 
     with ui.expansion(
-        f"⚙️ {name}  —  {total_execs} runs · {success_rate:.0f}% success",
-        icon="",
+        f"{name}  —  {total_execs} runs · {success_rate:.0f}% success",
+        icon="settings",
     ).classes("w-full").style(
         f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
         f"border-radius: 12px; margin-bottom: 12px;"
@@ -307,28 +307,28 @@ def _flywheel_svg() -> str:
   <!-- Execute (top) -->
   <g transform="translate(320,40)">
     <rect x="-55" y="-18" width="110" height="36" rx="8" fill="{success}" opacity="0.15" stroke="{success}" stroke-width="1.5"/>
-    <text x="0" y="-3" text-anchor="middle" fill="{success}" font-size="11" font-weight="700">⚙️ EXECUTE</text>
+    <text x="0" y="-3" text-anchor="middle" fill="{success}" font-size="11" font-weight="700">EXECUTE</text>
     <text x="0" y="12" text-anchor="middle" fill="{muted}" font-size="9">Shadow runs task</text>
   </g>
 
   <!-- Refinery (right) -->
   <g transform="translate(530,130)">
     <rect x="-55" y="-18" width="110" height="36" rx="8" fill="{warning}" opacity="0.15" stroke="{warning}" stroke-width="1.5"/>
-    <text x="0" y="-3" text-anchor="middle" fill="{warning}" font-size="11" font-weight="700">🔬 REFINERY</text>
+    <text x="0" y="-3" text-anchor="middle" fill="{warning}" font-size="11" font-weight="700">REFINERY</text>
     <text x="0" y="12" text-anchor="middle" fill="{muted}" font-size="9">Extracts lessons</text>
   </g>
 
   <!-- Memory (bottom) -->
   <g transform="translate(320,220)">
     <rect x="-55" y="-18" width="110" height="36" rx="8" fill="#a78bfa" opacity="0.15" stroke="#a78bfa" stroke-width="1.5"/>
-    <text x="0" y="-3" text-anchor="middle" fill="#a78bfa" font-size="11" font-weight="700">🧠 MEMORY</text>
+    <text x="0" y="-3" text-anchor="middle" fill="#a78bfa" font-size="11" font-weight="700">MEMORY</text>
     <text x="0" y="12" text-anchor="middle" fill="{muted}" font-size="9">Consolidates knowledge</text>
   </g>
 
   <!-- Recall (left) -->
   <g transform="translate(110,130)">
     <rect x="-55" y="-18" width="110" height="36" rx="8" fill="{info}" opacity="0.15" stroke="{info}" stroke-width="1.5"/>
-    <text x="0" y="-3" text-anchor="middle" fill="{info}" font-size="11" font-weight="700">💡 RECALL</text>
+    <text x="0" y="-3" text-anchor="middle" fill="{info}" font-size="11" font-weight="700">RECALL</text>
     <text x="0" y="12" text-anchor="middle" fill="{muted}" font-size="9">Guides next run</text>
   </g>
 

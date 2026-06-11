@@ -45,13 +45,13 @@ def build_global_css() -> str:
 {type_vars}
 }}
 
-body, html {{ background: var(--color-bg) !important; color: var(--color-text) !important; font-family: 'Inter','Segoe UI',system-ui,-apple-system,sans-serif; margin: 0; }}
-.nicegui-content {{ background: var(--color-bg) !important; min-height: 100vh; }}
+body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, var(--color-bg) 55%) !important; color: var(--color-text) !important; font-family: 'Inter','Segoe UI',system-ui,-apple-system,sans-serif; margin: 0; }}
+.nicegui-content {{ background: transparent !important; min-height: 100vh; }}
 
 .s-card {{ background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-3); transition: border-color .2s, box-shadow .2s; }}
 .s-card:hover {{ border-color: var(--color-accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 30%, transparent); }}
 
-.s-pill {{ display: inline-block; padding: 3px 10px; border-radius: var(--radius-pill); font-size: var(--type-sm); font-weight: 600; line-height: 1.6; }}
+.s-pill {{ display: inline-block; padding: 2px 9px; border-radius: var(--radius-pill); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; line-height: 1.7; }}
 {pill_tint}
 
 .s-btn {{ border-radius: var(--radius-sm); padding: 6px 14px; font-size: var(--type-md); font-weight: 600; border: 1px solid transparent; cursor: pointer; }}
@@ -65,7 +65,7 @@ body, html {{ background: var(--color-bg) !important; color: var(--color-text) !
 
 .s-table {{ width: 100%; border-collapse: collapse; }}
 .s-table th, .s-table td {{ padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--color-border); text-align: left; }}
-.s-table th {{ color: var(--color-muted); font-size: var(--type-sm); font-weight: 700; }}
+.s-table th {{ color: var(--color-muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
 
 .s-tabs {{ border-bottom: 1px solid var(--color-border); }}
 
@@ -93,24 +93,40 @@ body, html {{ background: var(--color-bg) !important; color: var(--color-text) !
 .s-banner {{ display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); font-size: var(--type-sm); font-weight: 600; }}
 .s-banner--danger {{ background: color-mix(in srgb, var(--color-danger) 18%, transparent); color: var(--color-danger); border: 1px solid color-mix(in srgb, var(--color-danger) 45%, transparent); }}
 .s-banner--warn {{ background: color-mix(in srgb, var(--color-warn) 18%, transparent); color: var(--color-warn); border: 1px solid color-mix(in srgb, var(--color-warn) 45%, transparent); }}
+.s-banner--info {{ background: color-mix(in srgb, var(--color-info) 16%, transparent); color: var(--color-info); border: 1px solid color-mix(in srgb, var(--color-info) 40%, transparent); }}
 
 /* ── unified inbox card accents (highlighted safe-default / destructive treatment) ── */
 .s-card--danger {{ border-color: color-mix(in srgb, var(--color-danger) 55%, transparent); }}
 .s-safe-default {{ background: color-mix(in srgb, var(--color-success) 14%, transparent); border: 1px solid color-mix(in srgb, var(--color-success) 40%, transparent); border-radius: var(--radius-sm); padding: var(--space-1) var(--space-2); color: var(--color-success); font-size: var(--type-sm); font-weight: 600; }}
 .s-field-label {{ color: var(--color-muted); font-size: var(--type-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
-.s-mono {{ font-family: 'SF Mono','Consolas',monospace; font-size: var(--type-xs); color: var(--color-muted); }}
+.s-mono {{ font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: var(--type-xs); color: var(--color-muted); }}
 
 /* ── entity rows (shared tool/skill renderers — Phase 5 Slice 3) ── */
 .s-text-success {{ color: var(--color-success); }}
 .s-dryrun-cell {{ font-size: var(--type-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }}
-.s-dep-badge {{ display: inline-block; background: var(--color-surface2); color: var(--color-text); font-family: 'SF Mono','Consolas',monospace; font-size: 11px; padding: 2px 8px; border-radius: var(--radius-sm); border: 1px solid var(--color-border); white-space: nowrap; }}
-.s-tool-chip {{ display: inline-block; background: var(--color-surface2); color: var(--color-text); font-family: 'SF Mono','Consolas',monospace; font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--color-border); }}
+.s-dep-badge {{ display: inline-block; background: var(--color-surface2); color: var(--color-text); font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: 11px; padding: 2px 8px; border-radius: var(--radius-sm); border: 1px solid var(--color-border); white-space: nowrap; }}
+.s-tool-chip {{ display: inline-block; background: var(--color-surface2); color: var(--color-text); font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: 11px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--color-border); }}
 .s-skill-header {{ padding: 14px 18px; cursor: pointer; gap: 14px; }}
 .s-skill-row {{ }}
 .s-skill-row--deprecated {{ opacity: 0.72; }}
 .s-skill-cat {{ display: inline-block; background: color-mix(in srgb, var(--cat, var(--color-muted)) 20%, transparent); color: var(--cat, var(--color-muted)); font-size: 10px; font-weight: 700; padding: 3px 10px; border-radius: 12px; letter-spacing: 0.06em; white-space: nowrap; }}
 .s-skill-evidence {{ font-size: 11px; white-space: nowrap; }}
 .s-skill-md {{ background: var(--color-surface2); }}
+
+/* ── board-4 fidelity: flatten Quasar Material chrome to the bespoke flat look ── */
+.q-btn {{ box-shadow: none !important; text-transform: none; letter-spacing: 0; font-weight: 600; }}
+.q-btn .q-btn__content {{ text-transform: none; }}
+/* Solid-variant buttons render via ``flat`` (transparent) + a tinted bg class,
+   which otherwise leaves Quasar's default primary-blue text on a coloured box
+   (~1.2 contrast — near-invisible).  Force readable per-variant text. */
+.s-btn--primary, .s-btn--primary .q-btn__content,
+.s-btn--danger,  .s-btn--danger  .q-btn__content,
+.s-btn--success, .s-btn--success .q-btn__content {{ color: #ffffff !important; }}
+.s-btn--warn, .s-btn--warn .q-btn__content {{ color: #1b1404 !important; }}
+.s-btn--ghost, .s-btn--ghost .q-btn__content {{ color: var(--color-text) !important; }}
+.q-card {{ box-shadow: none !important; }}
+.q-field--outlined .q-field__control {{ border-radius: var(--radius-sm); }}
+.q-menu {{ border: 1px solid var(--color-border); box-shadow: 0 10px 30px rgba(0,0,0,.5) !important; }}
 {_legacy_compat_css()}"""
 
 

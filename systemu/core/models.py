@@ -286,6 +286,11 @@ class Tool(BaseModel):
     tool_md_path:        str = ""               # path to TOOL.md manifest
     status:              ToolStatus = ToolStatus.PROPOSED
     forged_by_systemu:   bool = False
+    # W2.2: forged (LLM-generated) tools execute in a subprocess by default;
+    # the operator may opt a reviewed tool back into the in-process fast path
+    # (~100-500ms faster per call) by setting this. Built-ins (not forged)
+    # always keep the fast path.
+    trusted_inprocess:   bool = False
     enabled:             bool = False   # Must be explicitly toggled ON by user after code review
     version:             int = 1
     # v0.5.0-a: dry-run validation gate (Gate 3.5).

@@ -41,18 +41,41 @@ if _ENV_FILE.exists():
 # MIGRATION.md.  Operators must use the SHARING_ON_* names directly.
 
 
+# W2.3: the second factor for auto-forge. Disabling all three tool security
+# gates must take more than one .env line — the ack phrase is deliberately
+# explicit about what is being signed away.
+AUTO_FORGE_ACK_PHRASE = "I_UNDERSTAND_ALL_GATES_ARE_BYPASSED"
+
+
 def _load_auto_forge_tools() -> bool:
-    """Read SYSTEMU_AUTO_FORGE_TOOLS and emit a loud warning when enabled."""
+    """Read SYSTEMU_AUTO_FORGE_TOOLS; require the explicit ack phrase (W2.3).
+
+    ``SYSTEMU_AUTO_FORGE_TOOLS=true`` alone no longer enables the bypass —
+    ``SYSTEMU_AUTO_FORGE_ACK`` must equal :data:`AUTO_FORGE_ACK_PHRASE` too.
+    Without it, auto-forge stays OFF and the warning tells the operator
+    exactly what is missing (instead of silently disarming every gate).
+    """
     import sys
-    enabled = os.getenv("SYSTEMU_AUTO_FORGE_TOOLS", "false").lower() == "true"
-    if enabled:
+    requested = os.getenv("SYSTEMU_AUTO_FORGE_TOOLS", "false").lower() == "true"
+    if not requested:
+        return False
+    acked = os.getenv("SYSTEMU_AUTO_FORGE_ACK", "") == AUTO_FORGE_ACK_PHRASE
+    if not acked:
         print(
-            "\n\033[93m⚠  WARNING: SYSTEMU_AUTO_FORGE_TOOLS is enabled — all tool security gates\n"
-            "   are bypassed. LLM-generated code will be saved and enabled without human\n"
-            "   review. DEV/TESTING MODE ONLY. Do not use in production.\033[0m\n",
+            "\n\033[93m⚠  SYSTEMU_AUTO_FORGE_TOOLS=true was set but NOT enabled.\n"
+            "   Bypassing all three tool security gates requires the explicit ack:\n"
+            f"   SYSTEMU_AUTO_FORGE_ACK={AUTO_FORGE_ACK_PHRASE}\n"
+            "   Auto-forge remains OFF until both are set. DEV/TESTING ONLY.\033[0m\n",
             file=sys.stderr,
         )
-    return enabled
+        return False
+    print(
+        "\n\033[93m⚠  WARNING: SYSTEMU_AUTO_FORGE_TOOLS is enabled (ack received) — all\n"
+        "   tool security gates are bypassed. LLM-generated code will be saved and\n"
+        "   enabled without human review. DEV/TESTING MODE ONLY.\033[0m\n",
+        file=sys.stderr,
+    )
+    return True
 
 
 def _resolve_execution_adherence() -> str:

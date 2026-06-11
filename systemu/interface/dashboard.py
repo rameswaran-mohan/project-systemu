@@ -65,13 +65,18 @@ def _autoforge_banner_message() -> "str | None":
 # /memory|/flywheel|/notifications → /insights?tab=…) are preserved as
 # redirect handlers in register_routes() below — bookmarks and email
 # deep-links continue to work.
+# Line icons (Material Symbols via icons.py — board 4 §2 "drop emoji for a line
+# set").  icon(concept) → a Quasar/Material symbol name, rendered with ui.icon —
+# never an emoji literal.
+from systemu.interface.design.icons import icon as _icon
+
 NAV_SPINES = [
-    ("/",         "🏠", "Home"),
-    ("/work",     "📋", "Work"),      # Slice 2a: workflow-centric list (scrolls+activities fold in)
-    ("/shadows",  "👥", "Shadows"),
-    ("/tools",    "🔧", "Build"),     # tools+skills+evolutions fold in (Slice 3)
-    ("/insights", "📊", "Insights"),
-    ("/settings", "⚙️", "Settings"),
+    ("/",         _icon("home"),     "Home"),
+    ("/work",     _icon("work"),     "Work"),      # Slice 2a: workflow-centric list (scrolls+activities fold in)
+    ("/shadows",  _icon("shadow"),   "Shadows"),
+    ("/tools",    _icon("build"),    "Build"),     # tools+skills+evolutions fold in (Slice 3)
+    ("/insights", _icon("insights"), "Insights"),
+    ("/settings", _icon("settings"), "Settings"),
 ]
 NAV_ITEMS = NAV_SPINES   # back-compat alias (callers iterate (path, icon, label))
 
@@ -104,6 +109,20 @@ def active_nav_path(current_path: str, nav_paths: list) -> str:
     return sp if sp in nav_paths else ""
 
 
+# Header line-icon for a route — the line icon of its owning spine (board 4 §2).
+_HEADER_ICON_CONCEPT = {
+    "/": "home", "/work": "work", "/shadows": "shadow",
+    "/tools": "build", "/insights": "insights", "/settings": "settings",
+}
+
+
+def _spine_icon(current_path: str) -> str:
+    """Material symbol for the page header — the line icon of the route's spine
+    (falls back to the inbox glyph for the spine-less /inbox)."""
+    concept = _HEADER_ICON_CONCEPT.get(spine_of(current_path))
+    return _icon(concept) if concept else _icon("inbox")
+
+
 def _build_layout(page_title: str, current_path: str):
     """Return a NiceGUI context manager that renders the sidebar + header."""
     from nicegui import ui
@@ -114,12 +133,12 @@ def _build_layout(page_title: str, current_path: str):
     # Google Font
     ui.add_head_html(
         '<link rel="preconnect" href="https://fonts.googleapis.com">'
-        '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">'
+        '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">'
     )
 
     # Root wrapper
     with ui.row().style(
-        f"width: 100vw; min-height: 100vh; background: {THEME['bg']}; gap: 0;"
+        "width: 100vw; min-height: 100vh; background: transparent; gap: 0;"
     ):
         # Hamburger button — visible only on narrow viewports.  Toggles
         # the .s-sidebar-open class on <body> which expands the sidebar.
@@ -148,7 +167,7 @@ def _build_layout(page_title: str, current_path: str):
             with ui.row().classes("s-sidebar-header").style(
                 "align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 16px;"
             ):
-                ui.label("⚡").style("font-size: 22px;")
+                ui.icon("bolt").style(f"font-size: 26px; color: {THEME['primary']};")
                 ui.label("Systemu").classes("s-sidebar-label").style(
                     f"font-size: 18px; font-weight: 800; color: {THEME['text']};"
                 )
@@ -170,7 +189,10 @@ def _build_layout(page_title: str, current_path: str):
                     f"font-size: 14px; font-weight: {'600' if is_active else '500'}; "
                     f"text-decoration: none; transition: background 0.15s;"
                 ):
-                    ui.label(icon).style("min-width: 22px; text-align: center;")
+                    icon_color = THEME["primary"] if is_active else THEME["text_muted"]
+                    ui.icon(icon).style(
+                        f"min-width: 22px; font-size: 20px; color: {icon_color};"
+                    )
                     ui.label(label).classes("s-sidebar-label")
 
             for path, icon, label in NAV_SPINES:
@@ -182,7 +204,7 @@ def _build_layout(page_title: str, current_path: str):
                 f"padding: 12px; background: {THEME['surface2']}; border-radius: 8px; "
                 f"margin-top: 16px; gap: 4px;"
             ):
-                ui.label("⚡ Daemon active").style(
+                ui.label("Daemon active").style(
                     f"font-size: 11px; color: {THEME['success']}; font-weight: 600;"
                 )
                 # Resolve the actual bind address rather than hard-coding
@@ -196,7 +218,7 @@ def _build_layout(page_title: str, current_path: str):
 
         # ── Main content area ──
         with ui.column().style(
-            f"flex: 1; padding: 32px 40px; overflow-y: auto; background: {THEME['bg']}; position: relative;"
+            f"flex: 1; padding: 32px 40px; overflow-y: auto; background: transparent; position: relative;"
         ):
             # v0.8.0.2: top-of-page health banner -- surfaces multi-daemon,
             # missing OPENROUTER key, read-only vault.  Silent when healthy.
@@ -223,7 +245,7 @@ def _build_layout(page_title: str, current_path: str):
                 with ui.dialog() as dlg, ui.card().style(
                     f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; border-radius: 16px; padding: 28px; min-width: 420px;"
                 ):
-                    ui.label("🔴 New Capture Session").style(
+                    ui.label("New Capture Session").style(
                         f"font-size: 18px; font-weight: 700; color: {THEME['text']}; margin-bottom: 16px;"
                     )
                     name_input = ui.input(label="Session Name (Task desc)", placeholder="Deploy new web page").style("width: 100%;")
@@ -244,7 +266,7 @@ def _build_layout(page_title: str, current_path: str):
                         
                     with ui.row().style("gap: 10px; margin-top: 16px;"):
                         ui.button("Start Recording", on_click=_do_record).style(
-                            f"background: #ef4444; color: white; border-radius: 8px;"
+                            f"background: {THEME['danger']}; color: white; border-radius: 8px;"
                         )
                         ui.button("Cancel", on_click=dlg.close).style(
                             f"background: {THEME['surface2']}; color: {THEME['text']}; border-radius: 8px;"
@@ -255,9 +277,15 @@ def _build_layout(page_title: str, current_path: str):
             with ui.row().classes("w-full items-center justify-between").style(
                 f"margin-bottom: 24px; border-bottom: 1px solid {THEME['border']}; padding-bottom: 12px;"
             ):
-                ui.label(page_title).style(
-                    f"font-size: 26px; font-weight: 800; color: {THEME['text']};"
-                )
+                with ui.row().style("align-items: center; gap: 12px;"):
+                    import re as _re_title
+                    _clean_title = _re_title.sub(r"^\s*[^\w\s]+\s*", "", page_title)
+                    ui.icon(_spine_icon(current_path)).style(
+                        f"font-size: 28px; color: {THEME['primary']};"
+                    )
+                    ui.label(_clean_title).style(
+                        f"font-size: 26px; font-weight: 800; color: {THEME['text']};"
+                    )
                 
                 with ui.row().style("gap: 12px; align-items: center;"):
                     # "Needs you (N)" — Phase 5 amendment A1: the always-
@@ -273,7 +301,7 @@ def _build_layout(page_title: str, current_path: str):
                         _ny_vault = None
                     _ny_model = needs_you_badge_model(_ny_vault)
                     needs_you_badge = ui.link(
-                        f"📥 Needs you ({_ny_model['count']})",
+                        f"Needs you ({_ny_model['count']})",
                         _ny_model["target"],
                     ).classes("s-pill s-pill--warn").style(
                         "text-decoration: none; cursor: pointer;"
@@ -282,7 +310,7 @@ def _build_layout(page_title: str, current_path: str):
 
                     def _update_needs_you():
                         m = needs_you_badge_model(_ny_vault)
-                        needs_you_badge.set_text(f"📥 Needs you ({m['count']})")
+                        needs_you_badge.set_text(f"Needs you ({m['count']})")
                         needs_you_badge.set_visibility(m["visible"])
 
                     from systemu.interface.ui_helpers import safe_timer as _ny_timer
@@ -295,16 +323,16 @@ def _build_layout(page_title: str, current_path: str):
                     # single styled Record button this replaces.
                     with ds_button("＋ New", variant="primary"):
                         with ui.menu().classes("s-menu"):
-                            ui.menu_item("🔴 Record session", on_click=_open_record_dialog)
+                            ui.menu_item("Record session", on_click=_open_record_dialog)
                             ui.menu_item(
-                                "📝 Submit task",
+                                "Submit task",
                                 on_click=lambda: ui.navigate.to("/chat?tab=compose"),
                             )
 
                     # Active Tasks button — count badge sits next to button, menu uses @ui.refreshable
                     with ui.row().style("align-items: center; gap: 4px;"):
                         tasks_count = ui.label("").style(
-                            f"background: #ef4444; color: white; border-radius: 10px; "
+                            f"background: {THEME['danger']}; color: white; border-radius: 10px; "
                             f"padding: 2px 7px; font-size: 10px; font-weight: 700; line-height: 1.6;"
                         )
                         tasks_count.set_visibility(False)
@@ -329,14 +357,14 @@ def _build_layout(page_title: str, current_path: str):
                                                 f"font-size: 10px; color: {THEME['primary']}; font-weight: 700; letter-spacing: 0.05em;"
                                             )
                                         ui.button(
-                                            "⛔ Stop",
+                                            "Stop",
                                             on_click=lambda _, jid=j.id: jm.cancel_job_hard(jid),
                                         ).style(
-                                            f"background: #ef4444; color: white; border-radius: 6px; "
+                                            f"background: {THEME['danger']}; color: white; border-radius: 6px; "
                                             f"padding: 4px 10px; font-size: 11px; font-weight: 600;"
                                         )
 
-                        with ui.button("⚙️ Active Tasks").style(
+                        with ui.button("Active Tasks").style(
                             f"background: {THEME['surface2']}; color: {THEME['text']}; border-radius: 8px; font-size: 13px;"
                         ):
                             with ui.menu().style(
@@ -349,14 +377,10 @@ def _build_layout(page_title: str, current_path: str):
             # route, not just in stdout where it scrolls away.
             _banner = _autoforge_banner_message()
             if _banner:
-                with ui.row().classes("w-full bg-red-100 border-l-4 border-red-500 p-3 q-mb-md").style(
-                    "background: #fee2e2; border-left: 4px solid #ef4444; "
-                    "padding: 12px 16px; margin-bottom: 16px; border-radius: 4px; "
-                    "align-items: center; gap: 12px;"
-                ):
-                    ui.icon("warning").style("color: #b91c1c; font-size: 24px;")
+                with ui.row().classes("s-banner s-banner--danger w-full q-mb-md"):
+                    ui.icon("warning").style("font-size: 24px;")
                     ui.label(_banner).style(
-                        "color: #7f1d1d; font-weight: 700; font-size: 13px; line-height: 1.4;"
+                        "font-weight: 700; font-size: 13px; line-height: 1.4;"
                     )
 
             # Page content is rendered here by the caller
@@ -372,8 +396,8 @@ def _build_layout(page_title: str, current_path: str):
             overlay.set_visibility(False)
             
             with overlay:
-                ui.label("🔴 Capture Recording Active...").style(
-                    f"font-size: 32px; font-weight: 800; color: #ef4444;"
+                ui.label("Capture Recording Active...").style(
+                    f"font-size: 32px; font-weight: 800; color: {THEME['danger']};"
                 )
                 ui.label("Dashboard is hidden from screenshots to prevent data leakage.").style(
                     f"font-size: 16px; color: {THEME['text_muted']};"
@@ -389,10 +413,10 @@ def _build_layout(page_title: str, current_path: str):
                         ui.notify("Cancelling capture and cleaning up files...", type="warning")
                         _cancel_capture(jm)
                 
-                    ui.button("⏹ Stop & Analyze", on_click=_btn_stop).style(
+                    ui.button("Stop & Analyze", on_click=_btn_stop).style(
                         f"background: {THEME['success']}; color: white; border-radius: 8px; padding: 12px 24px; font-size: 16px; font-weight: 600;"
                     )
-                    ui.button("🗑️ Cancel & Trash", on_click=_btn_cancel).style(
+                    ui.button("Cancel & Trash", on_click=_btn_cancel).style(
                         f"background: {THEME['surface2']}; color: {THEME['text']}; border-radius: 8px; padding: 12px 24px; font-size: 16px; font-weight: 600;"
                     )
 
@@ -488,7 +512,7 @@ def _show_record_dialog():
     """Fallback: open the record dialog via page navigate to ensure correct slot context."""
     from nicegui import ui
     ui.navigate.to("/")
-    ui.notify("Click the 🔴 Record Session button in the header.", type="info")
+    ui.notify("Click the Record Session button in the header.", type="info")
 
 
 def _stop_capture(jm):
@@ -671,7 +695,7 @@ def register_routes() -> None:
 
     @ui.page("/")
     def page_console():
-        with _build_layout("🏠 Home", "/"):
+        with _build_layout("Home", "/"):
             build_console_page()
 
     # ── Work (Phase 5 Slice 2a: the workflow-centric Work spine page) ─────
@@ -679,19 +703,19 @@ def register_routes() -> None:
     # via redirects in a later slice; for now only the nav repoints here.
     @ui.page("/work")
     def page_work():
-        with _build_layout("📋 Work", "/work"):
+        with _build_layout("Work", "/work"):
             build_work_page()
 
     @ui.page("/workflow/{workflow_id}")
     def page_workflow_detail(workflow_id: str):
         # Pass the REAL path so spine_of highlights the Work spine
         # (/scrolls) — this page used to claim "/" and lit Home.
-        with _build_layout(f"🔄 Workflow — {workflow_id}", f"/workflow/{workflow_id}"):
+        with _build_layout(f"Workflow — {workflow_id}", f"/workflow/{workflow_id}"):
             build_workflow_detail_page(workflow_id)
 
     @ui.page("/scrolls")
     def page_scrolls():
-        with _build_layout("📜 Scrolls", "/scrolls"):
+        with _build_layout("Scrolls", "/scrolls"):
             build_scrolls_page()
 
     @ui.page("/shadows")
@@ -699,7 +723,7 @@ def register_routes() -> None:
         # 6h: /shadows is canonical; /army now redirects here. The builder
         # (build_army_page) + the shadow_army storage key are unchanged — this
         # is a URL rename only.
-        with _build_layout("👥 Shadows", "/shadows"):
+        with _build_layout("Shadows", "/shadows"):
             build_army_page()
 
     # ── Insights (v0.7.2: tabbed parent for Memory / Flywheel / Events) ───
@@ -707,7 +731,7 @@ def register_routes() -> None:
     def page_insights(tab: str = "memory"):
         # ?tab=memory|flywheel|events selects the active tab (invalid values
         # fall back to memory inside build_insights_page).
-        with _build_layout("📊 Insights", "/insights"):
+        with _build_layout("Insights", "/insights"):
             build_insights_page(default_tab=tab)
 
     @ui.page("/memory/{shadow_id}")
@@ -716,24 +740,24 @@ def register_routes() -> None:
         # the Insights → Memory tab's "View memory" buttons.  Pass the REAL
         # path so spine_of highlights the Shadows spine (/shadows) — this page
         # used to claim "/insights".
-        with _build_layout(f"🧠 Memory — {shadow_id}", f"/memory/{shadow_id}"):
+        with _build_layout(f"Memory — {shadow_id}", f"/memory/{shadow_id}"):
             build_shadow_memory_page(shadow_id)
 
     @ui.page("/activities")
     def page_activities():
-        with _build_layout("📋 Activities", "/activities"):
+        with _build_layout("Activities", "/activities"):
             build_activities_page()
 
     @ui.page("/tools")
     def page_tools(forge: str = ""):
         # ?forge=<tool_id> deep-links to a proposed tool and auto-opens its
         # spec/code review dialog (precedent: page_insights(tab=...)).
-        with _build_layout("🔧 Build", "/tools"):
+        with _build_layout("Build", "/tools"):
             build_tools_page(forge_tool_id=forge or None)
 
     @ui.page("/skills")
     def page_skills():
-        with _build_layout("🧠 Skills Registry", "/skills"):
+        with _build_layout("Skills Registry", "/skills"):
             build_skills_page()
 
     # Phase 6 Slice 6f: the /workshop route is dissolved.  Its last surface —
@@ -742,18 +766,18 @@ def register_routes() -> None:
 
     @ui.page("/evolutions")
     def page_evolutions():
-        with _build_layout("🧬 Evolutions", "/evolutions"):
+        with _build_layout("Evolutions", "/evolutions"):
             build_evolutions_page()
 
     @ui.page("/settings")
     def page_settings():
-        with _build_layout("⚙️ Settings", "/settings"):
+        with _build_layout("Settings", "/settings"):
             build_settings_page()
 
     # ── Inbox (Phase 3 Batch 3: the one decisions surface — unified cards) ─
     @ui.page("/inbox")
     def page_inbox():
-        with _build_layout("📥 Inbox", "/inbox"):
+        with _build_layout("Inbox", "/inbox"):
             build_inbox_page()
 
     # ── Chat (v0.7.2: now tabbed — Compose + Live Events) ─────────────────
@@ -761,7 +785,7 @@ def register_routes() -> None:
     def page_chat(tab: str = "compose"):
         # ?tab=compose|live selects the active tab.  /systemu-chat redirects
         # here with tab=live so legacy deep-links keep working.
-        with _build_layout("💬 Chat", "/chat"):
+        with _build_layout("Chat", "/chat"):
             build_chat_tabs(default_tab=tab)
 
     # ── Legacy URL redirects (Phase 6 Batch 2, 6d) ────────────────────────

@@ -1,0 +1,132 @@
+"""Wave 1.2 — a readiness-parked task must produce an ACTIONABLE Inbox gate.
+
+The Stage-3.5 readiness gate parks tasks whose tools aren't deployed+enabled —
+on a fresh install that's every first task, and the park was previously a log
+line + chat status with no operator path forward.  Now it posts a unified
+``tools_blocked`` gate: "Enable & run" resolves through resolve_gate → the
+canonical Gate-3 ``tools_enable`` verb (Gate-3.5 dry-run rule stays enforced).
+"""
+import pytest
+
+from systemu.core.models import Activity, ActivityStatus, Tool, ToolStatus
+from systemu.interface.command.gate import GateDescriptor
+from systemu.interface.command.inbox import InboxQueue, resolve_gate
+from systemu.interface.readiness_gate import ensure_tools_blocked_gate
+from systemu.storage.file_vault import FileVault
+from systemu.vault.vault import Vault
+
+
+@pytest.fixture()
+def vault(tmp_path):
+    return FileVault(Vault(str(tmp_path / "vault")))
+
+
+def _tool(i: int, *, enabled=False, dry="passed", status=ToolStatus.FORGED) -> Tool:
+    return Tool(
+        id=f"tool_{i}", name=f"tool_{i}", description=f"test tool {i}",
+        tool_type="api_call", status=status, enabled=enabled, dry_run_status=dry,
+        implementation_path=f"vault/tools/implementations/tool_{i}.py",
+    )
+
+
+def _activity(vault, tool_ids) -> Activity:
+    act = Activity(
+        id="act_blocked", name="Blocked task", scroll_id="scr_1",
+        status=ActivityStatus.PARTIAL, required_tool_ids=list(tool_ids),
+        missing_tools=[f"tool_{i}" for i in range(len(tool_ids))],
+    )
+    vault.save_activity(act)
+    return act
+
+
+class TestDescriptor:
+    def test_from_blocked_tools_shape(self, vault):
+        tools = [_tool(1), _tool(2, dry="not_run")]
+        act = _activity(vault, [t.id for t in tools])
+        d = GateDescriptor.from_blocked_tools(act, tools)
+        assert "2 tool(s)" in d.title
+        assert d.dedup == "tools_blocked:act_blocked"
+        assert d.options == ["Dismiss", "Enable & run"]
+        assert d.safe_default == "Dismiss"
+        assert "tool_1" in d.inspect and "dry-run: not_run" in d.inspect
+
+
+class TestProducer:
+    def test_enqueues_once_idempotently(self, vault):
+        tools = [_tool(1)]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        dec1 = ensure_tools_blocked_gate(vault, act, tools)
+        dec2 = ensure_tools_blocked_gate(vault, act, tools)
+        assert dec1 == dec2
+        queue = InboxQueue(vault)
+        matches = [i for i, d in queue.list_descriptors()
+                   if d.dedup == "tools_blocked:act_blocked"]
+        assert len(matches) == 1
+
+    def test_context_carries_tool_ids(self, vault):
+        tools = [_tool(1), _tool(2)]
+        act = _activity(vault, [t.id for t in tools])
+        dec_id = ensure_tools_blocked_gate(vault, act, tools)
+        decision = vault.get_decision(dec_id)
+        assert decision.context.get("gate_type") == "tools_blocked"
+        assert decision.context.get("tool_ids") == ["tool_1", "tool_2"]
+
+
+class TestExecutor:
+    def _resolved(self, vault, act, tools, choice):
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        dec_id = ensure_tools_blocked_gate(vault, act, tools)
+        OperatorDecisionQueue(vault).resolve(dec_id, choice=choice)
+        return vault.get_decision(dec_id)
+
+    def test_approve_enables_dry_run_passed_tool(self, vault):
+        tools = [_tool(1, dry="passed")]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        decision = self._resolved(vault, act, tools, "Enable & run")
+        result = resolve_gate(decision, vault=vault)
+        assert result.status.value == "ok"
+        assert vault.get_tool("tool_1").enabled is True
+
+    def test_approve_reports_not_dry_run_tool_without_enabling(self, vault):
+        tools = [_tool(1, dry="not_run")]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        decision = self._resolved(vault, act, tools, "Enable & run")
+        result = resolve_gate(decision, vault=vault)
+        assert result.status.value == "error"          # blocked, loudly
+        assert "dry_run_status" in result.summary
+        assert vault.get_tool("tool_1").enabled is False   # Gate-3.5 held
+
+    def test_dismiss_is_noop(self, vault):
+        tools = [_tool(1, dry="passed")]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        decision = self._resolved(vault, act, tools, "Dismiss")
+        result = resolve_gate(decision, vault=vault)
+        assert result.status.value == "noop"
+        assert vault.get_tool("tool_1").enabled is False
+
+
+class TestWiring:
+    def test_direct_task_posts_the_gate(self):
+        import inspect
+        from systemu.pipelines import direct_task
+        assert "ensure_tools_blocked_gate" in inspect.getsource(direct_task)
+
+    def test_work_page_warn_tint(self):
+        from systemu.interface.pages.work import _status_class
+        assert _status_class("waiting_on_tools") == "warn"
+        assert _status_class("partial") == "warn"
+
+    def test_detail_blocked_tools_model(self, vault):
+        from systemu.interface.pages.workflow_detail import blocked_tools_of
+        act = _activity(vault, ["tool_1"])
+        assert blocked_tools_of(act) == ["tool_0"]
+        act.status = ActivityStatus.COMPLETED
+        assert blocked_tools_of(act) == []

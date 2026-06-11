@@ -27,7 +27,10 @@ from systemu.runtime.workflow_tracker import STAGES, WorkflowSnapshot
 # extraction_failed → danger; pending_approval is warn AND carries the
 # needs_approval affordance (Slice 2b: Review & Approve → unified gate card).
 _DANGER_STATUSES = {"extraction_failed", "failed", "error"}
-_WARN_STATUSES = {"validator_blocked", "pending_approval"}
+# W1.2: a readiness-parked task (waiting_on_tools / partial) needs the
+# operator — tint warn so it doesn't read as a healthy in-flight row.
+_WARN_STATUSES = {"validator_blocked", "pending_approval",
+                  "waiting_on_tools", "partial"}
 
 
 def _status_class(status: str) -> str:
@@ -128,15 +131,6 @@ def _filter_rows(rows: List[Dict[str, Any]], query, status) -> List[Dict[str, An
 # status_class → s-pill tint token (the only mapping the renderer needs).
 _PILL_CLASS = {"ok": "s-pill--success", "warn": "s-pill--warn", "danger": "s-pill--danger"}
 
-_STAGE_ICONS = {
-    "capture":   "🎙️",
-    "scroll":    "📜",
-    "activity":  "📋",
-    "execution": "⚙️",
-    "done":      "✅",
-}
-
-
 def _short_ts(iso: str) -> str:
     """ISO timestamp → human-readable (seconds precision)."""
     return (iso or "")[:19].replace("T", " ")
@@ -179,7 +173,7 @@ def build_work_page() -> None:
 
     # ── Header + filter bar ────────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between q-mb-md"):
-        ui.label("📋 Work").classes("s-page-title")
+        ui.label("Work").classes("s-page-title")
 
     initial_rows = _load_rows()
     statuses = sorted({r["status"] for r in initial_rows if r.get("status")})
@@ -261,8 +255,7 @@ def _render_row(row: Dict[str, Any], on_refresh=None) -> None:
 def _render_stage_chip(chip: Dict[str, Any]) -> None:
     from nicegui import ui
 
-    icon = _STAGE_ICONS.get(chip["stage"], "•")
-    text = f"{icon} {chip['stage']}"
+    text = chip["stage"]
     cls = "s-pill " + ("s-pill--accent" if chip["reached"] else "s-pill--muted")
     if chip["link"]:
         ui.link(text, chip["link"]).classes(cls) \
@@ -283,5 +276,5 @@ def _render_unlinked_row(act: Dict[str, Any]) -> None:
             ui.link(act.get("name") or aid, "/activities") \
                 .classes("s-cell s-cell--bold col-grow") \
                 .style("text-decoration: none;")
-            ui.label("📜 missing scroll").classes("s-pill s-pill--muted")
+            ui.label("missing scroll").classes("s-pill s-pill--muted")
             ui.label(act.get("status") or "unknown").classes("s-pill s-pill--muted")

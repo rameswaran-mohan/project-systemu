@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -119,12 +118,11 @@ class SqliteApprovalGate:
         default_choice = actions[0] if actions else ""
 
         # ── Headless / cross-process mode ─────────────────────────────────────
-        is_headless = (
-            not sys.stdin.isatty()
-            or os.environ.get("SYSTEMU_HEADLESS") == "1"
-        )
+        # Wave 1.1: one shared detector (also honours SYSTEMU_NON_INTERACTIVE,
+        # which this gate previously ignored).
+        from systemu.interface.notifications import is_headless as _is_headless
 
-        if not is_headless:
+        if not _is_headless():
             # Interactive fallback — useful when running worker + dashboard in
             # the same process during development / local testing.
             return self._cli_prompt(title, message, actions,
@@ -165,11 +163,8 @@ class SqliteApprovalGate:
         Headless (worker daemon): auto-returns `default`.
         Interactive (dev): falls back to click.confirm.
         """
-        is_headless = (
-            not sys.stdin.isatty()
-            or os.environ.get("SYSTEMU_HEADLESS") == "1"
-        )
-        if is_headless:
+        from systemu.interface.notifications import is_headless as _is_headless
+        if _is_headless():
             logger.info(
                 "[SqliteApprovalGate] Headless confirm — auto-%s: %s",
                 "yes" if default else "no", prompt_text,

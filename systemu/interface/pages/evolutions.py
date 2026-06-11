@@ -14,12 +14,13 @@ from systemu.interface.dashboard_state import AppState, THEME, status_badge_html
 from systemu.interface.name_resolver import resolve_names
 
 
+# Evolution type → Material icon name
 _TYPE_ICON = {
-    "upgrade":  "⬆️",
-    "merge":    "🔀",
-    "split":    "✂️",
-    "combine":  "🔗",
-    "discover": "💡",
+    "upgrade":  "upgrade",
+    "merge":    "call_merge",
+    "split":    "content_cut",
+    "combine":  "link",
+    "discover": "lightbulb",
 }
 
 
@@ -28,7 +29,7 @@ def build_evolutions_page() -> None:
     vault = state.vault
 
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("🧬 Evolution Engine").style(
+        ui.label("Evolution Engine").style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
         ui.button("▶ Run Evolution Check Now", on_click=_run_evolution).style(
@@ -92,7 +93,7 @@ def build_evolutions_page() -> None:
 
 def _proposal_card(evo: dict) -> None:
     etype = evo.get("evolution_type", "?")
-    icon  = _TYPE_ICON.get(etype, "🔹")
+    icon  = _TYPE_ICON.get(etype, "category")
     eid   = evo.get("id", "")
 
     with ui.card().style(
@@ -103,7 +104,7 @@ def _proposal_card(evo: dict) -> None:
         # Header
         with ui.row().style("align-items: center; justify-content: space-between; margin-bottom: 8px;"):
             with ui.row().style("align-items: center; gap: 10px;"):
-                ui.label(icon).style("font-size: 20px;")
+                ui.icon(icon).style("font-size: 20px;")
                 ui.label(f"{etype.upper()} — {evo.get('target_entity_type', '?')}").style(
                     f"font-size: 14px; font-weight: 700; color: {THEME['warning']};"
                 )

@@ -37,7 +37,7 @@ def build_activities_page() -> None:
 
     # ── Header ────────────────────────────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("📋 Activities").style(
+        ui.label("Activities").style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
 
@@ -139,12 +139,12 @@ def build_activities_page() -> None:
                         # Skills count with warning if missing tools
                         with ui.element("td").style("padding: 12px 16px;"):
                             with ui.row().style("align-items: center; gap: 6px;"):
-                                ui.label(f"🧠 {n_skills}").style(f"font-size: 13px; color: {THEME['text']};")
+                                ui.label(f"{n_skills}").style(f"font-size: 13px; color: {THEME['text']};")
 
                         # Tools count
                         with ui.element("td").style("padding: 12px 16px;"):
                             with ui.row().style("align-items: center; gap: 6px;"):
-                                ui.label(f"🔧 {n_tools}").style(f"font-size: 13px; color: {THEME['text']};")
+                                ui.label(f"{n_tools}").style(f"font-size: 13px; color: {THEME['text']};")
                                 if n_missing > 0:
                                     ui.html(
                                         f'<span style="background: color-mix(in srgb, #f59e0b 20%, transparent); '
@@ -167,7 +167,7 @@ def build_activities_page() -> None:
                         with ui.element("td").style("padding: 12px 16px;"):
                             with ui.row().style("gap: 6px;"):
                                 ui.button(
-                                    "🔍 Detail",
+                                    "Detail",
                                     on_click=lambda _, i=aid: _show_activity_detail(i, vault),
                                 ).style(
                                     f"background: {THEME['surface2']}; color: {THEME['text']}; "
@@ -216,7 +216,7 @@ def _show_activity_detail(activity_id: str, vault) -> None:
         ui.separator().style(f"background: {THEME['border']}; margin: 0 0 16px 0;")
 
         # Scroll link
-        _section_header("📜 Source Scroll")
+        _section_header("Source Scroll")
         with ui.row().style("align-items: center; gap: 10px; margin-bottom: 16px;"):
             with ui.column().style("gap: 0;"):
                 ui.label(resolve_name(activity.scroll_id, vault)).style(
@@ -231,7 +231,7 @@ def _show_activity_detail(activity_id: str, vault) -> None:
             )
 
         # Skills section
-        _section_header(f"🧠 Skills ({len(activity.required_skill_ids)})")
+        _section_header(f"Skills ({len(activity.required_skill_ids)})")
         if activity.required_skill_ids:
             for sid in activity.required_skill_ids:
                 _skill_card(sid, vault)
@@ -241,13 +241,13 @@ def _show_activity_detail(activity_id: str, vault) -> None:
         ui.separator().style(f"background: {THEME['border']}; margin: 12px 0;")
 
         # Tools section
-        _section_header(f"🔧 Tools ({len(activity.required_tool_ids)})")
+        _section_header(f"Tools ({len(activity.required_tool_ids)})")
         if activity.missing_tools:
             ui.html(
                 f'<div style="background: color-mix(in srgb, #f59e0b 15%, transparent); '
                 f'border: 1px solid #f59e0b; border-radius: 8px; padding: 10px 14px; '
                 f'color: #f59e0b; font-size: 13px; margin-bottom: 12px;">'
-                f'⚠️ {len(activity.missing_tools)} tool(s) not yet forged: '
+                f'⚠ {len(activity.missing_tools)} tool(s) not yet forged: '
                 f'{", ".join(activity.missing_tools)}</div>'
             )
         if activity.required_tool_ids:
@@ -259,7 +259,7 @@ def _show_activity_detail(activity_id: str, vault) -> None:
         ui.separator().style(f"background: {THEME['border']}; margin: 12px 0;")
 
         # Shadow assignment
-        _section_header("👤 Assigned Shadow")
+        _section_header("Assigned Shadow")
         if activity.assigned_shadow_id:
             with ui.column().style("gap: 0; margin-bottom: 16px;"):
                 ui.label(resolve_name(activity.assigned_shadow_id, vault)).style(
@@ -319,7 +319,7 @@ def _skill_card(skill_id: str, vault) -> None:
                 f"background: color-mix(in srgb, {THEME['primary']} 8%, transparent); "
                 f"border-radius: 6px; padding: 8px 12px; margin-bottom: 8px;"
             ):
-                ui.label(f"📖 {preview}").style(
+                ui.label(preview).style(
                     f"font-size: 12px; color: {THEME['text']}; font-style: italic; line-height: 1.5;"
                 )
 
@@ -336,7 +336,7 @@ def _skill_card(skill_id: str, vault) -> None:
                             f'<span style="background: color-mix(in srgb, {t_color} 15%, transparent); '
                             f'color: {t_color}; font-size: 10px; font-weight: 600; '
                             f'padding: 2px 8px; border-radius: 4px; border: 1px solid color-mix(in srgb, {t_color} 40%, transparent);">'
-                            f'🔧 {t.name}</span>'
+                            f'{t.name}</span>'
                         )
                     except (KeyError, AttributeError):
                         t_muted = THEME["text_muted"]
@@ -366,7 +366,7 @@ def _tool_card(tool_id: str, vault) -> None:
         f"border-radius: 10px; padding: 12px 14px; margin-bottom: 8px; width: 100%;"
     ):
         with ui.row().style("align-items: center; gap: 8px;"):
-            ui.label(f"🔧 {tool.name}").style(
+            ui.label(tool.name).style(
                 f"font-size: 14px; font-weight: 700; color: {THEME['text']}; flex: 1;"
             )
             ui.html(

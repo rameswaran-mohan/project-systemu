@@ -43,9 +43,9 @@ def build_memory_status() -> None:
     pending      = sum(1 for r in rows if r["pending_consolidation"])
 
     with ui.row().classes("w-full gap-3 flex-wrap"):
-        _stat("📝", "Buffer entries",       str(total_buffer), THEME["info"])
-        _stat("📚", "Consolidated entries", str(total_memory), THEME["primary"])
-        _stat("⏳", "Awaiting consolidation", str(pending),    THEME["warning"])
+        _stat("edit_note", "Buffer entries",       str(total_buffer), THEME["info"])
+        _stat("menu_book", "Consolidated entries", str(total_memory), THEME["primary"])
+        _stat("hourglass_empty", "Awaiting consolidation", str(pending), THEME["warning"])
 
     # Per-shadow rows
     with ui.column().classes("w-full").style(
@@ -57,7 +57,7 @@ def build_memory_status() -> None:
                 f"width: 100%; gap: 12px; padding: 8px 12px; align-items: center; "
                 f"border-bottom: 1px solid {THEME['border']};"
             ):
-                ui.label("👤").style("font-size: 14px; min-width: 18px;")
+                ui.icon("person").style("font-size: 14px; min-width: 18px;")
                 with ui.column().style("flex: 1; gap: 1px;"):
                     ui.label(r["name"]).style(
                         f"font-size: 13px; font-weight: 600; color: {THEME['text']};"
@@ -79,7 +79,7 @@ def build_memory_status() -> None:
     with ui.row().style("gap: 8px; margin-top: 12px;"):
         ui.button(
             "Open Memory page →",
-            on_click=lambda: ui.navigate.to("/memory"),
+            on_click=lambda: ui.navigate.to("/insights?tab=memory"),
         ).style(
             f"background: {THEME['surface2']}; color: {THEME['text']}; "
             f"border: 1px solid {THEME['border']}; border-radius: 8px; "
@@ -130,7 +130,7 @@ def _stat(icon: str, label: str, value: str, color: str) -> None:
         f"border-radius: 10px; padding: 10px 14px; min-width: 140px; flex: 1; gap: 2px;"
     ):
         with ui.row().style("align-items: center; gap: 6px;"):
-            ui.label(icon).style("font-size: 16px;")
+            ui.icon(icon).style("font-size: 16px;")
             ui.label(label).style(
                 f"font-size: 11px; color: {THEME['text_muted']}; font-weight: 600; "
                 f"text-transform: uppercase; letter-spacing: 0.06em;"

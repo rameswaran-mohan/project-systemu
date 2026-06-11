@@ -37,11 +37,11 @@ def build_memory_consolidation_page() -> None:
 
     # ── Header ────────────────────────────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("💡 Memory Consolidation").style(
+        ui.label("Memory Consolidation").style(
             f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
         )
         ui.button(
-            "🔄 Run All Now",
+            "Run All Now",
             on_click=lambda: _run_all(config, vault),
         ).style(
             f"background: {THEME['primary']}; color: white; border-radius: 8px; "
@@ -57,10 +57,10 @@ def build_memory_consolidation_page() -> None:
     needs_work      = sum(1 for r in shadow_rows if r["needs_consolidation"])
 
     with ui.row().style("gap: 12px; margin-bottom: 24px; flex-wrap: wrap;"):
-        _stat_card("👥", str(len(shadow_rows)), "Total Shadows")
-        _stat_card("📝", str(total_buffered),   "Buffered Lessons")
+        _stat_card("groups", str(len(shadow_rows)), "Total Shadows")
+        _stat_card("edit_note", str(total_buffered),   "Buffered Lessons")
         _stat_card(
-            "⚡",
+            "bolt",
             str(needs_work),
             "Ready to Consolidate",
             highlight=(needs_work > 0),
@@ -109,7 +109,7 @@ def _render_scheduler_card(vault) -> None:
         f"border-radius: 12px; padding: 18px 24px; margin-bottom: 20px; width: 100%;"
     ):
         with ui.row().style("align-items: center; gap: 6px; margin-bottom: 14px;"):
-            ui.label("⏰").style("font-size: 16px;")
+            ui.icon("schedule").style("font-size: 16px;")
             ui.label("Scheduler Status").style(
                 f"font-size: 14px; font-weight: 700; color: {THEME['text']};"
             )
@@ -124,18 +124,18 @@ def _render_scheduler_card(vault) -> None:
             )
 
         with ui.row().style("gap: 36px; flex-wrap: wrap;"):
-            _sched_stat("🕐 Next run",      next_run)
-            _sched_stat("✅ Last run",       last_run)
+            _sched_stat("Next run",      next_run)
+            _sched_stat("Last run",       last_run)
             _sched_stat(
-                "📊 Buffer threshold",
+                "Buffer threshold",
                 f"{BUFFER_THRESHOLD} lessons",
             )
             _sched_stat(
-                "⏳ Staleness window",
+                "Staleness window",
                 f"{STALE_AFTER_DAYS} days",
             )
             if updated is not None:
-                _sched_stat("🔁 Last updated", f"{updated} shadow(s)")
+                _sched_stat("Last updated", f"{updated} shadow(s)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,14 +224,14 @@ def _render_shadow_row(
         with ui.row().style("flex: 2; justify-content: flex-end; gap: 6px;"):
             if row["needs_consolidation"]:
                 ui.button(
-                    "🔄 Consolidate",
+                    "Consolidate",
                     on_click=lambda _, s=sid: _run_one(s, config, vault),
                 ).style(
                     f"background: {THEME['primary']}; color: white; "
                     f"border-radius: 6px; font-size: 12px; padding: 4px 10px;"
                 )
             ui.button(
-                "🔍 View",
+                "View",
                 on_click=lambda _, s=sid: ui.navigate.to(f"/memory/{s}"),
             ).style(
                 f"background: {THEME['surface2']}; color: {THEME['text']}; "
@@ -252,14 +252,14 @@ def _run_all(config, vault) -> None:
     """
     from systemu.interface.memory_actions import run_all_async
 
-    run_all_async(config, vault, on_done=lambda: ui.navigate.to("/memory"))
+    run_all_async(config, vault, on_done=lambda: ui.navigate.to("/insights?tab=memory"))
 
 
 def _run_one(shadow_id: str, config, vault) -> None:
     """Consolidate a single shadow OFF-LOOP and refresh the page (P11)."""
     from systemu.interface.memory_actions import run_one_async
 
-    run_one_async(shadow_id, config, vault, on_done=lambda: ui.navigate.to("/memory"))
+    run_one_async(shadow_id, config, vault, on_done=lambda: ui.navigate.to("/insights?tab=memory"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,10 +272,12 @@ def _stat_card(icon: str, value: str, label: str, *, highlight: bool = False) ->
         f"background: {THEME['surface']}; border: 1px solid {border}; "
         f"border-radius: 10px; padding: 14px 20px; min-width: 120px;"
     ):
-        ui.label(f"{icon} {value}").style(
-            f"font-size: 22px; font-weight: 800; color: "
-            f"{'#f59e0b' if highlight and value != '0' else THEME['text']};"
-        )
+        with ui.row().style("align-items: center; gap: 6px;"):
+            ui.icon(icon).classes("s-muted").style("font-size: 20px;")
+            ui.label(value).style(
+                f"font-size: 22px; font-weight: 800; color: "
+                f"{THEME['warn'] if highlight and value != '0' else THEME['text']};"
+            )
         ui.label(label).style(f"font-size: 11px; color: {THEME['text_muted']};")
 
 

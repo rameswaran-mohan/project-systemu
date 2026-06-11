@@ -1052,17 +1052,13 @@ class Supervisor:
         if status == "success":
             # Persist the terminal COMPLETED state so recovery sweeps and the
             # hourly sweep never re-queue an already-finished activity.
-            try:
-                from systemu.core.models import ActivityStatus
-                activity = self.vault.get_activity(activity_id)
-                activity.status = ActivityStatus.COMPLETED
-                activity.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                self.vault.save_activity(activity)
-                logger.info("[Supervisor] Activity %s marked COMPLETED", activity_id)
-            except Exception as exc:
-                logger.warning(
-                    "[Supervisor] Could not mark activity %s COMPLETED: %s", activity_id, exc
-                )
+            # Wave 1.4: shared helper — the sync path (run_direct_task) uses
+            # the same writer, so both execution modes agree on terminal state.
+            from systemu.runtime.activity_completion import mark_activity_completed
+            # getattr: the original inline code read self.vault INSIDE its
+            # try/except, so a vault-less Supervisor (tests, partial init)
+            # stayed best-effort — keep that exact tolerance.
+            mark_activity_completed(getattr(self, "vault", None), activity_id)
             # [A.2] Mark DB row completed
             if self._task_queue is not None and sub_id:
                 try:

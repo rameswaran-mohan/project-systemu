@@ -89,9 +89,9 @@ def build_insights_page(default_tab: str = "memory") -> None:
     with ui.tabs().style(
         f"background: {THEME['surface']}; border-bottom: 1px solid {THEME['border']};"
     ) as tabs:
-        ui.tab("memory", label="💡 Memory")
-        ui.tab("flywheel", label="🔁 Flywheel")
-        ui.tab("events", label="🔔 Manual Logs")
+        ui.tab("memory", label="Memory")
+        ui.tab("flywheel", label="Flywheel")
+        ui.tab("events", label="Manual Logs")
 
     # ── Tab panels ──────────────────────────────────────────────────────────
     # Each panel calls the existing page builder verbatim — no logic moves.
@@ -110,7 +110,7 @@ def build_insights_page(default_tab: str = "memory") -> None:
             from systemu.interface.components.live_events_pane import (
                 build_supervisor_events_pane,
             )
-            ui.label("🔔 Live Manual Logs").style(
+            ui.label("Live Manual Logs").style(
                 f"font-size: 14px; font-weight: 700; color: {THEME['text']}; "
                 f"margin-bottom: 8px;"
             )

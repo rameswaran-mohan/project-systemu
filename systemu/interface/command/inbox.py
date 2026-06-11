@@ -10,7 +10,8 @@ from typing import List, Tuple
 from systemu.interface.command.gate import GateDescriptor
 from systemu.interface.command.result import CommandResult, CommandStatus
 
-_APPROVE_LABELS = {"approve", "approve & apply", "approve & install", "forge"}
+_APPROVE_LABELS = {"approve", "approve & apply", "approve & install", "forge",
+                   "enable & run"}
 
 # Operator gates are render-only: resolving ANY option unblocks the waiting
 # run (the caller re-reads the choice via get_resolved_choice). They are
@@ -68,6 +69,38 @@ def resolve_gate(decision, *, vault) -> CommandResult:
         return CommandResult(
             status=CommandStatus.OK,
             summary=f"Approved dependency {package}; pip install + dry-run started.",
+        )
+
+    if gate_type == "tools_blocked":
+        # W1.2: a task parked by the Stage-3.5 readiness gate. Approve runs
+        # the canonical Gate-3 verb (tools_enable) per blocking tool — the
+        # Gate-3.5 rule (dry-run must have passed) stays enforced by the verb,
+        # so never-dry-run tools are REPORTED, not silently bypassed. Once
+        # enabled, the heal sweep / recovery Pass 2 re-runs the parked task.
+        from systemu.interface.command.verbs import tools_enable
+        tool_ids = (ctx.get("tool_ids") or [])
+        enabled, skipped, failed = [], [], []
+        for tid in tool_ids:
+            res = tools_enable(tid, vault=vault)
+            label = (res.data or {}).get("tool_id", tid) if res.data else tid
+            if res.status == CommandStatus.OK:
+                enabled.append(label)
+            elif res.status == CommandStatus.NOOP:
+                skipped.append(label)
+            else:
+                failed.append(f"{label}: {res.summary}")
+        parts = []
+        if enabled:
+            parts.append(f"enabled {len(enabled)} tool(s)")
+        if skipped:
+            parts.append(f"{len(skipped)} already enabled")
+        if failed:
+            parts.append(f"{len(failed)} blocked — " + " | ".join(failed))
+        summary = ("Readiness gate: " + "; ".join(parts or ["no tools to enable"])
+                   + ". The heal sweep re-runs the parked task once tools are ready.")
+        return CommandResult(
+            status=CommandStatus.ERROR if (failed and not enabled) else CommandStatus.OK,
+            summary=summary,
         )
 
     if gate_type == "forge":

@@ -171,6 +171,45 @@ class GateDescriptor(BaseModel):
         )
 
     @classmethod
+    def from_blocked_tools(cls, activity, tools) -> "GateDescriptor":
+        """Build a GateDescriptor for a task parked on not-ready tools (W1.2).
+
+        The Stage-3.5 readiness gate parks a task when its required tools are
+        not deployed+enabled — on a fresh install that's EVERY first task, and
+        until now the park was a log line + a 'waiting_on_tools' chat status
+        with no operator path forward.  This gate names the blockers and
+        "Enable & run" executes Gate-3 enable on each (the heal sweep then
+        re-runs the parked task automatically).
+
+        Enabling LLM-forged tools is a security gate (Gate 3), so producers
+        MUST enqueue with ``policy=None`` — never auto-executed, even under
+        Bypass mode.
+        """
+        act_id = getattr(activity, "id", "") or ""
+        act_name = getattr(activity, "name", "") or act_id
+        lines = []
+        for t in tools or []:
+            status = getattr(getattr(t, "status", None), "value",
+                             str(getattr(t, "status", "?")))
+            dry = getattr(t, "dry_run_status", "not_run")
+            enabled = "enabled" if getattr(t, "enabled", False) else "disabled"
+            lines.append(f"{getattr(t, 'name', '?')} — {status}, {enabled}, dry-run: {dry}")
+        options = ["Dismiss", "Enable & run"]
+        return cls(
+            title=f"Task blocked — {len(tools or [])} tool(s) not ready",
+            risk="medium",
+            inspect=f"Task: {act_name}\n" + "\n".join(lines),
+            options=options,
+            safe_default=options[0],
+            what_approve_does=(
+                "Runs Gate-3 enable on each blocking tool (tools that haven't "
+                "passed a dry-run are reported and stay disabled). Once "
+                "enabled, the heal sweep re-runs the parked task automatically."
+            ),
+            dedup=f"tools_blocked:{act_id}",
+        )
+
+    @classmethod
     def from_evolution(cls, proposal) -> "GateDescriptor":
         """Build a GateDescriptor from an Evolution proposal.
 
