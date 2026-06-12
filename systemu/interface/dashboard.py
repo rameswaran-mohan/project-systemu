@@ -718,8 +718,29 @@ def register_routes() -> None:
 
     @ui.page("/")
     def page_console():
+        # W9.1: first-run operators land on the onboarding wizard until they
+        # finish or explicitly skip (needs_onboarding is cheap + defensive —
+        # any vault error means "don't redirect").
+        from systemu.interface.pages.welcome import needs_onboarding
+        try:
+            from systemu.interface.dashboard_state import AppState as _ObState
+            _ob_vault = getattr(_ObState.get(), "vault", None)
+        except Exception:
+            _ob_vault = None
+        if _ob_vault is not None and needs_onboarding(_ob_vault):
+            ui.navigate.to("/welcome")
+            return
         with _build_layout("Home", "/"):
             build_console_page()
+
+    # ── Welcome (W9.1: first-run onboarding wizard) ───────────────────────
+    @ui.page("/welcome")
+    def page_welcome():
+        # Claims its own path (no spine highlight — like /inbox), so the
+        # title↔nav-label contract on "/" stays single-owner.
+        from systemu.interface.pages.welcome import build_welcome_page
+        with _build_layout("Welcome", "/welcome"):
+            build_welcome_page()
 
     # ── Work (Phase 5 Slice 2a: the workflow-centric Work spine page) ─────
     # /scrolls and /activities stay registered below — they fold into /work
@@ -805,11 +826,13 @@ def register_routes() -> None:
 
     # ── Chat (v0.7.2: now tabbed — Compose + Live Events) ─────────────────
     @ui.page("/chat")
-    def page_chat(tab: str = "compose"):
+    def page_chat(tab: str = "compose", prefill: str = ""):
         # ?tab=compose|live selects the active tab.  /systemu-chat redirects
         # here with tab=live so legacy deep-links keep working.
+        # W10.4: ?prefill= lands a starter prompt in the composer (the
+        # operator still clicks Run — never auto-submitted).
         with _build_layout("Chat", "/chat"):
-            build_chat_tabs(default_tab=tab)
+            build_chat_tabs(default_tab=tab, prefill=prefill)
 
     # ── Legacy URL redirects (Phase 6 Batch 2, 6d) ────────────────────────
     # Preserve every old top-level URL so bookmarks, notification emails, and

@@ -66,6 +66,8 @@ def build_status_rows(vault, limit: int = 25) -> List[Dict[str, Any]]:
             "outcome": outcome[:240],
             "target": f"/workflow/{scroll_id}" if scroll_id else None,
             "attention": status in _ATTENTION_STATUSES,
+            # W8.4: produced-file count for the row chip.
+            "files": len(e.get("files_produced") or []),
         })
     return rows
 
@@ -118,6 +120,8 @@ def render_status_menu(vault) -> None:
                         if row["target"]:
                             name.style("cursor: pointer;")
                             name.on("click", lambda _, t=row["target"]: ui.navigate.to(t))
+                        if row.get("files"):
+                            ui.label(f"{row['files']} file(s)").classes("s-mono")
                         ui.label(row["ts_display"]).classes("s-mono")
                     if row["outcome"]:
                         ui.label(row["outcome"]).classes("s-muted").style(

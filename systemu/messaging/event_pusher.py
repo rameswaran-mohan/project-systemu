@@ -146,6 +146,34 @@ def translate_event(event: Dict[str, Any]) -> Optional[OutboundMessage]:
     message  = event.get("message") or ""
     ctx      = event.get("context") or {}
 
+    # 0a) W10.1: pending operator decisions (the modern needs-you flow —
+    # W5.3 made these events self-describing). Unlimited bucket: the
+    # operator MUST hear about these while away. Resolutions are noise.
+    if category == "operator_decision_posted":
+        title = ctx.get("title") or message
+        return OutboundMessage(
+            text=(f"🔔 Needs you: {title}\n\n"
+                  f"Open the dashboard Inbox to answer."),
+            category="approval",
+        )
+    if category in {"operator_decision_resolved", "operator_decision_expired"}:
+        return None
+
+    # 0b) W10.1: task outcomes (W8's terminal events — quick lane + sync
+    # workflow runs). Push the result with the summary head; per-iteration
+    # quick_task events fall through to the default drop.
+    if category == "task_outcome":
+        details = event.get("details") or {}
+        summary = str(details.get("summary") or "")[:300]
+        icon = "✅" if level == "SUCCESS" else "⚠️"
+        text = f"{icon} {message}"
+        if summary:
+            text += f"\n\n{summary}"
+        files = details.get("files") or []
+        if files:
+            text += f"\n({len(files)} file(s) produced)"
+        return OutboundMessage(text=text, category="execution")
+
     # 1) Approval requests — always push, regardless of level.
     if category == "approval":
         options = ctx.get("options") or ["Approve", "Reject"]

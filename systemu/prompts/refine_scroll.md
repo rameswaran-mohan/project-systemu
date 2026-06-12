@@ -139,6 +139,8 @@ outcomes over conversational ones — files survive across sessions.
 
 **clarifying_questions (optional):** Default to `[]`. Emit 1–2 questions ONLY when the request is genuinely ambiguous in a way that would materially change the outcome and you cannot reasonably infer the answer. Shape: `[{"id": "short_key", "prompt": "the question", "options": [{"label": "A", "desc": "..."}, {"label": "B", "desc": "..."}], "allow_free_text": true}]`. Most requests need none — do not ask about things you can infer from the capture.
 
+These OFFICE ESSENTIALS *do* warrant one question when absent and not inferable — guessing them produces confidently wrong work: the **recipient/audience** of an outbound deliverable; the **source** (which file, folder, or system) when several could apply; the **date range or period** for any report or summary; an **amount or threshold** that gates an action; **which account/client/vendor** when more than one plausibly matches. Never ask about preferences you can default sensibly (format, tone, file naming).
+
 ## Output format
 
 Return **only** valid JSON in this exact structure. No markdown fences, no explanation:

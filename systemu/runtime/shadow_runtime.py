@@ -3850,6 +3850,16 @@ class ShadowRuntime:
         except Exception:
             logger.debug("[Runtime] truncate_result hook skipped", exc_info=True)
 
+        # W8.4: record verified artifacts from this call (params + parsed,
+        # exists-on-disk filtered) so build_result()["files_produced"] is real.
+        if result.success:
+            try:
+                from systemu.runtime.artifacts import collect_artifact_paths
+                context.add_files(collect_artifact_paths(
+                    tool_name, parameters, result.parsed))
+            except Exception:
+                logger.debug("[Runtime] artifact collection skipped", exc_info=True)
+
         # Detect dependency-related result types and suppress retries.
         # Four error_types map to a single behaviour ("don't call this tool
         # again in this run") but trigger distinct operator-facing event-log

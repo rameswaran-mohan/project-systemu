@@ -242,7 +242,11 @@ def _wire_chat_history_completion(
                 "execution_id": (ctx.get("result") or {}).get("execution_id"),
                 "error":        ctx.get("error") if terminal == "failed" else None,
                 # W5.2: outcome summary for the Status dropdown (queued path).
-                "summary":      (ctx.get("result") or {}).get("final_summary") or "",
+                # W8.4: build_result's key is "summary" (final_summary never
+                # existed) + real per-file artifacts.
+                "summary":      ((ctx.get("result") or {}).get("final_summary")
+                                 or (ctx.get("result") or {}).get("summary") or ""),
+                "files_produced": list((ctx.get("result") or {}).get("files_produced") or []),
             })
         except Exception as exc:
             logger.warning("[DirectTask] chat history update failed: %s", exc)
@@ -505,7 +509,10 @@ def run_direct_task(
         "execution_id": result.get("execution_id"),
         # W5.2: persist the run's outcome so the Status dropdown (and any
         # other task-list surface) can show WHAT happened, not just a badge.
-        "summary":      result.get("final_summary") or "",
+        # W8.4 bug fix: build_result's key is "summary" — reading only
+        # "final_summary" persisted empty outcomes since W5.2 shipped.
+        "summary":      result.get("final_summary") or result.get("summary") or "",
+        "files_produced": list(result.get("files_produced") or []),
     })
 
     # W5.3: stream the outcome to the live panes — the operator should see
@@ -516,7 +523,8 @@ def run_direct_task(
         from systemu.interface.notifications import log_event as _log_event
         _status = result.get("status", "unknown")
         _level = {"success": "SUCCESS", "partial": "WARNING"}.get(_status, "ERROR")
-        _summary = result.get("final_summary") or ""
+        # W8.4: same summary-key fix as the history write above.
+        _summary = result.get("final_summary") or result.get("summary") or ""
         _log_event(
             _level, "task_outcome",
             f"Task {_status}: {prompt[:80]}",
@@ -524,6 +532,7 @@ def run_direct_task(
              "activity_id": activity.id,
              "execution_id": result.get("execution_id")},
             details={"summary": _summary,
+                     "files": list(result.get("files_produced") or []),
                      "output_dir": getattr(config, "output_dir", "") or ""},
         )
     except Exception:
@@ -547,8 +556,8 @@ def run_direct_task(
             config=config,
             session_id=ts,
             intent=getattr(scroll, "intent", ""),
-            chat_result=result.get("final_summary"),
-            files_produced=[],
+            chat_result=result.get("final_summary") or result.get("summary"),
+            files_produced=list(result.get("files_produced") or []),
             status=result.get("status", "unknown"),
             execution_id=result.get("execution_id"),
             raw_chat_id=ts,

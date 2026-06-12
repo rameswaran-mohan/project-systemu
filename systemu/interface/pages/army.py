@@ -234,10 +234,13 @@ def build_army_page() -> None:
     state = AppState.get()
     vault = state.vault
 
+    from systemu.interface.design.glossary import lore_sublabel
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("Shadows").style(
-            f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
-        )
+        with ui.column().classes("q-gutter-none"):
+            ui.label("Shadows").style(
+                f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
+            )
+            ui.label(lore_sublabel("shadows")).classes("s-muted")
         with ui.row().style("gap: 8px; align-items: center;"):
             # Phase 5 Slice 4d-2: consolidation belongs to Shadows (IA §5).
             # The surface still lives at _memory_consolidation_route(); this

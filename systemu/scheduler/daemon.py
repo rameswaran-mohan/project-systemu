@@ -405,6 +405,29 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     except Exception:
         logger.exception("[Daemon] v0.8.22.1: resume-on-decision registration failed — continuing boot")
 
+    # W10.1: Telegram reach — the gateway + EventBus pusher shipped complete
+    # in v0.8.x and were started by NOTHING. With the bot token + allowlist
+    # env set, needs-you items and task outcomes now reach the operator's
+    # phone, and /status answers from there. Best-effort: boot never fails
+    # on messaging.
+    try:
+        from systemu.messaging.telegram_gateway import build_from_env as _tg_build
+        from systemu.messaging.handlers import build_status_handler, default_handlers
+        from systemu.messaging.event_pusher import EventPusher
+        from systemu.interface.event_bus import EventBus
+        _tg_handlers = {**default_handlers(),
+                        "status": build_status_handler(vault)}
+        _tg_gateway = _tg_build(command_handlers=_tg_handlers)
+        if _tg_gateway is not None:
+            _tg_gateway.start()
+            _tg_pusher = EventPusher(_tg_gateway)
+            _tg_pusher.subscribe(EventBus.get())
+            logger.info("[Daemon] Telegram gateway + event pusher started")
+        else:
+            logger.info("[Daemon] Telegram not configured — messaging dormant")
+    except Exception:
+        logger.exception("[Daemon] messaging startup failed — continuing boot")
+
     # Build scheduler
     scheduler = BackgroundScheduler()
     scheduler.add_job(

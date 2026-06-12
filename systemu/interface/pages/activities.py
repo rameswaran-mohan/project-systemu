@@ -36,10 +36,13 @@ def build_activities_page() -> None:
     vault = state.vault
 
     # ── Header ────────────────────────────────────────────────────────────────
+    from systemu.interface.design.glossary import lore_sublabel
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("Activities").style(
-            f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
-        )
+        with ui.column().classes("q-gutter-none"):
+            ui.label("Activities").style(
+                f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
+            )
+            ui.label(lore_sublabel("activities")).classes("s-muted")
 
     # ── Search + status filter (shared helper — board 5a) ──────────────────────
     from systemu.interface.components.list_filter import filter_rows, select_options

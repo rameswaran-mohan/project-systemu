@@ -70,6 +70,32 @@ def handle_chat(cmd: InboundCommand) -> str:
         return f"Sorry — /chat failed: {exc}"
 
 
+def build_status_handler(vault) -> Callable[[InboundCommand], str]:
+    """W10.1 — vault-scoped /status: pending-attention count (gates AND
+    asks, the W5.1 accounting) + recent tasks with outcomes. Richer than the
+    queue-only handle_status and testable without AppState. Never raises —
+    the gateway must always be able to reply."""
+    def _status(_cmd) -> str:
+        try:
+            from systemu.interface.components.attention import needs_you_total
+            from systemu.interface.components.status_menu import build_status_rows
+            pending = needs_you_total(vault)
+            rows = build_status_rows(vault, limit=5)
+            lines = [f"Needs you: {pending} item(s) pending."]
+            if rows:
+                lines.append("Recent tasks:")
+                for row in rows:
+                    lines.append(f"• [{row['status']}] {row['name']}")
+            else:
+                lines.append("No tasks yet.")
+            lines.append("Act on items from the dashboard Inbox.")
+            return "\n".join(lines)
+        except Exception:
+            logger.debug("[Handler] vault /status failed", exc_info=True)
+            return "Status unavailable right now — check the dashboard."
+    return _status
+
+
 def handle_status(_: InboundCommand) -> str:
     try:
         state = _state()
