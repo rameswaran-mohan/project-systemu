@@ -643,6 +643,16 @@ class SqliteVault:
         # data_dir is the parent of memory_dir — used by notifications.py for event_log.jsonl
         self.data_dir: Path = self._memory_dir.parent
 
+        # W12 (docker A6 audit): `.root` is the contract every file-side
+        # consumer relies on (user profile + facts, vault migrator, episodic
+        # paths). SqliteVault never exposed it, so on sqlite/postgres
+        # backends the migrator crashed (caught) and the user-profile layer
+        # silently broke — with the W11.4 gate that would LOCK docker-mode
+        # installs at /welcome (the FOURTH occurrence of the wrapper-drift
+        # class). The memory dir is the on-disk home for those artifacts on
+        # SQL backends.
+        self.root: Path = self._memory_dir
+
         connect_args: dict = {}
         is_sqlite = database_url.startswith("sqlite")
         if is_sqlite:
@@ -1021,6 +1031,33 @@ class SqliteVault:
             if row is None:
                 raise KeyError(f"decision {decision_id} not found")
             return _row_to_decision(row)
+
+    # ── User profile + facts (v0.9.0 Layer 1) ────────────────────────────────
+    #
+    # W12 (docker A6 audit): the quartet was never present here — the SAME
+    # wrapper-drift class as FileVault/ParallelVault (fixed earlier this
+    # wave). The profile layer is file-side by design; it lives under
+    # ``self.root`` (the memory dir) on SQL backends.
+
+    def get_user_profile(self):
+        from systemu.runtime.user_profile import get_profile
+        return get_profile(self)
+
+    def save_user_profile(self, profile) -> None:
+        from systemu.runtime.user_profile import save_profile
+        save_profile(self, profile)
+
+    def load_user_facts(self, *, tags=None, include_superseded: bool = False,
+                        recent=None):
+        from systemu.runtime.user_profile import get_facts
+        return get_facts(self, tags=tags,
+                         include_superseded=include_superseded, recent=recent)
+
+    def append_user_fact(self, *, fact: str, source: str, tags=None,
+                         source_ref=None, confidence: float = 1.0):
+        from systemu.runtime.user_profile import add_fact
+        return add_fact(self, fact, source=source, tags=tags,
+                        source_ref=source_ref, confidence=confidence)
 
     # ── v0.6.8-a: recovery-engine duck-typed finders ─────────────────────────
     # The RecoveryEngine (systemu/recovery/engine.py) needs lightweight

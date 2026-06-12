@@ -178,4 +178,15 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
 
     # UI-thread timer is the SOLE driver of refresh (slot-error tolerant),
     # mirroring live_runs_pane — the queue is file-backed so a poll is enough.
-    safe_timer(2.0, _pane.refresh)
+    # W12 (ship-blocker class): change-gated — the unconditional 2s repaint
+    # destroyed and rebuilt the Answer/Approve buttons, silently eating any
+    # click that raced the tick.
+    import json as _json
+
+    from systemu.interface.ui_helpers import gated_refresh
+
+    def _fingerprint():
+        from systemu.interface.components.attention import pending_ask_rows
+        return _json.dumps([_rows(), pending_ask_rows(vault)], default=str)
+
+    safe_timer(2.0, gated_refresh(_fingerprint, _pane.refresh))

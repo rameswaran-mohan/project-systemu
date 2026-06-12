@@ -128,7 +128,7 @@ def prompt_password(question: str, default_random: bool = True) -> str:
 def check_python_version() -> None:
     if sys.version_info < (3, 10):
         error(f"Python 3.10+ required (you have {sys.version_info.major}.{sys.version_info.minor})")
-        # OS-specific upgrade hint.  Debian 11 (still common on
+        # v0.6.3-a: OS-specific upgrade hint.  Debian 11 (still common on
         # bare-metal servers) ships 3.9 by default — users hit the version
         # check and stall without knowing how to upgrade.
         print()
@@ -160,7 +160,7 @@ def check_command(cmd: str, friendly: Optional[str] = None) -> bool:
 
 
 def check_linux_capture_deps() -> list[str]:
-    """return list of missing Linux capture deps (xdotool, xclip).
+    """v0.6.2: return list of missing Linux capture deps (xdotool, xclip).
 
     Returns empty list on non-Linux platforms or when all deps are present.
     Used by setup_local() to print apt-install hint to the operator.
@@ -179,7 +179,7 @@ def check_linux_capture_deps() -> list[str]:
 
 
 def playwright_install_args() -> list[str]:
-    """return platform-appropriate args for `python -m playwright ...`.
+    """v0.6.2: return platform-appropriate args for `python -m playwright ...`.
 
     Linux gets --with-deps so playwright pulls Chromium's OS libraries
     (libnss3, libatk1.0-0, etc.) via apt.  Without --with-deps the browser
@@ -195,7 +195,7 @@ def playwright_install_args() -> list[str]:
 
 
 def detect_proxy_config() -> Dict[str, str]:
-    """read HTTP_PROXY / HTTPS_PROXY env vars (lowercase variants too).
+    """v0.6.3-b: read HTTP_PROXY / HTTPS_PROXY env vars (lowercase variants too).
 
     Returns a dict like ``{"http": "...", "https": "..."}`` suitable for
     passing to urllib.request via ProxyHandler.  Empty dict when no proxy
@@ -233,7 +233,7 @@ def _mask_proxy_url(url: str) -> str:
 
 
 def validate_openrouter_key(key: str, *, proxies: Dict[str, str]) -> tuple[bool, str]:
-    """probe OpenRouter to confirm the API key works.
+    """v0.6.3-c: probe OpenRouter to confirm the API key works.
 
     Returns ``(True, "")`` on success; ``(False, "<reason>")`` otherwise.
 
@@ -275,7 +275,7 @@ def validate_openrouter_key(key: str, *, proxies: Dict[str, str]) -> tuple[bool,
 def _resolve_outputs_host_dir() -> Path:
     """Pick an absolute host path for the outputs volume.
 
-    on Docker Desktop Windows, default to ~/SystemuOutputs.  The user
+    v0.6.9: on Docker Desktop Windows, default to ~/SystemuOutputs.  The user
     home is auto-shared by Docker Desktop on Windows, so the bind propagates
     without additional File-sharing config.  On Linux/macOS, project-relative
     ./outputs is fine because the Docker daemon shares the project dir by
@@ -293,7 +293,7 @@ def _resolve_outputs_host_dir() -> Path:
 
 
 def _run_bind_smoke_test(host_outputs_dir: Path) -> tuple[bool, str]:
-    """After docker compose up, write a probe file from inside a
+    """v0.6.9: After docker compose up, write a probe file from inside a
     throwaway container and check it appears on the host filesystem.
 
     Returns (success, message). When success is False, the message contains
@@ -345,7 +345,7 @@ def _run_bind_smoke_test(host_outputs_dir: Path) -> tuple[bool, str]:
 
 
 def is_apple_silicon() -> bool:
-    """True when running on Apple Silicon (M1/M2/M3/M4 Mac).
+    """v0.6.4-c: True when running on Apple Silicon (M1/M2/M3/M4 Mac).
 
     Used to surface a "less-tested codepath" banner during install — most
     of systemu has been validated on Intel Mac + Linux x86_64 + Windows
@@ -357,7 +357,7 @@ def is_apple_silicon() -> bool:
 
 
 def print_apple_silicon_banner() -> None:
-    """info banner when running install on Apple Silicon.
+    """v0.6.4-c: info banner when running install on Apple Silicon.
 
     Non-blocking — just lets the operator know they're on a less-tested
     codepath and where to look if something breaks.
@@ -380,7 +380,7 @@ def print_apple_silicon_banner() -> None:
 
 
 def print_macos_permissions_guide() -> None:
-    """macOS — print the System Settings paths needed for capture.
+    """v0.6.3-d: macOS — print the System Settings paths needed for capture.
 
     pynput's keyboard/clipboard hooks require Accessibility.  Screen capture
     in sharing_on requires Screen Recording.  Both are silent no-ops without
@@ -415,7 +415,7 @@ def print_macos_permissions_guide() -> None:
 
 
 def check_linux_pyatspi() -> bool:
-    """probe whether AT-SPI Python bindings are importable.
+    """v0.6.4-b: probe whether AT-SPI Python bindings are importable.
 
     Returns True on non-Linux platforms (not applicable) or when the
     ``pyatspi`` module can be located via importlib.  Returns False with
@@ -445,7 +445,7 @@ def check_linux_pyatspi() -> bool:
 
 
 def detect_wayland_session() -> bool:
-    """return True when running on Linux Wayland (capture broken).
+    """v0.6.2: return True when running on Linux Wayland (capture broken).
 
     pynput requires X11.  Ubuntu 22.04+ and Fedora Workstation default to
     Wayland — on those sessions, sharing_on capture records empty event
@@ -492,18 +492,18 @@ def render_env(values: Dict[str, str]) -> str:
     return "\n".join(out) + "\n"
 
 
-# registry of env vars that were renamed in prior releases.
+# v0.6.2: registry of env vars that were renamed in prior releases.
 # Keep entries here for at least one minor release after the rename so
 # operators upgrading via `git pull` see a clear migration message.
 _RENAMED_ENV_VARS: Dict[str, str] = {
-    # SYSTEMU_AUTO_APPROVE_SCROLLS lied about scope (cascaded to
+    # v0.6.1-b: SYSTEMU_AUTO_APPROVE_SCROLLS lied about scope (cascaded to
     # every notify_user prompt).  Renamed to SYSTEMU_NON_INTERACTIVE.
     "SYSTEMU_AUTO_APPROVE_SCROLLS": "SYSTEMU_NON_INTERACTIVE",
 }
 
 
 def detect_stale_env_vars() -> Dict[str, str]:
-    """return {old_name: new_name} for any renamed env vars
+    """v0.6.2: return {old_name: new_name} for any renamed env vars
     present in the operator's .env but for which the new name is NOT
     also present.
 
@@ -563,7 +563,7 @@ def merge_existing_env(values_or_path, new_vars: Optional[Dict[str, str]] = None
             raw = raw[1:-1]
         existing[key] = raw
 
-    # auto-migrate deprecated env keys so the operator's .env
+    # v0.6.9: auto-migrate deprecated env keys so the operator's .env
     # converges on the canonical names.  Don't overwrite explicit values
     # of the new key.
     DEPRECATED_RENAMES = {
@@ -638,7 +638,7 @@ def scan_tool_deps(implementations_dir):
 
 
 def bake_tool_deps(args: argparse.Namespace) -> None:
-    """scan tools/implementations for `# deps:` comments, prompt the
+    """v0.6.8-d: scan tools/implementations for `# deps:` comments, prompt the
     operator (or auto-approve via --approve-tool-deps), and write the resulting
     union to tools/requirements-tools.txt.  Docker builds COPY this file and
     pip-install it into the runtime image.  No-op if no deps are declared."""
@@ -672,21 +672,21 @@ def setup_local(args: argparse.Namespace) -> None:
     header("Local install — native venv + SQLite + Huey-SQLite broker")
     check_python_version()
 
-    # echo detected proxy so user sees their corp firewall config
+    # v0.6.3-b: echo detected proxy so user sees their corp firewall config
     # was honored.  pip + Playwright auto-read the env vars themselves;
     # this is purely informational.
     for scheme, url in detect_proxy_config().items():
         info(f"Detected {scheme.upper()}_PROXY: {_mask_proxy_url(url)}")
 
-    # macOS-only — print Accessibility + Screen Recording guidance.
+    # v0.6.3-d: macOS-only — print Accessibility + Screen Recording guidance.
     # No-op on Linux / Windows.  Docker modes skip this (host perms don't
     # apply to containers).
     print_macos_permissions_guide()
 
-    # macOS-only — info banner when running on ARM64 (M-series).
+    # v0.6.4-c: macOS-only — info banner when running on ARM64 (M-series).
     print_apple_silicon_banner()
 
-    # Linux capture-deps check — non-blocking warning.
+    # v0.6.2: Linux capture-deps check — non-blocking warning.
     missing = check_linux_capture_deps()
     if missing:
         warn(
@@ -698,7 +698,7 @@ def setup_local(args: argparse.Namespace) -> None:
             f"   sudo dnf install {' '.join(missing)}      # Fedora"
         )
 
-    # Linux UI introspection bindings check — non-blocking warning.
+    # v0.6.4-b: Linux UI introspection bindings check — non-blocking warning.
     check_linux_pyatspi()
 
     if detect_wayland_session():
@@ -710,7 +710,7 @@ def setup_local(args: argparse.Namespace) -> None:
             "log back in selecting an X11/Xorg session at the login screen."
         )
 
-    # warn on stale env vars (renamed in a prior release).
+    # v0.6.2: warn on stale env vars (renamed in a prior release).
     stale = detect_stale_env_vars()
     for old, new in stale.items():
         warn(
@@ -762,6 +762,7 @@ def setup_local(args: argparse.Namespace) -> None:
                  "instead.  Crash safety degrades until this is resolved.")
 
     api_keys = collect_api_keys(args)
+    api_keys.update(collect_setup_prefs(args))
     write_env({
         "SYSTEMU_MODE": "local",
         **api_keys,
@@ -771,7 +772,7 @@ def setup_local(args: argparse.Namespace) -> None:
         "SYSTEMU_QUEUE_BROKER": "sqlite",
         "SYSTEMU_VAULT_DIR": "systemu/vault",
         "HUEY_WORKERS": "4",
-        # local mode keeps the v0.6.7 auto-install behaviour
+        # v0.6.8-e: local mode keeps the v0.6.7 auto-install behaviour
         # (PROMPT-mode gated by the operator allow-list).
         "SYSTEMU_TOOL_DEP_INSTALL_MODE": "auto",
     })
@@ -787,11 +788,11 @@ def setup_local(args: argparse.Namespace) -> None:
 def setup_docker_local(args: argparse.Namespace) -> None:
     header("docker-local install — Postgres vault + Huey-SQLite broker")
 
-    # echo proxy detection for docker builds too.
+    # v0.6.3-b: echo proxy detection for docker builds too.
     for scheme, url in detect_proxy_config().items():
         info(f"Detected {scheme.upper()}_PROXY: {_mask_proxy_url(url)}")
 
-    # warn on stale env vars (renamed in a prior release).
+    # v0.6.2: warn on stale env vars (renamed in a prior release).
     stale = detect_stale_env_vars()
     for old, new in stale.items():
         warn(
@@ -808,6 +809,7 @@ def setup_docker_local(args: argparse.Namespace) -> None:
 
     pg_password = args.pg_password or prompt_password("Postgres password")
     api_keys = collect_api_keys(args)
+    api_keys.update(collect_setup_prefs(args))
 
     write_env({
         "SYSTEMU_MODE": "docker-local",
@@ -821,17 +823,17 @@ def setup_docker_local(args: argparse.Namespace) -> None:
         "SYSTEMU_QUEUE_BROKER": "sqlite",
         "SYSTEMU_VAULT_DIR": "/app/systemu/vault",
         "HUEY_WORKERS": str(args.huey_workers),
-        # expose Postgres on the host so `sharing_on record`
+        # v0.6.6-a: expose Postgres on the host so `sharing_on record`
         # running on the host can reach the container's vault.  Loopback-only
         # by default — matches the dashboard's existing 127.0.0.1:8765
         # security boundary.  Operators on shared hosts can opt out by
         # editing this line in .env (set to empty + add an override file).
         "SYSTEMU_DB_BIND": "127.0.0.1:5432",
-        # absolute host path for the outputs bind mount.  Docker
+        # v0.6.8-f: absolute host path for the outputs bind mount.  Docker
         # Desktop on Windows silently degrades a relative ``./outputs`` to a
         # named volume — the .docx files end up invisible on the host.
         "SYSTEMU_HOST_OUTPUTS_DIR": str(_resolve_outputs_host_dir()),
-        # docker-* modes use allow-list — runtime installs go
+        # v0.6.8-e: docker-* modes use allow-list — runtime installs go
         # through approve_and_install() which writes to tool_dep_approvals
         # and rebuilds the image baked-deps requirements.
         "SYSTEMU_TOOL_DEP_INSTALL_MODE": "allow-list",
@@ -849,7 +851,7 @@ def setup_docker_local(args: argparse.Namespace) -> None:
     print(f"   Start with:  {bold('./start.sh' if sys.platform != 'win32' else 'start.bat')}")
     print(f"   Stop with:   {bold('./stop.sh'  if sys.platform != 'win32' else 'stop.bat')}")
 
-    # probe the bind mount before declaring install complete.
+    # v0.6.9: probe the bind mount before declaring install complete.
     if not getattr(args, "skip_bind_check", False) and not getattr(args, "skip_pull", False):
         host_outputs = _resolve_outputs_host_dir()
         ok, msg = _run_bind_smoke_test(host_outputs)
@@ -862,11 +864,11 @@ def setup_docker_local(args: argparse.Namespace) -> None:
 def setup_docker_enterprise(args: argparse.Namespace) -> None:
     header("docker-enterprise install — Postgres + Redis + scaled workers")
 
-    # echo proxy detection for docker builds too.
+    # v0.6.3-b: echo proxy detection for docker builds too.
     for scheme, url in detect_proxy_config().items():
         info(f"Detected {scheme.upper()}_PROXY: {_mask_proxy_url(url)}")
 
-    # warn on stale env vars (renamed in a prior release).
+    # v0.6.2: warn on stale env vars (renamed in a prior release).
     stale = detect_stale_env_vars()
     for old, new in stale.items():
         warn(
@@ -892,6 +894,7 @@ def setup_docker_enterprise(args: argparse.Namespace) -> None:
         except ValueError:
             replicas = 2
     api_keys = collect_api_keys(args)
+    api_keys.update(collect_setup_prefs(args))
 
     if redis_password:
         redis_url = f"redis://:{redis_password}@redis:6379/0"
@@ -916,15 +919,15 @@ def setup_docker_enterprise(args: argparse.Namespace) -> None:
         "SYSTEMU_VAULT_DIR": "/app/systemu/vault",
         "HUEY_WORKERS": str(args.huey_workers),
         "WORKER_REPLICAS": str(replicas),
-        # enterprise mode does NOT publish Postgres by default —
+        # v0.6.6-a: enterprise mode does NOT publish Postgres by default —
         # production deployments should keep the DB on the docker-internal
         # network only.  The enterprise `postgres` service has no `ports:`
         # section, so this variable has no effect in enterprise.  Set in
         # .env for parity / documentation purposes.
         "SYSTEMU_DB_BIND": "",
-        # see docker-local above — same rationale.
+        # v0.6.8-f: see docker-local above — same rationale.
         "SYSTEMU_HOST_OUTPUTS_DIR": str(_resolve_outputs_host_dir()),
-        # docker-* modes use allow-list (see docker-local above).
+        # v0.6.8-e: docker-* modes use allow-list (see docker-local above).
         "SYSTEMU_TOOL_DEP_INSTALL_MODE": "allow-list",
     })
     write_mode_marker("docker-enterprise")
@@ -941,7 +944,7 @@ def setup_docker_enterprise(args: argparse.Namespace) -> None:
     print(f"   Stop with:   {bold('./stop.sh'  if sys.platform != 'win32' else 'stop.bat')}")
     print(f"   Workers:     {replicas} replica(s) × {args.huey_workers} threads each")
 
-    # probe the bind mount before declaring install complete.
+    # v0.6.9: probe the bind mount before declaring install complete.
     if not getattr(args, "skip_bind_check", False) and not getattr(args, "skip_pull", False):
         host_outputs = _resolve_outputs_host_dir()
         ok, msg = _run_bind_smoke_test(host_outputs)
@@ -954,7 +957,7 @@ def setup_docker_enterprise(args: argparse.Namespace) -> None:
 def collect_api_keys(args: argparse.Namespace) -> Dict[str, str]:
     """Prompt for API keys (skipped when --non-interactive and keys are unset).
 
-    in interactive mode, the OpenRouter key is probe-validated
+    v0.6.3-c: in interactive mode, the OpenRouter key is probe-validated
     against /api/v1/models.  On 401 the operator gets re-prompted (up to 3
     attempts).  On connection error we warn and proceed — user may be
     air-gapped or behind a strict proxy that blocks outbound during install.
@@ -967,29 +970,47 @@ def collect_api_keys(args: argparse.Namespace) -> Dict[str, str]:
             out["GOOGLE_API_KEY"] = args.google_key
         return out
     print()
-    info("API keys — leave blank to fill in later by editing .env")
+    info("API keys — systemu needs an OpenRouter key to think "
+         "(get one at https://openrouter.ai/keys).")
 
     proxies = detect_proxy_config()
-    attempts_left = 3
-    while attempts_left > 0:
+    invalid_attempts_left = 3
+    blank_attempts = 0
+    while True:
         key = prompt("OpenRouter API key", default="")
         if not key:
-            info("Skipping OpenRouter validation (blank key).")
-            out["OPENROUTER_API_KEY"] = ""
-            break
+            # W11.3: a blank key is no longer a silent shrug — setup is
+            # enforced at install time. --no-key keeps an explicit
+            # air-gapped/CI escape hatch.
+            if getattr(args, "no_key", False):
+                info("--no-key: leaving OPENROUTER_API_KEY blank in .env.")
+                out["OPENROUTER_API_KEY"] = ""
+                break
+            blank_attempts += 1
+            if blank_attempts >= 3:
+                warn("Proceeding WITHOUT a key — systemu cannot run tasks "
+                     "until OPENROUTER_API_KEY is set in .env, and the "
+                     "dashboard will require it at first launch.")
+                out["OPENROUTER_API_KEY"] = ""
+                break
+            warn("A key is required for systemu to work. Get one at "
+                 "https://openrouter.ai/keys — or re-run with --no-key for "
+                 "an air-gapped install.")
+            continue
         info("Validating OpenRouter key …")
         ok, msg = validate_openrouter_key(key, proxies=proxies)
         if ok:
             success("OpenRouter key is valid.")
             out["OPENROUTER_API_KEY"] = key
             break
-        attempts_left -= 1
+        invalid_attempts_left -= 1
         if "401" in msg:
-            if attempts_left > 0:
-                warn(f"{msg}.  {attempts_left} attempt(s) left.")
+            if invalid_attempts_left > 0:
+                warn(f"{msg}.  {invalid_attempts_left} attempt(s) left.")
                 continue
             warn(f"{msg}.  Storing the rejected key anyway — fix it in .env later.")
             out["OPENROUTER_API_KEY"] = key
+            break
         else:
             # Network / proxy issue — don't loop; let install continue.
             warn(f"{msg}.  Storing the key as-is (validation skipped).")
@@ -997,6 +1018,44 @@ def collect_api_keys(args: argparse.Namespace) -> Dict[str, str]:
             break
 
     out["GOOGLE_API_KEY"] = prompt("Google AI Studio key", default="")
+    return out
+
+
+def collect_setup_prefs(args: argparse.Namespace) -> Dict[str, str]:
+    """W11.3: the 'very important settings' asked at install time.
+
+    Model preset + output folder — written to .env so the dashboard starts
+    correctly configured instead of silently falling back to budget-class
+    defaults and ~/Documents. Skipped under --non-interactive (CI installs
+    keep explicit flags/env as their contract); choosing 'later' keeps
+    today's defaults byte-for-byte.
+    """
+    out: Dict[str, str] = {}
+    if args.non_interactive:
+        return out
+    print()
+    info("Model preset — which brain should systemu use? (changeable any time in Settings)")
+    preset = prompt_choice(
+        "Preset",
+        [
+            ("balanced", "Balanced — strong reasoning at sensible cost (recommended)"),
+            ("quality",  "Quality — the best models, highest cost"),
+            ("budget",   "Budget — cheapest/free models (reduced quality)"),
+            ("later",    "Decide later — keep current defaults"),
+        ],
+        default_idx=0,
+    )
+    if preset != "later":
+        out["SYSTEMU_MODEL_PRESET"] = preset
+
+    default_out = str(Path.home() / "Documents" / "systemu-output")
+    folder = prompt("Output folder (where produced files land)", default=default_out)
+    try:
+        Path(folder).expanduser().mkdir(parents=True, exist_ok=True)
+        success(f"Output folder ready: {folder}")
+    except Exception as exc:
+        warn(f"Could not create {folder}: {exc} — set SYSTEMU_OUTPUT_DIR later.")
+    out["SYSTEMU_OUTPUT_DIR"] = folder
     return out
 
 
@@ -1019,6 +1078,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Threads per worker process / container (default 4).")
     p.add_argument("--openrouter-key", help="Pass OPENROUTER_API_KEY non-interactively.")
     p.add_argument("--google-key", help="Pass GOOGLE_API_KEY non-interactively.")
+    p.add_argument("--no-key", action="store_true",
+                   help="W11.3: skip the (otherwise required) OpenRouter key "
+                        "prompt — air-gapped installs fill .env later.")
     p.add_argument("--skip-playwright", action="store_true",
                    help="Skip Playwright Chromium install (local only).")
     p.add_argument("--skip-pull", action="store_true",

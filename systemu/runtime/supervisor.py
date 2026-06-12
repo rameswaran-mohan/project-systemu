@@ -162,7 +162,25 @@ def _resolve_max_concurrent() -> int:
         return MAX_CONCURRENT_SHADOWS
     return value if value >= 1 else MAX_CONCURRENT_SHADOWS
 MAX_RETRIES             = 2      # how many times to retry a failed activity
-STUCK_THRESHOLD_S       = 300    # [FIX-2] raised from 180s — LLM calls can take 130s each
+
+
+def _resolve_stuck_threshold() -> int:
+    """W12 (audit F10): the no-heartbeat cancel window, env-tunable.
+
+    Default 300s ([FIX-2] — LLM calls can take 130s each). Slow/preview
+    models can stall one call past that, so operators running them widen
+    the window via ``SYSTEMU_STUCK_THRESHOLD_S`` without forking code.
+    Invalid or <60s values fall back to the default.
+    """
+    import os as _os
+    try:
+        value = int(_os.environ.get("SYSTEMU_STUCK_THRESHOLD_S", "") or 300)
+    except ValueError:
+        return 300
+    return value if value >= 60 else 300
+
+
+STUCK_THRESHOLD_S       = _resolve_stuck_threshold()
 HEARTBEAT_INTERVAL_S    = 20     # how often the watchdog checks
 SLEEP_JUMP_THRESHOLD_S  = HEARTBEAT_INTERVAL_S * 3   # gap > 60s → host likely slept
 QUEUE_PERSIST_FILE      = "supervisor_queue.json"   # inside vault dir

@@ -204,18 +204,24 @@ def build_supervisor_events_pane(
     `ui.timer` is the only thing that calls `_pane.refresh()`.
     """
     from systemu.interface.event_bus import EventBus
+    from systemu.interface.ui_helpers import (
+        RepaintGate, event_ui_key, prune_open_state, stateful_expansion)
 
     # Thread-safe ring buffer (deque.append is atomic under the GIL).
     events: "deque[Dict[str, Any]]" = deque(maxlen=_MAX_EVENTS)
     state = {"show_system": bool(show_system_default)}
 
+    # W11.1: expansion open/closed state, keyed by event_ui_key — restored on
+    # every repaint so an opened row STAYS open. Repaints themselves are
+    # change-gated (an idle pane stops re-rendering entirely).
+    open_state: Dict[int, bool] = {}
+    gate = RepaintGate()
+
     # ── Muted "Show system" toggle ────────────────────────────────────────
     def _on_toggle(e) -> None:
         state["show_system"] = bool(getattr(e, "value", e))
-        try:
-            _pane.refresh()
-        except Exception:
-            pass
+        gate.bump()
+        _tick()  # late-bound closure — defined below, before any toggle fires
 
     switch = ui.switch(
         "Show system", value=show_system_default, on_change=_on_toggle
@@ -250,13 +256,16 @@ def build_supervisor_events_pane(
         level = (ev.get("level") or "INFO").upper()
         tstr = _format_event_time(ev.get("ts"))
         header = (f"{tstr}  " if tstr else "") + f"[{level}] " + str(ev.get("message", ""))[:200]
-        with ui.expansion(header, value=False).classes("w-full").style(
+        with stateful_expansion(
+            header, state_key=event_ui_key(ev), open_state=open_state,
+        ).classes("w-full").style(
             f"font-size: 12px; color: {THEME['text']};"
         ):
             render_event_details_body(ev.get("details") or {})
 
     @ui.refreshable
     def _pane():
+        prune_open_state(open_state, (event_ui_key(e) for e in events))
         visible = [
             e for e in _display_order(events)
             if _passes_origin_filter(e, origins, show_system=state["show_system"])
@@ -276,14 +285,15 @@ def build_supervisor_events_pane(
         _pane()
 
     def _on_event(event: Dict[str, Any]) -> None:
-        # Publish-thread callback: ONLY append. NEVER refresh here (liveness).
+        # Publish-thread callback: ONLY append + mark dirty. NEVER refresh
+        # here (liveness).
         events.append(event)
+        gate.bump()
 
     # Subscribe with replay so the pane shows recent history immediately.
     unsubscribe = EventBus.get().subscribe(_on_event, replay=True)
 
-    # UI-thread timer is the SOLE driver of refresh (cheap; diffing is internal
-    # to the @ui.refreshable).
+    # UI-thread timer is the SOLE driver of refresh.
     #
     # BUG-1 fix: this used to be gated on _should_schedule_refresh(client)
     # (has_socket_connection) — but during the initial page BUILD the websocket
@@ -291,7 +301,14 @@ def build_supervisor_events_pane(
     # showed only the replay until a manual page refresh. The gate belongs to
     # POST-RUN refreshes (its v0.8.11 origin), not build-time scheduling.
     # safe_timer tolerates post-disposal ticks, and we cancel on disconnect.
+    #
+    # W11.1: the tick repaints ONLY when the gate is dirty — an unconditional
+    # 0.5 s refresh destroyed and rebuilt every expansion collapsed, so the
+    # expand arrow could never stay open (a fresh gate paints its first tick,
+    # so the replayed history still shows immediately).
     def _tick() -> None:
+        if not gate.should_paint():
+            return
         try:
             _pane.refresh()
         except Exception:

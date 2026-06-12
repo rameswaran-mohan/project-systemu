@@ -53,7 +53,7 @@ class TestInstallerPublishesApprovalCard:
     def test_blocked_pending_publishes_approval_event(self, tmp_path, bus_capture):
         store = DepApprovalStore(tmp_path / "approvals.json")
         r = di.ensure_satisfied(
-            ["python-docx"],
+            ["fake-docx-dep"],
             mode=di.InstallMode.PROMPT,
             approvals=store,
             tool_name="create_word_doc",
@@ -63,17 +63,17 @@ class TestInstallerPublishesApprovalCard:
         approval_events = [e for e in bus_capture if e.get("category") == "approval"]
         assert len(approval_events) == 1
         ctx = approval_events[0]["context"]
-        assert ctx["package"]      == "python-docx"
+        assert ctx["package"]      == "fake-docx-dep"
         assert ctx["tool_name"]    == "create_word_doc"
         assert ctx["redirect_to"]  == "/tools"
-        assert ctx["dedup_key"]    == "dep-install:python-docx"
+        assert ctx["dedup_key"]    == "dep-install:fake-docx-dep"
 
     def test_repeated_blocks_dedupe(self, tmp_path, bus_capture):
         store = DepApprovalStore(tmp_path / "approvals.json")
         # Hit the same missing dep three times (simulating three shadows).
         for _ in range(3):
             di.ensure_satisfied(
-                ["python-docx"],
+                ["fake-docx-dep"],
                 mode=di.InstallMode.PROMPT,
                 approvals=store,
                 tool_name="create_word_doc",
@@ -87,7 +87,7 @@ class TestInstallerPublishesApprovalCard:
         # Simulate request_count climbing by hitting the same dep many times.
         for _ in range(6):
             di.ensure_satisfied(
-                ["python-docx"],
+                ["fake-docx-dep"],
                 mode=di.InstallMode.PROMPT,
                 approvals=store,
                 tool_name="create_word_doc",
@@ -104,15 +104,15 @@ class TestStoreReReadsOnEveryCheck:
     def test_separate_process_write_visible(self, tmp_path):
         path = tmp_path / "approvals.json"
         s_reader = DepApprovalStore(path)
-        assert not s_reader.is_approved("python-docx")
+        assert not s_reader.is_approved("fake-docx-dep")
 
         # Simulate a *separate process* (CLI / dashboard) approving.
         s_writer = DepApprovalStore(path)
-        s_writer.approve("python-docx")
+        s_writer.approve("fake-docx-dep")
 
         # The reader instance is the same Python object as before but
         # MUST now see the approval — that's the v0.3.6 contract.
-        assert s_reader.is_approved("python-docx")
+        assert s_reader.is_approved("fake-docx-dep")
 
     def test_revoke_visible_to_reader(self, tmp_path):
         path = tmp_path / "approvals.json"
@@ -130,13 +130,13 @@ class TestStoreReReadsOnEveryCheck:
 class TestApproveAndRevokePublishDismissal:
     def test_approve_publishes_dismissed(self, tmp_path, bus_capture):
         s = DepApprovalStore(tmp_path / "approvals.json")
-        s.approve("python-docx")
+        s.approve("fake-docx-dep")
         dismissals = [e for e in bus_capture if e.get("category") == "approval_dismissed"]
         assert len(dismissals) == 1
         ctx = dismissals[0]["context"]
-        assert ctx["package"]   == "python-docx"
+        assert ctx["package"]   == "fake-docx-dep"
         assert ctx["outcome"]   == "approved"
-        assert ctx["dedup_key"] == "dep-install:python-docx"
+        assert ctx["dedup_key"] == "dep-install:fake-docx-dep"
 
     def test_revoke_publishes_dismissed(self, tmp_path, bus_capture):
         s = DepApprovalStore(tmp_path / "approvals.json")
@@ -174,23 +174,23 @@ class TestEndToEndUnblock:
 
         # 1. First attempt: blocked pending approval, no install.
         r1 = di.ensure_satisfied(
-            ["python-docx"], mode=di.InstallMode.PROMPT,
+            ["fake-docx-dep"], mode=di.InstallMode.PROMPT,
             approvals=store, tool_name="create_word_doc",
         )
         assert r1.status is di.InstallStatus.BLOCKED_PENDING_APPROVAL
         assert installs == []
 
         # 2. Operator approves (separate process semantics).
-        DepApprovalStore(tmp_path / "approvals.json").approve("python-docx")
+        DepApprovalStore(tmp_path / "approvals.json").approve("fake-docx-dep")
 
         # 3. Same store, second attempt — re-reads file and installs.
         r2 = di.ensure_satisfied(
-            ["python-docx"], mode=di.InstallMode.PROMPT,
+            ["fake-docx-dep"], mode=di.InstallMode.PROMPT,
             approvals=store, tool_name="create_word_doc",
         )
         assert r2.ok
         assert r2.status is di.InstallStatus.INSTALLED
-        assert installs == [["python-docx"]]
+        assert installs == [["fake-docx-dep"]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

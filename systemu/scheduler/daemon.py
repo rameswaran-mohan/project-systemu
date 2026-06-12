@@ -397,6 +397,31 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # pattern — best-effort; daemon boots even on migrator failure.
     _v0822_run_vault_migrator(vault, logger_=logger)
 
+    # W12 (ship-blocker, audit-caught live): under the daemon there IS a
+    # decision queue and a dashboard — operator asks must route there, not
+    # silently auto-skip headless. Without this, the first recorded
+    # workflow's "New Shadow Recommended" ask auto-skipped and the pipeline
+    # dead-ended at an unassigned activity on EVERY default install.
+    # setdefault: an operator's explicit SYSTEMU_DECISION_QUEUE=false wins.
+    os.environ.setdefault("SYSTEMU_DECISION_QUEUE", "true")
+
+    # W11.3: ensure the install is actually set up — auto-fix what's safe
+    # (directories), log loudly what the operator still has to do. Boot never
+    # fails on this.
+    try:
+        from systemu.runtime.first_run import auto_setup, setup_status
+        for _fix in auto_setup(config, vault):
+            logger.info("[FirstRun] %s", _fix)
+        _missing = [c for c in setup_status(config, vault)
+                    if c["required"] and not c["ok"]]
+        if _missing:
+            logger.warning(
+                "[FirstRun] setup incomplete — the dashboard will walk the "
+                "operator through it: %s",
+                ", ".join(c["id"] for c in _missing))
+    except Exception:
+        logger.exception("[Daemon] first-run check failed — continuing boot")
+
     # v0.8.22.1 (R5): resume chat tasks when their stuck-loop decision is resolved.
     try:
         from systemu.runtime.resume_on_decision import register as _register_resume

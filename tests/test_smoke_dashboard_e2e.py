@@ -106,6 +106,10 @@ def dashboard(tmp_path_factory):
         "SYSTEMU_VAULT_DIR": str(vault_dir),
         "SYSTEMU_STORAGE": "file",
         "SYSTEMU_NON_INTERACTIVE": "true",
+        # W11.4: the smoke vault is fresh (no profile) — without the escape
+        # hatch every route would funnel to /welcome and the populated-surface
+        # checks below would test the wizard instead of the app.
+        "SYSTEMU_SKIP_ONBOARDING": "1",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
     })

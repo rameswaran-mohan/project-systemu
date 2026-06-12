@@ -229,3 +229,23 @@ class FileVault:
 
     def search_session_summaries(self, query: str, **kwargs):
         return self._v.search_session_summaries(query, **kwargs)
+
+    # ── User profile + facts (v0.9.0 Layer 1) ────────────────────────────────
+    #
+    # W12 ship-readiness audit: SAME wrapper-drift class again — the quartet
+    # was added to the inner Vault in v0.9.0 but never proxied, so the
+    # welcome wizard's Finish died with AttributeError on file-backend
+    # installs, and the W11.4 mandatory gate then hard-locked them at
+    # /welcome (the profile it requires could never save).
+
+    def get_user_profile(self):
+        return self._v.get_user_profile()
+
+    def save_user_profile(self, profile) -> None:
+        return self._v.save_user_profile(profile)
+
+    def load_user_facts(self, **kwargs):
+        return self._v.load_user_facts(**kwargs)
+
+    def append_user_fact(self, **kwargs):
+        return self._v.append_user_fact(**kwargs)

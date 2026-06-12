@@ -91,14 +91,58 @@ def build_chat_page(prefill: str = "") -> None:
         f"font-size: 28px; font-weight: 800; color: {THEME['text']}; margin-bottom: 4px;"
     )
     ui.label(
-        "Type a task in plain English. Prefix with /continue to extend the previous task."
-    ).style(f"color: {THEME['text_muted']}; font-size: 14px; margin-bottom: 24px;")
+        "Type a task in plain English — Quick mode answers in seconds."
+    ).style(f"color: {THEME['text_muted']}; font-size: 14px; margin-bottom: 16px;")
 
-    # ── History panel ─────────────────────────────────────────────────────────
-    history_col = ui.column().classes("w-full").style("gap: 10px; margin-bottom: 20px;")
+    # ── Lane control + composer — FIRST (W11.2) ──────────────────────────────
+    # Field report (2026-06-12): with any history the composer sat below the
+    # fold and the operator had to scroll past up to 20 cards to type. The
+    # input is the page's purpose — it renders before the history, autofocused.
+    deployment = os.environ.get("SYSTEMU_MODE", "local").lower()
+    with ui.row().classes("w-full items-center").style("gap: 12px; margin-bottom: 8px;"):
+        ui.label("Mode:").style(
+            f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 600;"
+        )
+        lane = ui.radio(
+            options={
+                "quick":   "Quick answer (seconds)",
+                "run_now": "Workflow — run now",
+                "queue":   "Workflow — queue",
+            },
+            value="quick",
+        ).props("inline dense").style(f"color: {THEME['text']};")
+        ui.label(f"mode: {deployment}").style(
+            f"font-size: 11px; color: {THEME['text_muted']}; margin-left: auto;"
+        )
+
+    with ui.row().classes("w-full items-end").style("gap: 10px;"):
+        prompt_input = ui.textarea(
+            placeholder=(
+                "Type a task, e.g.  take a screenshot of example.com and save to ~/Desktop/\n"
+                "Use /continue to extend the previous task."
+            )
+        ).props("autofocus").style(
+            f"flex: 1; background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+            f"border-radius: 10px; padding: 12px; font-size: 14px; "
+            f"color: {THEME['text']}; resize: vertical; min-height: 80px;"
+        )
+
+        submit_btn = ui.button("▶ Run Task").style(
+            f"background: {THEME['primary']}; color: white; border-radius: 10px; "
+            f"font-weight: 700; padding: 12px 20px; font-size: 14px; align-self: flex-end;"
+        )
+
+    ui.label("Ctrl+Enter to run  ·  /continue extends the previous task").classes(
+        "s-muted"
+    ).style("font-size: 11px; margin-bottom: 4px;")
     status_label = ui.label("").style(
         f"font-size: 13px; color: {THEME['text_muted']}; min-height: 20px;"
     )
+
+    ui.separator().style(f"background: {THEME['border']}; margin: 8px 0;")
+
+    # ── History panel (below the composer; newest first) ─────────────────────
+    history_col = ui.column().classes("w-full").style("gap: 10px; margin-bottom: 20px;")
 
     def _render_history() -> None:
         history_col.clear()
@@ -252,47 +296,6 @@ def build_chat_page(prefill: str = "") -> None:
             pass
     except Exception:
         pass
-
-    ui.separator().style(f"background: {THEME['border']}; margin: 8px 0;")
-
-    # ── Lane control (W8.3): Quick answer by default; the factory pipeline
-    # (workflow run-now / queue) one click away. Quick = the 8.2 bounded
-    # ReAct loop over Gate-3-enabled tools — answers in seconds instead of
-    # minutes of refine→approve→extract→decide meta-work.
-    deployment = os.environ.get("SYSTEMU_MODE", "local").lower()
-    with ui.row().classes("w-full items-center").style("gap: 12px; margin-bottom: 8px;"):
-        ui.label("Mode:").style(
-            f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 600;"
-        )
-        lane = ui.radio(
-            options={
-                "quick":   "Quick answer (seconds)",
-                "run_now": "Workflow — run now",
-                "queue":   "Workflow — queue",
-            },
-            value="quick",
-        ).props("inline dense").style(f"color: {THEME['text']};")
-        ui.label(f"mode: {deployment}").style(
-            f"font-size: 11px; color: {THEME['text_muted']}; margin-left: auto;"
-        )
-
-    # ── Input area ────────────────────────────────────────────────────────────
-    with ui.row().classes("w-full items-end").style("gap: 10px;"):
-        prompt_input = ui.textarea(
-            placeholder=(
-                "Type a task, e.g.  take a screenshot of example.com and save to ~/Desktop/\n"
-                "Use /continue to extend the previous task."
-            )
-        ).style(
-            f"flex: 1; background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
-            f"border-radius: 10px; padding: 12px; font-size: 14px; "
-            f"color: {THEME['text']}; resize: vertical; min-height: 80px;"
-        )
-
-        submit_btn = ui.button("▶ Run Task").style(
-            f"background: {THEME['primary']}; color: white; border-radius: 10px; "
-            f"font-weight: 700; padding: 12px 20px; font-size: 14px; align-self: flex-end;"
-        )
 
     # W10.4: a ?prefill= starter lands in the composer, ready to Run.
     if prefill:

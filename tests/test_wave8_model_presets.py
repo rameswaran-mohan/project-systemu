@@ -15,10 +15,13 @@ import pytest
 from sharing_on.model_presets import PRESETS, is_budget_class, resolve_preset
 
 # Today's shipped defaults — the back-compat contract.
+# W11.7: tier3 was z-ai/glm-4.5-air:free until OpenRouter removed it (404
+# "This model is unavailable" in field telemetry) — a dead default is a bug,
+# not a contract.
 _TODAY = {
     "tier1": "deepseek/deepseek-v4-flash",
     "tier2": "deepseek/deepseek-v4-flash",
-    "tier3": "z-ai/glm-4.5-air:free",
+    "tier3": "deepseek/deepseek-v4-flash",
 }
 
 

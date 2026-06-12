@@ -169,9 +169,30 @@ def run_quick_task(
 
     llm = llm_json or _default_llm_json
     if sandbox is None:
+        from pathlib import Path as _Path
+
+        from systemu.runtime.dep_approvals import init_default_store
+        from systemu.runtime.dependency_installer import resolve_install_mode
         from systemu.runtime.tool_sandbox import ToolSandbox
+
+        # W11.7: the SAME installer policy as the full runtime. This sandbox
+        # used to be constructed without install_mode/approvals — PROMPT mode
+        # with approvals=None fail-closes EVERY dep-declaring tool, so the
+        # default chat lane couldn't run most web tools even when the
+        # packages were installed and previously approved (field RCA
+        # 2026-06-12). The W6 lesson said never fork the execution path;
+        # the construction wiring is part of that path.
+        try:
+            install_mode = resolve_install_mode(
+                config_mode=getattr(config, "tool_dep_install_mode", None),
+                systemu_mode=getattr(config, "systemu_mode", None),
+            )
+            approvals = init_default_store(_Path("data"))
+        except Exception:
+            install_mode, approvals = None, None
         sandbox = ToolSandbox(getattr(vault, "root", None), vault=vault,
-                              config=config)
+                              config=config, install_mode=install_mode,
+                              approvals=approvals)
 
     try:
         system_prompt = load_prompt("quick_task.md")
@@ -295,7 +316,15 @@ def run_quick_task(
             params = _normalize_output_paths(tool_name, params, output_dir)
             history.append({"role": "tool_call", "tool": tool_name,
                             "params": params, "reasoning": reasoning})
-            if mcp_entry is not None:
+            denial = _safety_denied(tool_name, params)
+            if denial is not None:
+                # Counts as a failed call: the same-tool cap + the model's
+                # own adaptation (or ASK_USER) take it from here.
+                from types import SimpleNamespace as _NS
+                result = _NS(success=False, parsed={
+                    "success": False, "error": denial,
+                    "error_type": "destructive_auto_denied"}, error=denial)
+            elif mcp_entry is not None:
                 result = _execute_mcp_tool(mcp_entry, params, config)
             else:
                 result = _execute_tool(sandbox, tool, params)
@@ -304,6 +333,10 @@ def run_quick_task(
             parsed = getattr(result, "parsed", {}) or {}
             success = bool(getattr(result, "success", False))
             error = getattr(result, "error", None)
+            if not success:
+                # W11.7: a failure with no message is unactionable — the
+                # field report literally read "run_command failed: None".
+                error = _failure_error(error, parsed)
             history.append({
                 "role": "tool_result", "tool": tool_name, "success": success,
                 "parsed": _clamp(parsed), "error": error,
@@ -347,6 +380,44 @@ def run_quick_task(
     return _finish(QuickResult(
         status="failed", iterations=iteration,
         error=f"iteration budget exhausted ({max_iters}) without an answer"))
+
+
+def _safety_denied(tool_name: str, params: Dict[str, Any]) -> "str | None":
+    """W12 (audit F5): the quick lane's destructive gate.
+
+    The default chat lane carried NO destructive check at all (the workflow
+    runtime gates; this lane didn't — an asymmetry hole). Destructive calls
+    are denied with an actionable message the model can adapt to; provably
+    read-only shell commands pass (`is_destructive_call` judges commands,
+    not tool names). Returns the denial message, or None to allow.
+    """
+    try:
+        from systemu.runtime.tool_sandbox import ToolSandbox
+        if not ToolSandbox.is_destructive_call(tool_name, params):
+            return None
+    except Exception:
+        return None  # classifier failure must never block the lane
+    return (f"Safety gate: '{tool_name}' with these params is classified "
+            "destructive and the quick lane runs unattended. Use a read-only "
+            "alternative, or ASK_USER to get the operator's go-ahead.")
+
+
+def _failure_error(error, parsed) -> str:
+    """An always-actionable failure message (W11.7).
+
+    Falls back from the tool's error to its stderr tail to its exit code —
+    never the string "None".
+    """
+    if error:
+        return str(error)
+    parsed = parsed or {}
+    stderr_tail = str(parsed.get("stderr") or "")[-200:].strip()
+    if stderr_tail:
+        return stderr_tail
+    code = parsed.get("returncode", parsed.get("exit_code"))
+    if code is not None:
+        return f"tool reported failure (exit {code})"
+    return "tool reported failure without an error message"
 
 
 def _execute_tool(sandbox, tool, params: Dict[str, Any]):

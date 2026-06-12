@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.9.19"
+version = "0.9.21"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -52,6 +52,17 @@ dependencies = [
     "pyyaml>=6.0",         # config + skill migrator + skill exporter
     "ddgs>=9.14",
     "keyring>=24",
+
+    # --- W12-B1: the starter tool pack works from `pip install systemu` ---
+    # Every pip dep the curated 41-tool seed pack declares ships with the
+    # core install (ship-readiness R3/R5: no dep-approval interruptions on
+    # first use; tests/test_starter_pack_conformance.py pins this).
+    "requests>=2.31",      # fetch_json / fetch_html / download_file / api_call_get / web_extract
+    "jsonschema>=4.0",     # extract_records / web_extract
+    "openpyxl>=3.1",       # create/read_excel_sheet
+    "python-docx>=1.1",    # create/read_word_doc
+    "pyperclip>=1.8",      # clipboard_read / clipboard_write
+    "plyer>=2.1",          # notify_desktop
 ]
 
 [project.optional-dependencies]

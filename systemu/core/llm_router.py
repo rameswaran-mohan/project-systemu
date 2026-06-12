@@ -57,6 +57,38 @@ def _is_network_retriable(exc: BaseException) -> bool:
     return False
 
 
+def _resolve_provider_keyaware(model: str, override: str, config) -> type:
+    """W12 (audit F3): key-aware provider resolution.
+
+    Auto-detection routes ``google/*`` / ``anthropic/*`` / ``gpt-*`` model
+    ids to native providers — but OpenRouter legitimately serves those same
+    catalog ids. When the auto-detected native provider's key is ABSENT and
+    the OpenRouter key is present, fall back to OpenRouter instead of
+    failing with a cryptic 400 ("Missing or invalid Authorization header").
+    An explicit ``SYSTEMU_TIER{N}_PROVIDER`` override always wins.
+    """
+    import os as _os
+    from systemu.llm.providers import resolve_provider_class
+    from systemu.llm.providers.openrouter import OpenRouterProvider
+
+    cls = resolve_provider_class(model, override_name=override or None)
+    if override:
+        return cls
+    native_key = {
+        "GoogleProvider":    (getattr(config, "google_api_key", "") or ""),
+        "AnthropicProvider": _os.environ.get("ANTHROPIC_API_KEY", ""),
+        "OpenAIProvider":    _os.environ.get("OPENAI_API_KEY", ""),
+    }.get(cls.__name__)
+    if (native_key is not None and not native_key.strip()
+            and (getattr(config, "openrouter_api_key", "") or "").strip()):
+        logger.info(
+            "[LLM] %s has no API key configured — routing %r via OpenRouter "
+            "(set the native key or SYSTEMU_TIER*_PROVIDER to change this)",
+            cls.__name__, model)
+        return OpenRouterProvider
+    return cls
+
+
 def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:
     """Return a new AsyncOpenAI client bound to the current event loop.
 
@@ -85,13 +117,12 @@ def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:
     reusing a client that was created in a different (possibly closed) loop
     causes httpx to enqueue I/O on a dead loop and hang indefinitely.
     """
-    from systemu.llm.providers import resolve_provider_class
     from systemu.llm.providers.google import GoogleProvider
     from systemu.llm.providers.openai import OpenAIProvider
 
     model = _model_for_tier(tier, config) if tier in (1, 2, 3) else ""
     override = getattr(config, f"tier{tier}_provider", "") if tier in (1, 2, 3) else ""
-    provider_cls = resolve_provider_class(model, override_name=override or None)
+    provider_cls = _resolve_provider_keyaware(model, override, config)
 
     # AsyncOpenAI-compatible providers — return the underlying client as before
     if provider_cls is GoogleProvider:
@@ -130,11 +161,10 @@ def _get_provider(config: Config, tier: int):
     beats automatic ``matches()``-based detection from the model name.
     """
     import os as _os
-    from systemu.llm.providers import resolve_provider_class
 
     model = _model_for_tier(tier, config) if tier in (1, 2, 3) else ""
     override = getattr(config, f"tier{tier}_provider", "") if tier in (1, 2, 3) else ""
-    provider_cls = resolve_provider_class(model, override_name=override or None)
+    provider_cls = _resolve_provider_keyaware(model, override, config)
 
     cls_name = provider_cls.__name__
     if cls_name == "GoogleProvider":

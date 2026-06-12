@@ -311,6 +311,27 @@ class ParallelVault:
     def search_session_summaries(self, query: str, **kwargs):
         return self._p.search_session_summaries(query, **kwargs)
 
+    # ── User profile + facts (v0.9.0 Layer 1) ────────────────────────────────
+    #
+    # W12 ship-readiness audit: same wrapper-drift class as episodic above —
+    # never proxied, so the welcome wizard could not save a profile through
+    # this wrapper (and the W11.4 gate then locked the dashboard).
+
+    def get_user_profile(self):
+        return self._p.get_user_profile()
+
+    def save_user_profile(self, profile) -> None:
+        self._p.save_user_profile(profile)
+        self._write_secondary("save_user_profile", profile)
+
+    def load_user_facts(self, **kwargs):
+        return self._p.load_user_facts(**kwargs)
+
+    def append_user_fact(self, **kwargs):
+        result = self._p.append_user_fact(**kwargs)
+        self._write_secondary("append_user_fact", **kwargs)
+        return result
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Diff helpers (non-blocking, best-effort)

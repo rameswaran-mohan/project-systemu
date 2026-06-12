@@ -1569,6 +1569,9 @@ class ShadowRuntime:
         # fetch_json had been called repeatedly, because lying-success calls
         # reset the failure streak and vanished from the report.
         self._tools_since_credit: set[str] = set()
+        # W12 (F9): tool → objective id claimed on a FAILED call; a later
+        # success of the same tool nudges the model to re-claim. Reset per run.
+        self._failed_objective_claims: dict[str, int] = {}
         self._operator_hint: "str | None" = None
         # v0.9.8 Phase 2: autonomous-coach self-steer counter; reset per run in execute().
         self._coach_steers_used: int = 0
@@ -2147,6 +2150,12 @@ class ShadowRuntime:
         self._tools_since_credit.clear()
         self._stuck_round_for_obj.clear()
         self._operator_hint = None
+        # W12 (audit F9): objective claims consumed by FAILED tool calls —
+        # when the same tool later succeeds WITHOUT re-claiming, the model is
+        # nudged to re-state the claim (the A2 run finished its deliverable
+        # at iter=12 but never re-claimed; the watchdog cancelled a finished
+        # run and the retry re-did paid work).
+        self._failed_objective_claims = {}
         # v0.9.8 Phase 2: reset the autonomous-coach self-steer counter per run.
         self._coach_steers_used = 0
         # v0.9.8 (B2): consecutive read-only research tool calls (web_search/
@@ -3485,6 +3494,39 @@ class ShadowRuntime:
                                     completed_obj,
                                     result.success if result is not None else None,
                                 )
+                                # W12 (F9): remember the failed claim so a later
+                                # SUCCESS of the same tool can nudge a re-claim.
+                                try:
+                                    getattr(self, "_failed_objective_claims", {})[
+                                        tool_name] = completed_obj
+                                except Exception:
+                                    pass
+                        elif (completed_obj is None and result is not None
+                                and result.success):
+                            # W12 (F9): this tool previously claimed an objective
+                            # and FAILED; now it succeeded with no claim. Without
+                            # the nudge the objective is never credited, the run
+                            # never completes, and the watchdog cancels finished
+                            # work (seen live in the A2 audit).
+                            _missed = getattr(
+                                self, "_failed_objective_claims", {}).pop(
+                                tool_name, None)
+                            if (_missed is not None
+                                    and _missed not in completed_objectives):
+                                context.add_observation(
+                                    {
+                                        "type": "credit_nudge",
+                                        "objective_id": _missed,
+                                        "message": (
+                                            f"Your earlier FAILED attempt claimed "
+                                            f"objective {_missed}; this call "
+                                            f"SUCCEEDED without a claim. If the "
+                                            f"objective is now complete, declare "
+                                            f"completes_objective={_missed} on your "
+                                            f"next TOOL_CALL or COMPLETE action."),
+                                    },
+                                    current_ab,
+                                )
                     else:
                         # Legacy ActionBlock completion tracking
                         completed_ab = decision.get("completes_action_block")
@@ -3777,6 +3819,31 @@ class ShadowRuntime:
                         )
                     except Exception:
                         logger.debug("[Runtime] log_event failed for auto-deny notice")
+                # W12 (audit F6): a headless auto-deny must feed the SAME
+                # failure-streak machinery as a failed call — a bare
+                # `return None` left the governor blind and the model
+                # retried the identical denied command to max-iterations
+                # (30 → PARTIAL after ~90s in the A2 audit run). The
+                # observation also tells the model HOW to adapt instead of
+                # the misleading "User denied" (no user exists headless).
+                from systemu.interface.notifications import is_headless as _ih
+                if _ih():
+                    deny_obs = {
+                        "type": "safety_gate_denied",
+                        "success": False,
+                        "tool_name": tool_name,
+                        "error": (
+                            f"Safety gate: '{tool_name}' with these params is "
+                            "classified destructive and auto-denied in "
+                            "non-interactive runs. Do NOT retry the same call — "
+                            "use a read-only alternative (e.g. a query-only "
+                            "command or a file/read tool), or COMPLETE/FAIL "
+                            "with what you have."),
+                        "error_type": "destructive_auto_denied",
+                    }
+                    context.add_observation(deny_obs, current_ab)
+                    return ToolResult(success=False, parsed=deny_obs,
+                                      error=deny_obs["error"])
                 context.add_observation(
                     {"type": "user_denied", "tool_name": tool_name,
                      "message": "User denied this destructive action."},

@@ -27,6 +27,8 @@ sharing_on daemon start
 Open the dashboard at <http://localhost:8765>.
 
 > New to the vocabulary? See [docs/glossary.md](docs/glossary.md) for a Systemu → industry-terms map.
+>
+> **How do I actually work with it?** One page: [OPERATOR-SOP.md](OPERATOR-SOP.md) — the record→approve→run→results loop, what the approval cards mean, and a troubleshooting table.
 
 ---
 

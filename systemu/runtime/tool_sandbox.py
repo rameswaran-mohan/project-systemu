@@ -47,6 +47,51 @@ _WRITE_NAME_TOKENS = (
     "write", "save", "create", "export", "dump", "append", "output", "generate", "render",
 )
 
+# ── W12 (audit F5): command-level shell-safety classification ────────────────
+# Tools that execute arbitrary shell commands — judged by the COMMAND they
+# carry, not by their name (see ToolSandbox.is_destructive_call).
+_SHELL_TOOL_NAMES = {"run_command", "run_cli_command"}
+
+# Programs that only READ system/file state. Deliberately tight: anything
+# not provably read-only keeps the safety gate.
+_READONLY_PROGRAMS = {
+    # Windows
+    "ver", "dir", "type", "systeminfo", "ipconfig", "whoami", "where",
+    "hostname", "tasklist", "date", "time",
+    # POSIX
+    "ls", "cat", "pwd", "uname", "df", "du", "ps", "head", "tail", "wc",
+    "which", "env",
+}
+_READONLY_GIT_SUBCOMMANDS = {
+    "status", "log", "diff", "show", "branch", "remote", "describe", "blame",
+}
+# Chaining/redirection makes ANY command non-read-only: `>` writes, `&&`/
+# `|`/`;` smuggle a second command, backticks/`$()` substitute.
+_SHELL_METACHARS = set("&|;><`$\r\n")
+
+
+def is_readonly_shell_command(command: str) -> bool:
+    """True only when *command* is PROVABLY read-only.
+
+    A single command (no shell metacharacters) whose program is on the
+    read-only allowlist — `ver`, `dir`, `git status`, `python --version`…
+    False means "keep the safety gate", never "is destructive".
+    """
+    cmd = (command or "").strip()
+    if not cmd or any(c in _SHELL_METACHARS for c in cmd):
+        return False
+    tokens = cmd.split()
+    prog = tokens[0].lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if prog.endswith(".exe"):
+        prog = prog[:-4]
+    if prog == "git":
+        return len(tokens) >= 2 and tokens[1].lower() in _READONLY_GIT_SUBCOMMANDS
+    if prog in ("python", "python3"):
+        return tokens[1:2] in (["--version"], ["-V"])
+    if prog in ("pip", "pip3"):
+        return len(tokens) >= 2 and tokens[1].lower() in ("list", "show", "freeze", "--version")
+    return prog in _READONLY_PROGRAMS
+
 
 def _is_write_ish(name: str, params: Dict[str, Any]) -> bool:
     """Heuristic: does this tool call write/produce a file?"""
@@ -588,19 +633,30 @@ class ToolSandbox:
 
         Errs on the side of caution — false positives are far safer than
         false negatives for destructive actions.
+
+        W12 (audit F5): shell tools are judged by their COMMAND, not their
+        name. The old name-only rule marked EVERY run_command destructive,
+        so a read-only ``ver`` was auto-denied in every non-interactive
+        context — which includes the daemon the dashboard runs in. Provably
+        read-only commands pass; everything ambiguous keeps the gate.
         """
         name_lower = tool_name.lower()
+
+        # Dangerous parameter patterns gate REGARDLESS of anything else.
+        params_str = json.dumps(parameters).lower()
+        if any(p in params_str for p in ["rm -rf", "drop table", "delete from", "--force"]):
+            return True
+
+        if name_lower in _SHELL_TOOL_NAMES:
+            cmd = str(parameters.get("command") or parameters.get("cmd") or "")
+            return not is_readonly_shell_command(cmd)
+
         destructive_hints = {
             "delete", "remove", "drop", "truncate", "wipe", "purge",
             "overwrite", "send", "publish", "deploy", "purchase", "pay",
-            "transfer", "execute_sql", "run_command", "shell",
+            "transfer", "execute_sql", "shell",
         }
         if any(hint in name_lower for hint in destructive_hints):
-            return True
-
-        # Check parameter values for dangerous patterns
-        params_str = json.dumps(parameters).lower()
-        if any(p in params_str for p in ["rm -rf", "drop table", "delete from", "--force"]):
             return True
 
         return False

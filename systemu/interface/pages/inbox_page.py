@@ -336,6 +336,8 @@ def build_inbox_page() -> None:
     vault = state.vault
 
     ui.label("Inbox").classes("s-page-title").style("margin-bottom: 4px;")
+    from systemu.interface.design.glossary import lore_sublabel
+    ui.label(lore_sublabel("inbox")).classes("s-muted")
     ui.label(
         "Every decision the agent needs from you — one card, one place. "
         "Approve executes the authorized action."
@@ -386,10 +388,24 @@ def build_inbox_page() -> None:
     _history()
 
     # Refresh both sections periodically (file-backed queue → polling is enough).
-    from systemu.interface.ui_helpers import safe_timer
+    # W12 (ship-blocker class): change-gated — unconditional repaints destroyed
+    # and rebuilt the Approve/Answer buttons, silently eating racing clicks.
+    import json as _json
+
+    from systemu.interface.ui_helpers import gated_refresh, safe_timer
 
     def _refresh_all():
         _triage.refresh()
         _history.refresh()
 
-    safe_timer(5.0, _refresh_all)
+    def _fingerprint():
+        from systemu.interface.command.inbox import InboxQueue
+        from systemu.interface.components.attention import pending_ask_rows
+        pending = [(d.gate_id, d.title) for d in
+                   InboxQueue(vault).list_descriptors()] if vault else []
+        asks = pending_ask_rows(vault) if vault else []
+        resolved = [(r.get("id"), r.get("resolved_at"))
+                    for r in _load_resolved_gate_rows(vault)] if vault else []
+        return _json.dumps([pending, asks, resolved], default=str)
+
+    safe_timer(5.0, gated_refresh(_fingerprint, _refresh_all))

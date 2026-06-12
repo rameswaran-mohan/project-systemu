@@ -377,8 +377,20 @@ def _force_restart_workers() -> None:
 
 
 def _trigger_record_dialog() -> None:
-    """Open the record session dialog (reuses dashboard.py handler)."""
+    """Open the record session dialog.
+
+    W12 (audit): uses the REAL dialog opener the layout stashes per-client —
+    the old navigate-to-/ fallback visibly did nothing when clicked on Home
+    itself (a dead primary affordance, caught live).
+    """
     from nicegui import ui
+    try:
+        opener = getattr(ui.context.client, "systemu_open_record_dialog", None)
+        if opener is not None:
+            opener()
+            return
+    except Exception:
+        pass
     try:
         from systemu.interface.dashboard import _show_record_dialog
         _show_record_dialog()

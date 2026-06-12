@@ -13,6 +13,13 @@ _GLOSSARY = {
     "shadows":    "Agents — the personas that run your workflows",
     "forge":      "Build a tool — create a new capability",
     "evolutions": "Improvements — proposed upgrades the system has learned",
+    # W11.6: every spine page explains itself in one line, not just the
+    # three lore pages.
+    "work":       "Your workflows — everything you've asked for, with live status",
+    "inbox":      "Approvals — questions waiting for your yes or no",
+    "build":      "Toolbox — capabilities you enable, build, and connect",
+    "skills":     "Skills — reusable know-how your agents have learned",
+    "insights":   "Memory & metrics — what it has learned and how it's doing",
 }
 
 

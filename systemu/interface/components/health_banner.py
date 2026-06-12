@@ -51,8 +51,9 @@ class HealthState:
 
 # -- Probes (each best-effort, never raises) ---------------------------------
 
-def _count_systemu_daemons() -> int:
-    """Best-effort count of running daemon processes.  Returns 0 on error."""
+def _scan_daemon_count() -> int:
+    """The raw psutil scan — best-effort, 0 on error. SLOW on Windows
+    (cmdline for every process ≈ 1 s); only ever call via the cache below."""
     try:
         import psutil
         count = 0
@@ -66,6 +67,28 @@ def _count_systemu_daemons() -> int:
         return count
     except Exception:
         return 0
+
+
+_PROBE_TTL_S = 20.0
+_daemon_probe_cache = {"ts": -1e9, "count": 0}
+
+
+def _count_systemu_daemons(_now: Optional[float] = None) -> int:
+    """Best-effort count of running daemon processes, TTL-cached.
+
+    W12-B5 (audit F1): the full process scan ran on EVERY page build and was
+    the single biggest page-latency cost — every route took 1.2–2.0 s
+    server-side. The daemon count changes rarely; 20 s of staleness is
+    harmless for a warning banner.
+    """
+    import time
+    now = time.monotonic() if _now is None else _now
+    if now - _daemon_probe_cache["ts"] < _PROBE_TTL_S:
+        return _daemon_probe_cache["count"]
+    count = _scan_daemon_count()
+    _daemon_probe_cache["ts"] = now
+    _daemon_probe_cache["count"] = count
+    return count
 
 
 def _openrouter_key_present() -> bool:

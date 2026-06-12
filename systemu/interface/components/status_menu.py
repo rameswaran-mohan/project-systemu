@@ -92,6 +92,8 @@ def render_status_menu(vault) -> None:
     # W7.3: icon makes the control read as a button at a glance (a bare ghost
     # "Status" label next to the tinted badges was easy to miss entirely).
     with button("Status", variant="ghost", icon="monitoring"):
+        # W11.6: the header's primary controls explain themselves on hover.
+        ui.tooltip("Your recent tasks — outcomes, files produced, and links")
         with ui.menu().classes("s-menu").style("min-width: 380px; padding: 8px;"):
 
             @ui.refreshable

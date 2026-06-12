@@ -89,10 +89,17 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
     from nicegui import ui, app
 
     from systemu.interface.event_bus import EventBus
-    from systemu.interface.ui_helpers import safe_timer
+    from systemu.interface.ui_helpers import (
+        RepaintGate, event_ui_key, prune_open_state, safe_timer,
+        stateful_expansion)
 
     # Thread-safe ring buffer (deque.append is atomic under the GIL).
     events: "deque[Dict[str, Any]]" = deque(maxlen=_MAX_LIVE_EVENTS)
+
+    # W11.1: expansion open/closed state survives repaints; repaints happen
+    # only when content changed (see live_events_pane — same field bug).
+    open_state: Dict[int, bool] = {}
+    gate = RepaintGate()
 
     # W5.3: stable-slot host for the inline Answer dialog — creating a dialog
     # from inside the timer-refreshed _pane races slot disposal (see
@@ -120,7 +127,9 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
             ui.label(header).style("font-size: 12px; font-family: monospace;")
             return
 
-        with ui.expansion(header, value=False).classes("w-full").style(
+        with stateful_expansion(
+            header, state_key=event_ui_key(ev), open_state=open_state,
+        ).classes("w-full").style(
             "font-size: 12px;"
         ):
             if row["details"]:
@@ -143,6 +152,7 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
 
     @ui.refreshable
     def _pane() -> None:
+        prune_open_state(open_state, (event_ui_key(e) for e in events))
         rows = _visible()
         if not rows:
             ui.label("Waiting for streamed run events…").style("font-size: 12px;")
@@ -155,14 +165,22 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
         _pane()
 
     def _on_event(event: Dict[str, Any]) -> None:
-        # Publish-thread callback: ONLY append. NEVER refresh here (liveness).
+        # Publish-thread callback: ONLY append + mark dirty. NEVER refresh
+        # here (liveness).
         events.append(event)
+        gate.bump()
 
     # Subscribe with replay so the pane shows recent history immediately.
     unsubscribe = EventBus.get().subscribe(_on_event, replay=True)
 
     # UI-thread timer is the SOLE driver of refresh (slot-error tolerant).
-    safe_timer(0.5, _pane.refresh)
+    # W11.1: change-gated — an unconditional refresh rebuilt every expansion
+    # collapsed twice a second, so the expand arrow could never stay open.
+    def _tick() -> None:
+        if gate.should_paint():
+            _pane.refresh()
+
+    safe_timer(0.5, _tick)
 
     # Detach the subscriber when the client is DELETED (not on disconnect —
     # W7.2: app.on_disconnect is global, so any client's transient drop

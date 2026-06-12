@@ -50,7 +50,19 @@ def starter_prompts() -> List[str]:
 
 
 def detect_timezone() -> str:
-    """Best-effort IANA-ish timezone name for prefill; never raises."""
+    """Best-effort IANA timezone name for prefill; never raises.
+
+    W12 (audit F3): prefers tzlocal (ships with apscheduler) so Windows
+    yields 'Asia/Kolkata' rather than 'India Standard Time' — downstream
+    consumers expect IANA names.
+    """
+    try:
+        import tzlocal
+        name = tzlocal.get_localzone_name()
+        if name:
+            return str(name)
+    except Exception:
+        pass
     try:
         from datetime import datetime, timezone
         local = datetime.now(timezone.utc).astimezone()
@@ -58,6 +70,60 @@ def detect_timezone() -> str:
         return str(name or "UTC")
     except Exception:
         return "UTC"
+
+
+def _refresh_key_status(config, *, env_file: str = ".env") -> bool:
+    """Notice a key added to .env while /welcome is open (W11.4).
+
+    The key is never typed in the browser — the operator edits .env in their
+    editor and clicks Re-check. Reads the live environment first, then the
+    .env file next to the app, WITHOUT stomping the process environment (no
+    load_dotenv override — the daemon's env stays exactly as booted). Updates
+    the live config snapshot on success. Never raises.
+    """
+    import os
+    key = (os.environ.get("OPENROUTER_API_KEY", "") or "").strip()
+    if not key:
+        try:
+            from dotenv import dotenv_values
+            key = ((dotenv_values(env_file) or {})
+                   .get("OPENROUTER_API_KEY") or "").strip()
+        except Exception:
+            key = ""
+    if key:
+        try:
+            config.openrouter_api_key = key
+        except Exception:
+            pass
+    return bool(key)
+
+
+# The W11.4 redirect funnels fresh installs to /welcome on these checks ONLY.
+# The tour is deliberately excluded: its steps navigate spine routes, so
+# gating on it would redirect-loop — it auto-starts after the wizard and
+# offers resume until completed instead (W11.5).
+_REDIRECT_REQUIRED = ("key_present", "profile_present")
+
+
+def onboarding_gate(vault, config) -> List[str]:
+    """W11.4: the required first-run steps still incomplete — [] means free.
+
+    Mandatory applies to FRESH installs only: a pre-W11 'skipped' sentinel is
+    honored forever, and SYSTEMU_SKIP_ONBOARDING=1 is the CI/dev/smoke escape
+    hatch. Defensive: any error returns [] — never brick the dashboard.
+    """
+    import os
+    try:
+        if (os.environ.get("SYSTEMU_SKIP_ONBOARDING", "") or "").lower() in ("1", "true"):
+            return []
+        from systemu.runtime.user_profile import get_facts
+        if get_facts(vault, tags=[_SKIP_TAG]):
+            return []  # pre-W11 'later' honored — no retroactive nagging
+        from systemu.runtime.first_run import setup_status
+        return [c["id"] for c in setup_status(config, vault)
+                if c["id"] in _REDIRECT_REQUIRED and not c["ok"]]
+    except Exception:
+        return []
 
 
 def needs_onboarding(vault) -> bool:
@@ -113,10 +179,15 @@ def build_welcome_page() -> None:
     from nicegui import ui
     from sharing_on.model_presets import PRESETS, is_budget_class
     from systemu.interface.dashboard_state import AppState
+    from systemu.interface.design.primitives import button
 
     state = AppState.get()
     vault = state.vault
     config = state.config
+
+    # W11.4: while the gate holds (fresh install, key/profile missing) the
+    # wizard is mandatory — no skip is offered. Voluntary visitors keep it.
+    _gate_active = bool(onboarding_gate(vault, config))
 
     with ui.column().classes("w-full items-center"):
         with ui.column().classes("s-card").style("max-width: 720px; width: 100%;"):
@@ -132,10 +203,24 @@ def build_welcome_page() -> None:
                 ui.label("API key loaded — you're ready to run tasks.").classes("s-cell")
             else:
                 ui.label(
-                    "No API key found. Add OPENROUTER_API_KEY=<your key> to "
-                    "the .env file next to the app and restart — keys are "
-                    "never entered in the browser."
+                    "No API key found — and Systemu can't think without one. "
+                    "Get a key at openrouter.ai/keys, add "
+                    "OPENROUTER_API_KEY=<your key> to the .env file next to "
+                    "the app, save, then click Re-check. Keys are never "
+                    "entered in the browser."
                 ).classes("s-banner s-banner--warn w-full")
+
+                def _recheck(_=None) -> None:
+                    # W11.4: no restart dance — reload .env in place.
+                    if _refresh_key_status(config):
+                        ui.notify("Key found — you're ready.", type="positive")
+                        ui.navigate.to("/welcome")
+                    else:
+                        ui.notify(
+                            "Still no key in .env — save the file and try again.",
+                            type="warning")
+
+                button("Re-check", variant="primary", on_click=_recheck)
 
             # ── 2. Model preset ───────────────────────────────────────────
             ui.label(f"2 · {onboarding_steps()[1]}").classes("s-section-head")
@@ -144,7 +229,7 @@ def build_welcome_page() -> None:
                 "'quality' is recommended for office work; 'budget' is the "
                 "cheapest. Change anytime in Settings."
             ).classes("s-muted")
-            preset_select = ui.select(sorted(PRESETS), label="Preset").classes("s-input")
+            preset_select = ui.select(sorted(PRESETS), label="Preset").classes("s-input s-input-full")
             if is_budget_class(getattr(config, "tier1_model", "")):
                 ui.label(
                     "Currently on a flash/free-class reasoning model — fine "
@@ -191,6 +276,15 @@ def build_welcome_page() -> None:
                               f"/chat?prefill={_q(p)}"))
 
             def _finish(_=None) -> None:
+                # W11.4: setup is enforced, not suggested — the key must
+                # exist before the wizard completes (last-second .env saves
+                # are honored via the same re-check).
+                if (not getattr(config, "openrouter_api_key", "")
+                        and not _refresh_key_status(config)):
+                    ui.notify(
+                        "Add your API key first (step 1) — Systemu can't run "
+                        "without it.", type="warning")
+                    return
                 if not name_in.value.strip():
                     ui.notify("Please tell me your name.", type="warning")
                     return
@@ -218,7 +312,9 @@ def build_welcome_page() -> None:
                     ui.notify(f"Could not save: {exc}", type="negative")
                     return
                 ui.notify("All set — welcome aboard.", type="positive")
-                ui.navigate.to("/")
+                # W11.5 handoff: the wizard flows straight into the guided
+                # tour (mandatory on first run; replayable from Settings).
+                ui.navigate.to("/?tour=0")
 
             def _later(_=None) -> None:
                 try:
@@ -227,7 +323,9 @@ def build_welcome_page() -> None:
                     logger.debug("[Welcome] skip sentinel failed", exc_info=True)
                 ui.navigate.to("/")
 
-            from systemu.interface.design.primitives import button
             with ui.row().classes("w-full q-gutter-sm q-mt-md"):
                 button("Finish setup", variant="primary", on_click=_finish)
-                button("Maybe later", variant="ghost", on_click=_later)
+                if not _gate_active:
+                    # Voluntary visit (already set up, or pre-W11 skip) —
+                    # leaving is fine. Fresh installs get no skip: mandatory.
+                    button("Maybe later", variant="ghost", on_click=_later)

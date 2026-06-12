@@ -50,9 +50,12 @@ def build_skills_page() -> None:
     vault = state.vault
 
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
-        ui.label("Skills Registry").style(
-            f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
-        )
+        with ui.column().style("gap: 2px;"):
+            ui.label("Skills Registry").style(
+                f"font-size: 22px; font-weight: 800; color: {THEME['text']};"
+            )
+            from systemu.interface.design.glossary import lore_sublabel
+            ui.label(lore_sublabel("skills")).classes("s-muted")
 
     # ── Category filter ───────────────────────────────────────────────────────
     all_skills = vault.load_index("skills")

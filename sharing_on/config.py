@@ -106,7 +106,8 @@ class Config:
     # --- LLM ---
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    llm_model: str = "z-ai/glm-4.5-air:free"
+    # W11.7: was z-ai/glm-4.5-air:free — OpenRouter 404s it now.
+    llm_model: str = "deepseek/deepseek-v4-flash"
     google_api_key: str = ""   # Google AI Studio key — used for Tier 2 (Gemini direct)
 
     # --- Systemu LLM Tiers ---
@@ -115,7 +116,7 @@ class Config:
     # via SYSTEMU_TIER{1,2,3}_MODEL env vars.
     tier1_model: str = "deepseek/deepseek-v4-flash"         # deep reasoning
     tier2_model: str = "deepseek/deepseek-v4-flash"         # structured / code
-    tier3_model: str = "z-ai/glm-4.5-air:free"              # fast / formatting
+    tier3_model: str = "deepseek/deepseek-v4-flash"         # fast / formatting (W11.7: glm-4.5-air:free 404s)
     # v0.7-e: provider override per tier.  Empty string = auto-detect from
     # model name via systemu.llm.providers.resolve_provider_class.  Set to one
     # of {"openrouter","google","anthropic","openai","ollama"} to force.
@@ -407,7 +408,7 @@ class Config:
         instance = cls(
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
             google_api_key=os.getenv("GOOGLE_API_KEY", ""),
-            llm_model=os.getenv("SHARING_ON_MODEL", "z-ai/glm-4.5-air:free"),
+            llm_model=os.getenv("SHARING_ON_MODEL", "deepseek/deepseek-v4-flash"),
             # Systemu uses tier3 for log→instructions (existing analyze step)
             # W8.1: defaults route through the preset (SYSTEMU_MODEL_PRESET);
             # explicit per-tier env vars always win. No preset ⇒ today's

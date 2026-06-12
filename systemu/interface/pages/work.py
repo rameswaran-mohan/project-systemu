@@ -173,7 +173,10 @@ def build_work_page() -> None:
 
     # ── Header + filter bar ────────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between q-mb-md"):
-        ui.label("Work").classes("s-page-title")
+        with ui.column().style("gap: 2px;"):
+            ui.label("Work").classes("s-page-title")
+            from systemu.interface.design.glossary import lore_sublabel
+            ui.label(lore_sublabel("work")).classes("s-muted")
 
     initial_rows = _load_rows()
     statuses = sorted({r["status"] for r in initial_rows if r.get("status")})
@@ -199,9 +202,10 @@ def build_work_page() -> None:
     def _rows_view() -> None:
         rows = _filter_rows(_load_rows(), filt["query"], filt["status"])
         if not rows:
-            ui.label(
-                "No workflows yet — record a session or submit a task to start one."
-            ).classes("s-muted q-pa-md")
+            with ui.row().classes("q-pa-md items-center").style("gap: 6px;"):
+                ui.label("No workflows yet —").classes("s-muted")
+                ui.link("submit a task in Chat", "/chat").classes("s-muted")
+                ui.label("or hit ＋New → Record session.").classes("s-muted")
         for row in rows:
             _render_row(row, on_refresh=_rows_view.refresh)
 
@@ -212,8 +216,27 @@ def build_work_page() -> None:
                 _render_unlinked_row(act)
 
     _rows_view()
-    # Liveness: same 2s reconcile cadence as the workflow_pipeline card.
-    safe_timer(2.0, _rows_view.refresh)
+
+    # W12 (ship-blocker, audit-caught live): change-gated liveness. The
+    # unconditional 2s repaint destroyed and rebuilt every row button, so a
+    # click arriving for the just-destroyed element was silently dropped —
+    # "Review & Approve did nothing" (the W11.1 expansion bug's click-eating
+    # sibling). Repaint only when the rows actually changed; user-driven
+    # filter changes still refresh directly.
+    import json as _json
+
+    from systemu.interface.ui_helpers import gated_refresh
+
+    def _fingerprint() -> str:
+        rows = _filter_rows(_load_rows(), filt["query"], filt["status"])
+        # updated_at is stamped on every tracker poll — including it would
+        # change the fingerprint every tick and defeat the gate entirely.
+        stable = [{k: v for k, v in r.items() if k != "updated_at"}
+                  for r in rows]
+        return _json.dumps([stable, _load_unlinked()], sort_keys=True,
+                           default=str)
+
+    safe_timer(2.0, gated_refresh(_fingerprint, _rows_view.refresh))
 
 
 def _render_row(row: Dict[str, Any], on_refresh=None) -> None:

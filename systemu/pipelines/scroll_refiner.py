@@ -416,6 +416,18 @@ def refine_scroll(
     )
     log_event("INFO", "scroll", f"Scroll created: '{scroll.name}' ({len(scroll.objectives)} objectives)", {"scroll_id": scroll.id})
 
+    # W12 (audit F7): ring needs-you NOW — gates used to enqueue only when
+    # the operator happened to render /work, so a freshly refined scroll sat
+    # invisible (badge 0, rail empty, Inbox empty) until they wandered there.
+    # Best-effort: the gate is enqueue-on-demand idempotent either way.
+    try:
+        from systemu.interface.scroll_gate import ensure_scroll_gate
+        if str(getattr(scroll.status, "value", scroll.status)) == "pending_approval":
+            ensure_scroll_gate(vault, scroll)
+    except Exception:
+        logger.debug("[Scroll] eager gate enqueue failed (non-fatal)",
+                     exc_info=True)
+
     # ── Approval gate ──────────────────────────────────────────────────────
     # The Scroll is now persisted at PENDING_APPROVAL.  Three approval paths:
     #   1. auto_proceed=True (programmatic — used by tests and `analyze --auto`)

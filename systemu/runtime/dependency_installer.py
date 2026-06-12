@@ -214,9 +214,28 @@ def _lock_for(pkg: str) -> threading.Lock:
         return lock
 
 
+def _dist_name(pkg: str) -> str:
+    """Bare distribution name from a requirement string ('requests>=2' → 'requests')."""
+    return re.split(r"[<>=!~\[; ]", pkg.strip(), 1)[0]
+
+
 def _is_satisfied(pkg: str) -> bool:
     with _satisfied_lock:
-        return pkg in _satisfied
+        if pkg in _satisfied:
+            return True
+    # W11.7: the cache only remembers THIS process's installs — a package
+    # already present in the environment is satisfied too. Without this,
+    # every fresh daemon treated installed deps as missing, and PROMPT mode
+    # re-gated packages the operator had installed and approved long ago
+    # (field RCA 2026-06-12: requests/playwright installed + approved, yet
+    # every dep-declaring tool blocked).
+    try:
+        from importlib import metadata as _metadata
+        _metadata.version(_dist_name(pkg))
+    except Exception:
+        return False
+    _mark_satisfied([pkg])
+    return True
 
 
 def _mark_satisfied(pkgs: Iterable[str]) -> None:

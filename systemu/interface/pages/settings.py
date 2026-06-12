@@ -280,6 +280,23 @@ def build_settings_page() -> None:
                 _mcp_btn("Add server", variant="primary", on_click=_add_mcp)
 
         # ── Telegram reach (W10.1 — status only, env-configured) ───────────
+        # ── Help (W11.5) ───────────────────────────────────────────────────
+        _section_header("Help")
+        with ui.column().classes("s-card w-full"):
+            ui.label(
+                "New here, or showing a colleague around? The guided tour "
+                "walks the six main screens in two minutes."
+            ).classes("s-muted")
+            from systemu.interface.design.primitives import button as _tour_btn
+            _tour_btn("Replay the tour", variant="ghost",
+                      on_click=lambda _=None: ui.navigate.to("/?tour=0"))
+            # W12 (B7): the one-page operator SOP ships with the install.
+            ui.label(
+                "Prefer reading? OPERATOR-SOP.md (next to the app) is the "
+                "one-page guide: the record → approve → run → results loop, "
+                "what each approval card means, and troubleshooting."
+            ).classes("s-muted")
+
         _section_header("Telegram")
         with ui.column().classes("s-card w-full"):
             import os as _tg_os

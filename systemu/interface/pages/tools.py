@@ -138,6 +138,9 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
     state = AppState.get()
     vault = state.vault
 
+    from systemu.interface.design.glossary import lore_sublabel
+    ui.label(lore_sublabel("build")).classes("s-muted").style("margin-bottom: 8px;")
+
     # Deep-link: /tools?forge=<id> auto-opens the spec/code review dialog after
     # the page has rendered (ui.timer defers past the slot-stack build).  This
     # is scheduled before the no-tools early return so the deep-link still

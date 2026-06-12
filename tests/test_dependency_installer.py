@@ -97,7 +97,7 @@ class TestResolveInstallMode:
 
 class TestPackageValidation:
     def test_accepts_simple_name(self):
-        assert di._normalise_and_validate(["python-docx"]) == ["python-docx"]
+        assert di._normalise_and_validate(["fake-docx-dep"]) == ["fake-docx-dep"]
 
     def test_accepts_version_specifier(self):
         assert di._normalise_and_validate(["requests>=2.31"]) == ["requests>=2.31"]
@@ -110,11 +110,11 @@ class TestPackageValidation:
 
     def test_rejects_shell_metachars(self):
         with pytest.raises(di.InvalidPackageSpecError):
-            di._normalise_and_validate(["python-docx; rm -rf /"])
+            di._normalise_and_validate(["fake-docx-dep; rm -rf /"])
 
     def test_rejects_quotes(self):
         with pytest.raises(di.InvalidPackageSpecError):
-            di._normalise_and_validate(['python-docx"'])
+            di._normalise_and_validate(['fake-docx-dep"'])
 
     def test_rejects_subshell(self):
         with pytest.raises(di.InvalidPackageSpecError):
@@ -143,20 +143,20 @@ class TestEnsureSatisfied:
             di.ensure_satisfied(["x"], mode=di.InstallMode.AUTO)
 
     def test_off_mode_blocks(self):
-        r = di.ensure_satisfied(["python-docx"], mode=di.InstallMode.OFF)
+        r = di.ensure_satisfied(["fake-docx-dep"], mode=di.InstallMode.OFF)
         assert not r.ok
         assert r.status is di.InstallStatus.BLOCKED_DISABLED
 
     def test_prompt_without_store_blocks_all(self):
-        r = di.ensure_satisfied(["python-docx"], mode=di.InstallMode.PROMPT)
+        r = di.ensure_satisfied(["fake-docx-dep"], mode=di.InstallMode.PROMPT)
         assert not r.ok
         assert r.status is di.InstallStatus.BLOCKED_PENDING_APPROVAL
-        assert r.pending_approval == ["python-docx"]
+        assert r.pending_approval == ["fake-docx-dep"]
 
     def test_prompt_with_unapproved_blocks_records_pending(self, tmp_path):
         store = DepApprovalStore(tmp_path / "approvals.json")
         r = di.ensure_satisfied(
-            ["python-docx"],
+            ["fake-docx-dep"],
             mode=di.InstallMode.PROMPT,
             approvals=store,
             tool_name="create_word_doc",
@@ -166,37 +166,37 @@ class TestEnsureSatisfied:
         assert r.status is di.InstallStatus.BLOCKED_PENDING_APPROVAL
         pending = store.list_pending()
         assert len(pending) == 1
-        assert pending[0]["package"] == "python-docx"
+        assert pending[0]["package"] == "fake-docx-dep"
         assert pending[0]["first_seen_tool"] == "create_word_doc"
 
     def test_prompt_with_approved_installs(self, tmp_path, monkeypatch):
         store = DepApprovalStore(tmp_path / "approvals.json")
-        store.approve("python-docx")
+        store.approve("fake-docx-dep")
         monkeypatch.setattr(di, "_run_pip_install", _ok_install)
 
         r = di.ensure_satisfied(
-            ["python-docx"],
+            ["fake-docx-dep"],
             mode=di.InstallMode.PROMPT,
             approvals=store,
         )
         assert r.ok and r.status is di.InstallStatus.INSTALLED
-        assert r.installed_now == ["python-docx"]
+        assert r.installed_now == ["fake-docx-dep"]
 
     def test_always_mode_installs_without_approval(self, monkeypatch):
         monkeypatch.setattr(di, "_run_pip_install", _ok_install)
-        r = di.ensure_satisfied(["python-docx"], mode=di.InstallMode.ALWAYS)
+        r = di.ensure_satisfied(["fake-docx-dep"], mode=di.InstallMode.ALWAYS)
         assert r.ok and r.status is di.InstallStatus.INSTALLED
 
     def test_failed_install_surfaces(self, monkeypatch):
         monkeypatch.setattr(di, "_run_pip_install", _fail_install)
-        r = di.ensure_satisfied(["python-docx"], mode=di.InstallMode.ALWAYS)
+        r = di.ensure_satisfied(["fake-docx-dep"], mode=di.InstallMode.ALWAYS)
         assert not r.ok
         assert r.status is di.InstallStatus.FAILED
         assert r.pip_stderr_tail == "boom"
 
     def test_invalid_spec_returns_failed_not_raise(self):
         r = di.ensure_satisfied(
-            ["python-docx; rm -rf /"],
+            ["fake-docx-dep; rm -rf /"],
             mode=di.InstallMode.ALWAYS,
         )
         assert not r.ok
@@ -210,8 +210,8 @@ class TestEnsureSatisfied:
             return _ok_install(packages, timeout=timeout)
         monkeypatch.setattr(di, "_run_pip_install", stub)
 
-        r1 = di.ensure_satisfied(["python-docx"], mode=di.InstallMode.ALWAYS)
-        r2 = di.ensure_satisfied(["python-docx"], mode=di.InstallMode.ALWAYS)
+        r1 = di.ensure_satisfied(["fake-docx-dep"], mode=di.InstallMode.ALWAYS)
+        r2 = di.ensure_satisfied(["fake-docx-dep"], mode=di.InstallMode.ALWAYS)
         assert r1.ok and r2.ok
         # Only one actual pip call.
         assert len(calls) == 1

@@ -112,8 +112,11 @@ class TestWiring:
         from systemu.interface import dashboard
         src = inspect.getsource(dashboard)
         assert '"/welcome"' in src, "the /welcome route must be registered"
-        assert "needs_onboarding" in src, \
-            "the home page must redirect first-run operators to /welcome"
+        # W11.4 superseded the home-only needs_onboarding redirect with the
+        # every-route onboarding_gate funnel (mandatory setup) — same intent,
+        # stronger contract.
+        assert "onboarding_gate" in src, \
+            "first-run operators must be redirected to /welcome"
 
     def test_welcome_offers_presets_but_never_collects_the_key(self):
         from systemu.interface.pages import welcome

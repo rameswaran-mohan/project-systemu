@@ -21,7 +21,11 @@ from typing import Dict, Mapping, Optional
 _BUDGET = {
     "tier1": "deepseek/deepseek-v4-flash",   # deep reasoning
     "tier2": "deepseek/deepseek-v4-flash",   # structured / code
-    "tier3": "z-ai/glm-4.5-air:free",        # fast / formatting
+    # W11.7: was z-ai/glm-4.5-air:free — OpenRouter now 404s it ("This model
+    # is unavailable"), which silently killed every tier-3 consumer
+    # (web_extract et al.) on default installs (field telemetry 2026-06-11).
+    # deepseek-v4-flash is cheap and proven live in the field.
+    "tier3": "deepseek/deepseek-v4-flash",   # fast / formatting
 }
 
 PRESETS: Dict[str, Dict[str, str]] = {
@@ -33,7 +37,7 @@ PRESETS: Dict[str, Dict[str, str]] = {
     "balanced": {
         "tier1": "deepseek/deepseek-v4",
         "tier2": "deepseek/deepseek-v4-flash",
-        "tier3": "z-ai/glm-4.5-air:free",
+        "tier3": "deepseek/deepseek-v4-flash",   # W11.7: glm-4.5-air:free 404s
     },
     "budget": dict(_BUDGET),
 }

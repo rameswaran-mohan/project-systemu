@@ -88,9 +88,8 @@ def build_insights_page(default_tab: str = "memory") -> None:
     ui.label("Insights").style(
         f"font-size: 28px; font-weight: 800; color: {THEME['text']}; margin-bottom: 4px;"
     )
-    ui.label(
-        "Operational analytics — memory health, the data flywheel, and the live Manual Logs."
-    ).style(
+    from systemu.interface.design.glossary import lore_sublabel
+    ui.label(lore_sublabel("insights")).style(
         f"color: {THEME['text_muted']}; font-size: 14px; margin-bottom: 20px;"
     )
 

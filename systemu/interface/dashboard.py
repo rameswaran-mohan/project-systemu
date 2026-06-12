@@ -277,6 +277,14 @@ def _build_layout(page_title: str, current_path: str):
                         )
                 dlg.open()
 
+            # W12 (audit): Home's "Record" tile used to call a navigate-to-/
+            # fallback that visibly did NOTHING on the home page itself.
+            # Stash the real opener per-client so any page can launch it.
+            try:
+                ui.context.client.systemu_open_record_dialog = _open_record_dialog
+            except Exception:
+                pass
+
             # Top Header Row
             with ui.row().classes("w-full items-center justify-between").style(
                 f"margin-bottom: 24px; border-bottom: 1px solid {THEME['border']}; padding-bottom: 12px;"
@@ -318,6 +326,14 @@ def _build_layout(page_title: str, current_path: str):
                             # button look like it never shipped.
                             logger.warning("[Dashboard] Status menu failed to render",
                                            exc_info=True)
+                    # W11.5: an unfinished tour stays visible until completed
+                    # (the tour never redirects — this pill is its memory).
+                    try:
+                        from systemu.interface.tour import render_tour_pill
+                        render_tour_pill(_ny_vault)
+                    except Exception:
+                        logger.debug("[Dashboard] tour pill failed", exc_info=True)
+
                     _ny_model = needs_you_badge_model(_ny_vault)
                     needs_you_badge = ui.link(
                         f"Needs you ({_ny_model['count']})",
@@ -326,6 +342,9 @@ def _build_layout(page_title: str, current_path: str):
                         "text-decoration: none; cursor: pointer;"
                     )
                     needs_you_badge.set_visibility(_ny_model["visible"])
+                    # W11.6: the header's primary controls explain themselves.
+                    with needs_you_badge:
+                        ui.tooltip("Approvals and questions waiting for you — click to answer")
 
                     def _update_needs_you():
                         m = needs_you_badge_model(_ny_vault)
@@ -341,6 +360,7 @@ def _build_layout(page_title: str, current_path: str):
                     # `.s-menu` token class — net-zero new inline styles vs the
                     # single styled Record button this replaces.
                     with ds_button("＋ New", variant="primary"):
+                        ui.tooltip("Start something: record yourself doing a task, or submit one in chat")
                         with ui.menu().classes("s-menu"):
                             ui.menu_item("Record session", on_click=_open_record_dialog)
                             ui.menu_item(
@@ -401,6 +421,14 @@ def _build_layout(page_title: str, current_path: str):
                     ui.label(_banner).style(
                         "font-weight: 700; font-size: 13px; line-height: 1.4;"
                     )
+
+            # W11.5: the floating tour card (?tour=N) — rendered by the
+            # layout so it follows the operator across every step's route.
+            try:
+                from systemu.interface.tour import maybe_render_tour
+                maybe_render_tour(current_path)
+            except Exception:
+                logger.debug("[Dashboard] tour card failed", exc_info=True)
 
             # Page content is rendered here by the caller
             content_area = ui.column().classes("w-full")
@@ -716,19 +744,29 @@ def register_routes() -> None:
     from systemu.interface.pages.work                      import build_work_page
     from systemu.interface.pages import recover as _recover_page_module  # noqa: F401  # registers /recover/<scope>/<id>
 
-    @ui.page("/")
-    def page_console():
-        # W9.1: first-run operators land on the onboarding wizard until they
-        # finish or explicitly skip (needs_onboarding is cheap + defensive —
-        # any vault error means "don't redirect").
-        from systemu.interface.pages.welcome import needs_onboarding
+    def _redirect_to_welcome_if_needed() -> bool:
+        """W11.4: funnel fresh installs to /welcome from EVERY route until
+        the API key exists and the profile is saved (onboarding_gate carries
+        the escape hatches: env flag, pre-W11 skip sentinel, defensive []).
+
+        Returns True when a redirect was issued — the caller stops rendering.
+        """
         try:
             from systemu.interface.dashboard_state import AppState as _ObState
-            _ob_vault = getattr(_ObState.get(), "vault", None)
+            from systemu.interface.pages.welcome import onboarding_gate
+            _st = _ObState.get()
+            missing = onboarding_gate(getattr(_st, "vault", None),
+                                      getattr(_st, "config", None))
         except Exception:
-            _ob_vault = None
-        if _ob_vault is not None and needs_onboarding(_ob_vault):
+            return False
+        if missing:
             ui.navigate.to("/welcome")
+            return True
+        return False
+
+    @ui.page("/")
+    def page_console():
+        if _redirect_to_welcome_if_needed():
             return
         with _build_layout("Home", "/"):
             build_console_page()
@@ -747,11 +785,15 @@ def register_routes() -> None:
     # via redirects in a later slice; for now only the nav repoints here.
     @ui.page("/work")
     def page_work():
+        if _redirect_to_welcome_if_needed():
+            return
         with _build_layout("Work", "/work"):
             build_work_page()
 
     @ui.page("/workflow/{workflow_id}")
     def page_workflow_detail(workflow_id: str):
+        if _redirect_to_welcome_if_needed():
+            return
         # Pass the REAL path so spine_of highlights the Work spine
         # (/scrolls) — this page used to claim "/" and lit Home.
         with _build_layout(f"Workflow — {workflow_id}", f"/workflow/{workflow_id}"):
@@ -759,11 +801,15 @@ def register_routes() -> None:
 
     @ui.page("/scrolls")
     def page_scrolls():
+        if _redirect_to_welcome_if_needed():
+            return
         with _build_layout("Scrolls", "/scrolls"):
             build_scrolls_page()
 
     @ui.page("/shadows")
     def page_shadows():
+        if _redirect_to_welcome_if_needed():
+            return
         # 6h: /shadows is canonical; /army now redirects here. The builder
         # (build_army_page) + the shadow_army storage key are unchanged — this
         # is a URL rename only.
@@ -773,6 +819,8 @@ def register_routes() -> None:
     # ── Insights (v0.7.2: tabbed parent for Memory / Flywheel / Events) ───
     @ui.page("/insights")
     def page_insights(tab: str = "memory"):
+        if _redirect_to_welcome_if_needed():
+            return
         # ?tab=memory|flywheel|events selects the active tab (invalid values
         # fall back to memory inside build_insights_page).
         with _build_layout("Insights", "/insights"):
@@ -780,6 +828,8 @@ def register_routes() -> None:
 
     @ui.page("/memory/{shadow_id}")
     def page_shadow_memory(shadow_id: str):
+        if _redirect_to_welcome_if_needed():
+            return
         # Per-shadow memory view stays its own page — it's deep-linked from
         # the Insights → Memory tab's "View memory" buttons.  Pass the REAL
         # path so spine_of highlights the Shadows spine (/shadows) — this page
@@ -789,11 +839,15 @@ def register_routes() -> None:
 
     @ui.page("/activities")
     def page_activities():
+        if _redirect_to_welcome_if_needed():
+            return
         with _build_layout("Activities", "/activities"):
             build_activities_page()
 
     @ui.page("/tools")
     def page_tools(forge: str = ""):
+        if _redirect_to_welcome_if_needed():
+            return
         # ?forge=<tool_id> deep-links to a proposed tool and auto-opens its
         # spec/code review dialog (precedent: page_insights(tab=...)).
         with _build_layout("Build", "/tools"):
@@ -801,6 +855,8 @@ def register_routes() -> None:
 
     @ui.page("/skills")
     def page_skills():
+        if _redirect_to_welcome_if_needed():
+            return
         with _build_layout("Skills Registry", "/skills"):
             build_skills_page()
 
@@ -810,23 +866,31 @@ def register_routes() -> None:
 
     @ui.page("/evolutions")
     def page_evolutions():
+        if _redirect_to_welcome_if_needed():
+            return
         with _build_layout("Evolutions", "/evolutions"):
             build_evolutions_page()
 
     @ui.page("/settings")
     def page_settings():
+        if _redirect_to_welcome_if_needed():
+            return
         with _build_layout("Settings", "/settings"):
             build_settings_page()
 
     # ── Inbox (Phase 3 Batch 3: the one decisions surface — unified cards) ─
     @ui.page("/inbox")
     def page_inbox():
+        if _redirect_to_welcome_if_needed():
+            return
         with _build_layout("Inbox", "/inbox"):
             build_inbox_page()
 
     # ── Chat (v0.7.2: now tabbed — Compose + Live Events) ─────────────────
     @ui.page("/chat")
     def page_chat(tab: str = "compose", prefill: str = ""):
+        if _redirect_to_welcome_if_needed():
+            return
         # ?tab=compose|live selects the active tab.  /systemu-chat redirects
         # here with tab=live so legacy deep-links keep working.
         # W10.4: ?prefill= lands a starter prompt in the composer (the
@@ -874,6 +938,10 @@ def run_dashboard(
     import os
     if not host:
         host = os.getenv("SYSTEMU_DASHBOARD_HOST", "127.0.0.1")
+
+    # W12 (audit F2): the sidebar footer displays SYSTEMU_DASHBOARD_PORT —
+    # stamp the REAL serving port so custom ports don't show ":8765".
+    os.environ["SYSTEMU_DASHBOARD_PORT"] = str(port)
 
     try:
         from nicegui import ui, app as ng_app
