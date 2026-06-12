@@ -70,6 +70,28 @@ def _find_listening_pid(port: int):
 #  Public commands
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _dashboard_port_free(port: int, host: str = "") -> bool:
+    """W13.7: pre-bind probe — True when the dashboard port is free.
+
+    The loser of a port race used to keep running headless while recordings
+    and decisions landed in whichever vault won (5 daemons seen racing one
+    port in the field). Never raises.
+    """
+    import socket
+    h = host or os.getenv("SYSTEMU_DASHBOARD_HOST", "127.0.0.1")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((h, int(port)))
+        finally:
+            s.close()
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True  # probe failure must not block a legitimate boot
+
+
 def start_daemon(
     vault_dir: str,
     config,
@@ -616,6 +638,17 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     )
 
     # ── Start NiceGUI dashboard in a background thread ─────────────────────
+    # W13.7 (field hazard: 5 daemons racing one port): fail FAST when the
+    # port is taken — the loser of the race used to keep running headless
+    # while recordings/decisions landed in whichever vault won.
+    if not _dashboard_port_free(port):
+        logger.critical(
+            "[Daemon] Port %d is already in use — another systemu daemon? "
+            "Refusing to start so recordings can't land in the wrong vault. "
+            "Stop the other instance (`sharing_on daemon stop --all`) or use "
+            "a different --port.", port)
+        return
+
     try:
         from systemu.interface.dashboard import run_dashboard_thread
         run_dashboard_thread(config, port=port)

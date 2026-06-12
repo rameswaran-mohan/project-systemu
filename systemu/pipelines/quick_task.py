@@ -284,9 +284,19 @@ def run_quick_task(
 
         if kind == "ANSWER":
             answer = str(action.get("answer_md") or "").strip()
-            _publish("INFO", f"[{iteration}/{max_iters}] answer ready")
+            # W13.6 (groundedness, minimal): the model's own honest verdict.
+            # A "could not complete" answer must never report success — the
+            # field run 'nearest barito shop' admitted failure in the text
+            # yet was counted a success. Missing/odd values default to True
+            # (back-compat with scripted tests and older transcripts).
+            completed = action.get("completed")
+            completed = True if completed is None else bool(completed)
+            _publish("INFO" if completed else "WARNING",
+                     f"[{iteration}/{max_iters}] answer ready"
+                     + ("" if completed else " (task NOT completed)"))
             return _finish(QuickResult(
-                status="success", answer_md=answer or "(empty answer)",
+                status="success" if completed else "partial",
+                answer_md=answer or "(empty answer)",
                 iterations=iteration))
 
         if kind == "ASK_USER":
@@ -337,6 +347,23 @@ def run_quick_task(
                 # W11.7: a failure with no message is unactionable — the
                 # field report literally read "run_command failed: None".
                 error = _failure_error(error, parsed)
+            if (not success and parsed.get("error_type")
+                    == "dependency_install_pending_approval"):
+                # W13.2b: a blocked package must be ONE CLICK away — surface
+                # the dep gate in needs-you immediately (idempotent dedup);
+                # Approve installs it and the next attempt proceeds.
+                try:
+                    from systemu.runtime.tool_registry import (
+                        _maybe_enqueue_dep_gate)
+                    for _pkg in (parsed.get("missing_packages") or []):
+                        _maybe_enqueue_dep_gate(
+                            vault=vault, tool_id=getattr(tool, "id", "") or "",
+                            tool_name=tool_name, package=str(_pkg))
+                    error = (str(error) + " An Approve & install button is "
+                             "waiting in the dashboard's Needs-you.")
+                except Exception:
+                    logger.debug("[QuickTask] dep gate enqueue failed",
+                                 exc_info=True)
             history.append({
                 "role": "tool_result", "tool": tool_name, "success": success,
                 "parsed": _clamp(parsed), "error": error,

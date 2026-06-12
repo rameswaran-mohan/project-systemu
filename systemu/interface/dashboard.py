@@ -588,6 +588,13 @@ def _stop_capture(jm):
     # for every outcome (dispatched / no captures dir / no session) so the
     # operator sees what happened.
     from nicegui import ui as _ui_for_toast
+    # W13.4 / W7.1: capture the client on the UI thread — the refine
+    # launcher below runs on a worker thread and must re-enter it for
+    # notify/navigate to reach this operator's browser.
+    try:
+        _client = ui.context.client
+    except Exception:
+        _client = None
     for j in capture_jobs:
         job_name = j.name  # capture name BEFORE stopping (closure-safe)
         jm.stop_job_gracefully(j.id)
@@ -633,12 +640,20 @@ def _stop_capture(jm):
                 job_type="refine", dedup_key=f"refine:{latest}",
             )
             logger.info("[Dashboard] Refine job dispatched for: %s", latest)
+            # W13.4: plain-language guidance + take the operator to Work,
+            # where the new workflow row appears and (W12 F7) Needs-you
+            # rings the moment analysis finishes. W7.1 pattern: re-enter the
+            # captured client — this runs on a worker thread.
             try:
-                _ui_for_toast.notify(
-                    f"Refine job dispatched for {latest.name}. "
-                    f"Watch /scrolls for the result.",
-                    type="positive",
-                )
+                if _client is not None:
+                    with _client:
+                        _ui_for_toast.notify(
+                            "Recording saved — turning it into a workflow "
+                            "now. You'll see it in Work, and Needs-you will "
+                            "ring when it's ready to review.",
+                            type="positive", timeout=8000,
+                        )
+                        _ui_for_toast.navigate.to("/work")
             except Exception:
                 pass
 

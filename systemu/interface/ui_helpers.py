@@ -115,6 +115,26 @@ class RepaintGate:
         return True
 
 
+def background_activity_count() -> int:
+    """Best-effort count of running background work (jobs + executions).
+
+    W13.1: drives the small Live-header spinner so the operator always has
+    a fingertip indication that something is still running. Never raises.
+    """
+    n = 0
+    try:
+        from systemu.interface.jobs import JobManager
+        n += len(JobManager.get().get_active_jobs())
+    except Exception:
+        pass
+    try:
+        from systemu.runtime.supervisor import Supervisor
+        n += int(Supervisor.get().get_status().get("running_count", 0) or 0)
+    except Exception:
+        pass
+    return n
+
+
 def gated_refresh(fingerprint_fn: Callable[[], Any],
                   refresh_fn: Callable[[], Any]) -> Callable[[], None]:
     """A timer tick that repaints ONLY when the data actually changed (W12).

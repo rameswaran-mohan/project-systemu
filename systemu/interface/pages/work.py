@@ -131,6 +131,40 @@ def _filter_rows(rows: List[Dict[str, Any]], query, status) -> List[Dict[str, An
 # status_class → s-pill tint token (the only mapping the renderer needs).
 _PILL_CLASS = {"ok": "s-pill--success", "warn": "s-pill--warn", "danger": "s-pill--danger"}
 
+# W13.4: statuses after which "Run again" makes sense — the workflow has
+# actually run to a terminal state (success OR failure: re-running a failed
+# run is the most common operator wish).
+_RERUN_STATUSES = {"completed", "success", "done", "failed", "failure",
+                   "partial", "cancelled"}
+
+
+def can_rerun(row: Dict[str, Any]) -> bool:
+    """W13.4: the repeatability payoff, made visible — offered once the
+    workflow reached a terminal state and isn't waiting on approval."""
+    if row.get("needs_approval"):
+        return False
+    return str(row.get("status", "")).lower() in _RERUN_STATUSES
+
+
+def rerun_workflow(scroll_id: str) -> str:
+    """Resubmit the workflow's activity to its assigned shadow (a fresh
+    execution — Supervisor dedups in-flight duplicates). Returns the toast
+    message; raises with a plain-language reason when it can't."""
+    from systemu.interface.dashboard_state import AppState
+    from systemu.runtime.supervisor import Supervisor
+
+    vault = AppState.get().vault
+    acts = vault.load_index("activities") or []
+    act = next((a for a in acts if a.get("scroll_id") == scroll_id), None)
+    if act is None:
+        raise ValueError("this workflow has no runnable activity yet")
+    shadow_id = act.get("assigned_shadow_id")
+    if not shadow_id:
+        raise ValueError("no specialist assigned yet — approve the workflow first")
+    Supervisor.get().submit(act["id"], shadow_id, reason="operator_rerun",
+                            scroll_id=scroll_id)
+    return f"Re-running '{act.get('name') or scroll_id}' — watch Live."
+
 def _short_ts(iso: str) -> str:
     """ISO timestamp → human-readable (seconds precision)."""
     return (iso or "")[:19].replace("T", " ")
@@ -271,6 +305,29 @@ def _render_row(row: Dict[str, Any], on_refresh=None) -> None:
                     on_click=lambda _, i=row["workflow_id"]:
                         open_scroll_review_dialog(i, on_resolved=on_refresh),
                 ).classes("s-btn s-btn--primary")
+            elif can_rerun(row):
+                # W13.4: one click re-runs a learned workflow (W7.1 pattern:
+                # submit off-loop, re-enter the captured client after).
+                async def _on_rerun(_=None, sid=row["workflow_id"]):
+                    import asyncio
+                    try:
+                        client = ui.context.client
+                    except Exception:
+                        client = None
+                    try:
+                        msg = await asyncio.to_thread(rerun_workflow, sid)
+                        typ = "positive"
+                    except Exception as exc:
+                        msg, typ = f"Could not re-run: {exc}", "negative"
+                    if client is not None:
+                        try:
+                            with client:
+                                ui.notify(msg, type=typ)
+                        except Exception:
+                            pass
+
+                ui.button("Run again", on_click=_on_rerun).classes(
+                    "s-btn s-btn--ghost")
 
             ui.label(_short_ts(row["updated_at"])).classes("s-mono")
 

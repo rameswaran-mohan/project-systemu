@@ -160,6 +160,13 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
         for ev in rows:
             _render_row(ev)
 
+    # W13.1: repaints pause while the operator reads an expansion — a
+    # mid-stream rebuild yanked open content and could eat racing clicks.
+    _paused_chip = ui.label(
+        "paused while reading — close to resume"
+    ).classes("s-muted").style("font-size: 11px;")
+    _paused_chip.set_visibility(False)
+
     scroll_style = f"height: {height_px}px; width: 100%;"
     with ui.scroll_area().style(scroll_style):
         _pane()
@@ -177,8 +184,20 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
     # W11.1: change-gated — an unconditional refresh rebuilt every expansion
     # collapsed twice a second, so the expand arrow could never stay open.
     def _tick() -> None:
-        if gate.should_paint():
-            _pane.refresh()
+        if not gate.should_paint():
+            return
+        if any(open_state.values()):
+            gate.bump()
+            try:
+                _paused_chip.set_visibility(True)
+            except Exception:
+                pass
+            return
+        try:
+            _paused_chip.set_visibility(False)
+        except Exception:
+            pass
+        _pane.refresh()
 
     safe_timer(0.5, _tick)
 
@@ -216,5 +235,24 @@ def render_right_rail(vault, stream_ref: str = "") -> None:
     build_inbox_rail_section(vault, stream_ref=stream_ref)
 
     # "Live" — recent streamed run events (no header of its own).
-    ui.label("Live").classes("s-section-head").style("margin-top: 16px;")
+    with ui.row().classes("items-center").style("gap: 8px; margin-top: 16px;"):
+        ui.label("Live").classes("s-section-head")
+        # W13.1: fingertip signal that something is running in the background.
+        from systemu.interface.ui_helpers import (
+            background_activity_count, safe_timer as _hdr_timer)
+        _busy = ui.spinner("dots", size="sm")
+        _busy.set_visibility(False)
+        _busy.tooltip("Working in the background…")
+        _busy_state = {"on": False}
+
+        def _busy_tick() -> None:
+            try:
+                on = background_activity_count() > 0
+                if on != _busy_state["on"]:
+                    _busy_state["on"] = on
+                    _busy.set_visibility(on)
+            except Exception:
+                pass
+
+        _hdr_timer(2.0, _busy_tick)
     live_runs_pane(stream_ref=stream_ref)

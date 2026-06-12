@@ -17,14 +17,16 @@ outside the JSON).
 
 2. Deliver the final answer:
 ```
-{"action": "ANSWER", "answer_md": "<the complete answer, rich markdown>"}
+{"action": "ANSWER", "answer_md": "<the complete answer, rich markdown>", "completed": true}
 ```
 - Answer as soon as you genuinely can — do not pad the loop.
 - The answer must be grounded in the tool results in your history. Quote the
   concrete data you found (names, prices, paths). If you saved files, list
   their full paths.
-- If the task cannot be completed, ANSWER honestly with what you tried, what
-  failed, and what the operator could do (this is still an ANSWER).
+- `completed` is your honest verdict: true ONLY when the task was actually
+  accomplished. If the task cannot be completed, ANSWER honestly with what
+  you tried, what failed, and what the operator could do — and set
+  `"completed": false`. Never dress a failure as a success.
 
 3. Ask the operator (only when the task is impossible without it):
 ```

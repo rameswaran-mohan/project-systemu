@@ -223,10 +223,21 @@ def build_supervisor_events_pane(
         gate.bump()
         _tick()  # late-bound closure — defined below, before any toggle fires
 
-    switch = ui.switch(
-        "Show system", value=show_system_default, on_change=_on_toggle
-    ).props("dense")
-    switch.style(f"color: {THEME['text_muted']}; font-size: 11px; margin-bottom: 4px;")
+    with ui.row().classes("items-center").style("gap: 10px;"):
+        switch = ui.switch(
+            "Show system", value=show_system_default, on_change=_on_toggle
+        ).props("dense")
+        switch.style(f"color: {THEME['text_muted']}; font-size: 11px; margin-bottom: 4px;")
+        # W13.1: fingertip signal that work is still running in the background.
+        _busy = ui.spinner("dots", size="sm")
+        _busy.set_visibility(False)
+        _busy.tooltip("Working in the background…")
+        # W13.1: repaints pause while the operator reads an expansion — a
+        # mid-stream rebuild yanked open content and could eat clicks.
+        _paused_chip = ui.label(
+            "live updates paused while reading — close details to resume"
+        ).classes("s-muted").style("font-size: 11px;")
+        _paused_chip.set_visibility(False)
 
     def _plain_row(ev) -> None:
         """Render one event as the flat time / level / message row (no arrow)."""
@@ -306,10 +317,31 @@ def build_supervisor_events_pane(
     # 0.5 s refresh destroyed and rebuilt every expansion collapsed, so the
     # expand arrow could never stay open (a fresh gate paints its first tick,
     # so the replayed history still shows immediately).
+    _busy_state = {"on": False}
+
     def _tick() -> None:
+        # W13.1: background-activity spinner (cheap; only flips on change).
+        try:
+            from systemu.interface.ui_helpers import background_activity_count
+            busy = background_activity_count() > 0
+            if busy != _busy_state["on"]:
+                _busy_state["on"] = busy
+                _busy.set_visibility(busy)
+        except Exception:
+            pass
         if not gate.should_paint():
             return
+        # W13.1: never rebuild under the reader — pause while any expansion
+        # is open; re-arm the gate so the queued update applies on collapse.
+        if any(open_state.values()):
+            gate.bump()
+            try:
+                _paused_chip.set_visibility(True)
+            except Exception:
+                pass
+            return
         try:
+            _paused_chip.set_visibility(False)
             _pane.refresh()
         except Exception:
             pass  # client may have disconnected

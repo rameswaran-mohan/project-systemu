@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.9.21"
+version = "0.9.22"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -63,6 +63,17 @@ dependencies = [
     "python-docx>=1.1",    # create/read_word_doc
     "pyperclip>=1.8",      # clipboard_read / clipboard_write
     "plyer>=2.1",          # notify_desktop
+
+    # --- W13.2a: packages forged tools most commonly request ---------------
+    # Evidence: the field dep-approval store + forge history (geopy was the
+    # first operator-approved package; data/scrape/date work dominates forge
+    # asks). Bundling them removes the most frequent approval interruption;
+    # anything NOT bundled still gets the one-click Inbox approve (W13.2b).
+    "pandas>=2.0",         # tabular work — the most common forge ask
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",           # bs4's fast parser + xml tooling
+    "geopy>=2.4",          # location lookups (get_current_location et al)
+    "python-dateutil>=2.9",
 ]
 
 [project.optional-dependencies]

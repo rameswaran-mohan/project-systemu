@@ -49,8 +49,16 @@ fi
 #            errors, so a broken migration doesn't block the container.
 if [ -n "${SYSTEMU_DATABASE_URL:-}" ]; then
     echo "[entrypoint] Running alembic upgrade head ..."
-    (cd /app && alembic upgrade head 2>&1) \
-        || echo "[entrypoint] alembic upgrade failed — daemon will fall back to SQLAlchemy create_all"
+    (cd /app && alembic upgrade head 2>&1) || {
+        # W13.7 (docker A6 audit): upgrade failed (typically a half-created
+        # alembic_version from a prior boot on a persisted volume). The
+        # daemon's create_all builds the CURRENT model schema (= head), so
+        # stamping head records the truthful baseline and future migrations
+        # apply as deltas instead of failing forever.
+        echo "[entrypoint] alembic upgrade failed — stamping head (create_all builds current schema)"
+        (cd /app && alembic stamp head 2>&1) \
+            || echo "[entrypoint] stamp also failed — daemon falls back to SQLAlchemy create_all only"
+    }
 fi
 
 exec "$@"

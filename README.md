@@ -1,64 +1,82 @@
 # Systemu
 
-> **The open-source way to record any computer workflow, export it as a portable Anthropic Agent Skill, and run it locally with a supervised agent runtime.**
+> **Teach your computer your job — by doing it once.**
+> Record any task on your screen. Systemu turns the recording into a
+> repeatable workflow, staffs it with an AI specialist, and runs it under
+> your approval — every action gated, logged, and local.
 
-<!-- v0.7-b: hero gif placeholder. Operator records the actual screencast later. -->
-<!-- ![Systemu dashboard](assets/dashboard-hero.gif) -->
-<!-- Until the gif is recorded, this comment block keeps the README rendering clean on github.com. -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
-## Install
+## Why Systemu
+
+Chat assistants wait to be asked, and agent frameworks need you to write
+skills by hand. Systemu learns the way a colleague does — **by watching
+you work**. Do the task once; it writes the step-by-step playbook, asks
+your approval, and from then on it's one click to run again. That makes
+it the LLM-native answer to RPA: no selectors, no scripts, no consultant.
+
+And unlike the viral personal-assistant agents, Systemu is built for work
+that has consequences:
+
+* **Approval gates with un-automatable floors** — installing packages,
+  running freshly written code, destructive steps: each lands as one card
+  in your Inbox with a plain-English summary and a safe default. Most
+  approvals are one click; none are silent.
+* **Local-first** — your recordings, workflows, memory, and results live
+  in a vault on your machine. API keys are never typed into the browser.
+* **Honest by construction** — tool results are verified (a no-output
+  call is a failure, not a phantom success), outcomes report file paths
+  you can open, and "couldn't do it" is never dressed up as done.
+
+## Quick start
 
 ```bash
-pip install systemu                                                       # PyPI
-docker run -p 8765:8765 ghcr.io/rameswaran-mohan/systemu:0.9.11           # Docker
+pip install systemu
 ```
-
-### First run (after `pip install`)
 
 In your chosen working directory:
 
 ```bash
-sharing_on init       # seeds ./systemu/vault/ with the bundled starter catalog
+sharing_on init           # seeds the starter catalog (41 tools, idempotent)
 sharing_on daemon start
 ```
 
-> The `init` command is idempotent and only needs to run once per working directory. It copies the starter tools + skills from the wheel into your vault so the system has a working catalog on first run. Without `init`, the daemon will start but the vault will be empty until you run a capture session that triggers auto-forge.
+Open <http://localhost:8765>. A two-minute setup wizard and guided tour
+take it from there: add your key, say who you are, run a starter task —
+then hit **Record** and teach it something real.
 
-Open the dashboard at <http://localhost:8765>.
+**The one-page guide:** [OPERATOR-SOP.md](OPERATOR-SOP.md) — the
+record → approve → run → results loop, what each approval card means, and
+a troubleshooting table. New to the vocabulary?
+[docs/glossary.md](docs/glossary.md) maps Systemu terms to industry ones.
 
-> New to the vocabulary? See [docs/glossary.md](docs/glossary.md) for a Systemu → industry-terms map.
->
-> **How do I actually work with it?** One page: [OPERATOR-SOP.md](OPERATOR-SOP.md) — the record→approve→run→results loop, what the approval cards mean, and a troubleshooting table.
+Docker (Postgres-backed) and enterprise (Redis-scaled) modes:
 
----
+```bash
+git clone <this repo> && cd <repo>
+python install.py --mode docker-local     # or docker-enterprise
+```
 
-[![tests](https://github.com/rameswaran-mohan/project-systemu-pro/actions/workflows/test.yml/badge.svg)](https://github.com/rameswaran-mohan/project-systemu-pro/actions/workflows/test.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+## What's in the box
 
-> **An AI runtime that turns recorded workflows into autonomous agents you operate from a dashboard.**
+- **Sharing-On** (`sharing_on`) — the capture engine: records screenshots,
+  window switches, file changes, and input while you demonstrate a task,
+  then turns the recording into accurate plain-English instructions.
+- **Systemu runtime** — executes workflows through AI **Shadow** agents
+  (specialists created per job, with your approval), a curated 41-tool
+  registry that works out of the box, MCP connector support, episodic
+  memory, and an evolution engine that proposes improvements from real runs.
+- **The dashboard** — a command center: **Home · Work · Shadows · Build ·
+  Insights · Settings**, a persistent *Needs you* + *Live* rail, and one
+  Decisions Inbox where every approval lands. Quick tasks answer in
+  seconds from Chat; recorded workflows re-run in one click.
 
-Systemu combines two components:
-
-- **Sharing-On** (`sharing_on`) records what you do on your computer
-  and converts the recording into a structured workflow specification
-  using an LLM.
-- **Systemu runtime** executes that specification autonomously through
-  AI **Shadow** agents, a curated tool registry, an intent-aware
-  governance layer, and a NiceGUI dashboard.
-
-The dashboard is a **command center** organised around six spines —
-**Home**, **Work**, **Shadows**, **Build**, **Insights**, and
-**Settings** — with a persistent right rail (what *Needs you* + a *Live*
-run feed) and a single **Decisions Inbox** where every approval gate
-lands in one place. See [Dashboard](#dashboard) below.
-
-**📚 Read these first:**
+**📚 More:**
 [Getting Started](docs/getting-started.md) ·
 [Architecture](ARCHITECTURE.md) ·
 [User Guide](USER_GUIDE.md) ·
-[Contributing](CONTRIBUTING.md) ·
-[Migration (v0.2)](MIGRATION.md)
+[Contributing](CONTRIBUTING.md)
 
 ---
 
