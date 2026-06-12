@@ -254,6 +254,10 @@ def _render_history_card(row: Dict[str, Any]) -> None:
     ):
         status_pill(descriptor.risk)
         ui.label(descriptor.title).classes("s-cell").style("flex: 1;")
+        # W10.2: policy auto-grants are visibly marked — the audit trail
+        # must distinguish "the operator approved" from "the dial approved".
+        if (row.get("context") or {}).get("resolved_by") == "auto_policy":
+            ui.html('<span class="s-pill s-pill--info">auto-policy</span>')
         choice = row.get("choice") or ""
         ui.html(f'<span class="s-pill s-pill--muted">{choice}</span>')
 

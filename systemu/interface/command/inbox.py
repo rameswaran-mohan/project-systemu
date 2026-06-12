@@ -281,6 +281,24 @@ class InboxQueue:
                 risk=descriptor.risk, gate_type=gate_type, capability=capability)
             if verdict == "allow":
                 # Auto-grant: execute the authorized action WITHOUT posting.
+                # W10.2: but NEVER without a trace — the deny path always
+                # recorded an audit row while allow recorded NOTHING, leaving
+                # policy auto-grants invisible to the audit trail. Save a
+                # BORN-RESOLVED decision row (resolved_by=auto_policy): it
+                # shows in /inbox History and exports with the ledger, but
+                # was never pending — so it cannot ping the needs-you badge
+                # or push "Needs you" to the operator's phone. Best-effort:
+                # an audit-write failure must not block the grant (it is
+                # logged loud instead).
+                try:
+                    self._save_auto_allow_audit_row(
+                        descriptor, gate_type, ctx,
+                        vault=vault or self._vault)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "[inbox] could not record auto-allow audit row for %s",
+                        descriptor.dedup, exc_info=True)
                 synthetic = _synthetic_approved(descriptor, gate_type)
                 return resolve_gate(synthetic, vault=vault or self._vault)
             if verdict == "deny":
@@ -312,6 +330,32 @@ class InboxQueue:
             context=ctx,
             dedup_key=descriptor.dedup,
         )
+
+    def _save_auto_allow_audit_row(self, descriptor: GateDescriptor,
+                                   gate_type: str, ctx: dict, *, vault) -> None:
+        """W10.2: persist a born-resolved decision row for a policy
+        auto-grant. Constructed directly (NOT posted): posting would fire
+        operator_decision_posted → needs-you badge + phone push for
+        something that needed no attention."""
+        import uuid
+        from datetime import datetime, timezone
+        from systemu.approval.decision_queue import OperatorDecision
+
+        now = datetime.now(tz=timezone.utc)
+        options = list(descriptor.options or [])
+        affirmative = options[-1] if options else "Approve"
+        vault.save_decision(OperatorDecision(
+            id=f"dec_{uuid.uuid4().hex[:8]}",
+            title=descriptor.title,
+            body=(descriptor.inspect or "")[:500],
+            options=options or [affirmative],
+            context={**ctx, "resolved_by": "auto_policy"},
+            dedup_key=descriptor.dedup,
+            status="resolved",
+            choice=affirmative,
+            created_at=now,
+            resolved_at=now,
+        ))
 
     def list_descriptors(self) -> List[Tuple[str, GateDescriptor]]:
         out: List[Tuple[str, GateDescriptor]] = []

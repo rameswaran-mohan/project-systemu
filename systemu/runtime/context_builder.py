@@ -91,6 +91,11 @@ class ExecutionContext:
         self._history:   List[ExecutionEvent] = []
         self._snapshots: List[Snapshot]       = []
 
+        # W8.4: verified artifact paths accumulated across the run (fed by
+        # the runtime's tool-result site via add_files; surfaced through
+        # build_result so files_produced stops being a permanent []).
+        self.files_produced: List[str] = []
+
         # v0.4.0-b: persistent across rollback (rollback rewinds _history;
         # sticky notes survive so the LLM doesn't replay failed paths with
         # amnesia).  Reflection blocks are also stored here so they end up
@@ -450,6 +455,16 @@ class ExecutionContext:
 
     # ── Result building ───────────────────────────────────────────────────────
 
+    def add_files(self, paths: List[str]) -> None:
+        """W8.4: record verified artifact paths (deduped, order preserved).
+        Defensive against contexts built without __init__ (test fixtures,
+        legacy resume shims) — the attribute self-heals."""
+        if not hasattr(self, "files_produced"):
+            self.files_produced = []
+        for path in paths or []:
+            if path and path not in self.files_produced:
+                self.files_produced.append(path)
+
     def build_result(
         self,
         status: str,
@@ -490,5 +505,7 @@ class ExecutionContext:
             "tools_called":   tools_called,
             "tool_calls":     len(tool_events),
             "rounds":         rounds,
+            # W8.4: real per-file artifact tracking (was a permanent []).
+            "files_produced": list(getattr(self, "files_produced", []) or []),
             "timestamp":      utcnow().isoformat(),
         }

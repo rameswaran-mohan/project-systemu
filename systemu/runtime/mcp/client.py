@@ -64,6 +64,47 @@ def mcp_call_tool(
     return {"success": True, "response": body}
 
 
+def mcp_list_tools(
+    *,
+    server: str,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    """W9.3 — discover the tools a server offers (POST {server}/tools/list).
+
+    Tolerant normalization: accepts ``{"tools": [...]}`` or a bare list;
+    each entry becomes ``{"name", "description", "schema"}`` (``inputSchema``
+    and ``parameters`` both accepted as the schema key). Honest failure dict
+    on any error — discovery must never raise into the Settings page.
+    """
+    url = f"{server.rstrip('/')}/tools/list"
+    try:
+        resp = httpx.post(url, json={}, timeout=timeout)
+    except Exception as exc:
+        return {"success": False, "error": f"connection failed: {exc}"}
+    if resp.status_code >= 400:
+        return {"success": False,
+                "error": f"HTTP {resp.status_code}: {getattr(resp, 'text', '')[:200]}"}
+    try:
+        body = resp.json()
+    except Exception as exc:
+        return {"success": False, "error": f"response not JSON: {exc}"}
+
+    raw = body.get("tools") if isinstance(body, dict) else body
+    if not isinstance(raw, list):
+        return {"success": False, "error": "response carried no tools list"}
+    tools = []
+    for entry in raw:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        tools.append({
+            "name": str(entry["name"]),
+            "description": str(entry.get("description") or ""),
+            "schema": dict(entry.get("inputSchema")
+                           or entry.get("parameters") or {}),
+        })
+    return {"success": True, "tools": tools}
+
+
 # ── Tool registration ─────────────────────────────────────────────────
 
 _MCP_SCHEMA = {

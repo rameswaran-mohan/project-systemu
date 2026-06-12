@@ -48,6 +48,46 @@ def build_settings_page() -> None:
                 config.tier3_model,
             )
 
+            # W8.1: preset fill-in. Applying a preset fills the three tier
+            # inputs; "Save Settings" then persists them as the explicit
+            # SYSTEMU_TIER*_MODEL vars (which always win over the preset env,
+            # so there is never a precedence surprise).
+            from sharing_on.model_presets import PRESETS, is_budget_class
+            from systemu.interface.design.primitives import button as _ds_btn
+
+            @ui.refreshable
+            def _brain_advisory() -> None:
+                if is_budget_class(tier1.value):
+                    ui.label(
+                        "Tier 1 (the reasoning brain) is a flash/free-class "
+                        "model — cheap, but it caps task quality. Apply the "
+                        "'quality' preset for noticeably better results."
+                    ).classes("s-banner s-banner--warn w-full")
+
+            with ui.row().classes("w-full items-center q-gutter-sm"):
+                preset_select = ui.select(
+                    sorted(PRESETS), label="Preset",
+                ).classes("s-input")
+
+                def _apply_preset(_=None):
+                    tiers = PRESETS.get(preset_select.value or "")
+                    if not tiers:
+                        ui.notify("Pick a preset first.", type="info")
+                        return
+                    tier1.value = tiers["tier1"]
+                    tier2.value = tiers["tier2"]
+                    tier3.value = tiers["tier3"]
+                    _brain_advisory.refresh()
+                    ui.notify(
+                        f"Preset '{preset_select.value}' filled in — click "
+                        "Save Settings to apply.", type="info",
+                    )
+
+                _ds_btn("Apply preset", variant="ghost", on_click=_apply_preset)
+
+            _brain_advisory()
+            tier1.on("change", lambda _: _brain_advisory.refresh())
+
         # ── Behaviour ──────────────────────────────────────────────────────
         _section_header("Behaviour")
         with ui.column().style(
@@ -126,6 +166,138 @@ def build_settings_page() -> None:
             ui.label("API key is loaded from the .env file. Editing is not supported live for security — update the .env file and restart.").style(
                 f"font-size: 12px; color: {THEME['text_muted']};"
             )
+
+        # ── MCP servers (W9.3) ─────────────────────────────────────────────
+        _section_header("MCP servers")
+        with ui.column().classes("s-card w-full"):
+            ui.label(
+                "Connect external MCP tool servers (bring-your-own URL; "
+                "OAuth-protected servers are not supported yet). Discovered "
+                "tools stay OFF until you enable them — enabled connector "
+                "tools become callable from Chat's Quick answer lane."
+            ).classes("s-muted")
+
+            from systemu.runtime.mcp.connections import (
+                add_server, all_servers, enabled_tools, is_tool_enabled,
+                remove_server, set_tool_enabled,
+            )
+            from systemu.interface.design.primitives import button as _mcp_btn
+
+            def _mcp_tool_dialog(server: str, tools: list) -> None:
+                from systemu.interface.design import card as _card
+                with ui.dialog() as dlg, _card(classes="s-dialog q-pa-lg"):
+                    ui.label(f"Tools on {server}").classes("s-dialog-title")
+                    if not tools:
+                        ui.label("The server reported no tools.").classes("s-muted")
+                    for t in tools:
+                        with ui.row().classes("w-full items-center q-gutter-sm"):
+                            ui.label(t["name"]).classes("s-cell s-cell--bold")
+                            ui.label(t.get("description", "")).classes(
+                                "s-muted").style("flex: 1;")
+                            sw = ui.switch(
+                                value=is_tool_enabled(state.vault, server, t["name"]),
+                            ).props("dense")
+
+                            def _toggle(e, s=server, tool=t):
+                                set_tool_enabled(
+                                    state.vault, s, tool["name"],
+                                    bool(getattr(e, "value", False)),
+                                    description=tool.get("description", ""),
+                                    schema=tool.get("schema") or {})
+                                _mcp_servers.refresh()
+
+                            sw.on_value_change(_toggle)
+                    ui.button("Close", on_click=dlg.close).classes(
+                        "s-btn s-btn--ghost q-mt-md")
+                dlg.open()
+
+            @ui.refreshable
+            def _mcp_servers() -> None:
+                servers = all_servers(state.vault)
+                if not servers:
+                    ui.label("No servers connected.").classes("s-muted")
+                for srv in servers:
+                    with ui.row().classes("w-full items-center q-gutter-sm"):
+                        ui.label(srv).classes("s-mono").style("flex: 1;")
+
+                        async def _discover(_=None, s=srv):
+                            import asyncio
+                            from systemu.runtime.mcp.client import mcp_list_tools
+                            # W7.1 pattern: network off the loop; client
+                            # captured before the await for post-await UI.
+                            try:
+                                client = ui.context.client
+                            except Exception:
+                                client = None
+                            ui.notify(f"Discovering tools on {s}…", type="info")
+                            out = await asyncio.to_thread(
+                                lambda: mcp_list_tools(server=s))
+                            if client is None:
+                                return
+                            try:
+                                with client:
+                                    if not out.get("success"):
+                                        ui.notify(
+                                            f"Discovery failed: {out.get('error')}",
+                                            type="negative")
+                                        return
+                                    _mcp_tool_dialog(s, out.get("tools") or [])
+                            except Exception:
+                                pass
+
+                        def _remove(_=None, s=srv):
+                            remove_server(state.vault, s)
+                            ui.notify(f"Removed {s} (its tools are disabled).",
+                                      type="info")
+                            _mcp_servers.refresh()
+
+                        _mcp_btn("Discover tools", variant="ghost",
+                                 on_click=_discover)
+                        _mcp_btn("Remove", variant="ghost", on_click=_remove)
+                enabled_now = sorted(e["name"] for e in enabled_tools(state.vault))
+                if enabled_now:
+                    ui.label("Enabled connector tools: " + ", ".join(enabled_now)
+                             ).classes("s-muted")
+
+            _mcp_servers()
+            with ui.row().classes("w-full items-center q-gutter-sm"):
+                mcp_url_in = ui.input(
+                    placeholder="http://localhost:8080",
+                ).classes("s-input").style("flex: 1;")
+
+                def _add_mcp(_=None):
+                    url = (mcp_url_in.value or "").strip()
+                    if not url.startswith(("http://", "https://")):
+                        ui.notify("Enter a full http(s):// server URL.",
+                                  type="warning")
+                        return
+                    add_server(state.vault, url)
+                    mcp_url_in.set_value("")
+                    ui.notify("Server added — discover its tools to enable them.",
+                              type="positive")
+                    _mcp_servers.refresh()
+
+                _mcp_btn("Add server", variant="primary", on_click=_add_mcp)
+
+        # ── Telegram reach (W10.1 — status only, env-configured) ───────────
+        _section_header("Telegram")
+        with ui.column().classes("s-card w-full"):
+            import os as _tg_os
+            _tg_token = bool(_tg_os.environ.get("SHARING_ON_TELEGRAM_BOT_TOKEN", "").strip())
+            _tg_allow = bool(_tg_os.environ.get("SHARING_ON_TELEGRAM_ALLOWED_USER_IDS", "").strip())
+            if _tg_token and _tg_allow:
+                ui.label(
+                    "Configured — needs-you items and task outcomes are "
+                    "pushed to your allowlisted Telegram users; /status "
+                    "answers from there."
+                ).classes("s-cell")
+            else:
+                ui.label(
+                    "Not configured. Set SHARING_ON_TELEGRAM_BOT_TOKEN and "
+                    "SHARING_ON_TELEGRAM_ALLOWED_USER_IDS in .env and "
+                    "restart the daemon — tokens are never entered in the "
+                    "browser. Requires: pip install 'python-telegram-bot>=20'."
+                ).classes("s-muted")
 
         # ── Connections (v0.8.18) ──────────────────────────────────────────
         # Operator enters per-tool API keys here.  Values are stored via

@@ -402,14 +402,19 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         """Build config from environment variables with sensible defaults."""
+        from sharing_on.model_presets import resolve_preset
+        _preset_tiers = resolve_preset(os.environ)
         instance = cls(
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
             google_api_key=os.getenv("GOOGLE_API_KEY", ""),
             llm_model=os.getenv("SHARING_ON_MODEL", "z-ai/glm-4.5-air:free"),
             # Systemu uses tier3 for log→instructions (existing analyze step)
-            tier1_model=os.getenv("SYSTEMU_TIER1_MODEL", "deepseek/deepseek-v4-flash"),
-            tier2_model=os.getenv("SYSTEMU_TIER2_MODEL", "deepseek/deepseek-v4-flash"),
-            tier3_model=os.getenv("SYSTEMU_TIER3_MODEL", "z-ai/glm-4.5-air:free"),
+            # W8.1: defaults route through the preset (SYSTEMU_MODEL_PRESET);
+            # explicit per-tier env vars always win. No preset ⇒ today's
+            # defaults byte-for-byte (resolve_preset's budget fallback).
+            tier1_model=os.getenv("SYSTEMU_TIER1_MODEL", _preset_tiers["tier1"]),
+            tier2_model=os.getenv("SYSTEMU_TIER2_MODEL", _preset_tiers["tier2"]),
+            tier3_model=os.getenv("SYSTEMU_TIER3_MODEL", _preset_tiers["tier3"]),
             # v0.7-e: optional provider override per tier (empty = auto-detect)
             tier1_provider=os.getenv("SYSTEMU_TIER1_PROVIDER", ""),
             tier2_provider=os.getenv("SYSTEMU_TIER2_PROVIDER", ""),

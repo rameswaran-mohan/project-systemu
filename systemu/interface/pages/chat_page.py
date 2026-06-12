@@ -81,8 +81,8 @@ def _default_dispatch_mode() -> str:
     return "queue" if mode.startswith("docker") else "run_now"
 
 
-def build_chat_page() -> None:
-    """Render the chat page."""
+def build_chat_page(prefill: str = "") -> None:
+    """Render the chat page. ``prefill`` lands in the composer (W10.4)."""
     state  = AppState.get()
     vault  = state.vault
     config = state.config
@@ -136,6 +136,8 @@ def build_chat_page() -> None:
             "skipped_no_shadow":"#94a3b8",
             "waiting_on_tools": THEME.get("warning", "#f59e0b"),
             "pending_decision": THEME.get("warning", "#f59e0b"),
+            # W8.3: quick lane asked the operator a question.
+            "needs_input":      THEME["warning"],
         }.get(status, THEME.get("text_muted", "#94a3b8"))
 
         card_opacity = "opacity: 0.55; " if is_stale else ""
@@ -163,6 +165,48 @@ def build_chat_page() -> None:
                     f"background: {status_color}; color: white; "
                     f"border-radius: 6px; font-size: 11px; padding: 3px 8px; white-space: nowrap;"
                 )
+
+            # W8.3: quick-lane entries carry the FULL answer — render it as
+            # rich markdown (no 120-char truncation), list produced files,
+            # and offer promotion into the factory pipeline.
+            # W8.4: produced files render for EVERY entry that has them
+            # (workflow runs now carry real files_produced too).
+            for _f in (entry.get("files_produced") or []):
+                ui.label(_f).classes("s-mono")
+
+            if entry.get("lane") == "quick":
+                _summary = entry.get("summary") or ""
+                if _summary:
+                    ui.markdown(_summary).classes("s-cell w-full")
+                if entry.get("status") == "success":
+                    async def _save_as_workflow(_=None, p=entry.get("prompt", "")):
+                        import asyncio
+                        # W7.1 pattern: promotion is an LLM call — run it off
+                        # the loop and re-enter the captured client after.
+                        try:
+                            client = ui.context.client
+                        except Exception:
+                            client = None
+                        ui.notify("Saving as workflow…", type="info")
+                        try:
+                            from systemu.pipelines.quick_task import promote_to_workflow
+                            scroll = await asyncio.to_thread(
+                                promote_to_workflow, p, config, vault)
+                            msg = (f"Workflow '{getattr(scroll, 'name', '?')}' "
+                                   "saved — review it in Work.")
+                            typ = "positive"
+                        except Exception as exc:
+                            msg, typ = f"Could not save workflow: {exc}", "negative"
+                        if client is not None:
+                            try:
+                                with client:
+                                    ui.notify(msg, type=typ)
+                            except Exception:
+                                pass
+
+                    from systemu.interface.design.primitives import button as _ds_btn
+                    _ds_btn("Save as workflow", variant="ghost",
+                            on_click=_save_as_workflow)
 
             # v0.8.22 (C): if this entry is parked on a pending operator decision,
             # render the inline card so the operator can resolve in chat.
@@ -211,16 +255,22 @@ def build_chat_page() -> None:
 
     ui.separator().style(f"background: {THEME['border']}; margin: 8px 0;")
 
-    # ── Dispatch-mode toggle (Run now vs Queue) ───────────────────────────────
-    default_mode = _default_dispatch_mode()
+    # ── Lane control (W8.3): Quick answer by default; the factory pipeline
+    # (workflow run-now / queue) one click away. Quick = the 8.2 bounded
+    # ReAct loop over Gate-3-enabled tools — answers in seconds instead of
+    # minutes of refine→approve→extract→decide meta-work.
     deployment = os.environ.get("SYSTEMU_MODE", "local").lower()
     with ui.row().classes("w-full items-center").style("gap: 12px; margin-bottom: 8px;"):
-        ui.label("Dispatch:").style(
+        ui.label("Mode:").style(
             f"font-size: 12px; color: {THEME['text_muted']}; font-weight: 600;"
         )
-        dispatch = ui.radio(
-            options={"run_now": "Run now (synchronous)", "queue": "Queue (via Supervisor)"},
-            value=default_mode,
+        lane = ui.radio(
+            options={
+                "quick":   "Quick answer (seconds)",
+                "run_now": "Workflow — run now",
+                "queue":   "Workflow — queue",
+            },
+            value="quick",
         ).props("inline dense").style(f"color: {THEME['text']};")
         ui.label(f"mode: {deployment}").style(
             f"font-size: 11px; color: {THEME['text_muted']}; margin-left: auto;"
@@ -244,15 +294,24 @@ def build_chat_page() -> None:
             f"font-weight: 700; padding: 12px 20px; font-size: 14px; align-self: flex-end;"
         )
 
+    # W10.4: a ?prefill= starter lands in the composer, ready to Run.
+    if prefill:
+        prompt_input.set_value(prefill)
+
     def _on_submit() -> None:
         raw = prompt_input.value.strip()
         if not raw:
             ui.notify("Please enter a task.", type="warning")
             return
 
-        queue_mode = (dispatch.value == "queue")
+        mode = lane.value or "quick"
+        queue_mode = (mode == "queue")
         prompt_input.set_value("")
-        status_label.set_text("Queued — see Systemu Chat for progress" if queue_mode else "Running…")
+        status_label.set_text({
+            "quick":   "Answering…",
+            "queue":   "Queued — see Systemu Chat for progress",
+            "run_now": "Running…",
+        }.get(mode, "Running…"))
         # W7.4: do NOT disable the submit button — each submission runs in its
         # own thread, so concurrent chat tasks are fine. Disabling it for the
         # whole sync run made the UI itself serialize task submission.
@@ -274,13 +333,20 @@ def build_chat_page() -> None:
 
         def _run() -> None:
             try:
+                if mode == "quick":
+                    # W8.3: the fast lane — bounded ReAct loop, no scroll/
+                    # activity/shadow creation. submit_quick_task keeps the
+                    # chat-history contract so the thread below renders it.
+                    from systemu.pipelines.quick_task import submit_quick_task
+                    submit_quick_task(raw, config, vault)
+                    return
                 from systemu.pipelines.direct_task import run_direct_task
                 result_holder[0] = run_direct_task(
                     raw, config, vault,
                     route_through_supervisor=queue_mode,
                 )
             except Exception as exc:
-                logger.error("[ChatPage] run_direct_task failed: %s", exc)
+                logger.error("[ChatPage] task run failed: %s", exc)
             finally:
                 # v0.8.11 RC2: ui.timer fails asynchronously when the client
                 # navigated away — a sync try/except can't catch it. Pre-check
@@ -327,12 +393,14 @@ def build_chat_page() -> None:
 _VALID_CHAT_TABS = ("compose", "live")
 
 
-def build_chat_tabs(default_tab: str = "compose") -> None:
+def build_chat_tabs(default_tab: str = "compose", prefill: str = "") -> None:
     """Two-tab chat: Compose (this page) + Live (supervisor event feed).
 
     Args:
         default_tab: ``"compose"`` or ``"live"``.  Anything else falls back
                      to ``"compose"``.
+        prefill:     W10.4 — starter prompt landed in the composer (the
+                     operator still clicks Run; never auto-submitted).
     """
     if default_tab not in _VALID_CHAT_TABS:
         default_tab = "compose"
@@ -351,6 +419,6 @@ def build_chat_tabs(default_tab: str = "compose") -> None:
         "padding-top: 16px;"
     ):
         with ui.tab_panel("compose"):
-            build_chat_page()
+            build_chat_page(prefill=prefill)
         with ui.tab_panel("live"):
             build_systemu_chat_page()

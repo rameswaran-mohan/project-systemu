@@ -123,10 +123,16 @@ def render_event_details_body(details: Dict[str, Any]) -> None:
     if summary:
         ui.label("Outcome").classes("s-field-label")
         ui.label(str(summary)).classes("s-cell").style("white-space: pre-wrap;")
+    # W8.4: per-file artifacts when the run tracked them; the folder as
+    # fallback context either way.
+    files = details.get("files")
     output_dir = details.get("output_dir")
-    if output_dir:
+    if files or output_dir:
         ui.label("Artifacts").classes("s-field-label")
-        ui.label(str(output_dir)).classes("s-mono").style("white-space: pre-wrap;")
+        for f in (files or []):
+            ui.label(str(f)).classes("s-mono").style("white-space: pre-wrap;")
+        if output_dir:
+            ui.label(str(output_dir)).classes("s-mono").style("white-space: pre-wrap;")
     reasoning = details.get("reasoning")
     if reasoning:
         ui.label("Reasoning").style(
