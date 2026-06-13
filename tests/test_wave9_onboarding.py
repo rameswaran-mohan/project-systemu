@@ -92,6 +92,53 @@ class TestSaveOnboarding:
         assert len(facts) == 1 and "Freelance" in facts[0].fact
 
 
+class TestFinalizeOnboarding:
+    """The starter-bug fix: a starter click must FINALIZE onboarding (validate
+    key+name, persist the profile) before navigating to /chat?prefill=, exactly
+    like Finish — otherwise the W11.4 gate bounces /chat back to /welcome and it
+    looks like the page "just refreshes"."""
+
+    def _cfg(self, key="sk-or-x"):
+        from types import SimpleNamespace
+        return SimpleNamespace(openrouter_api_key=key, output_dir="",
+                               tier1_model="", tier2_model="", tier3_model="")
+
+    def test_blocks_without_key_and_persists_nothing(self, vault):
+        from systemu.interface.pages.welcome import finalize_onboarding
+        ok, msg = finalize_onboarding(vault, self._cfg(key=""), name="Ramesh",
+                                      preset="", refresh_key_fn=lambda c: False)
+        assert ok is False and "key" in msg.lower()
+        assert vault.get_user_profile() is None
+
+    def test_blocks_without_name_and_persists_nothing(self, vault):
+        from systemu.interface.pages.welcome import finalize_onboarding
+        ok, msg = finalize_onboarding(vault, self._cfg(), name="   ", preset="")
+        assert ok is False and "name" in msg.lower()
+        assert vault.get_user_profile() is None
+
+    def test_finalizes_and_persists_profile(self, vault):
+        from systemu.interface.pages.welcome import finalize_onboarding
+        ok, msg = finalize_onboarding(
+            vault, self._cfg(), name="Ramesh", location="Chennai, IN",
+            timezone="Asia/Kolkata", output_dir="C:/docs", preset="")
+        assert ok is True and msg == ""
+        prof = vault.get_user_profile()
+        assert prof is not None and prof.name == "Ramesh"
+
+    def test_starter_click_finalizes_first_not_bare_navigate(self):
+        """Guard the RCA fix: the step-4 starter click must route through the
+        finalize wrapper, NOT a bare ui.navigate.to('/chat?prefill=…') that the
+        onboarding gate would bounce."""
+        import inspect
+        import re
+        from systemu.interface.pages import welcome
+        src = inspect.getsource(welcome.build_welcome_page)
+        assert "_run_finalize" in src and "finalize_onboarding" in inspect.getsource(welcome)
+        assert not re.search(
+            r'on\(\s*["\']click["\'][^)]*navigate\.to\(\s*\n?\s*f?["\']/chat',
+            src, re.S), "starter click must finalize before navigating, not bare-navigate"
+
+
 class TestHelpers:
     def test_detect_timezone_returns_nonempty(self):
         from systemu.interface.pages.welcome import detect_timezone

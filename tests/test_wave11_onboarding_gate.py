@@ -130,10 +130,17 @@ class TestWelcomeEnforcement:
             _config(), env_file=str(tmp_path / "none.env")) is False
 
     def test_finish_requires_the_key(self):
+        """Finish must verify the key exists — setup is enforced, not suggested.
+        The check now lives in the shared finalize_onboarding() that Finish AND
+        the step-4 starters route through; assert both the delegation and the
+        enforcement (behavior is also covered by TestFinalizeOnboarding)."""
         from systemu.interface.pages import welcome
-        src = inspect.getsource(welcome.build_welcome_page)
-        assert "_refresh_key_status" in src.split("def _finish")[1].split("def _later")[0], \
-            "Finish must verify the key exists — setup is enforced, not suggested"
+        finish_body = (inspect.getsource(welcome.build_welcome_page)
+                       .split("def _finish")[1].split("def _later")[0])
+        assert "_run_finalize" in finish_body, \
+            "Finish routes through the shared finalize path"
+        assert "_refresh_key_status" in inspect.getsource(welcome.finalize_onboarding), \
+            "finalize_onboarding must verify the key exists — setup is enforced"
 
     def test_skip_button_hidden_while_gate_active(self):
         from systemu.interface.pages import welcome

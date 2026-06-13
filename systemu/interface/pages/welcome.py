@@ -174,6 +174,47 @@ def save_onboarding(vault, *, name: str, location: str, timezone: str,
     return profile
 
 
+def finalize_onboarding(vault, config, *, name: str, location: str = "",
+                        timezone: str = "", output_dir: str = "", role: str = "",
+                        org: str = "", persona: str = "", preset: str = "",
+                        refresh_key_fn=None) -> "tuple[bool, str]":
+    """Validate (API key + name required) and persist onboarding, then report
+    ``(ok, message)``. ``ok=False`` → ``message`` is a user-facing reason and
+    nothing past the failed gate was persisted; ``ok=True`` → profile saved
+    (message "").
+
+    Shared by the Finish button AND the step-4 starter use-cases so a starter
+    click finishes setup instead of bouncing off the onboarding gate (the
+    starter used to bare-navigate to /chat, which the W11.4 gate redirected
+    straight back to /welcome — the "just refreshes" bug)."""
+    refresh = refresh_key_fn if refresh_key_fn is not None else _refresh_key_status
+    if not getattr(config, "openrouter_api_key", "") and not refresh(config):
+        return (False, "Add your API key first (step 1) — Systemu can't run "
+                       "without it.")
+    if not (name or "").strip():
+        return (False, "Please tell me your name.")
+    try:
+        # Preset chosen → persist as explicit tier vars (explicit always wins).
+        from sharing_on.model_presets import PRESETS
+        tiers = PRESETS.get(preset or "")
+        if tiers:
+            from systemu.interface.pages.settings import _update_env_var
+            _update_env_var("SYSTEMU_TIER1_MODEL", tiers["tier1"])
+            _update_env_var("SYSTEMU_TIER2_MODEL", tiers["tier2"])
+            _update_env_var("SYSTEMU_TIER3_MODEL", tiers["tier3"])
+            config.tier1_model = tiers["tier1"]
+            config.tier2_model = tiers["tier2"]
+            config.tier3_model = tiers["tier3"]
+        save_onboarding(
+            vault, name=name, location=location, timezone=timezone,
+            output_dir=output_dir, role=role or "", org=org or "",
+            persona=persona or "")
+    except Exception as exc:
+        logger.exception("[Welcome] onboarding save failed")
+        return (False, f"Could not save: {exc}")
+    return (True, "")
+
+
 def build_welcome_page() -> None:
     """Render the one-screen wizard (token classes; no inline f-styles)."""
     from nicegui import ui
@@ -259,6 +300,23 @@ def build_welcome_page() -> None:
                 "Organisation / team (optional)", placeholder="Acme Pvt Ltd",
             ).classes("s-input s-input-full")
 
+            def _run_finalize(dest: str, success_msg: str) -> None:
+                """Validate + persist onboarding, then navigate to ``dest`` on
+                success (Finish → the tour; a starter → /chat?prefill=…). On a
+                validation failure, notify and stay put — same as Finish."""
+                ok, msg = finalize_onboarding(
+                    vault, config,
+                    name=name_in.value, location=loc_in.value,
+                    timezone=tz_in.value, output_dir=out_in.value,
+                    role=role_in.value or "", org=org_in.value or "",
+                    persona=persona_in.value or "",
+                    preset=preset_select.value or "")
+                if not ok:
+                    ui.notify(msg, type="warning")
+                    return
+                ui.notify(success_msg, type="positive")
+                ui.navigate.to(dest)
+
             # ── 4. Try it ─────────────────────────────────────────────────
             ui.label(f"4 · {onboarding_steps()[3]}").classes("s-section-head")
             ui.label(
@@ -271,50 +329,20 @@ def build_welcome_page() -> None:
             for _p in starter_prompts():
                 _label = ui.label(f"›  {_p}").classes("s-cell")
                 _label.style("cursor: pointer;")
+                # Finalize onboarding FIRST, then open the starter pre-filled —
+                # a bare navigate to /chat would be bounced back by the W11.4
+                # onboarding gate (the "just refreshes" bug).
                 _label.on("click",
-                          lambda _, p=_p: ui.navigate.to(
-                              f"/chat?prefill={_q(p)}"))
+                          lambda _, p=_p: _run_finalize(
+                              f"/chat?prefill={_q(p)}",
+                              "Setup saved — opening your starter…"))
 
             def _finish(_=None) -> None:
-                # W11.4: setup is enforced, not suggested — the key must
-                # exist before the wizard completes (last-second .env saves
-                # are honored via the same re-check).
-                if (not getattr(config, "openrouter_api_key", "")
-                        and not _refresh_key_status(config)):
-                    ui.notify(
-                        "Add your API key first (step 1) — Systemu can't run "
-                        "without it.", type="warning")
-                    return
-                if not name_in.value.strip():
-                    ui.notify("Please tell me your name.", type="warning")
-                    return
-                try:
-                    # Preset chosen → persist as explicit tier vars (same
-                    # semantics as Settings: explicit always wins).
-                    tiers = PRESETS.get(preset_select.value or "")
-                    if tiers:
-                        from systemu.interface.pages.settings import _update_env_var
-                        _update_env_var("SYSTEMU_TIER1_MODEL", tiers["tier1"])
-                        _update_env_var("SYSTEMU_TIER2_MODEL", tiers["tier2"])
-                        _update_env_var("SYSTEMU_TIER3_MODEL", tiers["tier3"])
-                        config.tier1_model = tiers["tier1"]
-                        config.tier2_model = tiers["tier2"]
-                        config.tier3_model = tiers["tier3"]
-                    save_onboarding(
-                        vault,
-                        name=name_in.value, location=loc_in.value,
-                        timezone=tz_in.value, output_dir=out_in.value,
-                        role=role_in.value or "", org=org_in.value or "",
-                        persona=persona_in.value or "",
-                    )
-                except Exception as exc:
-                    logger.exception("[Welcome] onboarding save failed")
-                    ui.notify(f"Could not save: {exc}", type="negative")
-                    return
-                ui.notify("All set — welcome aboard.", type="positive")
-                # W11.5 handoff: the wizard flows straight into the guided
-                # tour (mandatory on first run; replayable from Settings).
-                ui.navigate.to("/?tour=0")
+                # W11.4: setup is enforced (key + name required). Shared
+                # validate + persist with the step-4 starters via
+                # finalize_onboarding. W11.5 handoff: success flows straight
+                # into the guided tour (replayable from Settings).
+                _run_finalize("/?tour=0", "All set — welcome aboard.")
 
             def _later(_=None) -> None:
                 try:
