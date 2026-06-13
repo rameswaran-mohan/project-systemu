@@ -1254,6 +1254,29 @@ def daemon_start(ctx, port: int, foreground: bool):
     config, vault = _get_vault_and_config(ctx)
     from systemu.scheduler.daemon import start_daemon
 
+    # First-run guard: no API key → run setup now (interactive TTY) or point
+    # at it (headless). Booting without a key only yields a dead dashboard
+    # that fails every task — exactly the pip-install pitfall this closes.
+    import sys as _sys
+
+    from sharing_on.setup_flow import key_present, run_setup
+    if not key_present():
+        if _sys.stdin.isatty():
+            console.print("[yellow]No API key configured yet — let's set it "
+                          "up before starting.[/yellow]")
+            run_setup(interactive=True, print_fn=lambda s: console.print(s))
+            if not key_present():
+                console.print("[yellow]Still no key — start aborted. Run "
+                              "[bold]sharing_on setup[/bold] when ready.[/yellow]")
+                return
+            # Reload config so the freshly-written key/preset take effect.
+            config, vault = _get_vault_and_config(ctx)
+        else:
+            console.print("[red]No OPENROUTER_API_KEY configured. Run "
+                          "[bold]sharing_on setup[/bold] (or set it in .env) "
+                          "before starting the daemon.[/red]")
+            return
+
     console.print(f"\n[cyan]⚡ Starting Systemu daemon on port {port} ...[/cyan]")
     start_daemon(
         vault_dir=config.vault_dir,

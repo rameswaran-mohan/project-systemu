@@ -28,16 +28,25 @@ _BUDGET = {
     "tier3": "deepseek/deepseek-v4-flash",   # fast / formatting
 }
 
+# W13.x: `deepseek/deepseek-v4` (non-flash) was a DEAD id — OpenRouter
+# returns 400 "not a valid model ID" (field error 2026-06-13, balanced
+# preset tier1). Same dead-default class as glm-4.5-air:free. Presets now
+# use only ids with positive live evidence this cycle:
+#   * deepseek/deepseek-v4-flash       — the budget default, proven in field
+#   * google/gemini-3-flash-preview    — drove the entire A2 recording E2E
+#     (via OpenRouter, key-aware routing) — a stronger flash-class brain
+# quality tier1 keeps the premium Anthropic opt-in; the runtime fallback
+# (_is_invalid_model_error → budget default) covers any id that still drifts.
 PRESETS: Dict[str, Dict[str, str]] = {
     "quality": {
         "tier1": "anthropic/claude-sonnet-4.5",
-        "tier2": "deepseek/deepseek-v4",
+        "tier2": "google/gemini-3-flash-preview",
         "tier3": "deepseek/deepseek-v4-flash",
     },
     "balanced": {
-        "tier1": "deepseek/deepseek-v4",
+        "tier1": "google/gemini-3-flash-preview",
         "tier2": "deepseek/deepseek-v4-flash",
-        "tier3": "deepseek/deepseek-v4-flash",   # W11.7: glm-4.5-air:free 404s
+        "tier3": "deepseek/deepseek-v4-flash",
     },
     "budget": dict(_BUDGET),
 }

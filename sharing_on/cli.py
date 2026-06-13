@@ -773,6 +773,49 @@ def info():
 
 
 @cli.command()
+@click.option("--key", default=None,
+              help="OpenRouter key non-interactively (CI). Prefer the hidden "
+                   "interactive prompt — argv lands in shell history.")
+@click.option("--preset", type=click.Choice(["balanced", "quality", "budget"]),
+              default=None, help="Model preset (default: ask).")
+@click.option("--output-dir", default=None, help="Where produced files land.")
+@click.option("--no-validate", is_flag=True, help="Skip the live key probe.")
+def setup(key, preset, output_dir, no_validate):
+    """Configure your API key + models (run right after `pip install systemu`).
+
+    Walks you through the OpenRouter key (entered hidden, validated, stored
+    in a 0600 .env), a model preset, and an output folder. Re-run any time
+    to reconfigure. `daemon start` runs this for you the first time if no
+    key is set.
+    """
+    import sys as _sys
+
+    from sharing_on.setup_flow import run_setup
+
+    interactive = key is None and _sys.stdin.isatty()
+    if not interactive and key is None:
+        console.print("[yellow]Non-interactive and no --key given — nothing "
+                      "to configure. Pass --key, or run in a terminal.[/yellow]")
+        return
+    console.print("\n[cyan]⚡ Systemu setup[/cyan]")
+    summary = run_setup(
+        interactive=interactive, key=key, preset=preset,
+        output_dir=output_dir, validate=not no_validate,
+        print_fn=lambda s: console.print(s),
+    )
+    console.print("")
+    for msg in summary["messages"]:
+        console.print(f"  • {msg}")
+    if summary["key_set"]:
+        console.print(f"\n[green]✓ Configured.[/green] "
+                      f"Wrote {summary['env_path']}. "
+                      f"Next: [bold]sharing_on daemon start[/bold]")
+    else:
+        console.print("\n[yellow]No API key set — Systemu can't run tasks "
+                      "until you add one (`sharing_on setup`).[/yellow]")
+
+
+@cli.command()
 @click.option("--force", is_flag=True, help="Overwrite existing vault entries (default: skip).")
 @click.option("--no-seed", is_flag=True, help="Create vault structure only; skip starter catalog seeding.")
 def init(force: bool, no_seed: bool):

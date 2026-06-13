@@ -41,6 +41,37 @@ _NETWORK_BACKOFF_S    = [5.0, 15.0]
 _GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
+def _is_invalid_model_error(exc_str: str) -> bool:
+    """W13.x: a provider 400 that means 'this model ID does not exist'.
+
+    Model catalogs drift (deepseek/openrouter rename ids; a preset or a
+    stale SYSTEMU_TIER*_MODEL in .env points at a dead id) — when that
+    happens the WHOLE task must not hard-fail. We detect the rejection and
+    fall back to the shipped budget default for the tier. Kept narrow so it
+    never swallows a real schema/JSON 400.
+    """
+    s = (exc_str or "").lower()
+    return (
+        "not a valid model" in s
+        or "invalid model" in s
+        or "model_not_found" in s
+        or "no endpoints found" in s            # OpenRouter's phrasing for a dead id
+    )
+
+
+def _fallback_model_for_tier(tier: int, current: str) -> "str | None":
+    """The proven shipped default for this tier (the no-preset budget value),
+    used to rescue a call whose configured model id was rejected. Returns
+    None when the current model already IS that default (nothing safer to
+    try) or on any resolution error."""
+    try:
+        from sharing_on.model_presets import resolve_preset
+        fb = resolve_preset({}).get(f"tier{tier}")
+        return fb if fb and fb != current else None
+    except Exception:
+        return None
+
+
 def _is_network_retriable(exc: BaseException) -> bool:
     """Return True for transient network / timeout errors that warrant a retry."""
     for candidate in (exc, getattr(exc, "__cause__", None)):
@@ -367,9 +398,34 @@ async def llm_call(
         try:
             resp = await client.chat.completions.create(**kwargs)
         except Exception as exc:
-            # Some providers reject response_format=json_object -- retry without it
             exc_str = str(exc)
-            if response_format and "json" in response_format.get("type", "") and (
+            # (W13.x) Dead/renamed model ID — checked FIRST so a JSON call's
+            # 400 about the model isn't mis-handled as a JSON-mode rejection.
+            # Fall back to the shipped budget default for this tier (same
+            # OpenRouter provider in the common case) so catalog drift or a
+            # stale SYSTEMU_TIER*_MODEL never bricks the whole task.
+            if _is_invalid_model_error(exc_str):
+                fb = _fallback_model_for_tier(tier, model)
+                if fb:
+                    logger.error(
+                        "[LLM] tier=%d model %r rejected as invalid — falling "
+                        "back to %r. Fix SYSTEMU_TIER%d_MODEL (or your preset "
+                        "in Settings) to silence this.", tier, model, fb, tier)
+                    try:
+                        resp = await client.chat.completions.create(
+                            **{**kwargs, "model": fb})
+                        model = fb  # honest telemetry below
+                    except Exception as exc2:
+                        logger.error("[LLM] API error (model fallback): %s", exc2)
+                        raise RuntimeError(
+                            f"LLM call failed (tier={tier}, model={model}; "
+                            f"fallback {fb} also failed): {exc2}") from exc2
+                else:
+                    logger.error("[LLM] API error (no safe fallback): %s", exc)
+                    raise RuntimeError(
+                        f"LLM call failed (tier={tier}, model={model}): {exc}") from exc
+            # Some providers reject response_format=json_object -- retry without it
+            elif response_format and "json" in response_format.get("type", "") and (
                 "400" in exc_str or "json" in exc_str.lower() or "not supported" in exc_str.lower()
             ):
                 logger.warning("[LLM] JSON mode rejected by provider (%s), retrying without response_format", exc_str[:80])
