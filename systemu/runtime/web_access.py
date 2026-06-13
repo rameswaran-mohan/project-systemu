@@ -224,21 +224,38 @@ def _decode_ddg_url(url: str) -> str:
 
 
 def _parse_ddg_results(markdown_or_html: str, max_results: int) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    seen = set()
+    """Parse Jina-on-DDG markdown into {title, url, snippet}.
+
+    Jina renders ~3 links per result, ALL pointing at the same uddg redirect:
+    the title, the display URL, and the snippet paragraph. Group by the decoded
+    target (first-seen order) and surface the longest PROSE anchor as the
+    snippet — the bare display URL (no spaces) and the title are excluded.
+    Lite/older renderings with a single link per result just get snippet="".
+    """
+    groups: Dict[str, Dict[str, Any]] = {}
+    order = 0
     for m in _MD_LINK.finditer(markdown_or_html or ""):
-        title = re.sub(r"<[^>]+>", "", m.group(1)).strip().strip("*").strip()
+        text = re.sub(r"<[^>]+>", "", m.group(1)).strip().strip("*").strip()
         real = _decode_ddg_url(m.group(2))
-        if not real.startswith("http"):
+        if not real.startswith("http") or "duckduckgo.com" in _host(real):
+            continue                          # skip DDG nav / favicon / self links
+        if not text or len(text) < 2:
             continue
-        if "duckduckgo.com" in _host(real):   # skip DDG's own nav/self links
-            continue
-        if not title or len(title) < 2:
-            continue
-        if real in seen:
-            continue
-        seen.add(real)
-        out.append({"title": title[:200], "url": real, "snippet": ""})
+        g = groups.get(real)
+        if g is None:
+            groups[real] = {"title": text, "texts": [text], "order": order}
+            order += 1
+        else:
+            g["texts"].append(text)
+
+    out: List[Dict[str, str]] = []
+    for real, g in sorted(groups.items(), key=lambda kv: kv[1]["order"]):
+        title = g["title"]
+        # snippet = the longest prose anchor (has a space, >=20 chars, not the
+        # title) — excludes the no-space display URL and the title itself.
+        prose = [t for t in g["texts"] if t != title and " " in t and len(t) >= 20]
+        snippet = max(prose, key=len) if prose else ""
+        out.append({"title": title[:200], "url": real, "snippet": snippet[:500]})
         if len(out) >= max_results:
             break
     return out

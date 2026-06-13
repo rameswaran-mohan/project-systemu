@@ -97,6 +97,36 @@ def test_search_web_parses_jina_ddg(monkeypatch):
     assert all(u.startswith("http") and "duckduckgo.com" not in u for u in urls)
 
 
+def test_search_web_extracts_snippets_from_grouped_jina_links(monkeypatch):
+    """Real DDG-via-Jina renders ~3 same-URL links per result: the title, the
+    display URL, and the snippet paragraph. The parser must group by target URL
+    and surface the prose snippet (the longest anchor), not drop it to ""."""
+    wa._CACHE._d.clear()
+    u1 = ("https://duckduckgo.com/l/?uddg=https%3A%2F%2Fhungryforever.net"
+          "%2Fbest%2F&rut=abc")
+    u2 = ("https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.crazymasalafood.com"
+          "%2Ftop20%2F&rut=def")
+    md = (
+        f"[10 Best Places For Punjabi Food In Chennai]({u1})\n\n"
+        f"[![Image 1](https://external-content.duckduckgo.com/ip3/x.ico)]({u1})"
+        f"[hungryforever.net/best/]({u1})\n\n"
+        f"[Here is our list of the best Punjabi places in Chennai including "
+        f"Jamavar at The Leela Palace.]({u1})\n\n"
+        f"[Top 20 Punjabi Restaurants In Chennai - Crazy Masala Food]({u2})\n\n"
+        f"[Here is a list of the top 20 Punjabi cuisine restaurants in Chennai, "
+        f"ranked by taste.]({u2})\n"
+    )
+    _patch_get(monkeypatch, {"r.jina.ai": (200, md)})
+    out = wa.search_web("best punjabi restaurant chennai")
+    assert len(out["results"]) == 2                      # one row per real URL
+    h = next(r for r in out["results"] if "hungryforever.net" in r["url"])
+    assert "10 Best Places" in h["title"]                # title is the first anchor
+    assert "Jamavar" in h["snippet"] and len(h["snippet"]) > 20   # prose snippet kept
+    assert "hungryforever.net/best" not in h["snippet"]  # not the bare display URL
+    c = next(r for r in out["results"] if "crazymasalafood.com" in r["url"])
+    assert "top 20" in c["snippet"].lower()
+
+
 # ── Task 4: find_places (Overpass + retry + ODbL attribution) ───────────────
 
 def test_find_places_overpass_named_pois_retry_and_attribution(monkeypatch):
