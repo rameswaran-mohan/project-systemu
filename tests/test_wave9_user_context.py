@@ -43,6 +43,20 @@ class TestProfileContextBlock:
         from systemu.runtime.user_context import profile_context_block
         assert profile_context_block(object()) == ""
 
+    def test_location_presented_verbatim_with_use_unchanged_instruction(self, vault):
+        """RCA 2026-06-13: the LLM rewrote 'santhoshpuram' as 'santhoshpuram,
+        Chennai' (which Nominatim couldn't match). The block must present the
+        operator location as an exact quoted literal with a do-not-modify
+        instruction, so the model passes it through unchanged."""
+        from systemu.interface.pages.welcome import save_onboarding
+        from systemu.runtime.user_context import profile_context_block
+        save_onboarding(vault, name="Ra", location="santhoshpuram",
+                        timezone="Asia/Kolkata", output_dir="C:/docs")
+        block = profile_context_block(vault)
+        assert '"santhoshpuram"' in block                       # exact quoted literal
+        assert "do not" in block.lower()
+        assert "modify" in block.lower() or "reword" in block.lower()
+
 
 class TestQuickLaneInjection:
     def test_system_prompt_carries_the_block(self, vault):

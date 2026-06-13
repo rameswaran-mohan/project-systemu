@@ -404,5 +404,9 @@ class TestGoldenTasks:
         assert "3 times in a row" in (res.error or "")
         assert "always broken" in (res.error or ""), \
             "the tool's own error text must surface, not a generic message"
-        assert res.tool_calls == 3
+        # quick-lane block-repeat: an IDENTICAL failing call runs ONCE, then the
+        # two identical retries are blocked (not re-executed). They still count
+        # toward the 3-strike cap, so the honest-failure contract holds (tool
+        # named, its error surfaced, no files) but the broken tool runs once.
+        assert res.tool_calls == 1
         assert res.files_produced == []

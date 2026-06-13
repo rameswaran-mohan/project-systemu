@@ -114,15 +114,47 @@ class TestQuickLoop:
         _add_tool(vault, "echo_tool", _ECHO_BODY, status=ToolStatus.PROPOSED)
         assert _enabled_tool_records(vault) == []
 
-    def test_iteration_cap_fails_honestly(self, vault):
+    def test_iteration_cap_salvages_partial_from_gathered_data(self, vault):
+        """RCA 2026-06-13: the loop gathered real data (web_read → a restaurant)
+        but never emitted ANSWER, then DROPPED it on budget exhaustion. It must
+        now synthesize an honest PARTIAL from the gathered observation — the
+        answer was sitting in history — not return a bare 'failed'."""
         from systemu.pipelines.quick_task import run_quick_task
         _add_tool(vault, "echo_tool", _ECHO_BODY)
         llm = _fake_llm([{"action": "TOOL_CALL", "tool": "echo_tool",
-                          "params": {"x": "again"}}])
-        res = run_quick_task("loop forever", None, vault, llm_json=llm, max_iters=3)
-        assert res.status == "failed"
-        assert "iteration" in (res.error or "").lower()
+                          "params": {"x": "Lassiwala Dhaba 4.0 stars"}}])
+        synth_calls = {"n": 0}
+
+        def fake_synth(prompt, history, config):
+            synth_calls["n"] += 1
+            assert any("Lassiwala Dhaba" in str(h) for h in history)  # grounded
+            return "Best match: **Lassiwala Dhaba** (4.0/5)."
+
+        res = run_quick_task("best punjabi restaurant near me", None, vault,
+                             llm_json=llm, max_iters=3, synthesize=fake_synth)
+        assert res.status == "partial"
+        assert "Lassiwala Dhaba" in res.answer_md
+        assert synth_calls["n"] == 1
         assert res.iterations == 3
+        assert "iteration" in (res.error or "").lower()   # reason retained
+
+    def test_no_salvage_when_nothing_usable_gathered(self, vault):
+        """The anti-hallucination floor: all-failed history has nothing usable,
+        so synthesis must NOT fire and the run stays an honest 'failed'."""
+        from systemu.pipelines.quick_task import run_quick_task
+        _add_tool(vault, "broken_tool", _FAIL_BODY)
+        called = {"n": 0}
+
+        def fake_synth(prompt, history, config):
+            called["n"] += 1
+            return "should never be called"
+
+        llm = _fake_llm([{"action": "TOOL_CALL", "tool": "broken_tool",
+                          "params": {"x": "1"}}])
+        res = run_quick_task("use broken", None, vault, llm_json=llm,
+                             synthesize=fake_synth)
+        assert res.status == "failed"
+        assert called["n"] == 0
 
     def test_same_tool_failure_streak_ends_the_run(self, vault):
         from systemu.pipelines.quick_task import run_quick_task
@@ -133,6 +165,53 @@ class TestQuickLoop:
         assert res.status == "failed"
         assert "broken_tool" in (res.error or "")
         assert res.iterations <= 4   # 3 failures + bail, not 12 silent loops
+
+    def test_repeated_failing_call_is_blocked_but_new_params_allowed(self, vault):
+        """Step 1 == step 12 in the live RCA: a (tool, params) that already
+        failed is refused with an actionable nudge and NOT re-executed; a
+        DIFFERENT call to the same tool is still allowed."""
+        from systemu.pipelines.quick_task import run_quick_task
+        _add_tool(vault, "broken_tool", _FAIL_BODY)
+        _add_tool(vault, "echo_tool", _ECHO_BODY)
+        bad = {"action": "TOOL_CALL", "tool": "broken_tool", "params": {"x": "1"}}
+        llm = _fake_llm([
+            bad,                                                       # executes, fails
+            bad,                                                       # BLOCKED (same sig)
+            {"action": "TOOL_CALL", "tool": "echo_tool", "params": {"x": "ok"}},  # allowed
+            {"action": "ANSWER", "answer_md": "done", "completed": True},
+        ])
+        res = run_quick_task("repeat then pivot", None, vault, llm_json=llm)
+        assert res.status == "success"
+        assert res.tool_calls == 2          # broken once + echo once; the repeat was blocked
+        assert any("already failed" in p for p in llm.calls["payloads"])
+
+    def test_plan_is_recorded_and_echoed_to_later_turns(self, vault):
+        """Plan-first: a non-trivial task emits a PLAN; the plan must then ride
+        in the payload of subsequent turns so execution follows it."""
+        from systemu.pipelines.quick_task import run_quick_task
+        _add_tool(vault, "echo_tool", _ECHO_BODY)
+        llm = _fake_llm([
+            {"action": "PLAN",
+             "steps": ["find restaurants near santhoshpuram", "rank by rating", "answer"],
+             "reasoning": "decompose first"},
+            {"action": "TOOL_CALL", "tool": "echo_tool", "params": {"x": "go"}},
+            {"action": "ANSWER", "answer_md": "done", "completed": True},
+        ])
+        res = run_quick_task("best restaurant near me", None, vault, llm_json=llm)
+        assert res.status == "success"
+        assert res.tool_calls == 1
+        # the plan reaches the turns AFTER planning
+        assert any("rank by rating" in p for p in llm.calls["payloads"][1:])
+
+    def test_last_action_turn_payload_nudges_answer(self, vault):
+        """Point 2: the final action turn must carry an explicit answer-now
+        signal (the harvest backstop still catches it if the model ignores it)."""
+        from systemu.pipelines.quick_task import run_quick_task
+        _add_tool(vault, "echo_tool", _ECHO_BODY)
+        llm = _fake_llm([{"action": "TOOL_CALL", "tool": "echo_tool", "params": {"x": "1"}}])
+        run_quick_task("x", None, vault, llm_json=llm, max_iters=2,
+                       synthesize=lambda *a, **k: "partial")
+        assert any('"final_turn": true' in p for p in llm.calls["payloads"])
 
     def test_ask_user_returns_needs_input(self, vault):
         from systemu.pipelines.quick_task import run_quick_task
@@ -210,3 +289,20 @@ class TestSubmitQuickTask:
         assert e["summary"] == "## the answer"
         assert e["lane"] == "quick"
         assert e["files_produced"] == []
+
+
+def test_has_usable_observation_gate():
+    """The salvage gate: only a successful result with real content counts.
+    A success with an empty payload (web_search 200 / 0 hits) does NOT."""
+    from systemu.pipelines.quick_task import _has_usable_observation
+    assert _has_usable_observation(
+        [{"role": "tool_result", "success": True,
+          "parsed": '{"results": [{"title": "x"}]}'}]) is True
+    assert _has_usable_observation(
+        [{"role": "tool_result", "success": True, "parsed": '{"results": []}'}]) is False
+    assert _has_usable_observation(
+        [{"role": "tool_result", "success": False, "error": "boom"}]) is False
+    assert _has_usable_observation([]) is False
+    # a non-dict text payload with real characters counts
+    assert _has_usable_observation(
+        [{"role": "tool_result", "success": True, "parsed": "Lassiwala Dhaba 4.0"}]) is True

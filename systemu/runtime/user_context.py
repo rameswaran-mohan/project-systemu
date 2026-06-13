@@ -31,7 +31,10 @@ def profile_context_block(vault) -> str:
     if profile.name:
         lines.append(f"- Name: {profile.name}")
     if profile.location_text:
-        lines.append(f"- Location: {profile.location_text}")
+        lines.append(
+            f'- Location: "{profile.location_text}" '
+            "(use this EXACT string for any location / near parameter — do not "
+            "append a city/region/country or reword it)")
     if profile.timezone:
         lines.append(f"- Timezone: {profile.timezone}")
     if profile.default_output_dir:

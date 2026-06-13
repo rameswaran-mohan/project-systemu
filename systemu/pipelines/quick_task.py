@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 _MAX_RESULT_CHARS = 2000     # per-entry transcript clamp (context economy)
 _SAME_TOOL_FAIL_CAP = 3
 _MALFORMED_CAP = 2
+_SYNTH_MAX_TOKENS = 700
+_MAX_PLANS = 3               # anti plan-thrash: cap re-plans per run
+# Keys whose non-empty presence in a tool payload counts as "usable content".
+_USABLE_CONTENT_KEYS = ("results", "records", "places", "data", "text",
+                        "content", "answer", "items", "rows", "response")
 
 
 @dataclass
@@ -154,6 +159,57 @@ def _publish(level: str, message: str, details: Optional[Dict[str, Any]] = None)
         logger.debug("[QuickTask] live event publish failed", exc_info=True)
 
 
+def _has_usable_observation(history: List[Dict[str, Any]]) -> bool:
+    """True iff history holds >=1 successful tool result carrying non-empty
+    content. A success with an empty payload (e.g. a web_search 200 with zero
+    hits) is NOT usable — synthesizing from it is the hallucination edge."""
+    for h in history:
+        if h.get("role") != "tool_result" or not h.get("success"):
+            continue
+        blob = h.get("parsed")
+        if blob in (None, ""):
+            continue
+        try:
+            obj = json.loads(blob) if isinstance(blob, str) else blob
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            if any(obj.get(k) not in (None, "", [], {}, 0) for k in _USABLE_CONTENT_KEYS):
+                return True
+            continue
+        if isinstance(blob, str) and len(blob.strip()) > 2:
+            return True
+    return False
+
+
+def _default_synthesize(prompt: str, history: List[Dict[str, Any]], config) -> Optional[str]:
+    """Grounding-only, cheap-tier final answer from gathered observations.
+    Returns None on any failure so the caller keeps an honest 'failed'. Fires
+    only after the loop budget is spent — bounded by tier-3 + low max_tokens."""
+    try:
+        from systemu.core.llm_router import llm_call_json
+        obs = [{"tool": h.get("tool"), "result": h.get("parsed")}
+               for h in history
+               if h.get("role") == "tool_result" and h.get("success")][-12:]
+        if not obs:
+            return None
+        system = (
+            "The assistant ran out of tool budget before answering. Using ONLY "
+            "the tool observations provided, write the most useful HONEST answer "
+            "to the operator's request. Quote concrete data actually present "
+            "(names, ratings, addresses, file paths). If the data is partial, say "
+            "so and state what is missing. Invent NOTHING not in the observations. "
+            'Reply with ONE JSON object: {"answer_md": "<markdown answer>"}.')
+        user = json.dumps({"request": prompt, "observations": obs}, default=str)
+        out = llm_call_json(tier=3, system=system, user=user, config=config,
+                            temperature=0.1, max_tokens=_SYNTH_MAX_TOKENS)
+        text = (out.get("answer_md") if isinstance(out, dict) else None) or ""
+        return text.strip() or None
+    except Exception:
+        logger.debug("[QuickTask] synthesis fallback failed", exc_info=True)
+        return None
+
+
 def run_quick_task(
     prompt: str,
     config,
@@ -161,6 +217,7 @@ def run_quick_task(
     *,
     llm_json: Optional[Callable[..., Dict[str, Any]]] = None,
     sandbox=None,
+    synthesize: Optional[Callable[..., Optional[str]]] = None,
     max_iters: int = 12,
     wall_clock_s: float = 240.0,
 ) -> QuickResult:
@@ -245,12 +302,17 @@ def run_quick_task(
     tool_calls = 0
     malformed_streak = 0
     fail_streaks: Dict[str, int] = {}
+    failed_sigs: set = set()         # (tool|params) calls that already failed
+    tool_errors: Dict[str, str] = {}  # last error text per tool (honest fail msg)
+    plan: List[str] = []             # plan-first: the model's todo for this run
+    plan_count = 0
     started = time.monotonic()
 
     def _finish(result: QuickResult) -> QuickResult:
         result.files_produced = files
         result.tool_calls = tool_calls
-        level = {"success": "SUCCESS", "needs_input": "WARNING"}.get(result.status, "ERROR")
+        level = {"success": "SUCCESS", "partial": "WARNING",
+                 "needs_input": "WARNING"}.get(result.status, "ERROR")
         head = result.answer_md or result.question or result.error or ""
         _publish(level, f"Quick task {result.status}: {prompt[:80]}",
                  details={"summary": head[:1000],
@@ -258,17 +320,31 @@ def run_quick_task(
                           })
         return result
 
+    synth = synthesize or _default_synthesize
+
+    def _terminate(reason: str, iters: int) -> QuickResult:
+        """Machine-owned exit: salvage an honest partial from gathered data,
+        else keep an honest failure. Never invents from nothing."""
+        if _has_usable_observation(history):
+            answer = synth(prompt, history, config)
+            if answer:
+                return _finish(QuickResult(
+                    status="partial", answer_md=answer, error=reason, iterations=iters))
+        return _finish(QuickResult(status="failed", error=reason, iterations=iters))
+
     iteration = 0
     for iteration in range(1, max_iters + 1):
         if time.monotonic() - started > wall_clock_s:
-            return _finish(QuickResult(
-                status="failed", iterations=iteration - 1,
-                error=f"wall-clock budget exceeded ({int(wall_clock_s)}s)"))
+            return _terminate(
+                f"wall-clock budget exceeded ({int(wall_clock_s)}s)", iteration - 1)
 
         payload = json.dumps({
             "task": prompt,
             "iteration": iteration,
             "max_iterations": max_iters,
+            "iterations_left": max_iters - iteration,
+            "final_turn": iteration >= max_iters,
+            "plan": plan,
             "tools": index,
             "history": history[-16:],
         }, default=str)
@@ -276,9 +352,7 @@ def run_quick_task(
         try:
             action = llm(system=system_prompt, user=payload, config=config)
         except Exception as exc:
-            return _finish(QuickResult(
-                status="failed", iterations=iteration,
-                error=f"LLM call failed: {exc}"))
+            return _terminate(f"LLM call failed: {exc}", iteration)
 
         kind = (action or {}).get("action") if isinstance(action, dict) else None
 
@@ -306,6 +380,21 @@ def run_quick_task(
                 question=question or "(no question given)",
                 answer_md=question))
 
+        if kind == "PLAN":
+            # Plan-first (adaptive): a non-trivial task decomposes into a short
+            # todo before acting. The plan rides in every later payload so
+            # execution follows it; re-plans are capped to avoid plan-thrash.
+            steps = [str(s).strip() for s in (action.get("steps") or [])
+                     if str(s).strip()][:8]
+            if steps and plan_count < _MAX_PLANS:
+                plan = steps
+                plan_count += 1
+                history.append({"role": "plan", "steps": plan,
+                                "reasoning": str(action.get("reasoning") or "")})
+                _publish("INFO",
+                         f"[{iteration}/{max_iters}] planned {len(plan)} step(s)")
+            continue
+
         if kind == "TOOL_CALL":
             malformed_streak = 0
             tool_name = str(action.get("tool") or "")
@@ -324,6 +413,27 @@ def run_quick_task(
                 continue
 
             params = _normalize_output_paths(tool_name, params, output_dir)
+            sig = tool_name + "|" + json.dumps(params, sort_keys=True, default=str)
+            if sig in failed_sigs:
+                # The live RCA's step-1 == step-12 loop: refuse to re-run a call
+                # that already failed. Counts toward the same-tool cap so an
+                # unchanged retry can't thrash the loop to its budget.
+                history.append({
+                    "role": "tool_result", "tool": tool_name, "success": False,
+                    "error": ("This exact call already failed earlier in this run — "
+                              "do not repeat it. Change the tool or parameters, or "
+                              "ANSWER with what you already have."),
+                })
+                _publish("WARNING",
+                         f"[{iteration}/{max_iters}] blocked repeat of a call "
+                         f"that already failed: {tool_name}")
+                fail_streaks[tool_name] = fail_streaks.get(tool_name, 0) + 1
+                if fail_streaks[tool_name] >= _SAME_TOOL_FAIL_CAP:
+                    return _terminate(
+                        f"tool '{tool_name}' failed {_SAME_TOOL_FAIL_CAP} times "
+                        f"in a row: {tool_errors.get(tool_name) or 'repeated a call that already failed'}",
+                        iteration)
+                continue
             history.append({"role": "tool_call", "tool": tool_name,
                             "params": params, "reasoning": reasoning})
             denial = _safety_denied(tool_name, params)
@@ -385,11 +495,12 @@ def run_quick_task(
                     logger.debug("[QuickTask] artifact collection failed", exc_info=True)
             else:
                 fail_streaks[tool_name] = fail_streaks.get(tool_name, 0) + 1
+                failed_sigs.add(sig)
+                tool_errors[tool_name] = str(error)
                 if fail_streaks[tool_name] >= _SAME_TOOL_FAIL_CAP:
-                    return _finish(QuickResult(
-                        status="failed", iterations=iteration,
-                        error=(f"tool '{tool_name}' failed "
-                               f"{_SAME_TOOL_FAIL_CAP} times in a row: {error}")))
+                    return _terminate(
+                        f"tool '{tool_name}' failed {_SAME_TOOL_FAIL_CAP} "
+                        f"times in a row: {error}", iteration)
             continue
 
         # Malformed action.
@@ -400,13 +511,11 @@ def run_quick_task(
                       "(TOOL_CALL / ANSWER / ASK_USER). Reply with exactly one."),
         })
         if malformed_streak >= _MALFORMED_CAP:
-            return _finish(QuickResult(
-                status="failed", iterations=iteration,
-                error="the model returned malformed actions twice in a row"))
+            return _terminate(
+                "the model returned malformed actions twice in a row", iteration)
 
-    return _finish(QuickResult(
-        status="failed", iterations=iteration,
-        error=f"iteration budget exhausted ({max_iters}) without an answer"))
+    return _terminate(
+        f"iteration budget exhausted ({max_iters}) without an answer", iteration)
 
 
 def _safety_denied(tool_name: str, params: Dict[str, Any]) -> "str | None":
