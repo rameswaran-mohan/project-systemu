@@ -72,6 +72,24 @@ def _fallback_model_for_tier(tier: int, current: str) -> "str | None":
         return None
 
 
+def _provider_override(tier: int, config) -> str:
+    return getattr(config, f"tier{tier}_provider", "") if tier in (1, 2, 3) else ""
+
+
+def _uses_native_path(tier: int, config) -> bool:
+    """W14 Task9: True for native-shape providers (Anthropic SDK, Ollama
+    httpx) that the AsyncOpenAI `_get_client` path can't serve — they route
+    through `_get_provider().call()` / LLMResponse instead. OpenAI-shape
+    providers (OpenRouter/Google/OpenAI) return False and keep the proven
+    path untouched."""
+    try:
+        model = _model_for_tier(tier, config) if tier in (1, 2, 3) else ""
+        cls = _resolve_provider_keyaware(model, _provider_override(tier, config), config)
+        return cls.__name__ in ("AnthropicProvider", "OllamaProvider")
+    except Exception:
+        return False
+
+
 def _classify_model_failure(*, was_validated: bool) -> str:
     """W14: a model the operator VALIDATED that now fails is genuine drift
     (degrade to the tier fallback + flag loudly). A model that was NEVER
@@ -203,17 +221,17 @@ def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:
             api_key=config.openai_api_key,
             timeout=_API_TIMEOUT_SECONDS,
         )
-    # W14 guardrail: native-Anthropic and Ollama are NOT AsyncOpenAI-shape.
-    # Forcing them on this path used to silently return an OpenRouter client
-    # (a lie — the operator's provider choice was ignored). The validation
-    # spec forbids silent substitution: refuse clearly instead. (Full
-    # _get_provider/LLMResponse live migration is the deferred follow-up.)
+    # W14 backstop: native-Anthropic and Ollama are NOT AsyncOpenAI-shape and
+    # must never be served by this client. The live path (llm_call) routes
+    # them through _get_provider()/LLMResponse BEFORE reaching here (W14 Task9);
+    # this guard only fires if something calls _get_client directly for them —
+    # raise rather than silently return an OpenRouter client (which would
+    # ignore the operator's provider choice).
     if provider_cls.__name__ in ("AnthropicProvider", "OllamaProvider"):
         raise RuntimeError(
-            f"Tier provider '{provider_cls.__name__}' is selected but is not "
-            f"yet servable on this call path. Choose openrouter/google/openai "
-            f"for this tier, or set it back to auto. (Native Anthropic / "
-            f"Ollama live calls are a tracked follow-up.)")
+            f"Provider '{provider_cls.__name__}' is not AsyncOpenAI-shape — it "
+            f"must be invoked via _get_provider()/LLMResponse, not _get_client. "
+            f"(anthropic / ollama go through the native path in llm_call.)")
     # Default (OpenRouter + any other AsyncOpenAI-compat fallback): use the
     # historical OpenRouter path.
     return AsyncOpenAI(
@@ -397,6 +415,68 @@ def _extract_json(raw_text: str, tier: int) -> Any:
 #  Core async implementation
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _llm_call_via_provider(
+    config: Config, tier: int, model: str, messages: List[Dict[str, Any]], *,
+    response_format: Optional[Dict[str, Any]], temperature: float,
+    max_tokens: int, t0: float,
+) -> Dict[str, Any]:
+    """W14 Task9: the live call for native-shape providers (Anthropic/Ollama).
+
+    Uses the unified BaseLLMProvider.call() -> LLMResponse and normalizes it
+    into the same dict shape the AsyncOpenAI path returns. response_format /
+    tools are NOT passed (native providers don't take OpenAI's json_object /
+    tools) — JSON is recovered by _extract_json + the repair loop in
+    async_llm_call_json, exactly as for any model lacking native JSON mode.
+    """
+    provider = _get_provider(config, tier)
+    try:
+        resp = await provider.call(messages=messages, model=model,
+                                   temperature=temperature, max_tokens=max_tokens)
+    except Exception as exc:
+        exc_str = str(exc)
+        if _is_invalid_model_error(exc_str):
+            try:
+                from systemu.runtime.model_validation import is_validated
+                _was = is_validated(_validated_models_path(),
+                                    provider=_provider_name_for_tier(tier, config),
+                                    model=model)
+            except Exception:
+                _was = False
+            if _classify_model_failure(was_validated=_was) == "config_error":
+                raise RuntimeError(
+                    f"LLM call failed (tier={tier}, model={model}): this model "
+                    f"was never validated and the provider rejects it — fix your "
+                    f"config (sharing_on setup / Settings).") from exc
+            # Validated native model drifted. Unlike the OpenRouter path we do
+            # NOT silently degrade to the budget default — that would switch
+            # PROVIDER (and cost). Flag loudly and fail honestly so the
+            # operator re-validates or re-points the tier.
+            _emit_drift_flag(tier=tier, dead=model, fallback="(none — native)")
+            raise RuntimeError(
+                f"LLM call failed (tier={tier}, model={model}): this validated "
+                f"native model stopped working — re-validate or change the tier "
+                f"provider/model in Settings.") from exc
+        logger.error("[LLM] native provider error: %s", exc)
+        raise RuntimeError(f"LLM call failed (tier={tier}, model={model}): {exc}") from exc
+
+    raw_text = (resp.content or "").strip()
+    usage = resp.usage or {}
+    in_tok = usage.get("input", usage.get("prompt_tokens", 0))
+    out_tok = usage.get("output", usage.get("completion_tokens", 0))
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    logger.info("[LLM] done tier=%d model=%s in=%d out=%d latency=%dms (native)",
+                tier, model, in_tok, out_tok, elapsed_ms)
+
+    content: Any = raw_text
+    if response_format and response_format.get("type") == "json_object":
+        content = _extract_json(raw_text, tier)
+    return {
+        "content": content, "model": model, "tier": tier,
+        "input_tokens": in_tok, "output_tokens": out_tok,
+        "latency_ms": elapsed_ms,
+    }
+
+
 async def llm_call(
     tier: int,
     system: str,
@@ -436,6 +516,15 @@ async def llm_call(
 
     logger.info("[LLM] tier=%d model=%s max_tokens=%d ...", tier, model, max_tokens)
     t0 = time.monotonic()
+
+    # W14 Task9: native-shape providers (Anthropic SDK / Ollama httpx) are not
+    # AsyncOpenAI-compatible — route them through the unified provider.call()
+    # path. OpenAI-shape providers fall through to the proven _get_client path
+    # below, unchanged.
+    if _uses_native_path(tier, config):
+        return await _llm_call_via_provider(
+            config, tier, model, messages, response_format=response_format,
+            temperature=temperature, max_tokens=max_tokens, t0=t0)
 
     # Use async-with so the httpx connection pool is closed deterministically
     # inside this coroutine — GC finalizers never need to touch it.
