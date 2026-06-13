@@ -96,7 +96,9 @@ class TestWizardSummary:
     def test_full_interactive_flow_with_injected_io(self, tmp_path):
         from sharing_on.setup_flow import _parse_env, run_setup
         p = _env(tmp_path)
-        inputs = iter(["1", str(tmp_path / "out")])  # preset choice, folder
+        # W14b: the wizard now asks the provider FIRST — "1" = OpenRouter →
+        # the simple key+preset path. Then preset choice, then folder.
+        inputs = iter(["1", "1", str(tmp_path / "out")])
         out = run_setup(
             interactive=True, env_path=p, validate=True,
             getpass_fn=lambda prompt: "sk-or-typed",

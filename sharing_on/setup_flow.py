@@ -154,6 +154,135 @@ def anthropic_available() -> bool:
         return False
 
 
+_PROVIDER_DEFAULT_MODEL = {
+    "openrouter": "deepseek/deepseek-v4-flash",
+    "google": "google/gemini-3-flash-preview",
+    "anthropic": "anthropic/claude-sonnet-4.5",
+    "openai": "openai/gpt-4o",
+    "ollama": "ollama/llama3.1",
+}
+_SINGLE_CHOICE = {"1": "openrouter", "2": "google", "3": "openai",
+                  "4": "anthropic", "5": "ollama"}
+_TIER_CHOICE = ["openrouter", "google", "openai", "anthropic", "ollama"]
+_TIER_LABELS = {1: "Tier 1 (deep reasoning)", 2: "Tier 2 (code / structured)",
+                3: "Tier 3 (fast / formatting)"}
+
+
+def _collect_model(provider, input_fn, print_fn):
+    default = _PROVIDER_DEFAULT_MODEL.get(provider, "")
+    return ((input_fn(f"    Model id for {provider} [{default}]: ") or default)
+            .strip())
+
+
+def _collect_credential(provider, getpass_fn, input_fn, print_fn):
+    if provider == "ollama":
+        return ((input_fn("    Ollama base URL [http://localhost:11434]: ")
+                 or "http://localhost:11434").strip())
+    if provider == "anthropic" and not anthropic_available():
+        print_fn("    note: the 'anthropic' package isn't installed yet — "
+                 "run `pip install 'systemu[anthropic]'` before using it.")
+    return (getpass_fn(f"    {provider} API key (hidden): ") or "").strip()
+
+
+def _interactive_provider_specs(*, getpass_fn, input_fn, print_fn):
+    """Ask the provider question. Returns None when the operator picks the
+    simple OpenRouter path (caller falls through to the one-key+preset flow),
+    or a 3-item tier_specs list for a single non-OpenRouter provider or a
+    per-tier mix. Credentials are reused across tiers that share a provider —
+    one provider = one key (the operator's 'same token' case)."""
+    print_fn("\nStep 1 — Which LLM provider?")
+    print_fn("  1. OpenRouter  (recommended — one key, 200+ models)")
+    print_fn("  2. Google      (needs a Google AI key)")
+    print_fn("  3. OpenAI      (needs an OpenAI key)")
+    print_fn("  4. Anthropic   (needs an Anthropic key + the [anthropic] extra)")
+    print_fn("  5. Ollama      (local models, no key)")
+    print_fn("  6. Different provider per tier (advanced)")
+    raw = (input_fn("  Choice [1]: ") or "1").strip()
+
+    if raw in _SINGLE_CHOICE:
+        prov = _SINGLE_CHOICE[raw]
+        if prov == "openrouter":
+            return None  # simple path — best UX for the common case
+        print_fn(f"\n  Using {prov} for all three tiers.")
+        cred = _collect_credential(prov, getpass_fn, input_fn, print_fn)
+        model = _collect_model(prov, input_fn, print_fn)
+        # one provider + one key applies to all three tiers
+        return [{"provider": prov, "model": model, "credential": cred}
+                for _ in range(3)]
+
+    if raw == "6":
+        specs, seen = [], {}
+        for i in (1, 2, 3):
+            print_fn(f"\n  {_TIER_LABELS[i]} — provider:")
+            for n, p in enumerate(_TIER_CHOICE, 1):
+                print_fn(f"    {n}. {p}")
+            if i > 1:
+                print_fn("    s. same as tier 1")
+            c = (input_fn("    Choice [1]: ") or "1").strip().lower()
+            if c == "s" and i > 1:
+                prov = specs[0]["provider"]
+            elif c.isdigit() and 1 <= int(c) <= len(_TIER_CHOICE):
+                prov = _TIER_CHOICE[int(c) - 1]
+            else:
+                prov = "openrouter"
+            # credential BEFORE model (consistent with the single-provider
+            # path; reused silently when this provider already appeared).
+            if prov in seen:
+                cred = seen[prov]
+                print_fn(f"    (reusing the {prov} credential from an earlier tier)")
+            else:
+                cred = _collect_credential(prov, getpass_fn, input_fn, print_fn)
+                seen[prov] = cred
+            model = _collect_model(prov, input_fn, print_fn)
+            specs.append({"provider": prov, "model": model, "credential": cred})
+        return specs
+
+    # unrecognized → safest default: OpenRouter simple path
+    return None
+
+
+def _run_tier_specs(tier_specs, *, output_dir, env_path) -> Dict[str, object]:
+    """Write a 3-item tier_specs list to .env: per-tier provider + model +
+    each provider's credential (de-duped — one key per provider)."""
+    updates: Dict[str, str] = {}
+    messages: List[str] = []
+    seen_cred: Dict[str, str] = {}
+    for i, spec in enumerate(tier_specs[:3], start=1):
+        prov = (spec.get("provider") or "").strip().lower()
+        model = (spec.get("model") or "").strip()
+        cred = (spec.get("credential") or "").strip()
+        if prov and prov != "auto":
+            updates[f"SYSTEMU_TIER{i}_PROVIDER"] = prov
+        if model:
+            updates[f"SYSTEMU_TIER{i}_MODEL"] = model
+        env_name = _PROVIDER_CRED_ENV.get(prov)
+        if env_name and cred:
+            if seen_cred.get(prov) and seen_cred[prov] != cred:
+                messages.append(
+                    f"Tier {i}: {prov} credential differs from an earlier tier; "
+                    f"v1 keeps one per provider — using the latest.")
+            seen_cred[prov] = cred
+            updates[env_name] = cred
+    provs = [updates.get(f"SYSTEMU_TIER{i}_PROVIDER", "auto") for i in (1, 2, 3)]
+    messages.append(f"Per-tier providers: {', '.join(provs)}.")
+    if output_dir:
+        try:
+            Path(output_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messages.append(f"Could not create {output_dir}: {exc}")
+        updates["SYSTEMU_OUTPUT_DIR"] = output_dir
+    if updates:
+        write_env_vars(updates, env_path=Path(env_path))
+    return {
+        "key_set": any(updates.get(_PROVIDER_CRED_ENV.get(p, "")) for p in seen_cred),
+        "validated": False,
+        "tier_providers": {i: updates.get(f"SYSTEMU_TIER{i}_PROVIDER", "auto") for i in (1, 2, 3)},
+        "output_dir": updates.get("SYSTEMU_OUTPUT_DIR"),
+        "env_path": str(env_path),
+        "messages": messages,
+    }
+
+
 # ── The wizard ───────────────────────────────────────────────────────────────
 
 def run_setup(
@@ -189,47 +318,23 @@ def run_setup(
     messages: List[str] = []
     validated = False
 
-    # ── Per-tier path (W14) — takes precedence over the simple key path ─────
+    # ── Per-tier path (W14): explicit tier_specs (CLI flags) ────────────────
     if tier_specs:
-        seen_cred: Dict[str, str] = {}  # provider -> credential (reuse)
-        for i, spec in enumerate(tier_specs[:3], start=1):
-            prov = (spec.get("provider") or "").strip().lower()
-            model = (spec.get("model") or "").strip()
-            cred = (spec.get("credential") or "").strip()
-            if prov and prov != "auto":
-                updates[f"SYSTEMU_TIER{i}_PROVIDER"] = prov
-            if model:
-                updates[f"SYSTEMU_TIER{i}_MODEL"] = model
-            env_name = _PROVIDER_CRED_ENV.get(prov)
-            if env_name and cred:
-                if seen_cred.get(prov) and seen_cred[prov] != cred:
-                    messages.append(
-                        f"Tier {i}: {prov} credential differs from an earlier "
-                        f"tier; v1 keeps one per provider — using the latest.")
-                seen_cred[prov] = cred
-                updates[env_name] = cred
-        provs = [updates.get(f"SYSTEMU_TIER{i}_PROVIDER", "auto") for i in (1, 2, 3)]
-        messages.append(f"Per-tier providers: {', '.join(provs)}.")
-        # output dir still applies (shared below)
-        chosen_out = output_dir
-        if chosen_out:
-            try:
-                Path(chosen_out).expanduser().mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                messages.append(f"Could not create {chosen_out}: {exc}")
-            updates["SYSTEMU_OUTPUT_DIR"] = chosen_out
-        if updates:
-            write_env_vars(updates, env_path=env_path)
-        return {
-            "key_set": any(updates.get(_PROVIDER_CRED_ENV.get(p, "")) for p in seen_cred),
-            "validated": validated,
-            "tier_providers": {i: updates.get(f"SYSTEMU_TIER{i}_PROVIDER", "auto") for i in (1, 2, 3)},
-            "output_dir": updates.get("SYSTEMU_OUTPUT_DIR"),
-            "env_path": str(env_path),
-            "messages": messages,
-        }
+        return _run_tier_specs(tier_specs, output_dir=output_dir, env_path=env_path)
 
-    # ── 1. Key ────────────────────────────────────────────────────────────
+    # ── Interactive provider choice (W14b) ──────────────────────────────────
+    # The fix for "setup only asked for an OpenRouter key": ask which provider
+    # FIRST. OpenRouter → the simple one-key+preset flow below (best UX for
+    # the common case). Anything else (or per-tier) builds tier_specs and
+    # routes through the same writer the CLI flags use.
+    if interactive and key is None:
+        built = _interactive_provider_specs(
+            getpass_fn=getpass_fn, input_fn=input_fn, print_fn=print_fn)
+        if built is not None:
+            return _run_tier_specs(built, output_dir=output_dir, env_path=env_path)
+        # built is None → operator chose OpenRouter → continue to simple path.
+
+    # ── 1. Key (OpenRouter simple path) ─────────────────────────────────────
     chosen_key = key
     if chosen_key is None and interactive:
         print_fn("\nStep 1 of 3 — OpenRouter API key")
