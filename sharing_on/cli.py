@@ -772,6 +772,9 @@ def info():
 # ---------------------------------------------------------------------------
 
 
+_PROVIDER_CHOICES = ["auto", "openrouter", "google", "anthropic", "openai", "ollama"]
+
+
 @cli.command()
 @click.option("--key", default=None,
               help="OpenRouter key non-interactively (CI). Prefer the hidden "
@@ -780,26 +783,52 @@ def info():
               default=None, help="Model preset (default: ask).")
 @click.option("--output-dir", default=None, help="Where produced files land.")
 @click.option("--no-validate", is_flag=True, help="Skip the live key probe.")
-def setup(key, preset, output_dir, no_validate):
-    """Configure your API key + models (run right after `pip install systemu`).
+@click.option("--tier1-provider", type=click.Choice(_PROVIDER_CHOICES), default=None)
+@click.option("--tier2-provider", type=click.Choice(_PROVIDER_CHOICES), default=None)
+@click.option("--tier3-provider", type=click.Choice(_PROVIDER_CHOICES), default=None)
+@click.option("--tier1-model", default=None)
+@click.option("--tier2-model", default=None)
+@click.option("--tier3-model", default=None)
+@click.option("--anthropic-key", default=None, help="ANTHROPIC_API_KEY (CI).")
+@click.option("--openai-key", default=None, help="OPENAI_API_KEY (CI).")
+@click.option("--ollama-url", default=None, help="OLLAMA_URL (CI).")
+def setup(key, preset, output_dir, no_validate, tier1_provider, tier2_provider,
+          tier3_provider, tier1_model, tier2_model, tier3_model,
+          anthropic_key, openai_key, ollama_url):
+    """Configure your API key(s) + models (run right after `pip install systemu`).
 
-    Walks you through the OpenRouter key (entered hidden, validated, stored
-    in a 0600 .env), a model preset, and an output folder. Re-run any time
-    to reconfigure. `daemon start` runs this for you the first time if no
-    key is set.
+    Simple path: an OpenRouter key (entered hidden, validated, stored in a
+    0600 .env) + a model preset. Advanced: pick a provider PER TIER with the
+    --tier{N}-provider/--tier{N}-model flags (credentials via --anthropic-key
+    / --openai-key / --ollama-url, or the per-provider env vars). Re-run any
+    time. `daemon start` runs this for you the first time if no key is set.
     """
     import sys as _sys
 
-    from sharing_on.setup_flow import run_setup
+    from sharing_on.setup_flow import _PROVIDER_CRED_ENV, run_setup
 
-    interactive = key is None and _sys.stdin.isatty()
-    if not interactive and key is None:
-        console.print("[yellow]Non-interactive and no --key given — nothing "
-                      "to configure. Pass --key, or run in a terminal.[/yellow]")
+    # Assemble per-tier specs when any --tierN-provider was given (CI/advanced).
+    tier_specs = None
+    if any(v is not None for v in (tier1_provider, tier2_provider, tier3_provider)):
+        _cred_by_prov = {"anthropic": anthropic_key, "openai": openai_key,
+                         "ollama": ollama_url, "openrouter": key}
+        tier_specs = []
+        for prov, model in ((tier1_provider, tier1_model),
+                            (tier2_provider, tier2_model),
+                            (tier3_provider, tier3_model)):
+            prov = (prov or "auto")
+            tier_specs.append({"provider": prov, "model": model or "",
+                               "credential": _cred_by_prov.get(prov) or ""})
+
+    interactive = (key is None and tier_specs is None and _sys.stdin.isatty())
+    if not interactive and key is None and tier_specs is None:
+        console.print("[yellow]Non-interactive and no --key / --tier*-provider "
+                      "given — nothing to configure. Pass flags, or run in a "
+                      "terminal.[/yellow]")
         return
     console.print("\n[cyan]⚡ Systemu setup[/cyan]")
     summary = run_setup(
-        interactive=interactive, key=key, preset=preset,
+        interactive=interactive, key=key, preset=preset, tier_specs=tier_specs,
         output_dir=output_dir, validate=not no_validate,
         print_fn=lambda s: console.print(s),
     )

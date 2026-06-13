@@ -72,6 +72,41 @@ def _fallback_model_for_tier(tier: int, current: str) -> "str | None":
         return None
 
 
+def _classify_model_failure(*, was_validated: bool) -> str:
+    """W14: a model the operator VALIDATED that now fails is genuine drift
+    (degrade to the tier fallback + flag loudly). A model that was NEVER
+    validated is a CONFIG ERROR (block + prompt) — never silently
+    substituted for one the operator didn't choose."""
+    return "drift" if was_validated else "config_error"
+
+
+def _validated_models_path():
+    from pathlib import Path
+    return Path("data") / "validated_models.json"
+
+
+def _provider_name_for_tier(tier: int, config) -> str:
+    """The tier's effective provider label for the validated-record lookup
+    (empty override = the OpenRouter default path)."""
+    return (getattr(config, f"tier{tier}_provider", "") or "").lower() or "openrouter"
+
+
+def _emit_drift_flag(*, tier: int, dead: str, fallback: str) -> None:
+    """Best-effort loud, visible flag that a validated model drifted and we
+    degraded. Never raises into the call path."""
+    try:
+        from systemu.interface.notifications import log_event
+        log_event(
+            "WARNING", "llm",
+            f"Tier-{tier} model '{dead}' stopped working — running on "
+            f"'{fallback}'. Re-validate your models in Settings.",
+            {"tier": tier, "dead_model": dead, "fallback_model": fallback,
+             "kind": "model_drift"})
+    except Exception:
+        logger.warning("[LLM] tier-%d model %r drifted → %r (flag emit failed)",
+                        tier, dead, fallback)
+
+
 def _is_network_retriable(exc: BaseException) -> bool:
     """Return True for transient network / timeout errors that warrant a retry."""
     for candidate in (exc, getattr(exc, "__cause__", None)):
@@ -98,7 +133,6 @@ def _resolve_provider_keyaware(model: str, override: str, config) -> type:
     failing with a cryptic 400 ("Missing or invalid Authorization header").
     An explicit ``SYSTEMU_TIER{N}_PROVIDER`` override always wins.
     """
-    import os as _os
     from systemu.llm.providers import resolve_provider_class
     from systemu.llm.providers.openrouter import OpenRouterProvider
 
@@ -107,8 +141,8 @@ def _resolve_provider_keyaware(model: str, override: str, config) -> type:
         return cls
     native_key = {
         "GoogleProvider":    (getattr(config, "google_api_key", "") or ""),
-        "AnthropicProvider": _os.environ.get("ANTHROPIC_API_KEY", ""),
-        "OpenAIProvider":    _os.environ.get("OPENAI_API_KEY", ""),
+        "AnthropicProvider": (getattr(config, "anthropic_api_key", "") or ""),
+        "OpenAIProvider":    (getattr(config, "openai_api_key", "") or ""),
     }.get(cls.__name__)
     if (native_key is not None and not native_key.strip()
             and (getattr(config, "openrouter_api_key", "") or "").strip()):
@@ -163,14 +197,25 @@ def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:
             timeout=_API_TIMEOUT_SECONDS,
         )
     if provider_cls is OpenAIProvider:
-        import os as _os
+        # W14: read the dedicated key; NEVER fall back to the OpenRouter key
+        # (that leaked an sk-or-* key to api.openai.com and 401'd cryptically).
         return AsyncOpenAI(
-            api_key=_os.environ.get("OPENAI_API_KEY", config.openrouter_api_key),
+            api_key=config.openai_api_key,
             timeout=_API_TIMEOUT_SECONDS,
         )
+    # W14 guardrail: native-Anthropic and Ollama are NOT AsyncOpenAI-shape.
+    # Forcing them on this path used to silently return an OpenRouter client
+    # (a lie — the operator's provider choice was ignored). The validation
+    # spec forbids silent substitution: refuse clearly instead. (Full
+    # _get_provider/LLMResponse live migration is the deferred follow-up.)
+    if provider_cls.__name__ in ("AnthropicProvider", "OllamaProvider"):
+        raise RuntimeError(
+            f"Tier provider '{provider_cls.__name__}' is selected but is not "
+            f"yet servable on this call path. Choose openrouter/google/openai "
+            f"for this tier, or set it back to auto. (Native Anthropic / "
+            f"Ollama live calls are a tracked follow-up.)")
     # Default (OpenRouter + any other AsyncOpenAI-compat fallback): use the
-    # historical OpenRouter path.  Anthropic / Ollama-shape providers should
-    # go through _get_provider() instead — see deferred-migration note above.
+    # historical OpenRouter path.
     return AsyncOpenAI(
         api_key=config.openrouter_api_key,
         base_url=config.openrouter_base_url,
@@ -204,11 +249,11 @@ def _get_provider(config: Config, tier: int):
         return provider_cls(api_key=config.openrouter_api_key,
                             base_url=config.openrouter_base_url)
     if cls_name == "AnthropicProvider":
-        return provider_cls(api_key=_os.environ.get("ANTHROPIC_API_KEY", ""))
+        return provider_cls(api_key=config.anthropic_api_key)
     if cls_name == "OpenAIProvider":
-        return provider_cls(api_key=_os.environ.get("OPENAI_API_KEY", ""))
+        return provider_cls(api_key=config.openai_api_key)
     if cls_name == "OllamaProvider":
-        return provider_cls(base_url=_os.environ.get("OLLAMA_URL", "http://localhost:11434"))
+        return provider_cls(base_url=config.ollama_url)
     raise RuntimeError(f"unhandled provider {cls_name}")
 
 
@@ -405,15 +450,35 @@ async def llm_call(
             # OpenRouter provider in the common case) so catalog drift or a
             # stale SYSTEMU_TIER*_MODEL never bricks the whole task.
             if _is_invalid_model_error(exc_str):
+                # W14: classify before acting. A model the operator VALIDATED
+                # that now drifts → degrade + LOUD flag. A model NEVER
+                # validated (stale env / hand-edit) → CONFIG ERROR, block +
+                # prompt; never silently substitute one they didn't choose.
+                try:
+                    from systemu.runtime.model_validation import is_validated
+                    _was_validated = is_validated(
+                        _validated_models_path(),
+                        provider=_provider_name_for_tier(tier, config), model=model)
+                except Exception:
+                    _was_validated = False
+                if _classify_model_failure(was_validated=_was_validated) == "config_error":
+                    logger.error(
+                        "[LLM] tier=%d model %r was NEVER validated and the "
+                        "provider rejects it — CONFIG ERROR, not degrading. "
+                        "Fix it: `sharing_on setup` or Settings.", tier, model)
+                    raise RuntimeError(
+                        f"LLM call failed (tier={tier}, model={model}): this "
+                        f"model was never validated and the provider rejects "
+                        f"it — fix your config (sharing_on setup / Settings).") from exc
                 fb = _fallback_model_for_tier(tier, model)
                 if fb:
                     logger.error(
-                        "[LLM] tier=%d model %r rejected as invalid — falling "
-                        "back to %r. Fix SYSTEMU_TIER%d_MODEL (or your preset "
-                        "in Settings) to silence this.", tier, model, fb, tier)
+                        "[LLM] tier=%d VALIDATED model %r stopped working "
+                        "(drift) — degrading to %r and flagging.", tier, model, fb)
                     try:
                         resp = await client.chat.completions.create(
                             **{**kwargs, "model": fb})
+                        _emit_drift_flag(tier=tier, dead=model, fallback=fb)
                         model = fb  # honest telemetry below
                     except Exception as exc2:
                         logger.error("[LLM] API error (model fallback): %s", exc2)

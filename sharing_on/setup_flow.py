@@ -135,6 +135,25 @@ def key_present(env_path: Optional[Path] = None) -> bool:
     return False
 
 
+# W14: each provider stores its credential under its own env var (one key
+# per provider in v1; ollama stores a base_url, no key).
+_PROVIDER_CRED_ENV = {
+    "openrouter": "OPENROUTER_API_KEY", "google": "GOOGLE_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
+    "ollama": "OLLAMA_URL",
+}
+
+
+def anthropic_available() -> bool:
+    """W14: True when the optional `anthropic` extra is importable — setup
+    uses this to gate/explain the Anthropic option."""
+    try:
+        import anthropic  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 # ── The wizard ───────────────────────────────────────────────────────────────
 
 def run_setup(
@@ -145,6 +164,7 @@ def run_setup(
     output_dir: Optional[str] = None,
     env_path: Optional[Path] = None,
     validate: bool = True,
+    tier_specs: Optional[List[dict]] = None,
     getpass_fn: Callable[[str], str] = _getpass.getpass,
     input_fn: Callable[[str], str] = input,
     print_fn: Callable[[str], None] = print,
@@ -152,13 +172,62 @@ def run_setup(
 ) -> Dict[str, object]:
     """Run the setup wizard. Returns a summary dict; never raises on bad input.
 
-    Non-interactive: only the explicitly-passed key/preset/output_dir are
-    written (for CI). Interactive: prompts with hidden key entry.
+    Two configuration shapes:
+      * Simple (key + preset): one OpenRouter key for all tiers. The
+        historical path; used when ``tier_specs`` is None.
+      * Per-tier (W14): ``tier_specs`` = a 3-item list of
+        ``{provider, model, credential}`` (tier 1, 2, 3). Writes
+        SYSTEMU_TIER{N}_PROVIDER / SYSTEMU_TIER{N}_MODEL and each provider's
+        credential env var, de-duping a credential already collected for the
+        same provider in this run (the operator's "ask per tier, reuse same
+        provider" requirement).
+
+    Non-interactive: only explicitly-passed values are written (CI).
     """
     env_path = Path(env_path) if env_path else (Path.cwd() / ".env")
     updates: Dict[str, str] = {}
     messages: List[str] = []
     validated = False
+
+    # ── Per-tier path (W14) — takes precedence over the simple key path ─────
+    if tier_specs:
+        seen_cred: Dict[str, str] = {}  # provider -> credential (reuse)
+        for i, spec in enumerate(tier_specs[:3], start=1):
+            prov = (spec.get("provider") or "").strip().lower()
+            model = (spec.get("model") or "").strip()
+            cred = (spec.get("credential") or "").strip()
+            if prov and prov != "auto":
+                updates[f"SYSTEMU_TIER{i}_PROVIDER"] = prov
+            if model:
+                updates[f"SYSTEMU_TIER{i}_MODEL"] = model
+            env_name = _PROVIDER_CRED_ENV.get(prov)
+            if env_name and cred:
+                if seen_cred.get(prov) and seen_cred[prov] != cred:
+                    messages.append(
+                        f"Tier {i}: {prov} credential differs from an earlier "
+                        f"tier; v1 keeps one per provider — using the latest.")
+                seen_cred[prov] = cred
+                updates[env_name] = cred
+        provs = [updates.get(f"SYSTEMU_TIER{i}_PROVIDER", "auto") for i in (1, 2, 3)]
+        messages.append(f"Per-tier providers: {', '.join(provs)}.")
+        # output dir still applies (shared below)
+        chosen_out = output_dir
+        if chosen_out:
+            try:
+                Path(chosen_out).expanduser().mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                messages.append(f"Could not create {chosen_out}: {exc}")
+            updates["SYSTEMU_OUTPUT_DIR"] = chosen_out
+        if updates:
+            write_env_vars(updates, env_path=env_path)
+        return {
+            "key_set": any(updates.get(_PROVIDER_CRED_ENV.get(p, "")) for p in seen_cred),
+            "validated": validated,
+            "tier_providers": {i: updates.get(f"SYSTEMU_TIER{i}_PROVIDER", "auto") for i in (1, 2, 3)},
+            "output_dir": updates.get("SYSTEMU_OUTPUT_DIR"),
+            "env_path": str(env_path),
+            "messages": messages,
+        }
 
     # ── 1. Key ────────────────────────────────────────────────────────────
     chosen_key = key

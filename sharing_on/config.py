@@ -109,6 +109,12 @@ class Config:
     # W11.7: was z-ai/glm-4.5-air:free — OpenRouter 404s it now.
     llm_model: str = "deepseek/deepseek-v4-flash"
     google_api_key: str = ""   # Google AI Studio key — used for Tier 2 (Gemini direct)
+    # W14: provider credentials as first-class Config (were ad-hoc os.environ
+    # reads in llm_router._get_provider — invisible to the Settings UI). One
+    # source of truth for the router AND Settings. Defaults reproduce today.
+    anthropic_api_key: str = ""
+    openai_api_key: str = ""
+    ollama_url: str = "http://localhost:11434"
 
     # --- Systemu LLM Tiers ---
     # v0.6.7: pinned to deepseek-v4-flash across all 3 modes (single OpenRouter
@@ -407,7 +413,12 @@ class Config:
         _preset_tiers = resolve_preset(os.environ)
         instance = cls(
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
+            openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             google_api_key=os.getenv("GOOGLE_API_KEY", ""),
+            # W14: provider creds — first-class env bindings (see dataclass).
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
             llm_model=os.getenv("SHARING_ON_MODEL", "deepseek/deepseek-v4-flash"),
             # Systemu uses tier3 for log→instructions (existing analyze step)
             # W8.1: defaults route through the preset (SYSTEMU_MODEL_PRESET);

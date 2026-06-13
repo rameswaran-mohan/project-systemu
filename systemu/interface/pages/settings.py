@@ -48,6 +48,23 @@ def build_settings_page() -> None:
                 config.tier3_model,
             )
 
+            # W14: per-tier PROVIDER selection. Auto ("") = today's behavior
+            # (detect from model id, OpenRouter catch-all). Explicit values
+            # force a provider and are honored over auto-detect at call time.
+            same_provider = ui.switch(
+                "Same provider for all tiers", value=True,
+            ).props("dense").classes("s-muted").style("font-size: 12px;")
+            tier1_prov = _provider_select("Tier 1 provider", config.tier1_provider)
+            tier2_prov = _provider_select("Tier 2 provider", config.tier2_provider)
+            tier3_prov = _provider_select("Tier 3 provider", config.tier3_provider)
+
+            def _sync_provider_visibility() -> None:
+                one = bool(same_provider.value)
+                tier2_prov.set_visibility(not one)
+                tier3_prov.set_visibility(not one)
+            _sync_provider_visibility()
+            same_provider.on("change", lambda _: _sync_provider_visibility())
+
             # W8.1: preset fill-in. Applying a preset fills the three tier
             # inputs; "Save Settings" then persists them as the explicit
             # SYSTEMU_TIER*_MODEL vars (which always win over the preset env,
@@ -87,6 +104,50 @@ def build_settings_page() -> None:
 
             _brain_advisory()
             tier1.on("change", lambda _: _brain_advisory.refresh())
+
+        # ── Provider credentials (W14) — read-only status, .env-sourced ────
+        _section_header("Provider credentials")
+        with ui.column().classes("s-card").style("gap: 8px; padding: 20px;"):
+            ui.label(
+                "Credentials are loaded from .env and never typed in the "
+                "browser. Set the env var, then restart the daemon. A red ✗ "
+                "on a provider you've selected above is why a tier would fail."
+            ).classes("s-muted")
+            # provider -> (config attr, env var name)
+            _CRED_ROWS = [
+                ("OpenRouter", "openrouter_api_key", "OPENROUTER_API_KEY"),
+                ("Google", "google_api_key", "GOOGLE_API_KEY"),
+                ("Anthropic", "anthropic_api_key", "ANTHROPIC_API_KEY"),
+                ("OpenAI", "openai_api_key", "OPENAI_API_KEY"),
+                ("Ollama URL", "ollama_url", "OLLAMA_URL"),
+            ]
+            for label, attr, env in _CRED_ROWS:
+                val = (getattr(config, attr, "") or "").strip()
+                mark = "✓ Set" if val else f"✗ Not set — add {env} to .env"
+                cls = "s-pill--success" if val else "s-pill--warn"
+                with ui.row().classes("w-full items-center").style("gap: 10px;"):
+                    ui.label(label).classes("s-cell").style("min-width: 120px;")
+                    ui.label(mark).classes(f"s-pill {cls}")
+
+            # W14 S8: red-flag the sharp edge — a provider SELECTED for a tier
+            # whose credential is empty will 401 at runtime (explicit override
+            # never reroutes). Surface it loudly here so it's fixed in .env.
+            _prov_to_attr = {
+                "openrouter": "openrouter_api_key", "google": "google_api_key",
+                "anthropic": "anthropic_api_key", "openai": "openai_api_key",
+                "ollama": "ollama_url",
+            }
+            _selected = {(getattr(config, f"tier{i}_provider", "") or "").lower()
+                         for i in (1, 2, 3)} - {"", "auto"}
+            _missing = sorted(
+                p for p in _selected
+                if not (getattr(config, _prov_to_attr.get(p, ""), "") or "").strip())
+            if _missing:
+                ui.label(
+                    "Selected for a tier but no credential set: "
+                    + ", ".join(_missing)
+                    + ". Those tiers will fail until you add the key(s) to .env."
+                ).classes("s-banner s-banner--danger w-full")
 
         # ── Behaviour ──────────────────────────────────────────────────────
         _section_header("Behaviour")
@@ -354,10 +415,23 @@ def build_settings_page() -> None:
                 _update_env_var("SYSTEMU_TIER2_MODEL", tier2.value.strip())
                 _update_env_var("SYSTEMU_TIER3_MODEL", tier3.value.strip())
                 _update_env_var("SYSTEMU_NON_INTERACTIVE", "1" if auto_approve.value else "0")
+                # W14: per-tier providers. "Same provider for all tiers" fans
+                # tier-1's choice out to all three. Empty value = Auto.
+                p1 = tier1_prov.value or ""
+                if same_provider.value:
+                    p2 = p3 = p1
+                else:
+                    p2, p3 = (tier2_prov.value or ""), (tier3_prov.value or "")
+                _update_env_var("SYSTEMU_TIER1_PROVIDER", p1)
+                _update_env_var("SYSTEMU_TIER2_PROVIDER", p2)
+                _update_env_var("SYSTEMU_TIER3_PROVIDER", p3)
                 # Patch live config too (until restart)
                 config.tier1_model           = tier1.value.strip() or config.tier1_model
                 config.tier2_model           = tier2.value.strip() or config.tier2_model
                 config.tier3_model           = tier3.value.strip() or config.tier3_model
+                config.tier1_provider        = p1
+                config.tier2_provider        = p2
+                config.tier3_provider        = p3
                 config.non_interactive       = auto_approve.value
                 ui.notify("Settings saved to .env. Restart daemon to fully apply.", type="positive")
             except Exception as exc:
@@ -491,6 +565,23 @@ def _connection_card(row: dict) -> None:
                     f"background: transparent; color: {THEME['danger']}; "
                     f"border: 1px solid {THEME['danger']}; border-radius: 8px;"
                 )
+
+
+_PROVIDER_OPTIONS = {
+    "": "Auto", "openrouter": "OpenRouter", "google": "Google",
+    "anthropic": "Anthropic", "openai": "OpenAI", "ollama": "Ollama",
+}
+
+
+def _provider_select(label: str, current_value: str):
+    """W14: a per-tier provider dropdown. Auto ("") = detect-from-model."""
+    with ui.column().style("gap: 4px;"):
+        ui.label(label).classes("s-muted").style("font-size: 12px;")
+        sel = ui.select(
+            options=dict(_PROVIDER_OPTIONS),
+            value=(current_value or ""),
+        ).props("dense").classes("s-input")
+    return sel
 
 
 def _model_input(label: str, description: str, current_value: str):
