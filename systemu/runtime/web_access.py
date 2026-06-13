@@ -301,12 +301,30 @@ def _osm_addr(tags: Dict[str, Any]) -> str:
     return ", ".join(p for p in parts if p)
 
 
-def geocode(place: str, *, config: Any = None) -> Optional[Tuple[float, float]]:
-    """Resolve a place name to (lat, lon) via Nominatim. Best-effort: retries ONCE
-    with a short backoff on a transient timeout / 5xx / empty body, then degrades
-    to None. Respects the Nominatim 1 req/s rate limit on every attempt."""
-    if not place:
-        return None
+# Cap the live Nominatim lookups for a many-comma string (full + coarser fallbacks).
+_GEOCODE_MAX_CANDIDATES = 4
+
+
+def _geocode_candidates(place: str) -> List[str]:
+    """Coarsening candidates for a free-text place: the full string first, then
+    drop the most-specific (leading) comma segment each step so a finicky
+    'neighborhood, city' that Nominatim can't match as one string degrades to
+    the city. 'Santhoshpuram, Chennai' -> ['Santhoshpuram, Chennai', 'Chennai'].
+    Comma-free input yields exactly one candidate (behavior unchanged)."""
+    full = place.strip()
+    cands: List[str] = [full] if full else []
+    parts = [p.strip() for p in place.split(",") if p.strip()]
+    for i in range(1, len(parts)):                 # drop leading (most specific) segments
+        cand = ", ".join(parts[i:])
+        if cand and cand not in cands:
+            cands.append(cand)
+    return cands[:_GEOCODE_MAX_CANDIDATES]
+
+
+def _geocode_one(place: str) -> Optional[Tuple[float, float]]:
+    """One Nominatim free-text lookup. Retries ONCE with a short backoff on a
+    transient timeout / 5xx / empty body, then returns None. A clean 200 with
+    valid JSON but no match is NOT retryable. Honors the 1 req/s rate limit."""
     url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + urllib.parse.quote(place)
     # Up to 2 attempts total (1 original + 1 retry on transient failure).
     for attempt in range(2):
@@ -331,6 +349,21 @@ def geocode(place: str, *, config: Any = None) -> Optional[Tuple[float, float]]:
         except Exception:  # noqa: BLE001 — never propagate; degrade to None
             logger.debug("[web_access] geocode attempt failed", exc_info=True)
             break
+    return None
+
+
+def geocode(place: str, *, config: Any = None) -> Optional[Tuple[float, float]]:
+    """Resolve a place name to (lat, lon) via Nominatim. Best-effort: tries the
+    full string, then progressively coarser comma-trimmed fallbacks (so a
+    'neighborhood, city' string Nominatim can't match as one degrades to the
+    city), each with a single transient retry. Degrades to None. Honors the
+    Nominatim 1 req/s rate limit on every attempt."""
+    if not place:
+        return None
+    for cand in _geocode_candidates(place):
+        coord = _geocode_one(cand)
+        if coord:
+            return coord
     return None
 
 

@@ -183,3 +183,75 @@ def test_geocode_gives_up_after_two_attempts(monkeypatch):
 
     assert wa.geocode("Chennai") is None
     assert calls["n"] == 2                              # original + one retry, then stop
+
+
+# ── B3d: geocode degrades a 'neighborhood, city' string to the city ─────────
+# Live failure (2026-06-13): Nominatim returns 200 [] for the combined freeform
+# string "santhoshpuram, Chennai" even though "Chennai" alone resolves, so a
+# "punjabi restaurant near me" task lost find_places and burned its whole
+# iteration budget. geocode must try progressively coarser comma-trimmed
+# fallbacks rather than giving up on the first miss.
+
+def test_geocode_falls_back_to_city_when_combined_string_unmatched(monkeypatch):
+    wa._CACHE._d.clear()
+    monkeypatch.setattr(wa._RL, "wait", lambda host: None)
+    monkeypatch.setattr(wa.time, "sleep", lambda s: None)
+
+    seen = []
+
+    def fake_get(url, timeout=30, headers=None):
+        seen.append(url)
+        # Nominatim knows the city, but not the combined neighborhood+city string.
+        if "Chennai" in url and "santhoshpuram" not in url.lower():
+            return 200, json.dumps([{"lat": "13.0837", "lon": "80.2702"}]), ""
+        return 200, "[]", ""
+    monkeypatch.setattr(wa, "_http_get", fake_get)
+
+    assert wa.geocode("santhoshpuram, Chennai") == (13.0837, 80.2702)
+    # tried the full string first, then fell back to the city
+    assert any("santhoshpuram" in u.lower() for u in seen)
+    assert any(("Chennai" in u and "santhoshpuram" not in u.lower()) for u in seen)
+
+
+def test_geocode_commafree_miss_makes_no_extra_calls(monkeypatch):
+    """A comma-free string that misses has no coarser fallback — exactly one
+    lookup (one attempt, clean empty), same as before. Guards against the fix
+    fanning out extra Nominatim calls for the common case."""
+    wa._CACHE._d.clear()
+    monkeypatch.setattr(wa._RL, "wait", lambda host: None)
+    monkeypatch.setattr(wa.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def fake_get(url, timeout=30, headers=None):
+        calls["n"] += 1
+        return 200, "[]", ""
+    monkeypatch.setattr(wa, "_http_get", fake_get)
+
+    assert wa.geocode("Nowheresville XYZ") is None
+    assert calls["n"] == 1
+
+
+def test_find_places_resolves_via_geocode_city_fallback(monkeypatch):
+    """End-to-end: an unmatched 'neighborhood, city' near-string still returns
+    POIs by falling back to the city center."""
+    wa._CACHE._d.clear()
+    monkeypatch.setattr(wa._RL, "wait", lambda host: None)
+    monkeypatch.setattr(wa.time, "sleep", lambda s: None)
+
+    def fake_get(url, timeout=30, headers=None):
+        if "Chennai" in url and "santhoshpuram" not in url.lower():
+            return 200, json.dumps([{"lat": "13.0837", "lon": "80.2702"}]), ""
+        return 200, "[]", ""
+    monkeypatch.setattr(wa, "_http_get", fake_get)
+
+    overpass_json = json.dumps({"elements": [
+        {"type": "node", "lat": 13.08, "lon": 80.27,
+         "tags": {"name": "Punjabi Dhaba", "amenity": "restaurant"}},
+    ]})
+    monkeypatch.setattr(wa, "_http_post",
+                        lambda url, data, timeout=40, headers=None: (200, overpass_json, ""))
+
+    out = wa.find_places("punjabi restaurant", near="santhoshpuram, Chennai", limit=3)
+    assert out["error"] in ("", None)
+    assert [p["name"] for p in out["places"]] == ["Punjabi Dhaba"]
+    assert out["center"] == {"lat": 13.0837, "lon": 80.2702}
