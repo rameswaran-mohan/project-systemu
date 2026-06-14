@@ -39,12 +39,18 @@ In your chosen working directory:
 
 ```bash
 sharing_on init           # seeds the starter catalog (41 tools, idempotent)
+sharing_on setup          # pick your LLM provider + model preset, store keys securely
 sharing_on daemon start
 ```
 
-Open <http://localhost:8765>. A two-minute setup wizard and guided tour
-take it from there: add your key, say who you are, run a starter task —
-then hit **Record** and teach it something real.
+`sharing_on setup` walks you through choosing a provider (OpenRouter, Google,
+OpenAI, Anthropic, or a local Ollama) per tier and stores the keys in a local
+`.env` — entered hidden, never echoed, never typed into a browser. Skip it and
+`daemon start` runs the same flow on first launch.
+
+Open <http://localhost:8765>. A short setup wizard and guided tour take it from
+there: confirm your models, say who you are, run a starter task — then hit
+**Record** and teach it something real.
 
 **The one-page guide:** [OPERATOR-SOP.md](OPERATOR-SOP.md) — the
 record → approve → run → results loop, what each approval card means, and
@@ -67,6 +73,13 @@ python install.py --mode docker-local     # or docker-enterprise
   (specialists created per job, with your approval), a curated 41-tool
   registry that works out of the box, MCP connector support, episodic
   memory, and an evolution engine that proposes improvements from real runs.
+  A Reverse-Harness Governor arbitrates the capabilities a running agent asks
+  for, writes a per-run decision-audit trail, and — opt-in — can fan a
+  decomposed goal out to a bounded fleet of parallel sub-agents.
+- **Bring your own model** — choose a provider per tier: OpenRouter, Google,
+  OpenAI, Anthropic (native SDK), or a local **Ollama** (keyless, on-device).
+  Presets — budget / balanced / quality — set the cost/quality dial in one
+  keystroke; `sharing_on setup` or Settings stores the keys.
 - **The dashboard** — a command center: **Home · Work · Shadows · Build ·
   Insights · Settings**, a persistent *Needs you* + *Live* rail, and one
   Decisions Inbox where every approval lands. Quick tasks answer in
@@ -127,11 +140,14 @@ Supervisor dispatches the Shadow.  Intelligent
           │
           ▼
 Reverse-Harness Governor arbitrates capability
-  requests the running Shadow PULLs (a missing
-  tool, a dependency, an escalation).  Under the
+  requests the running Shadow PULLs — a missing
+  tool, a dependency, an escalation, or a fan-out
+  to parallel sub-agents (opt-in).  Under the
   default risk-tiered gate mode it auto-grants
   low-risk requests and escalates the rest to the
-  Decisions Inbox; on approval the run resumes
+  Decisions Inbox; on approval the run resumes.
+  Every iteration's decision is written to a
+  per-run decision-audit ledger
           │
           ▼
 Dashboard shows live progress, results,
@@ -154,7 +170,7 @@ six-spine command center. The left sidebar has exactly six entries:
 | **Home** | `/` | Overview — stat cards, the workflow pipeline, and the live activity feed |
 | **Work** | `/work` | The workflow-centric view; Scrolls + Activities fold in here |
 | **Shadows** | `/shadows` | The Shadow roster (agent personas) and their per-shadow memory |
-| **Build** | `/tools` | Tool registry; Skills and Evolution proposals fold in here |
+| **Build** | `/tools` | Tool registry (with an *agent-built* filter for tools Systemu forged itself); Skills and Evolution proposals fold in here |
 | **Insights** | `/insights` | Memory, the capability flywheel, and the event stream (tabbed) |
 | **Settings** | `/settings` | LLM tier config, the gate-mode dial, and approval defaults |
 
@@ -229,11 +245,18 @@ sudo dnf install xdotool xclip      # Fedora
 
 ### LLM access
 
-You need at least one of:
+Systemu calls models in three tiers and you choose a **provider per tier** — mix
+and match, or use one everywhere. You need credentials for **at least one** of:
 
-- An [OpenRouter](https://openrouter.ai) key (free tier works)
-- A [Google AI Studio](https://aistudio.google.com) key (free)
-- A local Ollama instance reachable on `:11434`
+- [OpenRouter](https://openrouter.ai) (free tier works) — the default; one key reaches many models
+- [Google AI Studio](https://aistudio.google.com) (free)
+- [OpenAI](https://platform.openai.com)
+- [Anthropic](https://console.anthropic.com) — native SDK (install the `anthropic` extra)
+- A local [Ollama](https://ollama.com) instance on `:11434` — keyless, on-device
+
+`sharing_on setup` collects the keys (hidden entry, stored in `.env`) and the
+Settings page lets you switch providers, models, and the budget / balanced /
+quality preset anytime.
 
 ---
 
@@ -357,19 +380,41 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 
 ### API Keys
 
-| Variable | Required | Description |
-|---|---|---|
-| `OPENROUTER_API_KEY` | Yes | OpenRouter key for Tier 3 / sharing_on LLM calls. Free tier available at [openrouter.ai](https://openrouter.ai) |
-| `GOOGLE_API_KEY` | Yes | Google AI Studio key for Tier 1 and Tier 2 calls. Free at [aistudio.google.com](https://aistudio.google.com) |
+You need credentials for **at least one** provider — not all of them. Which keys
+matter depends on the provider you pick per tier (`sharing_on setup` or Settings).
+Keys are stored in `.env`; they are never typed into the browser.
 
-### LLM Models
+| Variable | Provider | Notes |
+|---|---|---|
+| `OPENROUTER_API_KEY` | OpenRouter | Default; one key reaches many models. Free tier at [openrouter.ai](https://openrouter.ai) |
+| `GOOGLE_API_KEY` | Google AI Studio | Free at [aistudio.google.com](https://aistudio.google.com) |
+| `OPENAI_API_KEY` | OpenAI | [platform.openai.com](https://platform.openai.com) |
+| `ANTHROPIC_API_KEY` | Anthropic (native) | Needs the extra: `pip install "systemu[anthropic]"` |
+| `OLLAMA_URL` | Ollama (local) | Default `http://localhost:11434` — no key required |
+| `OPENROUTER_BASE_URL` | OpenRouter | Optional — override the OpenRouter base URL |
+
+### LLM models & providers
+
+Defaults are the **budget** preset (`deepseek/deepseek-v4-flash` on every tier).
+Set `SYSTEMU_MODEL_PRESET` to `balanced` or `quality`, or override any tier
+explicitly — an explicit tier model always wins over the preset.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SYSTEMU_TIER1_MODEL` | `gemini-3.1-flash-lite-preview` | Deep reasoning — scroll refinement, shadow decisions |
-| `SYSTEMU_TIER2_MODEL` | `gemini-3.1-flash-lite-preview` | Structured output — tool forge, execution planning |
-| `SYSTEMU_TIER3_MODEL` | `z-ai/glm-4.5-air:free` | Fast formatting — log-to-instructions conversion |
-| `SHARING_ON_MODEL` | `z-ai/glm-4.5-air:free` | LLM used during sharing_on analysis |
+| `SYSTEMU_MODEL_PRESET` | _(budget)_ | `budget` \| `balanced` \| `quality` — one-keystroke cost/quality dial |
+| `SYSTEMU_TIER1_MODEL` | `deepseek/deepseek-v4-flash` | Deep reasoning — scroll refinement, shadow decisions |
+| `SYSTEMU_TIER2_MODEL` | `deepseek/deepseek-v4-flash` | Structured output — tool forge, execution planning |
+| `SYSTEMU_TIER3_MODEL` | `deepseek/deepseek-v4-flash` | Fast formatting — log-to-instructions conversion |
+| `SYSTEMU_TIER1_PROVIDER` | _(auto)_ | Provider for tier 1: `openrouter` \| `google` \| `openai` \| `anthropic` \| `ollama` (empty = auto-detect from the model id) |
+| `SYSTEMU_TIER2_PROVIDER` | _(auto)_ | Provider for tier 2 |
+| `SYSTEMU_TIER3_PROVIDER` | _(auto)_ | Provider for tier 3 |
+| `SHARING_ON_MODEL` | `deepseek/deepseek-v4-flash` | LLM used during sharing_on analysis |
+
+The **quality** preset uses `anthropic/claude-sonnet-4.5` (tier 1),
+`google/gemini-3-flash-preview` (tier 2), `deepseek/deepseek-v4-flash` (tier 3);
+**balanced** uses `google/gemini-3-flash-preview` on tier 1 and the budget model
+elsewhere. A model id a provider later rejects degrades to the tier's budget
+default **with a visible flag**, rather than bricking the run.
 
 ### Storage
 
@@ -418,6 +463,12 @@ All settings go in your `.env` file. Copy `.env.example` as a starting point.
 | `SYSTEMU_DOCKER_TOOL_TIMEOUT` | `300` | Per-tool timeout (seconds) when `SYSTEMU_TOOL_BACKEND=docker` |
 | `SYSTEMU_TOOL_DEP_INSTALL_MODE` | `auto` | `auto` \| `off` \| `prompt` \| `always` — how the runtime handles tool pip deps |
 | `SYSTEMU_PREWARM_TOOL_DEPS` | `false` | Install all deployed-tool deps on daemon start instead of on first call |
+
+### Sub-agent fan-out (opt-in)
+
+| Variable | Default | Description |
+|---|---|---|
+| `SYSTEMU_DELEGATE_USE_PARALLEL` | `false` | When `true`, a granted SUBAGENT request runs a goal's independent sub-tasks as a **bounded fleet of concurrent child agents** (one level deep), collated so partial success is reported honestly (what each child produced + what's missing) — never a blanket "everything failed". Off by default; sequential delegation is the safe, deterministic path. |
 
 ### Intelligent Supervisor (v0.4.0+)
 
@@ -548,6 +599,8 @@ project-systemu-pro/
 │   │   ├── rejection_store.py              — Operator-feedback learning
 │   │   ├── governor.py                      — Reverse-Harness Governor (arbitrate + materialise capability PULLs)
 │   │   ├── harness_arbiter.py               — Deterministic GRANT/DENY/ESCALATE policy
+│   │   ├── subagent_fleet.py / subagent_harness.py — opt-in parallel child fan-out + partial-success collation
+│   │   ├── decision_audit.py                — per-iteration decision ledger (executions/<id>/decision_audit.jsonl)
 │   │   ├── gate_mode_settings.py            — Gate-mode dial (bypass / risk-tiered / approve-only) + floor
 │   │   ├── tool_sandbox.py                 — Subprocess / docker / wsl / ssh exec
 │   │   └── tool_registry.py                — Runtime tool loader
@@ -609,6 +662,7 @@ surface; the headline groups:
 |---|---|
 | `sharing_on record` / `analyze` | Capture a workflow / re-analyze a recorded session |
 | `sharing_on init` | Seed the working-directory vault from the bundled starter catalog |
+| `sharing_on setup` | Pick the LLM provider + model preset per tier and store keys securely (hidden entry → `.env`); auto-runs on first `daemon start` if unconfigured |
 | `sharing_on daemon start` / `stop` / `status` | Run the background daemon + web dashboard |
 | `sharing_on doctor <id>` | Diagnose pending gates/blockers for a scroll/activity/shadow/tool (`--apply` to auto-fix) |
 | `sharing_on scrolls list` / `show` / `refine` / `approve` | Manage Scrolls (refined SOPs) |
@@ -656,7 +710,7 @@ including the explicit guidelines for AI-authored PRs.
 
 ## Project status
 
-Pre-1.0.  Current release: **v0.9.11** (see [CHANGELOG](CHANGELOG.md) for what's new).  The table below summarises what's shipped vs. what's next.
+Pre-1.0.  Current release: **v0.9.30** (see [`release-notes/`](release-notes/) for what's new).  The table below summarises what's shipped vs. what's next.
 
 ### Shipped
 
@@ -675,14 +729,16 @@ Pre-1.0.  Current release: **v0.9.11** (see [CHANGELOG](CHANGELOG.md) for what's
 | **v0.6.1** | Post-v0.6.0 hardening — `Tool.name` path-traversal guard, `SYSTEMU_AUTO_APPROVE_SCROLLS` → `SYSTEMU_NON_INTERACTIVE` rename with safe-action ordering, `RECALIBRATE_SKILL` runtime wiring, catalog N+1 fix, batched `save_skill` resolution |
 | **v0.7.x** | PyPI/Docker packaging, native LLM provider plugins (Anthropic/OpenAI), `export-skill` wedge + spec-conformant `SKILL.md` writer, episodic-memory + capability ledger |
 | **v0.8.x** | Decisions Inbox + gate-mode dial, `SYSTEMU_DECISION_QUEUE` for dashboard-driven approvals, wheel-bundled starter vault (`sharing_on init`) |
-| **v0.9.x** | Reverse-Harness Governor (capability PULL arbitration, TOOL provisioner + escalate→approve→resume) and the six-spine command-center dashboard (Home/Work/Shadows/Build/Insights/Settings) with the persistent right rail |
+| **v0.9.x** | Reverse-Harness Governor (capability PULL arbitration, TOOL provisioner + escalate→approve→resume); the six-spine command-center dashboard with the persistent right rail; **pip-first onboarding** (`sharing_on setup`); **per-tier provider selection** (OpenRouter/Google/OpenAI/Anthropic/Ollama) with native Anthropic + local Ollama invocation and model presets; **plan-first quick lane** with honest partial answers; web-search snippets; geocode robustness; Telegram mobile alerts; MCP connector support |
+| **v0.10.0** *(on `main`)* | Opt-in **parallel sub-agent fan-out** — a granted SUBAGENT spawns a bounded concurrent fleet (one level deep) with partial-success-aware collation; a per-run **decision-audit ledger**; lease-lifecycle + tool provenance (the *agent-built* badge); harness-run metrics |
 
 ### What's next
 
 The next-phase work is open for design.  Likely candidates (not yet scheduled):
 
 - Auto-recalibration without operator approval for low-risk **skill** patterns (telemetry-gated promotion)
-- Harness provisioners beyond TOOL (SKILL / ACCESS / COMPUTE / SUBAGENT are currently arbitration + observation only)
+- The remaining harness provisioners — SKILL / ACCESS / COMPUTE (TOOL ships; SUBAGENT fan-out ships opt-in; ACCESS isolation is currently Docker-only / future work)
+- Recursive sub-agent decomposition (today's fleet is one level deep)
 - Multi-tenant deployment + per-operator vaults
 - Hosted catalog of community-contributed tools / skills
 
