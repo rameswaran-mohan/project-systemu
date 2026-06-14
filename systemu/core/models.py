@@ -286,6 +286,9 @@ class Tool(BaseModel):
     tool_md_path:        str = ""               # path to TOOL.md manifest
     status:              ToolStatus = ToolStatus.PROPOSED
     forged_by_systemu:   bool = False
+    # v0.10.0 — the execution that runtime-forged this tool (provenance for the
+    # "agent-built" view + the harness ledger). None for design-time/operator forges.
+    forged_by_execution_id: Optional[str] = None
     # W2.2: forged (LLM-generated) tools execute in a subprocess by default;
     # the operator may opt a reviewed tool back into the in-process fast path
     # (~100-500ms faster per call) by setting this. Built-ins (not forged)
@@ -419,6 +422,7 @@ class ActivityStatus(str, Enum):
     ASSIGNED    = "assigned"     # Shadow assigned, ready to execute
     EXECUTABLE  = "executable"   # All tools deployed, can run immediately
     COMPLETED   = "completed"    # Shadow execution succeeded — terminal state
+    FAILED      = "failed"       # Terminal failure — retries exhausted / structural blocker
 
 
 class Activity(BaseModel):
@@ -817,6 +821,10 @@ class HarnessRequest(BaseModel):
     # blocking semantics (spec §7): True → escalate+suspend when not
     # auto-grantable; False → downgrade to deny (the run proceeds without it).
     blocking:   bool = True
+    # v0.10.0 — pull-decision instrumentation (observability only)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)   # agent's stated need-confidence
+    attempts_before_request: int = 0                          # tool tries before resorting to this
+    provenance: Dict[str, Any] = Field(default_factory=dict)  # {tool_attempts:[...], blocked_signals:[...]}
     created_at: datetime = Field(default_factory=_now)
     model_config = {"extra": "forbid"}
 
@@ -843,5 +851,13 @@ class HarnessVerdict(BaseModel):
     lease_id:     Optional[str] = None
     # structured alternatives handed back to the agent on DENY (so it adapts)
     alternatives: List[str] = Field(default_factory=list)
+    # v0.10.0 — was this verdict resolved by deterministic policy or the LLM judge?
+    # (replaces the [judged_by=llm] rationale string tag; powers the cost-tiering measure)
+    decided_by:   Literal["deterministic", "llm"] = "deterministic"
+    # v0.10.0 — filled by the terminal-pass reconciliation (pull-decision instrumentation)
+    request_outcome: Optional[Literal[
+        "granted_used", "granted_unused", "denied_fallback_ok",
+        "denied_fallback_failed", "escalate_unresolved",
+    ]] = None
     created_at:   datetime = Field(default_factory=_now)
     model_config = {"extra": "forbid"}

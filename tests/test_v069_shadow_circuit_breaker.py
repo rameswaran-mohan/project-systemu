@@ -44,6 +44,28 @@ def test_circuit_breaker_resets_on_different_reason():
     assert tripped is False
 
 
+def test_structural_tool_failure_recorded_on_nontransient_trip():
+    """Fix 2: a circuit trip on a NON-transient reason marks the tool as a
+    structural failure (won't be fixed by re-running) so the supervisor can
+    skip the retry storm."""
+    rt = ShadowRuntime.__new__(ShadowRuntime)
+    rt._consecutive_failures = []
+    for _ in range(3):
+        rt._record_tool_failure("web_act", "'Page' object has no attribute 'accessibility'")
+    assert rt._structural_failure() is True
+    assert "web_act" in rt._structural_tool_failures
+
+
+def test_transient_trip_is_not_structural():
+    """A circuit trip on a transient reason (timeout/504) must NOT be marked
+    structural — a retry could still succeed."""
+    rt = ShadowRuntime.__new__(ShadowRuntime)
+    rt._consecutive_failures = []
+    for _ in range(3):
+        rt._record_tool_failure("web_read", "read timeout after 30s")
+    assert rt._structural_failure() is False
+
+
 def test_circuit_breaker_lazy_init_when_attribute_missing():
     """Helper should work even if _consecutive_failures wasn't initialized
     by __init__ (defensive against bypass-init test patterns)."""

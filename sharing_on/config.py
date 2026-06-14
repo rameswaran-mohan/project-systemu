@@ -216,6 +216,13 @@ class Config:
     delegate_max_turns_per_child: int = field(
         default_factory=lambda: int(os.getenv("SYSTEMU_DELEGATE_MAX_TURNS_PER_CHILD", "20"))
     )
+    # Plan 0 Build 3 (Task 3.1 — paper fleet): run a goal's child subagents
+    # concurrently (bounded by delegate_max_concurrent_children) rather than
+    # sequentially. OFF by default — sequential is the safe, deterministic path;
+    # opt in via SYSTEMU_DELEGATE_USE_PARALLEL=true.
+    delegate_use_parallel: bool = field(
+        default_factory=lambda: os.getenv("SYSTEMU_DELEGATE_USE_PARALLEL", "false").lower() == "true"
+    )
 
     # v0.9.5 (Layer 6 — MCP integration): comma-separated MCP server URLs.
     # Empty by default — operator opts in by setting SYSTEMU_MCP_SERVER_URLS.

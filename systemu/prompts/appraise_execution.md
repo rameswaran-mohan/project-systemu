@@ -26,7 +26,7 @@ If the task failed, diagnose the exact step or objective where it got stuck, and
 {
   "outcome": "scroll_refinement",
   "failed_action_block_index": 1,
-  "feedback": "web_screenshot failed because the Playwright Chromium binary was missing. Run 'playwright install chromium' before executing. If browser tools are unavailable, use web_extract_text as an alternative to obtain page data."
+  "feedback": "web_screenshot failed because the Playwright Chromium binary was missing. Run 'playwright install chromium' before executing. If browser tools are unavailable, use one of the tools in available_tools, or state the capability is missing."
 }
 ```
 
@@ -73,6 +73,14 @@ If the task succeeded and the agent combined tools in a totally unique way to ac
   "required_tool_names": ["browser_screenshot", "slack_upload"]
 }
 ```
+
+## Grounding (REQUIRED)
+
+The payload includes `available_tools` — the tools that actually exist (name +
+description). When your `feedback` (or `required_tool_names`) names a tool, it
+MUST be one of those names, verbatim. If no available tool can do the step,
+write "no available tool can do this — the capability is MISSING" rather than
+inventing a tool name. Never recommend a tool that is not in `available_tools`.
 
 ## Rules
 1. Return ONLY the JSON object. No markdown formatting blocks outside the JSON, no explanations.

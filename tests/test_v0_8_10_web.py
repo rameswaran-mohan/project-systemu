@@ -256,6 +256,37 @@ class TestWebAct:
         out = act_loop.run_act_loop(FakePage(), "type password", max_steps=8)
         assert "secret" not in typed   # password field refused
 
+    def test_page_adapter_perceives_via_aria_snapshot_not_removed_api(self):
+        """Playwright >=1.49 removed page.accessibility. _PageAdapter must
+        perceive via locator('body').aria_snapshot() (verified format) and still
+        produce the ref->{role,name} map that click_ref/type_ref resolve."""
+        from systemu.vault.tools.implementations.web_act import _PageAdapter
+        from systemu.runtime.web.browser_pool import parse_a11y_snapshot
+        # Real aria_snapshot() output shape (captured live on Playwright 1.59).
+        ARIA = (
+            '- button "Submit"\n'
+            '- link "Home":\n'
+            '  - /url: https://example.com\n'
+            '- textbox "Search"\n'
+            '- heading "Title" [level=1]\n'
+            '- paragraph: ignored plain text\n'
+        )
+        class _Loc:
+            def aria_snapshot(self):
+                return ARIA
+        class _FakePWPage:
+            # deliberately NO `.accessibility` attribute (Playwright 1.59)
+            def locator(self, sel):
+                return _Loc()
+        adapter = _PageAdapter(_FakePWPage())
+        snap = adapter.accessibility_snapshot()
+        nodes = parse_a11y_snapshot(snap)
+        names = {n["name"] for n in nodes}
+        assert {"Submit", "Home", "Search"} <= names    # interactive nodes + accessible names
+        assert "Title" not in names                      # heading filtered (non-interactive)
+        assert adapter._refs                              # ref->node map populated for click_ref/type_ref
+        assert all("role" in n and "name" in n for n in adapter._refs.values())
+
 
 class TestToolWrappers:
     # v0.9.8: these exercise the LEGACY web-tool backends (monkeypatched). The

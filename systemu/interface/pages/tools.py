@@ -115,18 +115,27 @@ def _render_unbaked_banner() -> None:
         )
 
 
-def _filter_tools(tools, query, status):
+def _filter_tools(tools, query, status, forged_by_systemu_filter="all"):
     """Pure filter for the Tools registry toolbar (board 5a: search + status).
 
     ``query`` matches name/description case-insensitively; ``status`` is an
     exact (case-insensitive) match, with ``""``/``"all"`` meaning no status
     filter.  Tolerant of dicts missing the ``status``/``description`` keys.
+
+    ``forged_by_systemu_filter`` (Plan 0 — the "Agent-built" facet) keeps only
+    rows whose ``forged_by_systemu`` is truthy when ``"yes"``, only the rest
+    when ``"no"``, and applies no filter for ``"all"``/``""``.
     """
     q = (query or "").strip().lower()
     st = (status or "all").strip().lower()
+    fb = (forged_by_systemu_filter or "all").strip().lower()
     out = []
     for t in tools:
         if st not in ("", "all") and (t.get("status") or "").lower() != st:
+            continue
+        if fb == "yes" and not t.get("forged_by_systemu"):
+            continue
+        if fb == "no" and t.get("forged_by_systemu"):
             continue
         if q and q not in f"{t.get('name', '')} {t.get('description', '')}".lower():
             continue
@@ -158,7 +167,7 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
     # board 5a: live ⌕ search + status ▾ filter over the registry.
     _all_tools = vault.load_index("tools")
     _statuses = sorted({(t.get("status") or "") for t in _all_tools if t.get("status")})
-    _filt = {"query": "", "status": "all"}
+    _filt = {"query": "", "status": "all", "forged_by_systemu": "all"}
 
     def _on_tool_search(e) -> None:
         _filt["query"] = e.value if isinstance(e.value, str) else ""
@@ -166,6 +175,10 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
 
     def _on_tool_status(e) -> None:
         _filt["status"] = e.value or "all"
+        _tools_table.refresh()
+
+    def _on_tool_forged_by(e) -> None:
+        _filt["forged_by_systemu"] = e.value or "all"
         _tools_table.refresh()
 
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 20px;"):
@@ -178,6 +191,11 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
                     .classes("s-input s-search")
                 ui.select(["all"] + _statuses, value="all", on_change=_on_tool_status) \
                     .classes("s-input")
+                ui.select(
+                    {"all": "Agent-built: all", "yes": "Agent-built: yes",
+                     "no": "Agent-built: no"},
+                    value="all", on_change=_on_tool_forged_by,
+                ).props('label="Agent-built"').classes("s-input")
             ui.button("+ New Tool", on_click=_show_forge_dialog).style(
                 f"background: {THEME['primary']}; color: white; border-radius: 8px;"
             )
@@ -212,7 +230,10 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
 
     @ui.refreshable
     def _tools_table() -> None:
-        rows = _filter_tools(vault.load_index("tools"), _filt["query"], _filt["status"])
+        rows = _filter_tools(
+            vault.load_index("tools"), _filt["query"], _filt["status"],
+            forged_by_systemu_filter=_filt["forged_by_systemu"],
+        )
         with ui.element("table").style(
             f"width: 100%; border-collapse: collapse; background: {THEME['surface']}; "
             f"border: 1px solid {THEME['border']}; border-radius: 12px; overflow: hidden;"

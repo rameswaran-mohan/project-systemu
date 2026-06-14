@@ -86,6 +86,11 @@ class Governor:
         # In-process lease registry.  key = lease_id, value = lease dict.
         self._leases: Dict[str, Dict[str, Any]] = {}
         self._lease_lock = threading.RLock()
+        # v0.10.0 — the vault the active execution loop publishes so that
+        # ``revoke_leases()`` (which carries no vault param) can emit lease-revoke
+        # ledger events.  None until the loop sets it; when None the revoke-event
+        # ledger write is a best-effort no-op (never a fallback path).
+        self._active_ledger_vault = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -190,6 +195,7 @@ class Governor:
                 rationale=f"[judged_by=llm] {rationale}".strip(),
                 lease_id=lease_id,
                 alternatives=original.alternatives,
+                decided_by="llm",
             )
 
         if decision == HarnessDecision.DENY:
@@ -200,10 +206,13 @@ class Governor:
                 rationale=f"[judged_by=llm] {rationale}".strip(),
                 lease_id=None,
                 alternatives=original.alternatives,
+                decided_by="llm",
             )
 
         # ESCALATE (or any non-grant/deny) — keep the arbiter's ESCALATE
-        # verdict but record the judge's reasoning for the operator.
+        # verdict but record the judge's reasoning for the operator.  The judge
+        # still *decided* this (it was asked and resolved to ESCALATE), so the
+        # provenance is "llm".
         appended = original.rationale
         if rationale:
             appended = f"{original.rationale} [judged_by=llm: {rationale}]".strip()
@@ -214,6 +223,7 @@ class Governor:
             rationale=appended,
             lease_id=original.lease_id,
             alternatives=original.alternatives,
+            decided_by="llm",
         )
 
     def materialise(
@@ -275,6 +285,23 @@ class Governor:
             vault=vault,
             execution_id=execution_id,
         )
+
+        # A GRANT that minted a capability lease gets a dedicated lease-mint
+        # event so the ledger carries the full lease lifecycle (mint → revoke).
+        # Best-effort: never raises (the _ledger_append guard already swallows).
+        if isinstance(outcome, dict) and outcome.get("lease_id"):
+            self._ledger_append(
+                {
+                    "ts": _utcnow_iso(),
+                    "execution_id": execution_id,
+                    "event_type": "lease-mint",
+                    "lease_id": outcome["lease_id"],
+                    "kind": request.kind.value,
+                },
+                vault=vault,
+                execution_id=execution_id,
+            )
+
         return outcome
 
     def revoke_leases(self, execution_id: str) -> int:
@@ -284,11 +311,13 @@ class Governor:
         Returns the number of leases revoked.
         """
         count = 0
+        revoked_lease_ids: list[str] = []
         with self._lease_lock:
             for lease in self._leases.values():
                 if lease["execution_id"] == execution_id and not lease["revoked"]:
                     lease["revoked"] = True
                     lease["revoked_at"] = _utcnow_iso()
+                    revoked_lease_ids.append(lease["lease_id"])
                     count += 1
         if count:
             logger.info(
@@ -296,6 +325,25 @@ class Governor:
                 count,
                 execution_id,
             )
+
+        # Emit a lease-revoke ledger event for each revoked lease.  ``revoke_leases``
+        # carries no vault param, so we use the vault the active execution loop
+        # published on ``_active_ledger_vault``.  When it is None this is a
+        # best-effort no-op — never raise, never write to a fallback path.
+        vault = self._active_ledger_vault
+        if vault is not None:
+            for lease_id in revoked_lease_ids:
+                self._ledger_append(
+                    {
+                        "ts": _utcnow_iso(),
+                        "execution_id": execution_id,
+                        "event_type": "lease-revoke",
+                        "lease_id": lease_id,
+                    },
+                    vault=vault,
+                    execution_id=execution_id,
+                )
+
         return count
 
     def ledger_path(self, execution_id: str, vault=None) -> Path:
@@ -391,6 +439,7 @@ class Governor:
                 dependencies=spec.get("dependencies", []),
                 status=ToolStatus.PROPOSED,
                 forged_by_systemu=True,
+                forged_by_execution_id=execution_id,
             )
             vault.save_tool(tool)
 
@@ -815,12 +864,17 @@ class Governor:
                 "rationale": request.rationale,
                 "urgency": request.urgency,
                 "blocking": request.blocking,
+                # v0.10.0 pull-decision instrumentation — carried so reconciliation
+                # + the CGB extractor can classify the pull-decision failure mode.
+                "attempts_before": getattr(request, "attempts_before_request", 0),
+                "confidence": getattr(request, "confidence", None),
             },
             "verdict": {
                 "decision": verdict.decision.value,
                 "risk_band": verdict.risk_band.value,
                 "rationale": verdict.rationale,
                 "lease_id": verdict.lease_id,
+                "decided_by": verdict.decided_by,
             },
             "outcome": outcome,
         }
@@ -848,3 +902,90 @@ class Governor:
                 execution_id,
                 exc,
             )
+
+    # ── Terminal-pass request-outcome reconciliation (v0.10.0 pull-decision) ────
+
+    @staticmethod
+    def reconcile_outcomes(ledger_rows, used_tool_names, run_success: bool = True) -> list:
+        """Pure: derive per-request ``request-outcome`` events from a run's ledger.
+
+        Skips non-request event rows (lease-mint / lease-revoke / request-outcome).
+        For each arbitrated request:
+          * GRANT     → ``granted_used`` if its materialised tool was actually called
+                        in the run, else ``granted_unused``;
+          * DENY      → ``denied_fallback_ok`` / ``denied_fallback_failed`` by run success;
+          * ESCALATE  → ``escalate_unresolved`` (autonomous run, no operator decision here).
+        """
+        used = set(used_tool_names or ())
+        events: list = []
+        for row in (ledger_rows or ()):
+            if not isinstance(row, dict) or row.get("event_type"):
+                continue
+            req = row.get("request") or {}
+            verd = row.get("verdict") or {}
+            rid = req.get("request_id")
+            decision = str(verd.get("decision") or "").lower()
+            if not rid or not decision:
+                continue
+            if decision == "grant":
+                tool = (row.get("outcome") or {}).get("tool")
+                used_after = bool(tool and tool in used)
+                outcome = "granted_used" if used_after else "granted_unused"
+            elif decision == "deny":
+                used_after = None
+                outcome = "denied_fallback_ok" if run_success else "denied_fallback_failed"
+            else:
+                used_after = None
+                outcome = "escalate_unresolved"
+            # v0.10.0 Task 1.7 — pull-failure taxonomy (premature / wasted / unused).
+            try:
+                from systemu.runtime.failure_classifier import classify_pull_failure
+                category = classify_pull_failure(
+                    attempts_before=int(req.get("attempts_before", 0) or 0),
+                    decision=decision,
+                    fallback_ok=(run_success if decision == "deny" else None),
+                    used_after_grant=used_after,
+                )
+            except Exception:
+                category = "unknown"
+            events.append({
+                "ts": _utcnow_iso(),
+                "execution_id": row.get("execution_id"),
+                "event_type": "request-outcome",
+                "request_id": rid,
+                "outcome": outcome,
+                "pull_failure_category": category,
+            })
+        return events
+
+    def _read_ledger_rows(self, execution_id: str, vault) -> list:
+        rows: list = []
+        try:
+            p = self.ledger_path(execution_id, vault)
+            if p.exists():
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return rows
+
+    def write_outcome_reconciliation(
+        self, execution_id: str, used_tool_names, *, run_success: bool = True, vault=None,
+    ) -> int:
+        """Terminal-pass: read this run's ledger and append a ``request-outcome``
+        event per arbitrated request. Best-effort; never raises. Returns the count."""
+        v = vault if vault is not None else getattr(self, "_active_ledger_vault", None)
+        try:
+            rows = self._read_ledger_rows(execution_id, v)
+            events = self.reconcile_outcomes(rows, used_tool_names, run_success)
+            for ev in events:
+                self._ledger_append(ev, v, execution_id)
+            return len(events)
+        except Exception:
+            logger.debug("[Governor] outcome reconciliation failed", exc_info=True)
+            return 0

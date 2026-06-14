@@ -46,12 +46,28 @@ class TestMarkActivityCompleted:
         assert mark_activity_completed(vault, "act_nope") is False
 
 
+class TestMarkActivityFailed:
+    def test_flips_assigned_to_failed(self, vault):
+        from systemu.runtime.activity_completion import mark_activity_failed
+        _activity(vault)
+        assert mark_activity_failed(vault, "act_1", status="partial",
+                                    summary="max iters; web_act broken") is True
+        assert vault.get_activity("act_1").status == ActivityStatus.FAILED
+
+    def test_missing_activity_is_nonfatal(self, vault):
+        from systemu.runtime.activity_completion import mark_activity_failed
+        assert mark_activity_failed(vault, "act_nope") is False
+
+
 class TestCallSitesShareTheHelper:
     def test_supervisor_uses_helper(self):
         import inspect
         from systemu.runtime import supervisor
         src = inspect.getsource(supervisor.Supervisor._handle_result)
         assert "mark_activity_completed" in src
+        # Fix 2: the dead-letter path must mark the activity terminally FAILED
+        # (no more zombie ASSIGNED).
+        assert "mark_activity_failed" in src
 
     def test_direct_task_uses_helper(self):
         import inspect

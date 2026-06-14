@@ -35,3 +35,27 @@ def mark_activity_completed(vault, activity_id: str) -> bool:
             activity_id, exc,
         )
         return False
+
+
+def mark_activity_failed(vault, activity_id: str, *, status: str = "failed",
+                         summary: str = "") -> bool:
+    """Persist ``ActivityStatus.FAILED`` (terminal) so an activity that exhausted
+    retries or hit a structural blocker is conclusively finished, not orphaned at
+    ASSIGNED (the recorded-task "zombie" RCA). Best-effort — never raises; a
+    failed mark must not fail the run that already concluded.  Returns True when
+    persisted."""
+    try:
+        from systemu.core.models import ActivityStatus
+        activity = vault.get_activity(activity_id)
+        activity.status = ActivityStatus.FAILED
+        activity.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        vault.save_activity(activity)
+        logger.info("[ActivityCompletion] Activity %s marked FAILED (%s): %s",
+                    activity_id, status, (summary or "")[:160])
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[ActivityCompletion] Could not mark activity %s FAILED: %s",
+            activity_id, exc,
+        )
+        return False

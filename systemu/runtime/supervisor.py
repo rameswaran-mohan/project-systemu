@@ -1075,6 +1075,14 @@ class Supervisor:
                     key, result.get("status", "?"),
                 )
 
+    @staticmethod
+    def _should_retry(status: str, retry_count: int, structural: bool) -> bool:
+        """Retry only a TRANSIENT partial/failure run that has retries left. A
+        structural failure (a required tool persistently/structurally failed)
+        won't be fixed by re-running, so it goes straight to terminal — no storm."""
+        return (status in ("failure", "partial")
+                and retry_count < MAX_RETRIES and not structural)
+
     def _handle_result(self, payload: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Post-execution: log result, decide retry vs dead-letter, trigger LLM analysis."""
         activity_id = payload["activity_id"]
@@ -1145,8 +1153,11 @@ class Supervisor:
             )
             return
 
-        # Partial or failure — decide retry
-        if status in ("failure", "partial") and retry_count < MAX_RETRIES:
+        # Partial or failure — decide retry. A structural failure won't be fixed
+        # by re-running the same activity (a required tool persistently failed),
+        # so skip the retry storm and go straight to terminal.
+        structural = bool(result.get("structural_failure"))
+        if self._should_retry(status, retry_count, structural):
             wait_s = 5 * (retry_count + 1)   # back-off: 5s, 10s
             # [A.2] Mark this DB row as failed; the retry submit() creates a new row.
             if self._task_queue is not None and sub_id:
@@ -1181,6 +1192,7 @@ class Supervisor:
                 "status":      status,
                 "error":       error,
                 "retries":     retry_count,
+                "structural":  structural,
                 "failed_at":   datetime.now(timezone.utc).isoformat(),
             }
             with self._dl_lock:
@@ -1191,8 +1203,19 @@ class Supervisor:
                     self._task_queue.mark_dead_letter(sub_id, error[:500])
                 except Exception as exc:
                     logger.warning("[Supervisor] SQLite queue mark_dead_letter failed: %s", exc)
+            # Fix 2: terminal FAILED state so the activity isn't orphaned at
+            # ASSIGNED (the recorded-task "zombie" RCA). Best-effort.
+            try:
+                from systemu.runtime.activity_completion import mark_activity_failed
+                mark_activity_failed(getattr(self, "vault", None), activity_id,
+                                     status=status, summary=error)
+            except Exception:
+                logger.warning("[Supervisor] mark_activity_failed failed for %s",
+                               activity_id, exc_info=True)
+            _why = ("structural blocker — not retried" if structural
+                    else f"exhausted {retry_count} retries")
             self._publish(
-                f"💀 Dead-lettered: {self._aname(activity_id)} (exhausted {retry_count} retries) — {error[:200]}",
+                f"💀 Dead-lettered: {self._aname(activity_id)} ({_why}) — {error[:200]}",
                 level="ERROR",
                 context=dl_entry,
                 origin=payload.get("origin"),   # v0.8.16

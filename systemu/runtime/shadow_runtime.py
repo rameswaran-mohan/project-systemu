@@ -457,6 +457,18 @@ def _observe_best_effort(label: str, fn):
 MAX_ITERATIONS       = 30     # Hard ceiling on agentic loop iterations
 SNAPSHOT_INTERVAL    = 5      # Compact after every N completed ActionBlocks
 
+# Fix 2: a circuit-breaker trip on one of these (transient) reasons is NOT
+# structural — a retry could still succeed, so it must not poison the
+# structural-failure flag that tells the supervisor to skip the retry storm.
+_TRANSIENT_FAIL_HINTS = ("timeout", "timed out", "504", "503", "429", "rate limit",
+                         "temporar", "connection", "reset by peer", "econnreset",
+                         "unavailable", "try again")
+
+
+def _is_transient_reason(reason: str) -> bool:
+    r = (reason or "").lower()
+    return any(h in r for h in _TRANSIENT_FAIL_HINTS)
+
 # v0.8.17: fail-fast constants + helper for consecutive-degraded-search detection.
 _SEARCH_TOOLS = {"web_search"}
 _MAX_CONSEC_DEGRADED_SEARCH = 3
@@ -1488,9 +1500,16 @@ class ShadowRuntime:
         config: Config,
         vault:  Vault,
         executions_dir: Optional[Path] = None,
+        audit_namespace: Optional[Path] = None,
     ):
         self.config        = config
         self.vault         = vault
+        # v0.10.0 Item 1: when set (by SubagentFleet for a child), action-audit
+        # writes route to this per-child namespace instead of the shared global
+        # audit log. There is NO corruption risk under the asyncio-gather fleet
+        # model (synchronous vault writes can't interleave across coroutines); this
+        # provides semantic isolation so child audits stay cleanly separable.
+        self._audit_namespace = audit_namespace
         # v0.9.1.1 fix: load user_profile once at init so _resolve_verifier_output_dir
         # can actually prefer user_profile.default_output_dir over config.output_dir.
         try:
@@ -1689,7 +1708,21 @@ class ShadowRuntime:
         if self._consecutive_failures and self._consecutive_failures[-1] != key:
             self._consecutive_failures = []
         self._consecutive_failures.append(key)
-        return len(self._consecutive_failures) >= self.CIRCUIT_BREAKER_FAILURES
+        tripped = len(self._consecutive_failures) >= self.CIRCUIT_BREAKER_FAILURES
+        if tripped and not _is_transient_reason(reason):
+            # Fix 2: a tool that structurally/persistently fails (non-transient)
+            # won't be fixed by re-running — record it so the terminal flags the
+            # run structural and the supervisor skips the retry storm.
+            if not hasattr(self, "_structural_tool_failures"):
+                self._structural_tool_failures = set()
+            self._structural_tool_failures.add(tool_name)
+        return tripped
+
+    def _structural_failure(self) -> bool:
+        """True iff a tool structurally/persistently failed (non-transient
+        circuit trip) — re-running won't help. The terminal stamps the result
+        with this so the supervisor skips the retry storm."""
+        return bool(getattr(self, "_structural_tool_failures", None))
 
     # ─────────────────────────────────────────────────────────────────────────
     # v0.8.21 — stuck-loop guard helpers (pure; wired into execute() in T6).
@@ -2488,15 +2521,57 @@ class ShadowRuntime:
                 try:
                     from systemu.runtime.governor import Governor as _GovernorCls
                     governor = _GovernorCls(self.config)
+                    # v0.10.0: let the Governor write lease-mint/revoke ledger events
+                    # to THIS run's ledger (revoke_leases carries no vault param).
+                    try:
+                        governor._active_ledger_vault = self.vault
+                    except Exception:
+                        pass
                 except Exception:
                     governor = None
 
-            def _revoke_harness_leases():
-                if governor is not None:
+            # v0.10.0 Task 1.6: tool names invoked this run, for terminal request-
+            # outcome reconciliation (granted_used vs granted_unused).
+            _called_tools: set = set()
+            _used_harness = False        # set True once the agent makes a harness request
+            _harness_finalized = {"done": False}
+
+            def _revoke_harness_leases(run_success: bool = True, record_run: bool = True):
+                # Idempotent terminal finalize — safe to call from any terminal path
+                # (escalate-suspend, stuck-park-success, COMPLETE, FAIL); runs once.
+                if _harness_finalized["done"] or governor is None:
+                    return
+                _harness_finalized["done"] = True
+                # Terminal-pass: derive request-outcome (granted_used/unused,
+                # denied_fallback_*, escalate) from this run's ledger + the tools
+                # actually called, THEN revoke leases.
+                try:
+                    governor.write_outcome_reconciliation(
+                        execution_id, _called_tools, run_success=run_success, vault=self.vault)
+                except Exception:
+                    logger.debug("[Runtime] outcome reconciliation failed", exc_info=True)
+                try:
+                    governor.revoke_leases(execution_id)
+                except Exception:
+                    logger.debug("[Runtime] lease revocation failed", exc_info=True)
+                # v0.10.0 Task 1.7(c): harness-usage metric slice (additive + harness-only,
+                # so no double-count with the base recorder; skipped on parked/suspended
+                # runs via record_run=False).
+                if record_run:
                     try:
-                        governor.revoke_leases(execution_id)
+                        from systemu.runtime.affinity_log import compute_intent_hash
+                        from systemu.runtime.shadow_metrics import get_shadow_metrics
+                        get_shadow_metrics().note_harness_usage(
+                            shadow_id=getattr(shadow, "id", ""),
+                            intent_hash=compute_intent_hash(
+                                intent=getattr(scroll, "intent", "") or "",
+                                objectives=getattr(scroll, "objectives", None),
+                            ),
+                            used_harness=_used_harness,
+                            success=run_success,
+                        )
                     except Exception:
-                        logger.debug("[Runtime] lease revocation failed", exc_info=True)
+                        logger.debug("[Runtime] harness-usage slice skipped", exc_info=True)
 
             # v0.9.7 Phase 3: resolve execution-adherence + a mutable iteration
             # budget for THIS run.
@@ -2762,6 +2837,46 @@ class ShadowRuntime:
                     consecutive_thinks = 0
                 logger.info("[Runtime] iter=%d action=%s", iteration, action)
 
+                # ── v0.10.0 pull-decision instrumentation (observability only) ──
+                # One row per iteration capturing the action + the blockage signals
+                # active at decision time, so pull-decision quality (did a request
+                # follow genuine blockage?) is reconstructable post-run. Never raises.
+                try:
+                    from systemu.runtime.decision_audit import (
+                        IterationDecision, append_iteration_decision,
+                    )
+                    _rh = action == "REQUEST_HARNESS"
+                    _lg_msg = None
+                    try:
+                        _lg_msg = _user_payload.get("loop_guard_notice") or None
+                    except Exception:
+                        _lg_msg = None
+                    append_iteration_decision(
+                        self.vault.root, execution_id,
+                        IterationDecision(
+                            execution_id=execution_id,
+                            iteration=iteration,
+                            action=action,
+                            reasoning=str(
+                                decision.get("reasoning")
+                                or decision.get("thought")
+                                or decision.get("reason") or ""
+                            )[:500],
+                            consecutive_thinks=consecutive_thinks,
+                            loop_guard_active=bool(_lg_msg),
+                            loop_guard_message=_lg_msg,
+                            stuck_round_count=self._iters_since_obj_credit,
+                            consec_research_reads=getattr(self, "_consec_research_reads", 0),
+                            consec_tool_failures=sum(self._same_tool_fail_streak.values()),
+                            is_request_harness=_rh,
+                            harness_kind=(decision.get("kind") if _rh else None),
+                            harness_confidence=(decision.get("confidence") if _rh else None),
+                            harness_attempts_before=(decision.get("attempts_before") if _rh else None),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("[Runtime] decision-audit write failed", exc_info=True)
+
                 # ── Supervisor heartbeat — signals watchdog this shadow is alive ──
                 try:
                     from systemu.runtime.supervisor import Supervisor
@@ -2874,6 +2989,7 @@ class ShadowRuntime:
                         status="success",
                         final_summary=summary,
                     )
+                    _revoke_harness_leases(run_success=True)   # v0.10.0: finalize harness (idempotent)
                     # v0.4.3-a: record success in ShadowMetrics so the supervisor's
                     # affinity-routing alternative-selection learns this shadow
                     # handles this intent_hash well.
@@ -2908,6 +3024,7 @@ class ShadowRuntime:
                         final_summary=f"Shadow reported failure: {reason}",
                         error=reason,
                     )
+                    _revoke_harness_leases(run_success=False)   # v0.10.0: finalize harness (idempotent)
                     _record_terminal_telemetry(
                         shadow=shadow, execution_id=execution_id, scroll=scroll,
                         status="failure", iteration=iteration,
@@ -3069,6 +3186,38 @@ class ShadowRuntime:
                                 _hk = HarnessKind((decision.get("kind") or "tool").lower())
                             except Exception:
                                 _hk = HarnessKind.TOOL
+                            # v0.10.0 pull-decision instrumentation: thread the
+                            # agent's stated confidence/attempts + a provenance trail
+                            # of what was tried + which blockage signals were active.
+                            # Clamp/coerce defensively — a hallucinated value must
+                            # never raise and abort the run.
+                            try:
+                                _conf = float(decision.get("confidence", 0.5))
+                            except (TypeError, ValueError):
+                                _conf = 0.5
+                            _conf = min(1.0, max(0.0, _conf))
+                            try:
+                                _att = int(decision.get("attempts_before", 0))
+                            except (TypeError, ValueError):
+                                _att = 0
+                            _att = max(0, _att)
+                            _crr = getattr(self, "_consec_research_reads", 0)
+                            try:
+                                _lg_on = bool(_user_payload.get("loop_guard_notice"))
+                            except Exception:
+                                _lg_on = False
+                            _prov = {
+                                "tool_attempts": [
+                                    {"name": k, "failures": v}
+                                    for k, v in self._same_tool_fail_streak.items() if v > 0
+                                ],
+                                "blocked_signals": (
+                                    (["loop_guard"] if _lg_on else [])
+                                    + ([f"stuck:{self._iters_since_obj_credit}"]
+                                       if self._iters_since_obj_credit >= 1 else [])
+                                    + ([f"research_reads:{_crr}"] if _crr >= 1 else [])
+                                ),
+                            }
                             _req = HarnessRequest(
                                 kind=_hk, spec=decision.get("spec") or {},
                                 rationale=decision.get("rationale", ""),
@@ -3079,8 +3228,12 @@ class ShadowRuntime:
                                 # after the operator decides); blocking=False keeps
                                 # the proceed-with-fallback behaviour.
                                 blocking=bool(decision.get("blocking", True)),
+                                confidence=_conf,
+                                attempts_before_request=_att,
+                                provenance=_prov,
                             )
                         _gov = governor or Governor(self.config)
+                        _used_harness = True   # v0.10.0 Task 1.7(c): this run pulled the harness
                         _verdict = _gov.arbitrate(_req)
                         if _verdict.decision == HarnessDecision.GRANT:
                             _mat = _gov.materialise(
@@ -3091,14 +3244,51 @@ class ShadowRuntime:
                             # the request's fallback off the materialise dict (the
                             # only loop-local the helper signature doesn't carry).
                             _mat.setdefault("fallback", _req.fallback)
-                            # v0.9.7 Phase 3: apply the materialised grant into THIS
-                            # run via the shared helper (same code the deferred harness
-                            # grant-resume replays → resume is byte-identical to an
-                            # autonomous grant; the helper returns the updated budget).
-                            _iter_budget = self._apply_materialised_grant(
-                                _mat, context=context, tools=tools, tool_index=tool_index,
-                                current_ab=current_ab, iter_budget=_iter_budget,
-                            )
+                            # v0.10.0 Build 3: a GRANTed SUBAGENT is REAL — spawn a
+                            # parallel fleet of child ShadowRuntime loops and inject the
+                            # collated synthesis (partial-success aware: what ran + what
+                            # is missing). Gated behind SYSTEMU_DELEGATE_USE_PARALLEL
+                            # (default off → unchanged observation-only path, no regression).
+                            if (_mat.get("materialised") and _mat.get("subagent")
+                                    and getattr(self.config, "delegate_use_parallel", False)):
+                                _sa = _mat.get("subagent") or {}
+                                _tasks = (
+                                    (_req.spec.get("tasks") if isinstance(_req.spec, dict) else None)
+                                    or ([_sa.get("task")] if _sa.get("task") else [])
+                                )
+                                try:
+                                    from systemu.runtime.subagent_fleet import SubagentFleet
+                                    _fleet = SubagentFleet(
+                                        parent_execution_id=execution_id,
+                                        config=self.config, vault=self.vault,
+                                    )
+                                    _fres = await _fleet.spawn_children(shadow, activity, _tasks)
+                                    context.add_observation({
+                                        "type": "harness_granted",
+                                        "message": (_fres.get("synthesis")
+                                                    or "Sub-agents completed."),
+                                        "fleet": {
+                                            "any_succeeded": _fres.get("any_succeeded"),
+                                            "all_succeeded": _fres.get("all_succeeded"),
+                                            "budget": _fres.get("budget"),
+                                        },
+                                    }, current_ab)
+                                except Exception:
+                                    logger.debug("[Runtime] SUBAGENT fleet spawn failed", exc_info=True)
+                                    context.add_observation({
+                                        "type": "harness_grant_failed",
+                                        "message": (f"Sub-agent fleet could not run. "
+                                                    f"{_req.fallback or 'Proceed with an alternative or FAIL.'}"),
+                                    }, current_ab)
+                            else:
+                                # v0.9.7 Phase 3: apply the materialised grant into THIS
+                                # run via the shared helper (same code the deferred harness
+                                # grant-resume replays → resume is byte-identical to an
+                                # autonomous grant; the helper returns the updated budget).
+                                _iter_budget = self._apply_materialised_grant(
+                                    _mat, context=context, tools=tools, tool_index=tool_index,
+                                    current_ab=current_ab, iter_budget=_iter_budget,
+                                )
                         elif (_verdict.decision == HarnessDecision.ESCALATE
                               and getattr(_req, "blocking", True)):
                             # ── v0.9.7 grant-resume: BLOCKING ESCALATE → suspend ──
@@ -3156,7 +3346,9 @@ class ShadowRuntime:
                             except Exception:
                                 logger.debug("[Runtime] surface_harness_request failed",
                                              exc_info=True)
-                            _revoke_harness_leases()
+                            # Parked (not a completed run): reconcile + revoke, but do
+                            # NOT record a harness-usage run (record_run=False).
+                            _revoke_harness_leases(record_run=False)
                             # Suspend-return — match the stuck-park's mechanism
                             # (context.build_result) + carry the resume coords the
                             # Supervisor's _handle_result / reconciler read.
@@ -3212,6 +3404,16 @@ class ShadowRuntime:
                     if result is None:
                         continue   # User denied destructive call
                     tool_call_count += 1
+                    # Define tool_name once for this branch. Pre-existing latent bug:
+                    # the W12/F9 credit-nudge code below referenced a bare ``tool_name``
+                    # that was never assigned in this branch → NameError on any tool
+                    # call that didn't go through the completes_objective path.
+                    tool_name = decision.get("tool_name") or "?"
+                    # v0.10.0 Task 1.6: record invoked tool for outcome reconciliation.
+                    try:
+                        _called_tools.add(tool_name)
+                    except Exception:
+                        pass
 
                     # v0.8.21: stuck-guard — record tool outcome.
                     # (objective-credit reset is applied below at the credit site.)
@@ -3260,7 +3462,10 @@ class ShadowRuntime:
                                 tool_name=decision.get("tool_name", "") or "?",
                                 params=decision.get("parameters") or {},
                             )
-                            self.vault.append_action_audit(_audit_entry)
+                            self.vault.append_action_audit(
+                                _audit_entry,
+                                namespace_path=getattr(self, "_audit_namespace", None),
+                            )
                         except Exception:
                             logger.debug("[Runtime] v0.9.8 tool-success auto-audit failed", exc_info=True)
 
@@ -3584,7 +3789,7 @@ class ShadowRuntime:
                                 status="success",
                                 final_summary="Goal completed (verified at goal level).",
                             )
-                            _revoke_harness_leases()
+                            _revoke_harness_leases(run_success=True)
                             _record_shadow_metric(shadow=shadow, scroll=scroll, status="success")
                             _dispatch_refinery(shadow, scroll, res, context, self.config, self.vault)
                             return res
@@ -3719,11 +3924,30 @@ class ShadowRuntime:
                 status="partial", iteration=iteration,
                 extra={"reason": "MaxIterationsExceeded"},
             )
-            return context.build_result(
+            # Fix 2: an honest, specific partial summary (uncompleted objectives +
+            # which tools structurally failed) instead of the generic one, and a
+            # structural_failure flag so the supervisor skips re-running into the
+            # same wall.
+            _failed_tools = sorted(getattr(self, "_structural_tool_failures", set()))
+            if use_objectives:
+                _done = len(completed_objectives)
+                _pending = [getattr(o, "goal", str(o.id)) for o in scroll.objectives
+                            if o.id not in completed_objectives][:5]
+            else:
+                _done, _pending = current_ab - 1, []
+            _parts = [f"Execution reached max iterations ({MAX_ITERATIONS}); task incomplete.",
+                      f"Objectives completed: {_done}/{total_objectives}."]
+            if _pending:
+                _parts.append("Not completed: " + "; ".join(_pending) + ".")
+            if _failed_tools:
+                _parts.append("Tools that structurally failed: " + ", ".join(_failed_tools) + ".")
+            res = context.build_result(
                 status="partial",
-                final_summary=f"Execution reached max iterations ({MAX_ITERATIONS}). Task may be incomplete.",
+                final_summary=" ".join(_parts),
                 error="MaxIterationsExceeded",
             )
+            res["structural_failure"] = bool(_failed_tools)
+            return res
         finally:
             try:
                 from systemu.runtime.chat_submission_ctx import set_chat_submission_id

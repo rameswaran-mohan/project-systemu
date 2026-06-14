@@ -1112,8 +1112,28 @@ class Vault:
         return add_fact(self, fact, source=source, tags=tags,
                          source_ref=source_ref, confidence=confidence)
 
+    # Plan 0 Build 3 (Task 3.2 — paper fleet): per-child execution namespace.
+    def create_child_execution_namespace(self, parent_id: str, child_id: str) -> Path:
+        """Create and return an isolated namespace dir for a child subagent.
+
+        Layout::
+
+            vault/execution_<parent_id>/child_<child_id>/
+
+        Used by the subagent fleet so each child's audit/artifacts land in a
+        sandboxed subtree under its parent execution rather than the global
+        vault root. Idempotent — ``mkdir(parents=True, exist_ok=True)``.
+        """
+        ns = self.root / f"execution_{parent_id}" / f"child_{child_id}"
+        ns.mkdir(parents=True, exist_ok=True)
+        return ns
+
     # v0.9.1 (Layer 4) — action-audit log writer + reader.
-    def append_action_audit(self, entry: Dict[str, Any]) -> None:
+    def append_action_audit(
+        self,
+        entry: Dict[str, Any],
+        namespace_path: Optional[Path] = None,
+    ) -> None:
         """Append one audit entry to the action audit log.
 
         File backend: appends a JSON line to vault/audit/actions.jsonl.
@@ -1122,13 +1142,24 @@ class Vault:
         ``entry`` MUST contain: ts (ISO), execution_id, objective_id,
         action, params (dict), success (bool), error (Optional[str]).
         ``user_id`` is optional (set in multi-user docker-enterprise mode).
-        """
-        backend = getattr(self, "_storage_backend", "file")
-        if backend != "file":
-            from systemu.vault.backend import dispatch_append_action_audit
-            return dispatch_append_action_audit(self, entry)
 
-        audit_dir = self.root / "audit"
+        Plan 0 Build 3 (Task 3.2): when ``namespace_path`` is given (a child
+        execution namespace from :meth:`create_child_execution_namespace`), the
+        entry is written under ``namespace_path/audit/actions.jsonl`` instead of
+        the global vault audit log. When None, behaviour is unchanged.
+        """
+        if namespace_path is None:
+            backend = getattr(self, "_storage_backend", "file")
+            if backend != "file":
+                from systemu.vault.backend import dispatch_append_action_audit
+                return dispatch_append_action_audit(self, entry)
+            audit_dir = self.root / "audit"
+        else:
+            # Namespaced audit always uses the file layout under the child dir,
+            # regardless of the global storage backend — the namespace is a
+            # filesystem sandbox for one subagent's run.
+            audit_dir = Path(namespace_path) / "audit"
+
         audit_dir.mkdir(parents=True, exist_ok=True)
         audit_path = audit_dir / "actions.jsonl"
         with audit_path.open("a", encoding="utf-8") as fh:

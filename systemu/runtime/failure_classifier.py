@@ -52,6 +52,12 @@ CATEGORIES = (
     "parse_error",
     "api_error",
     "tool_inadequate",
+    # Plan 0 / Build 1 — pull-decision (reverse-harness) failure modes.
+    # These describe *governance* mistakes around a capability request,
+    # not tool-execution errors, and are produced by classify_pull_failure().
+    "premature_request",   # requested a grant before exhausting available tools
+    "wasted_request",      # request was denied but a viable fallback existed
+    "unused_grant",        # grant was issued but never actually invoked
     "unknown",
 )
 
@@ -285,6 +291,61 @@ def classify_tool_result(result: Any) -> Classification:
         keyword=None,
         matched_rule=None,
     )
+
+
+def classify_pull_failure(
+    *,
+    attempts_before: int,
+    decision: str,
+    fallback_ok: Optional[bool],
+    used_after_grant: Optional[bool],
+) -> str:
+    """Classify a *pull-decision* (reverse-harness) failure mode.
+
+    Unlike :func:`classify_tool_result`, which inspects a tool-execution
+    error, this looks at the governance shape of a capability request and
+    returns one of the three pull categories — or ``"unknown"`` when the
+    decision looks well-behaved.
+
+    Args:
+        attempts_before:   How many available tools the shadow tried before
+                           resorting to a request (``HarnessRequest.attempts_before_request``).
+        decision:          The harness decision — e.g. ``"request"``,
+                           ``"grant"``, ``"deny"``.  A truthy value means a
+                           request was actually made.
+        fallback_ok:       Whether a viable fallback existed at decision time.
+                           Only meaningful for a ``"deny"`` decision.
+        used_after_grant:  Whether a granted capability was subsequently
+                           invoked.  Only meaningful for a ``"grant"`` decision.
+
+    Returns:
+        One of ``"premature_request"``, ``"wasted_request"``,
+        ``"unused_grant"``, or ``"unknown"``.
+
+    Rules (first match wins):
+        * ``premature_request`` — a request was made with no prior tool
+          attempts (``attempts_before < 1``).
+        * ``wasted_request``    — the request was denied yet a viable
+          fallback existed (``decision == "deny"`` and ``fallback_ok``).
+        * ``unused_grant``      — a grant was issued but never invoked
+          (``decision == "grant"`` and ``used_after_grant`` is False).
+        * ``unknown``           — none of the above.
+    """
+    decision = (decision or "").strip().lower()
+    request_made = bool(decision)
+
+    try:
+        attempts = int(attempts_before)
+    except (TypeError, ValueError):
+        attempts = 0
+
+    if request_made and attempts < 1:
+        return "premature_request"
+    if decision == "deny" and bool(fallback_ok):
+        return "wasted_request"
+    if decision == "grant" and used_after_grant is False:
+        return "unused_grant"
+    return "unknown"
 
 
 def reflection_strategies_for(category: str) -> Iterable[str]:

@@ -490,7 +490,9 @@ class TestLedger:
             gov.materialise(req, verdict, vault=vault, config=_mock_config(), execution_id=exec_id)
 
         path = gov.ledger_path(exec_id, vault)
-        entry = json.loads(path.read_text(encoding="utf-8").strip())
+        # The materialisation entry is the first JSONL line; a GRANT that mints a
+        # lease also appends a dedicated "lease-mint" event line after it.
+        entry = json.loads(path.read_text(encoding="utf-8").strip().splitlines()[0])
         assert entry["outcome"]["materialised"] is True
         assert entry["outcome"]["lease_id"] == "lease_writecsvtest"
 

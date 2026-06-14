@@ -47,8 +47,22 @@ class _PageAdapter:
         self._refs = {}   # ref -> {"role", "name"} for the most recent snapshot
 
     def accessibility_snapshot(self):
+        # Playwright >=1.49 removed page.accessibility; aria_snapshot() yields the
+        # computed accessible names — the same names get_by_role(role, name=...)
+        # matches in click_ref/type_ref. Parse its YAML into the synthetic a11y
+        # tree parse_a11y_snapshot already understands, so no other call site
+        # changes. (aria_snapshot walks the DOM in order → stable refs.)
+        import re
         from systemu.runtime.web.browser_pool import parse_a11y_snapshot
-        snap = self._page.accessibility.snapshot() or {}
+        try:
+            yaml = self._page.locator("body").aria_snapshot() or ""
+        except Exception:
+            yaml = ""
+        children = [
+            {"role": m.group(1), "name": m.group(2), "children": []}
+            for m in re.finditer(r'-\s+([a-z][a-z0-9-]*)\s+"((?:[^"\\]|\\.)*)"', yaml)
+        ]
+        snap = {"role": "WebArea", "name": "", "children": children}
         # Rebuild the ref→node map using the same flattening the loop uses.
         self._refs = {n["ref"]: n for n in parse_a11y_snapshot(snap)}
         return snap

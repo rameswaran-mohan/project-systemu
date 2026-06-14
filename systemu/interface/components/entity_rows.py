@@ -111,6 +111,7 @@ def tool_row_model(header: dict, *, vault=None) -> dict:
         "enabled": enabled,
         "dry_run_status": dry_run_status,
         "description": header.get("description", "") or "",
+        "forged_by_systemu": bool(header.get("forged_by_systemu", False)),
         "show_review_forge": status == "proposed",
         "actions": _row_actions_for(header),
         "show_toggle": reviewed,
@@ -196,11 +197,15 @@ def render_tool_row(tool: dict, vault, *, editable: bool = True) -> None:
         _td(m["tool_type"])
 
         # Status badge — FORGED+enabled shows the green "enabled" pill.
+        # An "agent-built" pill (Plan 0) marks tools the runtime forged itself.
         with ui.element("td").classes("s-cell").style("padding: 12px 16px;"):
-            if status == "forged" and enabled:
-                ui.html(status_badge_html("enabled"))
-            else:
-                ui.html(status_badge_html(status or "?"))
+            with ui.row().classes("items-center").style("gap: 6px;"):
+                if status == "forged" and enabled:
+                    ui.html(status_badge_html("enabled"))
+                else:
+                    ui.html(status_badge_html(status or "?"))
+                if m["forged_by_systemu"]:
+                    ui.html('<span class="s-pill s-pill--accent">agent-built</span>')
 
         # Enabled toggle (Gate 3) — only for reviewed tools, only when editable.
         with ui.element("td").classes("s-cell").style("padding: 12px 16px;"):

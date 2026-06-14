@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from sharing_on.config import Config
@@ -52,6 +53,33 @@ def _register_execution(key: str) -> bool:
     return True
 
 
+_TOOLISH = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")   # snake_case tool-name shape
+
+
+def _available_tools(vault) -> List[Dict[str, str]]:
+    """Enabled + deployed tools as [{name, description}] — the appraiser's ground
+    truth so it stops recommending tools that don't exist (root cause X)."""
+    out: List[Dict[str, str]] = []
+    try:
+        for h in (vault.load_index("tools") or []):
+            if h.get("enabled") and str(h.get("status", "")).lower() in ("deployed", "upgraded"):
+                out.append({"name": h.get("name", ""),
+                            "description": (h.get("description") or "")[:140]})
+    except Exception:
+        logger.debug("[Refinery] available-tools load failed", exc_info=True)
+    return out
+
+
+def _validate_feedback_tools(feedback: str, known: set) -> str:
+    """Flag (never delete) snake_case tokens that look like tool names but aren't
+    in the registry, so a hallucinated recommendation can't be injected into a
+    scroll hint unchallenged. Grounding is the primary fix; this is the net."""
+    def _mark(m):
+        tok = m.group(0)
+        return tok if tok in known else f"{tok} (not an available tool)"
+    return _TOOLISH.sub(_mark, feedback or "")
+
+
 def process_execution_result(
     shadow: Shadow,
     scroll: Scroll,
@@ -89,6 +117,9 @@ def process_execution_result(
         "scroll_action_blocks": [ab.model_dump(mode="json") for ab in scroll.action_blocks],
         "scroll_objectives": [obj.model_dump(mode="json") for obj in scroll.objectives],
         "execution_log": history_json,
+        # Fix 3: ground the appraiser in the REAL tool registry so its feedback
+        # only ever names tools that exist (root cause X).
+        "available_tools": _available_tools(vault),
     }
 
     # 2. Tier 1 Appraisal
@@ -114,6 +145,28 @@ def process_execution_result(
 
     elif outcome == "scroll_refinement":
         _handle_scroll_refinement(appraisal, scroll, vault)
+        # Fix 4 (root cause Y): a STRUCTURAL failure means the activity's
+        # tool/skill mapping is broken (a required tool persistently failed) — the
+        # refined hint alone never changes the frozen mapping because the
+        # extractor's idempotency guard returns the existing activity. Put the
+        # scroll back into the re-extractable state (clear activity_id + APPROVED)
+        # so the NEXT extraction (recovery-sweep Pass 1 / re-approval) recomputes
+        # the mapping with the refined hints. recovery_attempts is owned by the
+        # sweep (bounds re-extraction) — do NOT touch it here. Transient failures
+        # leave the activity intact for the supervisor retry path.
+        if execution_result.get("structural_failure") and getattr(scroll, "activity_id", None):
+            try:
+                from systemu.core.models import ScrollStatus
+                scroll.activity_id = None
+                scroll.status = ScrollStatus.APPROVED
+                scroll.updated_at = utcnow()
+                vault.save_scroll(scroll)
+                logger.info(
+                    "[Refinery] Scroll %s structurally failed — cleared activity "
+                    "for re-extraction (mapping will be recomputed).", scroll.id)
+            except Exception:
+                logger.warning("[Refinery] re-extract reset failed for scroll %s",
+                               getattr(scroll, "id", "?"), exc_info=True)
 
     elif outcome == "propose_evolution":
         _handle_evolution(appraisal, vault)
@@ -155,6 +208,12 @@ def _handle_scroll_refinement(appraisal: Dict[str, Any], scroll: Scroll, vault: 
     if not isinstance(index, int) or not feedback:
         logger.warning("[Refinery] Missing refinement data in appraisal payload")
         return
+
+    # Fix 3: a refined hint must not recommend tools that don't exist. Flag any
+    # tool-shaped token in the feedback that isn't in the live registry before
+    # it is injected into the scroll (defense-in-depth behind the grounded prompt).
+    feedback = _validate_feedback_tools(
+        feedback, {t["name"] for t in _available_tools(vault)})
 
     from datetime import datetime as _dt
 
