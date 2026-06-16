@@ -253,6 +253,11 @@ def record(
 
     # Set up Ctrl+C → graceful stop
     stop_requested = [False]
+    # v0.9.32 Item 2, Layer 3: the trailing "Stop" click is trimmed in analysis
+    # using session.end_time as the anchor (stamped by session.stop() and
+    # persisted to session.json). We deliberately do NOT key the trim off the
+    # SIGINT timestamp — STOP_CLICK_TRIM_WINDOW is widened to absorb the
+    # end_time poll/IPC lag instead (see unifier.STOP_CLICK_TRIM_WINDOW).
 
     def _handle_interrupt(sig, frame):
         if not stop_requested[0]:
@@ -421,7 +426,8 @@ def _run_live_display(session: "CaptureSession", stop_requested: list) -> None:
             time.sleep(0.5)
 
 
-def _run_analysis(session: "CaptureSession", config: Config) -> None:
+def _run_analysis(session: "CaptureSession", config: Config,
+                  stop_ts=None) -> None:
     """Run step detection and LLM instruction generation."""
     console.print()
     console.rule("[bold blue]Analysis[/bold blue]")
@@ -432,9 +438,12 @@ def _run_analysis(session: "CaptureSession", config: Config) -> None:
 
     console.print(f"  [green]v[/green] Loaded [bold]{len(events):,}[/bold] raw events")
 
-    # Step 1b: Unify (deduplicate, filter noise, collapse repeats)
+    # Step 1b: Unify (deduplicate, filter noise, collapse repeats).
+    # v0.9.32 Item 2, Layer 3: stop_ts (= session.end_time) trims the trailing
+    # "Stop" click. Fall back to session.end_time when not passed explicitly.
+    _stop_ts = stop_ts if stop_ts is not None else getattr(session, "end_time", None)
     with console.status("[bold]Unifying and deduplicating events...[/bold]"):
-        events = unify_events(events)
+        events = unify_events(events, stop_ts=_stop_ts)
 
     console.print(f"  [green]v[/green] Unified to [bold]{len(events):,}[/bold] clean events")
 
@@ -588,8 +597,18 @@ def analyze(session_dir: str, model: str):
     console.print(f"  [green]v[/green] Loaded [bold]{len(events):,}[/bold] raw events")
 
     # Unify events
+    # v0.9.32 Item 2, Layer 3: T_stop is persisted as session.json's end_time
+    # (session.stop() sets it on the recorder's stop signal); trim the trailing
+    # "Stop" click using it.
+    _stop_ts = None
+    _end_raw = metadata.get("end_time")
+    if _end_raw:
+        try:
+            _stop_ts = datetime.fromisoformat(_end_raw)
+        except (ValueError, TypeError):
+            _stop_ts = None
     with console.status("[bold]Unifying events...[/bold]"):
-        events = unify_events(events)
+        events = unify_events(events, stop_ts=_stop_ts)
 
     console.print(f"  [green]v[/green] Unified to [bold]{len(events):,}[/bold] clean events")
 

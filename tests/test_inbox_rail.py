@@ -52,3 +52,59 @@ def test_descriptor_with_no_options_has_empty_approve_label():
     rows = _rows([("dec_3", d)])
     assert rows[0]["approve_label"] == ""
     assert rows[0]["risk"] == "low"
+
+
+# ── v0.9.32 (D.4 review FIX-3): command gates are render-only in the rail ──────
+def _command_descriptor():
+    return GateDescriptor.from_command(
+        tool_name="run_command", command="rm -rf build", cwd="/proj")
+
+
+def test_command_gate_row_is_render_only_no_quick_approve():
+    """A command gate's affirmative option is 'Always allow' — letting one rail
+    click pick it (with no Deny) would be dangerous AND resolve_gate NOOPs for it
+    so it would not even persist. The rail row must be render-only: NO
+    approve_label (no one-click quick-approve button)."""
+    d = _command_descriptor()
+    # The descriptor's affirmative IS the dangerous 'Always allow'...
+    assert d.options[-1] == "Always allow"
+    rows = _rows([("dec_cmd", d)])
+    row = rows[0]
+    # ...but the rail must NOT surface it as a one-click approve.
+    assert row["render_only"] is True
+    assert row["approve_label"] == ""
+    # The card itself still renders (title/risk preserved).
+    assert row["title"] == d.title
+    assert row["risk"] == "high"
+
+
+def test_non_command_gate_still_gets_quick_approve():
+    """Regression: render-only is scoped to command gates only — a forge gate
+    still surfaces its affirmative quick-approve label."""
+    rows = _rows([("dec_f", _forge_descriptor())])
+    assert rows[0]["render_only"] is False
+    assert rows[0]["approve_label"] == "Forge"
+
+
+def test_approve_descriptor_refuses_command_gate():
+    """Defense-in-depth: even if invoked directly, the one-click rail approver
+    REFUSES a command gate (it must go through the /insights three-way UI). It
+    must NOT NOOP-resolve it (the old behavior, which left the gate unresolved
+    AND unpersisted)."""
+    import pytest
+    from systemu.interface.components.inbox_rail import _approve_descriptor
+
+    resolved = {"called": False}
+
+    class _Queue:
+        def resolve(self, *a, **k):
+            resolved["called"] = True
+
+    class _Vault:
+        pass
+
+    d = _command_descriptor()
+    with pytest.raises(ValueError):
+        _approve_descriptor("dec_cmd", d, vault=_Vault())
+    # It refused BEFORE resolving — no mis-resolve, no NOOP.
+    assert resolved["called"] is False

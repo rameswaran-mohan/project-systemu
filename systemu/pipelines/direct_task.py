@@ -280,6 +280,8 @@ def run_direct_task(
     vault:  Vault,
     *,
     route_through_supervisor: bool = False,
+    chat_ts: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Optional[Any]:
     """Run a free-text task through the full pipeline.
 
@@ -295,6 +297,12 @@ def run_direct_task(
                 immediately.  Progress is published over the EventBus and shows
                 up in Systemu Chat.  Suitable for docker-* modes where workers
                 run in separate processes/containers.
+        chat_ts:
+            v0.9.32 fix — the canonical id under which the chat lane registered
+            the cancel Event in ``chat_task_registry``. When provided it is used
+            VERBATIM as the chat-history entry id so the per-entry Stop button
+            (``request_cancel(entry["ts"])``) matches the registry key. When None
+            (CLI / non-chat callers) the ts is generated internally as before.
 
     Returns:
         The Activity if execution was attempted (or queued, when
@@ -305,7 +313,7 @@ def run_direct_task(
     set_vault(vault)
     init_pipeline(config, vault)
 
-    ts = utcnow().isoformat()
+    ts = chat_ts or utcnow().isoformat()
 
     # ── /continue detection ───────────────────────────────────────────────
     prior_task:  Optional[Dict[str, Any]] = None
@@ -477,9 +485,12 @@ def run_direct_task(
     from systemu.runtime.shadow_runtime import ShadowRuntime
     runtime = ShadowRuntime(config, vault)
     try:
+        # v0.9.32 (D3.2): forward the operator interrupt token into the sync
+        # runtime so the ReAct loop's cancellation gate can exit cleanly.
         result = _run_coroutine(runtime.execute(shadow, activity,
                                                  origin="chat",
-                                                 chat_submission_id=ts))
+                                                 chat_submission_id=ts,
+                                                 cancel_event=cancel_event))
     except PendingOperatorDecision as pd:
         # v0.8.22 (C): the run parked itself waiting on an operator decision.
         # Surface the parked state on the chat history entry so the chat UI can
@@ -501,6 +512,21 @@ def run_direct_task(
             "status": "failed", "error": str(exc), "shadow_id": shadow.id,
         })
         _maybe_trigger_fact_extraction(vault, config, ts)
+        return activity
+
+    # v0.9.32 (D3.2): operator interrupt — mirror the PendingOperatorDecision
+    # branch above. Persist a terminal "cancelled" chat-history status (in
+    # _TERMINAL_STATUSES, distinct from "failed") and skip the outcome-event /
+    # COMPLETED-mark path below. No fact extraction on an intentional stop.
+    if result.get("status") == "cancelled":
+        vault.update_chat_history_entry(ts, {
+            "status":       "cancelled",
+            "shadow_id":    shadow.id,
+            "execution_id": result.get("execution_id"),
+            "summary":      result.get("final_summary")
+                            or result.get("summary") or "Cancelled by operator",
+        })
+        logger.info("[DirectTask] chat task %r cancelled by operator", ts)
         return activity
 
     vault.update_chat_history_entry(ts, {

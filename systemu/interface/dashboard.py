@@ -957,6 +957,12 @@ def run_dashboard(
     # W12 (audit F2): the sidebar footer displays SYSTEMU_DASHBOARD_PORT —
     # stamp the REAL serving port so custom ports don't show ":8765".
     os.environ["SYSTEMU_DASHBOARD_PORT"] = str(port)
+    # v0.9.32 Item 2: stamp the canonical browser origin so spawned recorders
+    # (via dispatch._dashboard_origin) drop captures of our own dashboard UI.
+    # 0.0.0.0 (docker bind) is rewritten to localhost — the value the browser
+    # actually loads — so the recorder's URL-origin match works.
+    _origin_host = "localhost" if host in ("0.0.0.0", "::", "") else host
+    os.environ["SYSTEMU_DASHBOARD_ORIGIN"] = f"http://{_origin_host}:{port}"
 
     try:
         from nicegui import ui, app as ng_app

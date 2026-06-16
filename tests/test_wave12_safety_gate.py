@@ -117,9 +117,14 @@ class TestQuickLaneGate:
             "the default chat lane ran shell commands UNGATED (asymmetry hole)"
 
     def test_denial_message_is_actionable(self):
+        # v0.9.32 (D.6): shell tools (run_command / run_cli_command) now defer
+        # to the ToolSandbox per-command gate (block-and-ask), so _safety_denied
+        # returns None for them. NON-shell destructive tools have no inline
+        # approval surface in this lane and keep the actionable auto-deny.
         from systemu.pipelines.quick_task import _safety_denied
-        msg = _safety_denied("run_command", {"command": "del x.txt"})
-        assert msg and "del x.txt"[:3] not in ("", None)
+        assert _safety_denied("run_command", {"command": "del x.txt"}) is None
+        msg = _safety_denied("delete_file", {"path": "x.txt"})
+        assert msg
         assert "read-only" in msg or "ASK_USER" in msg
 
     def test_readonly_commands_not_denied(self):

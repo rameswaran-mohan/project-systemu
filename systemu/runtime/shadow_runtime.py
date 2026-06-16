@@ -1397,6 +1397,16 @@ def _coerce_scalar_parameter(value, tool_name: str, tools) -> dict:
     return {}
 
 
+def _legacy_autodeny_applies(tool_name: str) -> bool:
+    """v0.9.32 (D.5): the pre-gate headless auto-deny path applies only to
+    NON-shell destructive tools. Shell tools (run_command / run_cli_command)
+    are gated at the ToolSandbox chokepoint (posts a command gate + raises
+    PendingOperatorDecision, which the workflow lane parks/resumes), so the
+    legacy confirm()/auto-deny must NOT pre-empt them."""
+    from systemu.runtime.tool_sandbox import _SHELL_TOOL_NAMES
+    return tool_name not in _SHELL_TOOL_NAMES
+
+
 import re as _re
 
 _PKG_TOKEN_RE = _re.compile(r"^[A-Za-z0-9._-]+$")
@@ -4013,8 +4023,11 @@ class ShadowRuntime:
         if not is_destructive:
             is_destructive = ToolSandbox.is_destructive_call(tool_name, parameters)
 
-        # Safety gate for destructive calls
-        if is_destructive and not dry_run:
+        # Safety gate for destructive calls.
+        # v0.9.32 (D.5): shell tools are gated at the ToolSandbox chokepoint
+        # (command gate → PendingOperatorDecision → park/resume); the legacy
+        # headless auto-deny here would pre-empt that, so we skip it for them.
+        if is_destructive and not dry_run and _legacy_autodeny_applies(tool_name):
             approved = confirm(
                 f"Shadow '{self.vault}' wants to perform a potentially destructive action:\n"
                 f"  Tool: {tool_name}\n"

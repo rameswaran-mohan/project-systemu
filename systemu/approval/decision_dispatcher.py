@@ -28,7 +28,7 @@ _handlers_bootstrapped = False
 
 
 def _ensure_handlers_registered() -> None:
-    """Force-import the three pipeline modules whose import-time side-effect
+    """Force-import the pipeline modules whose import-time side-effect
     is to register a dispatcher handler.
 
     Safe to call repeatedly — Python's import cache short-circuits subsequent
@@ -43,6 +43,7 @@ def _ensure_handlers_registered() -> None:
     import systemu.pipelines.shadow_decision  # noqa: F401
     import systemu.pipelines.scroll_refiner   # noqa: F401
     import systemu.pipelines.tool_forge       # noqa: F401
+    import systemu.pipelines.command_gate_handler  # noqa: F401  (v0.9.32 D.3)
     _handlers_bootstrapped = True
 
 

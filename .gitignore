@@ -69,6 +69,12 @@ dist/
 build/
 .eggs/
 
+# ── Virtual environments (never commit) ───────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
 # ── Test / CI artifacts ───────────────────────────────────────────────────────
 .pytest_cache/
 .coverage

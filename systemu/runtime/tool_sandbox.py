@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -51,6 +52,14 @@ _WRITE_NAME_TOKENS = (
 # Tools that execute arbitrary shell commands — judged by the COMMAND they
 # carry, not by their name (see ToolSandbox.is_destructive_call).
 _SHELL_TOOL_NAMES = {"run_command", "run_cli_command"}
+
+# v0.9.32 (D.4 review FIX-4): the destructive ``--force`` flag, matched on a
+# token boundary so it does NOT over-match longer flags that merely START with
+# it. ``(?![-\w])`` rejects a trailing hyphen or word char, so
+# ``--force-with-lease`` (a SAFE git flag) is not flagged, while standalone
+# ``--force`` (and ``--force=...``) still is. Operates on json.dumps(params),
+# which lowercases to the same text the substring denylist scans.
+_FORCE_FLAG_RE = re.compile(r"--force(?![-\w])")
 
 # Programs that only READ system/file state. Deliberately tight: anything
 # not provably read-only keeps the safety gate.
@@ -260,6 +269,7 @@ class ToolSandbox:
         approvals=None,
         vault=None,
         config=None,
+        command_approvals=None,   # v0.9.32 D.4: per-command operator gate store
     ):
         # v0.9.3: vault_root is now optional — fall back to vault.root when available.
         if vault_root is None and vault is not None:
@@ -280,6 +290,11 @@ class ToolSandbox:
         self._approvals    = approvals
         self._vault        = vault      # v0.9.1: for action-tool audit writes
         self._config       = config     # v0.9.1: for audit_log_enabled check
+        # v0.9.32 D.4: CommandApprovalStore for the per-command approval gate.
+        # When None the daemon's process-wide singleton is consulted lazily at
+        # gate time (init_default_store("data")), so callers that don't thread
+        # it still gate correctly.
+        self._command_approvals = command_approvals
 
         # Resolve the canonical backend name from env or explicit kwarg.
         from systemu.runtime.backend import (
@@ -503,6 +518,7 @@ class ToolSandbox:
         extra_packages: Optional[List[str]] = None,
         tool_type: Optional[str] = None,
         force_subprocess: bool = False,
+        _command_gate_resolved: Optional[str] = None,
     ) -> ToolResult:
         """Execute a tool implementation script with the given parameters.
 
@@ -543,6 +559,16 @@ class ToolSandbox:
             parameters = _normalize_output_paths(tool_name, parameters, _od)
         except Exception:
             logger.debug("[Sandbox] execute_tool output-path normalise failed", exc_info=True)
+
+        # ── v0.9.32 (D.4): per-command operator approval gate ─────────────
+        # The single chokepoint for both shell tools (run_command,
+        # run_cli_command) and both lanes. A destructive, non-allowlisted
+        # command posts a "command" floor gate and raises
+        # PendingOperatorDecision (caught + parked by the workflow lane;
+        # block-polled by the chat lane). Provably read-only commands and
+        # already-approved signatures fall through and run.
+        self._maybe_gate_command(tool_name, parameters,
+                                 resolved_dedup=_command_gate_resolved)
 
         # ── Fast path: ToolRegistry (direct Python function call) ─────────
         # Browser/Playwright tools MUST go through the subprocess path — their
@@ -625,6 +651,87 @@ class ToolSandbox:
             extra_packages=extra_packages or [],
         )
 
+    def _maybe_gate_command(self, tool_name: str, parameters: Dict[str, Any],
+                            *, resolved_dedup: Optional[str] = None) -> None:
+        """v0.9.32 (D.4): raise PendingOperatorDecision for a destructive,
+        non-allowlisted shell command. No-op for non-shell tools, provably
+        read-only commands, or already-approved signatures.
+
+        ``resolved_dedup`` is the chat-lane "Approve once" one-shot bypass
+        (D.6): when it matches this command's dedup key AND the decision queue
+        already holds a resolved non-Deny choice for that key, the gate is
+        skipped for THIS single call without persisting the signature.
+
+        Fail-closed posture: any failure to RESOLVE the approval store leaves
+        the gate active (we still post + raise) — we never silently run an
+        unapproved destructive command.
+        """
+        if tool_name not in _SHELL_TOOL_NAMES:
+            return
+        if not self.is_destructive_call(tool_name, parameters):
+            return  # provably read-only → run without approval
+
+        command = str(parameters.get("command") or parameters.get("cmd") or "")
+        cwd = str(parameters.get("cwd") or "")
+
+        from systemu.runtime.command_approvals import (
+            command_signature, init_default_store)
+        store = self._command_approvals
+        if store is None:
+            try:
+                store = init_default_store(Path("data"))
+            except Exception:
+                store = None  # fail-closed below: no store → still gate
+        sig = command_signature(command, cwd=cwd)
+        dedup = f"command:{sig}"
+        if store is not None and store.is_approved(sig):
+            return  # "Always allow" on record → run
+
+        # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
+        # exact decision with a non-Deny choice; honor it once without
+        # persisting (the re-attempt threads resolved_dedup=dedup).
+        #
+        # v0.9.32 (D.4 review FIX-2): CONSUME the decision when we honor it, so
+        # the "Approve once" is genuinely SINGLE-USE. consume_resolved_choice
+        # flips the resolved decision to status="consumed" — a LATER identical
+        # command (same dedup_key) then finds NO resolved choice and RE-ASKS,
+        # rather than replaying a stale one-shot and auto-running (fail-OPEN).
+        # "Always allow" never reaches here (handled by store.is_approved above).
+        if resolved_dedup and resolved_dedup == dedup:
+            try:
+                from systemu.approval.decision_queue import OperatorDecisionQueue
+                choice = OperatorDecisionQueue(self._vault).consume_resolved_choice(dedup)
+                if choice is not None and (choice or "").strip().lower() != "deny":
+                    return
+            except Exception:
+                logger.debug("[Sandbox] Approve-once bypass check failed; "
+                             "falling through to re-gate (fail-closed)",
+                             exc_info=True)
+
+        # Not approved → post the command gate and raise. The decision is
+        # posted exactly once (dedup command:<sig> short-circuits dupes); the
+        # lanes differ only in how they WAIT (D.5 park / D.6 block-poll).
+        from systemu.approval.exceptions import PendingOperatorDecision
+        from systemu.interface.command.gate import GateDescriptor
+        from systemu.interface.command.inbox import InboxQueue
+
+        descriptor = GateDescriptor.from_command(
+            tool_name=tool_name, command=command, cwd=cwd)
+        dec_id = InboxQueue(self._vault).enqueue(
+            descriptor,
+            gate_type="command",
+            policy=None,                  # floor gate — never auto-allow
+            context_extras={"command": command, "cwd": cwd},
+        )
+        raise PendingOperatorDecision(
+            decision_id=dec_id,
+            dedup_key=descriptor.dedup,
+            options=descriptor.options,
+            message=(f"Operator approval required to run `{command}`. "
+                     "Open the dashboard Inbox and choose Deny / Approve once "
+                     "/ Always allow."),
+        )
+
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -644,7 +751,13 @@ class ToolSandbox:
 
         # Dangerous parameter patterns gate REGARDLESS of anything else.
         params_str = json.dumps(parameters).lower()
-        if any(p in params_str for p in ["rm -rf", "drop table", "delete from", "--force"]):
+        # Plain substrings stay literal (rm -rf / drop table / delete from);
+        # ``--force`` uses a token-boundary regex (D.4 review FIX-4) so
+        # ``--force-with-lease`` is not flagged solely by the substring while
+        # standalone ``--force`` still is.
+        if any(p in params_str for p in ["rm -rf", "drop table", "delete from"]):
+            return True
+        if _FORCE_FLAG_RE.search(params_str):
             return True
 
         if name_lower in _SHELL_TOOL_NAMES:

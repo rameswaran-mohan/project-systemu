@@ -30,6 +30,24 @@ from systemu.interface.dashboard_state import AppState, THEME
 
 logger = logging.getLogger(__name__)
 
+
+def _make_stop_handler(key: str):
+    """Click handler: operator-cancel the running shadow with this Supervisor
+    running-list key. Best-effort — a missing Supervisor/key is a no-op + notify."""
+    def _stop(_=None):
+        try:
+            from systemu.runtime.supervisor import Supervisor
+            ok = Supervisor.get().request_cancel(key)
+        except Exception:
+            ok = False
+        try:
+            ui.notify("Stopping…" if ok else "Could not stop (already finished?)",
+                      type="warning" if ok else "negative")
+        except Exception:
+            pass
+    return _stop
+
+
 # ── Visual style constants ────────────────────────────────────────────────────
 
 LEVEL_STYLES: Dict[str, Dict[str, str]] = {
@@ -241,6 +259,42 @@ def build_systemu_chat_page() -> None:
     status_bar = ui.label("").style(
         f"font-size: 12px; color: {THEME['text_muted']}; margin-bottom: 8px;"
     )
+
+    # v0.9.32 (D3.3): per-running-shadow Stop list — reads Supervisor running set
+    # (each entry exposes its `key`) and offers a cooperative cancel button.
+    running_panel = ui.column().classes("w-full").style("margin-bottom: 8px; gap: 4px;")
+
+    @ui.refreshable
+    def _render_running_stops():
+        running = []
+        try:
+            from systemu.runtime.supervisor import Supervisor
+            running = Supervisor.get().get_status().get("running", [])
+        except Exception:
+            running = []
+        for r in running:
+            key = r.get("key")
+            if not key:
+                continue
+            # v0.9.32: token-derived styles as named locals — UI-style lint
+            # forbids inline .style(f"…"); name the style, re-theme via tokens.
+            _row_style = (
+                f"padding: 4px 8px; border: 1px solid {THEME['border']}; "
+                f"border-radius: 8px;"
+            )
+            _lbl_style = f"font-size: 12px; color: {THEME['text']};"
+            _stop_style = (
+                f"background: {THEME['danger']}; color: white; border-radius: 6px; "
+                f"padding: 2px 10px; font-size: 11px; font-weight: 600;"
+            )
+            with ui.row().classes("w-full items-center justify-between").style(_row_style):
+                ui.label(
+                    f"▶ {r.get('activity_id', key)}  ({r.get('status', 'running')})"
+                ).style(_lbl_style)
+                ui.button("Stop", on_click=_make_stop_handler(key)).style(_stop_style)
+
+    with running_panel:
+        _render_running_stops()
 
     # ── Message feed ─────────────────────────────────────────────────────────
     feed_container = ui.column().classes("w-full").style(
@@ -703,6 +757,12 @@ def build_systemu_chat_page() -> None:
             f"📥 {queue_depth} queued"
             + ("  •  ⏸ PAUSED" if _paused[0] else "")
         )
+
+        # v0.9.32 (D3.3): refresh the per-shadow Stop list every drain tick.
+        try:
+            _render_running_stops.refresh()
+        except Exception:
+            pass
 
     from systemu.interface.ui_helpers import safe_timer
     feed_timer = safe_timer(0.5, _drain)

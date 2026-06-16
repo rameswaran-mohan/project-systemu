@@ -294,6 +294,70 @@ class OperatorDecisionQueue:
             pass
         return decision
 
+    def consume_resolved_choice(self, dedup_key: str) -> Optional[str]:
+        """Atomically read AND retire the newest RESOLVED choice for a dedup_key.
+
+        v0.9.32 (D.4 review FIX-2): a one-shot "Approve once" must be SINGLE-USE.
+        ``get_resolved_choice`` is non-consuming — it returns the newest resolved
+        choice forever, so a LATER identical command (same dedup_key) replayed a
+        stale "Approve once" and auto-ran without fresh consent (fail-OPEN). The
+        gate now CONSUMES the decision when it honors it: this flips its status
+        from ``resolved`` -> ``consumed`` so ``get_resolved_choice`` (which only
+        returns ``status == "resolved"``) no longer sees it, and the next
+        identical command RE-ASKS.
+
+        Returns the consumed choice string, or None if there was no resolved
+        decision to consume. "Always allow" never reaches here — it persists in
+        the CommandApprovalStore and is checked before the one-shot bypass.
+        """
+        if not dedup_key:
+            return None
+        try:
+            headers = self._vault.load_index("decisions") or []
+        except Exception:
+            logger.exception("[DecisionQueue] could not load decisions index")
+            return None
+
+        for h in sorted(
+            headers,
+            key=lambda x: x.get("created_at") or "",
+            reverse=True,
+        ):
+            if h.get("dedup_key") != dedup_key:
+                continue
+            if h.get("status") != "resolved":
+                continue
+            try:
+                decision = self._vault.get_decision(h["id"])
+            except Exception as exc:
+                logger.warning(
+                    "[DecisionQueue] consume: resolved header %r (dedup_key=%r) "
+                    "has no loadable body — skipping. Error: %r",
+                    h.get("id"), dedup_key, exc,
+                )
+                continue
+            choice = decision.choice
+            decision.status = "consumed"
+            decision.resolved_at = datetime.now(tz=timezone.utc)
+            try:
+                self._vault.save_decision(decision)
+                logger.info(
+                    "[DecisionQueue] consumed one-shot %s -> %r (dedup_key=%r); "
+                    "a repeat command will re-ask.",
+                    decision.id, choice, dedup_key,
+                )
+            except Exception:
+                # Fail-closed: if we cannot retire the decision, do NOT report
+                # it as consumed (return None) so the caller re-gates rather
+                # than risk a future replay of a choice we failed to expire.
+                logger.warning(
+                    "[DecisionQueue] could not retire consumed one-shot %s "
+                    "(dedup_key=%r) — re-gating to stay fail-closed.",
+                    decision.id, dedup_key, exc_info=True)
+                return None
+            return choice
+        return None
+
     def expire_by_dedup_key(self, dedup_key: str) -> bool:
         """Mark a PENDING decision (by dedup key) as expired so it drops out of
         list_pending()/the Inbox. Idempotent: returns False if none pending.

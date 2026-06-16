@@ -220,8 +220,10 @@ def run_quick_task(
     synthesize: Optional[Callable[..., Optional[str]]] = None,
     max_iters: int = 12,
     wall_clock_s: float = 240.0,
+    cancel_event: Optional["threading.Event"] = None,
 ) -> QuickResult:
     """Run one bounded ReAct loop and return the outcome. Never raises."""
+    import threading  # noqa: F401  (typing/back-compat; Event is duck-checked)
     from systemu.core.utils import load_prompt
 
     llm = llm_json or _default_llm_json
@@ -245,11 +247,18 @@ def run_quick_task(
                 systemu_mode=getattr(config, "systemu_mode", None),
             )
             approvals = init_default_store(_Path("data"))
+            # v0.9.32 D.6: thread the per-command approval store so the chat
+            # lane's sandbox gate (block-and-ask) can consult Always-allow.
+            from systemu.runtime.command_approvals import (
+                init_default_store as _init_cmd_store)
+            command_approvals = _init_cmd_store(_Path("data"))
         except Exception:
             install_mode, approvals = None, None
+            command_approvals = None
         sandbox = ToolSandbox(getattr(vault, "root", None), vault=vault,
                               config=config, install_mode=install_mode,
-                              approvals=approvals)
+                              approvals=approvals,
+                              command_approvals=command_approvals)
 
     try:
         system_prompt = load_prompt("quick_task.md")
@@ -291,7 +300,7 @@ def run_quick_task(
     from pathlib import Path as _Path
     from systemu.runtime.tool_sandbox import _normalize_output_paths
     output_dir = ((getattr(config, "output_dir", "") or "") if config else "") \
-        or str(_Path(getattr(vault, "root", ".")) / "output")
+        or str(_Path(getattr(vault, "root", ".") or ".") / "output")
     try:
         _Path(output_dir).mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -311,8 +320,11 @@ def run_quick_task(
     def _finish(result: QuickResult) -> QuickResult:
         result.files_produced = files
         result.tool_calls = tool_calls
+        # v0.9.32 (review FIX 4): an intentional operator interrupt publishes at
+        # WARNING, not ERROR — matches the supervisor's cancelled publish level.
         level = {"success": "SUCCESS", "partial": "WARNING",
-                 "needs_input": "WARNING"}.get(result.status, "ERROR")
+                 "needs_input": "WARNING", "cancelled": "WARNING"}.get(
+                     result.status, "ERROR")
         head = result.answer_md or result.question or result.error or ""
         _publish(level, f"Quick task {result.status}: {prompt[:80]}",
                  details={"summary": head[:1000],
@@ -334,6 +346,19 @@ def run_quick_task(
 
     iteration = 0
     for iteration in range(1, max_iters + 1):
+        # v0.9.32 (D3.2): cooperative operator interrupt — checked at the loop
+        # boundary, beside the wall-clock budget. Salvage an honest partial from
+        # whatever was gathered, else an honest cancelled result. Never invents.
+        if cancel_event is not None and cancel_event.is_set():
+            if _has_usable_observation(history):
+                _answer = synth(prompt, history, config)
+                if _answer:
+                    return _finish(QuickResult(
+                        status="cancelled", answer_md=_answer,
+                        error="cancelled by operator", iterations=iteration - 1))
+            return _finish(QuickResult(
+                status="cancelled", error="cancelled by operator",
+                iterations=iteration - 1))
         if time.monotonic() - started > wall_clock_s:
             return _terminate(
                 f"wall-clock budget exceeded ({int(wall_clock_s)}s)", iteration - 1)
@@ -519,16 +544,21 @@ def run_quick_task(
 
 
 def _safety_denied(tool_name: str, params: Dict[str, Any]) -> "str | None":
-    """W12 (audit F5): the quick lane's destructive gate.
+    """Quick-lane destructive gate (v0.9.32, D-3).
 
-    The default chat lane carried NO destructive check at all (the workflow
-    runtime gates; this lane didn't — an asymmetry hole). Destructive calls
-    are denied with an actionable message the model can adapt to; provably
-    read-only shell commands pass (`is_destructive_call` judges commands,
-    not tool names). Returns the denial message, or None to allow.
+    Shell tools (run_command / run_cli_command) are now gated at the
+    ToolSandbox chokepoint with block-and-ask (the operator is present in
+    chat), so this returns None for them — the sandbox raises
+    PendingOperatorDecision and _execute_tool block-polls the choice.
+
+    NON-shell destructive tools have no inline approval surface in this lane,
+    so they keep the actionable auto-deny (the model adapts or ASK_USERs).
+    Returns the denial message, or None to allow / defer to the sandbox gate.
     """
     try:
-        from systemu.runtime.tool_sandbox import ToolSandbox
+        from systemu.runtime.tool_sandbox import ToolSandbox, _SHELL_TOOL_NAMES
+        if tool_name in _SHELL_TOOL_NAMES:
+            return None  # gated at the sandbox (block-and-ask)
         if not ToolSandbox.is_destructive_call(tool_name, params):
             return None
     except Exception:
@@ -556,20 +586,90 @@ def _failure_error(error, parsed) -> str:
     return "tool reported failure without an error message"
 
 
+def _poll_command_choice(vault, dedup_key: str, timeout: "float | None" = None):
+    """Block-poll the OperatorDecisionQueue for a command gate's resolved
+    choice (v0.9.32, D-3). Returns the choice string, or None on timeout
+    (caller treats None as Deny — fail-closed)."""
+    import time
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    deadline = time.monotonic() + (timeout if timeout is not None else 300.0)
+    q = OperatorDecisionQueue(vault)
+    while time.monotonic() < deadline:
+        choice = q.get_resolved_choice(dedup_key)
+        if choice is not None:
+            return choice
+        time.sleep(1.0)
+    return None
+
+
 def _execute_tool(sandbox, tool, params: Dict[str, Any]):
     """Execute one tool through the EXACT runtime contract (W6 runner,
     subprocess isolation policy, dependency install). Sync wrapper — the
-    quick lane runs in a worker thread."""
+    quick lane runs in a worker thread.
+
+    v0.9.32 (D-3): if the sandbox raises PendingOperatorDecision (a command
+    gate), block inline until the operator resolves it in the dashboard Inbox.
+    Approve once / Always allow → re-attempt; Deny or timeout → fail-closed
+    denial result. ONE gate, two wait strategies (workflow parks; chat blocks).
+    """
     from systemu.core.llm_router import _run_coroutine
     from systemu.runtime.tool_sandbox import requires_subprocess_isolation
+    from systemu.approval.exceptions import PendingOperatorDecision
+    from types import SimpleNamespace as _NS
 
-    return _run_coroutine(sandbox.execute_tool(
-        tool.implementation_path,
-        params,
-        extra_packages=tool.dependencies or [],
-        tool_type=getattr(tool.tool_type, "value", tool.tool_type),
-        force_subprocess=requires_subprocess_isolation(tool),
-    ))
+    def _call(resolved_dedup=None):
+        return _run_coroutine(sandbox.execute_tool(
+            tool.implementation_path,
+            params,
+            extra_packages=tool.dependencies or [],
+            tool_type=getattr(tool.tool_type, "value", tool.tool_type),
+            force_subprocess=requires_subprocess_isolation(tool),
+            _command_gate_resolved=resolved_dedup,
+        ))
+
+    def _denied(msg: str):
+        return _NS(success=False, error=msg,
+                   parsed={"success": False, "error": msg,
+                           "error_type": "command_denied"})
+
+    try:
+        return _call()
+    except PendingOperatorDecision as pend:
+        vault = getattr(sandbox, "_vault", None)
+        choice = _poll_command_choice(vault, pend.dedup_key)
+        norm = (choice or "").strip().lower()
+        if norm in ("approve once", "always allow"):
+            # The decision is resolved; "Always allow" persisted the signature
+            # (D.3 handler) so the re-attempt's sandbox gate passes. "Approve
+            # once" is honored by the one-shot bypass token (resolved_dedup),
+            # which lets _maybe_gate_command skip THIS call without persisting.
+            try:
+                return _call(resolved_dedup=pend.dedup_key)
+            except PendingOperatorDecision:
+                # Re-gated (e.g. the bypass didn't apply) → fail-closed.
+                return _denied("Command approved once but re-gated; not run. "
+                               "Choose 'Always allow' to permit repeat runs.")
+            except Exception:
+                # v0.9.32 (D.4 review FIX-5): any unexpected error on the
+                # re-attempt must fail-closed too, never crash the lane.
+                logger.exception("[QuickTask] command gate re-attempt errored "
+                                 "— fail-closed denial")
+                return _denied("Command approval re-attempt failed — denied "
+                               "(fail-closed).")
+        # Deny or timeout → fail-closed.
+        msg = ("Command denied by operator." if norm == "deny"
+               else "Command approval timed out — denied (fail-closed).")
+        return _denied(msg)
+    except Exception:
+        # v0.9.32 (D.4 review FIX-5): a NON-Pending exception from the dispatch
+        # (e.g. _maybe_gate_command's inbox enqueue against an unusable vault)
+        # used to propagate and crash run_quick_task. Fail-closed instead: the
+        # destructive command did NOT run, and the lane returns a clean denial
+        # (same shape as the timeout/Deny branch) so the ReAct loop adapts.
+        logger.exception("[QuickTask] tool dispatch raised an unexpected error "
+                         "— fail-closed denial")
+        return _denied("Tool dispatch failed unexpectedly — denied "
+                       "(fail-closed).")
 
 
 def promote_to_workflow(prompt: str, config, vault):
@@ -584,13 +684,21 @@ def promote_to_workflow(prompt: str, config, vault):
     return refine_from_text(prompt, vault, config)
 
 
-def submit_quick_task(prompt: str, config, vault, **kwargs) -> QuickResult:
+def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = None,
+                      **kwargs) -> QuickResult:
     """Chat-facing wrapper: run the quick lane AND keep the chat-history
     contract (same fields direct_task writes), so the Status dropdown, the
-    chat thread, and the fact-extraction hook work unchanged."""
+    chat thread, and the fact-extraction hook work unchanged.
+
+    v0.9.32 fix: ``chat_ts`` (when the chat lane supplies it) is the canonical id
+    under which the caller registered the cancel Event in ``chat_task_registry``.
+    Used VERBATIM as the chat-history entry id so the per-entry Stop button
+    (``request_cancel(entry["ts"])``) matches the registry key. When None
+    (non-chat callers) the ts is generated internally as before.
+    """
     from datetime import datetime
 
-    ts = datetime.now().isoformat(timespec="seconds")
+    ts = chat_ts or datetime.now().isoformat(timespec="seconds")
     try:
         vault.append_chat_history({
             "ts": ts, "prompt": prompt, "status": "running", "lane": "quick",
@@ -598,12 +706,16 @@ def submit_quick_task(prompt: str, config, vault, **kwargs) -> QuickResult:
     except Exception:
         logger.debug("[QuickTask] could not append chat history", exc_info=True)
 
+    # v0.9.32: cancel_event (if the caller registered one in chat_task_registry)
+    # rides through **kwargs into run_quick_task's loop-top cancel check.
     result = run_quick_task(prompt, config, vault, **kwargs)
 
-    status = {"needs_input": "pending_decision"}.get(result.status, result.status)
-    # needs_input is rendered by chat as the question itself, not a park —
-    # keep the plain status for v1 (no decision row exists to resolve).
-    status = result.status if result.status != "needs_input" else "needs_input"
+    # v0.9.32 (review FIX 5): the status written is result.status verbatim.
+    # needs_input is rendered by chat as the question itself, not a park (no
+    # decision row exists to resolve in v1), and "cancelled" is terminal — so
+    # no remap is applied here. (A dead pending_decision remap line — instantly
+    # overwritten by the line below it — was removed.)
+    status = result.status
     try:
         vault.update_chat_history_entry(ts, {
             "status": status,

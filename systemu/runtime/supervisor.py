@@ -62,6 +62,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from systemu.approval.exceptions import PendingOperatorDecision
+
 logger = logging.getLogger(__name__)
 
 # ── Harness suspend contract (v0.9.7) ─────────────────────────────────────────
@@ -900,6 +902,9 @@ class Supervisor:
                     "started_at":      v["started_at"],
                     "last_heartbeat":  v["last_heartbeat_at"],
                     "status":          v.get("status", "running"),
+                    # v0.9.32 (review FIX 2): observability only — surfaces WHY a
+                    # slot is cancelling ("operator"); no control flow reads it.
+                    "cancel_reason":   v.get("cancel_reason"),
                 }
                 for k, v in self._running.items()
             ]
@@ -916,6 +921,57 @@ class Supervisor:
             "max_concurrent":    self._max_concurrent,
             "stuck_threshold_s": STUCK_THRESHOLD_S,
         }
+
+    def request_cancel(self, key: str) -> bool:
+        """Operator-requested cooperative cancel of one running shadow (D3.1).
+
+        Sets ONLY the slot's ``cancel_event`` so the ReAct loop exits at its next
+        iteration boundary (``shadow_runtime.py`` cancellation gate), and marks the
+        entry ``cancelling`` (the watchdog skips ``cancelling`` slots so it never
+        re-queues a run that is intentionally winding down).
+
+        Operator vs. watchdog cancellation is distinguished STRUCTURALLY, not by
+        reading ``cancel_reason``:
+          - **Operator cancel** (here) leaves the key IN ``_running``. The worker
+            runs to completion with status="cancelled" and reaches
+            ``_handle_result``, which persists a terminal CANCELLED state and
+            skips the post-mortem.
+          - **Watchdog cancel** (``_check_stuck_shadows``) POPS the key from
+            ``_running`` first, so that run's result never reaches
+            ``_handle_result`` — it is re-queued or dead-lettered instead.
+        ``cancel_reason="operator"`` is set purely as harmless observability (it
+        is surfaced in ``get_status``); no control flow reads it.
+
+        Critically does NOT pop the key or release the semaphore — the worker's
+        ``finally`` (supervisor.py:1062) performs the single slot release; a
+        second release here would let an extra shadow start. Returns True iff a
+        running entry was found and signalled.
+        """
+        with self._running_lock:
+            entry = self._running.get(key)
+            if entry is None:
+                return False
+            ev = entry.get("cancel_event")
+            if ev is not None:
+                ev.set()
+            entry["status"] = "cancelling"
+            entry["cancel_reason"] = "operator"
+        logger.info("[Supervisor] Operator cancel requested for key=%s", key)
+        return True
+
+    def request_cancel_by_activity(self, activity_id: str) -> bool:
+        """Operator cancel keyed on activity_id — cancels every running slot whose
+        payload matches (normally one). Returns True iff at least one was found."""
+        keys = []
+        with self._running_lock:
+            for k, v in self._running.items():
+                if v.get("payload", {}).get("activity_id") == activity_id:
+                    keys.append(k)
+        cancelled_any = False
+        for k in keys:
+            if self.request_cancel(k):
+                cancelled_any = True
+        return cancelled_any
 
     # ── Dispatcher loop ───────────────────────────────────────────────────────
 
@@ -1046,6 +1102,33 @@ class Supervisor:
                 loop.close()
                 asyncio.set_event_loop(None)
 
+        except PendingOperatorDecision as pd:
+            # v0.9.32 (D.4 review FIX-1): a destructive shell command in this
+            # queued/scheduled/background shadow hit the per-command approval
+            # gate, which posted the operator card (in _maybe_gate_command)
+            # BEFORE raising. The operator can still approve it from the Inbox.
+            # We must STOP CLEANLY here — NOT fall into the generic `except`
+            # below, which would mark status="failure" → retry-storm +
+            # dead-letter + LLM post-mortem on something that is awaiting a
+            # human, not broken. Clean fail-closed deny (Option 1): the run
+            # did NOT execute the command; the operator re-runs the task after
+            # approving. (NOT a resume — that's a deferred follow-up.)
+            logger.info(
+                "[Supervisor] Shadow %s blocked on command-approval gate "
+                "(decision=%s, dedup=%s) — clean deny, no retry.",
+                shadow_id, getattr(pd, "decision_id", "?"),
+                getattr(pd, "dedup_key", "?"),
+            )
+            result = {
+                "status": "command_gate_blocked",
+                "error":  "command_gate",
+                "final_summary": (
+                    "Blocked: a shell command requires operator approval and "
+                    "was NOT run. Approve it (Always allow) in the inbox, then "
+                    "re-run the task."
+                ),
+            }
+
         except Exception as exc:
             logger.exception("[Supervisor] Shadow thread error: %s", exc)
             result = {
@@ -1118,13 +1201,54 @@ class Supervisor:
             )
             return
 
-        # Cancelled by watchdog — no retry needed (watchdog already re-queued)
+        # Cancelled — operator interrupt reaching the worker's _handle_result
+        # (the watchdog path is zombie-suppressed before here, since the watchdog
+        # popped the key from _running). Persist a terminal CANCELLED state (not a
+        # failure) and skip the LLM post-mortem — an intentional stop is not a bug
+        # to diagnose (D-6). No retry, no dead-letter.
         if status == "cancelled":
-            # [A.2] DB row was already marked by the watchdog path; nothing to do here.
+            try:
+                from systemu.runtime.activity_completion import mark_activity_failed
+                mark_activity_failed(getattr(self, "vault", None), activity_id,
+                                     status="cancelled",
+                                     summary="Cancelled by operator")
+            except Exception:
+                logger.warning("[Supervisor] mark_activity_failed(cancelled) failed for %s",
+                               activity_id, exc_info=True)
             self._publish(
-                f"🚫 Shadow cancelled (watchdog-requested): {activity_id}",
+                f"🚫 Cancelled by operator: {self._aname(activity_id)}",
                 level="WARNING",
                 context={"activity_id": activity_id},
+                origin=payload.get("origin"),   # v0.8.16
+            )
+            return
+
+        # Blocked on the per-command approval gate (v0.9.32, D.4 review FIX-1).
+        # A destructive shell command in this queued/scheduled/background run
+        # raised PendingOperatorDecision; the gate ALREADY posted the operator
+        # card before raising, so this is awaiting a human — NOT a bug. Persist
+        # a terminal FAILED state (clean deny: the command did not run, the
+        # operator re-runs the task after approving) and skip the LLM
+        # post-mortem. Mirrors the cancelled branch: publish + early return; NO
+        # retry, NO dead-letter, NO _analyze_failure (no storm).
+        if status == "command_gate_blocked":
+            summary = result.get("final_summary") or (
+                "Blocked: a shell command requires operator approval and was "
+                "NOT run. Approve it (Always allow) in the inbox, then re-run "
+                "the task."
+            )
+            try:
+                from systemu.runtime.activity_completion import mark_activity_failed
+                mark_activity_failed(getattr(self, "vault", None), activity_id,
+                                     status="failed", summary=summary)
+            except Exception:
+                logger.warning(
+                    "[Supervisor] mark_activity_failed(command_gate_blocked) "
+                    "failed for %s", activity_id, exc_info=True)
+            self._publish(
+                f"🔒 Needs approval (command gate): {self._aname(activity_id)} — {summary}",
+                level="WARNING",
+                context={"activity_id": activity_id, "shadow_id": shadow_id},
                 origin=payload.get("origin"),   # v0.8.16
             )
             return
@@ -1414,6 +1538,13 @@ Respond with a JSON object exactly matching this schema:
 
                 # Grace period for "starting" state (vault load / loop init can take time)
                 if status == "starting" and silence_s < STUCK_THRESHOLD_S:
+                    continue
+
+                # v0.9.32 (review FIX 3): an operator-cancelled slot is winding down,
+                # not stuck. Skip it — otherwise its silence (the ReAct loop has
+                # stopped emitting heartbeats) trips the watchdog, which pops and
+                # re-submits the very run the operator asked to stop.
+                if status == "cancelling":
                     continue
 
                 if silence_s > STUCK_THRESHOLD_S:

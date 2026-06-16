@@ -17,7 +17,7 @@ class GateMode(str, Enum):
     APPROVE_ONLY = "approve_only"  # always ask
 
 
-FLOOR_GATE_TYPES = frozenset({"dep", "recovery"})
+FLOOR_GATE_TYPES = frozenset({"dep", "recovery", "command"})
 FLOOR_CAPABILITIES = frozenset({
     "network-egress", "fs-write", "pkg-install",
     "destructive-recovery", "credential-access",

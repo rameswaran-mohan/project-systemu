@@ -17,6 +17,21 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 
+# v0.9.32 (D.4 review FIX-3): gate types whose affirmative option is DANGEROUS
+# and must NEVER be a one-click rail quick-approve. A command gate's last option
+# is "Always allow" — letting one rail click pick it (with no Deny offered) would
+# permanently allow a destructive command, AND the rail's resolve path
+# (resolve_gate) NOOPs for command gates so it would not even persist. These are
+# render-only in the rail: the card shows, but the operator resolves the full
+# three-way choice (Deny / Approve once / Always allow) via the /insights Inbox,
+# which routes through decision_dispatcher.dispatch -> command_gate_handler.
+_RAIL_RENDER_ONLY_DEDUP_PREFIXES = ("command:",)
+
+
+def _is_render_only_gate(dedup: str) -> bool:
+    return any(dedup.startswith(p) for p in _RAIL_RENDER_ONLY_DEDUP_PREFIXES)
+
+
 def _inbox_rail_rows(descriptors: List[Tuple[str, Any]]) -> List[Dict[str, Any]]:
     """Pure glance-row model: map ``(id, GateDescriptor)`` -> row dict.
 
@@ -24,17 +39,25 @@ def _inbox_rail_rows(descriptors: List[Tuple[str, Any]]) -> List[Dict[str, Any]]
     option label (the LAST option, e.g. "Approve"/"Forge"/"Approve & Install")
     so the quick-Approve button knows exactly what Approve does. Kept pure so
     the mapping is unit-testable independently of NiceGUI.
+
+    v0.9.32 (D.4 review FIX-3): render-only gates (command gates) carry an EMPTY
+    ``approve_label`` so the rail renders the card WITHOUT a dangerous one-click
+    quick-approve. ``render_only`` makes the intent explicit for callers/tests.
     """
     rows: List[Dict[str, Any]] = []
     for dec_id, d in descriptors:
         options = list(getattr(d, "options", []) or [])
+        dedup = getattr(d, "dedup", "") or ""
+        render_only = _is_render_only_gate(dedup)
         rows.append({
             "id": dec_id,
             "title": getattr(d, "title", ""),
             "risk": getattr(d, "risk", "low"),
+            "render_only": render_only,
             # The affirmative option is the LAST option (the Inbox convention:
-            # safe-default at index 0, affirmative last). Empty when no options.
-            "approve_label": options[-1] if options else "",
+            # safe-default at index 0, affirmative last). Empty when no options
+            # OR when the gate is render-only (no one-click quick-approve).
+            "approve_label": "" if render_only else (options[-1] if options else ""),
         })
     return rows
 
@@ -46,7 +69,17 @@ def _approve_descriptor(dec_id: str, descriptor, *, vault) -> None:
     Order mirrors the proven CLI path (cli_commands.decisions_resolve):
     ``queue.resolve(id, choice=...)`` returns the decision with ``.choice``
     set, so ``resolve_gate`` sees the operator's choice and executes.
+
+    v0.9.32 (D.4 review FIX-3): render-only gates (command gates) are REFUSED
+    here — they must be resolved via the full /insights three-way UI, never as a
+    one-click rail Always-allow (which has no Deny and which resolve_gate NOOPs,
+    so it would not even persist). Defense-in-depth: the rail no longer renders a
+    quick-approve button for these, but this guard makes the contract explicit.
     """
+    if _is_render_only_gate(getattr(descriptor, "dedup", "") or ""):
+        raise ValueError(
+            "Command gates are resolved in the /insights Inbox (Deny / Approve "
+            "once / Always allow), not via a one-click rail approve.")
     from systemu.interface.command.inbox import InboxQueue, resolve_gate
     queue = InboxQueue(vault)._queue
     options = list(getattr(descriptor, "options", []) or [])
@@ -136,7 +169,15 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
                     status_pill(row["risk"])
                 ui.label(row["title"]).classes("s-rail-title")
                 approve_label = row["approve_label"]
-                if approve_label:
+                if row.get("render_only"):
+                    # v0.9.32 (D.4 review FIX-3): command gates need the full
+                    # three-way choice (Deny / Approve once / Always allow) and
+                    # must NOT be one-click Always-allowed from the rail. Show a
+                    # hint that points to the /insights Inbox (which routes
+                    # through the dispatcher → command_gate_handler).
+                    ui.label("Resolve in Inbox →").classes("s-muted").style(
+                        "font-size: 11px;")
+                elif approve_label:
                     # W7.1: async + to_thread — Approve EXECUTES the gate
                     # action (pip installs, dry-runs, LLM calls); on the UI
                     # loop it froze the dashboard and dropped the websocket.

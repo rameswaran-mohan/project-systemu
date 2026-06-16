@@ -139,6 +139,36 @@ class GateDescriptor(BaseModel):
         )
 
     @classmethod
+    def from_command(cls, *, tool_name: str, command: str, cwd: str = "",
+                     reason: str = "") -> "GateDescriptor":
+        """Build a GateDescriptor for a destructive shell command (v0.9.32, D-2).
+
+        Running an arbitrary shell command is the highest-risk action, so
+        safe_default is "Deny" (index 0 — fail-closed). dedup is keyed on the
+        EXACT normalized signature so "Always allow" / re-attempts collapse to
+        one decision row. Options carry the three-way choice the command-gate
+        handler routes on (Deny / Approve once / Always allow)."""
+        from systemu.runtime.command_approvals import command_signature
+        sig = command_signature(command, cwd=cwd)
+        options = ["Deny", "Approve once", "Always allow"]
+        inspect = f"$ {command}"
+        if cwd:
+            inspect += f"\n(cwd: {cwd})"
+        if reason:
+            inspect += f"\n\nReason: {reason}"
+        return cls(
+            title=f"Run command: {tool_name}",
+            risk="high",
+            inspect=inspect,
+            options=options,
+            safe_default=options[0],
+            what_approve_does=(f"Runs `{command}`"
+                               + (f" in {cwd}" if cwd else "")
+                               + ". 'Always allow' remembers this exact command."),
+            dedup=f"command:{sig}",
+        )
+
+    @classmethod
     def from_forge(cls, tool) -> "GateDescriptor":
         """Build a GateDescriptor from a PROPOSED tool record.
 

@@ -46,12 +46,17 @@ def mark_activity_failed(vault, activity_id: str, *, status: str = "failed",
     persisted."""
     try:
         from systemu.core.models import ActivityStatus
+        # v0.9.32: an operator interrupt is terminal but NOT a failure — map the
+        # "cancelled" status to its own terminal state so the dashboard and the
+        # post-mortem skip-check can tell an intentional stop from a real failure.
+        terminal = (ActivityStatus.CANCELLED if status == "cancelled"
+                    else ActivityStatus.FAILED)
         activity = vault.get_activity(activity_id)
-        activity.status = ActivityStatus.FAILED
+        activity.status = terminal
         activity.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         vault.save_activity(activity)
-        logger.info("[ActivityCompletion] Activity %s marked FAILED (%s): %s",
-                    activity_id, status, (summary or "")[:160])
+        logger.info("[ActivityCompletion] Activity %s marked %s: %s",
+                    activity_id, terminal.value.upper(), (summary or "")[:160])
         return True
     except Exception as exc:
         logger.warning(

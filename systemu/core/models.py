@@ -423,6 +423,7 @@ class ActivityStatus(str, Enum):
     EXECUTABLE  = "executable"   # All tools deployed, can run immediately
     COMPLETED   = "completed"    # Shadow execution succeeded — terminal state
     FAILED      = "failed"       # Terminal failure — retries exhausted / structural blocker
+    CANCELLED   = "cancelled"    # v0.9.32: operator-interrupted — terminal, no post-mortem
 
 
 class Activity(BaseModel):

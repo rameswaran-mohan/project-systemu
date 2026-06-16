@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
+from urllib.parse import urlsplit
 
 from sharing_on.collectors.base import BaseCollector
 from sharing_on.events.models import CaptureEvent, EventAction, EventCategory
@@ -21,6 +23,37 @@ from sharing_on.events.store import EventStore
 logger = logging.getLogger(__name__)
 
 PORT = 49494
+
+
+# v0.9.32 FIX 2A: the dashboard binds 127.0.0.1 and stamps the origin as
+# http://127.0.0.1:<port>, but operators open http://localhost:<port>. A raw
+# hostname compare ('localhost' != '127.0.0.1') made Layer 1 dead in the common
+# case. Collapse every loopback alias to one canonical bucket before comparing.
+_LOOPBACK_ALIASES = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", None})
+
+
+def _canon_host(host: Optional[str]) -> Optional[str]:
+    """Map any loopback alias to a single canonical host; pass others through."""
+    if host in _LOOPBACK_ALIASES:
+        return "\x00loopback"
+    return host
+
+
+def _same_origin(url: str, origin: str) -> bool:
+    """True if `url`'s scheme://host:port equals `origin`. Path/query ignored.
+
+    Loopback aliases ({localhost, 127.0.0.1, ::1, 0.0.0.0}) are treated as one
+    canonical host so a 127.0.0.1-stamped origin matches a localhost-opened tab.
+    Non-loopback hosts are compared by hostname as before.
+    """
+    if not url or not origin:
+        return False
+    u, o = urlsplit(url), urlsplit(origin)
+    return (
+        (u.scheme, _canon_host(u.hostname), u.port)
+        == (o.scheme, _canon_host(o.hostname), o.port)
+    )
+
 
 class ExtensionRequestHandler(BaseHTTPRequestHandler):
     """Handles POST requests from the Chrome Extension."""
@@ -108,7 +141,16 @@ class WebExtensionCollector(BaseCollector):
     def handle_extension_event(self, payload: dict) -> None:
         """Called by the HTTP Request Handler when data arrives."""
         ts = datetime.now(timezone.utc)
-        
+
+        # v0.9.32 Item 2, Layer 1: default-drop captures of systemu's OWN
+        # dashboard UI. The dashboard is a browser tab, so a PID/window filter
+        # can't discriminate it from legit browser tasks — only the URL origin
+        # can. SYSTEMU_DASHBOARD_ORIGIN is set by dispatch at spawn time.
+        dashboard_origin = os.environ.get("SYSTEMU_DASHBOARD_ORIGIN", "")
+        if dashboard_origin and _same_origin(payload.get("url", ""), dashboard_origin):
+            logger.debug("Dropping dashboard-origin DOM event: %s", payload.get("url"))
+            return
+
         # Determine specific action
         action_str = payload.get("action", "mouse_click")
         if "input" in action_str:

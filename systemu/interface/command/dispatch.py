@@ -17,6 +17,7 @@ The reference signature matched reality, so no adaptation was required.
 """
 from __future__ import annotations
 
+import os
 import sys
 from typing import Callable, Dict, List
 
@@ -28,6 +29,25 @@ _IN_PROCESS_VERBS: Dict[str, Callable] = {}
 def _job_manager():
     from systemu.interface.jobs import JobManager
     return JobManager.get()
+
+
+def _dashboard_origin() -> str:
+    """Resolve the dashboard's HTTP origin from the same env the dashboard
+    stamps at startup (dashboard.run_dashboard sets SYSTEMU_DASHBOARD_PORT and
+    SYSTEMU_DASHBOARD_ORIGIN; SYSTEMU_DASHBOARD_HOST is the bind host).
+
+    Used to tag the spawned recorder so it can drop captures of systemu's own
+    dashboard chrome (v0.9.32 Item 2, Layer 1). A 0.0.0.0 bind is rewritten to
+    localhost so the value matches what the browser actually loads.
+    """
+    pre = os.environ.get("SYSTEMU_DASHBOARD_ORIGIN")
+    if pre:
+        return pre
+    host = os.environ.get("SYSTEMU_DASHBOARD_HOST") or "localhost"
+    if host in ("0.0.0.0", "::", ""):
+        host = "localhost"
+    port = os.environ.get("SYSTEMU_DASHBOARD_PORT") or "8765"
+    return f"http://{host}:{port}"
 
 
 def _verb_to_argv(verb: str, args: List[str]) -> List[str]:
@@ -45,6 +65,12 @@ def dispatch(verb: str, args: List[str], *, cwd: str = ".", vault=None,
     """
     if stream:
         cmd = _verb_to_argv(verb, args)
+        # v0.9.32 Item 2: tag the spawned recorder with the dashboard origin so
+        # WebExtensionCollector can drop captures of systemu's own UI (Layer 1).
+        # This is the SINGLE spawn site every record job passes through, so the
+        # env is set in exactly one place; JobMan.start_job → _child_env copies
+        # os.environ into the child.
+        os.environ["SYSTEMU_DASHBOARD_ORIGIN"] = _dashboard_origin()
         try:
             job = _job_manager().start_job(
                 name=f"{verb} {' '.join(args)}".strip(),

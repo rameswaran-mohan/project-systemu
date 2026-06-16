@@ -29,6 +29,24 @@ logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = {"success", "failure", "failed", "partial", "skipped_no_shadow", "cancelled"}
 
 
+def _make_chat_stop_handler(ts: str):
+    """Click handler: cooperative-cancel the chat task registered under `ts`."""
+    def _stop(_=None):
+        from systemu.runtime import chat_task_registry as _reg
+        ok = False
+        try:
+            ok = _reg.request_cancel(ts)
+        except Exception:
+            ok = False
+        try:
+            from nicegui import ui as _ui
+            _ui.notify("Stopping…" if ok else "Task is no longer running.",
+                       type="warning" if ok else "info")
+        except Exception:
+            pass
+    return _stop
+
+
 def _work_link_for(activity) -> str:
     """Phase 6 Batch 2 (6g): the live Work-spine deep link for a completed task.
 
@@ -205,10 +223,22 @@ def build_chat_page(prefill: str = "") -> None:
                     ui.label(meta).style(
                         f"font-size: 11px; color: {THEME['text_muted']};"
                     )
-                ui.badge(status.upper().replace("_", " ")).style(
-                    f"background: {status_color}; color: white; "
-                    f"border-radius: 6px; font-size: 11px; padding: 3px 8px; white-space: nowrap;"
-                )
+                with ui.column().classes("items-end").style("gap: 6px;"):
+                    ui.badge(status.upper().replace("_", " ")).style(
+                        f"background: {status_color}; color: white; "
+                        f"border-radius: 6px; font-size: 11px; padding: 3px 8px; white-space: nowrap;"
+                    )
+                    # v0.9.32 (D3.3): a running chat task can be cooperatively
+                    # stopped via the chat_task_registry token keyed on its ts.
+                    if status == "running":
+                        _raw_ts = entry.get("ts", "")
+                        _stop_style = (
+                            f"background: {THEME['danger']}; color: white; "
+                            f"border-radius: 6px; font-size: 10px; padding: 2px 8px;"
+                        )
+                        ui.button("Stop", on_click=_make_chat_stop_handler(_raw_ts)).props(
+                            "flat dense"
+                        ).style(_stop_style)
 
             # W8.3: quick-lane entries carry the FULL answer — render it as
             # rich markdown (no 120-char truncation), list produced files,
@@ -334,23 +364,47 @@ def build_chat_page(prefill: str = "") -> None:
         # without a nonlocal/closure-rebind dance.
         result_holder: list = [None]
 
+        # v0.9.32 (D3.2): register a cancel token for THIS chat submission so the
+        # per-entry Stop button (chat_task_registry.request_cancel(ts)) can halt it.
+        from datetime import datetime as _dt
+        from systemu.runtime import chat_task_registry as _reg
+        # v0.9.32 review fix 3A: MICROSECOND precision (not seconds). This id is
+        # the cancel-registry key AND the chat-history entry id; at second
+        # granularity two submissions within the same wall-clock second collide
+        # — they share one cancel token (register is idempotent) and clobber each
+        # other's chat-history rows. Microsecond keeps it a valid sortable
+        # isoformat while making same-second submissions distinct.
+        task_ts = _dt.now().isoformat()
+        cancel_event = _reg.register(task_ts)
+
         def _run() -> None:
             try:
                 if mode == "quick":
                     # W8.3: the fast lane — bounded ReAct loop, no scroll/
                     # activity/shadow creation. submit_quick_task keeps the
                     # chat-history contract so the thread below renders it.
+                    # v0.9.32 fix: pass the SAME canonical `task_ts` as chat_ts so
+                    # the appended chat-history entry id == the cancel-registry key
+                    # — otherwise the per-entry Stop button never matches.
                     from systemu.pipelines.quick_task import submit_quick_task
-                    submit_quick_task(raw, config, vault)
+                    submit_quick_task(raw, config, vault,
+                                      chat_ts=task_ts, cancel_event=cancel_event)
                     return
                 from systemu.pipelines.direct_task import run_direct_task
                 result_holder[0] = run_direct_task(
                     raw, config, vault,
                     route_through_supervisor=queue_mode,
+                    chat_ts=task_ts,
+                    cancel_event=cancel_event,
                 )
             except Exception as exc:
                 logger.error("[ChatPage] task run failed: %s", exc)
             finally:
+                # v0.9.32: always drop the cancel token (registry-leak guard).
+                try:
+                    _reg.unregister(task_ts)
+                except Exception:
+                    pass
                 # v0.8.11 RC2: ui.timer fails asynchronously when the client
                 # navigated away — a sync try/except can't catch it. Pre-check
                 # the connection so the post-run refresh is skipped cleanly.

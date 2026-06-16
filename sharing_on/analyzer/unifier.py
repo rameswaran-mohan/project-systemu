@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from sharing_on.events.models import CaptureEvent, EventAction, EventCategory
@@ -32,6 +32,16 @@ DEDUP_WINDOW = timedelta(milliseconds=500)
 # into a single event with a repeat count if they happen faster than this
 REPEAT_COLLAPSE_WINDOW = timedelta(seconds=2.0)
 
+# v0.9.32 Item 2, Layer 3: trailing *bare* raw-hook MOUSE_CLICK events within
+# this window before the stop anchor are treated as the operator's "Stop" click
+# and trimmed. The trim is anchored to session.end_time (stamped by the
+# live-display poll ~0.5s after the real click, plus IPC lag), NOT the SIGINT
+# timestamp — so the window is widened to ~1.5s to reliably absorb that lag and
+# still capture the bare stop click. Safe to widen because FIX 2C restricts the
+# trim to BARE clicks only (no element_text/element_name/url): an enriched legit
+# final click in the window survives. Clicks only — never keystrokes.
+STOP_CLICK_TRIM_WINDOW = timedelta(milliseconds=1500)
+
 
 # ── Noise patterns ───────────────────────────────────────────────────────────
 # Application names that are part of sharing_on itself — never interesting
@@ -39,7 +49,15 @@ SELF_NOISE_PATTERNS = [
     re.compile(r"sharing_on", re.IGNORECASE),
     re.compile(r"view_latest", re.IGNORECASE),
     re.compile(r"python\.exe.*sharing_on", re.IGNORECASE),
+    # v0.9.32 Item 2, Layer 2: systemu's own dashboard browser tab.
+    re.compile(r"Systemu Dashboard", re.IGNORECASE),
 ]
+
+# v0.9.32 Item 2, Layer 2 — exact control labels of systemu's own dashboard.
+# CROSS-REFERENCE: these MUST stay in sync with the NiceGUI button text in
+# systemu/interface/dashboard.py:463 ("Stop & Analyze") and :466 ("Cancel &
+# Trash"). The test test_v0932_recording_self_filter pins these strings.
+SELF_NOISE_LABELS = {"Stop & Analyze", "Cancel & Trash"}
 
 # Generic empty events that add no information
 def _is_empty_interaction(event: CaptureEvent) -> bool:
@@ -62,8 +80,19 @@ def _is_empty_interaction(event: CaptureEvent) -> bool:
 # Public API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def unify_events(events: List[CaptureEvent]) -> List[CaptureEvent]:
-    """Full unification pipeline.  Returns a clean, deduplicated event list."""
+def unify_events(
+    events: List[CaptureEvent],
+    stop_ts: Optional[datetime] = None,
+) -> List[CaptureEvent]:
+    """Full unification pipeline.  Returns a clean, deduplicated event list.
+
+    v0.9.32 Item 2, Layer 3: when `stop_ts` (the moment the recorder received
+    the stop signal) is supplied, trailing MOUSE_CLICK interactions in
+    [stop_ts - STOP_CLICK_TRIM_WINDOW, stop_ts] are dropped — they are the
+    operator clicking systemu's own "Stop & Analyze"/"Cancel & Trash" control,
+    which has no text/title in the raw-hook representation. No-op when stop_ts
+    is None (backward-compatible).
+    """
 
     original_count = len(events)
 
@@ -80,8 +109,11 @@ def unify_events(events: List[CaptureEvent]) -> List[CaptureEvent]:
     # 4. Collapse rapid repeats (e.g., 30x "Decrease font size" → 1 event with count)
     interactions = _collapse_repeats(interactions)
 
-    # 5. Filter self-noise (clicks on the sharing_on CLI/viewer itself)
+    # 5. Filter self-noise (clicks on the sharing_on CLI/viewer / dashboard)
     interactions = _filter_self_noise(interactions)
+
+    # 5b. Layer 3: trim the trailing stop click (raw-hook representation).
+    interactions = _trim_trailing_stop_clicks(interactions, stop_ts)
 
     # 6. Re-merge with non-interaction events and sort by timestamp
     unified = others + interactions
@@ -255,7 +287,14 @@ def _same_target(a: CaptureEvent, b: CaptureEvent) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _filter_self_noise(events: List[CaptureEvent]) -> List[CaptureEvent]:
-    """Remove events that are interactions with sharing_on's own UI."""
+    """Remove events that are interactions with sharing_on's / systemu's own UI.
+
+    v0.9.32 Item 2, Layer 2: in addition to the app/title pattern match, drop
+    interactions whose element_text is one of systemu's dashboard control labels
+    (SELF_NOISE_LABELS, kept in sync with dashboard.py:463/466). This catches the
+    introspector- and web-extension-enriched representations of the stop click
+    even when the origin env is absent (extension not installed).
+    """
     clean = []
     for ev in events:
         app  = ev.application or ""
@@ -264,5 +303,67 @@ def _filter_self_noise(events: List[CaptureEvent]) -> List[CaptureEvent]:
 
         if any(pat.search(combined) for pat in SELF_NOISE_PATTERNS):
             continue
+
+        text = (ev.data.get("element_text") or "").strip()
+        if text in SELF_NOISE_LABELS:
+            continue
+
         clean.append(ev)
     return clean
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Layer 3: trailing stop-click timestamp trim
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _is_bare_click(ev: CaptureEvent) -> bool:
+    """True if a MOUSE_CLICK carries NO identifying context.
+
+    v0.9.32 FIX 2C: the raw-hook representation of the operator's "Stop" click
+    has coords only — no element_text, element_name, or url. An ENRICHED final
+    click (introspector/web-extension labels) is a legitimate user action and
+    must survive even inside the trim window. The labelled/enriched stop-click
+    reps are already removed by Layers 1/2.
+    """
+    data = ev.data or {}
+    return not (
+        data.get("element_text")
+        or data.get("element_name")
+        or data.get("url")
+    )
+
+
+def _trim_trailing_stop_clicks(
+    events: List[CaptureEvent],
+    stop_ts: Optional[datetime],
+) -> List[CaptureEvent]:
+    """Drop BARE MOUSE_CLICK interactions inside [stop_ts - window, stop_ts].
+
+    Catches the raw-hook representation of systemu's own "Stop" click, which
+    carries no element_text/element_name/url for Layers 1/2 to match. Only
+    *bare* MOUSE_CLICKs are trimmed (FIX 2C) — an enriched legit final click in
+    the window survives — and only MOUSE_CLICK, never a keystroke.
+    """
+    if stop_ts is None:
+        return events
+
+    # FIX 2B: tolerate cross-version data where stop_ts is tz-naive while events
+    # are tz-aware (or vice versa). Assume UTC for any naive side so the
+    # comparison never raises "can't compare offset-naive and offset-aware".
+    if stop_ts.tzinfo is None:
+        stop_ts = stop_ts.replace(tzinfo=timezone.utc)
+    lo = stop_ts - STOP_CLICK_TRIM_WINDOW
+    kept = []
+    for ev in events:
+        ev_ts = ev.timestamp
+        if ev_ts is not None and ev_ts.tzinfo is None:
+            ev_ts = ev_ts.replace(tzinfo=timezone.utc)
+        if (
+            ev.action == EventAction.MOUSE_CLICK
+            and _is_bare_click(ev)
+            and lo <= ev_ts <= stop_ts
+        ):
+            logger.debug("Layer 3: trimming trailing bare stop-click at %s", ev.timestamp)
+            continue
+        kept.append(ev)
+    return kept
