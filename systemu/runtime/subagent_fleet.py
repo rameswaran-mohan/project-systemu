@@ -24,6 +24,7 @@ bounds, and collates.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from typing import Any, Dict, List
 
@@ -128,6 +129,28 @@ class SubagentFleet:
             1, _coerce_int(getattr(config, "delegate_max_concurrent_children", 2)) or 2
         )
         self._semaphore = asyncio.Semaphore(max_concurrent)
+
+    # ── child-config recursion barrier ────────────────────────────────────────
+
+    def _build_child_config(self, *, parent_depth: int = 0):
+        """v0.9.33 Bug 3: a child config copy with native recursion DISABLED.
+
+        Forces ``delegate_use_parallel=False`` so a granted child SUBAGENT
+        degrades to observation-only (it can never spawn its own fleet), and
+        stamps ``_subagent_depth = parent_depth + 1`` so the arbiter's depth
+        guard AND the v2 delegation refusal (shadow_runtime._handle_tool_call)
+        both see true nesting. The parent's config is never mutated.
+        """
+        try:
+            child_cfg = copy.copy(self.config)
+        except Exception:
+            child_cfg = self.config  # last-resort; still stamped below
+        try:
+            child_cfg.delegate_use_parallel = False
+            child_cfg._subagent_depth = int(parent_depth) + 1
+        except Exception:
+            logger.debug("[Fleet] could not stamp child config", exc_info=True)
+        return child_cfg
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -286,7 +309,13 @@ class SubagentFleet:
             except Exception:
                 _ns = None
 
-            child_runtime = ShadowRuntime(self.config, self.vault, audit_namespace=_ns)
+            # v0.9.33 Bug 3: build the child on a recursion-disabled, depth-stamped
+            # config copy so a granted child SUBAGENT degrades to observation-only
+            # (no native fleet) AND the child cannot recurse via the v2 spawn_subagent
+            # tool path either (the runtime reads its depth off this config copy).
+            _parent_depth = int(getattr(self.config, "_subagent_depth", 0) or 0)
+            child_cfg = self._build_child_config(parent_depth=_parent_depth)
+            child_runtime = ShadowRuntime(child_cfg, self.vault, audit_namespace=_ns)
             # Stash the deterministic child execution id so a runtime / mock can
             # surface it; the runtime mints its own internal id but this gives the
             # parent a stable handle.

@@ -165,7 +165,7 @@ def _map_grant_payload(harness_kind: str, materialise: dict) -> dict:
       * TOOL     → reads ``tool_id`` / ``granted_tool`` (name) / ``lease_id``
       * COMPUTE  → reads ``compute_grant`` (dict) / ``lease_id``
       * SKILL    → reads ``skill`` / ``lease_id``
-      * ACCESS   → reads ``access`` / ``apply``
+      * ACCESS   → reads ``access`` (advisory lease; no sandbox patch — D.2)
       * SUBAGENT → reads ``subagent``
       * INPUT    → reads ``operator_answer`` (handled by the caller, not here)
 
@@ -190,7 +190,8 @@ def _map_grant_payload(harness_kind: str, materialise: dict) -> dict:
         payload["lease_id"] = materialise.get("lease_id")
     elif kind == "access":
         payload["access"] = materialise.get("access")
-        payload["apply"] = materialise.get("apply")
+        # `apply` patch removed — advisory lease only, nothing consumed it
+        # (Bug 5 / D.2).
         payload["lease_id"] = materialise.get("lease_id")
     elif kind == "subagent":
         payload["subagent"] = materialise.get("subagent")

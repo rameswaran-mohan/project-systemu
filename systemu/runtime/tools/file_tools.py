@@ -56,7 +56,15 @@ def write_file_handler(
         n = resolved.write_text(content or "", encoding="utf-8")
     except OSError as exc:
         return {"success": False, "bytes_written": 0, "error": str(exc)}
-    return {"success": True, "bytes_written": int(n), "error": None}
+    # v0.9.33 A1: echo the RESOLVED absolute path. The runtime's artifact
+    # collector (collect_artifact_paths) resolves relative param paths against
+    # the process CWD, not output_dir — so a write redirected into output_dir
+    # would be omitted from files_produced whenever CWD != output_dir (the
+    # normal daemon/local-backend case). "path" is in artifacts._PATH_KEYS, so
+    # echoing it here registers the deliverable CWD-independently, mirroring how
+    # the v1 file_write tool already echoes its absolute path.
+    return {"success": True, "bytes_written": int(n),
+            "path": str(resolved), "error": None}
 
 
 def search_files_handler(

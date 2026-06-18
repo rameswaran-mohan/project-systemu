@@ -53,6 +53,38 @@ _WRITE_NAME_TOKENS = (
 # carry, not by their name (see ToolSandbox.is_destructive_call).
 _SHELL_TOOL_NAMES = {"run_command", "run_cli_command"}
 
+
+def _inject_sandbox_kwargs(handler, params: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
+    """v0.9.33 (A): add _root / output_dir to a v2 handler's kwargs so file
+    tools write into the run workspace, but only for params the handler
+    actually accepts (declared param or **kwargs catch-all) — otherwise a
+    handler with a fixed signature would raise TypeError.
+
+    NOTE: _normalize_output_paths (called in execute() before this) already
+    absolutizes write path-params INTO output_dir, so this _root=output_dir
+    injection is intentionally redundant (defense-in-depth): output_dir is the
+    intended jail root, and a handler that resolves a relative path against
+    _root then lands in the same place the normalizer already steered it.
+    """
+    import inspect
+    if not output_dir:
+        return params
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return params
+    accepts_var_kw = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    out = dict(params)
+    for key in ("_root", "output_dir"):
+        if key in out:
+            continue
+        if accepts_var_kw or key in sig.parameters:
+            out[key] = output_dir
+    return out
+
 # v0.9.32 (D.4 review FIX-4): the destructive ``--force`` flag, matched on a
 # token boundary so it does NOT over-match longer flags that merely START with
 # it. ``(?![-\w])`` rejects a trailing hyphen or word char, so
@@ -441,12 +473,19 @@ class ToolSandbox:
             ):
                 import asyncio as _asyncio
                 loop = _asyncio.get_running_loop()
+                # v0.9.33 (A): file_tools (and any sandbox-aware handler)
+                # accept _root/output_dir to keep writes inside the run
+                # workspace. _od is the resolved output dir computed above for
+                # _normalize_output_paths. Inject ONLY the kwargs the handler
+                # declares (or accepts via **kw) so handlers without those
+                # params don't raise TypeError.
+                _eff_params = _inject_sandbox_kwargs(entry.handler, dict(params or {}), _od)
                 try:
                     if entry.is_async:
-                        result = await entry.handler(**(params or {}))
+                        result = await entry.handler(**_eff_params)
                     else:
                         result = await loop.run_in_executor(
-                            None, lambda: entry.handler(**(params or {}))
+                            None, lambda: entry.handler(**_eff_params)
                         )
                 except Exception as exc:
                     # Capability ledger: record failure too (best-effort).

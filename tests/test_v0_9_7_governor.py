@@ -325,7 +325,9 @@ class TestMaterialiseSkillStub:
                                  config=_mock_config(), execution_id="exec_access")
         assert result["materialised"] is True
         assert "lease_id" in result
-        assert "apply" in result
+        # Bug 5 / D.2: ACCESS is an advisory lease only — no apply patch.
+        assert "apply" not in result
+        assert result["access"]["resource"] == "vault/tools"
 
     def test_grant_compute_now_materialises(self, tmp_path):
         """GRANT on COMPUTE is now implemented (Phase 3.1)."""

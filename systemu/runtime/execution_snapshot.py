@@ -68,6 +68,11 @@ class ExecutionSnapshot:
     sticky_notes:             List[str] = field(default_factory=list)
     original_tool_id:         Optional[str] = None
     recalibration_dedup_key:  Optional[str] = None
+    # v0.9.33 Bug 2/3: harness-request bookkeeping survives suspend/resume so a
+    # parked-then-resumed run does not silently reset the per-run cap or its
+    # nesting depth.
+    requests_this_run:        int = 0
+    subagent_depth:           int = 0
     snapshotted_at:           str = ""
 
 
@@ -132,6 +137,8 @@ def read_snapshot(
             sticky_notes=list(data.get("sticky_notes", [])),
             original_tool_id=data.get("original_tool_id"),
             recalibration_dedup_key=data.get("recalibration_dedup_key"),
+            requests_this_run=int(data.get("requests_this_run", 0)),
+            subagent_depth=int(data.get("subagent_depth", 0)),
             snapshotted_at=data.get("snapshotted_at", ""),
         )
     except Exception:
@@ -172,6 +179,8 @@ def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
         "sticky_notes":            snapshot.sticky_notes,
         "original_tool_id":        snapshot.original_tool_id,
         "recalibration_dedup_key": snapshot.recalibration_dedup_key,
+        "requests_this_run":       snapshot.requests_this_run,
+        "subagent_depth":          snapshot.subagent_depth,
         "snapshotted_at":          snapshot.snapshotted_at,
     }
 
@@ -191,6 +200,8 @@ def capture_from_context(
     activity_id: Optional[str] = None,
     original_tool_id: Optional[str] = None,
     recalibration_dedup_key: Optional[str] = None,
+    requests_this_run: int = 0,
+    subagent_depth: int = 0,
     history_max_events: int = 12,
 ) -> ExecutionSnapshot:
     """Build an ExecutionSnapshot from a live ExecutionContext.
@@ -224,6 +235,8 @@ def capture_from_context(
         sticky_notes=sticky,
         original_tool_id=original_tool_id,
         recalibration_dedup_key=recalibration_dedup_key,
+        requests_this_run=int(requests_this_run),
+        subagent_depth=int(subagent_depth),
     )
 
 

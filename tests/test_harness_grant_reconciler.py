@@ -124,8 +124,9 @@ class _FakeGovernor:
             return {"materialised": True, "lease_id": "lease_s",
                     "skill": "/skills/foo/SKILL.md"}
         if kind == "access":
+            # Bug 5 / D.2: real Governor no longer returns an apply patch.
             return {"materialised": True, "lease_id": "lease_a",
-                    "access": {"resource": "db"}, "apply": {"fs_read": "/data"}}
+                    "access": {"resource": "db"}}
         if kind == "subagent":
             return {"materialised": True, "lease_id": "lease_sa",
                     "subagent": {"task": "do X", "depth_cap": 1}}
@@ -369,7 +370,7 @@ class TestHarnessGrantReconciler:
         for kind, dataid, asserts in [
             ("skill", "k", lambda gp: gp["skill"] == "/skills/foo/SKILL.md"),
             ("access", "a", lambda gp: gp["access"] == {"resource": "db"}
-                                       and gp["apply"] == {"fs_read": "/data"}),
+                                       and "apply" not in gp),  # D.2: no apply patch
             ("subagent", "g", lambda gp: gp["subagent"]["task"] == "do X"),
         ]:
             vlt = _make_vault(tmp_path / kind)

@@ -9,6 +9,7 @@ At each iteration you will receive:
 2. The **Scroll intent** and **Objectives** — what you need to accomplish
 3. Your **execution history** — what you have done so far and observed
 4. The **current state** — which objectives are complete, which are pending
+5. Your **iteration budget** — `iteration` (current), `iter_budget` (the live ceiling), and `iterations_remaining`. When the budget runs low you may also receive a `low_budget_notice`.
 
 ## Your Decision
 
@@ -160,6 +161,7 @@ Use when you genuinely need information or a decision only the human operator ca
 12. **Every decision must make progress or finish.** A valid turn is either a `TOOL_CALL` that advances the task, a short `THINK`/`REFLECT` that changes your plan, or a terminal `COMPLETE`/`FAIL`. Do **not** restate the same intention turn after turn without acting — that is not progress.
 13. **Heed `loop_guard_notice`.** If your context contains a `loop_guard_notice`, you have repeated the same action without progress. Do something *different*: different arguments, a different tool, or `REFLECT` on a new strategy. Repeating the same call again is not allowed.
 14. **`loop_guard_force_finalize`.** If your context contains `loop_guard_force_finalize: true` (and `available_tools` is empty), you MUST end the turn now with `COMPLETE` (if the goal is met from evidence already gathered) or `FAIL` (stating plainly what blocked you). Do not attempt another tool call.
+15. **Budget your iterations.** You have a finite `iter_budget`; `iterations_remaining` tells you how many decisions are left before the run is force-finalized. When `iterations_remaining` is low (or a `low_budget_notice` appears) and the goal is close, **wind down**: prioritize the most load-bearing remaining objective, consolidate, and prepare to `COMPLETE`. Do not start new exploratory work you cannot finish within the remaining budget.
 
 ## Preference: Programmatic over GUI
 
@@ -190,6 +192,9 @@ If you have both a programmatic tool (e.g., `web_screenshot`, `create_word_doc`)
     }
   ],
   "completed_objectives": [],
+  "iteration": 7,
+  "iter_budget": 30,
+  "iterations_remaining": 23,
   "available_resources": {
     "skills": [{"id": "skill_abc123", "name": "web_data_capture", "category": "browser", "description": "..."}],
     "tools":  [{"id": "tool_xyz789", "name": "web_screenshot", "description": "..."}]

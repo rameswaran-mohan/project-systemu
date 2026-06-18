@@ -5,7 +5,7 @@ No network.  persist_skill_candidate is monkeypatched where needed.
 Coverage:
   - SKILL grant   → SKILL.md persisted (monkeypatched); lease minted; ledger written
   - SKILL bad name → materialised=False, no raise
-  - ACCESS grant  → lease + apply patch returned; ledger written
+  - ACCESS grant  → advisory lease returned (no apply patch — D.2); ledger written
   - COMPUTE grant → compute_grant within ceiling; over-spec clamped to ceiling
   - COMPUTE zero  → zero values clamped sensibly
   - SUBAGENT grant → spawn directive with depth/budget capped; no actual spawn
@@ -276,42 +276,29 @@ class TestMaterialiseAccess:
         assert result["access"]["resource"] == "vault/tools"
         assert result["access"]["access_type"] == "read"
 
-    def test_access_grant_returns_apply_patch(self, tmp_path):
+    def test_access_grant_records_lease_no_apply_patch(self, tmp_path):
+        """Bug 5 / D.2: ACCESS materialises an advisory lease + the access spec
+        only — the old sandbox-policy ``apply`` patch is gone (nothing consumed
+        it; single-owner backend by design). Covers the network_host + fs_read
+        specs the deleted apply-patch tests used to pin."""
         gov = _governor()
         vault = _mock_vault(tmp_path)
-        req = _req(HarnessKind.ACCESS, spec={"network_host": "api.example.com"})
-        verdict = _grant_verdict()
-
-        result = gov.materialise(req, verdict, vault=vault,
-                                 config=_mock_config(), execution_id="exec_access_04")
-
-        assert "apply" in result
-        assert result["apply"].get("network_host") == "api.example.com"
-
-    def test_access_grant_apply_fs_read(self, tmp_path):
-        gov = _governor()
-        vault = _mock_vault(tmp_path)
-        req = _req(HarnessKind.ACCESS, spec={"fs_read": "/tmp/data"})
-        verdict = _grant_verdict()
-
-        result = gov.materialise(req, verdict, vault=vault,
-                                 config=_mock_config(), execution_id="exec_access_05")
-
-        assert result["apply"].get("fs_read") == "/tmp/data"
-
-    def test_access_grant_fallback_patch_from_resource(self, tmp_path):
-        """When no explicit policy field, patch falls back to {access_type: resource}."""
-        gov = _governor()
-        vault = _mock_vault(tmp_path)
-        req = _req(HarnessKind.ACCESS, spec={"resource": "vault/secrets", "access_type": "read"})
-        verdict = _grant_verdict()
-
-        result = gov.materialise(req, verdict, vault=vault,
-                                 config=_mock_config(), execution_id="exec_access_06")
-
-        assert "apply" in result
-        # Either the resource-keyed fallback or an explicit field
-        assert result["apply"]
+        for spec, eid in [
+            ({"network_host": "api.example.com"}, "exec_access_04"),
+            ({"fs_read": "/tmp/data"}, "exec_access_05"),
+            ({"resource": "vault/secrets", "access_type": "read"}, "exec_access_06"),
+        ]:
+            req = _req(HarnessKind.ACCESS, spec=spec)
+            verdict = _grant_verdict()
+            result = gov.materialise(req, verdict, vault=vault,
+                                     config=_mock_config(), execution_id=eid)
+            assert result["materialised"] is True
+            assert "lease_id" in result
+            # The access spec is preserved verbatim …
+            for k, v in spec.items():
+                assert result["access"].get(k) == v
+            # … but the dead apply patch is no longer emitted.
+            assert "apply" not in result
 
     def test_access_grant_writes_ledger(self, tmp_path):
         gov = _governor()

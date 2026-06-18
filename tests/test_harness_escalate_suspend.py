@@ -79,7 +79,12 @@ class _EscalateGovernor:
     def __init__(self, *a, **kw):
         pass
 
-    def arbitrate(self, req):
+    def arbitrate(self, req, context=None):  # v0.9.33 Bug 2/3: the arbiter now
+        # receives a per-run arbitration context (requests_this_run + nesting
+        # depth). The stub ignores it but MUST accept it — otherwise the loop's
+        # ``_gov.arbitrate(_req, context=...)`` raises TypeError, which the
+        # REQUEST_HARNESS try/except swallows, so the run never parks: it falls
+        # through to the next decision and hangs in the network goal-verifier.
         return HarnessVerdict(
             request_id=req.request_id,
             decision=HarnessDecision.ESCALATE,

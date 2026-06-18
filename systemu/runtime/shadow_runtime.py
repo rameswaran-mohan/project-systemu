@@ -210,6 +210,60 @@ def _intent_engine_enabled(config) -> bool:
     return os.getenv("SYSTEMU_INTENT_ENGINE", "true").lower() == "true"
 
 
+def _next_harness_request_no(prev) -> int:
+    """v0.9.33 Bug 2: monotonic per-execution harness-request counter.
+
+    Coerces any prior value (None / garbage / negative) to a safe floor so a
+    corrupted resume count can never crash the loop. The first request is #1.
+    """
+    try:
+        n = int(prev)
+    except (TypeError, ValueError):
+        n = 0
+    return n + 1 if n >= 0 else 1
+
+
+# v0.9.33 Bug 3: the v2 (code-registered) delegation tools that, post Section A,
+# became dispatchable through the loop. A CHILD runtime (depth>=1) must never be
+# able to recurse through these — that is a SECOND delegation path alongside the
+# native REQUEST_HARNESS kind=subagent fleet, and its handler ignores the threaded
+# child config (it reads Config.from_env()). We refuse them for children here.
+_V2_DELEGATION_TOOL_NAMES = frozenset({
+    "spawn_subagent", "delegate", "mixture_of_agents",
+})
+
+
+def _harness_arbitration_context(pre_inc_count: int, subagent_depth: int) -> dict:
+    """v0.9.33 Bug 2/3: build the arbitration ``context`` the loop threads into
+    ``Governor.arbitrate``.
+
+    ``pre_inc_count`` is the per-run harness-request counter value BEFORE this
+    request was counted — so the arbiter's cap (count == max → cap) fires at
+    exactly ``max_requests_per_run`` requests, not one early. ``subagent_depth``
+    is this runtime's actual nesting (0 for a parent) so the SUBAGENT depth guard
+    sees real nesting rather than trusting model-claimed ``spec.depth``.
+    """
+    return {
+        "requests_this_run": int(pre_inc_count),
+        "subagent_depth": int(subagent_depth),
+    }
+
+
+def _runtime_depth_from_config(config) -> int:
+    """v0.9.33 Bug 3: read a runtime's subagent nesting depth off its config.
+
+    A parent runtime's config has no ``_subagent_depth`` → 0. SubagentFleet
+    stamps a child config with an incremented depth (see
+    ``SubagentFleet._build_child_config``) so the arbiter's depth guard
+    (``harness_arbiter._arbitrate_subagent``) sees REAL nesting. Pure and
+    crash-proof: any missing / garbage value floors to 0.
+    """
+    try:
+        return int(getattr(config, "_subagent_depth", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _intent_goal_success(*, vault, config, user_profile, scroll, execution_id,
                          summary=None) -> bool:
     """v0.9.7: goal-level acceptance from CURRENT durable evidence.
@@ -998,6 +1052,11 @@ def _apply_recalibrate_tool_directive(
             recalibration_dedup_key=(
                 f"tool-recalibrate:{tool.id}:{execution_id}"
             ),
+            # v0.9.33 Bug 2/3: the loop stashes the cap count + depth on context
+            # (no loop-local in this helper's scope) so a recalibration-resume
+            # keeps counting toward the cap instead of silently resetting it.
+            requests_this_run=int(getattr(context, "_resume_requests_this_run", 0) or 0),
+            subagent_depth=int(getattr(context, "_resume_subagent_depth", 0) or 0),
         )
         write_snapshot(snapshot)
     except Exception:
@@ -1338,6 +1397,93 @@ def _record_shadow_metric(*, shadow, scroll, status: str) -> None:
         logger.debug("[Runtime] shadow_metrics record skipped", exc_info=True)
 
 
+def _build_user_payload(
+    *,
+    shadow_name: str,
+    output_dir: str,
+    current_date: str,
+    current_datetime_utc: str,
+    use_objectives: bool,
+    intent,
+    scroll_json,
+    completed_objectives,
+    pending_objectives,
+    current_ab: int,
+    available_tools,
+    history,
+    last_snapshot,
+    iteration: int,
+    iter_budget: int,
+) -> dict:
+    """Build the BASE per-iteration user payload sent to the Tier-2 decision LLM.
+
+    v0.9.33 (Bug 4-C): surfaces the iteration budget — ``iteration``,
+    ``iter_budget``, ``iterations_remaining`` — so the agent can make
+    budget-aware decisions (wind down / consolidate when the budget is nearly
+    spent) instead of looping blindly to the ceiling.  ``iter_budget`` is the
+    LIVE budget at the call site (a COMPUTE harness grant can extend it
+    mid-run), so ``iterations_remaining`` always reflects the real headroom.
+
+    An *escalating* ``low_budget_notice`` is added when the remaining budget is
+    low AND there is still pending work — it re-fires (with the live remaining
+    count) on each low-budget iteration rather than once, so the reminder does
+    not get buried by intervening history.
+
+    Pure function: no I/O, no mutation of inputs, and the returned ``dict`` is a
+    fresh object whose ``available_tools`` is a NEW list — the loop mutates the
+    result in place (v2-tool augmentation, one-shot operator_hint, loop-guard
+    notice/force-finalize), so it must not alias the caller's inputs.
+    """
+    iterations_remaining = iter_budget - iteration
+
+    payload: dict = {
+        "shadow_name":          shadow_name,
+        "output_dir":           output_dir,
+        "current_date":         current_date,
+        "current_datetime_utc": current_datetime_utc,
+        # v0.9.33-C: iteration budget surfaced to the agent.
+        "iteration":            iteration,
+        "iter_budget":          iter_budget,
+        "iterations_remaining": iterations_remaining,
+    }
+
+    if use_objectives:
+        payload.update({
+            "intent":               intent,
+            "objectives":           scroll_json,
+            "completed_objectives": list(completed_objectives),
+            "pending_objectives":   pending_objectives,
+        })
+    else:
+        payload.update({
+            "current_action_block": current_ab,
+            "pending_action_blocks": [
+                ab for ab in scroll_json
+                if ab.get("step_number", 0) >= current_ab
+            ],
+        })
+
+    # New list (not the caller's) so the loop's in-place .append() is safe.
+    payload["available_tools"] = list(available_tools)
+    payload["history"]         = history
+    payload["last_snapshot"]   = last_snapshot
+
+    # v0.9.33-C: escalating low-budget nudge — only when the budget is nearly
+    # spent AND there is still pending work.  Cheap, additive, and only fires in
+    # the narrow window so it does not pollute every payload.
+    _LOW_BUDGET_THRESHOLD = 3
+    _has_pending = bool(pending_objectives) if use_objectives else True
+    if 0 < iterations_remaining <= _LOW_BUDGET_THRESHOLD and _has_pending:
+        payload["low_budget_notice"] = (
+            f"Only {iterations_remaining} iteration(s) remain before the budget "
+            f"({iter_budget}) is exhausted and the run is force-finalized. "
+            "Prioritize the most load-bearing remaining objective, consolidate, "
+            "and prepare to COMPLETE — do not start new exploratory work."
+        )
+
+    return payload
+
+
 def _build_history_slice(context, max_events: int = 30) -> list:
     """Return the LAST N tool-call/observation/thought events (in chronological
     order) as a compact list for LLM context.
@@ -1505,6 +1651,13 @@ class ShadowRuntime:
         executions_dir: Path where execution snapshots are persisted.
     """
 
+    @staticmethod
+    def _init_subagent_depth(config) -> int:
+        """v0.9.33 Bug 3: this runtime's nesting depth from its config (0 for a
+        parent). Thin wrapper over the pure module helper so tests can stamp
+        depth via ``ShadowRuntime.__new__`` without standing up the sandbox."""
+        return _runtime_depth_from_config(config)
+
     def __init__(
         self,
         config: Config,
@@ -1520,6 +1673,11 @@ class ShadowRuntime:
         # model (synchronous vault writes can't interleave across coroutines); this
         # provides semantic isolation so child audits stay cleanly separable.
         self._audit_namespace = audit_namespace
+        # v0.9.33 Bug 3: nesting depth of THIS runtime. The parent runs at 0;
+        # SubagentFleet stamps the child config with an incremented depth so the
+        # depth guard (harness_arbiter._arbitrate_subagent) and the v2 delegation
+        # refusal (in _handle_tool_call) both see real nesting.
+        self._subagent_depth = self._init_subagent_depth(config)
         # v0.9.1.1 fix: load user_profile once at init so _resolve_verifier_output_dir
         # can actually prefer user_profile.default_output_dir over config.output_dir.
         try:
@@ -2009,12 +2167,17 @@ class ShadowRuntime:
                     ),
                 }, current_ab)
             elif mat.get("access"):
-                # ── ACCESS: a scoped capability lease was granted ──
+                # ── ACCESS: a scoped capability lease was recorded ──
+                # Single-owner backend (by design): the lease is ADVISORY — no
+                # sandbox boundary is enforced locally. Tell the agent the truth
+                # so it does not believe a non-existent boundary authorizes the
+                # op; it proceeds with its EXISTING tools (Bug 5 / D.1).
                 context.add_observation({
                     "type": "harness_granted",
                     "message": (
-                        f"Access granted (scoped lease): {mat.get('access')}. "
-                        "Proceed with the operation it authorizes."
+                        f"Access lease recorded (advisory on the local single-owner "
+                        f"backend — no sandbox boundary is enforced): {mat.get('access')}. "
+                        "Proceed using your existing tools."
                     ),
                 }, current_ab)
             elif mat.get("subagent"):
@@ -2116,7 +2279,7 @@ class ShadowRuntime:
             mat["lease_id"] = payload.get("lease_id")
         elif _kind == "access" or payload.get("access"):
             mat["access"] = payload.get("access")
-            mat["apply"] = payload.get("apply")
+            # No apply patch — advisory lease only (Bug 5 / D.2).
         elif _kind == "subagent" or payload.get("subagent"):
             mat["subagent"] = payload.get("subagent")
         else:
@@ -2226,6 +2389,10 @@ class ShadowRuntime:
             execution_id = _gen_execution_id()
             exec_start   = __import__("time").time()
             tool_call_count = 0
+            # v0.9.33 Bug 2/3: per-execution harness-request counter. Threaded
+            # into Governor.arbitrate so the per-run cap (max_requests_per_run)
+            # actually fires. Restored from a resume snapshot below if present.
+            harness_requests_this_run = 0
             logger.info(
                 "[Runtime] Starting execution %s — shadow='%s' activity='%s'",
                 execution_id, shadow.name, activity.name,
@@ -2432,6 +2599,24 @@ class ShadowRuntime:
                         except Exception:
                             logger.debug("[Runtime] resume harness-grant parse failed",
                                          exc_info=True)
+                        # v0.9.33 Bug 2/3: restore the per-run harness-request
+                        # count + nesting depth from the ALREADY-READ snapshot
+                        # (no second read) BEFORE delete_snapshot consumes it, so
+                        # a resumed run keeps counting toward the cap and the depth
+                        # guard. Missing/garbage fields floor to 0 (backward-compat).
+                        try:
+                            harness_requests_this_run = max(
+                                0, int(getattr(snap, "requests_this_run", 0) or 0)
+                            )
+                            self._subagent_depth = max(
+                                int(getattr(self, "_subagent_depth", 0) or 0),
+                                int(getattr(snap, "subagent_depth", 0) or 0),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[Runtime] harness-count resume restore failed",
+                                exc_info=True,
+                            )
                         logger.info(
                             "[Runtime] resumed from snapshot of %s — restored %d completed objective(s), %d sticky note(s)",
                             resume_from_execution_id,
@@ -2671,6 +2856,12 @@ class ShadowRuntime:
                     context._resume_completed_objectives = (
                         set(completed_objectives) if use_objectives else set()
                     )
+                    # v0.9.33 Bug 2/3: stash the per-run harness-request count +
+                    # nesting depth so the recalibration snapshot helper (which
+                    # pulls loop state off context, not loop-locals) persists them
+                    # and a recalibration-resume keeps counting toward the cap.
+                    context._resume_requests_this_run = harness_requests_this_run
+                    context._resume_subagent_depth = int(getattr(self, "_subagent_depth", 0))
                     _apply_supervisor_directives(
                         directive_inbox.drain(),
                         context=context,
@@ -2738,35 +2929,35 @@ class ShadowRuntime:
                         "will be accepted. Act now."
                     )
                 )
-                _user_payload = {
-                    "shadow_name":        shadow.name,
+                _user_payload = _build_user_payload(
+                    shadow_name=shadow.name,
                     # output_dir: where Shadow-generated files must be written.
                     # Bind-mounted to the host's ./outputs/ directory so files
                     # are accessible outside the container.
-                    "output_dir":         self.config.output_dir,
+                    output_dir=self.config.output_dir,
                     # Temporal context — avoids LLM THINK storms over "what is today's date?"
-                    "current_date":        _datetime_module.date.today().isoformat(),
-                    "current_datetime_utc": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    **(
-                        {
-                            "intent":              scroll.intent,
-                            "objectives":          scroll_json,
-                            "completed_objectives": list(completed_objectives),
-                            "pending_objectives":  pending_objs,
-                        }
-                        if use_objectives else
-                        {
-                            "current_action_block": current_ab,
-                            "pending_action_blocks": [
-                                ab for ab in scroll_json
-                                if ab.get("step_number", 0) >= current_ab
-                            ],
-                        }
+                    current_date=_datetime_module.date.today().isoformat(),
+                    current_datetime_utc=utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    use_objectives=use_objectives,
+                    # intent/pending_objs are only emitted in objective mode by
+                    # the helper; passing them unconditionally is harmless
+                    # (pending_objs is None in action-block mode and ignored).
+                    intent=scroll.intent,
+                    scroll_json=scroll_json,
+                    completed_objectives=completed_objectives,
+                    pending_objectives=pending_objs,
+                    current_ab=current_ab,
+                    available_tools=tool_index,
+                    history=_build_history_slice(context),
+                    last_snapshot=(
+                        context._snapshots[-1].summary if context._snapshots else None
                     ),
-                    "available_tools": tool_index,
-                    "history":         _build_history_slice(context),
-                    "last_snapshot":   context._snapshots[-1].summary if context._snapshots else None,
-                }
+                    # v0.9.33-C: surface the LIVE iteration budget. _iter_budget is
+                    # dynamic — a COMPUTE harness grant extends it mid-run — so the
+                    # agent sees the real remaining headroom, not a fixed ceiling.
+                    iteration=iteration,
+                    iter_budget=_iter_budget,
+                )
                 # v0.9.6 T0: per-iteration guard — ensure v2 tools are always
                 # present in the LLM's available_tools even if tool_index was
                 # assembled before v2 discovery completed, or if a future code
@@ -3179,6 +3370,15 @@ class ShadowRuntime:
                             "message": "Capability provisioning is not enabled; use an available tool or FAIL.",
                         }, current_ab)
                         continue
+                    # v0.9.33 Bug 2: capture the PRE-increment count for the
+                    # arbiter (its cap contract is: count == max → cap; count ==
+                    # max-1 → proceed), THEN advance the counter so exactly
+                    # max_requests_per_run requests succeed. The increment runs
+                    # for every evaluated REQUEST_HARNESS/ASK_OPERATOR.
+                    _pre_inc_requests = harness_requests_this_run
+                    harness_requests_this_run = _next_harness_request_no(
+                        harness_requests_this_run
+                    )
                     try:
                         from systemu.runtime.governor import Governor
                         from systemu.core.models import (
@@ -3244,7 +3444,18 @@ class ShadowRuntime:
                             )
                         _gov = governor or Governor(self.config)
                         _used_harness = True   # v0.10.0 Task 1.7(c): this run pulled the harness
-                        _verdict = _gov.arbitrate(_req)
+                        # v0.9.33 Bug 2/3: thread real arbitration context. This
+                        # single change revives the per-run request cap
+                        # (requests_this_run — the PRE-increment count, matching
+                        # the arbiter's count==max cap contract) AND feeds the
+                        # ACTUAL nesting depth to the SUBAGENT depth guard
+                        # (subagent_depth), instead of trusting model-claimed
+                        # spec.depth alone.
+                        _arb_ctx = _harness_arbitration_context(
+                            _pre_inc_requests,
+                            int(getattr(self, "_subagent_depth", 0)),
+                        )
+                        _verdict = _gov.arbitrate(_req, context=_arb_ctx)
                         if _verdict.decision == HarnessDecision.GRANT:
                             _mat = _gov.materialise(
                                 _req, _verdict, vault=self.vault,
@@ -3259,6 +3470,11 @@ class ShadowRuntime:
                             # collated synthesis (partial-success aware: what ran + what
                             # is missing). Gated behind SYSTEMU_DELEGATE_USE_PARALLEL
                             # (default off → unchanged observation-only path, no regression).
+                            # v0.9.33 Bug 3: a CHILD runtime's config has
+                            # delegate_use_parallel forced False (SubagentFleet.
+                            # _build_child_config), so a granted child SUBAGENT
+                            # always takes the observation-only else-branch below —
+                            # no native fleet recursion is possible.
                             if (_mat.get("materialised") and _mat.get("subagent")
                                     and getattr(self.config, "delegate_use_parallel", False)):
                                 _sa = _mat.get("subagent") or {}
@@ -3273,14 +3489,27 @@ class ShadowRuntime:
                                         config=self.config, vault=self.vault,
                                     )
                                     _fres = await _fleet.spawn_children(shadow, activity, _tasks)
+                                    # v0.9.33 Bug 3: TERMINAL fleet observation.
+                                    # Delegation has run; the agent must synthesize
+                                    # the children's results and COMPLETE — it must
+                                    # NOT re-delegate (re-entering this branch each
+                                    # iteration cascaded sub-fleets). The children's
+                                    # work is still credited (synthesis flows through).
                                     context.add_observation({
                                         "type": "harness_granted",
-                                        "message": (_fres.get("synthesis")
-                                                    or "Sub-agents completed."),
+                                        "message": (
+                                            (_fres.get("synthesis")
+                                             or "Sub-agents completed.")
+                                            + " Delegation complete — synthesize these"
+                                              " results into your answer and COMPLETE the"
+                                              " objective now;"
+                                              " do not re-delegate or request more sub-agents."
+                                        ),
                                         "fleet": {
                                             "any_succeeded": _fres.get("any_succeeded"),
                                             "all_succeeded": _fres.get("all_succeeded"),
                                             "budget": _fres.get("budget"),
+                                            "terminal": True,
                                         },
                                     }, current_ab)
                                 except Exception:
@@ -3327,6 +3556,10 @@ class ShadowRuntime:
                                     completed_objectives=set(completed_objectives),
                                     context=context,
                                     activity_id=getattr(activity, "id", ""),
+                                    # v0.9.33 Bug 2/3: carry the per-run cap count +
+                                    # nesting depth so a resume keeps counting.
+                                    requests_this_run=harness_requests_this_run,
+                                    subagent_depth=int(getattr(self, "_subagent_depth", 0)),
                                 )
                                 import json as _json
                                 _snap.sticky_notes.append(
@@ -3875,6 +4108,11 @@ class ShadowRuntime:
                                 completed_objectives=set(completed_objectives),
                                 context=context,
                                 activity_id=getattr(activity, "id", ""),
+                                # v0.9.33 Bug 2/3: the stuck-park is the common
+                                # operator-park path — carry the cap count + depth
+                                # so a resumed run keeps counting toward the cap.
+                                requests_this_run=harness_requests_this_run,
+                                subagent_depth=int(getattr(self, "_subagent_depth", 0)),
                             )
                             # R3: persist the per-objective stuck round counters so
                             # rounds accumulate across resumes (carried as a sticky tag).
@@ -4087,6 +4325,77 @@ class ShadowRuntime:
                     current_ab,
                 )
                 return None
+
+        # ── v0.9.33 (A): v2 (code-registered) tool short-circuit ──────────
+        # _build_llm_tool_catalog advertises v2 tools, but the v1 lookup
+        # below only knows vault tools — without this, every advertised v2
+        # tool returned "not found". Dispatch via ToolSandbox.execute (which
+        # consults tool_registry_v2, runs entry.handler, injects _root, and
+        # records the capability ledger by name). The dry-run short-circuit
+        # and the destructive gate above already applied; shell tools are not
+        # v2-registered, so the v0.9.32 command gate is unaffected.
+        from systemu.runtime.tool_registry_v2 import registry as _v2_registry
+        _v2_entry = _v2_registry.get(tool_name)
+        if _v2_entry is not None and _v2_registry.available(tool_name, self.config):
+            # ── v0.9.33 Bug 3: child-runtime recursion barrier (v2 path) ──────
+            # spawn_subagent / delegate / mixture_of_agents are now dispatchable
+            # (Section A) and form a SECOND delegation path whose handler uses
+            # Config.from_env() — it ignores the recursion-disabled child config.
+            # So a child (depth>=1) must be refused here, mirroring the native
+            # REQUEST_HARNESS kind=subagent depth guard. No native fleet AND no
+            # v2 fork → the cascade is closed on both paths. Parents (depth 0)
+            # and all non-delegation v2 tools are unaffected.
+            if (tool_name in _V2_DELEGATION_TOOL_NAMES
+                    and int(getattr(self, "_subagent_depth", 0)) >= 1):
+                context.add_tool_call(decision, current_ab)
+                _refusal = ToolResult(
+                    success=False,
+                    parsed={"refused": True, "tool": tool_name,
+                            "reason": "subagent_recursion_barrier"},
+                    error=("Delegation is not available to a sub-agent "
+                           f"(depth {int(getattr(self, '_subagent_depth', 0))}): "
+                           "synthesize the work yourself and COMPLETE; do not "
+                           "re-delegate or spawn further sub-agents."),
+                )
+                context.add_observation(_refusal.to_dict(), current_ab)
+                logger.info(
+                    "[Runtime] refused v2 delegation tool %s for child runtime "
+                    "(depth=%d) — recursion barrier",
+                    tool_name, int(getattr(self, "_subagent_depth", 0)),
+                )
+                return _refusal
+            # Record the call exactly like the v1 path.
+            context.add_tool_call(decision, current_ab)
+            # DRY RUN — skip real execution (mirror the v1 dry-run path).
+            if dry_run:
+                fake_result = ToolResult(
+                    success=True,
+                    parsed={"dry_run": True, "tool": tool_name, "params": parameters},
+                )
+                context.add_observation(fake_result.to_dict(), current_ab)
+                logger.debug("[Runtime] DRY RUN (v2): %s(%s)", tool_name, parameters)
+                return fake_result
+            # LIVE — dispatch through the v2 dispatcher (returns a dict).
+            v2_dict = await self.sandbox.execute(tool_name, parameters)
+            v2_success = bool(v2_dict.get("success", True)) if isinstance(v2_dict, dict) else True
+            v2_result = ToolResult(
+                success=v2_success,
+                parsed=v2_dict if isinstance(v2_dict, dict) else {"value": v2_dict},
+                error=(v2_dict.get("error") if isinstance(v2_dict, dict) and not v2_success else None),
+            )
+            context.add_observation(v2_result.to_dict(), current_ab)
+            # Record verified artifacts on success (mirror the v1 path).
+            if v2_result.success:
+                try:
+                    from systemu.runtime.artifacts import collect_artifact_paths
+                    context.add_files(collect_artifact_paths(
+                        tool_name, parameters, v2_result.parsed))
+                except Exception:
+                    logger.debug("[Runtime] v2 artifact collection skipped", exc_info=True)
+            else:
+                logger.warning("[Runtime] v2 tool %s failed: %s",
+                               tool_name, v2_result.error)
+            return v2_result
 
         # Find the Tool object
         tool_obj = next((t for t in tools if t.name == tool_name), None)

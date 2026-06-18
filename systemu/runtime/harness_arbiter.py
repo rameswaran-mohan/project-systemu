@@ -248,7 +248,14 @@ def _arbitrate_subagent(
 ) -> Dict[str, Any]:
     """SUBAGENT kind — within depth+budget is MEDIUM; beyond is HIGH."""
     spec = request.spec
-    requested_depth = int(spec.get("depth", 1))
+    # v0.9.33 Bug 3: the depth guard must reflect ACTUAL nesting, not just the
+    # model-claimed spec.depth (a child could claim depth=1 forever and cascade).
+    # Take the MAX of (a) the requester's real nesting + 1 (ctx["subagent_depth"]
+    # is the requester's current depth; parent=0) and (b) the model-claimed
+    # spec.depth — so a child cannot undercut its true depth by lying low, AND an
+    # over-claimed large depth still escalates (preserving the existing contract).
+    actual_next_depth = int(ctx.get("subagent_depth", 0)) + 1
+    requested_depth = max(int(spec.get("depth", 1)), actual_next_depth)
     requested_budget_fraction = float(spec.get("budget_fraction", 0.0))
 
     beyond_depth = requested_depth > policy.max_subagent_depth

@@ -589,33 +589,22 @@ class Governor:
     ) -> dict:
         """ACCESS provisioner — issue a scoped capability lease for a resource.
 
-        Phase 3 behaviour: record the lease and return the access spec + a
-        policy patch dict the loop/sandbox will apply.  Does NOT open any
-        network or filesystem resource here.
-
-        The ``apply`` dict mirrors the sandbox-policy patch format:
-          {"network_host": <host>} or {"fs_read": <path>} etc.
-        taken directly from request.spec (the agent declares what it needs).
+        Single-owner posture (by design): record the advisory lease and return
+        the access spec only.  Does NOT open any network or filesystem resource
+        and does NOT emit a sandbox-policy patch — there is no sandbox boundary
+        to apply one to, and nothing in the loop consumed the old ``apply`` patch
+        (Bug 5 / D.2: dead plumbing removed).
 
         Returns
         -------
-        {"materialised": True, "lease_id": ..., "access": <spec>, "apply": <patch>}
+        {"materialised": True, "lease_id": ..., "access": <spec>}
         or {"materialised": False, "reason": ...}
         """
         spec = request.spec or {}
         try:
-            # Build the sandbox-policy patch from spec fields
-            patch: Dict[str, Any] = {}
-            for field_name in ("network_host", "fs_read", "fs_write", "env_var"):
-                if field_name in spec:
-                    patch[field_name] = spec[field_name]
-            if not patch:
-                # Fall back to exposing the resource identifier
-                resource = spec.get("resource", "")
-                access_type = spec.get("access_type", "read")
-                if resource:
-                    patch = {access_type: resource}
-
+            # Single-owner backend: nothing to materialise beyond the advisory
+            # lease record. No sandbox-policy patch is built (Bug 5 / D.2).
+            pass
         except Exception as exc:
             logger.error(
                 "[Governor] access provision failed: %s", exc, exc_info=True,
@@ -629,9 +618,8 @@ class Governor:
         self._register_lease(lease_id, request, execution_id)
 
         logger.info(
-            "[Governor] materialised ACCESS lease_id=%s patch=%s execution_id=%s",
+            "[Governor] recorded advisory ACCESS lease_id=%s execution_id=%s",
             lease_id,
-            patch,
             execution_id,
         )
 
@@ -639,7 +627,6 @@ class Governor:
             "materialised": True,
             "lease_id": lease_id,
             "access": dict(spec),
-            "apply": patch,
         }
 
     def _provision_compute(
