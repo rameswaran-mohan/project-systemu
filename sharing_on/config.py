@@ -291,6 +291,13 @@ class Config:
     clipboard_poll_interval: float = 1.5     # clipboard polling
     step_idle_threshold: float = 10.0        # seconds of inactivity = step boundary
 
+    # v0.9.34.1 Feature D — capture scope. "broad" (default) records everything
+    # system-wide (unchanged). "narrow" records only one target app/window; the
+    # global input-hook stays broad in Phase 1 (see collectors/scope.py).
+    capture_scope: str = "broad"             # SHARING_ON_CAPTURE_SCOPE: broad|narrow
+    capture_target_app: str = ""             # SHARING_ON_CAPTURE_APP: process/app name
+    capture_target_title: str = ""           # SHARING_ON_CAPTURE_TITLE: window-title substring
+
     # --- Filesystem watcher ---
     watch_dirs: List[str] = field(default_factory=list)
     ignore_patterns: List[str] = field(default_factory=lambda: [
@@ -476,6 +483,13 @@ class Config:
             screenshot_max_width=int(
                 os.getenv("SHARING_ON_SCREENSHOT_WIDTH", "1280")
             ),
+            capture_scope=(
+                os.getenv("SHARING_ON_CAPTURE_SCOPE", "broad").strip().lower()
+                if os.getenv("SHARING_ON_CAPTURE_SCOPE", "broad").strip().lower()
+                in ("broad", "narrow") else "broad"
+            ),
+            capture_target_app=os.getenv("SHARING_ON_CAPTURE_APP", "").strip(),
+            capture_target_title=os.getenv("SHARING_ON_CAPTURE_TITLE", "").strip(),
             systemu_mode=os.getenv("SYSTEMU_MODE", "local").lower(),
             storage_backend=os.getenv("SYSTEMU_STORAGE", "file").lower(),
             queue_backend=os.getenv("SYSTEMU_QUEUE", "").lower(),

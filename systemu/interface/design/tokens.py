@@ -141,6 +141,10 @@ body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, v
 .s-rail-item {{ display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; margin-bottom: 8px; }}
 .s-rail-title {{ font-size: var(--type-sm); color: var(--color-text); line-height: 1.35; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
 .s-rail-actions {{ display: flex; justify-content: flex-end; gap: 6px; }}
+/* "Needs you" scroller: bound the section so a long pending list scrolls
+   internally instead of pushing the "Live" pane below the fold. max-height =>
+   shrink-to-fit when short, scroll when long. */
+.s-rail-scroll {{ max-height: 260px; overflow-y: auto; }}
 
 /* ── entity rows (shared tool/skill renderers — Phase 5 Slice 3) ── */
 .s-text-success {{ color: var(--color-success); }}

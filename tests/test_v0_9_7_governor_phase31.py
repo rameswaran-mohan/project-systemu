@@ -376,7 +376,10 @@ class TestMaterialiseCompute:
         assert grant["extra_iterations"] <= 10
         assert grant["extra_think"] <= 3200
 
-    def test_compute_zero_values_allowed(self, tmp_path):
+    def test_compute_zero_request_defaults_nonzero(self, tmp_path):
+        # v0.9.34 Bug 7: an explicit-zero compute request is no longer a +0
+        # no-op — it defaults to a sensible non-zero, ceiling-bounded bump
+        # (ceiling 1.0 → max 100 iters / 32000 think).
         gov = _governor()
         vault = _mock_vault(tmp_path)
         req = _req(HarnessKind.COMPUTE, spec={"extra_iterations": 0, "extra_think": 0})
@@ -387,10 +390,12 @@ class TestMaterialiseCompute:
 
         assert result["materialised"] is True
         grant = result["compute_grant"]
-        assert grant["extra_iterations"] == 0
-        assert grant["extra_think"] == 0
+        assert 0 < grant["extra_iterations"] <= 100
+        assert 0 < grant["extra_think"] <= 32_000
 
-    def test_compute_empty_spec_defaults_to_zero(self, tmp_path):
+    def test_compute_empty_spec_defaults_nonzero(self, tmp_path):
+        # v0.9.34 Bug 7: an under-specified compute request (no amount) still
+        # grants a usable, bounded budget instead of nothing.
         gov = _governor()
         vault = _mock_vault(tmp_path)
         req = _req(HarnessKind.COMPUTE, spec={})
@@ -400,8 +405,8 @@ class TestMaterialiseCompute:
                                  config=_mock_config(), execution_id="exec_compute_06")
 
         assert result["materialised"] is True
-        assert result["compute_grant"]["extra_iterations"] == 0
-        assert result["compute_grant"]["extra_think"] == 0
+        assert 0 < result["compute_grant"]["extra_iterations"] <= 100
+        assert 0 < result["compute_grant"]["extra_think"] <= 32_000
 
     def test_compute_mints_lease(self, tmp_path):
         gov = _governor()

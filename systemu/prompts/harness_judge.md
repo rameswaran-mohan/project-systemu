@@ -4,7 +4,7 @@ this request as genuinely AMBIGUOUS at MEDIUM risk and could not resolve it on i
 own. Your single job is to decide: GRANT, DENY, or ESCALATE.
 
 You will receive a JSON object with:
-- "kind": the capability family (skill | access | compute | subagent | …).
+- "kind": the capability family (tool | skill | access | compute | subagent | mcp).
 - "spec": the kind-specific request payload (name, resource, budget, etc.).
 - "rationale": the agent's stated reason for needing this capability.
 - "arbiter_rationale": why the deterministic arbiter flagged this for judgment.

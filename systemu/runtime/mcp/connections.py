@@ -164,6 +164,23 @@ def transport_for(vault, server: str) -> Dict[str, Any]:
     return {"transport": "http", "url": server}
 
 
+def set_transport(vault, server: str, spec: Dict[str, Any]) -> None:
+    """Persist the transport (reconnect) spec for ``server`` so the stateless
+    call path reloads the real recipe via ``transport_for`` instead of the
+    ``http://<server_id>`` fallback (v0.9.34 Bug 8).
+
+    SECURITY: callers MUST pass credential env-var NAMES (``env_keys``), never
+    resolved secret VALUES — the connections store is plaintext on disk. Values
+    are re-resolved from the parent env at call time (client._resolve_transport).
+    """
+    server = (server or "").rstrip("/")
+    if not server:
+        return
+    state = get_state(vault)
+    state.setdefault("transports", {})[server] = dict(spec or {})
+    _save(vault, state)
+
+
 def get_enabled_grouped(vault) -> Dict[str, List[Dict[str, Any]]]:
     """Operator-enabled tools GROUPED BY SERVER (catalog/budget/Settings input).
 

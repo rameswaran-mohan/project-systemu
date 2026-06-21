@@ -24,6 +24,7 @@ from sharing_on.collectors.filesystem import FileSystemCollector
 from sharing_on.collectors.process import ProcessCollector
 from sharing_on.collectors.screen import ScreenCollector
 from sharing_on.collectors.window import WindowCollector
+from sharing_on.collectors.scope import CaptureScope
 from sharing_on.config import Config
 from sharing_on.events.models import CaptureEvent, EventAction, EventCategory
 from sharing_on.events.store import EventStore
@@ -177,6 +178,14 @@ class CaptureSession:
 
     # --- Internal ---
 
+    def _build_scope(self) -> CaptureScope:
+        """Build the capture-scope filter from config (broad by default)."""
+        return CaptureScope(
+            scope=self.config.capture_scope,
+            target_app=self.config.capture_target_app,
+            target_title=self.config.capture_target_title,
+        )
+
     def _build_collectors(self) -> None:
         """Create collector instances based on platform capabilities."""
         caps = self.platform.capabilities
@@ -248,6 +257,12 @@ class CaptureSession:
                 poll_interval=self.config.clipboard_poll_interval,
             ))
 
+        # v0.9.34.1 Feature D: install the capture-scope filter on every
+        # collector so emit() drops off-target events. Broad scope is a no-op.
+        scope = self._build_scope()
+        for collector in self._collectors:
+            collector.set_scope(scope)
+
     def _save_metadata(self) -> None:
         """Save session metadata to a JSON file."""
         metadata = {
@@ -262,6 +277,9 @@ class CaptureSession:
             "event_count": self._store.event_count,
             "collectors": [c.name for c in self._collectors],
             "watch_dirs": self.config.watch_dirs,
+            "capture_scope": self.config.capture_scope,
+            "capture_target_app": self.config.capture_target_app,
+            "capture_target_title": self.config.capture_target_title,
         }
         meta_path = self.output_dir / "session.json"
         meta_path.write_text(json.dumps(metadata, indent=2))

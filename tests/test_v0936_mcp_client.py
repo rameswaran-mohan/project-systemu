@@ -540,6 +540,42 @@ class TestClientOnSdk:
         import systemu.runtime.mcp.client  # noqa: F401  (force import/register)
         assert registry.get("mcp_call_tool") is not None
 
+    def test_search_tools_registered_and_dispatchable(self, monkeypatch):
+        # Regression (advertised-but-undispatchable class — same as the original
+        # mcp_call_tool gap): shadow_runtime advertises `mcp_search_tools` (the
+        # overflow-discovery affordance) but NOTHING registered a handler, so
+        # calling it 404'd and the overflow path was dead. It must register a
+        # real handler — same guarantee as mcp_call_tool.
+        from systemu.runtime.tool_registry_v2 import registry
+        import systemu.runtime.mcp.client as mc  # noqa: F401 (force register)
+        entry = registry.get("mcp_search_tools")
+        assert entry is not None
+        assert entry.handler is not None
+        assert entry.is_action_tool is False  # read-only discovery, never gated as action
+        # Behavioural: search the FULL enabled-tool set by keyword. Stub the vault
+        # construction + the connections store so no real vault is touched.
+        monkeypatch.setattr("systemu.vault.vault.Vault", lambda *a, **k: object())
+        fixture = {
+            "github": [
+                {"name": "create_issue", "description": "open a new issue"},
+                {"name": "list_repos", "description": "list repositories"},
+            ],
+            "slack": [
+                {"name": "post_message", "description": "send a chat message"},
+            ],
+        }
+        monkeypatch.setattr(
+            "systemu.runtime.mcp.connections.get_enabled_grouped",
+            lambda vault: fixture)
+        out = mc._mcp_search_handler(query="issue")
+        assert out["success"] is True
+        assert {m["tool"] for m in out["matches"]} == {"mcp__github__create_issue"}
+        # multi-term match + namespaced name + server/name fields preserved
+        out2 = mc._mcp_search_handler(query="chat message")
+        assert [m["name"] for m in out2["matches"]] == ["post_message"]
+        assert out2["matches"][0]["tool"] == "mcp__slack__post_message"
+        assert out2["matches"][0]["server"] == "slack"
+
 
 class TestDispatchRugPullOnUse:
     def test_dispatch_threads_vault_into_execute(self, monkeypatch, mcp_vault):

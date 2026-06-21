@@ -218,7 +218,14 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
                         button(approve_label, variant="primary",
                                on_click=_on_approve)
 
-    _pane()
+    # Bound the "Needs you" height so a long pending list scrolls internally
+    # instead of crowding out the "Live" events pane below it (mirrors
+    # live_runs_pane's fixed-height scroll). The header + answer-dialog host
+    # stay OUTSIDE this scroller so the title pins and the dialog slot is
+    # stable; _pane (@ui.refreshable) captures the scroller slot, so the 2s
+    # timer refreshes re-render inside the bounded region.
+    with ui.element("div").classes("s-rail-scroll"):
+        _pane()
 
     # UI-thread timer is the SOLE driver of refresh (slot-error tolerant),
     # mirroring live_runs_pane — the queue is file-backed so a poll is enough.

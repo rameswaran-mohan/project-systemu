@@ -9,6 +9,7 @@ from typing import Optional
 
 from sharing_on.events.models import CaptureEvent
 from sharing_on.events.store import EventStore
+from sharing_on.collectors.scope import CaptureScope
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class BaseCollector(ABC):
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[str] = None
+        self._scope: Optional[CaptureScope] = None
 
     @property
     def is_running(self) -> bool:
@@ -36,6 +38,23 @@ class BaseCollector(ABC):
     @property
     def error(self) -> Optional[str]:
         return self._error
+
+    def set_scope(self, scope: Optional[CaptureScope]) -> None:
+        """Install a capture-scope filter consulted by emit(). None = broad."""
+        self._scope = scope
+
+    def should_capture(self, event: CaptureEvent) -> bool:
+        """Filter hook: True if the event belongs to the configured scope.
+
+        Default consults self._scope (broad/None keeps everything). Collectors
+        with bespoke metadata (e.g. browser origins) may override.
+        """
+        # getattr default guards collectors built via __new__ (some tests) that
+        # never ran __init__ and so have no _scope attr — treat as broad.
+        scope = getattr(self, "_scope", None)
+        if scope is None:
+            return True
+        return scope.keep(event)
 
     def start(self) -> None:
         """Start the collector in a background thread."""
@@ -59,7 +78,10 @@ class BaseCollector(ABC):
         logger.info(f"Collector '{self.name}' stopped")
 
     def emit(self, event: CaptureEvent) -> None:
-        """Send a captured event to the event store (thread-safe)."""
+        """Send a captured event to the event store (thread-safe), unless the
+        active capture scope filters it out."""
+        if not self.should_capture(event):
+            return
         self._store.put(event)
 
     def _safe_collect_loop(self) -> None:

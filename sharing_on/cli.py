@@ -184,6 +184,19 @@ def cli(ctx, debug: bool):
     default=False,
     help="Skip LLM analysis after recording. Just save raw events.",
 )
+@click.option(
+    "--scope",
+    type=click.Choice(["broad", "narrow"]),
+    default="broad",
+    show_default=True,
+    help="Capture scope: 'broad' records everything; 'narrow' records only --app.",
+)
+@click.option(
+    "--app",
+    default="",
+    help="Narrow-mode target: app/process name (e.g. chrome.exe) or browser "
+         "origin (e.g. https://github.com). Implies --scope narrow.",
+)
 @click.pass_context
 def record(
     ctx,
@@ -194,6 +207,8 @@ def record(
     screenshot_interval: float,
     model: str,
     no_analyze: bool,
+    scope: str,
+    app: str,
 ):
     """
     Record computer activity for a task and generate step-by-step instructions.
@@ -217,6 +232,12 @@ def record(
         config.watch_dirs = list(watch)
     if output:
         config.output_base_dir = output
+    # v0.9.34.1 Feature D: capture-scope overrides. --app implies narrow.
+    if app:
+        config.capture_target_app = app
+        config.capture_scope = "narrow"
+    elif scope == "narrow":
+        config.capture_scope = "narrow"
 
     # Validate config (only needed for analysis step)
     if not no_analyze:

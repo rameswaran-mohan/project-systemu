@@ -123,6 +123,17 @@ def _spine_icon(current_path: str) -> str:
     return _icon(concept) if concept else _icon("inbox")
 
 
+def _record_dispatch_args(task_name: str, scope: str, app: str) -> list:
+    """Build the ``record`` dispatch args for the dashboard dialog (v0.9.34.1
+    Feature D). Broad = today's behaviour (no scope flags). Narrow requires a
+    non-empty app target; a blank target degrades to broad so we never spawn a
+    useless ``--scope narrow`` with nothing to narrow to."""
+    args = ["--name", task_name, "--no-analyze"]
+    if scope == "narrow" and app.strip():
+        args += ["--scope", "narrow", "--app", app.strip()]
+    return args
+
+
 def _build_layout(page_title: str, current_path: str):
     """Return a NiceGUI context manager that renders the sidebar + header."""
     from nicegui import ui
@@ -253,6 +264,18 @@ def _build_layout(page_title: str, current_path: str):
                         f"font-size: 18px; font-weight: 700; color: {THEME['text']}; margin-bottom: 16px;"
                     )
                     name_input = ui.input(label="Session Name (Task desc)", placeholder="Deploy new web page").style("width: 100%;")
+
+                    # v0.9.34.1 Feature D: capture-scope toggle (narrow = one app).
+                    scope_toggle = ui.toggle(
+                        {"broad": "Everything (broad)", "narrow": "One app (narrow)"},
+                        value="broad",
+                    ).style("margin-top: 12px;")
+                    app_input = ui.input(
+                        label="App / process or origin",
+                        placeholder="chrome.exe  or  https://github.com",
+                    ).style("width: 100%;")
+                    app_input.bind_visibility_from(scope_toggle, "value",
+                                                   backward=lambda v: v == "narrow")
                     
                     def _do_record():
                         if jm.has_active_capture():
@@ -262,7 +285,12 @@ def _build_layout(page_title: str, current_path: str):
                         from systemu.interface.command.dispatch import dispatch
                         from systemu.interface.dashboard_state import AppState
                         cwd = AppState.get().project_root   # Always absolute
-                        dispatch("record", ["--name", task_name, "--no-analyze"],
+                        args = _record_dispatch_args(
+                            task_name,
+                            scope=scope_toggle.value,
+                            app=app_input.value or "",
+                        )
+                        dispatch("record", args,
                                  cwd=cwd, stream=True, job_type="capture",
                                  dedup_key=f"record:{task_name}")
                         ui.notify("Recording started!", type="positive")

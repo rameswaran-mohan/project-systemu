@@ -55,6 +55,13 @@ def _same_origin(url: str, origin: str) -> bool:
     )
 
 
+def _is_origin_target(target: str) -> bool:
+    """True if a narrow capture target looks like a browser origin (has a
+    scheme), e.g. 'https://github.com'. App-process targets ('chrome.exe')
+    return False so the origin allow-list does not engage for them."""
+    return "://" in (target or "")
+
+
 class ExtensionRequestHandler(BaseHTTPRequestHandler):
     """Handles POST requests from the Chrome Extension."""
     
@@ -138,6 +145,14 @@ class WebExtensionCollector(BaseCollector):
         # Overridden because HTTPServer handles the loop natively
         pass
 
+    def should_capture(self, event) -> bool:
+        """Web events do their OWN scope filtering in handle_extension_event (the
+        narrow-mode origin allow-list below); the base process-name match would
+        wrongly drop them because their application is the generic
+        "Chrome/Edge Web Browser", never a process/origin token. Always allow at
+        the base hook — narrowing already happened before emit()."""
+        return True
+
     def handle_extension_event(self, payload: dict) -> None:
         """Called by the HTTP Request Handler when data arrives."""
         ts = datetime.now(timezone.utc)
@@ -150,6 +165,16 @@ class WebExtensionCollector(BaseCollector):
         if dashboard_origin and _same_origin(payload.get("url", ""), dashboard_origin):
             logger.debug("Dropping dashboard-origin DOM event: %s", payload.get("url"))
             return
+
+        # v0.9.34.1 Feature D: narrow-mode origin allow-list. When the narrow
+        # target is a URL origin (not a browser process), keep ONLY events whose
+        # URL matches that origin — a generalization of the dashboard drop above.
+        scope = getattr(self, "_scope", None)
+        if scope is not None and scope.is_narrow and _is_origin_target(scope.target_app):
+            if not _same_origin(payload.get("url", ""), scope.target_app):
+                logger.debug("Narrow scope dropped off-origin DOM event: %s",
+                             payload.get("url"))
+                return
 
         # Determine specific action
         action_str = payload.get("action", "mouse_click")

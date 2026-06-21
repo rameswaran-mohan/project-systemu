@@ -340,6 +340,34 @@ class TestMaterialiseSkillStub:
         assert result["materialised"] is True
         assert "compute_grant" in result
 
+    def test_grant_compute_without_amount_defaults_nonzero(self, tmp_path):
+        """Bug 7: a granted compute request must not be a +0 no-op. A request that
+        omits extra_iterations (or sends 0) defaults to a sensible non-zero bump
+        so the grant actually extends the budget."""
+        gov = _default_governor()
+        vault = _mock_vault(tmp_path)
+        # the common under-specified case: kind=compute with no amount
+        req = _req(HarnessKind.COMPUTE, spec={})
+        result = gov.materialise(req, _grant_verdict(), vault=vault,
+                                 config=_mock_config(), execution_id="exec_c0")
+        assert result["materialised"] is True
+        assert result["compute_grant"]["extra_iterations"] > 0
+        # an explicit zero is treated the same — a no-op grant is never useful
+        req0 = _req(HarnessKind.COMPUTE, spec={"extra_iterations": 0})
+        r0 = gov.materialise(req0, _grant_verdict(), vault=vault,
+                             config=_mock_config(), execution_id="exec_c0b")
+        assert r0["compute_grant"]["extra_iterations"] > 0
+
+    def test_grant_compute_honours_explicit_amount(self, tmp_path):
+        """Bug 7 guard: an explicit extra_iterations is honoured (not overridden
+        by the default), clamped to the ceiling (max 100 at the default ceiling)."""
+        gov = _default_governor()
+        vault = _mock_vault(tmp_path)
+        req = _req(HarnessKind.COMPUTE, spec={"extra_iterations": 3})
+        result = gov.materialise(req, _grant_verdict(), vault=vault,
+                                 config=_mock_config(), execution_id="exec_c3")
+        assert result["compute_grant"]["extra_iterations"] == 3
+
     def test_grant_subagent_now_materialises(self, tmp_path):
         """GRANT on SUBAGENT is now implemented (Phase 3.1)."""
         gov = _default_governor()

@@ -126,8 +126,36 @@ The inverse of `TOOL_CALL`: when **no available tool fits the objective**, ask t
   "is_destructive": false
 }
 ```
-- `kind` ∈ `tool` | `skill` | `access` | `compute` | `subagent` (phase 1 materialises `tool`).
+- `kind` ∈ `tool` | `skill` | `access` | `compute` | `subagent` | `mcp`. (`tool` materialises inline; `mcp` connects to an MCP server — see the affordance below.)
 - If GRANTED, the new capability is offered back to you as an observation — then call it via `TOOL_CALL`. If DENIED, the observation carries alternatives — adapt.
+
+**`mcp` — connect to an MCP server to borrow its tools.** Use this when an MCP server exposes exactly the tool you lack (e.g. a GitHub or Slack server). The `spec` is an MCP-server connect recipe:
+```json
+{
+  "action": "REQUEST_HARNESS",
+  "kind": "mcp",
+  "spec": {
+    "server_id": "github",
+    "transport": "stdio",
+    "command": "uvx",
+    "args": ["mcp-server-github"],
+    "env_keys": ["GITHUB_TOKEN"],
+    "label": "GitHub MCP",
+    "tool_filter": ["create_issue", "list_repos"]
+  },
+  "rationale": "No local tool files issues; the GitHub MCP server exposes create_issue.",
+  "fallback": "If denied, ask the operator to file the issue.",
+  "completes_objective": null,
+  "is_destructive": false
+}
+```
+- `server_id` — stable id for the server (also the connection key). `transport` ∈ `stdio` | `http` | `sse`.
+- For `stdio`: give `command` + `args` (the server's launch command) and `env_keys` — the **NAMES** of environment variables holding credentials, never the secret values themselves (the runtime resolves them out-of-band).
+- For `http` / `sse`: give `url` instead of `command`/`args`.
+- `tool_filter` (optional) — opt into a named subset of the server's tools instead of all of them. `label` is a human-facing display name.
+- **A NEW server requires operator approval.** Connecting to a server the operator has not allow-listed or already connected is escalated for operator approval before it runs — so always supply a `fallback`. Re-attaching an already-connected server, or one on the operator's allow-list, is granted inline.
+
+**`compute` — extend your own iteration/think budget.** When you're running low (watch `iterations_remaining`), request more headroom to finish instead of stopping partial. The `spec` may carry `extra_iterations` (more steps) and/or `extra_think` (more think tokens); if you omit the amount, a sensible bounded default is granted.
 
 ### 8. ASK_OPERATOR — Ask the operator a question *(only when capability provisioning is enabled)*
 Use when you genuinely need information or a decision only the human operator can provide. Prefer acting autonomously; use this sparingly for true blockers.
