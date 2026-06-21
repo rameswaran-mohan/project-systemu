@@ -77,6 +77,18 @@ def test_prompt_documents_compute_extra_iterations():
     assert "extra_iterations" in p and "extra_think" in p
 
 
+def test_prompt_has_honesty_disposition_against_fabrication():
+    """v0.9.34.2: the executor prompt must set a no-fabrication disposition — the
+    agent uses/acquires real capabilities rather than inventing or approximating
+    a result it cannot genuinely produce (e.g. a guessed SHA-256). The disposition
+    is deliberately GENERIC (names no task/operation/REQUEST_HARNESS action)."""
+    p = Path("systemu/prompts/execute_step.md").read_text(encoding="utf-8")
+    assert "## How you work" in p
+    assert "careful, honest agent" in p
+    assert "not by guessing" in p
+    assert "acquiring the rest, is the job" in p
+
+
 def test_judge_prompt_kind_list_names_mcp():
     """The harness judge may receive an MCP request; its documented kind list
     must name mcp explicitly so the closed kind set stays consistent across every
