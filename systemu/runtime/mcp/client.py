@@ -27,13 +27,33 @@ def parse_servers(server_csv: str) -> List[str]:
     return [s.strip() for s in server_csv.split(",") if s.strip()]
 
 
+def _resolve_env_keys(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve a persisted transport spec's credential env-var NAMES
+    (``env_keys``) to their current values into ``env`` at call time (v0.9.34
+    Bug 8). Secrets are NEVER persisted to the connections store — only their
+    names — so this re-resolution from the parent env is what makes a credentialed
+    stdio server reconnect. Mirrors the connect-time resolution in
+    ``Governor._provision_mcp``. The ``env_keys`` field is consumed (not forwarded
+    to the SDK)."""
+    import os
+    keys = spec.pop("env_keys", None)
+    if keys:
+        env = dict(spec.get("env") or {})
+        for k in keys:
+            if k in os.environ:
+                env[k] = os.environ[k]
+        spec["env"] = env
+    return spec
+
+
 def _resolve_transport(server: str, vault) -> Dict[str, Any]:
-    """Transport spec for ``server``. With a vault, use the persisted spec; a
-    bare URL (or no vault) defaults to streamable-HTTP."""
+    """Transport spec for ``server``. With a vault, use the persisted spec
+    (resolving credential env-var names to values); a bare URL (or no vault)
+    defaults to streamable-HTTP."""
     if vault is not None:
         try:
             from systemu.runtime.mcp.connections import transport_for
-            return transport_for(vault, server)
+            return _resolve_env_keys(transport_for(vault, server))
         except Exception:
             logger.debug("[MCP] transport_for failed; defaulting to http", exc_info=True)
     return {"transport": "http", "url": (server or "").rstrip("/")}
@@ -213,4 +233,89 @@ registry.register(
     ),
     is_action_tool=True,  # an MCP call may mutate external state
     max_result_size_chars=50_000,
+)
+
+
+# ── mcp_search_tools — overflow-discovery affordance handler ───────────────
+# Same "advertised-but-undispatchable" class as the original mcp_call_tool gap:
+# shadow_runtime advertises `mcp_search_tools` (the lazy affordance shown when
+# the per-run exposure budget hides MCP tools), but NOTHING registered a handler,
+# so calling it failed with "tool not found" and the overflow-discovery path was
+# dead. Register the handler here so it's dispatchable. The exposure-budget logic
+# in shadow_runtime already strips/re-injects the catalog entry, so the
+# LLM-visible behaviour (shown only on overflow) is unchanged — only dispatch is
+# fixed. The budget HIDES tools from the catalog, not from the v2 registry, so a
+# matched tool is callable by its namespaced name (or via mcp_call_tool).
+
+_MCP_SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string",
+                  "description": "Keywords to match against tool names/descriptions."},
+    },
+    "required": ["query"],
+}
+
+
+def _mcp_search_handler(**kwargs) -> Dict[str, Any]:
+    """Search the FULL set of enabled MCP tools by keyword and return matches so
+    the agent can call a specific one — by its namespaced name
+    ``mcp__<server>__<tool>`` or via ``mcp_call_tool(server, name)``. Read-only
+    discovery (never mutates). A blank/empty query lists everything."""
+    query = str(kwargs.get("query") or "").strip().lower()
+    from sharing_on.config import Config
+    cfg = Config.from_env()
+    vault = None
+    try:
+        from systemu.vault.vault import Vault
+        vault = Vault(cfg.vault_dir)
+    except Exception:
+        logger.debug("[MCP] search handler vault unresolvable", exc_info=True)
+    if vault is None:
+        return {"success": False, "error": "no vault available for MCP tool search"}
+    try:
+        from systemu.runtime.mcp.connections import get_enabled_grouped
+        grouped = get_enabled_grouped(vault)
+    except Exception as exc:
+        logger.debug("[MCP] search enumerate failed", exc_info=True)
+        return {"success": False, "error": f"MCP tool search failed: {exc}"}
+    terms = [t for t in query.split() if t]
+    matches = []
+    for server, tools in (grouped or {}).items():
+        for t in (tools or []):
+            name = str(t.get("name") or "")
+            if not name:
+                continue
+            desc = str(t.get("description") or "")
+            hay = f"{name}\n{desc}".lower()
+            if not terms or all(term in hay for term in terms):
+                matches.append({
+                    "tool": f"mcp__{server}__{name}",
+                    "server": server,
+                    "name": name,
+                    "description": desc,
+                })
+    matches.sort(key=lambda m: m["tool"])
+    _LIMIT = 25
+    return {
+        "success": True,
+        "query": query,
+        "count": len(matches),
+        "truncated": len(matches) > _LIMIT,
+        "matches": matches[:_LIMIT],
+    }
+
+
+registry.register(
+    name="mcp_search_tools", toolset="mcp",
+    schema=_MCP_SEARCH_SCHEMA, handler=_mcp_search_handler,
+    check_fn=_mcp_check_fn,          # only dispatchable when MCP is enabled (L1)
+    description=(
+        "Search the tools available on connected MCP servers by keyword and find "
+        "a specific one to use. Use this when the MCP tool you need is not already "
+        "listed (the per-run exposure budget hides the rest). Returns matching "
+        "tool names you can then call."
+    ),
+    is_action_tool=False,  # read-only discovery
+    max_result_size_chars=20_000,
 )

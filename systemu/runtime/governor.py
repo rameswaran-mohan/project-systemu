@@ -682,7 +682,13 @@ class Governor:
             except (TypeError, ValueError):
                 raw_iterations = 0
             max_iterations = max(1, int(ceiling * 100))
-            extra_iterations = max(0, min(raw_iterations, max_iterations))
+            # v0.9.34 Bug 7: a granted compute request must not be a +0 no-op.
+            # The agent isn't required to name an explicit amount, so an
+            # absent/zero request defaults to a sensible non-zero bump (a quarter
+            # of the iteration ceiling, >=1) rather than granting nothing.
+            if raw_iterations <= 0:
+                raw_iterations = max(1, max_iterations // 4)
+            extra_iterations = max(1, min(raw_iterations, max_iterations))
 
             # extra_think: integer tokens, capped at ceiling * 32000
             raw_think = spec.get("extra_think", 0)
@@ -691,6 +697,9 @@ class Governor:
             except (TypeError, ValueError):
                 raw_think = 0
             max_think = max(0, int(ceiling * 32_000))
+            # Bug 7: same default-to-non-zero for think tokens when unspecified.
+            if raw_think <= 0:
+                raw_think = max_think // 4
             extra_think = max(0, min(raw_think, max_think))
 
             compute_grant = {
@@ -932,6 +941,24 @@ class Governor:
                     "parameters_schema": pschema,
                     "annotations": annotations,
                 })
+
+            # v0.9.34 Bug 8: persist the full transport (reconnect) spec so the
+            # stateless call path (client._resolve_transport → transport_for)
+            # reloads the real stdio command/args (or remote url) instead of the
+            # http://<server_id> fallback that left attached tools uncallable.
+            # SECRET-FREE: persist env-var NAMES, never the resolved values (the
+            # connections store is plaintext on disk); _resolve_transport
+            # re-resolves them from the parent env at call time.
+            persist_spec = {"transport": transport}
+            if spec.get("command"):
+                persist_spec["command"] = spec.get("command")
+            if spec.get("args"):
+                persist_spec["args"] = list(spec.get("args") or [])
+            if spec.get("url"):
+                persist_spec["url"] = spec.get("url")
+            if spec.get("env_keys"):
+                persist_spec["env_keys"] = list(spec.get("env_keys") or [])
+            _connections.set_transport(vault, server_id, persist_spec)
 
             # Persist server transport + label + connected flag (re-attach LOW).
             _connections.set_server_meta(

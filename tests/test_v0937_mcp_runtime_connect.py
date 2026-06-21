@@ -270,7 +270,8 @@ def _mcp_governor(monkeypatch):
     import systemu.runtime.mcp.sdk.manager as mgr_mod  # noqa
     monkeypatch.setattr(mgr_mod, "ConnectionManager", _FakeCM, raising=False)
 
-    recorder = {"enabled": [], "hashed": [], "tool_hash": [], "server_meta": []}
+    recorder = {"enabled": [], "hashed": [], "tool_hash": [], "server_meta": [],
+                "transport": []}
 
     import systemu.runtime.mcp.connections as conn_mod
     import systemu.runtime.mcp.sdk.schema_map as schema_mod
@@ -291,11 +292,17 @@ def _mcp_governor(monkeypatch):
     def _fake_set_server_meta(vault, server, *, label, transport, connected):
         recorder["server_meta"].append((server, label, transport, connected))
 
+    def _fake_set_transport(vault, server, spec):
+        # v0.9.34 Bug 8: _provision_mcp now persists the transport spec; fake it
+        # so the fixture's root=None _FakeVault never hits real connections I/O.
+        recorder["transport"].append((server, dict(spec or {})))
+
     # tool_def_hash lives in sdk.schema_map (NOT connections) — patch it there.
     monkeypatch.setattr(schema_mod, "tool_def_hash", _fake_tool_def_hash, raising=False)
     monkeypatch.setattr(conn_mod, "set_tool_enabled", _fake_set_tool_enabled, raising=False)
     monkeypatch.setattr(conn_mod, "set_tool_hash", _fake_set_tool_hash, raising=False)
     monkeypatch.setattr(conn_mod, "set_server_meta", _fake_set_server_meta, raising=False)
+    monkeypatch.setattr(conn_mod, "set_transport", _fake_set_transport, raising=False)
 
     _FakeCM.instances = []
     from systemu.runtime.governor import Governor
@@ -350,6 +357,17 @@ class TestProvisionMcp:
         assert all(len(e) == 6 for e in rec["enabled"])  # (server,name,en,desc,schema,annotations)
         # server meta persisted with transport + connected flag (connected REQUIRED)
         assert rec["server_meta"] == [("github", "GitHub", "stdio", True)]
+        # v0.9.34 Bug 8: the transport (reconnect) spec is persisted so the
+        # stateless call path reconnects with real stdio command/args — and it is
+        # SECRET-FREE (env-var NAMES only, never resolved values on disk).
+        assert rec["transport"], "transport spec was not persisted (Bug 8)"
+        tserver, tspec = rec["transport"][-1]
+        assert tserver == "github"
+        assert tspec["transport"] == "stdio"
+        assert tspec["command"] == "uvx"
+        assert tspec["args"] == ["mcp-server-github"]
+        assert tspec["env_keys"] == ["GITHUB_TOKEN"]
+        assert "env" not in tspec  # resolved secret values never persisted
         # the lease is registered + queryable
         assert gov.get_lease(out["lease_id"]) is not None
 
@@ -428,6 +446,77 @@ class TestProvisionMcp:
                                 input_schema=SCHEMA)
         assert conn.check_and_pin_hash(vault, "echosrv", "echo", current) is True
         assert conn.get_enabled_meta(vault, "echosrv", "echo") is not None
+
+    def test_provision_persists_transport_spec_secret_free(self, tmp_path, monkeypatch):
+        """Bug 8: after a successful connect, _provision_mcp persists the full
+        transport spec so the stateless call path (transport_for) reconnects with
+        the real stdio command/args instead of the http://<server_id> fallback —
+        AND persists env-var NAMES only, never resolved secret VALUES (the store
+        is plaintext on disk)."""
+        import systemu.runtime.mcp.sdk.manager as mgr_mod
+        from systemu.runtime.governor import Governor
+        from systemu.runtime.mcp import connections as conn
+
+        monkeypatch.setenv("MY_MCP_TOKEN", "super-secret-value")
+
+        class _CM:
+            def __init__(self, *a, **k):
+                pass
+
+            def connect_and_discover_sync(self, server_id, spec, **kw):
+                return {"connected": True, "oauth_required": False,
+                        "authorize_url": None, "error": None,
+                        "tools": [{"name": "echo", "description": "d",
+                                   "parameters_schema": {"type": "object"},
+                                   "annotations": {"readOnlyHint": True}}]}
+
+        monkeypatch.setattr(mgr_mod, "ConnectionManager", _CM, raising=False)
+
+        class _Vault:
+            root = tmp_path
+
+        vault = _Vault()
+        req = HarnessRequest(
+            kind=HarnessKind.MCP,
+            spec={"server_id": "lookup", "transport": "stdio", "command": "uvx",
+                  "args": ["mcp-server-lookup"], "env_keys": ["MY_MCP_TOKEN"],
+                  "label": "Lookup"},
+        )
+        gov = Governor(config=None)
+        out = gov.materialise(req, _grant_verdict(req), vault=vault, config=None,
+                              execution_id="exec_tr")
+        assert out["materialised"] is True
+
+        # transport_for returns the REAL stdio recipe (NOT the http fallback).
+        spec = conn.transport_for(vault, "lookup")
+        assert spec["transport"] == "stdio"
+        assert spec["command"] == "uvx"
+        assert spec["args"] == ["mcp-server-lookup"]
+        assert spec.get("env_keys") == ["MY_MCP_TOKEN"]
+        # the resolved SECRET VALUE must never be written to disk.
+        raw = (tmp_path / "connections" / "mcp.json").read_text(encoding="utf-8")
+        assert "super-secret-value" not in raw
+
+    def test_resolve_transport_resolves_env_keys_at_call_time(self, tmp_path, monkeypatch):
+        """Bug 8 (reconnect half): the persisted spec carries env-var NAMES;
+        client._resolve_transport resolves them to current values into ``env`` at
+        call time, and consumes ``env_keys`` (not forwarded to the SDK)."""
+        from systemu.runtime.mcp import connections as conn
+        from systemu.runtime.mcp.client import _resolve_transport
+
+        monkeypatch.setenv("MY_MCP_TOKEN", "live-value")
+
+        class _Vault:
+            root = tmp_path
+
+        vault = _Vault()
+        conn.set_transport(vault, "lookup", {
+            "transport": "stdio", "command": "uvx", "args": ["x"],
+            "env_keys": ["MY_MCP_TOKEN"]})
+        spec = _resolve_transport("lookup", vault)
+        assert spec["transport"] == "stdio"
+        assert spec["env"]["MY_MCP_TOKEN"] == "live-value"
+        assert "env_keys" not in spec  # consumed, not forwarded to the SDK
 
     def test_tool_filter_limits_enabled_tools(self, _mcp_governor):
         gov, rec = _mcp_governor
@@ -687,7 +776,7 @@ class TestMcpLeaseRevoke:
 #  Golden suspend→resolve→resume (reuse tests/test_harness_grant_reconciler.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-from tests.test_harness_grant_reconciler import (  # reuse the golden fixtures
+from test_harness_grant_reconciler import (  # reuse the golden fixtures
     _make_vault,
     _seed_snapshot,
     _post_resolve_harness_gate,
