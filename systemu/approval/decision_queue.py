@@ -261,8 +261,19 @@ class OperatorDecisionQueue:
             raise KeyError(f"OperatorDecision {decision_id} not found: {exc}")
         # v0.8.19 (R3): structured-question answers are JSON, not an option label —
         # skip the membership check for that kind; plain decisions stay strict.
-        _structured = (decision.context or {}).get("kind") == "structured_question"
-        if not _structured and choice not in decision.options:
+        # v0.9.35 (P1): an elicitation FORM gate (carries a non-empty
+        # requested_schema in its context) likewise resolves with a JSON form
+        # answer (build_elicitation_answer output) rather than an option label —
+        # so accept a non-option choice for it too. A free-text ASK_OPERATOR /
+        # INPUT gate (harness_kind == "input") similarly carries the operator's
+        # answer as the choice, which need not be one of the fixed option labels.
+        # The safe-default option (Decline) still passes the strict path below.
+        _ctx = decision.context or {}
+        _structured = _ctx.get("kind") == "structured_question"
+        _elicitation_form = bool(_ctx.get("requested_schema"))
+        _input_gate = str(_ctx.get("harness_kind") or "").lower() == "input"
+        if (not (_structured or _elicitation_form or _input_gate)
+                and choice not in decision.options):
             raise ValueError(
                 f"choice {choice!r} not in options {decision.options!r} "
                 f"for decision {decision_id}"

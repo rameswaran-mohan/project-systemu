@@ -515,12 +515,17 @@ def request_credential(req, *, resolver=None) -> Optional[str]:
                                    options=actions, credential_key=req.key)
 
 
-def request_choice(questions, *, dedup_key, extra_context=None) -> Optional[dict]:
+def request_choice(questions, *, dedup_key, extra_context=None,
+                   requested_schema=None) -> Optional[dict]:
     """v0.8.19 — ask the operator a structured question (multi-option + free-text).
 
     questions: [{id, prompt, multi: bool, options: [{label, desc}], allow_free_text: bool}]
     Returns the answer dict {qid: value} once resolved; None when no queue is available
     (caller proceeds with a default). Raises PendingChoiceRequest while awaiting an answer.
+
+    v0.9.35 (P1): when ``requested_schema`` (MCP elicitation form mode) is
+    supplied, it is stamped into the posted context so render_decision_card
+    renders a single multi-field form. Absent ⇒ unchanged structured_question.
     """
     import json
     queue = _get_decision_queue()
@@ -538,17 +543,20 @@ def request_choice(questions, *, dedup_key, extra_context=None) -> Optional[dict
         labels = labels + ["Other"]
     if not labels:
         labels = ["Submit"]   # post() requires non-empty options
+    _context = _v0822_merge_chat_id({
+        "kind": "structured_question",
+        "questions": questions,
+        # v0.8.22.1 (R4): resume coordinates so the daemon re-dispatch handler
+        # can recover execution_id / activity_id / objective_id on resolve.
+        **(extra_context or {}),
+    })
+    if isinstance(requested_schema, dict) and requested_schema.get("properties"):
+        _context["requested_schema"] = requested_schema
     decision_id = queue.post(
         title=(q0.get("prompt") or "Input needed")[:80],
         body="Answer to continue.",
         options=labels,
-        context=_v0822_merge_chat_id({
-            "kind": "structured_question",
-            "questions": questions,
-            # v0.8.22.1 (R4): resume coordinates so the daemon re-dispatch handler
-            # can recover execution_id / activity_id / objective_id on resolve.
-            **(extra_context or {}),
-        }),
+        context=_context,
         dedup_key=dedup_key,
     )
     from systemu.approval.exceptions import PendingChoiceRequest

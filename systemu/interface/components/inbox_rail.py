@@ -6,8 +6,8 @@ NiceGUI wrapper (``build_inbox_rail_section``) is a thin shell that follows
 the SAME liveness contract (``safe_timer`` refresh, unsubscribe on
 disconnect).
 
-This component is deliberately NOT wired into the persistent IA shell /
-``dashboard._build_layout`` — that integration lands in Phase 4. It renders
+It is wired into the persistent IA shell (``dashboard.render_right_rail`` →
+``right_rail.build_inbox_rail_section``). It renders
 ``InboxQueue(vault).list_descriptors()`` as glance rows (risk badge + title +
 a quick Approve button) so the operator can clear low-friction gates without
 leaving the current page.
@@ -17,15 +17,17 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 
-# v0.9.32 (D.4 review FIX-3): gate types whose affirmative option is DANGEROUS
-# and must NEVER be a one-click rail quick-approve. A command gate's last option
-# is "Always allow" — letting one rail click pick it (with no Deny offered) would
-# permanently allow a destructive command, AND the rail's resolve path
-# (resolve_gate) NOOPs for command gates so it would not even persist. These are
-# render-only in the rail: the card shows, but the operator resolves the full
-# three-way choice (Deny / Approve once / Always allow) via the /insights Inbox,
-# which routes through decision_dispatcher.dispatch -> command_gate_handler.
-_RAIL_RENDER_ONLY_DEDUP_PREFIXES = ("command:",)
+# v0.9.32 (D.4 review FIX-3) + v0.9.34 (P0 review HIGH-2): gate types whose
+# affirmative option is DANGEROUS and must NEVER be a one-click rail quick-approve.
+# A command gate's last option is "Always allow"; an MCP gate's is also "Always
+# allow" (options: Deny / Approve once / Trust this tool for the session / Always
+# allow). Letting one rail click pick options[-1] (with no Deny offered) would
+# permanently allow a destructive command/MCP call, AND the rail's resolve path
+# (resolve_gate) NOOPs for both gate types so it would not even persist. These are
+# render-only in the rail: the card shows ("Resolve in Inbox →"), but the operator
+# resolves the full choice via the /insights Inbox, which routes through
+# decision_dispatcher.dispatch -> command_gate_handler / mcp_call_gate_handler.
+_RAIL_RENDER_ONLY_DEDUP_PREFIXES = ("command:", "mcp:")
 
 
 def _is_render_only_gate(dedup: str) -> bool:
@@ -78,8 +80,9 @@ def _approve_descriptor(dec_id: str, descriptor, *, vault) -> None:
     """
     if _is_render_only_gate(getattr(descriptor, "dedup", "") or ""):
         raise ValueError(
-            "Command gates are resolved in the /insights Inbox (Deny / Approve "
-            "once / Always allow), not via a one-click rail approve.")
+            "Command and MCP gates are resolved in the /insights Inbox "
+            "(Deny / Approve once / [Trust for session] / Always allow), not "
+            "via a one-click rail approve.")
     from systemu.interface.command.inbox import InboxQueue, resolve_gate
     queue = InboxQueue(vault)._queue
     options = list(getattr(descriptor, "options", []) or [])

@@ -7,7 +7,7 @@
 10	systemu/interface/components/pending_tools.py:inline .style(f"…") — compose a primitive
 12	systemu/interface/components/workflow_pipeline.py:inline .style(f"…") — compose a primitive
 13	systemu/interface/components/live_events_pane.py:inline .style(f"…") — compose a primitive
-14	systemu/interface/pages/insights.py:inline .style(f"…") — compose a primitive
+17	systemu/interface/pages/insights.py:inline .style(f"…") — compose a primitive
 14	systemu/interface/pages/shadow_memory_page.py:inline .style(f"…") — compose a primitive
 15	systemu/interface/pages/skills_page.py:raw hex literal — use a design token
 16	systemu/interface/components/pending_deps.py:inline .style(f"…") — compose a primitive

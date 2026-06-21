@@ -803,6 +803,7 @@ class HarnessKind(str, Enum):
     COMPUTE  = "compute"    # more iterations / think-budget / spend
     SUBAGENT = "subagent"   # spawn a helper sub-Shadow for a sub-objective
     INPUT    = "input"      # ASK_OPERATOR — request info/decision (not a capability)
+    MCP      = "mcp"        # connect to an MCP server at runtime (P3)
 
 
 class HarnessRequest(BaseModel):
@@ -811,7 +812,16 @@ class HarnessRequest(BaseModel):
 
     ``spec`` is a kind-specific payload. For ``TOOL`` it mirrors a forge spec
     (name, parameters_schema, return_schema, implementation_notes); for
-    ``INPUT`` it carries ``{"question": ..., "options": [...]}``.
+    ``INPUT`` it carries ``{"question": ..., "options": [...]}``; for ``MCP``
+    it carries an MCP-server connect spec::
+
+        {"server_id": str,           # stable id (also the connections key)
+         "transport": "stdio"|"http"|"sse",
+         "command": str, "args": [str], "env_keys": [str],   # stdio only
+         "url": str,                 # http/sse only
+         "auth": {...}|None,         # optional auth hint (URL-mode OAuth = P4)
+         "label": str,               # human-facing display name
+         "tool_filter": [str]|None}  # optional per-tool opt-in subset
     """
     request_id: str = Field(default_factory=lambda: "hreq_" + uuid.uuid4().hex[:8])
     kind:       HarnessKind

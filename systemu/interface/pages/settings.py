@@ -232,15 +232,21 @@ def build_settings_page() -> None:
         _section_header("MCP servers")
         with ui.column().classes("s-card w-full"):
             ui.label(
-                "Connect external MCP tool servers (bring-your-own URL; "
-                "OAuth-protected servers are not supported yet). Discovered "
-                "tools stay OFF until you enable them — enabled connector "
-                "tools become callable from Chat's Quick answer lane."
+                "Connect external MCP tool servers over stdio, streamable-HTTP, "
+                "or SSE. Discovered tools stay OFF until you enable them; their "
+                "definitions are pinned on discovery and re-checked on use "
+                "(a changed definition disables the tool and asks again). Enabled "
+                "tools become callable, namespaced as mcp__server__tool, behind "
+                "the action gate."
             ).classes("s-muted")
 
             from systemu.runtime.mcp.connections import (
                 add_server, all_servers, enabled_tools, is_tool_enabled,
-                remove_server, set_tool_enabled,
+                remove_server, set_tool_enabled, transport_for, get_enabled_meta,
+            )
+            from systemu.runtime.mcp.client import discover_and_pin
+            from systemu.runtime.mcp.sdk.registry_bridge import (
+                register_server_tools, unregister_server_tools, namespaced_name,
             )
             from systemu.interface.design.primitives import button as _mcp_btn
 
@@ -260,11 +266,26 @@ def build_settings_page() -> None:
                             ).props("dense")
 
                             def _toggle(e, s=server, tool=t):
+                                on = bool(getattr(e, "value", False))
                                 set_tool_enabled(
-                                    state.vault, s, tool["name"],
-                                    bool(getattr(e, "value", False)),
+                                    state.vault, s, tool["name"], on,
                                     description=tool.get("description", ""),
                                     schema=tool.get("schema") or {})
+                                if on:
+                                    # Enable wires the namespaced v2 entry so the
+                                    # tool is callable in the full loop (not just
+                                    # the quick lane), behind the action gate.
+                                    register_server_tools(state.vault, s, [{
+                                        "name": tool["name"],
+                                        "description": tool.get("description", ""),
+                                        "parameters_schema": tool.get("schema") or {},
+                                        "annotations": tool.get("annotations") or {},
+                                    }])
+                                else:
+                                    # Drop just this tool's namespaced entry.
+                                    from systemu.runtime.tool_registry_v2 import registry as _reg
+                                    _reg.unregister(namespaced_name(s, tool["name"]))
+                                    _reg.invalidate_check_fn_cache()
                                 _mcp_servers.refresh()
 
                             sw.on_value_change(_toggle)
@@ -283,16 +304,16 @@ def build_settings_page() -> None:
 
                         async def _discover(_=None, s=srv):
                             import asyncio
-                            from systemu.runtime.mcp.client import mcp_list_tools
-                            # W7.1 pattern: network off the loop; client
-                            # captured before the await for post-await UI.
+                            # v0.9.36 P2: discover_and_pin discovers AND pins the
+                            # rug-pull baseline (re-checked on use). W7.1 pattern:
+                            # network off the loop; client captured before await.
                             try:
                                 client = ui.context.client
                             except Exception:
                                 client = None
                             ui.notify(f"Discovering tools on {s}…", type="info")
                             out = await asyncio.to_thread(
-                                lambda: mcp_list_tools(server=s))
+                                lambda: discover_and_pin(state.vault, s))
                             if client is None:
                                 return
                             try:
@@ -322,17 +343,35 @@ def build_settings_page() -> None:
 
             _mcp_servers()
             with ui.row().classes("w-full items-center q-gutter-sm"):
+                mcp_transport_sel = ui.select(
+                    {"http": "Streamable HTTP", "sse": "SSE",
+                     "stdio": "stdio (local command)"},
+                    value="http",
+                ).classes("s-input").props("dense")
                 mcp_url_in = ui.input(
-                    placeholder="http://localhost:8080",
+                    placeholder="http://localhost:8080  (or: command for stdio)",
                 ).classes("s-input").style("flex: 1;")
 
                 def _add_mcp(_=None):
-                    url = (mcp_url_in.value or "").strip()
-                    if not url.startswith(("http://", "https://")):
-                        ui.notify("Enter a full http(s):// server URL.",
+                    raw = (mcp_url_in.value or "").strip()
+                    transport = mcp_transport_sel.value or "http"
+                    if not raw:
+                        ui.notify("Enter a server URL (http/sse) or command (stdio).",
                                   type="warning")
                         return
-                    add_server(state.vault, url)
+                    if transport == "stdio":
+                        parts = raw.split()
+                        spec = {"transport": "stdio", "command": parts[0],
+                                "args": parts[1:], "env": {}}
+                        server_id = f"stdio:{parts[0]}"
+                    else:
+                        if not raw.startswith(("http://", "https://")):
+                            ui.notify("Enter a full http(s):// server URL.",
+                                      type="warning")
+                            return
+                        spec = {"transport": transport, "url": raw.rstrip("/")}
+                        server_id = raw.rstrip("/")
+                    add_server(state.vault, server_id, transport=spec)
                     mcp_url_in.set_value("")
                     ui.notify("Server added — discover its tools to enable them.",
                               type="positive")
@@ -745,7 +784,8 @@ _GATE_OVERRIDE_VERDICTS = {
 }
 
 # Gate types the override grid exposes (the adapters that flow into the queue).
-_GATE_TYPES = ("scroll", "dep", "forge", "evolution", "recovery", "harness")
+_GATE_TYPES = ("scroll", "dep", "forge", "evolution", "recovery", "harness",
+               "mcp", "mcp_call", "sampling")
 
 
 def _gate_mode_card_model(settings: dict) -> dict:

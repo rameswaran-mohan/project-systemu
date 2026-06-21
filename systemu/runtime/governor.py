@@ -13,9 +13,11 @@ arbitrate(request, context) → HarnessVerdict
 
 materialise(request, verdict, *, vault, config, execution_id) → dict
     Acts **only** on ``verdict.decision == GRANT``.
-    Phase 1 implements the TOOL provisioner (forge spine) only.  All other
-    kinds (SKILL / ACCESS / COMPUTE / SUBAGENT / INPUT) return a stub
-    "not-implemented" dict and are never raised as exceptions.
+    Phase 1 implements the TOOL provisioner (forge spine) only.  Later phases
+    add SKILL / ACCESS / COMPUTE / SUBAGENT and the MCP runtime-connect
+    provisioner (P3, ``_provision_mcp`` — connect+discover → enable → lease).
+    Remaining kinds (INPUT, etc.) return a stub "not-implemented" dict and are
+    never raised as exceptions.
 
 Harness ledger
     Append-only JSONL at ``<vault_root>/harness_ledger/<execution_id>.jsonl``.
@@ -308,10 +310,13 @@ class Governor:
         """Mark all leases belonging to ``execution_id`` as revoked.
 
         Called by the execution engine at the terminal state (COMPLETE / FAIL).
-        Returns the number of leases revoked.
+        Returns the number of leases revoked. MCP leases ALSO unregister their
+        live namespaced tools from the v2 registry (dangling-capability guard) —
+        done AFTER releasing the lock, never raises.
         """
         count = 0
         revoked_lease_ids: list[str] = []
+        mcp_servers_to_unregister: list[str] = []          # P3: collect under lock
         with self._lease_lock:
             for lease in self._leases.values():
                 if lease["execution_id"] == execution_id and not lease["revoked"]:
@@ -319,6 +324,9 @@ class Governor:
                     lease["revoked_at"] = _utcnow_iso()
                     revoked_lease_ids.append(lease["lease_id"])
                     count += 1
+                    _server = lease.get("mcp_server_id")
+                    if lease.get("kind") == "mcp" and _server:
+                        mcp_servers_to_unregister.append(_server)
         if count:
             logger.info(
                 "[Governor] revoked %d lease(s) for execution_id=%s",
@@ -342,6 +350,19 @@ class Governor:
                     },
                     vault=vault,
                     execution_id=execution_id,
+                )
+
+        # P3: unregister MCP namespaced tools AFTER the lock (registry mutation).
+        for _server in mcp_servers_to_unregister:
+            try:
+                from systemu.runtime.mcp.sdk.registry_bridge import (
+                    unregister_server_tools,
+                )
+                unregister_server_tools(_server)
+            except Exception:
+                logger.debug(
+                    "[Governor] mcp unregister_server_tools failed for %s",
+                    _server, exc_info=True,
                 )
 
         return count
@@ -377,6 +398,8 @@ class Governor:
             return self._provision_compute(request, verdict, vault=vault, config=config, execution_id=execution_id)
         if request.kind == HarnessKind.SUBAGENT:
             return self._provision_subagent(request, verdict, vault=vault, config=config, execution_id=execution_id)
+        if request.kind == HarnessKind.MCP:
+            return self._provision_mcp(request, verdict, vault=vault, config=config, execution_id=execution_id)
         # Remaining kinds (INPUT, etc.) — not materialised
         return {
             "materialised": False,
@@ -786,6 +809,167 @@ class Governor:
             "lease_id": lease_id,
         }
 
+    def _provision_mcp(
+        self,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        config,
+        execution_id: str,
+    ) -> dict:
+        """MCP provisioner (P3) — connect+discover (one seam) → hash-pin +
+        persist + enable → mint lease. Forge-style: NEVER raises; every failure
+        is a ``{"materialised": False, "reason": ...}`` dict.
+
+        Reuses the PINNED P2 layer (lazy-imported — no import-time connect,
+        v0.9.33 lesson): the SINGLE seam
+        ``ConnectionManager().connect_and_discover_sync(server_id, spec)``
+        (connect + DNS/SSRF/TLS precheck + discover in one call),
+        ``schema_map.tool_def_hash`` (the ONLY def-hash) +
+        ``connections.set_tool_hash`` (rug-pull pin), and
+        ``connections.set_tool_enabled`` / ``set_server_meta``. Honours
+        ``spec["tool_filter"]`` (per-tool opt-in) and the P2 exposure budget
+        (enforced inside ``connections.set_tool_enabled``).
+
+        Returns
+        -------
+        success   {"materialised": True, "lease_id": ...,
+                   "mcp": {"server_id","label","transport",
+                           "tools": [FULL dicts {name,description,
+                                     parameters_schema,annotations}]}}
+        oauth     {"materialised": False, "reason": "oauth_pending",
+                   "authorize_url": ...}   (P4 wires the URL-mode handoff)
+        failure   {"materialised": False, "reason": ...}
+        """
+        spec = request.spec or {}
+        server_id = str(spec.get("server_id", "") or "")
+        transport = str(spec.get("transport", "") or "").lower()
+        label = str(spec.get("label", "") or server_id)
+        tool_filter = spec.get("tool_filter")
+        try:
+            import os
+            from systemu.runtime.mcp.sdk.manager import ConnectionManager
+            from systemu.runtime.mcp.sdk.schema_map import (
+                tool_def_hash, sanitize_description,
+            )
+            from systemu.runtime.mcp import connections as _connections
+
+            # Build the connect spec from the request (the seam's contract:
+            # {transport, command, args, env, url}). env_keys names the parent
+            # env vars the child may inherit — forwarded as `env` per P2.
+            connect_spec = {
+                "transport": transport,
+                "command": spec.get("command"),
+                "args": spec.get("args"),
+                # v0.9.37 (review HIGH): resolve approved env-var NAMES to their
+                # current values for the stdio child. Passing the name LIST as the
+                # env dict left credentialed stdio MCP servers unable to connect.
+                "env": {k: os.environ[k] for k in (spec.get("env_keys") or [])
+                        if k in os.environ},
+                "url": spec.get("url"),
+            }
+
+            # ── The ONE pinned seam: connect + DNS/SSRF/TLS precheck + discover.
+            # Thread the operator allowlist + TLS policy (review HIGH/MEDIUM): the
+            # runtime-connect path now actually enforces mcp_require_tls and honours
+            # allowed_mcp_hosts (an allow-listed private host can connect; a
+            # plaintext remote host is rejected).
+            cm = ConnectionManager()
+            result = cm.connect_and_discover_sync(
+                server_id, connect_spec,
+                allowed_hosts=set(getattr(self.policy, "allowed_mcp_hosts", None) or set()),
+                require_tls=bool(getattr(self.policy, "mcp_require_tls", True)),
+            ) or {}
+
+            # OAuth handoff — surfaced honestly; P4 owns the URL-mode resolve.
+            if result.get("oauth_required"):
+                return {
+                    "materialised": False,
+                    "reason": "oauth_pending",
+                    "authorize_url": result.get("authorize_url"),
+                }
+            if not result.get("connected"):
+                # DNS-resolution SSRF returns error="ssrf_blocked" here (P2).
+                return {
+                    "materialised": False,
+                    "reason": f"mcp connect failed: {result.get('error') or 'unknown'}",
+                }
+
+            # `tools` are normalised dicts {name, description,
+            # parameters_schema, annotations}. Hash-pin (rug-pull defence) +
+            # enable per filter/budget; carry the FULL dicts through (B5) so
+            # register_server_tools downstream gets schema + action tier.
+            discovered = result.get("tools") or []
+            wanted = set(tool_filter) if tool_filter else None
+            granted_tools: list = []
+            for t in discovered:
+                name = str(t.get("name") or "")
+                if not name:
+                    continue
+                if wanted is not None and name not in wanted:
+                    continue
+                # v0.9.37 (review BLOCKER+HIGH): sanitize the server-supplied
+                # description to the SAME canonical form the use-time rug-pull
+                # re-check (mcp_list_tools) uses — otherwise the pin-hash (raw)
+                # never matches the re-check (sanitized) and EVERY connected tool
+                # auto-disables on its first call. Also keeps unsanitized/poisoned
+                # descriptions out of the catalog (tool-poisoning defence).
+                desc = sanitize_description(str(t.get("description") or ""))
+                pschema = dict(t.get("parameters_schema") or {})
+                annotations = dict(t.get("annotations") or {})
+                # Pin the canonical def-hash so P2's use-time re-hash detects
+                # drift (rug-pull → fail-closed disable + re-prompt).
+                h = tool_def_hash(name=name, description=desc, input_schema=pschema)
+                _connections.set_tool_hash(vault, server_id, name, h)
+                _connections.set_tool_enabled(
+                    vault, server_id, name, True,
+                    description=desc, schema=pschema, annotations=annotations,
+                )
+                granted_tools.append({
+                    "name": name,
+                    "description": desc,
+                    "parameters_schema": pschema,
+                    "annotations": annotations,
+                })
+
+            # Persist server transport + label + connected flag (re-attach LOW).
+            _connections.set_server_meta(
+                vault, server_id, label=label, transport=transport, connected=True,
+            )
+
+        except Exception as exc:
+            logger.error(
+                "[Governor] mcp provision failed for '%s': %s",
+                server_id, exc, exc_info=True,
+            )
+            return {
+                "materialised": False,
+                "reason": f"mcp provision failed: {exc}",
+            }
+
+        lease_id: str = verdict.lease_id or _mint_lease_id()
+        self._register_lease(lease_id, request, execution_id)
+
+        logger.info(
+            "[Governor] materialised MCP server '%s' (%s) tools=%s lease_id=%s exec=%s",
+            server_id, transport, [t["name"] for t in granted_tools],
+            lease_id, execution_id,
+        )
+
+        return {
+            "materialised": True,
+            "lease_id": lease_id,
+            "mcp": {
+                "server_id": server_id,
+                "label": label,
+                "transport": transport,
+                # B5: FULL tool dicts (not bare names) so the grant-apply path
+                # can call register_server_tools(vault, server, tool_dicts).
+                "tools": granted_tools,
+            },
+        }
+
     # ── Lease registry ────────────────────────────────────────────────────────
 
     def _register_lease(
@@ -802,6 +986,12 @@ class Governor:
             "granted_at": _utcnow_iso(),
             "revoked": False,
             "revoked_at": None,
+            # P3: MCP leases carry the server_id so revoke can unregister the
+            # live namespaced tools; all other kinds leave it None.
+            "mcp_server_id": (
+                str((request.spec or {}).get("server_id", "") or "")
+                if request.kind == HarnessKind.MCP else None
+            ),
         }
         with self._lease_lock:
             self._leases[lease_id] = lease

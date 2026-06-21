@@ -604,6 +604,22 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # P4 MCP OAuth follow-up reconciler: a URL-mode OAuth handoff parks the run
+    # ASSIGNED until the operator finishes out-of-band. This poll picks up the
+    # resolved follow-up gate and calls Supervisor.resume_after_grant. Idempotent
+    # via its OWN persisted flag (decision.context["mcp_oauth_dispatched"]) — it
+    # NEVER stamps harness_grant_dispatched, so the original escalation can still
+    # complete on its own gate.
+    from systemu.scheduler.jobs import _mcp_oauth_reconciler_job
+    scheduler.add_job(
+        _mcp_oauth_reconciler_job,
+        trigger="interval",
+        seconds=15,
+        id="mcp_oauth_reconciler",
+        name="MCP OAuth Follow-up Reconciler",
+        replace_existing=True,
+    )
+
     scheduler.start()
 
     # One-shot recovery sweep — fires 5 seconds after startup to heal any

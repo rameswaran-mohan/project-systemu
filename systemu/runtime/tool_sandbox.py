@@ -464,6 +464,14 @@ class ToolSandbox:
             or str(self.vault_root / "output")
         params = _normalize_output_paths(name, params, _od)
 
+        # v0.9.34 (P0 HIGH-1 follow-up): PendingOperatorDecision must be IN SCOPE
+        # here. It is imported locally inside execute_tool / _maybe_gate_command,
+        # NOT at module level — so without this import, evaluating the
+        # `except PendingOperatorDecision:` clause below on ANY handler exception
+        # throws NameError, which the outer `except Exception` then catches and
+        # diverts the call to the v1 path ("not found"). Import before the try.
+        from systemu.approval.exceptions import PendingOperatorDecision
+
         # ── v2 registry (code-registered tools) ──────────────────────────
         try:
             from systemu.runtime.tool_registry_v2 import registry as _v2_registry
@@ -487,6 +495,15 @@ class ToolSandbox:
                         result = await loop.run_in_executor(
                             None, lambda: entry.handler(**_eff_params)
                         )
+                except PendingOperatorDecision:
+                    # v0.9.34 (P0 review HIGH-1): an action/destructive MCP tool
+                    # (or any v2 handler) may raise PendingOperatorDecision via
+                    # the gated chokepoint. It MUST propagate to the decision-
+                    # queue resume handlers (worker/supervisor/scheduler park +
+                    # resume) — EXACTLY as the v1 execute_tool path does. Swallowing
+                    # it into a failure dict would orphan the Inbox decision and
+                    # silently continue the run with a denied tool (no park/resume).
+                    raise
                 except Exception as exc:
                     # Capability ledger: record failure too (best-effort).
                     try:
@@ -511,6 +528,13 @@ class ToolSandbox:
                 if isinstance(result, dict):
                     return result
                 return {"success": True, "value": result}
+        except PendingOperatorDecision:
+            # v0.9.34 (P0 HIGH-1): the inner handler re-raises a parked decision;
+            # this OUTER try must let it propagate too (PendingOperatorDecision IS
+            # an Exception, so the blanket `except Exception` below would otherwise
+            # re-catch it and divert the parked call to the v1 path). Re-raise so
+            # the worker/supervisor/scheduler park+resume handlers receive it.
+            raise
         except Exception as exc:
             logger.debug(
                 "[ToolSandbox] v2 dispatch raised, falling back to v1 for %s: %s",

@@ -114,20 +114,41 @@ def stub_server():
 
 
 class TestDiscovery:
-    def test_list_tools_normalizes(self, stub_server):
+    # v0.9.36 P2: discovery now speaks the MCP wire protocol via the SDK-isolated
+    # ConnectionManager (the legacy REST /tools/list stub no longer applies).
+    # These drive the manager directly; the wire-level round-trip is covered by
+    # the hermetic reference server in tests/test_v0936_mcp_client.py.
+    def test_list_tools_normalizes(self, monkeypatch):
+        from systemu.runtime.mcp.sdk import manager as _m
         from systemu.runtime.mcp.client import mcp_list_tools
-        out = mcp_list_tools(server=stub_server, timeout=10)
+
+        async def fake_list(self, server, spec):
+            return [{
+                "name": "lookup_invoice",
+                "description": "Find an invoice",
+                "parameters_schema": {"type": "object",
+                                      "properties": {"number": {"type": "string"}},
+                                      "required": []},
+                "annotations": {},
+            }]
+        monkeypatch.setattr(_m.ConnectionManager, "list_tools", fake_list)
+        out = mcp_list_tools(server="http://stub", timeout=10)
         assert out["success"] is True
-        assert out["tools"] == [{
-            "name": "lookup_invoice", "description": "Find an invoice",
-            "schema": {"type": "object",
-                       "properties": {"number": {"type": "string"}}},
-        }]
+        assert len(out["tools"]) == 1
+        tool = out["tools"][0]
+        assert tool["name"] == "lookup_invoice"
+        # description is now sanitised (untrusted-labelled) before it surfaces
+        assert tool["description"].startswith("[untrusted MCP tool description]")
+        assert "Find an invoice" in tool["description"]
+        assert tool["schema"]["properties"]["number"] == {"type": "string"}
 
     def test_list_tools_unreachable_is_honest(self):
         from systemu.runtime.mcp.client import mcp_list_tools
         out = mcp_list_tools(server="http://127.0.0.1:1", timeout=2)
-        assert out["success"] is False and out["error"]
+        # A real connection failure surfaces as an empty discovery (the manager
+        # logs + returns []), so honesty here = no fabricated tools.
+        assert out["success"] is True
+        assert out["tools"] == []
 
 
 class TestQuickLaneInclusion:
@@ -142,13 +163,28 @@ class TestQuickLaneInclusion:
         llm.calls = calls
         return llm
 
-    def test_enabled_mcp_tool_in_index_and_dispatches(self, vault, stub_server):
+    def test_enabled_mcp_tool_in_index_and_dispatches(self, vault, monkeypatch):
         from systemu.runtime.mcp import connections as cx
+        from systemu.runtime.mcp.sdk import manager as _m
         from systemu.pipelines.quick_task import run_quick_task
-        cx.add_server(vault, stub_server)
-        cx.set_tool_enabled(vault, stub_server, "lookup_invoice", True,
+        server = "http://stub"
+        cx.add_server(vault, server)
+        # v0.9.34: MCP action calls are gated; a read-only tool (readOnlyHint)
+        # is Tier R → ungated, so this lookup dispatches directly as before.
+        cx.set_tool_enabled(vault, server, "lookup_invoice", True,
                             description="Find an invoice",
-                            schema={"type": "object"})
+                            schema={"type": "object"},
+                            annotations={"readOnlyHint": True})
+
+        # v0.9.36 P2: the call now routes through the SDK-isolated manager
+        # (httpx REST stub dropped). Mock the manager's transport-level call_tool
+        # to return the same PAID payload the legacy stub produced.
+        async def fake_call(self, srv, spec, name, arguments=None):
+            return {"success": True,
+                    "response": {"invoice": (arguments or {}).get("number", ""),
+                                 "status": "PAID"}}
+        monkeypatch.setattr(_m.ConnectionManager, "call_tool", fake_call)
+
         llm = self._llm([
             {"action": "TOOL_CALL", "tool": "lookup_invoice",
              "params": {"number": "INV-42"}},
@@ -156,7 +192,7 @@ class TestQuickLaneInclusion:
         ])
         res = run_quick_task("find invoice 42", None, vault, llm_json=llm)
         assert res.status == "success" and res.tool_calls == 1
-        # The index advertised the connector; the REAL stub response reached
+        # The index advertised the connector; the REAL connector response reached
         # the second turn (anti-no-op for connectors).
         assert "lookup_invoice" in llm.calls["payloads"][0]
         assert "PAID" in llm.calls["payloads"][1]
@@ -193,8 +229,11 @@ class TestQuickLaneInclusion:
         from systemu.runtime.mcp import connections as cx
         import systemu.runtime.mcp.client as client
         from systemu.pipelines.quick_task import run_quick_task
+        # v0.9.34: read-only (Tier R) so the gate doesn't intercept; this test
+        # is about empty-response-is-failure, not the approval gate.
         cx.set_tool_enabled(vault, "http://x", "ghost_tool", True,
-                            description="", schema={})
+                            description="", schema={},
+                            annotations={"readOnlyHint": True})
         monkeypatch.setattr(client, "mcp_call_tool",
                             lambda **k: {"success": True, "response": {}})
         llm = self._llm([

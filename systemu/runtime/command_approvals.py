@@ -77,6 +77,33 @@ def command_signature(command: str, *, cwd: str = "") -> str:
     return hashlib.sha1(raw).hexdigest()
 
 
+def mcp_signature(server: str, tool: str) -> str:
+    """Always-allow signature for an MCP (server, tool) pair.
+
+    The server is whitespace-stripped and trailing-slash-normalized (matching
+    connections._path / is_tool_enabled normalization) so a cosmetic trailing
+    "/" does not invalidate a persisted Always-allow. EXACT-match: a different
+    server or tool never collides.
+    """
+    norm_server = (server or "").strip().rstrip("/")
+    norm_tool = (tool or "").strip()
+    raw = f"mcp\x00{norm_server}\x00{norm_tool}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def mcp_session_key(server: str, tool: str, session_id: str) -> str:
+    """Session-scoped trust key for an MCP (server, tool) within ONE run.
+
+    session_id is part of the hash, so a trust grant CANNOT leak across runs:
+    a new run has a new session_id → a fresh, untrusted key.
+    """
+    norm_server = (server or "").strip().rstrip("/")
+    norm_tool = (tool or "").strip()
+    norm_sess = (session_id or "").strip()
+    raw = f"mcp-session\x00{norm_server}\x00{norm_tool}\x00{norm_sess}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
 class CommandApprovalStore:
     """Persistent allow-list of operator-approved command signatures.
 
@@ -102,6 +129,50 @@ class CommandApprovalStore:
         with self._lock:
             self._data = self._load()
             return sig in self._data.get("approved", {})
+
+    def is_session_trusted(self, session_key: str) -> bool:
+        """Return True iff this exact session-trust key is on record.
+
+        Re-reads the file on every check (same out-of-process freshness
+        contract as is_approved) so a dashboard-side "Trust for session"
+        click is seen by the daemon without a restart.
+        """
+        with self._lock:
+            self._data = self._load()
+            return session_key in self._data.get("session_trusted", {})
+
+    def trust_session(
+        self,
+        session_key: str,
+        *,
+        server: str = "",
+        tool: str = "",
+        session_id: str = "",
+        approved_by: str = "operator",
+    ) -> bool:
+        """Record session-scoped trust for an MCP (server, tool, session).
+
+        Returns True when newly trusted. Idempotent: re-trusting an existing
+        key returns False and leaves the record untouched.
+        """
+        newly = False
+        with self._lock:
+            self._data = self._load()
+            trusted: Dict[str, Any] = self._data.setdefault("session_trusted", {})
+            if session_key not in trusted:
+                trusted[session_key] = {
+                    "trusted_at": _now_iso(),
+                    "trusted_by": approved_by,
+                    "server":     server,
+                    "tool":       tool,
+                    "session_id": session_id,
+                }
+                self._save()
+                newly = True
+        if newly:
+            logger.info("[CommandApprovals] session-trusted %s (%s:%s, run %s)",
+                        session_key, server, tool, session_id)
+        return newly
 
     def approve(
         self,
@@ -206,17 +277,18 @@ class CommandApprovalStore:
 
     def _load(self) -> Dict[str, Any]:
         if not self.path.exists():
-            return {"version": 1, "approved": {}, "pending": {}}
+            return {"version": 1, "approved": {}, "pending": {}, "session_trusted": {}}
         try:
             raw = self.path.read_text(encoding="utf-8")
             if not raw.strip():
-                return {"version": 1, "approved": {}, "pending": {}}
+                return {"version": 1, "approved": {}, "pending": {}, "session_trusted": {}}
             data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError("approval file is not a JSON object")
             data.setdefault("version",  1)
             data.setdefault("approved", {})
             data.setdefault("pending",  {})
+            data.setdefault("session_trusted", {})
             return data
         except Exception:
             logger.exception(
@@ -224,7 +296,7 @@ class CommandApprovalStore:
                 "The bad file is left in place for operator inspection.",
                 self.path,
             )
-            return {"version": 1, "approved": {}, "pending": {}}
+            return {"version": 1, "approved": {}, "pending": {}, "session_trusted": {}}
 
     def _save(self) -> None:
         try:

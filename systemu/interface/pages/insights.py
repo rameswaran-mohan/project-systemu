@@ -70,6 +70,16 @@ def build_structured_answer(questions: list, values: dict) -> str:
     return json.dumps({q["id"]: values.get(q["id"]) for q in (questions or [])})
 
 
+def build_elicitation_answer(schema: dict, values: dict) -> str:
+    """v0.9.35 (P1) — serialize an elicitation form's per-field values to the
+    JSON stored as the decision choice. Only fields declared in the schema's
+    properties are emitted (secret fields never enter this dict). The reconciler
+    type-coerces these strings via elicitation.param_answers_from_choice."""
+    import json
+    props = (schema or {}).get("properties") or {}
+    return json.dumps({name: (values or {}).get(name) for name in props})
+
+
 def build_insights_page(default_tab: str = "memory") -> None:
     """Render the Insights page with three tabs (Memory / Flywheel / Events).
 
@@ -240,6 +250,93 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                 except Exception as exc:
                     ui.notify(f"Failed to resolve: {exc}", type="negative")
             return _click
+
+        # v0.9.35 (P1): elicitation form — ONE card, ALL fields, typed widgets,
+        # defaults pre-filled, client-side validation, secret fields → URL mode.
+        # Keyed on a non-empty requested_schema so non-INPUT gates are untouched.
+        _ctx = card.get("context") or {}
+        _req_schema = _ctx.get("requested_schema") or {}
+        if isinstance(_req_schema, dict) and (_req_schema.get("properties")):
+            from systemu.runtime.elicitation import is_secret_field
+            _props = _req_schema.get("properties") or {}
+            _required = _req_schema.get("required") or []
+            _widgets: dict = {}
+            ui.label(card.get("title") or "Input needed").style(
+                f"font-weight: 700; color: {THEME['text']}; margin-bottom: 6px;"
+            )
+            if card.get("body"):
+                ui.label(card["body"]).style(
+                    f"font-size: 13px; color: {THEME['text_muted']}; margin-bottom: 8px;"
+                )
+            for _name, _spec in _props.items():
+                _field = {"name": _name, **(_spec if isinstance(_spec, dict) else {})}
+                _ftype = (_spec or {}).get("type", "string")
+                _desc = (_spec or {}).get("description", "") or _name
+                _default = (_spec or {}).get("default")
+                ui.label(f"{_name} — {_desc}").style(
+                    f"font-size: 13px; color: {THEME['text']}; margin-top: 8px;"
+                )
+                if is_secret_field(_field):
+                    # Secret → URL mode: never a typed input, never in the form/log.
+                    ui.label(
+                        "🔒 This is a credential. Provide it out-of-band "
+                        "(it is never typed here, sent to the model, or logged)."
+                    ).style(f"font-size: 12px; color: {THEME['text_muted']};")
+                    continue
+                _enum = (_spec or {}).get("enum")
+                if isinstance(_enum, list) and _enum:
+                    _w = ui.select(list(_enum),
+                                   value=_default if _default in _enum else None
+                                   ).style("min-width: 220px;")
+                elif _ftype == "boolean":
+                    _w = ui.radio(["Yes", "No"],
+                                  value=("Yes" if _default else "No")
+                                  if _default is not None else None).props("inline")
+                else:
+                    _w = ui.input(_name, value=("" if _default is None else str(_default))
+                                  ).style("min-width: 220px;")
+                _widgets[_name] = (_ftype, _w)
+
+            def _submit_form(_e=None, did=card["id"], the_queue=queue,
+                             schema=_req_schema, widgets=_widgets, required=_required):
+                try:
+                    vals: dict = {}
+                    for _n, (_t, _wg) in widgets.items():
+                        _v = getattr(_wg, "value", None)
+                        if _t == "boolean":
+                            _v = (_v == "Yes") if _v in ("Yes", "No") else None
+                        vals[_n] = _v
+                    # Client-side required check (secrets excluded from widgets).
+                    _missing = [r for r in required
+                                if r in widgets and (vals.get(r) in (None, ""))]
+                    if _missing:
+                        ui.notify("Fill all required fields: " + ", ".join(_missing),
+                                  type="warning")
+                        return
+                    the_queue.resolve(did, choice=build_elicitation_answer(schema, vals))
+                    ui.notify("Submitted", type="positive")
+                    on_resolved()
+                except Exception as exc:
+                    ui.notify(f"Failed: {exc}", type="negative")
+
+            with ui.row().style("gap: 8px; margin-top: 12px;"):
+                ui.button("Submit", on_click=_submit_form).style(
+                    f"background: {THEME['primary']}; color: white; border-radius: 6px; "
+                    f"padding: 6px 14px; font-size: 13px;"
+                )
+                # Decline = safe default → resolve with the gate's safe_default
+                # ("Deny") so _apply_harness_grant emits harness_grant_failed.
+                ui.button(
+                    "Decline",
+                    on_click=_make_handler(card["id"], card["dedup_key"],
+                                           card["options"][0] if card["options"] else "Deny",
+                                           queue),
+                ).style(
+                    f"background: {THEME['surface2']}; color: {THEME['text']}; "
+                    f"border: 1px solid {THEME['border']}; border-radius: 6px; "
+                    f"padding: 6px 14px; font-size: 13px;"
+                )
+            return  # elicitation branch handled — skip flat option buttons
 
         # v0.8.19 (R3): structured ask-user cards render option pickers + free
         # text + a single Submit that serializes answers to JSON and resolves

@@ -39,6 +39,10 @@ class GateDescriptor(BaseModel):
     # resolve branch can authorize the action against the real entity — without
     # it, dep approve_and_install always got tool_id="" (see from_dep).
     tool_id:           str = ""
+    # v0.9.35 (P1): MCP form-mode schema for an INPUT/elicitation gate. Empty
+    # for every non-elicitation gate (back-compat). Carried so the operator
+    # card can render a multi-field form and the reconciler can type-coerce.
+    requested_schema:  dict = Field(default_factory=dict)
     model_config = {"extra": "forbid"}
 
     def to_decision_context(self, *, gate_type: str) -> dict:
@@ -96,11 +100,15 @@ class GateDescriptor(BaseModel):
 
         Subsumes ``harness_review.surface_harness_request``: same options,
         same safe-default ("Deny"), same dedup-key format, same field access.
+        v0.9.35: an INPUT request may carry a ``requested_schema`` in its spec
+        (elicitation form mode) — surfaced so the card renders a multi-field form.
         """
         kind_val = getattr(request.kind, "value", str(request.kind))
         risk = getattr(verdict.risk_band, "value", str(verdict.risk_band))
         req_id = getattr(request, "request_id", "") or ""
         options = list(_HARNESS_OPTIONS)
+        _spec = getattr(request, "spec", {}) or {}
+        _req_schema = _spec.get("requested_schema") or {}
         return cls(
             title=f"Harness request: {kind_val} [{req_id}]",
             risk=risk,
@@ -109,6 +117,24 @@ class GateDescriptor(BaseModel):
             safe_default=options[0],
             what_approve_does=f"Grants the {kind_val} capability the agent requested.",
             dedup=f"harness:{execution_id}:{req_id}",
+            requested_schema=_req_schema if isinstance(_req_schema, dict) else {},
+        )
+
+    @classmethod
+    def from_oauth_url(cls, *, server_id, authorize_url, execution_id):
+        """A URL-mode OAuth handoff card (P4). Safe-default Deny; dedup per
+        (execution_id, server_id) so repeated surfacing returns the same card.
+        Uses ONLY the fixed GateDescriptor fields (extra=forbid) — gate_type is an
+        InboxQueue.enqueue() arg, NOT a descriptor field. The operator clicks
+        `inspect` (the authorize URL) to complete consent out-of-band."""
+        return cls(
+            title=f"Authorize MCP server: {server_id}",
+            risk="high",
+            inspect=authorize_url,
+            options=["Deny", "Approve"],
+            safe_default="Deny",
+            what_approve_does="Authorizes the MCP server out-of-band.",
+            dedup=f"mcp_oauth:{execution_id}:{server_id}",
         )
 
     @classmethod
@@ -166,6 +192,41 @@ class GateDescriptor(BaseModel):
                                + (f" in {cwd}" if cwd else "")
                                + ". 'Always allow' remembers this exact command."),
             dedup=f"command:{sig}",
+        )
+
+    @classmethod
+    def from_mcp_call(cls, *, server: str, tool: str, params: dict,
+                      destructive: bool = True) -> "GateDescriptor":
+        """Build a GateDescriptor for an MCP tool call (v0.9.34 P0, §3.3 L3).
+
+        Risk-tiered + scoped-trust. The card offers the four choices the
+        action gate routes on: Deny / Approve once / Trust this tool for the
+        session / Always allow. safe_default is "Deny" (index 0 — fail-closed).
+        ``destructive`` raises the risk band to high and labels the card; the
+        dedup key is mcp:<server>:<tool> so the dispatcher namespace 'mcp'
+        routes the resolution and re-attempts collapse to one row."""
+        from systemu.runtime.command_approvals import mcp_signature  # noqa: F401
+        options = ["Deny", "Approve once",
+                   "Trust this tool for the session", "Always allow"]
+        try:
+            import json as _json
+            args_preview = _json.dumps(params or {}, default=str)[:300]
+        except Exception:
+            args_preview = str(params)[:300]
+        inspect = f"server: {server}\ntool: {tool}\nargs: {args_preview}"
+        verb = "a DESTRUCTIVE/irreversible" if destructive else "an"
+        return cls(
+            title=f"MCP tool call: {tool}",
+            risk="high" if destructive else "medium",
+            inspect=inspect,
+            options=options,
+            safe_default=options[0],
+            what_approve_does=(
+                f"Calls {verb} MCP tool {tool!r} on {server}. "
+                "'Trust this tool for the session' suppresses re-prompts for "
+                "this exact (server, tool) until the run ends; 'Always allow' "
+                "remembers it across runs."),
+            dedup=f"mcp:{server}:{tool}",
         )
 
     @classmethod
