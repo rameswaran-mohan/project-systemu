@@ -167,6 +167,8 @@ def _map_grant_payload(harness_kind: str, materialise: dict) -> dict:
       * SKILL    → reads ``skill`` / ``lease_id``
       * ACCESS   → reads ``access`` (advisory lease; no sandbox patch — D.2)
       * SUBAGENT → reads ``subagent``
+      * MCP      → reads ``mcp`` (server block) / ``lease_id``; oauth_pending
+                   forwards ``reason`` + ``authorize_url``
       * INPUT    → reads ``operator_answer`` (handled by the caller, not here)
 
     ``kind`` + ``granted`` are carried through for the helper's kind dispatch.
@@ -196,6 +198,17 @@ def _map_grant_payload(harness_kind: str, materialise: dict) -> dict:
     elif kind == "subagent":
         payload["subagent"] = materialise.get("subagent")
         payload["lease_id"] = materialise.get("lease_id")
+    elif kind == "mcp":
+        # P3: carry the discovered-server block (or the oauth_pending handoff)
+        # the resumed run replays into the live registry via registry_bridge.
+        if materialise.get("mcp"):
+            payload["mcp"] = materialise.get("mcp")
+            payload["lease_id"] = materialise.get("lease_id")
+        else:
+            # not materialised (e.g. oauth_pending) — forward the honest reason
+            # so the resumed run narrates the handoff rather than a phantom grant.
+            payload["reason"] = materialise.get("reason")
+            payload["authorize_url"] = materialise.get("authorize_url")
     # else: unknown/unmaterialised capability — kind+granted only; the helper
     # narrates generically via its no-key branch.
     return payload
@@ -286,6 +299,11 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
         # Cheap filters before any work.
         if dctx.get("kind") != "gate" or dctx.get("gate_type") != "harness":
             continue
+        # P4: an mcp_oauth URL-mode follow-up is NOT a terminal harness grant —
+        # it must never be materialised here nor stamp harness_grant_dispatched,
+        # so the ORIGINAL escalation can still complete on its own gate.
+        if dctx.get("follow_up") == "mcp_oauth":
+            continue
         if dctx.get("harness_grant_dispatched"):
             continue
         execution_id = dctx.get("execution_id")
@@ -309,16 +327,40 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
                     ),
                 }
             elif harness_kind == "input":
-                # ASK_OPERATOR — the operator's answer is the choice itself
-                # (or an explicit answer field), not a materialised capability.
-                grant_payload = {
-                    "kind": "input",
-                    "operator_answer": (
-                        dctx.get("operator_answer")
-                        or decision.choice
-                        or ""
-                    ),
-                }
+                # ASK_OPERATOR / elicitation — the operator's answer is the choice
+                # itself, not a materialised capability.
+                _req_schema = dctx.get("requested_schema") or {}
+                _pending = dctx.get("pending_tool") or {}
+                if _req_schema and _pending:
+                    # v0.9.35 (P1): structured elicitation. The choice is the
+                    # form JSON; type-coerce per the schema into param_answers,
+                    # carry the pending tool call so _apply_harness_grant can
+                    # merge + re-dispatch (which re-validates).
+                    import json as _json
+                    from systemu.runtime.elicitation import param_answers_from_choice
+                    try:
+                        _raw = _json.loads(decision.choice or "{}")
+                        if not isinstance(_raw, dict):
+                            _raw = {}
+                    except Exception:
+                        _raw = {}
+                    # A "Deny"/safe-default choice is not JSON → empty answers →
+                    # the apply branch fails closed (harness_grant_failed).
+                    grant_payload = {
+                        "kind": "input",
+                        "param_answers": param_answers_from_choice(_req_schema, _raw),
+                        "pending_tool": _pending,
+                        "requested_schema": _req_schema,
+                    }
+                else:
+                    grant_payload = {
+                        "kind": "input",
+                        "operator_answer": (
+                            dctx.get("operator_answer")
+                            or decision.choice
+                            or ""
+                        ),
+                    }
             else:
                 # Approve / Edit spec → materialise the capability ONCE.
                 request = HarnessRequest(
@@ -369,6 +411,139 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
             dispatched,
         )
     return dispatched
+
+
+# P4 OAuth-pending timeout: a URL-mode handoff the operator never completes is
+# abandoned after this many seconds (clean timeout ⇒ harness_grant_failed).
+MCP_OAUTH_PENDING_TIMEOUT_SECONDS = int(
+    os.environ.get("SYSTEMU_MCP_OAUTH_TIMEOUT_SECONDS", "1800")
+)
+
+
+def reconcile_resolved_mcp_oauth(*, vault, supervisor, data_dir=None) -> int:
+    """Daemon-tick executor for URL-mode OAuth follow-up gates (P4).
+
+    Distinct from ``reconcile_resolved_harness_grants``: this gate is a NESTED
+    follow-up of an MCP connect escalation. It deliberately does NOT touch
+    ``harness_grant_dispatched`` — the original escalation owns that flag and must
+    still be able to complete. The run stays parked ASSIGNED while pending; this
+    reconciler resumes it when the operator finishes (Approve) or abandons it
+    (Deny / clean timeout ⇒ harness_grant_failed).
+
+    Idempotency is keyed on its OWN flag ``context["mcp_oauth_dispatched"]`` so it
+    never interferes with the two existing reconcilers.
+
+    Acts ONCE per resolved row:
+      * Approve → resume with a {"kind":"mcp","granted":True} payload (the SDK
+        provider has already written the token to the 0600 store by now).
+      * Deny / reject / skip → resume with {"kind":"mcp","denied":True,
+        "rationale": "operator denied OAuth"} ⇒ run gets harness_grant_failed.
+      * Pending past the timeout → resume with the same denied payload (clean
+        timeout, also harness_grant_failed) and stamp the flag so it's not retried.
+
+    Fully defensive: a per-row failure is logged and the row is skipped WITHOUT
+    stamping the flag, for a later-tick retry. Returns rows actually dispatched.
+    """
+    from systemu.core.utils import utcnow
+    from datetime import datetime, timedelta
+
+    try:
+        headers = vault.load_index("decisions") or []
+    except Exception:
+        logger.debug("[McpOAuthReconciler] could not load decisions index", exc_info=True)
+        return 0
+
+    candidate_ids = [h["id"] for h in headers if h.get("status") == "resolved"]
+    if not candidate_ids:
+        return 0
+
+    dispatched = 0
+    now = utcnow()
+    for did in candidate_ids:
+        try:
+            decision = vault.get_decision(did)
+        except Exception:
+            logger.debug("[McpOAuthReconciler] could not load decision %s", did, exc_info=True)
+            continue
+        dctx = decision.context or {}
+
+        if dctx.get("gate_type") != "mcp_oauth" and dctx.get("follow_up") != "mcp_oauth":
+            continue
+        if dctx.get("mcp_oauth_dispatched"):
+            continue
+        execution_id = dctx.get("execution_id")
+        activity_id = dctx.get("activity_id")
+        shadow_id = dctx.get("shadow_id")
+        if not (execution_id and activity_id and shadow_id):
+            continue
+
+        try:
+            choice = str(decision.choice or "").strip().lower()
+            denied = choice in {"deny", "reject", "skip"}
+
+            # Clean-timeout safety net (a card resolved but pending past the bound,
+            # or never actioned but reaped to resolved by another sweep).
+            if not denied:
+                created_raw = dctx.get("created_at")
+                if created_raw:
+                    try:
+                        created = datetime.fromisoformat(str(created_raw))
+                        if (now - created) > timedelta(seconds=MCP_OAUTH_PENDING_TIMEOUT_SECONDS) \
+                                and choice not in {"approve", "approved", "edit spec"}:
+                            denied = True
+                    except ValueError:
+                        pass
+
+            if denied:
+                grant_payload = {
+                    "kind": "mcp",
+                    "denied": True,
+                    "rationale": dctx.get("rationale") or "operator denied OAuth",
+                }
+            else:
+                grant_payload = {"kind": "mcp", "granted": True,
+                                 "server_id": dctx.get("server_id")}
+
+            supervisor.resume_after_grant(
+                execution_id=execution_id,
+                activity_id=activity_id,
+                shadow_id=shadow_id,
+                grant_payload=grant_payload,
+                origin=dctx.get("origin"),
+                chat_submission_id=dctx.get("chat_submission_id"),
+            )
+
+            # Stamp OUR OWN flag — never harness_grant_dispatched.
+            decision.context["mcp_oauth_dispatched"] = True
+            vault.save_decision(decision)
+            dispatched += 1
+        except Exception:
+            logger.exception(
+                "[McpOAuthReconciler] dispatch failed for decision %s (execution_id=%s) "
+                "— skipping, will retry next tick", did, execution_id)
+
+    if dispatched:
+        logger.info("[McpOAuthReconciler] resumed %d oauth follow-up run(s)", dispatched)
+    return dispatched
+
+
+def _mcp_oauth_reconciler_job() -> None:
+    """APScheduler entry: thin wrapper around ``reconcile_resolved_mcp_oauth``
+    using the daemon-initialised globals. Mirrors ``_harness_grant_reconciler_job``;
+    never crashes the tick."""
+    if _vault is None:
+        return
+    try:
+        from systemu.runtime.supervisor import Supervisor
+        supervisor = Supervisor.get()
+    except Exception:
+        return
+    try:
+        from pathlib import Path
+        reconcile_resolved_mcp_oauth(vault=_vault, supervisor=supervisor,
+                                     data_dir=Path("data"))
+    except Exception:
+        logger.exception("[McpOAuthReconciler] job crashed")
 
 
 def _harness_grant_reconciler_job() -> None:

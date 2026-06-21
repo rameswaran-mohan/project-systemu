@@ -123,18 +123,27 @@ def surface_harness_request(
     dedup_key = f"harness:{execution_id}:{request_id}"
 
     # ── Build human-readable body ─────────────────────────────────────────────
-    spec_preview = json.dumps(spec, default=str)
-    if len(spec_preview) > 400:
-        spec_preview = spec_preview[:397] + "..."
-
+    # v0.9.35 (P1): an INPUT request carrying a requested_schema renders a typed
+    # multi-field form (render_decision_card, Task 6) from ctx["requested_schema"].
+    # SUPPRESS the raw `Spec: {json}` dump in that case — otherwise a truncated
+    # JSON blob appears ABOVE the nice form. Render only spec['question'].
+    _has_form = bool((spec.get("requested_schema") or {}))
     body_lines = [
         f"Kind: {kind_val}  |  Risk: {verdict_risk}  |  Urgency: {urgency}  |  Blocking: {blocking}",
         "",
         f"Agent rationale: {rationale or '(none)'}",
         f"Verdict rationale: {verdict_rationale or '(none)'}",
         "",
-        f"Spec: {spec_preview}",
     ]
+    if _has_form:
+        # Typed form gate: question only, no raw spec dump (the form is the body).
+        body_lines.append(spec.get("question") or "Please provide the requested input.")
+    else:
+        # Unchanged for free-text / capability requests: the full spec preview.
+        spec_preview = json.dumps(spec, default=str)
+        if len(spec_preview) > 400:
+            spec_preview = spec_preview[:397] + "..."
+        body_lines.append(f"Spec: {spec_preview}")
     body = "\n".join(body_lines)
 
     # ── Harness-specific context preserved across the re-tag ──────────────────
@@ -160,6 +169,11 @@ def surface_harness_request(
         "spec":              spec,
         "rationale":         rationale,
         "verdict_rationale": verdict_rationale,
+        # v0.9.35 (P1): elicitation form schema + the pending tool call so the
+        # operator card renders a multi-field form and the reconciler can merge
+        # typed answers back into the original call (empty for non-INPUT gates).
+        "requested_schema":  (spec.get("requested_schema") or {}),
+        "pending_tool":      (spec.get("pending_tool") or {}),
     }
 
     # Merge chat_submission_id from contextvar so the chat UI can link the card
@@ -215,6 +229,82 @@ def surface_harness_request(
     except Exception:
         pass  # log_event is best-effort; never block the surfacing
 
+    return decision_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  surface_oauth_url_card  (P4 — URL-mode OAuth handoff)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def surface_oauth_url_card(
+    server_id: str,
+    authorize_url: str,
+    *,
+    execution_id: str,
+    activity_id: str = "",
+    shadow_id: str = "",
+    vault,
+) -> str:
+    """Surface a URL-mode OAuth handoff as an operator card.
+
+    The operator clicks the descriptor's `inspect` (the full authorize URL) to
+    complete consent out-of-band. NO token/secret field is placed on the card or
+    in its context — the secret is acquired by the SDK provider into the 0600
+    vault store and never transits this surface. The card is tagged
+    gate_type='mcp_oauth' and carries follow-up coords so the daemon reconciler
+    (jobs.py) can retry the parked run when the operator finishes. Crucially this
+    is a FOLLOW-UP gate: it must NOT stamp harness_grant_dispatched (the original
+    escalation still completes).
+
+    LOW (don't-log-secrets): the authorize URL may carry a client_id / PKCE
+    code_challenge in its query. The full URL lives ONLY on the descriptor's
+    `inspect` field + `context_extras["authorize_url"]` (the operator must be able
+    to open it). The human-readable `body` and every log line carry the
+    QUERY-MASKED URL only, so no decision body or transcript line ever contains
+    the raw query string.
+    """
+    from systemu.interface.command.gate import GateDescriptor
+    from systemu.interface.command.inbox import InboxQueue
+    from urllib.parse import urlsplit, urlunsplit
+
+    def _mask_query(u: str) -> str:
+        """Drop the query + fragment from a URL for body/log display
+        (client_id / PKCE challenge / any token-ish param stays out of logs)."""
+        try:
+            parts = urlsplit(u)
+            masked = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+            return masked + ("?…(redacted)" if (parts.query or parts.fragment) else "")
+        except Exception:
+            return "(url redacted)"
+
+    masked_url = _mask_query(authorize_url)
+    body = (
+        f"MCP server '{server_id}' needs authorization.\n\n"
+        f"Open the authorization link on this card and complete sign-in, then "
+        f"return here.\nLink: {masked_url}\n\n"
+        f"Approve once you have completed authorization; Deny to abandon the connection."
+    )
+    context_extras: Dict[str, Any] = {
+        "execution_id":  execution_id,
+        "activity_id":   activity_id,
+        "shadow_id":     shadow_id,
+        "server_id":     server_id,
+        # Full URL rides the context so the operator card can render a clickable
+        # link AND the reconciler/SDK provider can use it — but it is NEVER placed
+        # in the body or any log line below.
+        "authorize_url": authorize_url,
+        "follow_up":     "mcp_oauth",
+        "harness_kind":  "mcp",
+    }
+    descriptor = GateDescriptor.from_oauth_url(  # B8-fixed classmethod
+        server_id=server_id, authorize_url=authorize_url, execution_id=execution_id,
+    )
+    decision_id = InboxQueue(vault).enqueue(
+        descriptor, gate_type="mcp_oauth", body=body, context_extras=context_extras,
+    )
+    # Log the MASKED url only (never the raw query).
+    logger.info("[HarnessReview] surfaced mcp_oauth card decision_id=%s server=%s url=%s",
+                decision_id, server_id, masked_url)
     return decision_id
 
 

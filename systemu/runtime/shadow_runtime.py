@@ -53,6 +53,12 @@ from dataclasses import dataclass, field as _dataclass_field
 from systemu.runtime import objective_verifier, state_delta
 from systemu.runtime.loop_guard import LoopGuard
 
+# P4 / H9 — sampling gate rail. Imported at module scope (NOT lazily inside the
+# helper) so the gate rail + descriptor are module attributes the production
+# wiring resolves and tests can monkeypatch.
+from systemu.interface.command.inbox import InboxQueue
+from systemu.interface.command.gate import GateDescriptor
+
 
 @dataclass
 class ObjectiveState:
@@ -70,6 +76,143 @@ class CompletionOutcome:
     feedback_message: Optional[str] = None
     escalate_stuck: bool = False
     bypassed_verifier: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  P4 / H9 — MCP sampling on the REAL gate rail + BYPASS floor
+#
+#  The pure routing core (sdk/sampling.route_sampling_request) is policy-free so
+#  it stays reusable (web_act). PRODUCTION sampling rides the SAME
+#  InboxQueue.enqueue(..., gate_type="sampling", policy=…) rail every other
+#  operator gate uses — `sampling` is on the BYPASS floor (so BYPASS still asks),
+#  the production on_gate defaults to ASK (never silent allow), a deny is
+#  fail-closed (the model is never invoked), any "Trust for session" grant is
+#  scoped per (server_id, session_id), and every call writes a per-call ledger
+#  entry that carries NO prompt text / no secret.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _has_session_sampling_trust(vault, server_id: str, session_id: str) -> bool:
+    """True iff a prior 'Trust for session' grant covers sampling for this
+    (server_id, session_id). Mirrors the MCP action-gate session-trust check
+    (command_approvals). Fail-closed: ANY failure to resolve the store ⇒ no
+    trust ⇒ the gate is posted."""
+    try:
+        from systemu.runtime.command_approvals import (
+            get_default_store, mcp_session_key)
+        store = get_default_store()
+        if store is None:
+            return False
+        skey = mcp_session_key(f"sampling:{server_id}", "createMessage", session_id)
+        return bool(store.is_session_trusted(skey))
+    except Exception:
+        logger.debug("[Sampling] session-trust check failed; will gate "
+                     "(fail-closed)", exc_info=True)
+        return False
+
+
+def _resolve_sampling_gate(decision_id, *, vault=None, server_id="",
+                           session_id="", dedup="") -> bool:
+    """Resolve a posted 'sampling' gate decision to an approve/deny outcome.
+
+    Mirrors how the MCP action gate consumes a resolved decision
+    (OperatorDecisionQueue.consume_resolved_choice keyed on the gate dedup — the
+    operator chooses Deny / Approve once / Trust for session). Returns True iff
+    approved. A 'Trust for session' choice records a per-(server,session) trust
+    grant via the SAME command_approvals store the MCP gate uses, so subsequent
+    calls in the same run skip the prompt. Fail-closed: any error ⇒ deny."""
+    key = dedup or f"sampling:{session_id}:{server_id}"
+    try:
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        choice = OperatorDecisionQueue(vault).consume_resolved_choice(key)
+    except Exception:
+        logger.debug("[Sampling] gate resolution failed; deny (fail-closed)",
+                     exc_info=True)
+        return False
+    norm = str(choice or "").strip().lower()
+    if norm in {"deny", "reject", "skip", ""}:
+        return False
+    if norm in {"trust for session", "trust this server for the session",
+                "trust", "always allow"}:
+        try:
+            from systemu.runtime.command_approvals import (
+                get_default_store, mcp_session_key)
+            store = get_default_store()
+            if store is not None:
+                skey = mcp_session_key(f"sampling:{server_id}", "createMessage",
+                                       session_id)
+                store.trust_session(skey, server=f"sampling:{server_id}",
+                                    tool="createMessage", session_id=session_id)
+        except Exception:
+            logger.debug("[Sampling] could not persist session trust",
+                         exc_info=True)
+    return True
+
+
+def _build_sampling_on_gate(*, server_id, session_id, vault, policy, ledger):
+    """Return the operator-gate hook passed into route_sampling_request in
+    PRODUCTION. It posts a deniable 'sampling' gate through the REAL Inbox rail
+    (gate_type='sampling', which is on the BYPASS floor), defaults to ASK (never
+    silent allow), scopes any 'Trust for session' grant to (server_id,
+    session_id), and writes a per-call ledger entry. Returns True iff approved."""
+
+    def _on_gate(summary):  # summary is route_sampling_request's redacted dict
+        # 1) check a per-server/session standing trust grant (set by a prior
+        #    'Trust for session' resolution) BEFORE posting again.
+        if _has_session_sampling_trust(vault, server_id, session_id):
+            allowed = True
+        else:
+            dedup = f"sampling:{session_id}:{server_id}"
+            descriptor = GateDescriptor(
+                title=f"MCP server wants an LLM completion: {server_id}",
+                risk="medium",
+                inspect=(f"server={server_id} session={session_id} "
+                         f"messages={summary.get('message_count')} "
+                         f"max_tokens={summary.get('max_tokens')} "
+                         f"tier={summary.get('tier')}"),
+                options=["Deny", "Approve once", "Trust for session"],
+                safe_default="Deny",
+                what_approve_does=("Routes ONE sampling/createMessage through "
+                                   "systemu's own model. No api key reaches the server."),
+                dedup=dedup,
+            )
+            decision_id = InboxQueue(vault).enqueue(
+                descriptor,
+                gate_type="sampling",      # ON THE FLOOR — BYPASS still asks
+                body="",                   # NO prompt text on the card (redacted)
+                policy=policy,             # consults the dial; floor forces 'ask'
+                context_extras={"server_id": server_id, "session_id": session_id,
+                                "kind": "gate"},
+            )
+            allowed = _resolve_sampling_gate(decision_id, vault=vault,
+                                             server_id=server_id,
+                                             session_id=session_id, dedup=dedup)
+        # 2) per-call ledger entry — auditable, secret-free.
+        ledger.append({
+            "server_id": server_id, "session_id": session_id,
+            "allowed": bool(allowed),
+            "message_count": summary.get("message_count"),
+            "max_tokens": summary.get("max_tokens"),
+            "tier": summary.get("tier"),
+        })
+        return bool(allowed)
+
+    return _on_gate
+
+
+def build_sampling_callback(manager, *, server_id, session_id, vault, config,
+                            policy, tier=2, ledger=None):
+    """Inject the gate-backed sampling callback into the manager's
+    set_sampling_callback slot (the slot exists from P2, left None). Uses
+    transports.make_sampling_callback for the SDK<->dict adapter, but supplies a
+    gate-backed on_gate so production NEVER routes with on_gate=None."""
+    from systemu.runtime.mcp.sdk import transports
+    ledger = ledger if ledger is not None else []
+    on_gate = _build_sampling_on_gate(server_id=server_id, session_id=session_id,
+                                      vault=vault, policy=policy, ledger=ledger)
+    cb = transports.make_sampling_callback(config=config, tier=tier, on_gate=on_gate)
+    manager.set_sampling_callback(cb)
+    return cb
 
 
 def process_completion_claim(
@@ -352,6 +495,81 @@ def _resolve_tool_whitelist(context: str) -> set:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+#  v0.9.36 P2 — MCP tool-exposure budget (context-rot control)
+# ─────────────────────────────────────────────────────────────────────────
+
+_MCP_SEARCH_AFFORDANCE = {
+    "name": "mcp_search_tools",
+    "description": (
+        "Search the tools available on connected MCP servers by keyword and "
+        "expose a specific one for use. Use this when the MCP tool you need is "
+        "not already listed (the per-run exposure budget hides the rest)."
+    ),
+    "parameters_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string",
+                      "description": "Keywords to match against tool names/descriptions."},
+        },
+        "required": ["query"],
+    },
+    "toolset": "mcp",
+    "is_action_tool": False,
+}
+
+
+# Meta-tools that are MCP-toolset but are NOT per-server tools: they must always
+# be exposed and NEVER counted against the budget (contract: "Exposure budget
+# excludes mcp_call_tool AND mcp_search_tools from the budget count").
+_MCP_BUDGET_EXEMPT = {"mcp_call_tool", "mcp_search_tools"}
+
+
+def _apply_mcp_exposure_budget(catalog: List[Dict[str, Any]],
+                               *, max_exposed: int) -> List[Dict[str, Any]]:
+    """Cap per-server MCP-toolset entries at ``max_exposed`` per run. Non-MCP
+    tools pass through untouched. The MCP meta-tools ``mcp_call_tool`` and
+    ``mcp_search_tools`` are EXEMPT — always passed through and NEVER counted
+    against the budget. When the remaining (countable) MCP tools exceed the
+    budget, keep a round-robin slice across servers (families stay represented)
+    and advertise a single ``mcp_search_tools`` affordance so the rest are
+    reachable on demand.
+    """
+    non_mcp = [e for e in catalog if e.get("toolset") != "mcp"]
+    # Exempt meta-tools (excluded from the count, but preserved in output);
+    # de-dup any pre-existing mcp_search_tools so we re-add exactly one below.
+    exempt = [e for e in catalog if e.get("toolset") == "mcp"
+              and e.get("name") in _MCP_BUDGET_EXEMPT
+              and e.get("name") != "mcp_search_tools"]
+    mcp = [e for e in catalog if e.get("toolset") == "mcp"
+           and e.get("name") not in _MCP_BUDGET_EXEMPT]
+    if len(mcp) <= max_exposed:
+        return non_mcp + exempt + mcp
+
+    # Group by server (prefix mcp__<server>__) and round-robin to the budget.
+    from collections import OrderedDict
+    by_server: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    for e in mcp:
+        name = e.get("name", "")
+        server = name.split("__")[1] if name.startswith("mcp__") and "__" in name[5:] else ""
+        by_server.setdefault(server, []).append(e)
+
+    kept: List[Dict[str, Any]] = []
+    queues = list(by_server.values())
+    idx = 0
+    while len(kept) < max_exposed and any(queues):
+        q = queues[idx % len(queues)]
+        if q:
+            kept.append(q.pop(0))
+        idx += 1
+        # Drop emptied queues so round-robin doesn't spin.
+        queues = [qq for qq in queues if qq]
+        if not queues:
+            break
+    # exempt meta-tools + the kept slice + exactly one search affordance.
+    return non_mcp + exempt + kept + [dict(_MCP_SEARCH_AFFORDANCE)]
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #  v0.9.5 T0 — LLM-visible tool catalog builder (v1 + v2 unified)
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -430,7 +648,10 @@ def _build_llm_tool_catalog(vault=None, config=None) -> List[Dict[str, Any]]:
                 "parameters_schema": dict(getattr(t, "parameters_schema", {}) or {}),
             })
 
-    return catalog
+    # v0.9.36 P2: cap MCP tool exposure (context-rot control); overflow is
+    # reachable via the lazy mcp_search_tools affordance.
+    _max = int(getattr(_cfg, "mcp_max_exposed_tools", 15)) if _cfg is not None else 15
+    return _apply_mcp_exposure_budget(catalog, max_exposed=_max)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -2087,6 +2308,11 @@ class ShadowRuntime:
             granted ``extra_iterations`` (clamped 0..100); observation.
           * SKILL / ACCESS / SUBAGENT — observation only (parity with the
             autonomous path, which narrates these today).
+          * MCP (``mat["mcp"]``) — register the discovered tools into the LIVE
+            v2 registry via ``registry_bridge.register_server_tools`` (namespaced
+            ``mcp__server__tool``); observation lists the now-callable names
+            derived from that call's RETURN. Does NOT touch v1 ``tools`` /
+            ``tool_index`` (the v2 catalog picks the registered tools up).
           * failure (``mat["materialised"]`` falsy) — harness_grant_failed
             observation carrying ``mat["reason"]`` and the request's fallback
             (the caller stamps ``mat["fallback"]`` before calling).
@@ -2191,6 +2417,54 @@ class ShadowRuntime:
                         "the granted depth/budget."
                     ),
                 }, current_ab)
+            elif mat.get("mcp"):
+                # ── MCP: register discovered tools into the LIVE v2 registry ──
+                # (namespaced mcp__server__tool via the P2 registry_bridge);
+                # _build_llm_tool_catalog picks them up automatically — so we do
+                # NOT touch the v1 `tools`/`tool_index` lists here. The
+                # observation lists the now-callable names so the agent uses them.
+                _mcp = mat.get("mcp") or {}
+                _server = str(_mcp.get("server_id") or "")
+                # B5: tools are FULL dicts {name, description, parameters_schema,
+                # annotations}. Pass them POSITIONALLY (vault FIRST) and derive
+                # the callable names from register_server_tools' RETURN value —
+                # never reconstruct `mcp__server__tool` ourselves (the slug may
+                # differ; the budget may register fewer than discovered).
+                _tool_dicts = list(_mcp.get("tools") or [])
+                _registered: list = []
+                try:
+                    from systemu.runtime.mcp.sdk.registry_bridge import (
+                        register_server_tools,
+                    )
+                    _registered = register_server_tools(
+                        self.vault, _server, _tool_dicts,
+                    ) or []
+                except Exception:
+                    logger.debug("[Runtime] mcp register_server_tools failed",
+                                 exc_info=True)
+                # Fall back to the namespaced_name of each discovered tool only
+                # if the bridge returned nothing (e.g. a stubbed test) — still
+                # the authoritative builder, not a hand-built string.
+                _callable = list(_registered)
+                if not _callable and _tool_dicts:
+                    try:
+                        from systemu.runtime.mcp.sdk.registry_bridge import (
+                            namespaced_name,
+                        )
+                        _callable = [namespaced_name(_server, str(t.get("name") or ""))
+                                     for t in _tool_dicts if t.get("name")]
+                    except Exception:
+                        _callable = []
+                context.add_observation({
+                    "type": "harness_granted",
+                    "message": (
+                        f"MCP server '{_mcp.get('label') or _server}' connected. "
+                        f"Callable tools: {', '.join(_callable) or '(none)'}. "
+                        "Call them by their namespaced names now."
+                    ),
+                    "mcp_server": _server,
+                    "mcp_tools": _callable,
+                }, current_ab)
             else:
                 context.add_observation({
                     "type": "harness_granted",
@@ -2231,7 +2505,9 @@ class ShadowRuntime:
           * else → reconstruct a per-kind *materialise dict* from ``payload`` and
             route through the SHARED ``_apply_materialised_grant`` so resume is
             byte-identical to an autonomous GRANT (TOOL deploy+register, COMPUTE
-            budget bump, SKILL/ACCESS/SUBAGENT observation).
+            budget bump, SKILL/ACCESS/SUBAGENT observation, MCP register the
+            discovered server tools into the live registry — empty ``mcp`` block
+            replays the oauth_pending/non-materialised handoff honestly).
 
         Returns the possibly-updated ``iter_budget``.
         """
@@ -2282,12 +2558,94 @@ class ShadowRuntime:
             # No apply patch — advisory lease only (Bug 5 / D.2).
         elif _kind == "subagent" or payload.get("subagent"):
             mat["subagent"] = payload.get("subagent")
+        elif _kind == "mcp" or payload.get("mcp"):
+            mat["mcp"] = payload.get("mcp")
+            mat["lease_id"] = payload.get("lease_id")
+            if not mat["mcp"]:
+                # oauth_pending / non-materialised handoff replayed honestly
+                mat["materialised"] = False
+                mat["reason"] = payload.get("reason") or "mcp not materialised"
         else:
             # Unknown/empty grant — narrate generically (helper's no-key branch).
             pass
 
         return self._apply_materialised_grant(
             mat, context=context, tools=tools, tool_index=tool_index,
+            current_ab=current_ab, iter_budget=iter_budget,
+        )
+
+    async def _apply_harness_grant_async(
+        self,
+        payload: Dict[str, Any],
+        *,
+        context,
+        tools,
+        tool_index,
+        current_ab,
+        iter_budget: int,
+    ) -> int:
+        """Async resume-apply that adds the v0.9.35 (P1) INPUT param-answer
+        re-dispatch on top of the sync :meth:`_apply_harness_grant`.
+
+        For an INPUT payload carrying ``param_answers`` + ``pending_tool``:
+          * empty ``param_answers`` (Decline / non-coercible) ⇒ a
+            ``harness_grant_failed`` observation; the tool is NOT re-dispatched
+            (never fabricate a value);
+          * otherwise merge ``param_answers`` into ``pending_tool.parameters``
+            and RE-DISPATCH the original call through the injected
+            ``self._resume_redispatch`` closure (which calls _handle_tool_call →
+            re-validates; a still-missing field re-asks; the gate runs once).
+
+        All non-INPUT-param payloads (DENY, plain operator_answer, capability
+        kinds) defer to the sync helper byte-for-byte.
+        """
+        payload = payload or {}
+        _kind = str(payload.get("kind", "") or "").lower()
+        if (_kind == "input"
+                and payload.get("pending_tool")
+                and "param_answers" in payload):
+            _pending = payload.get("pending_tool") or {}
+            _answers = payload.get("param_answers") or {}
+            if not _answers:
+                context.add_observation({
+                    "type": "harness_grant_failed",
+                    "message": (
+                        "Operator declined to supply the missing parameter(s). "
+                        "Use an alternative tool or FAIL — do not fabricate values."
+                    ),
+                }, current_ab)
+                return iter_budget
+            _merged = dict(_pending.get("parameters") or {})
+            _merged.update(_answers)
+            _decision = {
+                "tool_name": _pending.get("tool_name", ""),
+                "parameters": _merged,
+            }
+            _redispatch = getattr(self, "_resume_redispatch", None)
+            if _redispatch is None:
+                # No live re-dispatch closure (legacy caller) — hand the values
+                # back so the agent re-issues the call itself.
+                context.add_observation({
+                    "type": "harness_granted",
+                    "message": (
+                        "Operator supplied the missing parameter(s): "
+                        f"{_answers}. Re-issue the tool call with them."
+                    ),
+                }, current_ab)
+                return iter_budget
+            try:
+                await _redispatch(_decision)
+            except Exception:
+                logger.debug("[Runtime] INPUT re-dispatch failed", exc_info=True)
+                context.add_observation({
+                    "type": "harness_grant_failed",
+                    "message": ("Re-dispatch of the completed tool call failed; "
+                                "retry it yourself or FAIL."),
+                }, current_ab)
+            return iter_budget
+        # Everything else: identical to the sync path.
+        return self._apply_harness_grant(
+            payload, context=context, tools=tools, tool_index=tool_index,
             current_ab=current_ab, iter_budget=iter_budget,
         )
 
@@ -2387,6 +2745,12 @@ class ShadowRuntime:
         self._chat_submission_token = set_chat_submission_id(chat_submission_id)
         try:
             execution_id = _gen_execution_id()
+            # v0.9.34 P0 (H3): scope MCP "Trust for session" to THIS run so a
+            # trust grant cannot leak across runs (mcp_session_key bakes the id
+            # into its hash). Resolved from the run id here — NOT from any
+            # LLM-supplied tool kwarg.
+            from systemu.runtime.mcp_run_ctx import set_mcp_session_id
+            self._mcp_session_token = set_mcp_session_id(execution_id)
             exec_start   = __import__("time").time()
             tool_call_count = 0
             # v0.9.33 Bug 2/3: per-execution harness-request counter. Threaded
@@ -2825,15 +3189,42 @@ class ShadowRuntime:
             _hgrant = getattr(self, "_resume_harness_grant", None)
             if _hgrant is not None:
                 self._resume_harness_grant = None
+                # v0.9.35 (P1): a re-dispatch closure so an INPUT param grant can
+                # re-run the original tool call (which re-validates via the seam).
+                # A still-missing sentinel ⇒ a missing_required_params observation
+                # so the resumed loop's next LLM turn re-issues the call (Task 4
+                # then intercepts it live).
+                async def _resume_redispatch(_decision, _ab=current_ab):
+                    _r = await self._handle_tool_call(
+                        _decision, tools, context, _ab, dry_run,
+                        shadow=shadow, execution_id=execution_id,
+                    )
+                    if (_r is not None
+                            and isinstance(getattr(_r, "parsed", None), dict)
+                            and _r.parsed.get("__needs_input__")):
+                        context.add_observation({
+                            "type": "missing_required_params",
+                            "success": False,
+                            "tool_name": _decision.get("tool_name", "") or "?",
+                            "error": ("Still missing required parameter(s) after "
+                                      "the operator's answer. Re-issue the call with "
+                                      "the remaining values or FAIL."),
+                            "error_type": "missing_required_params",
+                        }, _ab)
+                        return None
+                    return _r
+                self._resume_redispatch = _resume_redispatch
                 try:
-                    _iter_budget = self._apply_harness_grant(
+                    _iter_budget = await self._apply_harness_grant_async(
                         _hgrant, context=context, tools=tools,
                         tool_index=tool_index, current_ab=current_ab,
                         iter_budget=_iter_budget,
                     )
                 except Exception:
-                    logger.debug("[Runtime] _apply_harness_grant failed — proceeding",
+                    logger.debug("[Runtime] _apply_harness_grant_async failed — proceeding",
                                  exc_info=True)
+                finally:
+                    self._resume_redispatch = None
 
             while iteration < _iter_budget:
                 iteration += 1
@@ -3385,9 +3776,31 @@ class ShadowRuntime:
                             HarnessRequest, HarnessKind, HarnessDecision,
                         )
                         if action == "ASK_OPERATOR":
+                            # v0.9.35 (P1): optional structured fields. When the
+                            # agent supplies a requested_schema (or a `fields`
+                            # list), thread it so the operator gets a multi-field
+                            # form; absent ⇒ byte-identical free-text question.
+                            _ask_spec = {
+                                "question": decision.get("question")
+                                or decision.get("rationale", "")
+                            }
+                            _ask_schema = decision.get("requested_schema")
+                            if not _ask_schema and isinstance(decision.get("fields"), list):
+                                from systemu.runtime.elicitation import (
+                                    elicitation_schema_from_fields,
+                                    split_secret_fields,
+                                )
+                                _form_fields, _secret = split_secret_fields(
+                                    decision.get("fields") or []
+                                )
+                                _ask_schema = elicitation_schema_from_fields(_form_fields)
+                                if _secret:
+                                    _ask_spec["secret_fields"] = [f["name"] for f in _secret]
+                            if isinstance(_ask_schema, dict) and _ask_schema.get("properties"):
+                                _ask_spec["requested_schema"] = _ask_schema
                             _req = HarnessRequest(
                                 kind=HarnessKind.INPUT,
-                                spec={"question": decision.get("question") or decision.get("rationale", "")},
+                                spec=_ask_spec,
                                 rationale=decision.get("rationale", ""),
                                 fallback=decision.get("fallback", ""),
                             )
@@ -3644,6 +4057,117 @@ class ShadowRuntime:
                         decision, tools, context, current_ab, dry_run,
                         shadow=shadow, execution_id=execution_id,
                     )
+                    # ── v0.9.35 (P1): missing-required → suspend for operator input ──
+                    # _handle_tool_call returned a __needs_input__ sentinel: route it
+                    # through the SAME blocking-ESCALATE suspend rail the harness uses
+                    # (no new status). Headless / no-queue ⇒ fail-closed observation.
+                    if (result is not None
+                            and isinstance(getattr(result, "parsed", None), dict)
+                            and result.parsed.get("__needs_input__")):
+                        _req = result.parsed.get("harness_request")
+                        # v0.9.35 (review HIGH): surface the form whenever an
+                        # operator channel exists — the decision QUEUE (the no-TTY
+                        # queue-mode daemon = production topology) OR a TTY. Mirror
+                        # the blocking-ESCALATE rail (which has no is_headless guard
+                        # and relies on the queue). Fail-closed ONLY when there is
+                        # genuinely no operator channel (no queue AND no TTY) —
+                        # is_headless() alone wrongly disabled elicitation on every
+                        # queue-mode daemon.
+                        from systemu.interface.notifications import (
+                            is_headless, _get_decision_queue,
+                        )
+                        if _get_decision_queue() is None and is_headless():
+                            context.add_observation({
+                                "type": "missing_required_params",
+                                "success": False,
+                                "tool_name": decision.get("tool_name", "") or "?",
+                                "error": (
+                                    "Tool needs required parameter(s) that are "
+                                    "missing, and no operator is available to "
+                                    "supply them (non-interactive run). Provide the "
+                                    "values yourself in the next TOOL_CALL, use an "
+                                    "alternative tool, or FAIL — do NOT fabricate."),
+                                "error_type": "missing_required_params",
+                            }, current_ab)
+                            continue
+                        # Interactive: arbitrate (INPUT always ESCALATEs) + suspend.
+                        try:
+                            from systemu.runtime.governor import Governor
+                            from systemu.core.models import HarnessDecision
+                            _gov = governor or Governor(self.config)
+                            _arb_ctx = _harness_arbitration_context(
+                                harness_requests_this_run,
+                                int(getattr(self, "_subagent_depth", 0)),
+                            )
+                            _verdict = _gov.arbitrate(_req, context=_arb_ctx)
+                        except Exception:
+                            logger.debug("[Runtime] INPUT arbitrate failed", exc_info=True)
+                            context.add_observation({
+                                "type": "missing_required_params",
+                                "success": False,
+                                "tool_name": decision.get("tool_name", "") or "?",
+                                "error": ("Could not raise an input request; provide "
+                                          "the missing parameters yourself or FAIL."),
+                                "error_type": "missing_required_params",
+                            }, current_ab)
+                            continue
+                        # Snapshot + __HARNESS_PENDING__ (mirror the blocking-ESCALATE rail).
+                        try:
+                            from systemu.runtime.execution_snapshot import (
+                                capture_from_context, write_snapshot,
+                            )
+                            _snap = capture_from_context(
+                                execution_id=execution_id,
+                                shadow_id=getattr(shadow, "id", ""),
+                                scroll_id=getattr(scroll, "id", ""),
+                                iteration=iteration,
+                                current_action_block=current_ab,
+                                completed_objectives=set(completed_objectives),
+                                context=context,
+                                activity_id=getattr(activity, "id", ""),
+                                requests_this_run=harness_requests_this_run,
+                                subagent_depth=int(getattr(self, "_subagent_depth", 0)),
+                            )
+                            import json as _json
+                            _snap.sticky_notes.append(
+                                f"__HARNESS_PENDING__::{execution_id}::"
+                                + _json.dumps({
+                                    "request_id": _req.request_id,
+                                    "kind":       _req.kind.value,
+                                    "spec":       _req.spec,
+                                    "fallback":   _req.fallback,
+                                })
+                            )
+                            write_snapshot(_snap)
+                        except Exception:
+                            logger.debug("[Runtime] INPUT-escalate snapshot failed",
+                                         exc_info=True)
+                        try:
+                            from systemu.interface.harness_review import surface_harness_request
+                            _did = surface_harness_request(
+                                _req, _verdict, execution_id=execution_id,
+                                activity_id=activity.id, shadow_id=shadow.id,
+                                vault=self.vault,
+                            )
+                            logger.info(
+                                "[Runtime] missing-required INPUT → parked "
+                                "(operator card %s)", _did,
+                            )
+                        except Exception:
+                            logger.debug("[Runtime] surface_harness_request failed",
+                                         exc_info=True)
+                        _revoke_harness_leases(record_run=False)
+                        _susp = context.build_result(
+                            status="suspended_harness_escalation",
+                            final_summary=(
+                                "Parked awaiting operator input: missing required "
+                                f"parameter(s) for tool "
+                                f"{decision.get('tool_name', '') or '?'}."
+                            ),
+                        )
+                        _susp["activity_id"] = activity.id
+                        _susp["shadow_id"]   = shadow.id
+                        return _susp
                     if result is None:
                         continue   # User denied destructive call
                     tool_call_count += 1
@@ -4202,6 +4726,15 @@ class ShadowRuntime:
                 set_chat_submission_id(None, reset_token=self._chat_submission_token)
             except Exception:
                 pass
+            try:
+                # v0.9.34 P0 (H3): reset the run-scoped MCP session-id carrier.
+                # getattr(..., None) so an early-exit path that never reached the
+                # set-point resets harmlessly (reset_token=None is the clear branch).
+                from systemu.runtime.mcp_run_ctx import set_mcp_session_id
+                set_mcp_session_id(None, reset_token=getattr(
+                    self, "_mcp_session_token", None))
+            except Exception:
+                pass
 
     # ─── Private helpers ──────────────────────────────────────────────────────
 
@@ -4260,6 +4793,66 @@ class ShadowRuntime:
         # Fallback heuristic check
         if not is_destructive:
             is_destructive = ToolSandbox.is_destructive_call(tool_name, parameters)
+
+        # ── v0.9.35 (P1): missing-required detection seam ────────────────────
+        # One chokepoint for v1/v2/MCP: after alias/scalar coercion (above) and
+        # BEFORE the destructive gate, the v2 short-circuit, and v1 dispatch.
+        # A non-empty gap builds a kind=INPUT HarnessRequest carrying the
+        # requested_schema + pending_tool and returns a SENTINEL ToolResult.
+        # The TOOL_CALL loop branch routes the sentinel through the existing
+        # blocking-ESCALATE suspend rail (one suspend implementation).
+        # Empty schema ⇒ empty gap ⇒ zero behavior change.
+        if not dry_run:
+            try:
+                from systemu.runtime.param_validation import missing_required
+                from systemu.runtime.tool_registry_v2 import registry as _v2_reg
+                _gap = missing_required(
+                    tool_name, parameters, tools=tools, v2_registry=_v2_reg,
+                )
+            except Exception:
+                logger.debug("[Runtime] missing_required seam errored — skipping",
+                             exc_info=True)
+                _gap = []
+            if _gap:
+                from systemu.core.models import HarnessRequest, HarnessKind
+                from systemu.runtime.elicitation import (
+                    elicitation_schema_from_fields, split_secret_fields,
+                )
+                # v0.9.35 (P1): URL-mode secrets. Split credential fields OUT of
+                # the typed form before building requested_schema, so a secret
+                # never enters the form schema (and therefore never the LLM/logs).
+                # Secret NAMES are carried for the URL-mode card label only.
+                _form_fields, _secret_fields = split_secret_fields(_gap)
+                _req = HarnessRequest(
+                    kind=HarnessKind.INPUT,
+                    spec={
+                        "question": (
+                            f"Tool '{tool_name}' needs "
+                            f"{len(_gap)} more parameter(s) to run."
+                        ),
+                        "requested_schema": elicitation_schema_from_fields(_form_fields),
+                        "secret_fields": [f["name"] for f in _secret_fields],
+                        "pending_tool": {
+                            "tool_name": tool_name,
+                            "parameters": dict(parameters),
+                        },
+                    },
+                    rationale=(
+                        f"Missing required parameter(s): "
+                        f"{', '.join(f['name'] for f in _gap)}."
+                    ),
+                    fallback=reasoning or "",
+                    blocking=True,
+                )
+                logger.info(
+                    "[Runtime] tool=%s missing required %s — raising INPUT elicitation",
+                    tool_name, [f["name"] for f in _gap],
+                )
+                return ToolResult(
+                    success=False,
+                    parsed={"__needs_input__": True, "harness_request": _req},
+                    error="missing_required_params",
+                )
 
         # Safety gate for destructive calls.
         # v0.9.32 (D.5): shell tools are gated at the ToolSandbox chokepoint

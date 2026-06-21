@@ -115,15 +115,54 @@ def _mcp_quick_entries(vault, taken_names) -> List[Dict[str, Any]]:
         return []
 
 
-def _execute_mcp_tool(entry: Dict[str, Any], params: Dict[str, Any], config):
-    """Dispatch one connector call with the truth-in-results envelope:
-    an empty payload is NOT success (W6.2 applies to connectors too)."""
-    from types import SimpleNamespace
-    import systemu.runtime.mcp.client as mcp_client   # module attr → patchable
+def _execute_mcp_tool(entry: Dict[str, Any], params: Dict[str, Any], config,
+                      *, vault=None, session_id: str = ""):
+    """Dispatch one connector call through the v0.9.34 P0 gated chokepoint
+    (allowlist + risk-tiered action gate + output guard). Truth-in-results: an
+    empty payload is NOT success (W6.2 applies to connectors too).
 
-    out = mcp_client.mcp_call_tool(
-        server=entry["server"], name=entry["name"],
-        params=params, config=config)
+    An action gate may raise PendingOperatorDecision; the chat lane block-polls
+    for the operator's choice (mirrors _execute_tool). Deny/timeout → a clean
+    fail-closed denial result so the ReAct loop adapts (never crashes)."""
+    from types import SimpleNamespace
+    from systemu.runtime.mcp.dispatch import call_mcp_tool
+    from systemu.approval.exceptions import PendingOperatorDecision
+
+    def _denied(msg: str):
+        return SimpleNamespace(success=False, parsed={
+            "success": False, "error": msg, "error_type": "mcp_denied"},
+            error=msg)
+
+    def _call(resolved_dedup=None):
+        return call_mcp_tool(
+            entry["server"], entry["name"], params,
+            vault=vault, config=config, session_id=session_id,
+            resolved_dedup=resolved_dedup)
+
+    try:
+        out = _call()
+    except PendingOperatorDecision as pend:
+        choice = _poll_command_choice(vault, pend.dedup_key)
+        norm = (choice or "").strip().lower()
+        if norm in ("approve once", "always allow",
+                    "trust this tool for the session"):
+            try:
+                out = _call(resolved_dedup=pend.dedup_key)
+            except PendingOperatorDecision:
+                return _denied("MCP call approved once but re-gated; not run.")
+            except Exception:
+                logger.exception("[QuickTask] MCP gate re-attempt errored "
+                                 "— fail-closed denial")
+                return _denied("MCP approval re-attempt failed — denied "
+                               "(fail-closed).")
+        else:
+            msg = ("MCP call denied by operator." if norm == "deny"
+                   else "MCP approval timed out — denied (fail-closed).")
+            return _denied(msg)
+    except Exception:
+        logger.exception("[QuickTask] MCP dispatch raised — fail-closed denial")
+        return _denied("MCP dispatch failed unexpectedly — denied (fail-closed).")
+
     response = out.get("response")
     if not out.get("success"):
         return SimpleNamespace(success=False, parsed={},
@@ -306,6 +345,14 @@ def run_quick_task(
     except Exception:
         logger.debug("[QuickTask] could not ensure output_dir", exc_info=True)
 
+    # v0.9.34 P0: a per-run session id scopes MCP "Trust for session" so trust
+    # cannot leak across runs (mcp_session_key bakes it into the hash). The quick
+    # lane is NOT a ShadowRuntime run, so it does NOT read the mcp_run_ctx carrier
+    # — it mints its own id and passes it explicitly through _execute_mcp_tool.
+    # Stable within one run_quick_task call, different across calls.
+    import uuid as _uuid
+    execution_id = f"quick_{_uuid.uuid4().hex[:12]}"
+
     history: List[Dict[str, Any]] = []
     files: List[str] = []
     tool_calls = 0
@@ -470,7 +517,8 @@ def run_quick_task(
                     "success": False, "error": denial,
                     "error_type": "destructive_auto_denied"}, error=denial)
             elif mcp_entry is not None:
-                result = _execute_mcp_tool(mcp_entry, params, config)
+                result = _execute_mcp_tool(mcp_entry, params, config,
+                                           vault=vault, session_id=execution_id)
             else:
                 result = _execute_tool(sandbox, tool, params)
             tool_calls += 1

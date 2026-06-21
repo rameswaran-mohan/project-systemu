@@ -230,6 +230,22 @@ class Config:
     mcp_server_urls: str = field(
         default_factory=lambda: os.getenv("SYSTEMU_MCP_SERVER_URLS", "")
     )
+    # v0.9.36 P2 (Layer 6 — real MCP client): tool-exposure budget. Tool-
+    # selection accuracy collapses past ~30–50 tools; cap how many MCP tools
+    # enter available_tools per run. Overflow is reachable via lazy on-demand
+    # exposure (mcp_search_tools). Default 15 (user-directed).
+    mcp_max_exposed_tools: int = field(
+        default_factory=lambda: int(os.getenv("SYSTEMU_MCP_MAX_EXPOSED_TOOLS", "15"))
+    )
+    # v0.9.36 P2: grandfather env-declared MCP servers (server-trusted + tools
+    # enabled) for backward-compat. ON by default; new Settings/runtime servers
+    # always use per-tool opt-in. DELEGATES to the ONE canonical reader so the
+    # '' ⇒ ON truthiness matches dispatch/connections exactly (contract).
+    mcp_env_autotrust: bool = field(
+        default_factory=lambda: __import__(
+            "systemu.runtime.mcp.connections", fromlist=["env_autotrust_enabled"]
+        ).env_autotrust_enabled()
+    )
 
     # v0.9.6 (Layer 7 — Proactive Surfacing): inactivity-triggered curator.
     curator_enabled: bool = field(

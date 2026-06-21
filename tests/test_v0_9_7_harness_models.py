@@ -28,7 +28,7 @@ def test_harness_request_forbids_extra():
 
 def test_harness_request_kinds_cover_all_families():
     assert {k.value for k in HarnessKind} == {
-        "tool", "skill", "access", "compute", "subagent", "input",
+        "tool", "skill", "access", "compute", "subagent", "input", "mcp",
     }
 
 

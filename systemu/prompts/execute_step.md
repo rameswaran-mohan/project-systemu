@@ -131,12 +131,34 @@ The inverse of `TOOL_CALL`: when **no available tool fits the objective**, ask t
 
 ### 8. ASK_OPERATOR — Ask the operator a question *(only when capability provisioning is enabled)*
 Use when you genuinely need information or a decision only the human operator can provide. Prefer acting autonomously; use this sparingly for true blockers.
+
+Free-text (unchanged):
 ```json
 {
   "action": "ASK_OPERATOR",
   "question": "Which output format do you want — CSV or XLSX?",
   "rationale": "The request is ambiguous about format and the choice changes the deliverable.",
   "fallback": "If no answer, default to CSV.",
+  "completes_objective": null,
+  "is_destructive": false
+}
+```
+
+Structured form (optional) — supply `requested_schema` (MCP elicitation form mode: flat object; primitive fields string/number/integer/boolean/enum; `format` ∈ email/uri/date/date-time; per-field `default`) to get a single multi-field operator card instead of free text. Omit it for unchanged free-text behavior. NEVER request a secret/credential/token as a form field — those are collected out-of-band (URL mode) and never enter your context.
+```json
+{
+  "action": "ASK_OPERATOR",
+  "question": "Confirm the export settings.",
+  "requested_schema": {
+    "type": "object",
+    "properties": {
+      "format": {"type": "string", "enum": ["csv", "xlsx"], "description": "Output format"},
+      "include_headers": {"type": "boolean", "default": true, "description": "Include a header row"}
+    },
+    "required": ["format", "include_headers"]
+  },
+  "rationale": "Two settings the operator must decide before I write the file.",
+  "fallback": "If no answer, default to csv with headers.",
   "completes_objective": null,
   "is_destructive": false
 }

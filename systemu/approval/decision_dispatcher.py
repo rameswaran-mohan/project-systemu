@@ -44,6 +44,7 @@ def _ensure_handlers_registered() -> None:
     import systemu.pipelines.scroll_refiner   # noqa: F401
     import systemu.pipelines.tool_forge       # noqa: F401
     import systemu.pipelines.command_gate_handler  # noqa: F401  (v0.9.32 D.3)
+    import systemu.pipelines.mcp_call_gate_handler  # noqa: F401  (v0.9.34 P0)
     _handlers_bootstrapped = True
 
 

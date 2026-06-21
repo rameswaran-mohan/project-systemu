@@ -14,9 +14,15 @@ logger = logging.getLogger(__name__)
 _PASSWORD_HINTS = ("password", "passwd", "pwd")
 
 
-def _plan_next(instruction: str, nodes: List[Dict[str, str]], history: List[Dict], config) -> Dict:
-    """Ask the Tier-2 LLM for the next action. Returns a dict with 'action'."""
-    from systemu.core.llm_router import llm_call_json
+def _plan_next(instruction: str, nodes: List[Dict[str, str]], history: List[Dict],
+               config, bridge=None) -> Dict:
+    """Ask the Tier-2 LLM for the next action. Returns a dict with 'action'.
+
+    When ``bridge`` is supplied (the sdk.sampling parent-LLM-bridge — the SAME
+    mechanism MCP sampling uses, Task #11), the planning call is routed through
+    it so no api key need enter a browser subprocess. The default path keeps the
+    legacy in-process ``llm_call_json`` behavior byte-for-byte.
+    """
     import json
     system = (
         "You drive a web page via its accessibility tree. Given the instruction, "
@@ -25,16 +31,30 @@ def _plan_next(instruction: str, nodes: List[Dict[str, str]], history: List[Dict
         'or {"action":"READ"} or {"action":"DONE","result":"..."}.'
     )
     user = json.dumps({"instruction": instruction, "elements": nodes, "history": history})
+
+    if bridge is not None:
+        raw = bridge(
+            [{"role": "system", "content": {"type": "text", "text": system}},
+             {"role": "user", "content": {"type": "text", "text": user}}],
+            config=config, tier=2,
+        )
+        try:
+            return json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return {"action": "READ"}  # fail-safe: re-observe rather than crash
+
+    from systemu.core.llm_router import llm_call_json
     return llm_call_json(tier=2, system=system, user=user, config=config,
                          temperature=0.1, max_tokens=512)
 
 
-def run_act_loop(page, instruction: str, max_steps: int = 8, config=None) -> Dict[str, Any]:
+def run_act_loop(page, instruction: str, max_steps: int = 8, config=None,
+                 bridge=None) -> Dict[str, Any]:
     steps: List[Dict] = []
     for _ in range(max_steps):
         raw = page.accessibility_snapshot()
         nodes = parse_a11y_snapshot(raw)
-        decision = _plan_next(instruction, nodes, steps, config)
+        decision = _plan_next(instruction, nodes, steps, config, bridge=bridge)
         action = (decision.get("action") or "").upper()
         if action == "DONE":
             return {"success": True, "result": decision.get("result", ""), "steps": steps}

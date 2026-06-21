@@ -17,6 +17,9 @@ Environment variables (all optional):
   SYSTEMU_HARNESS_ALLOWED_PACKAGES=              comma-separated whitelisted pip packages
   SYSTEMU_HARNESS_ALLOWED_HOSTS=                 comma-separated whitelisted hostnames
   SYSTEMU_HARNESS_LLM_JUDGE=true                 let an LLM judge ambiguous MEDIUM-risk requests
+  SYSTEMU_HARNESS_AUTO_GRANT_MCP=false           reserved auto-grant switch for MCP kind
+  SYSTEMU_HARNESS_ALLOWED_MCP_SERVERS=           comma-separated allowlisted MCP server_ids
+  SYSTEMU_HARNESS_ALLOWED_MCP_HOSTS=             comma-separated hosts exempt from the SSRF literal-IP deny
 """
 
 from __future__ import annotations
@@ -106,6 +109,16 @@ class HarnessPolicy:
         (the ``needs_llm_judgment`` cases the arbiter flags) to an LLM judge
         instead of always escalating. Default True. The judge is conservative:
         it only GRANTs when clearly safe, otherwise it ESCALATEs.
+    auto_grant_mcp
+        Reserved auto-grant switch for the MCP kind. Default False. Even when
+        True, NEW external servers always ESCALATE (operator approval); only
+        re-attach/allowlisted servers grant at LOW — mirroring auto_grant_tool.
+    allowed_mcp_servers
+        Allowlist of MCP ``server_id``s that may connect without escalation
+        (LOW GRANT, treated like a re-attach). Empty = all new servers escalate.
+    allowed_mcp_hosts
+        Hosts exempt from the SSRF literal-IP deny in _arbitrate_mcp (e.g.
+        ``{"127.0.0.1"}`` for a trusted local dev MCP server). Empty = none.
     """
 
     # ── per-kind auto-grant switches ──────────────────────────────────────────
@@ -128,6 +141,16 @@ class HarnessPolicy:
     allowed_resources: Set[str] = field(default_factory=set)
     allowed_packages:  Set[str] = field(default_factory=set)
     allowed_hosts:     Set[str] = field(default_factory=set)
+
+    # ── MCP runtime-connect (P3) ──────────────────────────────────────────────
+    auto_grant_mcp:      bool        = False
+    allowed_mcp_servers: Set[str]    = field(default_factory=set)
+    allowed_mcp_hosts:   Set[str]    = field(default_factory=set)
+
+    # ── MCP remote-transport / OAuth policy (P4 ADDS ONLY THESE TWO) ───────────
+    # (allowed_mcp_hosts is P3-owned; P4 must not declare it here.)
+    mcp_require_tls:     bool        = True
+    mcp_oauth_timeout_s: int         = 1800
 
     @classmethod
     def from_config(cls, config: Dict[str, Any] | None = None) -> "HarnessPolicy":
@@ -226,4 +249,9 @@ class HarnessPolicy:
             allowed_resources=_cfg_set("allowed_resources", set()),
             allowed_packages=_cfg_set("allowed_packages", set()),
             allowed_hosts=_cfg_set("allowed_hosts", set()),
+            auto_grant_mcp=_cfg_bool("auto_grant_mcp", False),
+            allowed_mcp_servers=_cfg_set("allowed_mcp_servers", set()),
+            allowed_mcp_hosts=_cfg_set("allowed_mcp_hosts", set()),
+            mcp_require_tls=_cfg_bool("mcp_require_tls", True),
+            mcp_oauth_timeout_s=_cfg_int("mcp_oauth_timeout_s", 1800),
         )

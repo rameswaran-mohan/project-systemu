@@ -31,8 +31,10 @@ that cannot be auto-granted are ESCALATE (suspend the run, await operator).
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from systemu.core.models import (
     HarnessDecision,
@@ -318,6 +320,78 @@ def _arbitrate_input(
     )
 
 
+# Cloud-metadata + private/loopback/link-local literals an MCP URL must never
+# target unless the operator explicitly allowlists the host. DNS-resolution of
+# *hostnames* to private IPs is enforced at connect time (Governor._provision_mcp),
+# keeping THIS module pure (no network).
+def _is_ssrf_ip_literal(host: str) -> bool:
+    """True iff ``host`` is an IP literal in a loopback/link-local/private/
+    unspecified range (incl. the 169.254.169.254 metadata endpoint, which is
+    link-local and thus already covered). Non-IP hostnames return False here —
+    they are resolved+rechecked at connect time, not in this pure layer."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(
+        ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified
+    )
+
+
+def _arbitrate_mcp(
+    request: HarnessRequest, policy: HarnessPolicy, ctx: Dict[str, Any]
+) -> Dict[str, Any]:
+    """MCP kind — connect to an MCP server at runtime (spec §3.5).
+
+    Rules, in order:
+      1. SSRF DENY HIGH — an http/sse URL whose host is a private/loopback/
+         link-local/metadata IP LITERAL and is NOT in ``policy.allowed_mcp_hosts``.
+      2. Re-attach GRANT LOW — ``server_id`` is already connected (call site
+         passes ``ctx["connected_mcp_servers"]``) OR explicitly allowlisted
+         (``policy.allowed_mcp_servers``). No re-prompt after restart.
+      3. New external server → ESCALATE HIGH (operator approval). The shared
+         post-process downgrades non-blocking ESCALATE HIGH → DENY HIGH.
+    """
+    spec = request.spec or {}
+    server_id = str(spec.get("server_id", "") or "")
+    transport = str(spec.get("transport", "") or "").lower()
+    url = str(spec.get("url", "") or "")
+
+    # ── 1. SSRF (literal-IP) — precedes everything; a "connected" claim cannot
+    #        whitelist a loopback/metadata literal. Only http/sse carry a URL;
+    #        stdio has no host and is skipped.
+    if transport in ("http", "sse") and url:
+        host = (urlparse(url).hostname or "").lower().strip()
+        if host and host not in policy.allowed_mcp_hosts and _is_ssrf_ip_literal(host):
+            return _result(
+                request, HarnessDecision.DENY, RiskBand.HIGH,
+                f"MCP target host '{host}' is a private/loopback/metadata "
+                "address — refused (SSRF). Allowlist it explicitly to override.",
+                alternatives=[
+                    "use a public MCP server URL",
+                    "ask the operator to allowlist this host",
+                ],
+            )
+
+    # ── 2. Re-attach / allowlisted server → LOW GRANT (no re-prompt).
+    connected: List[str] = list(ctx.get("connected_mcp_servers", []) or [])
+    if server_id and (server_id in connected or server_id in policy.allowed_mcp_servers):
+        return _result(
+            request, HarnessDecision.GRANT, RiskBand.LOW,
+            f"MCP server '{server_id}' is already connected/allowlisted — "
+            "re-attach is safe.",
+            lease=True,
+        )
+
+    # ── 3. New external server → HIGH → ESCALATE (post-process handles
+    #        non-blocking → DENY, mirroring _arbitrate_tool).
+    return _result(
+        request, HarnessDecision.ESCALATE, RiskBand.HIGH,
+        f"Connecting to new MCP server '{server_id or '<unnamed>'}' requires "
+        "operator approval (HIGH risk — new external capability source).",
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -329,6 +403,7 @@ _KIND_ARBITRATORS = {
     HarnessKind.COMPUTE:  _arbitrate_compute,
     HarnessKind.SUBAGENT: _arbitrate_subagent,
     HarnessKind.INPUT:    _arbitrate_input,
+    HarnessKind.MCP:      _arbitrate_mcp,
 }
 
 
@@ -353,6 +428,10 @@ def arbitrate(
           ``requests_this_run``      int        — count of requests so far
           ``baseline_tokens``        int        — token baseline for COMPUTE band
           ``subagent_depth``         int        — current nesting depth (for SUBAGENT)
+          ``connected_mcp_servers``  list[str]  — server_ids already connected
+                                                  (re-attach → MCP GRANT LOW, no re-prompt)
+          ``allowed_mcp_hosts``      (policy)   — hosts exempt from the SSRF
+                                                  literal-IP deny (see HarnessPolicy)
 
     Returns
     -------

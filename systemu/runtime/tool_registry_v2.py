@@ -103,6 +103,23 @@ class ToolRegistry:
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )
 
+    def unregister(self, name: str) -> bool:
+        """Remove a tool entry by name. Returns True when present. Used by the
+        MCP registry bridge to drop namespaced tools on disable / lease-revoke."""
+        with self._lock:
+            existed = name in self._tools
+            self._tools.pop(name, None)
+            return existed
+
+    def unregister_prefix(self, prefix: str) -> int:
+        """Remove every tool whose name starts with ``prefix``. Returns the count
+        removed (used to drop all of one MCP server's namespaced tools)."""
+        with self._lock:
+            doomed = [n for n in self._tools if n.startswith(prefix)]
+            for n in doomed:
+                self._tools.pop(n, None)
+            return len(doomed)
+
     def get(self, name: str) -> Optional[ToolEntry]:
         return self._tools.get(name)
 
