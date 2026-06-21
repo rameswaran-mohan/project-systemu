@@ -2339,15 +2339,24 @@ class ShadowRuntime:
                 # v0.9.7 Phase 2: deploy the freshly-forged tool
                 # synchronously (dry-run → DEPLOYED + enabled) so it
                 # is callable in THIS run, not just a future one.
+                _dryrun_reason = None
                 if _nt is not None and not getattr(_nt, "enabled", False):
                     try:
                         from systemu.pipelines.tool_deploy import deploy_forged_tool
-                        if deploy_forged_tool(_nt.id, self.vault, self.config).get("deployed"):
+                        _dep = deploy_forged_tool(_nt.id, self.vault, self.config)
+                        if _dep.get("deployed"):
                             try:
                                 _nt = self.vault.get_tool(_nt.id)
                             except Exception:
                                 pass
-                    except Exception:
+                        else:
+                            # v0.9.34.3: surface the dry-run failure so the agent
+                            # can repair its tool on a re-request. It was discarded
+                            # before, so the agent re-forged the same broken schema
+                            # and failed instead of fixing it.
+                            _dryrun_reason = _dep.get("reason")
+                    except Exception as _exc:
+                        _dryrun_reason = f"deploy raised: {_exc}"
                         logger.debug("[Runtime] forge-deploy failed", exc_info=True)
                 if _nt is not None and getattr(_nt, "enabled", False):
                     tools.append(_nt)
@@ -2366,8 +2375,13 @@ class ShadowRuntime:
                     context.add_observation({
                         "type": "harness_granted_pending",
                         "message": (
-                            f"Capability '{getattr(_nt, 'name', _tref)}' was forged but is pending "
-                            "enablement/dry-run; it is not callable this run. Use an existing tool or FAIL."
+                            f"Capability '{getattr(_nt, 'name', _tref)}' was forged but FAILED its "
+                            "automatic dry-run, so it is not callable this run. "
+                            + (f"Dry-run error: {_dryrun_reason}. " if _dryrun_reason else "")
+                            + "If you request this capability again, FIX the cause first — most often the "
+                            "implementation's parameters must match the declared parameters_schema (same "
+                            "names; the schema must not require a parameter the function does not accept). "
+                            "Otherwise use an existing tool or FAIL."
                         ),
                     }, current_ab)
             elif mat.get("compute_grant"):

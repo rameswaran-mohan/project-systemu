@@ -127,6 +127,49 @@ def test_tool_grant_deploys_and_appends(monkeypatch):
     assert any(o.get("type") == "harness_granted" for o in ctx.observations)
 
 
+def test_tool_grant_failed_dryrun_surfaces_reason(monkeypatch):
+    # v0.9.34.3: when the forged tool's automatic dry-run FAILS, the agent must
+    # be handed the dry-run error (so it can repair its schema on a re-request),
+    # not the old detail-free "pending" message.
+    not_enabled = SimpleNamespace(
+        id="tool_z", name="zlib_tool", description="compress",
+        parameter_names=["input_path"],
+        parameters_schema={"input_path": {"type": "string"},
+                           "output_path": {"type": "string"}},
+        enabled=False,
+    )
+    vault = SimpleNamespace(
+        get_tool=lambda tid: not_enabled,   # stays not-enabled (deploy failed)
+        find_tool_by_name=lambda n: None,
+    )
+    rt = _runtime_stub(vault)
+    ctx = _FakeContext()
+
+    err = "run() got an unexpected keyword argument 'output_path'"
+    monkeypatch.setattr(
+        "systemu.pipelines.tool_deploy.deploy_forged_tool",
+        lambda tool_id, vault, config: {"deployed": False, "reason": err},
+    )
+
+    tools: List[Any] = []
+    tool_index: List[Dict[str, Any]] = []
+    mat = {"materialised": True, "tool": "tool_z"}
+    new_budget = rt._apply_materialised_grant(
+        mat, context=ctx, tools=tools, tool_index=tool_index, current_ab=2, iter_budget=20,
+    )
+
+    # Not callable: nothing appended to the live tool list; budget unchanged.
+    assert new_budget == 20
+    assert tools == [] and tool_index == []
+    # The pending observation now carries the dry-run error + the repair hint.
+    pend = next(o for o in ctx.observations
+                if o.get("type") == "harness_granted_pending")
+    msg = pend["message"]
+    assert "FAILED its automatic dry-run" in msg
+    assert err in msg                  # the actual dry-run error is surfaced
+    assert "parameters_schema" in msg  # generic tool-authoring repair hint
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Failure fallback
 # ─────────────────────────────────────────────────────────────────────────────
