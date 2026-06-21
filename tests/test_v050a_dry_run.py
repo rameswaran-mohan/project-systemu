@@ -140,6 +140,34 @@ class TestPathSandbox:
         assert out["file_path"].endswith(".txt")
         assert out["x"] == "not_a_path"   # unaffected
 
+    def test_input_path_sandboxed_and_test_file_created(self):
+        # v0.9.34.4: input-side keys are now sandboxed AND a test file is created
+        # at the path, so a forged tool that READS a file is dry-runnable.
+        from pathlib import Path as _P
+        from systemu.pipelines.tool_dry_run import _sandbox_paths
+        out = _sandbox_paths({"input_path": "data.bin"})
+        p = _P(out["input_path"])
+        assert p.is_file()             # created on disk, not just a path string
+        assert p.read_bytes()          # has content a reader can consume
+        assert out["input_path"].endswith(".bin")
+
+    def test_output_path_file_created(self):
+        # An output file path also gets a test file (a reading tool finds content;
+        # a writing tool simply overwrites it — harmless).
+        from pathlib import Path as _P
+        from systemu.pipelines.tool_dry_run import _sandbox_paths
+        out = _sandbox_paths({"output_path": "out.json"})
+        assert _P(out["output_path"]).is_file()
+
+    def test_output_dir_creates_directory_not_file(self):
+        # v0.9.34.4 regression guard: a *_dir key must become a real DIRECTORY,
+        # not a file — else a tool that mkdirs / writes into output_dir breaks.
+        from pathlib import Path as _P
+        from systemu.pipelines.tool_dry_run import _sandbox_paths
+        out = _sandbox_paths({"output_dir": "results"})
+        p = _P(out["output_dir"])
+        assert p.is_dir() and not p.is_file()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # dry_run_tool top-level behaviour

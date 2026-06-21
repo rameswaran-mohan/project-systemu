@@ -332,6 +332,13 @@ def _sandbox_paths(params: Dict[str, Any]) -> Dict[str, Any]:
     Recognises common path key names; for the value we look for
     extension-bearing strings or path separators.  Conservative — when
     in doubt, leave the value alone.
+
+    v0.9.34.4: also CREATE a small test file at each sandboxed file path so a
+    forged tool that READS a file is dry-runnable (the dry-run only checks the
+    tool does not crash, not output correctness — any bytes suffice). Input-side
+    key names are included so reading tools are sandboxed consistently with
+    writing ones. Directory-style keys (``*_dir``) get a real directory, not a
+    file, so a tool that writes INTO the dir still works.
     """
     if not params:
         return params
@@ -340,13 +347,27 @@ def _sandbox_paths(params: Dict[str, Any]) -> Dict[str, Any]:
     pathy_keys = {
         "output_path", "file_path", "dest", "destination", "output_dir",
         "path", "filepath", "out", "outfile",
+        # input-side keys, so a tool that READS a file is dry-runnable:
+        "input_path", "input_file", "infile", "in_path", "src", "source", "data_path",
     }
     out: Dict[str, Any] = {}
     for k, v in params.items():
         if k in pathy_keys and isinstance(v, str) and v:
             ext_match = re.search(r"\.(\w{1,5})$", v)
             ext = ext_match.group(0) if ext_match else ""
-            out[k] = str(sandbox / f"{k}{ext}")
+            p = sandbox / f"{k}{ext}"
+            out[k] = str(p)
+            try:
+                if k.endswith("_dir"):
+                    # Directory-style param: create the dir (not a file) so a tool
+                    # that mkdirs / writes into it still works.
+                    p.mkdir(parents=True, exist_ok=True)
+                else:
+                    # Create a small test file so a tool that READS this path finds
+                    # content. (Output tools simply overwrite it; harmless.)
+                    p.write_bytes(b"dry-run test payload\n")
+            except Exception:
+                pass
         else:
             out[k] = v
     return out

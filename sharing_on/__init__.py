@@ -1,3 +1,3 @@
 """sharing_on — Record computer activity, generate step-by-step instructions."""
 
-__version__ = "0.9.34.3"
+__version__ = "0.9.34.4"
