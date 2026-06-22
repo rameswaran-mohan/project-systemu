@@ -1116,6 +1116,36 @@ class Governor:
     _DECISION_PRIORITY = {"grant": 3, "deny": 2, "escalate": 1}
 
     @staticmethod
+    def _granted_tool_names(outcome: dict, kind: str = ""):
+        """The set of callable tool names a GRANT materialised — used to decide
+        granted_used vs granted_unused — or ``None`` when the kind materialises
+        no single named tool (compute/access/skill/subagent), which must NOT be
+        penalised as unused_grant (v0.9.38 Bug 12).
+
+        Keys on the outcome SHAPE so legacy rows classify correctly even without
+        an explicit kind: a TOOL/forge grant carries ``outcome['tool']``; an MCP
+        grant carries ``outcome['mcp']['tools']`` (full dicts) which register as
+        namespaced ``mcp__<server>__<tool>`` names — exactly what shows up in the
+        run's used-tool set."""
+        outcome = outcome or {}
+        tool = outcome.get("tool")
+        if tool:                      # TOOL (forge) — single named tool
+            return {tool}
+        mcp = outcome.get("mcp")
+        if mcp:                       # MCP — namespaced names, as registered
+            server = mcp.get("server_id") or ""
+            try:
+                from systemu.runtime.mcp.sdk.registry_bridge import namespaced_name
+                names = {namespaced_name(server, t.get("name"))
+                         for t in (mcp.get("tools") or [])
+                         if isinstance(t, dict) and t.get("name")}
+                return names or None
+            except Exception:
+                return None
+        # compute / access / skill / subagent — no single materialised tool. N/A.
+        return None
+
+    @staticmethod
     def reconcile_outcomes(ledger_rows, used_tool_names, run_success: bool = True) -> list:
         """Pure: derive ONE ``request-outcome`` event per request_id from a run's
         ledger.
@@ -1155,9 +1185,16 @@ class Governor:
             _pri, row, decision = best[rid]
             req = row.get("request") or {}
             if decision == "grant":
-                tool = (row.get("outcome") or {}).get("tool")
-                used_after = bool(tool and tool in used)
-                outcome = "granted_used" if used_after else "granted_unused"
+                # v0.9.38 Bug 12: resolve materialised tool names PER KIND (TOOL
+                # → outcome['tool']; MCP → namespaced names; compute/access/skill/
+                # subagent → None = N/A). used_after None ⇒ no trackable tool, so
+                # NOT granted_unused (and NOT unused_grant below).
+                names = Governor._granted_tool_names(
+                    row.get("outcome") or {}, req.get("kind", ""))
+                used_after = None if names is None else bool(names & used)
+                outcome = ("granted_used" if used_after is True
+                           else "granted_unused" if used_after is False
+                           else "granted")
             elif decision == "deny":
                 used_after = None
                 outcome = "denied_fallback_ok" if run_success else "denied_fallback_failed"
@@ -1172,6 +1209,7 @@ class Governor:
                     decision=decision,
                     fallback_ok=(run_success if decision == "deny" else None),
                     used_after_grant=used_after,
+                    kind=req.get("kind", ""),   # v0.9.38 Bug 12: kind-aware premature
                 )
             except Exception:
                 category = "unknown"

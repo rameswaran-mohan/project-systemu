@@ -444,25 +444,29 @@ def arbitrate(
     -----
     Default-deny: any kind without a registered arbitrator is ESCALATE HIGH.
     Per-run request cap: when ``requests_this_run >= policy.max_requests_per_run``
-    the request is DENY (non-blocking) or ESCALATE (blocking) before
-    kind-specific logic runs.
+    the request is a hard DENY (blocking and non-blocking alike) before
+    kind-specific logic runs, so a capped run reaches a terminal instead of
+    suspending. See the v0.9.38 Bug 13 note at the cap check below.
     """
     ctx = context or {}
 
     # ── 1. Per-run request cap ─────────────────────────────────────────────
+    # v0.9.38 Bug 13: the cap is a HARD limit — DENY even for blocking requests.
+    # A blocking ESCALATE here suspended the run for operator approval, which on
+    # the subagent re-delegation path looped (escalate→suspend→approve→resume→
+    # re-request) until the resume budget ran out, leaving the run PARKED
+    # (suspended_harness_escalation) — never terminal, so its grants never
+    # reconciled. DENY instead: the run continues and drives to a terminal
+    # (COMPLETE/FAIL) with current capabilities, and the cap resets next run.
     requests_this_run: int = int(ctx.get("requests_this_run", 0))
     if requests_this_run >= policy.max_requests_per_run:
-        alts = ["wait for the next run", "batch capabilities before starting"]
-        if not request.blocking:
-            return _result(
-                request, HarnessDecision.DENY, RiskBand.HIGH,
-                f"Per-run request cap ({policy.max_requests_per_run}) exceeded.",
-                alternatives=alts,
-            )
         return _result(
-            request, HarnessDecision.ESCALATE, RiskBand.HIGH,
-            f"Per-run request cap ({policy.max_requests_per_run}) exceeded — "
-            "operator must allow more requests or restart the run.",
+            request, HarnessDecision.DENY, RiskBand.HIGH,
+            f"Per-run request cap ({policy.max_requests_per_run}) exceeded — no "
+            "more capability requests this run. Proceed with current capabilities "
+            "and COMPLETE or FAIL; the cap resets on the next run.",
+            alternatives=["proceed with current capabilities and complete",
+                          "batch capabilities before starting the next run"],
         )
 
     # ── 2. Kind-specific arbitration ──────────────────────────────────────

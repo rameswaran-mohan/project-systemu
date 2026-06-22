@@ -191,7 +191,7 @@ def _build_layout(page_title: str, current_path: str):
             ):
                 if _BRAND_LOGO.exists():
                     ui.image(str(_BRAND_LOGO)).style(
-                        "width: 28px; height: 28px; border-radius: 7px; "
+                        "width: 34px; height: 34px; border-radius: 8px; "
                         "flex: 0 0 auto;")
                 else:
                     ui.icon("bolt").style(f"font-size: 26px; color: {THEME['primary']};")
@@ -224,7 +224,12 @@ def _build_layout(page_title: str, current_path: str):
                 ):
                     icon_color = THEME["primary"] if is_active else THEME["text_muted"]
                     ui.icon(icon).style(
-                        f"min-width: 22px; font-size: 20px; color: {icon_color};"
+                        # Fixed 22px centered box so every glyph (incl. wide ones)
+                        # stays in the same column — narrow/wide icons no longer
+                        # shift the nav alignment.
+                        f"flex: 0 0 22px; display: inline-flex; align-items: center; "
+                        f"justify-content: center; font-size: 20px; line-height: 1; "
+                        f"color: {icon_color};"
                     )
                     ui.label(label).classes("s-sidebar-label")
 

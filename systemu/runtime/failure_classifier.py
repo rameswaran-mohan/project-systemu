@@ -299,6 +299,7 @@ def classify_pull_failure(
     decision: str,
     fallback_ok: Optional[bool],
     used_after_grant: Optional[bool],
+    kind: str = "",
 ) -> str:
     """Classify a *pull-decision* (reverse-harness) failure mode.
 
@@ -324,7 +325,12 @@ def classify_pull_failure(
 
     Rules (first match wins):
         * ``premature_request`` — a request was made with no prior tool
-          attempts (``attempts_before < 1``).
+          attempts (``attempts_before < 1``) **for a kind where trying a local
+          tool first is expected** (``tool``/``skill``). For concrete-gap kinds
+          (``access``/``mcp``/``compute``/``subagent``) there is no local
+          alternative to try, so an immediate request is correct, not premature
+          (v0.9.38 Bug 12). With ``kind`` unset the rule is conservative — it
+          does NOT flag premature.
         * ``wasted_request``    — the request was denied yet a viable
           fallback existed (``decision == "deny"`` and ``fallback_ok``).
         * ``unused_grant``      — a grant was issued but never invoked
@@ -332,6 +338,7 @@ def classify_pull_failure(
         * ``unknown``           — none of the above.
     """
     decision = (decision or "").strip().lower()
+    kind = (kind or "").strip().lower()
     request_made = bool(decision)
 
     try:
@@ -339,7 +346,7 @@ def classify_pull_failure(
     except (TypeError, ValueError):
         attempts = 0
 
-    if request_made and attempts < 1:
+    if request_made and attempts < 1 and kind in ("tool", "skill"):
         return "premature_request"
     if decision == "deny" and bool(fallback_ok):
         return "wasted_request"

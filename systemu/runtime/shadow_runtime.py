@@ -2422,14 +2422,24 @@ class ShadowRuntime:
                 }, current_ab)
             elif mat.get("subagent"):
                 # ── SUBAGENT: delegation capability granted ──
+                # v0.9.38 Bug 13: TERMINAL framing (mirrors the native fleet
+                # branch). The old "decompose and proceed" wording invited the
+                # agent to keep issuing kind=subagent requests, which on the
+                # escalate→suspend→approve→resume path looped until the request
+                # cap / resume budget ran out and the run ended parked
+                # (suspended_harness_escalation), never finalizing or
+                # reconciling. Tell it to PROCEED and COMPLETE, not re-request.
                 _sa = mat.get("subagent") or {}
                 context.add_observation({
                     "type": "harness_granted",
                     "message": (
                         "Sub-agent delegation granted for: "
-                        f"{str(_sa.get('task', ''))[:160]}. Decompose and proceed within "
-                        "the granted depth/budget."
+                        f"{str(_sa.get('task', ''))[:160]}. Proceed with the work and "
+                        "COMPLETE the objective now — do NOT request more sub-agents; "
+                        "request another only for a distinct, named sub-task you "
+                        "genuinely cannot do yourself."
                     ),
+                    "fleet": {"terminal": True},
                 }, current_ab)
             elif mat.get("mcp"):
                 # ── MCP: register discovered tools into the LIVE v2 registry ──

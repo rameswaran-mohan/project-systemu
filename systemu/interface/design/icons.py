@@ -11,7 +11,7 @@ ICONS = {
     "work": "list_alt",
     "shadow": "smart_toy",
     "build": "construction",
-    "insights": "monitoring",
+    "insights": "insights",
     "settings": "settings",
     "inbox": "inbox",
     "record": "fiber_manual_record",

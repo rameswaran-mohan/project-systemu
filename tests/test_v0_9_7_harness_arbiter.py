@@ -369,13 +369,18 @@ class TestInputKind:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRequestCap:
-    def test_cap_exceeded_blocking_is_escalate(self):
+    def test_cap_exceeded_blocking_is_deny(self):
+        # v0.9.38 Bug 13: a capped *blocking* request now DENIES (was ESCALATE).
+        # A blocking ESCALATE here suspended the run, which on the sub-agent
+        # re-delegation path looped (escalate→suspend→approve→resume→re-request)
+        # until parked. DENY drives the run to a terminal instead.
         policy = default_policy(max_requests_per_run=3)
         r = req(HarnessKind.SKILL, spec={"name": "any"}, blocking=True)
         ctx = {"requests_this_run": 3}
         result = arb(r, policy=policy, context=ctx)
-        assert decision_of(result) == HarnessDecision.ESCALATE
+        assert decision_of(result) == HarnessDecision.DENY
         assert band_of(result) == RiskBand.HIGH
+        assert len(verdict_of(result).alternatives) >= 1
 
     def test_cap_exceeded_non_blocking_is_deny(self):
         policy = default_policy(max_requests_per_run=3)

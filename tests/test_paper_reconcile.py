@@ -63,7 +63,7 @@ def test_reconcile_includes_pull_failure_category():
          "verdict": {"decision": "grant"}, "outcome": {"tool": "tu"}, "execution_id": "e"},
         {"request": {"request_id": "g_unused", "attempts_before": 2},
          "verdict": {"decision": "grant"}, "outcome": {"tool": "tx"}, "execution_id": "e"},
-        {"request": {"request_id": "premature", "attempts_before": 0},
+        {"request": {"request_id": "premature", "attempts_before": 0, "kind": "tool"},
          "verdict": {"decision": "grant"}, "outcome": {"tool": "tp"}, "execution_id": "e"},
         {"request": {"request_id": "deny", "attempts_before": 3},
          "verdict": {"decision": "deny"}, "outcome": {}, "execution_id": "e"},

@@ -153,6 +153,15 @@ class LocalBackend:
         import subprocess
 
         def _run_sync():
+            # v0.9.38 Bug 14: ensure the CWD exists before launching. A missing
+            # vault_root made subprocess.run raise WinError 267 ("the directory
+            # name is invalid") on Windows, which the forge dry-run reported as a
+            # tool failure and withheld an otherwise-correct forged tool.
+            try:
+                self.vault_root.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logger.debug("[LocalBackend] could not ensure cwd %s",
+                             self.vault_root, exc_info=True)
             return subprocess.run(
                 cmd,
                 capture_output=True,
@@ -190,4 +199,22 @@ class LocalBackend:
         for key in _SAFE_ENV_KEYS:
             if key in os.environ:
                 env[key] = os.environ[key]
+        # v0.9.38 Bug 14: guarantee the running interpreter's directory (and its
+        # Scripts dir) is on PATH so a forged tool that shells out to bare
+        # ``python``/``pip`` resolves it. The daemon is often launched via an
+        # absolute interpreter path with Python NOT on PATH, which made such
+        # tools' dry-run fail with exit 9009 (command not found) and get withheld.
+        try:
+            py_dir = os.path.dirname(sys.executable)
+            if py_dir:
+                parts = [py_dir]
+                scripts = os.path.join(py_dir, "Scripts")  # Windows console entry points
+                if os.path.isdir(scripts):
+                    parts.insert(0, scripts)
+                if env.get("PATH"):
+                    parts.append(env["PATH"])
+                env["PATH"] = os.pathsep.join(parts)
+        except Exception:
+            logger.debug("[LocalBackend] could not augment PATH with interpreter dir",
+                         exc_info=True)
         return env

@@ -155,11 +155,23 @@ class TestPullCategoriesPresent:
 
 class TestClassifyPullFailure:
     def test_premature_request(self):
+        # v0.9.38 Bug 12: premature is kind-aware — only kinds where a local
+        # attempt is expected (tool/skill) flag premature at attempts<1.
         out = fc.classify_pull_failure(
             attempts_before=0, decision="request",
-            fallback_ok=None, used_after_grant=None,
+            fallback_ok=None, used_after_grant=None, kind="tool",
         )
         assert out == "premature_request"
+
+    def test_premature_not_flagged_for_concrete_gap_kinds(self):
+        # access/mcp/compute/subagent have no local alternative — an immediate
+        # request at attempts_before=0 is correct, NOT premature.
+        for k in ("access", "mcp", "compute", "subagent"):
+            out = fc.classify_pull_failure(
+                attempts_before=0, decision="request",
+                fallback_ok=None, used_after_grant=None, kind=k,
+            )
+            assert out != "premature_request", f"{k} wrongly flagged premature"
 
     def test_wasted_request(self):
         out = fc.classify_pull_failure(
