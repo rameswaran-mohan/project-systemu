@@ -1,0 +1,18 @@
+{
+  "id": "skill_d6965792",
+  "name": "system_command_execution",
+  "description": "Proficiency in running shell commands and interpreting their output",
+  "category": "system",
+  "proficiency_level": "intermediate",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_f2891457"
+  ],
+  "required_tool_names": [
+    "run_command"
+  ],
+  "instructions_md": "To run system commands: 1) Use run_command with the full command string — shell=True is used internally. 2) Always check return_code: 0 = success, non-zero = error. 3) Set a timeout appropriate to the command duration — default is 30 seconds. 4) Use cwd to set the working directory for relative paths in the command. 5) For potentially destructive commands (rm, del, format), always confirm the target path before executing.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_d6965792\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

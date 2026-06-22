@@ -1,0 +1,46 @@
+{
+  "id": "tool_a768204a",
+  "name": "compress_files",
+  "description": "Compress files into a ZIP archive",
+  "tool_type": "file_operation",
+  "parameters_schema": {
+    "output_path": {
+      "type": "string",
+      "description": "Path for the output zip file"
+    },
+    "files": {
+      "type": "array",
+      "description": "List of file paths to include",
+      "default": []
+    },
+    "include_dir": {
+      "type": "string",
+      "description": "Add all files from this directory",
+      "default": ""
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "output_path": {
+      "type": "string"
+    },
+    "file_count": {
+      "type": "integer"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/compress_files.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_a768204a\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

@@ -1,0 +1,41 @@
+{
+  "id": "tool_102dd317",
+  "name": "notify_desktop",
+  "description": "Show a desktop notification or toast message",
+  "tool_type": "cli_command",
+  "parameters_schema": {
+    "title": {
+      "type": "string",
+      "description": "Notification title"
+    },
+    "message": {
+      "type": "string",
+      "description": "Notification body text"
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "Auto-dismiss after N seconds",
+      "default": 5
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [
+    "plyer"
+  ],
+  "implementation_path": "vault/tools/implementations/notify_desktop.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_102dd317\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

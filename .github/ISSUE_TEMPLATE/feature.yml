@@ -1,0 +1,69 @@
+name: Feature request
+description: Suggest a new capability or improvement
+title: "[Feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion!  The clearer the use case, the
+        easier it is to scope and prioritise.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What's the user-facing problem this would solve?
+      placeholder: |
+        "When I'm submitting a Scroll for the third time, I have to
+        re-approve the same tool gates each run.  This is friction
+        for repeat workflows."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How would you like it to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Other approaches you considered, and why this one is better.
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where would this live?
+      multiple: true
+      options:
+        - Dashboard UI
+        - Sharing-On capture
+        - Systemu runtime / Supervisor
+        - Tool registry / Workshop
+        - REST / CLI surface
+        - Docs / DX
+        - Other / I'm not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: success
+    attributes:
+      label: How would we know it's working?
+      description: Specific, observable success criteria.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and didn't find a duplicate
+          required: true
+        - label: This is a single, focused proposal (not a roadmap)
+          required: true

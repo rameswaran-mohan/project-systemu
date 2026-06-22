@@ -1,0 +1,42 @@
+{
+  "id": "tool_711517c3",
+  "name": "file_append",
+  "description": "Append text to an existing file, creating it if it does not exist",
+  "tool_type": "file_operation",
+  "parameters_schema": {
+    "path": {
+      "type": "string",
+      "description": "File path"
+    },
+    "content": {
+      "type": "string",
+      "description": "Text to append"
+    },
+    "encoding": {
+      "type": "string",
+      "description": "Encoding",
+      "default": "utf-8"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "path": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/file_append.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_711517c3\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

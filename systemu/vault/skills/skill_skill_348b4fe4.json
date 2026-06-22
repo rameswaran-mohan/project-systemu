@@ -1,0 +1,28 @@
+{
+  "id": "skill_348b4fe4",
+  "name": "file_management",
+  "description": "Proficiency in reading, writing, copying, and organizing files on the local filesystem",
+  "category": "file_ops",
+  "proficiency_level": "beginner",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_8c300ad3",
+    "tool_3b4a8d90",
+    "tool_83fa14e5",
+    "tool_acd741cb",
+    "tool_1f0bb1cf",
+    "tool_711517c3"
+  ],
+  "required_tool_names": [
+    "file_read",
+    "file_write",
+    "file_copy",
+    "file_delete",
+    "file_list_dir",
+    "file_append"
+  ],
+  "instructions_md": "For file operations: 1) Always expand ~ in paths — tools handle this automatically. 2) Use file_read before overwriting to verify you have the right content. 3) Use file_list_dir with a glob pattern to discover files (e.g. \"*.docx\", \"**/*.csv\"). 4) Prefer file_append for log-style writes to avoid overwriting existing content. 5) Before file_delete, confirm the path is the correct target — deletions are irreversible.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_348b4fe4\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

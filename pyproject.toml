@@ -1,0 +1,174 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "systemu"
+version = "0.9.36"
+description = "Record computer activity and generate step-by-step instructions"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    # --- Capture engine (sharing_on) ---
+    "mss>=9.0.0",
+    "psutil>=5.9.0",
+    "watchdog>=3.0.0",
+    "Pillow>=10.0.0",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "click>=8.0.0",
+    # v0.7-a-fix: pynput restricted to Windows.  It needs Xcode CLI tools
+    # on macOS and X11 dev headers on Linux; on headless CI it fails to
+    # install.  The sharing_on capture engine only uses pynput on Windows
+    # anyway — the Mac + Linux capture paths use pyobjc / pyatspi.
+    "pynput>=1.7.0; sys_platform == 'win32'",
+    "uiautomation>=2.0.0; sys_platform == 'win32'",
+    "pyobjc-core>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+    # NOTE: pyatspi (Linux AT-SPI bindings) is intentionally NOT listed here.
+    # It is distributed via system packages (`apt install python3-pyatspi`),
+    # not PyPI — pip cannot resolve it, breaking install on Linux CI.  The
+    # Linux introspector wraps the import in try/except, so the dep is
+    # optional at runtime.  Linux users who want full UI introspection
+    # should install the system package and grant their venv access to it
+    # (or pip install python3-pyatspi-wrapper if a maintained wheel ever
+    # appears on PyPI).
+    "playwright>=1.50.0",
+
+    # --- v0.7-a-fix2: runtime stack ---
+    # These were previously only in requirements.txt (a Windows-frozen
+    # lockfile that CI no longer installs).  Dashboard + vault + queue +
+    # scheduler need them to import; tests that exercise the dashboard
+    # (e.g. tests/test_recovery_panel.py) fail with ModuleNotFoundError
+    # if they are missing.  Listed at the loosest version that works.
+    "nicegui>=2.0",        # dashboard UI (Phase A/B/C/D/F pages)
+    "sqlalchemy>=2.0",     # vault ORM
+    "alembic>=1.13",       # vault migrations
+    "huey>=2.5",           # task queue (SQLite + Redis broker)
+    "apscheduler>=3.11",   # daemon's periodic jobs
+    "pydantic>=2.0",       # vault Pydantic models
+    "httpx>=0.27",         # used by the Ollama provider + general http
+    "mcp>=1.0",            # v0.9.36 P2: official MCP client/server SDK (isolated under runtime/mcp/sdk)
+    "pyyaml>=6.0",         # config + skill migrator + skill exporter
+    "ddgs>=9.14",
+    "keyring>=24",
+
+    # --- W12-B1: the starter tool pack works from `pip install systemu` ---
+    # Every pip dep the curated 41-tool seed pack declares ships with the
+    # core install (ship-readiness R3/R5: no dep-approval interruptions on
+    # first use; tests/test_starter_pack_conformance.py pins this).
+    "requests>=2.31",      # fetch_json / fetch_html / download_file / api_call_get / web_extract
+    "jsonschema>=4.0",     # extract_records / web_extract
+    "openpyxl>=3.1",       # create/read_excel_sheet
+    "python-docx>=1.1",    # create/read_word_doc
+    "pyperclip>=1.8",      # clipboard_read / clipboard_write
+    "plyer>=2.1",          # notify_desktop
+
+    # --- W13.2a: packages forged tools most commonly request ---------------
+    # Evidence: the field dep-approval store + forge history (geopy was the
+    # first operator-approved package; data/scrape/date work dominates forge
+    # asks). Bundling them removes the most frequent approval interruption;
+    # anything NOT bundled still gets the one-click Inbox approve (W13.2b).
+    "pandas>=2.0",         # tabular work — the most common forge ask
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",           # bs4's fast parser + xml tooling
+    "geopy>=2.4",          # location lookups (get_current_location et al)
+    "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+# Three install modes — pick one with: pip install -e ".[<mode>]"
+#   local            — native Python, SQLite vault + Huey-SQLite broker
+#   docker-local     — docker-compose, Postgres vault + Huey-SQLite broker
+#   docker-enterprise — docker-compose, Postgres vault + Huey-Redis broker
+
+# Native LLM provider extras (v0.7-e):
+#   anthropic        — native Anthropic SDK for claude-* models
+#   openai-native    — native OpenAI SDK (already in core deps)
+anthropic = ["anthropic>=0.40"]
+openai-native = []  # uses existing openai dep
+
+# v0.7-f: first out-of-tree plugin — Browser-Use wraps Playwright
+# with an LLM-driven agent loop.
+browser-use = ["browser-use>=0.5", "playwright>=1.40"]
+
+# v0.7-g: Mem0 long-term memory backend (opt-in swap-in for the default
+# filesystem JSONL+MD layout).  Select at runtime with
+# SYSTEMU_MEMORY_BACKEND=mem0.
+mem0 = ["mem0ai>=0.2"]
+
+local = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "huey>=2.5",
+    "apscheduler>=3.10",
+]
+docker-local = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "huey>=2.5",
+    "apscheduler>=3.10",
+    "psycopg2-binary>=2.9",
+]
+docker-enterprise = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "huey>=2.5",
+    "apscheduler>=3.10",
+    "psycopg2-binary>=2.9",
+    "redis>=4.0",
+]
+
+# NOTE: Legacy extras `[sqlite]` and `[postgres]` were removed in this release.
+# Use `[local]` (sqlite/alembic/huey) or `[docker-enterprise]` (+ postgres + redis)
+# instead.  See README.md "Quick Start" for the install matrix.
+
+[project.scripts]
+sharing_on = "sharing_on.cli:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "linux_only: tests that only run on Linux (playwright, posix-only paths)",
+    "docker_required: tests that need a docker daemon",
+    "e2e: end-to-end live tests (skipped by default)",
+    "smoke: boot the real dashboard + exercise it on uvicorn's serving loop (opt-in pre-release gate)",
+    "slow: long-running tests",
+]
+
+[tool.setuptools]
+# v0.8.10: ship non-Python data files (the vault seed + tool implementations)
+# inside the wheel.  Combined with the package-data globs below, this makes a
+# bare `pip install systemu` carry the curated tool pack + Wild Card shadow so
+# the daemon boots with a working capability set out of the box.
+include-package-data = true
+
+[tool.setuptools.packages.find]
+# Both top-level packages are part of the editable install:
+#   * sharing_on  — the capture engine (declared as the PyPI package above)
+#   * systemu     — the runtime, pipelines, interface, and starter vault
+# The legacy rename-compat shim was removed in v0.3 per the deprecation
+# window declared in v0.2's MIGRATION.md.
+include = ["sharing_on*", "systemu*"]
+
+[tool.setuptools.package-data]
+# v0.7.3 Bug #6 fix — pip wheel must include LLM prompt templates and the
+# starter skill/tool registry. Without these, every analyze / scroll-refine /
+# skill-export call from a pip-installed copy fails with FileNotFoundError.
+"sharing_on" = ["analyzer/prompts/*.md"]
+# v0.8.10: also ship the vault seed (curated tool pack + Wild Card shadow) and
+# the tool implementations from the top-level `systemu` package so a bare wheel
+# install carries a working capability set.
+"systemu" = [
+    "prompts/*.md",
+    "vault/**/*.json",
+    "vault/tools/implementations/*.py",
+    "vault/**/*.md",
+    # W4.3: locally-vendored dashboard fonts (Inter + JetBrains Mono woff2)
+    # served at /assets/fonts — must ship in the wheel or the pip-installed
+    # dashboard falls back to system fonts.
+    "interface/assets/fonts/*.woff2",
+    "interface/assets/fonts/*.txt",
+]
+"systemu.vault" = ["**/*.json", "**/*.md", "**/*.py"]

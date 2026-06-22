@@ -1,0 +1,325 @@
+# Systemu — Docker Compose
+#
+# Three deployment profiles — pick one with --profile:
+#
+#   docker compose up systemu                          ← default, file backend (legacy)
+#       Single container, JSON vault, no DB / queue services.
+#       Kept for backwards compatibility; not selected by install.py.
+#
+#   docker compose --profile local up                  ← docker-local
+#       Postgres + dashboard + worker (single replica).
+#       Huey broker is SQLite over a shared volume.
+#       Recommended for hobbyist self-hosting on a single box.
+#
+#   docker compose --profile enterprise up             ← docker-enterprise
+#       Postgres + Redis + dashboard + N workers (scale via WORKER_REPLICAS).
+#       Huey broker is Redis; Supervisor's durable queue is Redis-backed.
+#       Recommended for production / multi-host deployments.
+#
+#   docker compose --profile docker-sandbox up systemu-docker
+#       Tools execute inside ephemeral containers (Docker-in-Docker).
+#       Orthogonal to the storage/queue choice above.
+#
+# Selection is normally driven by install.py — operators rarely invoke the
+# raw compose commands.  All persistent data lives in named volumes:
+#   pg_data       Postgres data
+#   huey_data     SQLite Huey broker file (docker-local only)
+#   vault_data    legacy JSON vault (docker-local migration window)
+#   redis_data    Redis AOF (docker-enterprise only)
+
+services:
+
+  # ─── Default: file backend, single container (legacy / pre-installer) ────
+  # Profile gates this — otherwise `docker compose --profile local up`
+  # would also auto-start this no-profile service and collide on container
+  # name "/systemu" plus port 8765.  Operators who want the legacy file
+  # backend invoke it explicitly:  docker compose --profile legacy up systemu
+  systemu:
+    build: .
+    image: systemu:latest
+    container_name: systemu
+    ports:
+      - "${SYSTEMU_PORT:-8765}:8765"
+    volumes:
+      - vault_data:/data/vault
+      - ${SYSTEMU_HOST_OUTPUTS_DIR:-./outputs}:/app/systemu/outputs
+    env_file:
+      - .env
+    environment:
+      SYSTEMU_MODE: "file-legacy"
+      SYSTEMU_STORAGE: "file"
+      SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
+      SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
+    restart: unless-stopped
+    profiles: ["legacy"]
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # docker-local profile — Postgres vault + Huey-SQLite broker
+  # ──────────────────────────────────────────────────────────────────────────
+
+  postgres-local:
+    image: postgres:16-alpine
+    container_name: systemu-postgres-local
+    # v0.6.6-a: expose Postgres on the host so `sharing_on record` running
+    # on the host can reach the container's vault for the capture-and-analyze
+    # flow.  Default 127.0.0.1:5432 is loopback-only (same security boundary
+    # as the dashboard's already-exposed port 8765).  Operators on shared
+    # hosts can opt out by setting SYSTEMU_DB_BIND= empty in .env.  Enterprise
+    # mode does NOT expose by default; see the `postgres` service below.
+    ports:
+      - "${SYSTEMU_DB_BIND:-127.0.0.1:5432}:5432"
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-systemu}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-systemu}"
+      POSTGRES_DB: "${POSTGRES_DB:-systemu}"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-systemu} -d ${POSTGRES_DB:-systemu}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles: ["local"]
+
+  systemu-dashboard-local:
+    build: .
+    image: systemu:latest
+    container_name: systemu-dashboard-local
+    ports:
+      - "${SYSTEMU_PORT:-8765}:8765"
+    volumes:
+      - vault_data:/data/vault
+      - huey_data:/app/data
+      - ${SYSTEMU_HOST_OUTPUTS_DIR:-./outputs}:/app/systemu/outputs
+    env_file:
+      - .env
+    environment:
+      SYSTEMU_MODE: "docker-local"
+      SYSTEMU_STORAGE: "postgres"
+      SYSTEMU_DATABASE_URL: "postgresql://${POSTGRES_USER:-systemu}:${POSTGRES_PASSWORD:-systemu}@postgres-local:5432/${POSTGRES_DB:-systemu}"
+      SYSTEMU_QUEUE: "huey"
+      SYSTEMU_QUEUE_BROKER: "sqlite"
+      HUEY_SQLITE_PATH: "/app/data/huey.db"
+      SYSTEMU_VAULT_DIR: "/data/vault"
+      SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
+      SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
+    depends_on:
+      postgres-local:
+        condition: service_healthy
+        # v0.7.3 Bug #15 fix — restart dashboard if dep-health detection races
+        # on first compose up (Docker engine returned 500 on first attempt).
+        restart: true
+    # v0.7.3 Bug #15 fix — longer warm-up window so the daemon has time to
+    # run alembic migrations + initial vault scan before the healthcheck fires.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8765/ || exit 1"]
+      start_period: 45s
+      retries: 8
+      interval: 5s
+      timeout: 5s
+    restart: unless-stopped
+    profiles: ["local"]
+
+  systemu-worker-local:
+    build: .
+    image: systemu:latest
+    container_name: systemu-worker-local
+    command: python -m systemu.worker
+    volumes:
+      - vault_data:/data/vault
+      - huey_data:/app/data
+      - ${SYSTEMU_HOST_OUTPUTS_DIR:-./outputs}:/app/systemu/outputs
+    env_file:
+      - .env
+    environment:
+      SYSTEMU_MODE: "docker-local"
+      SYSTEMU_STORAGE: "postgres"
+      SYSTEMU_DATABASE_URL: "postgresql://${POSTGRES_USER:-systemu}:${POSTGRES_PASSWORD:-systemu}@postgres-local:5432/${POSTGRES_DB:-systemu}"
+      SYSTEMU_QUEUE: "huey"
+      SYSTEMU_QUEUE_BROKER: "sqlite"
+      HUEY_SQLITE_PATH: "/app/data/huey.db"
+      SYSTEMU_VAULT_DIR: "/data/vault"
+      SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
+      HUEY_WORKERS: "${HUEY_WORKERS:-4}"
+    depends_on:
+      postgres-local:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["local"]
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # docker-enterprise profile — Postgres vault + Redis broker + scaled workers
+  # ──────────────────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: systemu-postgres
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-systemu}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-systemu}"
+      POSTGRES_DB: "${POSTGRES_DB:-systemu}"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-systemu} -d ${POSTGRES_DB:-systemu}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles: ["enterprise"]
+
+  # The healthcheck and command lines below mix two layers of variable
+  # interpolation:
+  #   ${REDIS_PASSWORD:-}     — Compose-side; resolved at `docker compose up` time
+  #                              from the host environment / .env file.
+  #   $$REDIS_PASSWORD         — Compose-escaped literal `$REDIS_PASSWORD`,
+  #                              passed through verbatim and expanded by the
+  #                              container's shell using the env var Compose
+  #                              injected into the container.
+  # The `${REDIS_PASSWORD:+-a $$REDIS_PASSWORD}` expression therefore reads:
+  # if Compose sees a non-empty password on the host, render `-a $REDIS_PASSWORD`
+  # for the in-container shell to expand.  Edit with care — single $ vs $$
+  # changes which layer does the substitution.
+  redis:
+    image: redis:7-alpine
+    container_name: systemu-redis
+    command: >
+      sh -c '
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+        else
+          redis-server --appendonly yes
+        fi
+      '
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+-a $$REDIS_PASSWORD} ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    profiles: ["enterprise"]
+
+  systemu-dashboard:
+    build: .
+    image: systemu:latest
+    container_name: systemu-dashboard
+    ports:
+      - "${SYSTEMU_PORT:-8765}:8765"
+    volumes:
+      - vault_data:/data/vault
+      - ${SYSTEMU_HOST_OUTPUTS_DIR:-./outputs}:/app/systemu/outputs
+    env_file:
+      - .env
+    environment:
+      SYSTEMU_MODE: "docker-enterprise"
+      SYSTEMU_STORAGE: "postgres"
+      SYSTEMU_DATABASE_URL: "postgresql://${POSTGRES_USER:-systemu}:${POSTGRES_PASSWORD:-systemu}@postgres:5432/${POSTGRES_DB:-systemu}"
+      SYSTEMU_QUEUE: "huey"
+      SYSTEMU_QUEUE_BROKER: "redis"
+      # REDIS_AUTH convention: install.py writes either ":password@" (with
+      # password) or "" (no auth).  The result is a syntactically-valid
+      # `redis://USERINFO@HOST:PORT/DB` URL in both cases.  Do NOT set
+      # REDIS_AUTH=password directly — that would produce `redis://passwordredis:6379`.
+      SYSTEMU_REDIS_URL: "redis://${REDIS_AUTH:-}redis:6379/0"
+      SYSTEMU_VAULT_DIR: "/data/vault"
+      SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
+      SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
+    depends_on:
+      postgres:
+        condition: service_healthy
+        restart: true   # v0.7.3 Bug #15 — retry on dep-health race
+      redis:
+        condition: service_healthy
+        restart: true   # v0.7.3 Bug #15 — same race risk for redis
+    # v0.7.3 Bug #15 — longer warm-up window
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8765/ || exit 1"]
+      start_period: 45s
+      retries: 8
+      interval: 5s
+      timeout: 5s
+    restart: unless-stopped
+    profiles: ["enterprise"]
+
+  systemu-worker:
+    build: .
+    image: systemu:latest
+    command: python -m systemu.worker
+    volumes:
+      - vault_data:/data/vault
+      - ${SYSTEMU_HOST_OUTPUTS_DIR:-./outputs}:/app/systemu/outputs
+    env_file:
+      - .env
+    environment:
+      SYSTEMU_MODE: "docker-enterprise"
+      SYSTEMU_STORAGE: "postgres"
+      SYSTEMU_DATABASE_URL: "postgresql://${POSTGRES_USER:-systemu}:${POSTGRES_PASSWORD:-systemu}@postgres:5432/${POSTGRES_DB:-systemu}"
+      SYSTEMU_QUEUE: "huey"
+      SYSTEMU_QUEUE_BROKER: "redis"
+      SYSTEMU_REDIS_URL: "redis://${REDIS_AUTH:-}redis:6379/0"
+      SYSTEMU_VAULT_DIR: "/data/vault"
+      SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
+      HUEY_WORKERS: "${HUEY_WORKERS:-4}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+    restart: unless-stopped
+    profiles: ["enterprise"]
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # docker-sandbox profile — tool execution isolated in ephemeral containers
+  # (orthogonal to the storage/queue choice; can layer on top of either mode)
+  # ──────────────────────────────────────────────────────────────────────────
+
+  systemu-docker:
+    build: .
+    image: systemu:latest
+    container_name: systemu-docker
+    ports:
+      - "${SYSTEMU_PORT:-8765}:8765"
+    volumes:
+      - vault_data:/data/vault
+      - ${SYSTEMU_HOST_OUTPUTS_DIR:-./outputs}:/app/systemu/outputs
+      - /var/run/docker.sock:/var/run/docker.sock
+      - pip_cache:/root/.cache/pip
+    env_file:
+      - .env
+    environment:
+      SYSTEMU_STORAGE: "file"
+      SYSTEMU_TOOL_BACKEND: "docker"
+      SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
+      SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # v0.8.0.3: dashboard project root. Captures, refine handoff, and
+      # subprocess CWDs anchor here. /data is the mounted volume root so
+      # captures/ ends up at /data/captures/ alongside /data/vault/.
+      SYSTEMU_PROJECT_ROOT: "/data"
+    restart: unless-stopped
+    profiles: ["docker-sandbox"]
+
+volumes:
+  vault_data:
+  pg_data:
+  huey_data:
+  redis_data:
+  pip_cache:

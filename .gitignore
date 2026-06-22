@@ -1,0 +1,99 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# v0.8.18: tool credential fallback store (secrets — never commit)
+.credentials.json
+**/.credentials.json
+
+# ── Personal usage data (sharing_on capture sessions) ────────────────────────
+captures/
+systemu/captures/
+
+# ── Runtime databases and vault data ─────────────────────────────────────────
+data/
+.vault/
+
+# Vault runtime data — keep starter configs (tools/, shadow_army/, skills/)
+# but exclude personal sessions, activity logs, and memory blobs
+systemu/vault/activities/
+systemu/vault/executions/
+systemu/vault/evolutions/
+systemu/vault/notifications/
+systemu/vault/elder/
+systemu/vault/scrolls/*.json
+systemu/vault/shadow_army/shadow_shadow_*/
+# Runtime shadows are ignored; the ONE seeded Wild Card is the sole exception
+# so the fresh seed ships exactly one shadow. Do NOT un-ignore other shadow dirs.
+!systemu/vault/shadow_army/shadow_shadow_wildcard/
+!systemu/vault/shadow_army/shadow_shadow_wildcard/**
+
+# ── Database files ────────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ── Log files ─────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Shadow outputs (files generated during shadow execution) ──────────────────
+outputs/*
+!outputs/.gitkeep
+
+# ── Queue persistence ─────────────────────────────────────────────────────────
+supervisor_queue.json
+supervisor_queue.json.bak
+memory_consolidation_meta.json
+
+# ── Process / lock files ──────────────────────────────────────────────────────
+*.pid
+.systemu_daemon.pid
+.systemu_worker.pid
+
+# ── Installer-written runtime markers ─────────────────────────────────────────
+.systemu_mode
+
+# ── Operator-local Compose overrides (keep .example, ignore actual file) ─────
+docker-compose.override.yml
+
+# ── Python artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments (never commit) ───────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Test / CI artifacts ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+# Stray dirs created when a test passes a MagicMock() as a vault root path.
+MagicMock/
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Alembic ───────────────────────────────────────────────────────────────────
+alembic/versions/*.pyc

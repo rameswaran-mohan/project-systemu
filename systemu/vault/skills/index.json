@@ -1,0 +1,258 @@
+[
+  {
+    "id": "skill_a6c20d49",
+    "name": "web_data_capture",
+    "description": "Proficiency in fetching, rendering, and capturing data from web pages using programmatic browser automation",
+    "category": "browser",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "web_screenshot",
+      "web_read"
+    ],
+    "required_tool_ids": [
+      "tool_web_screenshot",
+      "tool_web_read"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_27f45331",
+    "name": "web_search_and_research",
+    "description": "Ability to search the web, evaluate results, and extract relevant information for a research objective",
+    "category": "browser",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "web_search",
+      "web_read",
+      "fetch_html"
+    ],
+    "required_tool_ids": [
+      "tool_web_search",
+      "tool_web_read",
+      "tool_70a65c87"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_76a9a962",
+    "name": "document_creation",
+    "description": "Proficiency in creating formatted Word documents with text content and embedded images",
+    "category": "file_ops",
+    "proficiency_level": "beginner",
+    "required_tool_names": [
+      "create_word_doc",
+      "file_write"
+    ],
+    "required_tool_ids": [
+      "tool_6e6e62c0",
+      "tool_3b4a8d90"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_648585f0",
+    "name": "spreadsheet_automation",
+    "description": "Ability to create and read Excel spreadsheets with structured data",
+    "category": "file_ops",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "create_excel_sheet",
+      "read_excel_sheet"
+    ],
+    "required_tool_ids": [
+      "tool_7bc4c9a3",
+      "tool_ee6bb137"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_348b4fe4",
+    "name": "file_management",
+    "description": "Proficiency in reading, writing, copying, and organizing files on the local filesystem",
+    "category": "file_ops",
+    "proficiency_level": "beginner",
+    "required_tool_names": [
+      "file_read",
+      "file_write",
+      "file_copy",
+      "file_delete",
+      "file_list_dir",
+      "file_append"
+    ],
+    "required_tool_ids": [
+      "tool_8c300ad3",
+      "tool_3b4a8d90",
+      "tool_83fa14e5",
+      "tool_acd741cb",
+      "tool_1f0bb1cf",
+      "tool_711517c3"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_c70ced27",
+    "name": "archive_management",
+    "description": "Ability to compress and extract ZIP and TAR archives",
+    "category": "file_ops",
+    "proficiency_level": "beginner",
+    "required_tool_names": [
+      "compress_files",
+      "extract_archive"
+    ],
+    "required_tool_ids": [
+      "tool_a768204a",
+      "tool_cdf257f3"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_3ed4981d",
+    "name": "http_data_fetching",
+    "description": "Proficiency in fetching data from REST APIs and web endpoints using HTTP GET requests",
+    "category": "data",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "fetch_json",
+      "fetch_html",
+      "download_file"
+    ],
+    "required_tool_ids": [
+      "tool_a1f69543",
+      "tool_70a65c87",
+      "tool_aa8349c7"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_cbb4ec04",
+    "name": "data_transformation",
+    "description": "Ability to parse, format, and transform data between different representations",
+    "category": "data",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "parse_json",
+      "format_date"
+    ],
+    "required_tool_ids": [
+      "tool_2716ecbd",
+      "tool_f01116e2"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_edc29d3a",
+    "name": "image_processing",
+    "description": "Ability to capture, resize, and manipulate image files",
+    "category": "productivity",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "take_screenshot",
+      "web_screenshot",
+      "image_resize"
+    ],
+    "required_tool_ids": [
+      "tool_ecaccc06",
+      "tool_web_screenshot",
+      "tool_bfc76fb8"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_d6965792",
+    "name": "system_command_execution",
+    "description": "Proficiency in running shell commands and interpreting their output",
+    "category": "system",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "run_command"
+    ],
+    "required_tool_ids": [
+      "tool_f2891457"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_2897cb4d",
+    "name": "clipboard_workflow",
+    "description": "Ability to read from and write to the system clipboard to transfer data between applications",
+    "category": "productivity",
+    "proficiency_level": "beginner",
+    "required_tool_names": [
+      "clipboard_read",
+      "clipboard_write"
+    ],
+    "required_tool_ids": [
+      "tool_c80288c5",
+      "tool_7053c530"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_762f0d3e",
+    "name": "reporting_and_documentation",
+    "description": "Ability to compile collected data into structured Word or text reports with appropriate formatting",
+    "category": "productivity",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "create_word_doc",
+      "file_write",
+      "image_resize"
+    ],
+    "required_tool_ids": [
+      "tool_6e6e62c0",
+      "tool_3b4a8d90",
+      "tool_bfc76fb8"
+    ],
+    "evidence_scroll_ids": [
+      "scroll_4e6b7667"
+    ],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_abf4444f",
+    "name": "desktop_application_control",
+    "description": "Fallback proficiency for controlling desktop applications via OS-level automation when no programmatic API exists",
+    "category": "system",
+    "proficiency_level": "intermediate",
+    "required_tool_names": [
+      "launch_application",
+      "close_application",
+      "keyboard_shortcut",
+      "type_text"
+    ],
+    "required_tool_ids": [
+      "tool_25e89a48",
+      "tool_b4cbca9d",
+      "tool_6c651325",
+      "tool_a7b54e36"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "skill_61834019",
+    "name": "notification_and_alerting",
+    "description": "Ability to surface task completion status and important alerts to the user",
+    "category": "productivity",
+    "proficiency_level": "beginner",
+    "required_tool_names": [
+      "notify_desktop"
+    ],
+    "required_tool_ids": [
+      "tool_102dd317"
+    ],
+    "evidence_scroll_ids": [],
+    "created_at": "2026-05-04T00:00:00"
+  }
+]

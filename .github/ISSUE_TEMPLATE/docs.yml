@@ -1,0 +1,26 @@
+name: Documentation issue
+description: Something in the docs is wrong, missing, or confusing
+title: "[Docs] "
+labels: ["documentation", "triage"]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page / file
+      description: Which doc page or file?
+      placeholder: "README.md / docs/getting-started.md / ARCHITECTURE.md"
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: What's wrong, missing, or confusing?
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording or content
+      description: Optional but very helpful.

@@ -1,0 +1,682 @@
+[
+  {
+    "id": "tool_web_search",
+    "name": "web_search",
+    "description": "Search the web and return results with title, URL, and snippet. Multi-provider: keyed (Brave/Serper) preferred, free DuckDuckGo-lite fallback. Do NOT use for IP→location lookups or for calling JSON APIs — use fetch_json against an IP-geolocation API (e.g. http://ip-api.com/json/) for those.",
+    "tool_type": "web",
+    "parameter_names": [
+      "query",
+      "max_results"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-30T00:00:00"
+  },
+  {
+    "id": "tool_find_places",
+    "name": "find_places",
+    "description": "Structured local business / point-of-interest lookup near a location (OpenStreetMap). Use for 'X shops/gyms/restaurants near me' — returns names, addresses, hours. NOT for general web search.",
+    "tool_type": "web",
+    "parameter_names": [
+      "query",
+      "near",
+      "lat",
+      "lon",
+      "limit"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-06-09T00:00:00"
+  },
+  {
+    "id": "tool_web_read",
+    "name": "web_read",
+    "description": "Read a web page and return readable title, text, and links. Fast HTTP fetch first; escalates to a headless browser for JS/SPA pages.",
+    "tool_type": "web",
+    "parameter_names": [
+      "url"
+    ],
+    "dependencies": [
+      "playwright"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-30T00:00:00"
+  },
+  {
+    "id": "tool_web_screenshot",
+    "name": "web_screenshot",
+    "description": "Render a URL in a headless browser and capture a full-page screenshot.",
+    "tool_type": "browser_action",
+    "parameter_names": [
+      "url",
+      "output_path"
+    ],
+    "dependencies": [
+      "playwright"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-30T00:00:00"
+  },
+  {
+    "id": "tool_web_act",
+    "name": "web_act",
+    "description": "Drive a web page to accomplish an instruction using accessibility-tree-first interaction (click/type/read) in a bounded LLM loop.",
+    "tool_type": "browser_action",
+    "parameter_names": [
+      "url",
+      "instruction",
+      "max_steps"
+    ],
+    "dependencies": [
+      "playwright"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-30T00:00:00"
+  },
+  {
+    "id": "tool_a1f69543",
+    "name": "fetch_json",
+    "description": "HTTP GET a JSON API endpoint and return the parsed response data. USE THIS — not web_search — to resolve the user's location/city from their IP (GET http://ip-api.com/json/ or https://ipinfo.io/json), to geocode/reverse-geocode via Nominatim, and for any REST/JSON API. web_search finds web pages; it does NOT call APIs or do IP geolocation.",
+    "tool_type": "api_call",
+    "parameter_names": [
+      "url",
+      "headers",
+      "params"
+    ],
+    "dependencies": [
+      "requests"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_70a65c87",
+    "name": "fetch_html",
+    "description": "HTTP GET a URL and return the raw HTML response",
+    "tool_type": "api_call",
+    "parameter_names": [
+      "url",
+      "headers"
+    ],
+    "dependencies": [
+      "requests"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_aa8349c7",
+    "name": "download_file",
+    "description": "Download a file from a URL to a local path",
+    "tool_type": "api_call",
+    "parameter_names": [
+      "url",
+      "output_path",
+      "overwrite"
+    ],
+    "dependencies": [
+      "requests"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_8c300ad3",
+    "name": "file_read",
+    "description": "Read a text file and return its content",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "path",
+      "encoding"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_3b4a8d90",
+    "name": "file_write",
+    "description": "Write text content to a file, creating parent directories as needed",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "path",
+      "content",
+      "encoding",
+      "overwrite"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_711517c3",
+    "name": "file_append",
+    "description": "Append text to an existing file, creating it if it does not exist",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "path",
+      "content",
+      "encoding"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_1f0bb1cf",
+    "name": "file_list_dir",
+    "description": "List files in a directory with optional glob pattern filtering",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "path",
+      "pattern",
+      "recursive"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_83fa14e5",
+    "name": "file_copy",
+    "description": "Copy a file from source to destination",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "src",
+      "dst",
+      "overwrite"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_acd741cb",
+    "name": "file_delete",
+    "description": "Delete a file from the filesystem",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "path"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_a768204a",
+    "name": "compress_files",
+    "description": "Compress files into a ZIP archive",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "output_path",
+      "files",
+      "include_dir"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_cdf257f3",
+    "name": "extract_archive",
+    "description": "Extract a ZIP or TAR archive to an output directory",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "archive_path",
+      "output_dir"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_6e6e62c0",
+    "name": "create_word_doc",
+    "description": "Create a Word .docx document with title, body text, and optional embedded image",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "output_path",
+      "title",
+      "body_text",
+      "image_path",
+      "overwrite"
+    ],
+    "dependencies": [
+      "python-docx"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_e4ce09e2",
+    "name": "read_word_doc",
+    "description": "Read all text content from a Word .docx file",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "path"
+    ],
+    "dependencies": [
+      "python-docx"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_7bc4c9a3",
+    "name": "create_excel_sheet",
+    "description": "Create an Excel .xlsx file with headers and data rows",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "output_path",
+      "sheet_name",
+      "headers",
+      "rows",
+      "overwrite"
+    ],
+    "dependencies": [
+      "openpyxl"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_ee6bb137",
+    "name": "read_excel_sheet",
+    "description": "Read data from an Excel .xlsx file and return headers and rows",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "path",
+      "sheet_name",
+      "sheet_index"
+    ],
+    "dependencies": [
+      "openpyxl"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_ecaccc06",
+    "name": "take_screenshot",
+    "description": "Capture a screenshot of the full screen or a specific region",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "output_path",
+      "region"
+    ],
+    "dependencies": [
+      "mss",
+      "pillow"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_c80288c5",
+    "name": "clipboard_read",
+    "description": "Read the current text content of the system clipboard",
+    "tool_type": "cli_command",
+    "parameter_names": [],
+    "dependencies": [
+      "pyperclip"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_7053c530",
+    "name": "clipboard_write",
+    "description": "Write text to the system clipboard",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "text"
+    ],
+    "dependencies": [
+      "pyperclip"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_102dd317",
+    "name": "notify_desktop",
+    "description": "Show a desktop notification or toast message",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "title",
+      "message",
+      "timeout"
+    ],
+    "dependencies": [
+      "plyer"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_f2891457",
+    "name": "run_command",
+    "description": "Execute a shell command and return stdout, stderr, and exit code",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "command",
+      "timeout",
+      "cwd"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_2716ecbd",
+    "name": "parse_json",
+    "description": "Parse a JSON string or file and return the Python data structure",
+    "tool_type": "python_function",
+    "parameter_names": [
+      "input",
+      "mode"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_f01116e2",
+    "name": "format_date",
+    "description": "Parse a date string and reformat it from one format to another",
+    "tool_type": "python_function",
+    "parameter_names": [
+      "date_str",
+      "input_format",
+      "output_format"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_bfc76fb8",
+    "name": "image_resize",
+    "description": "Resize an image file, maintaining aspect ratio if only one dimension is given",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "input_path",
+      "output_path",
+      "width",
+      "height",
+      "quality"
+    ],
+    "dependencies": [
+      "pillow"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_25e89a48",
+    "name": "launch_application",
+    "description": "Launch a desktop application non-blocking by name or executable path",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "path",
+      "application_name"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_b4cbca9d",
+    "name": "close_application",
+    "description": "Close a running desktop application by name or PID",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "application_name",
+      "pid",
+      "force"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_6c651325",
+    "name": "keyboard_shortcut",
+    "description": "Press a keyboard shortcut at the OS level using pynput (fallback tool)",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "shortcut"
+    ],
+    "dependencies": [
+      "pynput"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_a7b54e36",
+    "name": "type_text",
+    "description": "Type text into the currently focused window using OS-level key events (fallback tool)",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "text",
+      "delay"
+    ],
+    "dependencies": [
+      "pynput"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_api_call_get",
+    "name": "api_call_get",
+    "description": "Perform a GET request to a REST API endpoint.",
+    "tool_type": "api_call",
+    "parameter_names": [
+      "url",
+      "headers",
+      "timeout"
+    ],
+    "dependencies": [
+      "requests"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_detect_language_from_extension",
+    "name": "detect_language_from_extension",
+    "description": "Detect programming language from a file extension using a built-in mapping dictionary.",
+    "tool_type": "python_function",
+    "parameter_names": [
+      "filename"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_file_scan_directory",
+    "name": "file_scan_directory",
+    "description": "Recursively scan a directory and collect file metadata.",
+    "tool_type": "python_function",
+    "parameter_names": [
+      "source_path"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_run_cli_command",
+    "name": "run_cli_command",
+    "description": "Execute a shell command in the container and capture its stdout and stderr output.",
+    "tool_type": "cli_command",
+    "parameter_names": [
+      "command",
+      "timeout_seconds"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_write_csv_file",
+    "name": "write_csv_file",
+    "description": "Write a list of dictionaries to a CSV file.",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "output_path",
+      "data"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_write_markdown_file",
+    "name": "write_markdown_file",
+    "description": "Write content to a markdown file at a specified path.",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "file_path",
+      "content"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_write_text_file",
+    "name": "write_text_file",
+    "description": "Write raw text content to a file at a specified path.",
+    "tool_type": "file_operation",
+    "parameter_names": [
+      "file_path",
+      "content"
+    ],
+    "dependencies": [],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": true,
+    "created_at": "2026-05-04T00:00:00"
+  },
+  {
+    "id": "tool_extract_records",
+    "name": "extract_records",
+    "description": "Extract structured records from HTML/text you already have. Use AFTER web_read/fetch_html. If you only have a URL, use web_extract instead.",
+    "tool_type": "api_call",
+    "parameter_names": [
+      "text",
+      "schema",
+      "max_records"
+    ],
+    "dependencies": [
+      "jsonschema"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": false,
+    "created_at": "2026-06-02T00:00:00"
+  },
+  {
+    "id": "tool_web_extract",
+    "name": "web_extract",
+    "description": "Fetch a URL and extract structured records from it in one step. Pass `fields=[\"name\",\"url\",\"rating\"]` for the simple case; the runtime builds the JSON Schema for you. Prefer this over chaining fetch_html/web_read + extract_records when you start from a URL.",
+    "tool_type": "web",
+    "parameter_names": [
+      "url",
+      "fields",
+      "schema",
+      "max_records",
+      "max_pages",
+      "headers",
+      "timeout"
+    ],
+    "dependencies": [
+      "requests",
+      "jsonschema"
+    ],
+    "status": "deployed",
+    "enabled": true,
+    "forged_by_systemu": false,
+    "created_at": "2026-06-02T00:00:00"
+  }
+]

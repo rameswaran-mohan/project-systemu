@@ -1,0 +1,63 @@
+{
+  "id": "tool_web_extract",
+  "name": "web_extract",
+  "description": "Fetch a URL and extract structured records from it in one step. Prefer this over chaining fetch_html/web_read + extract_records when you start from a URL. Pass `fields=[\"name\",\"url\",\"rating\"]` for the simple case; the runtime builds the JSON Schema for you.",
+  "tool_type": "web",
+  "parameters_schema": {
+    "url": {
+      "type": "string",
+      "description": "URL to fetch and extract records from.",
+      "required": true
+    },
+    "fields": {
+      "type": "array",
+      "description": "Simple field list, e.g. [\"name\", \"url\", \"rating\"]. Names like rating/price/count are auto-typed as numbers; everything else is string. Prefer this over `schema` for typical web-page extraction.",
+      "default": []
+    },
+    "schema": {
+      "type": "object",
+      "description": "Advanced: full JSON Schema describing ONE record. Use this only when you need nested objects, arrays, or strict types beyond what `fields` provides. If both `fields` and `schema` are supplied, `schema` wins. If neither is supplied, the tool falls back to a best-effort heuristic extraction (name/url/price/rating/description).",
+      "default": {}
+    },
+    "max_records": {
+      "type": "integer",
+      "description": "Maximum records to return.",
+      "default": 20
+    },
+    "max_pages": {
+      "type": "integer",
+      "description": "Follow rel=next or ?page=N up to this cap. Default 1; hard cap 5.",
+      "default": 1
+    },
+    "headers": {
+      "type": "object",
+      "description": "Optional request headers (override defaults).",
+      "default": {}
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "Fetch timeout in seconds.",
+      "default": 30
+    }
+  },
+  "return_schema": {
+    "success": { "type": "boolean" },
+    "records": { "type": "array" },
+    "count":   { "type": "integer" },
+    "pages_fetched": { "type": "integer" },
+    "status_code": { "type": "integer" },
+    "error": { "type": "string" },
+    "error_type": { "type": "string" },
+    "note": { "type": "string" }
+  },
+  "implementation_notes": "GET with v0.8.20 polite headers (User-Agent + Accept); detects empty/soft-block bodies and returns degraded shape without an LLM call. Pagination added in T4. LLM-usability fix: `fields=[...]` builds a JSON Schema internally; bare call (no schema/fields) runs a non-LLM heuristic extraction over the most-common repeated container (li/article/section/div/tr) for {name, url, price, rating, description}.",
+  "dependencies": ["requests", "jsonschema"],
+  "implementation_path": "vault/tools/implementations/web_extract.py",
+  "tool_md_path": "systemu/vault/tools/tool_tool_web_extract/TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": false,
+  "enabled": true,
+  "version": 2,
+  "created_at": "2026-06-02T00:00:00",
+  "updated_at": "2026-06-05T00:00:00"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "skill_648585f0",
+  "name": "spreadsheet_automation",
+  "description": "Ability to create and read Excel spreadsheets with structured data",
+  "category": "file_ops",
+  "proficiency_level": "intermediate",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_7bc4c9a3",
+    "tool_ee6bb137"
+  ],
+  "required_tool_names": [
+    "create_excel_sheet",
+    "read_excel_sheet"
+  ],
+  "instructions_md": "To work with Excel files: 1) Use create_excel_sheet to build a new workbook — always provide headers as a list of strings first. 2) Pass rows as a list-of-lists matching the header column order. 3) Use read_excel_sheet to inspect existing files — specify sheet_name for multi-sheet workbooks. 4) When updating an existing sheet, read it first, modify the data in memory, then write a new file with overwrite=True. 5) Numeric values in rows will be stored as numbers; ensure data types match the intended column type.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_648585f0\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

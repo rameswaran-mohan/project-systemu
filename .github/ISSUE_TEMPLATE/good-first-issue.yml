@@ -1,0 +1,33 @@
+name: "Good first issue"
+description: "An issue suitable for first-time contributors"
+labels: ["good first issue"]
+body:
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: "What needs to change and where (file paths)"
+      placeholder: "e.g. 'Add a glossary entry for Refinery in docs/glossary.md'"
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: "How will we know it's done?  (tests pass, output looks like X, etc.)"
+      placeholder: |
+        - [ ] docs/glossary.md contains an entry mapping "Refinery" -> ...
+        - [ ] CI passes
+    validations:
+      required: true
+
+  - type: textarea
+    id: hints
+    attributes:
+      label: Hints for first-timers
+      description: "Suggested approach, related files, gotchas, who to ask"
+      placeholder: |
+        Look at the existing entries in docs/glossary.md for the
+        format.  The Refinery is implemented in
+        systemu/pipelines/refinery.py.

@@ -1,0 +1,49 @@
+{
+  "id": "tool_f2891457",
+  "name": "run_command",
+  "description": "Execute a shell command and return stdout, stderr, and exit code",
+  "tool_type": "cli_command",
+  "parameters_schema": {
+    "command": {
+      "type": "string",
+      "description": "Shell command to run"
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "Timeout in seconds",
+      "default": 30
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory",
+      "default": ""
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "stdout": {
+      "type": "string"
+    },
+    "stderr": {
+      "type": "string"
+    },
+    "return_code": {
+      "type": "integer"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/run_command.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_f2891457\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

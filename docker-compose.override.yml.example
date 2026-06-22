@@ -1,0 +1,41 @@
+# docker-compose.override.yml — operator-editable customisation layer.
+#
+# Copy to docker-compose.override.yml (no `.example`) and edit.  Compose
+# auto-merges this on top of docker-compose.yml; the base file stays clean.
+#
+# Common things to override:
+#   - host port for the dashboard
+#   - bind mounts for live code reload during development
+#   - resource limits on workers
+#   - extra environment variables (e.g. proxy settings, TLS certs)
+#
+# This file is .gitignored — operator-local config never commits.
+
+services:
+
+  # Bind-mount source for live reload (docker-local dashboard)
+  # systemu-dashboard-local:
+  #   volumes:
+  #     - .:/app
+  #
+  # systemu-worker-local:
+  #   volumes:
+  #     - .:/app
+
+  # Resource caps for enterprise workers
+  # systemu-worker:
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "1.5"
+  #         memory: "2g"
+
+  # Expose Postgres on the host for ad-hoc psql sessions
+  # postgres:
+  #   ports:
+  #     - "5432:5432"
+
+  # Expose Redis on the host for ad-hoc redis-cli
+  # redis:
+  #   ports:
+  #     - "6379:6379"

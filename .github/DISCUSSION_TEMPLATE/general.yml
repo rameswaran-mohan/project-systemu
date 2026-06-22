@@ -1,0 +1,24 @@
+title: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for starting a discussion!
+
+        Pick a category from the picker on the right:
+
+        - **Q&A**: ask for help (mark answered with the green check)
+        - **Show & Tell**: share what you built with Systemu
+        - **Ideas**: propose a feature or change
+        - **General**: anything else
+
+  - type: textarea
+    id: body
+    attributes:
+      label: What's on your mind?
+      description: |
+        For Q&A — what are you trying to do, what have you tried, what's
+        the actual vs expected behavior?  For Ideas — what problem are
+        you trying to solve?
+    validations:
+      required: true

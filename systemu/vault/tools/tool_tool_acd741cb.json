@@ -1,0 +1,30 @@
+{
+  "id": "tool_acd741cb",
+  "name": "file_delete",
+  "description": "Delete a file from the filesystem",
+  "tool_type": "file_operation",
+  "parameters_schema": {
+    "path": {
+      "type": "string",
+      "description": "Path to file to delete"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/file_delete.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_acd741cb\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

@@ -1,0 +1,31 @@
+{
+  "id": "tool_write_text_file",
+  "name": "write_text_file",
+  "description": "Write raw text content to a file at a specified path.",
+  "tool_type": "file_operation",
+  "parameters_schema": {
+    "file_path": {
+      "type": "string",
+      "description": "Full path to the output file"
+    },
+    "content": {
+      "type": "string",
+      "description": "The text content to write"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/write_text_file.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_write_text_file\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

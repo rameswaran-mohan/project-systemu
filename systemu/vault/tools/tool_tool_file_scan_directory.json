@@ -1,0 +1,27 @@
+{
+  "id": "tool_file_scan_directory",
+  "name": "file_scan_directory",
+  "description": "Recursively scan a directory and collect file metadata.",
+  "tool_type": "python_function",
+  "parameters_schema": {
+    "source_path": {
+      "type": "string",
+      "description": "Absolute or relative path to the directory to scan"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [],
+  "implementation_path": "vault/tools/implementations/file_scan_directory.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_file_scan_directory\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

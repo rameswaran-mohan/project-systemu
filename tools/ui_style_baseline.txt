@@ -1,0 +1,40 @@
+1	systemu/interface/components/learning_curves.py:raw hex literal — use a design token
+1	systemu/interface/components/workflow_pipeline.py:raw hex literal — use a design token
+1	systemu/interface/pages/console.py:raw hex literal — use a design token
+1	systemu/interface/pages/recover.py:raw hex literal — use a design token
+1	systemu/interface/pages/workflow_detail.py:raw hex literal — use a design token
+10	systemu/interface/components/memory_status.py:inline .style(f"…") — compose a primitive
+10	systemu/interface/components/pending_tools.py:inline .style(f"…") — compose a primitive
+12	systemu/interface/components/workflow_pipeline.py:inline .style(f"…") — compose a primitive
+13	systemu/interface/components/live_events_pane.py:inline .style(f"…") — compose a primitive
+17	systemu/interface/pages/insights.py:inline .style(f"…") — compose a primitive
+14	systemu/interface/pages/shadow_memory_page.py:inline .style(f"…") — compose a primitive
+15	systemu/interface/pages/skills_page.py:raw hex literal — use a design token
+16	systemu/interface/components/pending_deps.py:inline .style(f"…") — compose a primitive
+17	systemu/interface/pages/activities.py:raw hex literal — use a design token
+17	systemu/interface/pages/chat_page.py:inline .style(f"…") — compose a primitive
+17	systemu/interface/pages/evolutions.py:inline .style(f"…") — compose a primitive
+19	systemu/interface/pages/memory_consolidation_page.py:inline .style(f"…") — compose a primitive
+19	systemu/interface/pages/skills_page.py:inline .style(f"…") — compose a primitive
+2	systemu/interface/components/health_banner.py:raw hex literal — use a design token
+2	systemu/interface/pages/tools.py:raw hex literal — use a design token
+20	systemu/interface/pages/notifications_page.py:inline .style(f"…") — compose a primitive
+23	systemu/interface/pages/flywheel_page.py:inline .style(f"…") — compose a primitive
+26	systemu/interface/pages/console.py:inline .style(f"…") — compose a primitive
+29	systemu/interface/dashboard.py:inline .style(f"…") — compose a primitive
+3	systemu/interface/components/live_objectives_pane.py:inline .style(f"…") — compose a primitive
+35	systemu/interface/pages/systemu_chat.py:inline .style(f"…") — compose a primitive
+37	systemu/interface/pages/workflow_detail.py:inline .style(f"…") — compose a primitive
+4	systemu/interface/components/health_banner.py:inline .style(f"…") — compose a primitive
+4	systemu/interface/pages/memory_consolidation_page.py:raw hex literal — use a design token
+4	systemu/interface/pages/notifications_page.py:raw hex literal — use a design token
+41	systemu/interface/pages/settings.py:inline .style(f"…") — compose a primitive
+46	systemu/interface/pages/tools.py:inline .style(f"…") — compose a primitive
+49	systemu/interface/pages/workshop.py:inline .style(f"…") — compose a primitive
+5	systemu/interface/pages/flywheel_page.py:raw hex literal — use a design token
+51	systemu/interface/pages/activities.py:inline .style(f"…") — compose a primitive
+6	systemu/interface/components/learning_curves.py:inline .style(f"…") — compose a primitive
+76	systemu/interface/pages/army.py:inline .style(f"…") — compose a primitive
+8	systemu/interface/dashboard.py:raw hex literal — use a design token
+8	systemu/interface/pages/chat_page.py:raw hex literal — use a design token
+9	systemu/interface/components/skills_snapshot.py:inline .style(f"…") — compose a primitive

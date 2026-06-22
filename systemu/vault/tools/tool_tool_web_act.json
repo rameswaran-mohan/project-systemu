@@ -1,0 +1,48 @@
+{
+  "id": "tool_web_act",
+  "name": "web_act",
+  "description": "Drive a web page to accomplish an instruction using accessibility-tree-first interaction (click/type/read) in a bounded LLM loop.",
+  "tool_type": "browser_action",
+  "parameters_schema": {
+    "url": {
+      "type": "string",
+      "description": "Full URL to open"
+    },
+    "instruction": {
+      "type": "string",
+      "description": "Natural-language goal to accomplish on the page"
+    },
+    "max_steps": {
+      "type": "integer",
+      "description": "Maximum interaction steps",
+      "default": 8
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "result": {
+      "type": "string"
+    },
+    "steps": {
+      "type": "array",
+      "description": "Trace of executed actions"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "Opens the URL in a pooled headless context and runs systemu.runtime.web.act_loop.run_act_loop against an a11y-tree page adapter. Refuses to type into password-named fields. Honors domain allow/deny policy. Returns missing_packages=['playwright-chromium'] while chromium is still installing.",
+  "dependencies": [
+    "playwright"
+  ],
+  "implementation_path": "vault/tools/implementations/web_act.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_web_act\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-30T00:00:00",
+  "updated_at": "2026-05-30T00:00:00"
+}

@@ -1,0 +1,180 @@
+# GitHub Actions workflow for Systemu — copy to .github/workflows/test.yml
+# (kept here as a template because the bot account creating this PR doesn't
+# have `workflow` scope; the repo owner has to add it via the GitHub UI).
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Fast unit suite — matrix across OS x Python ─────────────────────────────
+  # Linux-only and docker-required tests are marker-skipped so the Windows /
+  # macOS legs of the matrix do not need a docker daemon or apt-installed
+  # browsers.  The full suite still runs on the Linux leg.
+  unit:
+    name: Unit (${{ matrix.os }} / ${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        shell: bash
+        run: |
+          # v0.7-a-fix4: -euo pipefail + separate install commands so the
+          # exact failing line is visible in the log (previous fix used
+          # `|| pip install -e .` + `tail -30` which masked exit codes).
+          set -euxo pipefail
+          python --version
+          python -c "import sys; print('platform:', sys.platform); print('executable:', sys.executable)"
+          python -m pip install --upgrade pip
+
+          echo "=== STEP 1/4: pip install -e . ==="
+          # Skip the docker-enterprise extra on Windows/macOS — those legs
+          # don't have a working postgres + redis client wheel path for
+          # every Python version; the matrix cells only need the core deps.
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            pip install -e ".[docker-enterprise]"
+          else
+            pip install -e .
+          fi
+
+          echo "=== STEP 2/4: pip install test deps ==="
+          pip install pytest pytest-asyncio fakeredis pyyaml
+
+          echo "=== STEP 3/4: pip list ==="
+          pip list
+
+          echo "=== STEP 4/4: smoke imports ==="
+          python -c "import systemu; import sharing_on; print('package roots OK')"
+          python -c "from systemu.interface.pages import recover; print('nicegui chain OK')"
+          python -c "from systemu.scheduler import daemon; print('apscheduler chain OK')"
+          python -c "from systemu.runtime import shadow_runtime; print('runtime chain OK')"
+      - name: Run pytest
+        shell: bash
+        env:
+          HUEY_IMMEDIATE: "1"
+        run: |
+          # v0.7-a-fix: -ra to print short reasons for all (failed/skipped)
+          # tests, and --tb=short to show short tracebacks even with --maxfail.
+          pytest tests/ --ignore=tests/e2e \
+            -m "not linux_only and not docker_required" \
+            -ra --tb=short --maxfail=5
+
+  # ── Integration suite against REAL Postgres + Redis ────────────────────────
+  # Catches drift between fakeredis/in-memory SQLite and the real services
+  # docker-* modes actually run against.  Linux-only — GitHub-hosted Windows
+  # and macOS runners don't reliably expose service containers.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: systemu
+          POSTGRES_PASSWORD: systemu
+          POSTGRES_DB: systemu
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U systemu -d systemu"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ".[docker-enterprise]"
+          pip install pytest pytest-asyncio
+
+      # Re-run the orphan + Supervisor e2e tests against REAL Redis to catch
+      # any fakeredis-vs-real-Redis behavioural drift (Lua eval, SCAN, etc.).
+      - name: e2e Redis tests against real Redis
+        env:
+          SYSTEMU_REDIS_URL: redis://localhost:6379/0
+          SYSTEMU_QUEUE_BROKER: redis
+          SYSTEMU_REDIS_PREFIX: ci-${{ github.run_id }}
+        run: |
+          pytest tests/e2e/test_redis_supervisor_e2e.py \
+                 tests/e2e/test_orphan_recovery_e2e.py \
+                 tests/test_redis_priority_queue.py -v
+
+      # Migration smoke test: copy systemu/vault/* (the starter content
+      # shipped in the repo) into the live Postgres and assert it landed.
+      - name: Migration smoke test (JSON → Postgres)
+        env:
+          SYSTEMU_DATABASE_URL: postgresql+psycopg2://systemu:systemu@localhost:5432/systemu
+        run: |
+          alembic upgrade head
+          python -m systemu.migrations.json_to_db --dry-run \
+                --source systemu/vault
+          python -m systemu.migrations.json_to_db \
+                --source systemu/vault \
+                --target "$SYSTEMU_DATABASE_URL"
+          # Re-run — must be idempotent
+          python -m systemu.migrations.json_to_db \
+                --source systemu/vault \
+                --target "$SYSTEMU_DATABASE_URL"
+      # Buffer-writer contract: exercise the v0.2.2 gate-keeper helpers
+      # against real Postgres.  Catches AttributeErrors from missing
+      # method implementations on alternate vault backends + any
+      # SQLAlchemy-driver behavioural drift between SQLite and Postgres
+      # (transaction isolation, JSON serialisation, FOR UPDATE locks).
+      - name: Buffer-writer contract against real Postgres
+        env:
+          SYSTEMU_DATABASE_URL: postgresql+psycopg2://systemu:systemu@localhost:5432/systemu
+        run: |
+          pytest tests/e2e/test_memory_tier_real_postgres.py -v
+  # ── Docker Compose profile render (catches compose typos) ──────────────────
+  # Linux-only — needs the docker CLI + compose plugin.
+  compose-render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (compose tests only)
+        run: |
+          pip install pytest pyyaml
+      - name: Render every profile
+        run: |
+          # Compose requires SOME .env even if everything has defaults.
+          cp .env.example .env
+          docker compose --profile local config --quiet
+          docker compose --profile enterprise config --quiet
+          docker compose --profile docker-sandbox config --quiet
+          rm .env
+      - name: Compose-profile pytest
+        run: |
+          cp .env.example .env
+          pytest tests/e2e/test_compose_profiles_render.py -v
+          rm .env

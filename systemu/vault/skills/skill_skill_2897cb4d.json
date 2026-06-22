@@ -1,0 +1,20 @@
+{
+  "id": "skill_2897cb4d",
+  "name": "clipboard_workflow",
+  "description": "Ability to read from and write to the system clipboard to transfer data between applications",
+  "category": "productivity",
+  "proficiency_level": "beginner",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_c80288c5",
+    "tool_7053c530"
+  ],
+  "required_tool_names": [
+    "clipboard_read",
+    "clipboard_write"
+  ],
+  "instructions_md": "Use clipboard_write to place text on the clipboard — content persists until overwritten. Use clipboard_read to retrieve the current clipboard contents — returns empty string if clipboard is empty. For workflows involving documents: write the value to clipboard, then use the target application's paste mechanism. For data extraction workflows: if a web tool copied data to clipboard, use clipboard_read to capture it programmatically.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_2897cb4d\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

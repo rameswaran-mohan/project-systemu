@@ -1,0 +1,18 @@
+{
+  "id": "skill_61834019",
+  "name": "notification_and_alerting",
+  "description": "Ability to surface task completion status and important alerts to the user",
+  "category": "productivity",
+  "proficiency_level": "beginner",
+  "evidence_scroll_ids": [],
+  "required_tool_ids": [
+    "tool_102dd317"
+  ],
+  "required_tool_names": [
+    "notify_desktop"
+  ],
+  "instructions_md": "Use notify_desktop to alert the user when a long-running task completes or when their input is needed. Keep notification titles concise (under 50 characters) and messages informative but brief. Set timeout to 10 seconds for important alerts, 5 seconds for informational notifications. If plyer is not available, the tool falls back to a console print — the notification will still be recorded in the execution log. Do not spam notifications for intermediate steps — use them only for completion events or genuine alerts.",
+  "skill_md_path": "systemu\\vault\\skills\\skill_skill_61834019\\SKILL.md",
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}

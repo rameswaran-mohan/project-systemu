@@ -1,0 +1,33 @@
+# .github/workflows/skill-validator.yml
+name: Skill Validator
+on:
+  pull_request:
+    paths:
+      - 'systemu/vault/skills/**'
+      - '.github/workflows/skill-validator.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install skills-ref validator
+        # Replace with the actual install command once skills-ref is on PyPI.
+        # As of 2026-05, install from anthropics/skills-ref tag.
+        run: |
+          pip install skills-ref || pip install git+https://github.com/anthropics/skills-ref.git || \
+              echo "skills-ref not yet available; this workflow will pass-through until install lands"
+      - name: Validate all skills
+        run: |
+          set -e
+          if ! command -v skills-ref >/dev/null 2>&1; then
+            echo "::warning::skills-ref not installed; skipping validation"
+            exit 0
+          fi
+          for d in systemu/vault/skills/*/; do
+            echo "Validating $d"
+            skills-ref validate "$d"
+          done

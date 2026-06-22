@@ -1,0 +1,38 @@
+{
+  "id": "tool_e4ce09e2",
+  "name": "read_word_doc",
+  "description": "Read all text content from a Word .docx file",
+  "tool_type": "file_operation",
+  "parameters_schema": {
+    "path": {
+      "type": "string",
+      "description": "Path to the .docx file"
+    }
+  },
+  "return_schema": {
+    "success": {
+      "type": "boolean"
+    },
+    "text": {
+      "type": "string"
+    },
+    "paragraph_count": {
+      "type": "integer"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "implementation_notes": "",
+  "dependencies": [
+    "python-docx"
+  ],
+  "implementation_path": "vault/tools/implementations/read_word_doc.py",
+  "tool_md_path": "systemu\\vault\\tools\\tool_tool_e4ce09e2\\TOOL.md",
+  "status": "deployed",
+  "forged_by_systemu": true,
+  "enabled": true,
+  "version": 1,
+  "created_at": "2026-05-04T00:00:00",
+  "updated_at": "2026-05-04T00:00:00"
+}
