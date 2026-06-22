@@ -1109,19 +1109,32 @@ class Governor:
 
     # ── Terminal-pass request-outcome reconciliation (v0.10.0 pull-decision) ────
 
+    # v0.9.37 (Bug 11): a single request_id can have MORE THAN ONE arb row when
+    # its lifecycle spans suspend→approve — an ESCALATE row (at suspend) and a
+    # GRANT row (at operator-approve/materialise), both in the original exec's
+    # ledger. Collapse them to ONE outcome, preferring the most-resolved verdict.
+    _DECISION_PRIORITY = {"grant": 3, "deny": 2, "escalate": 1}
+
     @staticmethod
     def reconcile_outcomes(ledger_rows, used_tool_names, run_success: bool = True) -> list:
-        """Pure: derive per-request ``request-outcome`` events from a run's ledger.
+        """Pure: derive ONE ``request-outcome`` event per request_id from a run's
+        ledger.
 
         Skips non-request event rows (lease-mint / lease-revoke / request-outcome).
-        For each arbitrated request:
+        When a request_id has multiple arb rows (escalate→approve lifecycle), the
+        most-resolved verdict wins (grant > deny > escalate) so the lifecycle
+        classifies as a single ``granted_*`` rather than both an
+        ``escalate_unresolved`` AND a ``granted_*`` (Bug 11). For the winning row:
           * GRANT     → ``granted_used`` if its materialised tool was actually called
                         in the run, else ``granted_unused``;
           * DENY      → ``denied_fallback_ok`` / ``denied_fallback_failed`` by run success;
-          * ESCALATE  → ``escalate_unresolved`` (autonomous run, no operator decision here).
+          * ESCALATE  → ``escalate_unresolved`` (no operator decision resolved it).
         """
         used = set(used_tool_names or ())
-        events: list = []
+        # First pass: pick the most-resolved arb row per request_id (first-seen
+        # order preserved for deterministic output).
+        best: dict = {}          # rid -> (priority, row, decision)
+        order: list = []
         for row in (ledger_rows or ()):
             if not isinstance(row, dict) or row.get("event_type"):
                 continue
@@ -1131,6 +1144,16 @@ class Governor:
             decision = str(verd.get("decision") or "").lower()
             if not rid or not decision:
                 continue
+            pri = Governor._DECISION_PRIORITY.get(decision, 0)
+            if rid not in best:
+                order.append(rid)
+                best[rid] = (pri, row, decision)
+            elif pri > best[rid][0]:
+                best[rid] = (pri, row, decision)
+        events: list = []
+        for rid in order:
+            _pri, row, decision = best[rid]
+            req = row.get("request") or {}
             if decision == "grant":
                 tool = (row.get("outcome") or {}).get("tool")
                 used_after = bool(tool and tool in used)
@@ -1179,14 +1202,37 @@ class Governor:
         return rows
 
     def write_outcome_reconciliation(
-        self, execution_id: str, used_tool_names, *, run_success: bool = True, vault=None,
+        self, execution_id: str, used_tool_names, *, run_success: bool = True,
+        vault=None, also_ids=None,
     ) -> int:
         """Terminal-pass: read this run's ledger and append a ``request-outcome``
-        event per arbitrated request. Best-effort; never raises. Returns the count."""
+        event per arbitrated request. Best-effort; never raises. Returns the count.
+
+        ``also_ids`` (v0.9.37, Bug 11): additional execution ids whose ledgers hold
+        arb rows for THIS run-tree — specifically the ORIGINAL (pre-suspend) exec
+        of an escalate→approve→resume lifecycle, whose ledger carries the request +
+        escalate/grant arb rows + lease-mint while the capability is actually USED
+        in the resumed run (``used_tool_names``). Their rows are folded in so the
+        lifecycle reconciles to ``granted_used`` here. Idempotent per request_id:
+        a request that already has a terminal ``request-outcome`` in any of these
+        ledgers is skipped, so re-finalize / cross-path reconciles never double-count.
+        """
         v = vault if vault is not None else getattr(self, "_active_ledger_vault", None)
         try:
             rows = self._read_ledger_rows(execution_id, v)
+            already = {r.get("request_id") for r in rows
+                       if isinstance(r, dict) and r.get("event_type") == "request-outcome"}
+            for eid in (also_ids or ()):
+                if not eid or eid == execution_id:
+                    continue
+                prior = self._read_ledger_rows(eid, v)
+                # Prior-exec arb rows FIRST so first-seen order stays stable and the
+                # grant row (written at approve) is grouped with its escalate row.
+                rows = prior + rows
+                already |= {r.get("request_id") for r in prior
+                            if isinstance(r, dict) and r.get("event_type") == "request-outcome"}
             events = self.reconcile_outcomes(rows, used_tool_names, run_success)
+            events = [ev for ev in events if ev.get("request_id") not in already]
             for ev in events:
                 self._ledger_append(ev, v, execution_id)
             return len(events)

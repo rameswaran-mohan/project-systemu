@@ -3201,7 +3201,8 @@ class ShadowRuntime:
             # run; resume is a fresh ShadowRuntime so a fresh set is correct.
             self._mcp_servers_registered_this_run = set()
 
-            def _revoke_harness_leases(run_success: bool = True, record_run: bool = True):
+            def _revoke_harness_leases(run_success: bool = True, record_run: bool = True,
+                                       reconcile: bool = True):
                 # Idempotent terminal finalize — safe to call from any terminal path
                 # AND from the execute() finally block, which GUARANTEES it runs
                 # exactly once per run even on the partial / max-iterations /
@@ -3213,21 +3214,40 @@ class ShadowRuntime:
                 # return calls this with record_run=False BEFORE the finally runs,
                 # so the finally's record_run=True fallback only ever fires on a
                 # genuine terminal exit.
+                # ``reconcile`` (v0.9.37 Bug 11): suspends pass reconcile=False so the
+                # premature escalate_unresolved is NOT written — the request is pending
+                # operator approval, not unresolved, and writing it now would
+                # double-count the terminal granted_* produced after resume.
                 if _harness_finalized["done"] or governor is None:
                     return
                 _harness_finalized["done"] = True
-                # Terminal-pass: derive request-outcome (granted_used/unused,
-                # denied_fallback_*, escalate) from this run's ledger + the tools
-                # actually called, THEN revoke leases.
-                try:
-                    governor.write_outcome_reconciliation(
-                        execution_id, _called_tools, run_success=run_success, vault=self.vault)
-                except Exception:
-                    logger.debug("[Runtime] outcome reconciliation failed", exc_info=True)
-                try:
-                    governor.revoke_leases(execution_id)
-                except Exception:
-                    logger.debug("[Runtime] lease revocation failed", exc_info=True)
+                # Bug 11: an escalate→suspend→approve→resume lifecycle splits across
+                # two execution ids — the request + escalate/grant arb rows + lease-mint
+                # live in the ORIGINAL (pre-suspend) exec's ledger (the operator's
+                # approve calls materialise under it), while the capability is actually
+                # USED in the RESUMED run. Reconcile the resumed run's tools
+                # (``_called_tools``) against BOTH ledgers so the lifecycle classifies
+                # granted_used (not escalate_unresolved). reconcile_outcomes collapses
+                # the escalate+grant rows for one request_id to a single granted_*.
+                _prior_eid = (resume_from_execution_id
+                              if (resume_from_execution_id
+                                  and resume_from_execution_id != execution_id)
+                              else None)
+                if reconcile:
+                    try:
+                        _rec_kw = {"run_success": run_success, "vault": self.vault}
+                        if _prior_eid:   # only on the resume path — keeps the
+                            _rec_kw["also_ids"] = [_prior_eid]   # base signature otherwise
+                        governor.write_outcome_reconciliation(
+                            execution_id, _called_tools, **_rec_kw)
+                    except Exception:
+                        logger.debug("[Runtime] outcome reconciliation failed", exc_info=True)
+                for _eid in ([execution_id] + ([_prior_eid] if _prior_eid else [])):
+                    try:
+                        governor.revoke_leases(_eid)
+                    except Exception:
+                        logger.debug("[Runtime] lease revocation failed for %s",
+                                     _eid, exc_info=True)
                 # v0.9.36 Bug 9 (Symptom A — cross-run MCP leak): the v2 tool
                 # registry is a PROCESS-GLOBAL singleton, but a resumed run mints
                 # its MCP lease under the now-dead pre-suspend Governor, so the
@@ -3408,7 +3428,7 @@ class ShadowRuntime:
                         # terminal — reconcile + revoke but do NOT record a run and
                         # do NOT tear down capabilities (record_run=False), and mark
                         # finalized so the execute() finally fallback no-ops here.
-                        _revoke_harness_leases(record_run=False)
+                        _revoke_harness_leases(record_run=False, reconcile=False)   # v0.9.37 Bug 11: defer reconcile to terminal
                         _susp = context.build_result(
                             status="suspended_harness_escalation",
                             final_summary=(
@@ -4259,7 +4279,7 @@ class ShadowRuntime:
                                              exc_info=True)
                             # Parked (not a completed run): reconcile + revoke, but do
                             # NOT record a harness-usage run (record_run=False).
-                            _revoke_harness_leases(record_run=False)
+                            _revoke_harness_leases(record_run=False, reconcile=False)   # v0.9.37 Bug 11: defer reconcile to terminal
                             # Suspend-return — match the stuck-park's mechanism
                             # (context.build_result) + carry the resume coords the
                             # Supervisor's _handle_result / reconciler read.
@@ -4411,7 +4431,7 @@ class ShadowRuntime:
                         except Exception:
                             logger.debug("[Runtime] surface_harness_request failed",
                                          exc_info=True)
-                        _revoke_harness_leases(record_run=False)
+                        _revoke_harness_leases(record_run=False, reconcile=False)   # v0.9.37 Bug 11: defer reconcile to terminal
                         _susp = context.build_result(
                             status="suspended_harness_escalation",
                             final_summary=(

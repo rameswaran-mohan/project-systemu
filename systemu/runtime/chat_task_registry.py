@@ -50,3 +50,16 @@ def unregister(ts: str) -> None:
     raises; a missing id is a no-op so double-unregister is safe."""
     with _LOCK:
         _EVENTS.pop(ts, None)
+
+
+def active_count() -> int:
+    """Number of in-flight chat-lane tasks (registered, not yet finalized).
+
+    v0.9.37: drives the dashboard's Live busy indicator for the chat lane.
+    Chat / quick-answer tasks run on an untracked daemon thread (no Supervisor
+    slot), so the spinner's ``background_activity_count`` could not see them; a
+    task is registered at start and unregistered in its ``finally``, so the live
+    map size is the chat-lane analogue of ``Supervisor.running_count`` (a
+    cancelling task counts until its lane finalizes)."""
+    with _LOCK:
+        return len(_EVENTS)

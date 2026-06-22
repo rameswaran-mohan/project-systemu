@@ -132,6 +132,14 @@ def background_activity_count() -> int:
         n += int(Supervisor.get().get_status().get("running_count", 0) or 0)
     except Exception:
         pass
+    try:
+        # v0.9.37: the chat lane (quick-answer + run_now) runs on an untracked
+        # daemon thread, NOT a Supervisor slot — count its in-flight tasks too so
+        # the Live busy dots fire for chat tasks, not just capture→execute runs.
+        from systemu.runtime import chat_task_registry
+        n += chat_task_registry.active_count()
+    except Exception:
+        pass
     return n
 
 

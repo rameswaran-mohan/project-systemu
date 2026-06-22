@@ -1,4 +1,8 @@
-# Systemu
+<p align="center">
+  <img src="systemu/interface/assets/logo.png" alt="Systemu" width="128" height="128">
+</p>
+
+<h1 align="center">Systemu</h1>
 
 > **Teach your computer your job — by doing it once.**
 > Record any task on your screen. Systemu turns the recording into a

@@ -70,6 +70,11 @@ def _autoforge_banner_message() -> "str | None":
 # never an emoji literal.
 from systemu.interface.design.icons import icon as _icon
 
+# v0.9.37: brand logo. Dropped in at systemu/interface/assets/logo.png and used
+# for the favicon + sidebar mark when present; falls back to the bolt glyph so a
+# missing file never breaks the dashboard. Shipped via the package-data glob.
+_BRAND_LOGO = Path(__file__).resolve().parent / "assets" / "logo.png"
+
 NAV_SPINES = [
     ("/",         _icon("home"),     "Home"),
     ("/work",     _icon("work"),     "Work"),      # Slice 2a: workflow-centric list (scrolls+activities fold in)
@@ -184,7 +189,12 @@ def _build_layout(page_title: str, current_path: str):
             with ui.row().classes("s-sidebar-header").style(
                 "align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 16px;"
             ):
-                ui.icon("bolt").style(f"font-size: 26px; color: {THEME['primary']};")
+                if _BRAND_LOGO.exists():
+                    ui.image(str(_BRAND_LOGO)).style(
+                        "width: 28px; height: 28px; border-radius: 7px; "
+                        "flex: 0 0 auto;")
+                else:
+                    ui.icon("bolt").style(f"font-size: 26px; color: {THEME['primary']};")
                 ui.label("Systemu").classes("s-sidebar-label").style(
                     f"font-size: 18px; font-weight: 800; color: {THEME['text']};"
                 )
@@ -1152,7 +1162,7 @@ def run_dashboard(
         host=host,
         port=port,
         title="Systemu Dashboard",
-        favicon="⚡",
+        favicon=(str(_BRAND_LOGO) if _BRAND_LOGO.exists() else "⚡"),
         dark=dark,
         reload=reload,
         show=False,          # Don't auto-open browser

@@ -61,6 +61,34 @@ class TestBackgroundActivity:
                             classmethod(lambda cls: _Sup()))
         assert uh.background_activity_count() == 3
 
+    def test_counts_chat_lane_tasks(self, monkeypatch):
+        """v0.9.37: chat / quick-answer tasks run off-Supervisor (untracked daemon
+        thread) but register in chat_task_registry — the Live busy count must
+        include them so the dots fire for chat, not only capture→execute runs."""
+        from systemu.interface import ui_helpers as uh
+        import systemu.interface.jobs as jobs_mod
+        import systemu.runtime.supervisor as sup_mod
+        from systemu.runtime import chat_task_registry as reg
+
+        class _JM:
+            def get_active_jobs(self):
+                return []
+
+        class _Sup:
+            def get_status(self):
+                return {"running_count": 0}
+
+        monkeypatch.setattr(jobs_mod.JobManager, "get", classmethod(lambda cls: _JM()))
+        monkeypatch.setattr(sup_mod.Supervisor, "get", classmethod(lambda cls: _Sup()))
+
+        base = uh.background_activity_count()          # robust to any prior state
+        reg.register("chat_ts_v0937")
+        try:
+            assert uh.background_activity_count() == base + 1
+        finally:
+            reg.unregister("chat_ts_v0937")            # leak-safe cleanup
+        assert uh.background_activity_count() == base
+
     def test_rail_live_header_has_the_spinner(self):
         from systemu.interface.components import right_rail as mod
         src = inspect.getsource(mod.render_right_rail)
