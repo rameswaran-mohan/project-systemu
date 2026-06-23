@@ -273,9 +273,6 @@ Single-operator deployment by default:
 
 - **First-run walkthrough** → [`docs/getting-started.md`](docs/getting-started.md)
 - **Operator reference** → [`USER_GUIDE.md`](USER_GUIDE.md)
-- **Smoke / e2e evidence** →
-  [`docs/manual-smoke-results.md`](docs/manual-smoke-results.md),
-  [`docs/manual-e2e-results.md`](docs/manual-e2e-results.md)
 - **Redis topologies** → [`docs/redis-topologies.md`](docs/redis-topologies.md)
-- **Migration from pre-pivot installs** → [`MIGRATION.md`](MIGRATION.md)
+- **Migration from pre-pivot installs** → [README → Migrating from a pre-pivot install](README.md#migrating-from-a-pre-pivot-install)
 - **Contribution flow** → [`CONTRIBUTING.md`](CONTRIBUTING.md)

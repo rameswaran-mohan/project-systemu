@@ -58,6 +58,7 @@ CATEGORIES = (
     "premature_request",   # requested a grant before exhausting available tools
     "wasted_request",      # request was denied but a viable fallback existed
     "unused_grant",        # grant was issued but never actually invoked
+    "cap_exceeded",        # request denied by the per-run cap (over-delegation)
     "unknown",
 )
 
@@ -300,6 +301,7 @@ def classify_pull_failure(
     fallback_ok: Optional[bool],
     used_after_grant: Optional[bool],
     kind: str = "",
+    cap_exceeded: bool = False,
 ) -> str:
     """Classify a *pull-decision* (reverse-harness) failure mode.
 
@@ -324,6 +326,10 @@ def classify_pull_failure(
         ``"unused_grant"``, or ``"unknown"``.
 
     Rules (first match wins):
+        * ``cap_exceeded``      — the request was denied by the per-run request
+          cap (``cap_exceeded`` is True). Highest precedence for a deny: this is
+          an over-delegation signal, NOT a fallback judgement, so it is never
+          folded into ``wasted_request`` (v0.9.41).
         * ``premature_request`` — a request was made with no prior tool
           attempts (``attempts_before < 1``) **for a kind where trying a local
           tool first is expected** (``tool``/``skill``). For concrete-gap kinds
@@ -346,6 +352,8 @@ def classify_pull_failure(
     except (TypeError, ValueError):
         attempts = 0
 
+    if decision == "deny" and bool(cap_exceeded):
+        return "cap_exceeded"
     if request_made and attempts < 1 and kind in ("tool", "skill"):
         return "premature_request"
     if decision == "deny" and bool(fallback_ok):

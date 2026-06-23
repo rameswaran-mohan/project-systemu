@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.9.39"
+version = "0.9.41"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 license = {text = "MIT"}
@@ -89,6 +89,10 @@ dependencies = [
 #   openai-native    — native OpenAI SDK (already in core deps)
 anthropic = ["anthropic>=0.40"]
 openai-native = []  # uses existing openai dep
+
+# Development / test extra — what CONTRIBUTING.md + the README "Development"
+# section assume for `pip install -e ".[dev]"` (run the pytest suite).
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23"]
 
 # v0.7-f: first out-of-tree plugin — Browser-Use wraps Playwright
 # with an LLM-driven agent loop.

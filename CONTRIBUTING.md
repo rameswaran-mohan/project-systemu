@@ -127,10 +127,10 @@ get a green local run.
 If your change touches user-facing behaviour, update:
 
 * `README.md` — the headline summary
-* `docs/user-guide.md` — operator-level guidance
+* `USER_GUIDE.md` — operator-level guidance
 * `docs/getting-started.md` — first-run walkthrough
 * `ARCHITECTURE.md` — only when the system architecture changes
-* `CHANGELOG.md` — add an entry under the `[Unreleased]` section
+* `release-notes/` — add a `vX.Y.Z.md` note for the release
   using the Keep-a-Changelog format
 
 Markdown is linted on CI; basic checks (`markdownlint`) catch broken
@@ -273,7 +273,7 @@ proposing it.
 ### Quick start (4 steps)
 
 1. Fork + clone: `git clone git@github.com:<you>/project-systemu.git`
-2. Install dev deps: `pip install -e ".[dev]"`  (or `pip install -e .` if the `[dev]` extra isn't yet defined)
+2. Install dev deps: `pip install -e ".[dev]"`
 3. Run tests: `pytest tests/ --ignore=tests/e2e`
 4. Open a draft PR early — we'll iterate together.
 

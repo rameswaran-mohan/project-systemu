@@ -1260,6 +1260,9 @@ class Governor:
         for rid in order:
             _pri, row, decision = best[rid]
             req = row.get("request") or {}
+            # v0.9.41: a DENY carrying the cap marker is over-delegation, classified
+            # as the dedicated `cap_exceeded` category (never `wasted_request`).
+            _cap = bool((row.get("outcome") or {}).get("cap_exceeded"))
             if decision == "grant":
                 # v0.9.38 Bug 12: resolve materialised tool names PER KIND (TOOL
                 # → outcome['tool']; MCP → namespaced names; compute/access/skill/
@@ -1273,7 +1276,9 @@ class Governor:
                            else "granted")
             elif decision == "deny":
                 used_after = None
-                outcome = "denied_fallback_ok" if run_success else "denied_fallback_failed"
+                outcome = ("denied_cap" if _cap
+                           else "denied_fallback_ok" if run_success
+                           else "denied_fallback_failed")
             else:
                 used_after = None
                 outcome = "escalate_unresolved"
@@ -1286,6 +1291,7 @@ class Governor:
                     fallback_ok=(run_success if decision == "deny" else None),
                     used_after_grant=used_after,
                     kind=req.get("kind", ""),   # v0.9.38 Bug 12: kind-aware premature
+                    cap_exceeded=_cap,          # v0.9.41: dedicated cap_exceeded category
                 )
             except Exception:
                 category = "unknown"

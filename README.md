@@ -264,10 +264,11 @@ quality preset anytime.
 
 ---
 
-## Quick Start
+## Install from source (Docker & enterprise modes)
 
-Full walkthrough lives in [docs/getting-started.md](docs/getting-started.md).
-The headline:
+Installed with `pip` above? You're done — this section is only for running the
+Docker / enterprise stacks or hacking on the code. Full walkthrough lives in
+[docs/getting-started.md](docs/getting-started.md). The headline:
 
 ```bash
 git clone https://github.com/rameswaran-mohan/project-systemu.git
@@ -290,7 +291,7 @@ The dashboard runs at [http://localhost:8765](http://localhost:8765) in every mo
 To re-run installer after changing your mind: `./install.sh` will detect the existing
 install and offer **reconfigure** / **upgrade-deps** / **quit**.
 
-To upgrade an existing install to the latest release (v0.6.4+): `./update.sh`
+To upgrade an existing install to the latest release: `./update.sh`
 (or `update.bat`). It stops the daemon, `git pull --ff-only`s, reinstalls deps,
 runs alembic migrations, and restarts. Pass `--yes` / `/y` for non-interactive
 CI / cron usage. Refuses on a dirty working tree.
@@ -708,13 +709,13 @@ including the explicit guidelines for AI-authored PRs.
 * Report bugs / suggest features → [issue tracker](https://github.com/rameswaran-mohan/project-systemu/issues)
 * Security disclosures → [`SECURITY.md`](SECURITY.md)
 * Community expectations → [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
-* Release notes → [`CHANGELOG.md`](CHANGELOG.md)
+* Release notes → [`release-notes/`](release-notes/) — one file per version, written at release time
 
 ---
 
 ## Project status
 
-Pre-1.0.  Current release: **v0.9.30** (see [`release-notes/`](release-notes/) for what's new).  The table below summarises what's shipped vs. what's next.
+Pre-1.0.  Current release: **v0.9.41** (see [`release-notes/`](release-notes/) for what's new).  The table below summarises what's shipped vs. what's next.
 
 ### Shipped
 
@@ -733,8 +734,7 @@ Pre-1.0.  Current release: **v0.9.30** (see [`release-notes/`](release-notes/) f
 | **v0.6.1** | Post-v0.6.0 hardening — `Tool.name` path-traversal guard, `SYSTEMU_AUTO_APPROVE_SCROLLS` → `SYSTEMU_NON_INTERACTIVE` rename with safe-action ordering, `RECALIBRATE_SKILL` runtime wiring, catalog N+1 fix, batched `save_skill` resolution |
 | **v0.7.x** | PyPI/Docker packaging, native LLM provider plugins (Anthropic/OpenAI), `export-skill` wedge + spec-conformant `SKILL.md` writer, episodic-memory + capability ledger |
 | **v0.8.x** | Decisions Inbox + gate-mode dial, `SYSTEMU_DECISION_QUEUE` for dashboard-driven approvals, wheel-bundled starter vault (`sharing_on init`) |
-| **v0.9.x** | Reverse-Harness Governor (capability PULL arbitration, TOOL provisioner + escalate→approve→resume); the six-spine command-center dashboard with the persistent right rail; **pip-first onboarding** (`sharing_on setup`); **per-tier provider selection** (OpenRouter/Google/OpenAI/Anthropic/Ollama) with native Anthropic + local Ollama invocation and model presets; **plan-first quick lane** with honest partial answers; web-search snippets; geocode robustness; Telegram mobile alerts; MCP connector support |
-| **v0.10.0** *(on `main`)* | Opt-in **parallel sub-agent fan-out** — a granted SUBAGENT spawns a bounded concurrent fleet (one level deep) with partial-success-aware collation; a per-run **decision-audit ledger**; lease-lifecycle + tool provenance (the *agent-built* badge); harness-run metrics |
+| **v0.9.x** | Reverse-Harness Governor (capability PULL arbitration, TOOL provisioner + escalate→approve→resume); the six-spine command-center dashboard with the persistent right rail; **pip-first onboarding** (`sharing_on setup`); **per-tier provider selection** (OpenRouter/Google/OpenAI/Anthropic/Ollama) with native Anthropic + local Ollama invocation and model presets; **plan-first quick lane** with honest partial answers; web-search snippets; geocode robustness; Telegram mobile alerts; MCP connector support; opt-in **parallel sub-agent fan-out** (a granted SUBAGENT spawns a bounded concurrent fleet, one level deep, with partial-success-aware collation); a per-run **decision-audit ledger** with a run-tree-scoped request cap + request-outcome taxonomy; lease-lifecycle + tool provenance (the *agent-built* badge) |
 
 ### What's next
 

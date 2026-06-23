@@ -3259,24 +3259,29 @@ class ShadowRuntime:
                               else None)
                 if reconcile:
                     try:
-                        # v0.9.39 Bug 15: the run-tree's SINGLE top-level terminal
-                        # (execution_id == root_eid) reconciles EVERY ledger in the
-                        # tree — the suspend→resume predecessors AND the sub-agent
-                        # children — via the per-root lineage index, instead of just
-                        # this exec + one immediate prior. A non-root execution (a
-                        # mid-chain resume / a child) still reconciles its own ledger
-                        # (+ its immediate prior); the root's sweep then folds in
-                        # whatever they left, idempotent per request_id (Bug 11).
+                        # v0.9.39 Bug 15: reconcile EVERY ledger in the run-tree —
+                        # the suspend→resume predecessors AND the sub-agent children —
+                        # via the per-root lineage index, at ANY genuine terminal.
+                        # NOT gated on ``execution_id == root_eid``: in a suspend→
+                        # resume chain the ROOT is the FIRST exec and SUSPENDS
+                        # (reconcile=False), so it never reaches a terminal — the exec
+                        # that actually terminates is the LAST resume, which is not the
+                        # root. Gating on root meant the sweep never fired for that
+                        # (dominant SUBAGENT) shape — 8 distinct grants reconciled to 1
+                        # event. Sweeping at every genuine terminal is safe: the
+                        # per-request_id collapse + the ``already`` dedup make redundant
+                        # sweeps idempotent, so the last terminal to run reconciles
+                        # every still-open grant in the tree. Falls back to
+                        # [_prior_eid] only when no sidecar exists (test stubs).
                         _also_ids = []
-                        if execution_id == root_eid:
-                            try:
-                                _also_ids = [
-                                    e for e in governor.runtree_execution_ids(
-                                        root_eid, self.vault)
-                                    if e and e != execution_id
-                                ]
-                            except Exception:
-                                _also_ids = []
+                        try:
+                            _also_ids = [
+                                e for e in governor.runtree_execution_ids(
+                                    root_eid, self.vault)
+                                if e and e != execution_id
+                            ]
+                        except Exception:
+                            _also_ids = []
                         if _prior_eid and _prior_eid not in _also_ids:
                             _also_ids.append(_prior_eid)   # immediate resume predecessor
                         _rec_kw = {"run_success": run_success, "vault": self.vault}
@@ -4204,6 +4209,24 @@ class ShadowRuntime:
                             int(getattr(self, "_subagent_depth", 0)),
                         )
                         _verdict = _gov.arbitrate(_req, context=_arb_ctx)
+                        # v0.9.41: a cap-exceeded DENY otherwise writes NO ledger row
+                        # (only the GRANT path logs, via materialise), so the
+                        # over-delegation requests vanished from the request-outcome
+                        # denominator. Record the arb row explicitly (the sanctioned
+                        # manual-append path) with a cap marker so reconciliation
+                        # surfaces it as the dedicated `cap_exceeded` category.
+                        if (_verdict.decision == HarnessDecision.DENY
+                                and getattr(_verdict, "cap_exceeded", False)):
+                            try:
+                                _gov._ledger_append(
+                                    _gov._ledger_entry(
+                                        _req, _verdict, {"cap_exceeded": True},
+                                        execution_id),
+                                    vault=self.vault, execution_id=execution_id,
+                                )
+                            except Exception:
+                                logger.debug("[Runtime] cap-deny ledger write failed",
+                                             exc_info=True)
                         if _verdict.decision == HarnessDecision.GRANT:
                             _mat = _gov.materialise(
                                 _req, _verdict, vault=self.vault,

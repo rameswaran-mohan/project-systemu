@@ -460,7 +460,7 @@ def arbitrate(
     # (COMPLETE/FAIL) with current capabilities, and the cap resets next run.
     requests_this_run: int = int(ctx.get("requests_this_run", 0))
     if requests_this_run >= policy.max_requests_per_run:
-        return _result(
+        _res = _result(
             request, HarnessDecision.DENY, RiskBand.HIGH,
             f"Per-run request cap ({policy.max_requests_per_run}) exceeded — no "
             "more capability requests this run. Proceed with current capabilities "
@@ -468,6 +468,11 @@ def arbitrate(
             alternatives=["proceed with current capabilities and complete",
                           "batch capabilities before starting the next run"],
         )
+        # v0.9.41: flag this deny as cap-driven so the loop records a ledger row
+        # and reconciliation classifies it as the dedicated `cap_exceeded` category
+        # (the over-delegation signal), not `wasted_request`.
+        _res["verdict"].cap_exceeded = True
+        return _res
 
     # ── 2. Kind-specific arbitration ──────────────────────────────────────
     arbitrator = _KIND_ARBITRATORS.get(request.kind)

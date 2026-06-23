@@ -902,6 +902,10 @@ class HarnessVerdict(BaseModel):
     # v0.10.0 — was this verdict resolved by deterministic policy or the LLM judge?
     # (replaces the [judged_by=llm] rationale string tag; powers the cost-tiering measure)
     decided_by:   Literal["deterministic", "llm"] = "deterministic"
+    # v0.9.41 — set on a DENY produced by the per-run request cap (over-delegation),
+    # so the loop records a ledger row and reconciliation classifies it as the
+    # dedicated `cap_exceeded` pull-failure category rather than `wasted_request`.
+    cap_exceeded: bool = False
     # v0.10.0 — filled by the terminal-pass reconciliation (pull-decision instrumentation)
     request_outcome: Optional[Literal[
         "granted_used", "granted_unused", "denied_fallback_ok",

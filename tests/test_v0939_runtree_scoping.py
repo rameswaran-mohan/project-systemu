@@ -113,6 +113,38 @@ def test_terminal_reconciles_all_tree_ledgers(tmp_path):
     assert {o["request_id"]: o["outcome"] for o in outs} == {
         "rs_root": "granted", "rs_child0": "granted", "rs_resume": "granted"}
 
+def test_non_root_terminal_reconciles_whole_tree(tmp_path):
+    # Mirrors the v0.9.39 smoke: a suspend→resume chain where the ROOT exec
+    # suspends (never reconciles) and a NON-root resume is the genuine terminal.
+    # That terminal must still reconcile every grant in the tree — including the
+    # root's own grant — via the run-tree lineage (the gate-on-root bug emitted 1
+    # event for 8 distinct grants).
+    g = Governor()
+    v = _vault(tmp_path)
+    root = "exec_root"
+    chain = ["exec_root", "exec_r1", "exec_r2", "exec_term"]  # exec_term terminates
+    for i, eid in enumerate(chain):
+        g.next_runtree_request(root, eid, v)
+        led = g.ledger_path(eid, v)
+        led.parent.mkdir(parents=True, exist_ok=True)
+        with led.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "request": {"request_id": f"hreq_{i}", "kind": "subagent",
+                            "attempts_before": 2},
+                "verdict": {"decision": "grant"},
+                "outcome": {"materialised": True}, "execution_id": eid}) + "\n")
+    # the genuine terminal is exec_term (NOT the root) — it sweeps the whole tree
+    also = [e for e in g.runtree_execution_ids(root, v) if e != "exec_term"]
+    n = g.write_outcome_reconciliation("exec_term", set(), run_success=True,
+                                       vault=v, also_ids=also)
+    assert n == 4, f"a non-root terminal must reconcile all 4 tree grants, got {n}"
+    # every grant — including the ROOT's — now has an outcome (written to exec_term)
+    led = g.ledger_path("exec_term", v)
+    outs = {json.loads(l)["request_id"] for l in led.read_text(encoding="utf-8").splitlines()
+            if l.strip() and json.loads(l).get("event_type") == "request-outcome"}
+    assert outs == {"hreq_0", "hreq_1", "hreq_2", "hreq_3"}
+
+
 def test_tree_reconciliation_is_idempotent(tmp_path):
     g = Governor()
     v = _vault(tmp_path)
@@ -177,3 +209,8 @@ def test_execute_wires_runtree_cap_and_reconciliation():
     assert "runtree_execution_ids(" in src                            # finalize sweeps tree
     # the root id flows into the fleet spawn + all 4 suspend/park snapshots
     assert src.count("root_execution_id=root_eid") >= 5
+    # REGRESSION GUARD (Bug 15 fix): the tree sweep must NOT be gated on the
+    # terminal being the root. In a suspend→resume chain the root suspends and
+    # never terminates — the genuine terminal is a non-root resume — so gating
+    # on root reconciled 8 distinct grants to 1 event. Keep the sweep ungated.
+    assert "if execution_id == root_eid:" not in src

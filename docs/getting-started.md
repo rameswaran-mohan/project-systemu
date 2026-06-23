@@ -3,9 +3,11 @@
 A five-minute walkthrough to take you from an empty checkout to a
 Shadow agent executing your first workflow.
 
-> **TL;DR**: clone → install → start → open dashboard → submit chat.
-> The whole thing runs locally with one external dependency (an
-> LLM API key).
+> **TL;DR (pip — fastest)**: `pip install systemu` → `sharing_on setup` →
+> `sharing_on daemon start` → open <http://localhost:8765> → submit a chat task.
+> For Docker / enterprise modes or hacking on the code, use the `git clone` +
+> `./install.sh` path in section 2 below. The whole thing runs locally with one
+> external dependency (an LLM API key).
 
 ---
 
@@ -181,8 +183,8 @@ Your vault data persists across restarts.
 
 ## What next?
 
-- **Browse the Workshop** (`/workshop`) to see the tools, shadows,
-  and skills that shipped with the install.  Each is editable.
+- **Browse the starter vault** in the **Build** (tools / skills) and
+  **Shadows** tabs to see what shipped with the install.  Each is editable.
 - **Read `USER_GUIDE.md`** for operator-level guidance.
 - **Read `ARCHITECTURE.md`** if you want to understand how the
   pieces fit together.

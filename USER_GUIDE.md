@@ -141,7 +141,7 @@ Model names follow the format `provider/model-name`, e.g. `openai/gpt-4o-mini`, 
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `SYSTEMU_AUTO_APPROVE_SCROLLS` | `false` | Skip the human approval step for scrolls. Dev/CI only. |
+| `SYSTEMU_NON_INTERACTIVE` | `false` | Auto-pick the safe-default choice in every approval prompt. Renamed from `SYSTEMU_AUTO_APPROVE_SCROLLS` in v0.6.1 (old name no longer recognised). Dev/CI only. |
 | `SYSTEMU_AUTO_FORGE_TOOLS` | `false` | Auto-enable generated tools without code review. **DANGEROUS — never use in production.** |
 | `SYSTEMU_VAULT_DIR` | `systemu/vault` | Path to vault storage root (relative to project root) |
 | `SYSTEMU_OUTPUT_DIR` | `~/Documents` | Where Shadow-generated output files are saved |
@@ -550,7 +550,7 @@ Results saved to `benchmark_results.json`. Measures:
 | Playwright errors | `python -m playwright install chromium` |
 | Recording captures 0 events | On macOS: grant Accessibility + Input Monitoring in System Settings → Privacy |
 | LLM returns prose instead of JSON | The repair retry handles this automatically. If it persists, try a different `SYSTEMU_TIER1_MODEL` |
-| Scroll stuck at `pending_approval` | `sharing_on scrolls approve <id>` or set `SYSTEMU_AUTO_APPROVE_SCROLLS=true` in `.env` for dev use |
+| Scroll stuck at `pending_approval` | `sharing_on scrolls approve <id>` or set `SYSTEMU_NON_INTERACTIVE=true` in `.env` for dev use |
 
 ---
 
