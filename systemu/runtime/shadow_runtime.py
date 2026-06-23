@@ -2788,6 +2788,7 @@ class ShadowRuntime:
         dry_run: bool = False,
         cancel_event: Optional[threading.Event] = None,
         resume_from_execution_id: Optional[str] = None,
+        root_execution_id: Optional[str] = None,
         origin: Optional[str] = None,
         chat_submission_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -2863,6 +2864,11 @@ class ShadowRuntime:
             # into Governor.arbitrate so the per-run cap (max_requests_per_run)
             # actually fires. Restored from a resume snapshot below if present.
             harness_requests_this_run = 0
+            # v0.9.39 Bug 15: the RUN-TREE id. Fresh top-level run → self is the
+            # root; a sub-agent child → inherited via the explicit param; a resume
+            # → refined from the snapshot below. The cap + outcome reconciliation
+            # key off this so they span the whole tree, not one execution.
+            root_eid = root_execution_id or execution_id
             logger.info(
                 "[Runtime] Starting execution %s — shadow='%s' activity='%s'",
                 execution_id, shadow.name, activity.name,
@@ -3086,6 +3092,14 @@ class ShadowRuntime:
                                 int(getattr(self, "_subagent_depth", 0) or 0),
                                 int(getattr(snap, "subagent_depth", 0) or 0),
                             )
+                            # v0.9.39 Bug 15: inherit the run-tree id from the
+                            # snapshot so this resumed exec keeps the SAME root as
+                            # the pre-suspend run — unless an explicit param root
+                            # was given (a child spawned mid-resume), which wins.
+                            if not root_execution_id:
+                                _snap_root = getattr(snap, "root_execution_id", None)
+                                if _snap_root:
+                                    root_eid = _snap_root
                         except Exception:
                             logger.debug(
                                 "[Runtime] harness-count resume restore failed",
@@ -3245,9 +3259,29 @@ class ShadowRuntime:
                               else None)
                 if reconcile:
                     try:
+                        # v0.9.39 Bug 15: the run-tree's SINGLE top-level terminal
+                        # (execution_id == root_eid) reconciles EVERY ledger in the
+                        # tree — the suspend→resume predecessors AND the sub-agent
+                        # children — via the per-root lineage index, instead of just
+                        # this exec + one immediate prior. A non-root execution (a
+                        # mid-chain resume / a child) still reconciles its own ledger
+                        # (+ its immediate prior); the root's sweep then folds in
+                        # whatever they left, idempotent per request_id (Bug 11).
+                        _also_ids = []
+                        if execution_id == root_eid:
+                            try:
+                                _also_ids = [
+                                    e for e in governor.runtree_execution_ids(
+                                        root_eid, self.vault)
+                                    if e and e != execution_id
+                                ]
+                            except Exception:
+                                _also_ids = []
+                        if _prior_eid and _prior_eid not in _also_ids:
+                            _also_ids.append(_prior_eid)   # immediate resume predecessor
                         _rec_kw = {"run_success": run_success, "vault": self.vault}
-                        if _prior_eid:   # only on the resume path — keeps the
-                            _rec_kw["also_ids"] = [_prior_eid]   # base signature otherwise
+                        if _also_ids:
+                            _rec_kw["also_ids"] = _also_ids
                         governor.write_outcome_reconciliation(
                             execution_id, _called_tools, **_rec_kw)
                     except Exception:
@@ -3410,6 +3444,7 @@ class ShadowRuntime:
                                 activity_id=getattr(activity, "id", ""),
                                 requests_this_run=harness_requests_this_run,
                                 subagent_depth=int(getattr(self, "_subagent_depth", 0)),
+                                root_execution_id=root_eid,
                             )
                             import json as _json
                             _snap.sticky_notes.append(
@@ -4055,6 +4090,21 @@ class ShadowRuntime:
                     harness_requests_this_run = _next_harness_request_no(
                         harness_requests_this_run
                     )
+                    # v0.9.39 Bug 15: the cap is RUN-TREE-WIDE. Bump the persistent
+                    # per-root counter (shared across the suspend→resume chain AND
+                    # sub-agent children) and use ITS pre-increment total as the
+                    # arbiter's cap operand, so a tree of executions can no longer
+                    # each restart at 0 and blow past max_requests_per_run. Falls
+                    # back to the per-exec count when no sidecar is writable
+                    # (no vault / governor — test stubs keep their old behaviour).
+                    if governor is not None:
+                        try:
+                            _tree_pre = governor.next_runtree_request(
+                                root_eid, execution_id, self.vault)
+                        except Exception:
+                            _tree_pre = None
+                        if _tree_pre is not None:
+                            _pre_inc_requests = _tree_pre
                     try:
                         from systemu.runtime.governor import Governor
                         from systemu.core.models import (
@@ -4185,6 +4235,8 @@ class ShadowRuntime:
                                     _fleet = SubagentFleet(
                                         parent_execution_id=execution_id,
                                         config=self.config, vault=self.vault,
+                                        # v0.9.39 Bug 15: children join THIS run-tree.
+                                        root_execution_id=root_eid,
                                     )
                                     _fres = await _fleet.spawn_children(shadow, activity, _tasks)
                                     # v0.9.33 Bug 3: TERMINAL fleet observation.
@@ -4258,6 +4310,7 @@ class ShadowRuntime:
                                     # nesting depth so a resume keeps counting.
                                     requests_this_run=harness_requests_this_run,
                                     subagent_depth=int(getattr(self, "_subagent_depth", 0)),
+                                    root_execution_id=root_eid,
                                 )
                                 import json as _json
                                 _snap.sticky_notes.append(
@@ -4412,6 +4465,7 @@ class ShadowRuntime:
                                 activity_id=getattr(activity, "id", ""),
                                 requests_this_run=harness_requests_this_run,
                                 subagent_depth=int(getattr(self, "_subagent_depth", 0)),
+                                root_execution_id=root_eid,
                             )
                             import json as _json
                             _snap.sticky_notes.append(
@@ -4924,6 +4978,7 @@ class ShadowRuntime:
                                 # so a resumed run keeps counting toward the cap.
                                 requests_this_run=harness_requests_this_run,
                                 subagent_depth=int(getattr(self, "_subagent_depth", 0)),
+                                root_execution_id=root_eid,
                             )
                             # R3: persist the per-objective stuck round counters so
                             # rounds accumulate across resumes (carried as a sticky tag).

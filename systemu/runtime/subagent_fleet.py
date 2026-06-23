@@ -121,8 +121,13 @@ class SubagentFleet:
         failed / missing / budget / synthesis report.
     """
 
-    def __init__(self, *, parent_execution_id: str, config, vault) -> None:
+    def __init__(self, *, parent_execution_id: str, config, vault,
+                 root_execution_id: str = "") -> None:
         self.parent_execution_id = parent_execution_id
+        # v0.9.39 Bug 15: the run-tree id every child inherits so the per-run
+        # request cap + outcome reconciliation span the whole tree. Defaults to
+        # the parent's execution id when the parent IS the run-tree root.
+        self.root_execution_id = root_execution_id or parent_execution_id
         self.config = config
         self.vault = vault
         max_concurrent = max(
@@ -323,7 +328,11 @@ class SubagentFleet:
 
             origin = f"delegate-fleet-{self.parent_execution_id}"
             return await asyncio.wait_for(
-                child_runtime.execute(child_shadow, child_activity, origin=origin),
+                # v0.9.39 Bug 15: the child adopts the parent's run-tree id so its
+                # capability requests count toward the shared cap and its ledger is
+                # swept by the run-tree's single terminal reconciliation.
+                child_runtime.execute(child_shadow, child_activity, origin=origin,
+                                      root_execution_id=self.root_execution_id),
                 timeout=per_child_timeout,
             )
 

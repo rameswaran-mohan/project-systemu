@@ -73,6 +73,10 @@ class ExecutionSnapshot:
     # nesting depth.
     requests_this_run:        int = 0
     subagent_depth:           int = 0
+    # v0.9.39 Bug 15: the run-tree id shared across the suspend→resume chain (and
+    # sub-agent children). A resume inherits it so the per-run request cap +
+    # outcome reconciliation stay scoped to the whole tree, not one execution.
+    root_execution_id:        Optional[str] = None
     snapshotted_at:           str = ""
 
 
@@ -139,6 +143,7 @@ def read_snapshot(
             recalibration_dedup_key=data.get("recalibration_dedup_key"),
             requests_this_run=int(data.get("requests_this_run", 0)),
             subagent_depth=int(data.get("subagent_depth", 0)),
+            root_execution_id=data.get("root_execution_id"),
             snapshotted_at=data.get("snapshotted_at", ""),
         )
     except Exception:
@@ -181,6 +186,7 @@ def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
         "recalibration_dedup_key": snapshot.recalibration_dedup_key,
         "requests_this_run":       snapshot.requests_this_run,
         "subagent_depth":          snapshot.subagent_depth,
+        "root_execution_id":       snapshot.root_execution_id,
         "snapshotted_at":          snapshot.snapshotted_at,
     }
 
@@ -202,6 +208,7 @@ def capture_from_context(
     recalibration_dedup_key: Optional[str] = None,
     requests_this_run: int = 0,
     subagent_depth: int = 0,
+    root_execution_id: Optional[str] = None,
     history_max_events: int = 12,
 ) -> ExecutionSnapshot:
     """Build an ExecutionSnapshot from a live ExecutionContext.
@@ -237,6 +244,7 @@ def capture_from_context(
         recalibration_dedup_key=recalibration_dedup_key,
         requests_this_run=int(requests_this_run),
         subagent_depth=int(subagent_depth),
+        root_execution_id=root_execution_id,
     )
 
 

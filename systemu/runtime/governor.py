@@ -54,6 +54,12 @@ from systemu.runtime.auto_skill_extractor import persist_skill_candidate
 
 logger = logging.getLogger(__name__)
 
+# v0.9.39 Bug 15: process-wide lock for the per-run-tree sidecar (cap counter +
+# lineage index). The sidecar is keyed by root_execution_id and shared across
+# Governor instances (children mint their own Governor), so the lock must be at
+# module scope, not per-instance, to make the read-modify-write atomic.
+_RUNTREE_LOCK = threading.Lock()
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1106,6 +1112,76 @@ class Governor:
                 execution_id,
                 exc,
             )
+
+    # ── Run-tree sidecar (v0.9.39 Bug 15) ──────────────────────────────────────
+    # A logical run spans MANY executions: a suspend→approve→resume chain plus the
+    # spawned sub-agent children, each with its own execution_id + ledger + (until
+    # now) its own request counter that reset to 0. The per-root sidecar gives the
+    # whole tree ONE shared request counter (so the cap actually bounds the tree)
+    # AND a lineage index of every execution that arbitrated a request (so the
+    # terminal reconciliation can sweep all their ledgers). Best-effort: every
+    # method degrades to a no-op / fallback when no vault is available (test stubs).
+
+    def runtree_path(self, root_execution_id: str, vault=None) -> Path:
+        root = self._vault_root(vault)
+        return root / "harness_ledger" / f"_runtree_{root_execution_id}.json"
+
+    def _read_runtree(self, root_execution_id: str, vault) -> dict:
+        try:
+            p = self.runtree_path(root_execution_id, vault)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {"requests": 0, "executions": []}
+
+    def _write_runtree(self, root_execution_id: str, data: dict, vault) -> None:
+        p = self.runtree_path(root_execution_id, vault)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        import os as _os
+        _os.replace(tmp, p)
+
+    def next_runtree_request(
+        self, root_execution_id: str, execution_id: str, vault=None,
+    ) -> Optional[int]:
+        """Atomically record a capability request against the run-tree.
+
+        Registers ``execution_id`` in the tree's lineage (so its ledger is later
+        reconciled) and returns the PRE-increment tree-wide request count — the
+        operand the arbiter's cap contract compares against ``max_requests_per_run``
+        (count == max → cap). Returns ``None`` when no sidecar can be written (no
+        vault / I/O failure), so the caller falls back to the per-execution count.
+        """
+        if not root_execution_id:
+            return None
+        try:
+            with _RUNTREE_LOCK:
+                data = self._read_runtree(root_execution_id, vault)
+                pre = int(data.get("requests", 0) or 0)
+                execs = list(data.get("executions") or [])
+                if execution_id and execution_id not in execs:
+                    execs.append(execution_id)
+                data["requests"] = pre + 1
+                data["executions"] = execs
+                self._write_runtree(root_execution_id, data, vault)
+                return pre
+        except Exception:
+            logger.debug("[Governor] runtree request bump failed", exc_info=True)
+            return None
+
+    def runtree_execution_ids(self, root_execution_id: str, vault=None) -> list:
+        """Every execution_id that arbitrated a request under this run-tree."""
+        if not root_execution_id:
+            return []
+        try:
+            with _RUNTREE_LOCK:
+                return list(self._read_runtree(root_execution_id, vault).get("executions") or [])
+        except Exception:
+            return []
 
     # ── Terminal-pass request-outcome reconciliation (v0.10.0 pull-decision) ────
 

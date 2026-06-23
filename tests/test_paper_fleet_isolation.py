@@ -21,7 +21,7 @@ async def test_fleet_passes_isolated_audit_namespace_to_child():
         def __init__(self, config, vault, audit_namespace=None):
             captured["audit_namespace"] = audit_namespace
 
-        async def execute(self, shadow, activity, origin=None):
+        async def execute(self, shadow, activity, origin=None, root_execution_id=None):
             return {"status": "success", "summary": "ok", "tool_calls": 1}
 
     with patch("systemu.runtime.shadow_runtime.ShadowRuntime", FakeRuntime), \
@@ -49,7 +49,7 @@ async def test_fleet_tolerates_namespace_failure():
         def __init__(self, config, vault, audit_namespace=None):
             captured["audit_namespace"] = audit_namespace
 
-        async def execute(self, shadow, activity, origin=None):
+        async def execute(self, shadow, activity, origin=None, root_execution_id=None):
             return {"status": "success", "summary": "ok"}
 
     with patch("systemu.runtime.shadow_runtime.ShadowRuntime", FakeRuntime), \
