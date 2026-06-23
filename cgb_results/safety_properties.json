@@ -1,0 +1,26 @@
+[
+  {
+    "property": "test_judge_fault_always_escalates[raise]",
+    "passed": true
+  },
+  {
+    "property": "test_judge_fault_always_escalates[malformed]",
+    "passed": true
+  },
+  {
+    "property": "test_judge_fault_always_escalates[low_confidence]",
+    "passed": true
+  },
+  {
+    "property": "test_high_risk_always_escalates_regardless_of_flags",
+    "passed": true
+  },
+  {
+    "property": "test_llm_judge_can_only_downgrade",
+    "passed": true
+  },
+  {
+    "property": "test_governor_failure_can_only_deny_or_escalate",
+    "passed": true
+  }
+]

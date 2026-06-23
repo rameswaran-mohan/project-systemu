@@ -1,0 +1,6 @@
+{"ts": "2026-06-23T06:35:23.132785Z", "execution_id": "exec_a647985c", "event_type": "request-outcome", "request_id": "hreq_805bb3a9", "outcome": "granted_unused", "pull_failure_category": "premature_request"}
+{"ts": "2026-06-23T06:35:23.132785Z", "execution_id": "exec_36ca5b0e", "event_type": "request-outcome", "request_id": "hreq_1bb2f964", "outcome": "granted_used", "pull_failure_category": "premature_request"}
+{"ts": "2026-06-23T06:35:23.132785Z", "execution_id": "exec_6817bc9d", "event_type": "request-outcome", "request_id": "hreq_6c35a97a", "outcome": "granted_unused", "pull_failure_category": "premature_request"}
+{"ts": "2026-06-23T06:35:23.132785Z", "execution_id": "exec_aca1f366", "event_type": "request-outcome", "request_id": "hreq_28000a4d", "outcome": "granted_unused", "pull_failure_category": "premature_request"}
+{"ts": "2026-06-23T06:35:23.132785Z", "execution_id": "exec_4579c077", "event_type": "request-outcome", "request_id": "hreq_ed0d887b", "outcome": "granted_used", "pull_failure_category": "premature_request"}
+{"ts": "2026-06-23T06:35:23.132785Z", "execution_id": "exec_c03732ce", "event_type": "request-outcome", "request_id": "hreq_41ffb69a", "outcome": "granted_unused", "pull_failure_category": "premature_request"}

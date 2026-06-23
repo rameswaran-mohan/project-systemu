@@ -1,0 +1,4 @@
+{"ts": "2026-06-23T09:24:32.358222Z", "execution_id": "exec_c021017d", "event_type": "request-outcome", "request_id": "hreq_d9d90ac7", "outcome": "granted", "pull_failure_category": "unknown"}
+{"ts": "2026-06-23T09:24:32.358222Z", "execution_id": "exec_25a9c8f0", "event_type": "request-outcome", "request_id": "hreq_c4897d2d", "outcome": "granted", "pull_failure_category": "unknown"}
+{"ts": "2026-06-23T09:24:32.358222Z", "execution_id": "exec_75bd3ee3", "event_type": "request-outcome", "request_id": "hreq_1b41f47f", "outcome": "granted", "pull_failure_category": "unknown"}
+{"ts": "2026-06-23T09:24:32.358222Z", "execution_id": "exec_5a3e95c2", "event_type": "request-outcome", "request_id": "hreq_acff9f50", "outcome": "granted", "pull_failure_category": "unknown"}
