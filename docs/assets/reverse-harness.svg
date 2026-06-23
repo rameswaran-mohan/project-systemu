@@ -1,0 +1,99 @@
+<svg viewBox="0 0 760 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="rhTitle rhDesc" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <title id="rhTitle">The Reverse-Harness loop</title>
+  <desc id="rhDesc">A running agent that hits a capability gap issues a REQUEST_HARNESS pull; the Governor arbitrates it by risk — low-risk auto-grants, medium goes to an off-path LLM judge, high escalates to the operator Inbox; granted capabilities are materialised across six families, leased and logged, and the run resumes.</desc>
+  <style>
+    svg { --ink:#2c2c2a; --sub:#5f5e5a; --box:#ffffff; --boxln:#d3d1c7; --line:#9a988f;
+          --card:#faf9f5; --cardln:#e6e4dc;
+          --acc:#534ab7; --accbg:#eeedfe; --accln:#7f77dd;
+          --low:#1d9e75; --med:#d85a30; --high:#d4537e; }
+    @media (prefers-color-scheme: dark) {
+      svg { --ink:#ecebe7; --sub:#b4b2a9; --box:#26262a; --boxln:#46453f; --line:#8a887f;
+            --card:#1b1b19; --cardln:#33332f;
+            --acc:#afa9ec; --accbg:#332c6b; --accln:#7f77dd;
+            --low:#5dcaa5; --med:#f0997b; --high:#ed93b1; }
+    }
+    .t { fill:var(--ink); font-weight:700; }
+    .s { fill:var(--sub); }
+    .lbl { fill:var(--sub); font-style:italic; }
+    .box { fill:var(--box); stroke:var(--boxln); stroke-width:1.5; }
+    .acc { fill:var(--accbg); stroke:var(--accln); stroke-width:2; }
+    .ln { stroke:var(--line); stroke-width:2; fill:none; }
+    .chip { stroke-width:1.5; }
+  </style>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--line)"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="758" height="618" rx="14" fill="var(--card)" stroke="var(--cardln)"/>
+
+  <text x="285" y="28" text-anchor="middle" class="t" font-size="19">The Reverse-Harness loop</text>
+  <text x="285" y="48" text-anchor="middle" class="s" font-size="12.5">pull what you lack &#8594; govern it by risk &#8594; grow</text>
+
+  <!-- spine arrows -->
+  <path class="ln" d="M285 118 L285 140" marker-end="url(#ah)"/>
+  <path class="ln" d="M285 188 L285 212" marker-end="url(#ah)"/>
+  <path class="ln" d="M285 264 L285 290" marker-end="url(#ah)"/>
+  <path class="ln" d="M285 374 L285 398" marker-end="url(#ah)"/>
+
+  <!-- You -->
+  <rect class="box" x="195" y="72" width="180" height="46" rx="9"/>
+  <text x="285" y="94" text-anchor="middle" class="t" font-size="14">You</text>
+  <text x="285" y="110" text-anchor="middle" class="s" font-size="11.5">chat, or record once</text>
+
+  <!-- Shadow agent -->
+  <rect class="box" x="195" y="142" width="180" height="46" rx="9"/>
+  <text x="285" y="164" text-anchor="middle" class="t" font-size="14">Shadow agent</text>
+  <text x="285" y="180" text-anchor="middle" class="s" font-size="11.5">runs your task</text>
+  <text x="392" y="205" class="lbl" font-size="11">hits a capability gap</text>
+
+  <!-- REQUEST_HARNESS -->
+  <rect class="acc" x="178" y="214" width="214" height="50" rx="9"/>
+  <text x="285" y="236" text-anchor="middle" class="t" font-size="14" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">REQUEST_HARNESS</text>
+  <text x="285" y="253" text-anchor="middle" class="s" font-size="11.5">"provision what I lack"</text>
+
+  <!-- Governor -->
+  <rect class="acc" x="160" y="290" width="250" height="84" rx="10"/>
+  <text x="285" y="311" text-anchor="middle" class="t" font-size="14.5">Governor</text>
+  <text x="285" y="327" text-anchor="middle" class="s" font-size="11.5">arbitrates every request by risk</text>
+  <rect class="chip" x="173" y="340" width="74" height="24" rx="12" fill="none" stroke="var(--low)"/>
+  <text x="210" y="356" text-anchor="middle" font-size="10.5" fill="var(--low)" font-weight="700">LOW &#183; grant</text>
+  <rect class="chip" x="251" y="340" width="62" height="24" rx="12" fill="none" stroke="var(--med)"/>
+  <text x="282" y="356" text-anchor="middle" font-size="10.5" fill="var(--med)" font-weight="700">MED &#183; judge</text>
+  <rect class="chip" x="317" y="340" width="80" height="24" rx="12" fill="none" stroke="var(--high)"/>
+  <text x="357" y="356" text-anchor="middle" font-size="10.5" fill="var(--high)" font-weight="700">HIGH &#183; escalate</text>
+
+  <!-- Operator Inbox (right) -->
+  <rect class="box" x="510" y="309" width="190" height="46" rx="9"/>
+  <text x="605" y="331" text-anchor="middle" class="t" font-size="13.5">Operator Inbox</text>
+  <text x="605" y="347" text-anchor="middle" class="s" font-size="11.5">you approve &#183; deny</text>
+  <path class="ln" d="M410 338 L506 334" marker-end="url(#ah)"/>
+  <text x="458" y="326" text-anchor="middle" class="lbl" font-size="10">escalate</text>
+  <path class="ln" d="M540 357 L420 367" marker-end="url(#ah)"/>
+  <text x="472" y="382" text-anchor="middle" class="lbl" font-size="10">decision</text>
+
+  <!-- Materialise -->
+  <rect class="box" x="160" y="398" width="250" height="48" rx="10"/>
+  <text x="285" y="419" text-anchor="middle" class="t" font-size="14">Materialise &amp; lease</text>
+  <text x="285" y="435" text-anchor="middle" class="s" font-size="11.5">forge &#183; grant &#183; log to the audit ledger</text>
+
+  <!-- family chips -->
+  <text x="285" y="470" text-anchor="middle" class="s" font-size="11">six capability families</text>
+  <g font-size="10.5" font-weight="700" fill="var(--ink)" text-anchor="middle">
+    <rect class="box" x="40"  y="480" width="104" height="26" rx="13"/><text x="92"  y="497">Tool</text>
+    <rect class="box" x="152" y="480" width="104" height="26" rx="13"/><text x="204" y="497">Skill</text>
+    <rect class="box" x="264" y="480" width="104" height="26" rx="13"/><text x="316" y="497">Access</text>
+    <rect class="box" x="376" y="480" width="104" height="26" rx="13"/><text x="428" y="497">Compute</text>
+    <rect class="box" x="488" y="480" width="104" height="26" rx="13"/><text x="540" y="497">Sub-agent</text>
+    <rect class="box" x="600" y="480" width="104" height="26" rx="13"/><text x="652" y="497">MCP</text>
+  </g>
+
+  <!-- loop back to Shadow -->
+  <path class="ln" d="M160 422 C 96 422 96 165 191 165" marker-end="url(#ah)"/>
+  <text x="84" y="297" text-anchor="middle" class="lbl" font-size="11" transform="rotate(-90 84 297)">resume &#8212; now capable</text>
+
+  <!-- footnote -->
+  <text x="285" y="545" text-anchor="middle" class="s" font-size="11">Every grant is leased, logged, and one-click revocable.</text>
+  <text x="285" y="562" text-anchor="middle" class="s" font-size="11">The judge can only ever downgrade toward safe.</text>
+</svg>

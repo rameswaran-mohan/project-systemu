@@ -4,34 +4,193 @@
 
 <h1 align="center">Systemu</h1>
 
-> **Teach your computer your job — by doing it once.**
-> Record any task on your screen. Systemu turns the recording into a
-> repeatable workflow, staffs it with an AI specialist, and runs it under
-> your approval — every action gated, logged, and local.
+> **A personal AI workforce you instruct in plain language or by showing it —
+> and that grows the capabilities it needs to finish the job, under your
+> governance.**
+>
+> Ask a quick question and get an answer in seconds. Hand a whole task to a
+> chat and an AI specialist runs it end-to-end. Or record a task on screen
+> once and replay it forever. However you instruct it, when the agent hits
+> something it lacks mid-run — a tool that doesn't exist, a skill it wasn't
+> given, a file it can't read — it doesn't fail and it doesn't fake it. It
+> **requests** the missing capability, and an always-on **Governor** grants,
+> denies, or escalates the request by risk. Every action gated, logged, and
+> local. Self-provisioning, made safe.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
-## Why Systemu
+**Three ways to put it to work:**
 
-Chat assistants wait to be asked, and agent frameworks need you to write
-skills by hand. Systemu learns the way a colleague does — **by watching
-you work**. Do the task once; it writes the step-by-step playbook, asks
-your approval, and from then on it's one click to run again. That makes
-it the LLM-native answer to RPA: no selectors, no scripts, no consultant.
+- 💬 **Ask** — a quick question in Chat comes back in seconds (plan-first, and
+  honest when an answer is only partial).
+- 🗣️ **Delegate** — describe a whole task in plain language; an AI specialist
+  runs it end-to-end through the governed pipeline.
+- 🎬 **Demonstrate** — record a task on screen once; Systemu turns it into a
+  reusable workflow you replay in one click.
 
-And unlike the viral personal-assistant agents, Systemu is built for work
-that has consequences:
+Tell it or show it — verbal or visual. Either way, the agent assembles the
+capabilities it needs as it goes, under your approval.
 
-* **Approval gates with un-automatable floors** — installing packages,
-  running freshly written code, destructive steps: each lands as one card
-  in your Inbox with a plain-English summary and a safe default. Most
-  approvals are one click; none are silent.
+## Why Systemu is different
+
+Most automation is **frozen at design time.** RPA scripts break when a
+selector moves; agent frameworks can only use the tools you wired up in
+advance. But the capability an agent *actually* needs is usually discovered
+mid-task — a tool that doesn't exist yet, a skill it wasn't given, a file
+it can't read. The system guesses the toolkit up front, and the agent —
+the one actually doing the work — can't ask for more.
+
+Systemu inverts that. Instead of the system **pushing** a fixed harness to
+the agent, the running agent **pulls** the capabilities it lacks at runtime,
+and an always-on **Governor** arbitrates every request by risk — auto-granting
+the safe, escalating the rest to you. The agent assembles its own harness,
+just-in-time, under governance. We named the pattern **Reverse-Harness** and
+[built a benchmark for it](#the-reverse-harness-pattern).
+
+It starts where RPA starts — record a task once — and goes where RPA can't:
+the agent grows to finish the job. Built for work that has consequences:
+
+* **Governed self-provisioning** — forging a tool, attaching an MCP server,
+  reading a secret, spawning sub-agents: each is a *request* the Governor
+  grants, denies, or escalates. High-risk requests always land as one card
+  in your Inbox with a plain-English summary and a safe default.
 * **Local-first** — your recordings, workflows, memory, and results live
   in a vault on your machine. API keys are never typed into the browser.
-* **Honest by construction** — tool results are verified (a no-output
-  call is a failure, not a phantom success), outcomes report file paths
-  you can open, and "couldn't do it" is never dressed up as done.
+* **Honest by construction** — tool results are verified (a no-output call
+  is a failure, not a phantom success), outcomes report file paths you can
+  open, and "couldn't do it" is never dressed up as done.
+
+---
+
+## The Reverse-Harness pattern
+
+<p align="center">
+  <img src="docs/assets/reverse-harness.svg" alt="The Reverse-Harness loop: a running agent hits a capability gap, issues a REQUEST_HARNESS pull, the Governor arbitrates by risk (low auto-grants, medium goes to an off-path judge, high escalates to the operator Inbox), the grant is materialised across six families, leased and logged, and the run resumes." width="760">
+</p>
+
+Classic agent harnesses are **push**: the system decides, at design time,
+which tools and permissions an agent gets. Reverse-Harness flips it to
+**pull** — the running agent proposes the capabilities it needs and a
+governance layer arbitrates them live. `REQUEST_HARNESS` becomes a
+first-class loop verb, the inverse of `TOOL_CALL`: *"provision a capability
+I lack"* vs *"use one I have."*
+
+```
+   PUSH  (classic harness)            PULL  (Reverse-Harness)
+   design time · fixed                runtime · just-in-time
+   ──────────────────────            ──────────────────────────
+   system picks the tools             agent hits a gap mid-task
+            │                                    │
+            ▼                                    ▼
+   agent is frozen with              REQUEST_HARNESS:
+   whatever it was handed            "provision what I lack"
+            │                                    │
+            ▼                                    ▼
+   gap at runtime → it fails         Governor arbitrates by risk
+                                     (grant · deny · escalate)
+                                                 │
+                                                 ▼
+                                     capability leased + logged,
+                                     revocable → the run continues
+```
+
+It generalizes capability acquisition from one class (tools, at design time)
+to **six families the Governor arbitrates at runtime:**
+
+| Family | The agent requests… | Default gate |
+|---|---|---|
+| **Tool** | a new executable tool (forge), or reuse of an existing one | reuse auto-grants; **new code escalates** |
+| **Skill** | a procedure (`SKILL.md`) — new or reused | reuse low-risk; new text → review |
+| **Access** | reading a file / resource / secret | whitelisted read low; **write / secret / network escalates** |
+| **Compute** | more iterations / think-budget | within ceiling low; **over ceiling escalates** |
+| **Sub-agent** | a bounded fleet of parallel child agents | depth + budget clamped; beyond → escalate |
+| **MCP** | attaching a Model Context Protocol server | re-attach low; **new server escalates** (SSRF-guarded, tool-hash-pinned) |
+
+The arbitration rests on two ideas we think are non-obvious:
+
+1. **A self-requested capability is *more* dangerous than a pre-provisioned
+   one** — the agent chose it — so it is gated *more* strictly, not less.
+2. **Judgment can only ever downgrade toward safe.** When an ambiguous
+   request needs an LLM judge, the judge may deny or escalate — it can
+   **never** grant beyond policy or "open a hole." A judge fault fails to
+   *escalation*, not to *grant*.
+
+Every grant is **leased and logged**: minted on grant, written to a per-run
+**decision-audit ledger** with its outcome, and revocable in one click —
+each self-built capability carries the provenance of the run that made it.
+We distilled the whole thing into **six reusable patterns** —
+Pull-Provisioning, the `REQUEST_HARNESS` verb, Risk-Tiered Arbitration,
+Attributed & Revocable Self-Grants, Off-Path Judgment, and a Provenance
+Ledger — and benchmarked it (see [Evidence](#evidence)).
+
+### What it looks like
+
+You hand a folder of scanned invoices to a chat: *"pull the totals into a
+spreadsheet."* The specialist starts — and finds it has no PDF-table
+extractor. Instead of failing, it requests one:
+
+1. `REQUEST_HARNESS{ kind: tool — "extract a table from a PDF" }`
+2. New code is **HIGH risk**, so the Governor escalates: one card lands in
+   your Inbox — *"forge `pdf_table_extract`? [view code] · [approve] · [deny]."*
+3. You approve. Systemu writes the tool, **dry-runs it** to prove it works,
+   deploys it with an *agent-built* badge, and the run resumes — now holding
+   the capability it lacked thirty seconds ago.
+4. Next time, the tool already exists: no request, no gate, instant.
+
+Notice the gap → request → govern → grow. That's the whole loop.
+
+## How Systemu grows itself
+
+Self-provisioning isn't a one-off. Capabilities the agent acquires persist
+(attributed and revocable), and the system keeps making them better:
+
+- **Forge tools on demand** — a missing tool is written (spec → code),
+  **dry-run-validated behind a gate**, then deployed as a first-class,
+  reusable tool. You see exactly what the agent built itself, with an
+  *agent-built* badge, and can revoke it anytime.
+- **Recalibrate what's inadequate** — when a tool or skill keeps failing,
+  the runtime diagnoses it and either repairs it in place or forks a
+  specialized version — re-validated before it ships.
+- **Evolve over time** — an evolution engine reviews real runs and
+  *proposes* improvements (merge duplicate specialists, upgrade a persona
+  with a discovered skill). Proposals land in your Inbox; nothing
+  auto-applies.
+- **Remember** — episodic memory captures what each run learned, a curator
+  consolidates skills over time (archive, never delete), and a capability
+  ledger tracks what actually works.
+
+Every one of these is **governed**: forging, recalibration, and evolution
+surface as approval cards by default. The agent gets more capable; you stay
+in control of what it keeps.
+
+## Evidence
+
+Reverse-Harness is being **validated, not just asserted.** Our Capability-Gap
+Benchmark puts it through tasks that are *impossible without acquiring a missing
+capability*, across the six families and multiple frontier models, in three
+conditions: a **frozen-harness baseline** (no pull), **governed pull** (the full
+Governor), and **pull without the LLM judge** — graded by an **external oracle**,
+never the system's own verifier (which would be circular).
+
+It targets the load-bearing question of self-provisioning that, to our
+knowledge, no prior benchmark isolates: **does the agent know when it's blocked,
+and does it request the *right* capability?** — pull-decision precision/recall,
+request appropriateness (premature / wasted / unused), governance cost (the
+deterministic-vs-LLM split), and per-family efficacy.
+
+Two properties hold **by construction**, independent of any run:
+
+- **Bounded safety.** Every high-risk request escalates regardless of
+  configuration; a judge fault escalates; a Governor failure can only ever deny
+  or escalate — never grant. These are verified as explicit safety properties,
+  not hoped-for behavior.
+- **Cost-disciplined governance.** Deterministic policy resolves the easy
+  majority for free; the LLM judge is reserved for genuinely ambiguous cases.
+
+The headline efficacy numbers — does governed pull recover tasks a frozen
+harness can't, and at what cost — **publish with the paper (evaluation in
+progress).**
 
 ## Quick start
 
@@ -379,147 +538,27 @@ see [`docs/redis-topologies.md`](docs/redis-topologies.md).
 
 ---
 
-## Configuration Reference
+## Configuration
 
-All settings go in your `.env` file. Copy `.env.example` as a starting point.
+Every setting lives in your `.env` file — copy [`.env.example`](.env.example)
+(each variable is documented inline) as a starting point, or let
+`sharing_on setup` and the dashboard **Settings** page write them for you. The
+ones you'll actually touch:
 
-### API Keys
-
-You need credentials for **at least one** provider — not all of them. Which keys
-matter depends on the provider you pick per tier (`sharing_on setup` or Settings).
-Keys are stored in `.env`; they are never typed into the browser.
-
-| Variable | Provider | Notes |
+| Variable | Default | What it does |
 |---|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter | Default; one key reaches many models. Free tier at [openrouter.ai](https://openrouter.ai) |
-| `GOOGLE_API_KEY` | Google AI Studio | Free at [aistudio.google.com](https://aistudio.google.com) |
-| `OPENAI_API_KEY` | OpenAI | [platform.openai.com](https://platform.openai.com) |
-| `ANTHROPIC_API_KEY` | Anthropic (native) | Needs the extra: `pip install "systemu[anthropic]"` |
-| `OLLAMA_URL` | Ollama (local) | Default `http://localhost:11434` — no key required |
-| `OPENROUTER_BASE_URL` | OpenRouter | Optional — override the OpenRouter base URL |
+| **API key** (one of) | — | `OPENROUTER_API_KEY` (default, many models), `GOOGLE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (needs `systemu[anthropic]`), or `OLLAMA_URL` (local, keyless). At least one. |
+| `SYSTEMU_MODEL_PRESET` | `budget` | Cost/quality dial: `budget` \| `balanced` \| `quality`. Override any tier with `SYSTEMU_TIER{1,2,3}_MODEL`; an explicit tier model always wins. |
+| `SYSTEMU_STORAGE` | `sqlite` (local) | `file` \| `sqlite` \| `postgres` — set by `install.py` per mode. |
+| `SYSTEMU_DASHBOARD_PORT` | `8765` | Dashboard port. |
+| `SYSTEMU_OUTPUT_DIR` | `~/Documents` | Where agent-generated files land. |
+| `SYSTEMU_NON_INTERACTIVE` | `false` | Auto-pick the safe default in every approval prompt (dev/CI only). |
+| `SYSTEMU_DELEGATE_USE_PARALLEL` | `false` | Opt in to parallel sub-agent fan-out for granted SUBAGENT requests. |
 
-### LLM models & providers
-
-Defaults are the **budget** preset (`deepseek/deepseek-v4-flash` on every tier).
-Set `SYSTEMU_MODEL_PRESET` to `balanced` or `quality`, or override any tier
-explicitly — an explicit tier model always wins over the preset.
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_MODEL_PRESET` | _(budget)_ | `budget` \| `balanced` \| `quality` — one-keystroke cost/quality dial |
-| `SYSTEMU_TIER1_MODEL` | `deepseek/deepseek-v4-flash` | Deep reasoning — scroll refinement, shadow decisions |
-| `SYSTEMU_TIER2_MODEL` | `deepseek/deepseek-v4-flash` | Structured output — tool forge, execution planning |
-| `SYSTEMU_TIER3_MODEL` | `deepseek/deepseek-v4-flash` | Fast formatting — log-to-instructions conversion |
-| `SYSTEMU_TIER1_PROVIDER` | _(auto)_ | Provider for tier 1: `openrouter` \| `google` \| `openai` \| `anthropic` \| `ollama` (empty = auto-detect from the model id) |
-| `SYSTEMU_TIER2_PROVIDER` | _(auto)_ | Provider for tier 2 |
-| `SYSTEMU_TIER3_PROVIDER` | _(auto)_ | Provider for tier 3 |
-| `SHARING_ON_MODEL` | `deepseek/deepseek-v4-flash` | LLM used during sharing_on analysis |
-
-The **quality** preset uses `anthropic/claude-sonnet-4.5` (tier 1),
-`google/gemini-3-flash-preview` (tier 2), `deepseek/deepseek-v4-flash` (tier 3);
-**balanced** uses `google/gemini-3-flash-preview` on tier 1 and the budget model
-elsewhere. A model id a provider later rejects degrades to the tier's budget
-default **with a visible flag**, rather than bricking the run.
-
-### Storage
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_STORAGE` | `file` | Backend: `file` (JSON vault), `sqlite`, or `postgres` |
-| `SYSTEMU_DATABASE_URL` | _(empty)_ | SQLAlchemy URL — required for `sqlite` or `postgres` mode |
-| `SYSTEMU_VAULT_DIR` | `systemu/vault` | Path to JSON vault (file mode only) |
-
-### Queue
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_QUEUE` | _(empty)_ | Leave empty for the in-process Supervisor queue. Set `huey` to route through Huey. |
-| `SYSTEMU_QUEUE_BROKER` | `sqlite` | Huey broker selection: `sqlite` (default) or `redis`. |
-| `SYSTEMU_REDIS_URL` | _(empty)_ | Required when `SYSTEMU_QUEUE_BROKER=redis`. e.g. `redis://:pass@redis:6379/0` |
-| `HUEY_WORKERS` | `4` | Huey thread count per worker process. |
-| `WORKER_REPLICAS` | `2` | docker-enterprise only — number of worker containers. |
-| `SYSTEMU_DB_BIND` | `127.0.0.1:5432` (docker-local) / empty (docker-enterprise) | **v0.6.6+** docker modes only. Host bind for the Postgres container. Required for `sharing_on record` from host to reach the container's vault. Loopback-only by default. Set to `0.0.0.0:5432` to expose on all interfaces (NOT recommended on shared hosts). To fully unpublish in docker-local, remove the `ports:` section via `docker-compose.override.yml`. |
-
-### Deployment mode
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_MODE` | `local` | `local` \| `docker-local` \| `docker-enterprise` — written by `install.py`; `start.sh`/`start.bat` read it |
-| `SYSTEMU_DASHBOARD_HOST` | _(unset → 127.0.0.1)_ | Bind host for the NiceGUI dashboard |
-| `SYSTEMU_DASHBOARD_PORT` | `8765` | Dashboard port |
-| `SYSTEMU_DECISION_QUEUE` | _(unset)_ | **v0.8.0:** When `true`, operator-decision prompts in non-TTY contexts are persisted to the dashboard `/insights → Pending Actions` queue instead of being silently auto-picked. Recommended for dashboard-driven workflows. |
-| `SYSTEMU_HEADLESS` | _(unset)_ | **Deprecated in v0.8.0** (use `SYSTEMU_DECISION_QUEUE` instead). When `1`, forces non-interactive mode at the `notify_user` layer (same effect as `SYSTEMU_NON_INTERACTIVE`) — silently auto-picks the safe-default `actions[0]`. |
-| `SYSTEMU_OUTPUT_DIR` | `~/Documents` | Where Shadow-generated files are saved |
-| `SYSTEMU_EXECUTION_RETENTION` | _(unset)_ | Max execution audit dirs to keep on disk; older pruned during save |
-
-### Behaviour & approval
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_NON_INTERACTIVE` | `false` | Auto-pick `actions[0]` (the safe-by-default choice) in every `notify_user` prompt. **Renamed from `SYSTEMU_AUTO_APPROVE_SCROLLS` in v0.6.1** — the old name lied about scope and is no longer recognised |
-| `SYSTEMU_AUTO_FORGE_TOOLS` | `false` | **Dev only** — auto-enables LLM-generated tools without review (bypasses Gate 2/3) |
-| `SYSTEMU_APPROVAL_TIMEOUT` | _(unset)_ | Seconds before a queued approval auto-resolves (sqlite_approval_gate) |
-
-### Tool execution
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_TOOL_BACKEND` | `local` | `local` \| `docker` \| `ssh` \| `wsl` (ssh/wsl are stubs) |
-| `SYSTEMU_DOCKER_TOOL_TIMEOUT` | `300` | Per-tool timeout (seconds) when `SYSTEMU_TOOL_BACKEND=docker` |
-| `SYSTEMU_TOOL_DEP_INSTALL_MODE` | `auto` | `auto` \| `off` \| `prompt` \| `always` — how the runtime handles tool pip deps |
-| `SYSTEMU_PREWARM_TOOL_DEPS` | `false` | Install all deployed-tool deps on daemon start instead of on first call |
-
-### Sub-agent fan-out (opt-in)
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_DELEGATE_USE_PARALLEL` | `false` | When `true`, a granted SUBAGENT request runs a goal's independent sub-tasks as a **bounded fleet of concurrent child agents** (one level deep), collated so partial success is reported honestly (what each child produced + what's missing) — never a blanket "everything failed". Off by default; sequential delegation is the safe, deterministic path. |
-
-### Intelligent Supervisor (v0.4.0+)
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_INTELLIGENT_SUPERVISOR` | `false` | Master kill switch for the Tier-1/2/3 intervention layer + scroll validator |
-| `SYSTEMU_MAX_CONSECUTIVE_THINK` | `5` | Hard cap on THINK-only iterations before the supervisor force-reflects |
-| `SYSTEMU_SUPERVISOR_CADENCE` | `auto` | How often the supervisor evaluates — `auto` \| `every` \| `slow` |
-| `SYSTEMU_SUPERVISOR_TIMEOUT_S` | `5.0` | Per-directive LLM timeout |
-| `SYSTEMU_SUPERVISOR_BUDGET_RUN` | `10` | Max supervisor LLM calls per shadow run |
-| `SYSTEMU_SUPERVISOR_BUDGET_HOUR_USD` | `5.0` | Hourly USD ceiling for supervisor LLM spend |
-| `SYSTEMU_SUPERVISOR_BUDGET_DAY_USD` | `50.0` | Daily USD ceiling |
-| `SYSTEMU_SUPERVISOR_TIER_ROUTINE` | `tier_3` | Tier used for routine supervisor checks |
-| `SYSTEMU_SUPERVISOR_TIER_INTERVENTION` | `tier_1` | Tier used for high-stakes interventions |
-
-### Pre-flight validators (v0.6.0)
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_SCROLL_VALIDATOR` | _(off; on when supervisor on)_ | Run the intent-aware scroll validator before activity extraction |
-| `SYSTEMU_SKILL_VALIDATOR` | _(off; on when scroll validator on)_ | Run the GUI-codification skill validator at extraction time |
-
-### Recalibration auto-approve (v0.5.1 + v0.6.0)
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_AUTO_APPROVE_LOW_RISK_RECAL` | `false` | Auto-apply low-risk **tool** recalibrations (fork-mode + dry-run passed + confidence=high + non-destructive). Otherwise surfaces operator card on `/tools`. |
-| `SYSTEMU_AUTO_APPROVE_LOW_RISK_SKILL_RECAL` | `false` | Auto-apply low-risk **skill** recalibrations (fork-mode + confidence=high + no `side_effect` in `produces` + non-destructive name). Otherwise surfaces operator card on `/skills`. |
-
-### Persona defaults
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYSTEMU_PERSONA_CREATIVITY` | `50` | Default persona dial (0–100) when shadows are auto-created |
-| `SYSTEMU_PERSONA_PROFESSIONALISM` | `50` | Default persona dial |
-| `SYSTEMU_PERSONA_TECHIE` | `50` | Default persona dial |
-| `SYSTEMU_PERSONA_THINKING` | `50` | Default persona dial |
-
-### sharing_on Capture
-
-| Variable | Default | Description |
-|---|---|---|
-| `SHARING_ON_SCREENSHOT_INTERVAL` | `3` | Seconds between screenshots |
-| `SHARING_ON_SCREENSHOT_WIDTH` | `1280` | Max screenshot width (pixels) |
-| `SHARING_ON_TELEGRAM_BOT_TOKEN` | _(unset)_ | Optional — when set, the daemon spins up a Telegram bot for chat-based submissions + approvals. See [docs/messaging.md](docs/messaging.md) |
-| `SHARING_ON_TELEGRAM_ALLOWED_USER_IDS` | _(unset)_ | Required when bot token is set — strict allowlist (refuses to start if empty) |
+The full set — per-tier models + providers, queue/Redis, Docker host binds,
+the Intelligent-Supervisor budget knobs, pre-flight validators, recalibration
+auto-approve, persona dials, and capture intervals — is documented inline in
+[`.env.example`](.env.example) and editable from the **Settings** page.
 
 ---
 
@@ -554,7 +593,7 @@ SYSTEMU_STORAGE=sqlite SYSTEMU_DATABASE_URL=sqlite:///./data/systemu.db \
   python -m systemu.migrations.json_to_db --source ./systemu/vault --dry-run
 ```
 
-See the `Migrating from a pre-pivot install` section below for the Postgres path.
+See the `Migrating from a pre-pivot install` section above for the Postgres path.
 
 ---
 
@@ -715,26 +754,17 @@ including the explicit guidelines for AI-authored PRs.
 
 ## Project status
 
-Pre-1.0.  Current release: **v0.9.41** (see [`release-notes/`](release-notes/) for what's new).  The table below summarises what's shipped vs. what's next.
+**Pre-1.0** — current release **v0.9.41**. It's used daily, but APIs and
+behavior can still change. Full per-version history lives in
+[`release-notes/`](release-notes/).
 
-### Shipped
-
-| Version | Scope |
-|---|---|
-| **v0.2** | Capture engine consolidated under `sharing_on` + identity split |
-| **v0.3** | Three-mode pivot (local / docker-local / docker-enterprise), identity_split, Postgres backend, Telegram messaging gateway |
-| **v0.4.0** | Intelligent Supervisor MVP — bounded action vocabulary, supervisor-flash bus, cost ledger, scroll validator |
-| **v0.4.1** | Per-shadow supervisor opt-in, TERMINATE resolution UX, operator-feedback learning, strategy-stream UI |
-| **v0.4.2** | Activity-shadow affinity routing |
-| **v0.4.3** | Shadow-level success metrics, `Shadow.specialty` routing tag, cost-pressure surfacing |
-| **v0.4.4** | Per-tool success-rate tracking, operator dashboard surfaces, specialty auto-suggest |
-| **v0.5.0** | Tool readiness pipeline (Gate 3.5 dry-run validation), mid-execution `RECALIBRATE_TOOL`, bump-vs-fork decision, operator-approved resume |
-| **v0.5.1** | Recalibration deferred items — override actions, spec-diff visualisation, low-risk auto-approve, cross-shadow inadequacy clustering, true snapshot-based resume |
-| **v0.6.0** | Intent-aware extraction pipeline (root-cause fix) — capture intent extractor, intent-aware scroll validator + remediation, schema-aware tool/skill selection, skill intent contracts + recalibration, intent-driven tool forge, intent-aware shadow tiebreak |
-| **v0.6.1** | Post-v0.6.0 hardening — `Tool.name` path-traversal guard, `SYSTEMU_AUTO_APPROVE_SCROLLS` → `SYSTEMU_NON_INTERACTIVE` rename with safe-action ordering, `RECALIBRATE_SKILL` runtime wiring, catalog N+1 fix, batched `save_skill` resolution |
-| **v0.7.x** | PyPI/Docker packaging, native LLM provider plugins (Anthropic/OpenAI), `export-skill` wedge + spec-conformant `SKILL.md` writer, episodic-memory + capability ledger |
-| **v0.8.x** | Decisions Inbox + gate-mode dial, `SYSTEMU_DECISION_QUEUE` for dashboard-driven approvals, wheel-bundled starter vault (`sharing_on init`) |
-| **v0.9.x** | Reverse-Harness Governor (capability PULL arbitration, TOOL provisioner + escalate→approve→resume); the six-spine command-center dashboard with the persistent right rail; **pip-first onboarding** (`sharing_on setup`); **per-tier provider selection** (OpenRouter/Google/OpenAI/Anthropic/Ollama) with native Anthropic + local Ollama invocation and model presets; **plan-first quick lane** with honest partial answers; web-search snippets; geocode robustness; Telegram mobile alerts; MCP connector support; opt-in **parallel sub-agent fan-out** (a granted SUBAGENT spawns a bounded concurrent fleet, one level deep, with partial-success-aware collation); a per-run **decision-audit ledger** with a run-tree-scoped request cap + request-outcome taxonomy; lease-lifecycle + tool provenance (the *agent-built* badge) |
+**The arc so far:** a capture engine + three deployment modes → the Intelligent
+Supervisor and tool-readiness pipeline (forge → dry-run → recalibrate) →
+intent-aware extraction → the Decisions Inbox + gate-mode dial → the
+**Reverse-Harness Governor**: capability-pull arbitration across all six
+families, scoped leases, a per-run decision-audit ledger, pip-first onboarding,
+per-tier providers (OpenRouter/Google/OpenAI/Anthropic/Ollama), MCP connectors,
+and opt-in parallel sub-agent fan-out.
 
 ### What's next
 
@@ -752,185 +782,25 @@ If you want to contribute, [`CONTRIBUTING.md`](CONTRIBUTING.md) is the contribut
 
 ## Troubleshooting
 
-Common operator-environment issues and their fixes.
-
-### Windows — "The system cannot find the drive specified" during `start.bat`
-
-Cosmetic stderr from cmd.exe or PowerShell walking PATH when it contains a stale entry pointing to an unmounted drive (typically an old mapped network drive).  Doesn't affect daemon startup.
-
-Diagnose:
-
-```powershell
-$env:Path -split ";" | ForEach-Object {
-    if ($_ -match "^[A-Z]:") {
-        $drive = $_.Substring(0, 2)
-        if (-not (Test-Path $drive)) { Write-Output "STALE: $_" }
-    }
-}
-```
-
-Fix: remove the offending entry from System Properties → Environment Variables → PATH.
-
-### Windows — PowerShell ExecutionPolicy blocks start.bat
-
-`start.bat` spawns daemon + worker via embedded PowerShell `Start-Process`.  On corporate-locked machines this can be blocked by Group Policy even with `-ExecutionPolicy Bypass`.
-
-Diagnose:
-
-```powershell
-Get-ExecutionPolicy -List
-```
-
-Fix: ask your IT department to whitelist the project directory, OR run start.bat from an elevated terminal where execution policy is unrestricted.
-
-### Linux — Capture records empty event streams (Wayland)
-
-Symptom: `sharing_on record` runs, produces a session folder, but `events.db` is empty or near-empty.  Dashboard works.
-
-Cause: pynput requires X11.  Ubuntu 22.04+ and Fedora Workstation default to Wayland.
-
-Fix: log out and select an X11/Xorg session at the login screen (gear icon next to the password field).  Daemon, dashboard, and tool execution work fine on Wayland — only capture is affected.
-
-### Linux — Missing capture deps (xdotool / xclip)
-
-Symptom: capture produces some events but clipboard/keyboard events are empty.
-
-Fix:
-
-```bash
-sudo apt install xdotool xclip      # Debian / Ubuntu
-sudo dnf install xdotool xclip      # Fedora
-```
-
-`install.py` warns about these at install time but doesn't auto-install (sudo prompt would block the installer).
-
-### Stale `SYSTEMU_AUTO_APPROVE_SCROLLS` in `.env` after upgrade
-
-Symptom: you set `SYSTEMU_AUTO_APPROVE_SCROLLS=true` expecting non-interactive mode; the daemon prompts you anyway.
-
-Cause: the env var was renamed to `SYSTEMU_NON_INTERACTIVE` in v0.6.1.  Hard cut, no alias.
-
-Fix: edit `.env`, replace `SYSTEMU_AUTO_APPROVE_SCROLLS` with `SYSTEMU_NON_INTERACTIVE`, restart the daemon.
-
-`install.py` and the daemon both emit warnings when the old key is detected.
-
-### Daemon crashes with `OperationalError: no such column`
-
-Symptom: dashboard loads but every page returns 500; `logs/daemon.log` shows `sqlalchemy.exc.OperationalError: no such column: ...`.
-
-Cause: DB schema is behind the code.  Happens when you `git pull` a release with a new migration but skip re-running `install.py`.
-
-Fix: `start.bat` / `start.sh` (v0.6.1+) auto-runs `alembic upgrade head` on every start.  If you're on an older start script:
-
-```bash
-python scripts/upgrade_db.py
-```
-
-Or just re-run `install.bat` / `./install.sh` — it migrates as part of setup.
-
-### macOS — capture silently records empty events
-
-Symptom: install completes, daemon runs, but sharing_on session captures contain empty event streams.
-
-Cause: macOS requires explicit Accessibility (for pynput keyboard/clipboard) and Screen Recording (for screenshots) grants.
-
-Fix:
-1. System Settings → Privacy & Security → **Accessibility** → click +, add Terminal (or whichever app runs `./start.sh`)
-2. System Settings → Privacy & Security → **Screen Recording** → click +, add Terminal
-3. Restart the daemon: `./stop.sh && ./start.sh`
-
-`install.py` (v0.6.3+) prints this guide automatically on macOS; the daemon does not detect the missing grant at runtime.
-
-### `Python 3.10+ required` on Debian 11 / older systems
-
-Symptom: `install.py` exits with `Python 3.10+ required (you have 3.9)`.
-
-Cause: Debian 11 ships 3.9 by default; Python 3.10+ is required.
-
-Fix: install 3.11 from the system package manager:
-
-```bash
-sudo apt install python3.11 python3.11-venv       # Debian / Ubuntu
-sudo dnf install python3.11                       # Fedora / RHEL
-brew install python@3.11                          # macOS
-winget install Python.Python.3.11                 # Windows
-```
-
-Then re-run with the new interpreter: `python3.11 install.py`. v0.6.3+ prints these hints automatically.
-
-### `Invalid key (HTTP 401 from OpenRouter)` during install
-
-Symptom: install.py rejects the OpenRouter key with a 401 message and re-prompts.
-
-Cause: the key was mistyped, revoked, or doesn't have model access enabled.
-
-Fix: generate a fresh key at <https://openrouter.ai/keys> — the installer (v0.6.3+) probe-validates it before writing to `.env`. After 3 attempts the installer stores the key anyway; correct it manually in `.env` later, then restart the daemon.
-
-### Behind a corporate proxy
-
-Symptom: install hangs at `Upgrading pip …`, `Installing dependencies …`, or `Validating OpenRouter key …`.
-
-Cause: pip, Playwright, and the OpenRouter validator all need `HTTP_PROXY` / `HTTPS_PROXY` env vars set.
-
-Fix: export the vars before running `install.py`:
-
-```bash
-export HTTPS_PROXY=http://user:pass@proxy.corp.example:3128
-export HTTP_PROXY=http://user:pass@proxy.corp.example:3128
-python install.py
-```
-
-```powershell
-# Windows PowerShell
-$env:HTTPS_PROXY = "http://user:pass@proxy.corp.example:3128"
-$env:HTTP_PROXY = "http://user:pass@proxy.corp.example:3128"
-python install.py
-```
-
-`install.py` (v0.6.3+) echoes the detected proxy URL (with password masked) at the top of the install log. If no proxy line appears, the vars weren't exported into the shell that ran `install.py`.
-
-### Apple Silicon (M1 / M2 / M3 / M4) — install or Playwright errors
-
-Symptom: install or Playwright fails with architecture-mismatch errors on an M-series Mac.
-
-Cause: some PyObjC-using deps or Chromium binaries lag the ARM64 build cycle.
-
-Fix: re-run install under Rosetta:
-
-```bash
-arch -x86_64 python install.py
-```
-
-`install.py` (v0.6.4+) prints an info banner on Apple Silicon listing this and other known caveats. Most installs complete natively without intervention.
-
-### Docker mode — captured scroll never appears on dashboard (v0.6.6+)
-
-Symptom: `sharing_on record` completes, you see `intent.json` + `instructions.md` in the capture directory, but no scroll lands on `/scrolls`.
-
-Cause: the host's `analyze` cannot reach the container's Postgres.
-
-Fix: confirm `SYSTEMU_DB_BIND` is set in `.env`:
-
-- **docker-local** (default): `SYSTEMU_DB_BIND=127.0.0.1:5432` — loopback-only binding. Pre-v0.6.6 installs and operators who manually edited `.env` may have this missing. Re-run `install.py --mode docker-local` to refresh.
-- **docker-enterprise**: not published by default. To enable for development, set `SYSTEMU_DB_BIND=127.0.0.1:5432` AND add a `ports:` block to the `postgres` service via a `docker-compose.override.yml`. Not recommended for production.
-
-After editing: `docker compose down && docker compose --profile <local|enterprise> up -d`.
-
-### Docker mode — dashboard shows different scrolls than the worker writes (pre-v0.6.6 only)
-
-Symptom: dashboard `/scrolls` lists fewer scrolls than `psql` shows in Postgres. Activities in the database are not visible in the dashboard's activity feed.
-
-Cause: pre-v0.6.6 dashboard fell back to FileVault when `SYSTEMU_REDIS_URL` was missing (docker-local intentionally has no Redis). Dashboard wrote to `/data/vault/*.json` while the worker wrote to Postgres. Split-brain.
-
-Fix: upgrade to v0.6.6+ via `./update.sh` (or `update.bat`). The AppState fix ([commit `v0.6.6-c`](#)) gates the Redis URL requirement on `SYSTEMU_QUEUE_BROKER=redis` (enterprise only).
-
-### Docker mode — elder/shadow memory disappears after `docker compose down -v` (pre-v0.6.6 only)
-
-Symptom: every container rebuild loses all consolidated learnings. `ELDER_MEMORY.md` and `shadow_<id>/memory/` files are empty on the new container.
-
-Cause: pre-v0.6.6 SqliteVault defaulted `memory_dir` to `/tmp/systemu_memory` for Postgres URLs. `/tmp` in a container is the writable layer, not a volume mount, so it's lost on rebuild.
-
-Fix: upgrade to v0.6.6+. The new default is `${SYSTEMU_VAULT_DIR}/memory`, which is volume-mounted and persistent.
+The fixes for what new users hit most:
+
+- **Windows — `start.bat` prints "the system cannot find the drive specified":**
+  cosmetic stderr from a stale `PATH` entry (an old mapped network drive). It
+  doesn't affect startup — remove the dead entry from PATH.
+- **Linux — capture records empty events:** `pynput` needs X11, but Ubuntu/Fedora
+  default to Wayland. Log in with an Xorg session (the daemon, dashboard, and
+  tools work fine on Wayland — only capture is affected) and
+  `sudo apt install xdotool xclip`.
+- **macOS — capture is empty:** grant **Accessibility** + **Screen Recording** to
+  your terminal in System Settings → Privacy & Security, then restart the daemon.
+- **`HTTP 401 from OpenRouter`:** the key is mistyped, revoked, or lacks model
+  access — generate a fresh one at <https://openrouter.ai/keys>.
+- **Daemon 500s with `no such column`:** the DB schema is behind the code —
+  `./update.sh` (or re-running the installer) applies the migrations.
+
+More environment-specific fixes — corporate proxy, Apple Silicon / Rosetta,
+Docker host binds, older Python — are in [`USER_GUIDE.md`](USER_GUIDE.md). For
+anything else, the [issue tracker](https://github.com/rameswaran-mohan/project-systemu/issues).
 
 ---
 
