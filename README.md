@@ -19,6 +19,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20816384.svg)](https://doi.org/10.5281/zenodo.20816384)
 
 **Three ways to put it to work:**
 
@@ -200,6 +201,20 @@ Rameswaran Mohan, 2026. Preprint, not yet peer-reviewed; licensed
 [CC&nbsp;BY&nbsp;4.0](https://creativecommons.org/licenses/by/4.0/). Every number
 is reproducible from [`cgb_eval/`](cgb_eval) and [`cgb_results/`](cgb_results) via
 `python -m cgb_eval.paper_numbers`.
+
+**Cite (DOI):** [10.5281/zenodo.20816384](https://doi.org/10.5281/zenodo.20816384)
+
+```bibtex
+@misc{mohan2026reverseharness,
+  title  = {Reverse-Harness: Design Patterns for Runtime, Agent-Initiated
+            Capability Provisioning under Governance},
+  author = {Mohan, Rameswaran},
+  year   = {2026},
+  note   = {Preprint},
+  doi    = {10.5281/zenodo.20816384},
+  url    = {https://doi.org/10.5281/zenodo.20816384}
+}
+```
 
 ## Quick start
 
