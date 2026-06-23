@@ -188,9 +188,18 @@ Two properties hold **by construction**, independent of any run:
 - **Cost-disciplined governance.** Deterministic policy resolves the easy
   majority for free; the LLM judge is reserved for genuinely ambiguous cases.
 
-The headline efficacy numbers — does governed pull recover tasks a frozen
-harness can't, and at what cost — **publish with the paper (evaluation in
-progress).**
+The headline result: across **179 trials** over **5 models / 5 vendors**, a
+frozen-harness baseline succeeds on **6%** of gap-bearing tasks and governed pull
+on **61%**, recovering **~60%** of the baseline's failures at modest cost. The full
+results — the recognition rate and request-outcome taxonomy, governance cost, and
+the bounded-safety verification — are in the preprint.
+
+📄 **Preprint:** [*Reverse-Harness: Design Patterns for Runtime, Agent-Initiated
+Capability Provisioning under Governance*](docs/Reverse-Harness-preprint.pdf) —
+Rameswaran Mohan, 2026. Preprint, not yet peer-reviewed; licensed
+[CC&nbsp;BY&nbsp;4.0](https://creativecommons.org/licenses/by/4.0/). Every number
+is reproducible from [`cgb_eval/`](cgb_eval) and [`cgb_results/`](cgb_results) via
+`python -m cgb_eval.paper_numbers`.
 
 ## Quick start
 
