@@ -138,13 +138,20 @@ body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, v
 .s-mono {{ font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: var(--type-xs); color: var(--color-muted); }}
 
 /* ── right-rail item cards (W7.3 — stacked: pill / wrapping title / actions) ── */
-.s-rail-item {{ display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; margin-bottom: 8px; }}
-.s-rail-title {{ font-size: var(--type-sm); color: var(--color-text); line-height: 1.35; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
+.s-rail-item {{ display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; margin-bottom: 6px; }}
+.s-rail-title {{ font-size: var(--type-sm); color: var(--color-text); line-height: 1.3; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
 .s-rail-actions {{ display: flex; justify-content: flex-end; gap: 6px; }}
-/* "Needs you" scroller: bound the section so a long pending list scrolls
-   internally instead of pushing the "Live" pane below the fold. max-height =>
-   shrink-to-fit when short, scroll when long. */
-.s-rail-scroll {{ max-height: 260px; overflow-y: auto; }}
+/* v0.9.42: compact buttons inside the "Needs you" rail so many gates stay tidy. */
+.s-rail-actions .s-btn {{ padding: 2px 9px; font-size: 11px; }}
+/* "Needs you" scroller: FIXED height (v0.9.42) so a long pending list scrolls
+   internally and never pushes the "Live" pane below the fold. scrollbar-gutter
+   keeps the content width constant whether or not the scrollbar is showing; the
+   scrollbar itself is thin + near-invisible. */
+.s-rail-scroll {{ height: 220px; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--color-border) 55%, transparent) transparent; }}
+.s-rail-scroll::-webkit-scrollbar {{ width: 6px; }}
+.s-rail-scroll::-webkit-scrollbar-track {{ background: transparent; }}
+.s-rail-scroll::-webkit-scrollbar-thumb {{ background: color-mix(in srgb, var(--color-border) 55%, transparent); border-radius: 3px; }}
+.s-rail-scroll:hover::-webkit-scrollbar-thumb {{ background: var(--color-border); }}
 
 /* ── entity rows (shared tool/skill renderers — Phase 5 Slice 3) ── */
 .s-text-success {{ color: var(--color-success); }}
@@ -253,8 +260,8 @@ def _legacy_compat_css() -> str:
 
 /* ── persistent right rail (Phase 4) ── */
 .s-rail {
-    width: 300px;
-    min-width: 300px;
+    width: clamp(300px, 22vw, 360px);
+    min-width: clamp(300px, 22vw, 360px);
     background: var(--color-surface);
     border-left: 1px solid var(--color-border);
     padding: 24px 16px;

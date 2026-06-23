@@ -215,6 +215,7 @@ def build_supervisor_events_pane(
     # every repaint so an opened row STAYS open. Repaints themselves are
     # change-gated (an idle pane stops re-rendering entirely).
     open_state: Dict[int, bool] = {}
+    read_state: Dict[int, bool] = {}   # v0.9.42: per-session unread tracking
     gate = RepaintGate()
 
     # ── Muted "Show system" toggle ────────────────────────────────────────
@@ -271,7 +272,8 @@ def build_supervisor_events_pane(
         header = (f"{tstr}  " if tstr else "") + f"[{level}] " + str(ev.get("message", ""))[:200]
         with stateful_expansion(
             header, state_key=event_ui_key(ev), open_state=open_state,
-        ).classes("w-full").style(
+            read_state=read_state,
+        ).style(
             f"font-size: 12px; color: {THEME['text']};"
         ):
             render_event_details_body(ev.get("details") or {})

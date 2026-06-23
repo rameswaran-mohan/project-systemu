@@ -188,20 +188,52 @@ def prune_open_state(open_state: dict, live_keys) -> None:
         open_state.pop(k, None)
 
 
-def stateful_expansion(header: str, *, state_key: Any, open_state: dict) -> Any:
+def stateful_expansion(header: str, *, state_key: Any, open_state: dict,
+                       read_state=None) -> Any:
     """A ``ui.expansion`` that survives ``@ui.refreshable`` repaints.
 
     The open/closed state lives in the caller-owned ``open_state`` dict keyed
     by ``state_key`` (use ``event_ui_key`` for event rows); each rebuild
     restores it instead of resetting to closed.
+
+    v0.9.42: when ``read_state`` (an unread-tracking dict keyed like
+    ``open_state``) is supplied, the row gains the expand chevron on the LEFT
+    (Quasar ``switch-toggle-side``) plus a small leading unread dot — a solid
+    accent dot when the entry is new, hollowing to an empty ring once the
+    operator expands or clicks it. Read-state is in-memory (per session). The
+    returned element is the expansion, so ``with stateful_expansion(...):``
+    still populates the body normally.
     """
     from nicegui import ui
 
-    return ui.expansion(
-        header,
-        value=bool(open_state.get(state_key, False)),
-        on_value_change=lambda e: record_open_state(open_state, state_key, e),
-    )
+    if read_state is None:
+        return ui.expansion(
+            header,
+            value=bool(open_state.get(state_key, False)),
+            on_value_change=lambda e: record_open_state(open_state, state_key, e),
+        )
+
+    _DOT = ("width: 8px; height: 8px; border-radius: 50%; margin-top: 7px; "
+            "flex: 0 0 auto; cursor: pointer; ")
+    _UNREAD = _DOT + "background: color-mix(in srgb, var(--color-accent), #000 22%);"
+    _READ = _DOT + "background: transparent; border: 1.5px solid var(--color-border);"
+
+    with ui.row().classes("w-full items-start no-wrap").style("gap: 6px;"):
+        dot = ui.element("div").style(_READ if read_state.get(state_key) else _UNREAD)
+
+        def _mark_read(_=None) -> None:
+            if not read_state.get(state_key):
+                read_state[state_key] = True
+                dot.style(replace=_READ)
+
+        exp = ui.expansion(
+            header,
+            value=bool(open_state.get(state_key, False)),
+            on_value_change=lambda e: (
+                record_open_state(open_state, state_key, e), _mark_read()),
+        ).props("switch-toggle-side").style("flex: 1 1 auto; min-width: 0;")
+        dot.on("click", _mark_read)
+    return exp
 
 
 def render_floor_pierce_banner() -> None:

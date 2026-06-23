@@ -208,7 +208,6 @@ def build_work_page() -> None:
     # ── Header + filter bar ────────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between q-mb-md"):
         with ui.column().style("gap: 2px;"):
-            ui.label("Work").classes("s-page-title")
             from systemu.interface.design.glossary import lore_sublabel
             ui.label(lore_sublabel("work")).classes("s-muted")
 

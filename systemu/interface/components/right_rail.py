@@ -99,6 +99,7 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
     # W11.1: expansion open/closed state survives repaints; repaints happen
     # only when content changed (see live_events_pane — same field bug).
     open_state: Dict[int, bool] = {}
+    read_state: Dict[int, bool] = {}   # v0.9.42: per-session unread tracking
     gate = RepaintGate()
 
     # W5.3: stable-slot host for the inline Answer dialog — creating a dialog
@@ -129,7 +130,8 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
 
         with stateful_expansion(
             header, state_key=event_ui_key(ev), open_state=open_state,
-        ).classes("w-full").style(
+            read_state=read_state,
+        ).style(
             "font-size: 12px;"
         ):
             if row["details"]:

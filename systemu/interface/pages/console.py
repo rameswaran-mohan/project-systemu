@@ -164,8 +164,7 @@ def build_home_page() -> None:
     pending_scrolls    = [s for s in scrolls    if s.get("status") == "pending_approval"]
 
     # ── Header + quick actions ─────────────────────────────────────────
-    with ui.row().classes("w-full items-center justify-between q-mb-md"):
-        ui.label("Home").classes("s-page-title")
+    with ui.row().classes("w-full items-center justify-end q-mb-md"):
         with ui.row().classes("items-center q-gutter-sm"):
             ui.button("Record", on_click=_trigger_record_dialog) \
                 .props("flat no-caps").classes("s-btn s-btn--primary")

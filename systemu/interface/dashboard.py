@@ -179,7 +179,7 @@ def _build_layout(page_title: str, current_path: str):
 
         # ── Sidebar ────────────────────────────────────────────────────────
         with ui.column().classes("s-sidebar").style(
-            f"width: 220px; min-width: 220px; background: {THEME['surface']}; "
+            f"width: clamp(160px, 13vw, 200px); min-width: clamp(160px, 13vw, 200px); background: {THEME['surface']}; "
             f"border-right: 1px solid {THEME['border']}; padding: 24px 12px; gap: 4px; "
             f"height: 100vh; position: sticky; top: 0; overflow-y: auto;"
         ):

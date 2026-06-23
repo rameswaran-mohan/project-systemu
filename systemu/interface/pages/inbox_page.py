@@ -335,7 +335,6 @@ def build_inbox_page() -> None:
     state = AppState.get()
     vault = state.vault
 
-    ui.label("Inbox").classes("s-page-title").style("margin-bottom: 4px;")
     from systemu.interface.design.glossary import lore_sublabel
     ui.label(lore_sublabel("inbox")).classes("s-muted")
     ui.label(

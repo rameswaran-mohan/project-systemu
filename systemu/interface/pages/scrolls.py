@@ -27,7 +27,6 @@ def build_scrolls_page() -> None:
     from systemu.interface.design.glossary import lore_sublabel
     with ui.row().classes("w-full items-center justify-between q-mb-md"):
         with ui.column().classes("q-gutter-none"):
-            ui.label("Scrolls").classes("s-page-title")
             ui.label(lore_sublabel("scrolls")).classes("s-muted")
         ui.button("+ Refine New Session", on_click=_show_refine_dialog).classes("s-btn s-btn--primary")
 
