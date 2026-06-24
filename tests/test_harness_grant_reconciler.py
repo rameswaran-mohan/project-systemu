@@ -449,3 +449,62 @@ class TestWrapperAndRegistration:
         assert "_harness_grant_reconciler_job" in src
         assert 'id="harness_grant_reconciler"' in src
         assert 'name="Harness Grant Reconciler"' in src
+
+
+class TestFreeTextInputAnswer:
+    """v0.9.45: a free-text ASK_OPERATOR (synthesized one-field schema) must inject
+    the operator's CLEAN typed value — not the raw form JSON or a button label —
+    so the agent gets a usable answer and the workflow-lane re-ask loop ends."""
+
+    def _post_resolve_free_text(self, vault, *, choice):
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.runtime.elicitation import free_text_input_schema
+        queue = OperatorDecisionQueue(vault)
+        did = queue.post(
+            title="Harness request: input [hreq_i]", body="?",
+            options=["Deny", "Approve", "Edit spec"],
+            context={
+                "kind": "gate", "gate_type": "harness",
+                "execution_id": "exec_i", "activity_id": "act_i",
+                "shadow_id": "sh_i", "request_id": "hreq_i",
+                "harness_kind": "input",
+                "requested_schema": free_text_input_schema("What number?"),
+                "pending_tool": {}, "param_substitution": False,
+                "spec": {"question": "What number?"}, "risk_band": "medium",
+            },
+            dedup_key="harness:exec_i:hreq_i",
+        )
+        queue.resolve(did, choice=choice)
+        return did
+
+    def test_clean_value_injected_not_json_or_label(self, tmp_path):
+        import json
+        from systemu.scheduler.jobs import reconcile_resolved_harness_grants
+        vlt = _make_vault(tmp_path)
+        data_dir = _seed_snapshot(
+            tmp_path, execution_id="exec_i", shadow_id="sh_i",
+            scroll_id="sc_i", activity_id="act_i")
+        self._post_resolve_free_text(vlt, choice=json.dumps({"answer": "42"}))
+        sup = _FakeSupervisor()
+        n = reconcile_resolved_harness_grants(
+            vault=vlt, supervisor=sup, data_dir=data_dir)
+        assert n == 1 and len(sup.calls) == 1
+        gp = sup.calls[0]["grant_payload"]
+        assert gp["kind"] == "input"
+        assert gp["operator_answer"] == "42"          # the CLEAN value
+        assert "{" not in gp["operator_answer"]        # not raw form JSON
+        assert gp["operator_answer"] not in ("Approve", "Edit spec", "Deny")
+
+    def test_deny_takes_denial_path_not_label_answer(self, tmp_path):
+        from systemu.scheduler.jobs import reconcile_resolved_harness_grants
+        vlt = _make_vault(tmp_path)
+        data_dir = _seed_snapshot(
+            tmp_path, execution_id="exec_i", shadow_id="sh_i",
+            scroll_id="sc_i", activity_id="act_i")
+        self._post_resolve_free_text(vlt, choice="Deny")
+        sup = _FakeSupervisor()
+        reconcile_resolved_harness_grants(
+            vault=vlt, supervisor=sup, data_dir=data_dir)
+        gp = sup.calls[0]["grant_payload"]
+        assert gp.get("denied") is True
+        assert gp.get("operator_answer") != "Deny"

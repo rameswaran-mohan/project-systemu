@@ -378,16 +378,18 @@ def test_surface_harness_request_suppresses_raw_spec_dump_for_form(tmp_path):
     assert "Tool 'geocode' needs more parameters." in body  # the question is shown
 
 
-def test_surface_harness_request_keeps_spec_dump_for_free_text(tmp_path):
-    """Back-compat: a free-text / capability request (no requested_schema) keeps
-    the full `Spec: {json}` preview in the card body."""
+def test_surface_harness_request_synthesizes_form_for_free_text_input(tmp_path):
+    """v0.9.45: a free-text INPUT request (no requested_schema) now SYNTHESIZES a
+    one-field schema so the card renders an answer BOX (not a raw `Spec: {json}`
+    dump) — the operator types the value and the reconciler extracts it cleanly,
+    ending the old re-ask futility loop."""
     from systemu.interface.harness_review import surface_harness_request
     from systemu.core.models import HarnessRequest, HarnessKind, HarnessVerdict, \
         HarnessDecision, RiskBand
     vlt = _make_vault(tmp_path)
     req = HarnessRequest(
         kind=HarnessKind.INPUT,
-        spec={"question": "CSV or XLSX?"},   # no requested_schema → free-text
+        spec={"question": "CSV or XLSX?"},   # no requested_schema → synthesized
         rationale="ambiguous format",
     )
     vd = HarnessVerdict(
@@ -399,7 +401,37 @@ def test_surface_harness_request_keeps_spec_dump_for_free_text(tmp_path):
         shadow_id="sh_2", vault=vlt,
     )
     dec = vlt.get_decision(did)
-    assert "Spec: {" in (dec.body or ""), "free-text gate must keep the spec preview"
+    # The synthesized form replaces the raw spec dump; the question is the body.
+    assert "Spec: {" not in (dec.body or "")
+    assert "CSV or XLSX?" in (dec.body or "")
+    # The context carries the synthesized one-field schema so render draws a box.
+    schema = (dec.context or {}).get("requested_schema") or {}
+    assert schema.get("properties", {}).get("answer", {}).get("type") == "string"
+
+
+def test_surface_harness_request_keeps_spec_dump_for_capability(tmp_path):
+    """Back-compat: a NON-input capability request (no requested_schema) still
+    keeps the full `Spec: {json}` preview — synthesis is scoped to kind==input."""
+    from systemu.interface.harness_review import surface_harness_request
+    from systemu.core.models import HarnessRequest, HarnessKind, HarnessVerdict, \
+        HarnessDecision, RiskBand
+    vlt = _make_vault(tmp_path)
+    req = HarnessRequest(
+        kind=HarnessKind.TOOL,
+        spec={"name": "geocode_place"},   # capability request, no schema
+        rationale="need a tool",
+    )
+    vd = HarnessVerdict(
+        request_id=req.request_id, decision=HarnessDecision.ESCALATE,
+        risk_band=RiskBand.MEDIUM, rationale="ask",
+    )
+    did = surface_harness_request(
+        req, vd, execution_id="exec_3", activity_id="act_3",
+        shadow_id="sh_3", vault=vlt,
+    )
+    dec = vlt.get_decision(did)
+    assert "Spec: {" in (dec.body or ""), "capability gate must keep the spec preview"
+    assert not ((dec.context or {}).get("requested_schema") or {})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

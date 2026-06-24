@@ -109,6 +109,12 @@ class GateDescriptor(BaseModel):
         options = list(_HARNESS_OPTIONS)
         _spec = getattr(request, "spec", {}) or {}
         _req_schema = _spec.get("requested_schema") or {}
+        # v0.9.45: a free-text ASK_OPERATOR (kind=input, no schema) gets a
+        # synthesized one-field schema so the card renders an answer BOX instead
+        # of generic capability buttons — the operator can type the value.
+        if kind_val == "input" and not _req_schema:
+            from systemu.runtime.elicitation import free_text_input_schema
+            _req_schema = free_text_input_schema(_spec.get("question") or "")
         return cls(
             title=f"Harness request: {kind_val} [{req_id}]",
             risk=risk,

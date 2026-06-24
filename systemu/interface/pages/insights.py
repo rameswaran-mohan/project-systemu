@@ -393,7 +393,13 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
 
         if card["context"]:
             with ui.expansion("Context", icon="info").style("margin-top: 10px;"):
-                ui.json_editor({"content": {"json": card["context"]}}).style(
+                # v0.9.45: sanitize the context (default=str) before json_editor —
+                # NiceGUI serializes it to the browser, and a stray callable in the
+                # context raised "Type is not JSON serializable: function" (the
+                # recurring harness-card render error).
+                import json as _json
+                _safe_ctx = _json.loads(_json.dumps(card["context"], default=str))
+                ui.json_editor({"content": {"json": _safe_ctx}}).style(
                     "max-height: 200px;"
                 )
 

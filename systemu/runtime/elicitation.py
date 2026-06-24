@@ -59,6 +59,28 @@ def elicitation_schema_from_fields(fields: List[Dict[str, Any]]) -> Dict[str, An
     return {"type": "object", "properties": props, "required": required}
 
 
+def free_text_input_schema(question: str) -> Dict[str, Any]:
+    """v0.9.45: a one-field free-text ``requested_schema`` for a plain
+    ASK_OPERATOR question that carries no structured fields.
+
+    A bare ASK_OPERATOR ("What number?") used to surface as a generic harness
+    gate (Deny/Approve/Edit spec) with NO answer field, so the operator could
+    only click a button — whose label was then injected as the agent's "answer",
+    and the agent re-asked forever. Synthesizing this schema makes
+    render_decision_card draw a real answer BOX (the same form widget the
+    missing-param / MCP-elicitation paths use), and the reconciler extracts the
+    operator's typed value cleanly.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string",
+                       "description": (question or "Your answer")[:200]},
+        },
+        "required": ["answer"],
+    }
+
+
 def coerce_field_value(ftype: str, raw: Any) -> Any:
     """Coerce a raw (usually string) operator answer to the field's type.
 

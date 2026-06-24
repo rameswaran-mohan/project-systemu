@@ -332,11 +332,11 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
                 _req_schema = dctx.get("requested_schema") or {}
                 _pending = dctx.get("pending_tool") or {}
                 _is_param_sub = bool(dctx.get("param_substitution"))
-                if _req_schema and (_pending or _is_param_sub):
-                    # v0.9.35 (P1): structured elicitation. The choice is the
-                    # form JSON; type-coerce per the schema into param_answers,
-                    # carry the pending tool call so _apply_harness_grant can
-                    # merge + re-dispatch (which re-validates).
+                if _req_schema and _req_schema.get("properties"):
+                    # v0.9.35 (P1) / v0.9.45: a structured elicitation OR a
+                    # synthesized free-text schema. The choice is the form JSON;
+                    # type-coerce per the schema. (A "Deny"/non-JSON choice is
+                    # handled by the deny branch above / coerces to empty.)
                     import json as _json
                     from systemu.runtime.elicitation import param_answers_from_choice
                     try:
@@ -345,19 +345,32 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
                             _raw = {}
                     except Exception:
                         _raw = {}
-                    # A "Deny"/safe-default choice is not JSON → empty answers →
-                    # the apply branch fails closed (harness_grant_failed).
-                    grant_payload = {
-                        "kind": "input",
-                        "param_answers": param_answers_from_choice(_req_schema, _raw),
-                        "requested_schema": _req_schema,
-                    }
-                    if _is_param_sub:
-                        # v0.9.35 (P3): scroll-parameter confirmation — substitute
-                        # answers into the scroll context, NOT a tool re-dispatch.
-                        grant_payload["param_substitution"] = True
+                    _coerced = param_answers_from_choice(_req_schema, _raw)
+                    if _pending:
+                        # missing-param: merge the typed answers + re-dispatch the
+                        # original tool call (which re-validates).
+                        grant_payload = {
+                            "kind": "input", "param_answers": _coerced,
+                            "requested_schema": _req_schema, "pending_tool": _pending,
+                        }
+                    elif _is_param_sub:
+                        # scroll-parameter confirmation — substitute into context.
+                        grant_payload = {
+                            "kind": "input", "param_answers": _coerced,
+                            "requested_schema": _req_schema, "param_substitution": True,
+                        }
                     else:
-                        grant_payload["pending_tool"] = _pending
+                        # v0.9.45: free-text ASK_OPERATOR — inject the CLEAN typed
+                        # VALUE (e.g. "42"), not the raw form JSON or a button label,
+                        # so the agent gets a usable answer and does NOT re-ask.
+                        _props = list((_req_schema.get("properties") or {}).keys())
+                        _key = "answer" if "answer" in _props else (
+                            _props[0] if _props else "answer")
+                        grant_payload = {
+                            "kind": "input",
+                            "operator_answer": str(_coerced.get(_key, "") or ""),
+                            "requested_schema": _req_schema,
+                        }
                 else:
                     grant_payload = {
                         "kind": "input",

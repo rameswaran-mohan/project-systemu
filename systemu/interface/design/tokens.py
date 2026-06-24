@@ -152,7 +152,7 @@ body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, v
    internally and never pushes the "Live" pane below the fold. scrollbar-gutter
    keeps the content width constant whether or not the scrollbar is showing; the
    scrollbar itself is thin + near-invisible. */
-.s-rail-scroll {{ height: 220px; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--color-border) 55%, transparent) transparent; }}
+.s-rail-scroll {{ height: 150px; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--color-border) 55%, transparent) transparent; }}
 .s-rail-scroll::-webkit-scrollbar {{ width: 6px; }}
 .s-rail-scroll::-webkit-scrollbar-track {{ background: transparent; }}
 .s-rail-scroll::-webkit-scrollbar-thumb {{ background: color-mix(in srgb, var(--color-border) 55%, transparent); border-radius: 3px; }}

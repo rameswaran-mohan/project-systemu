@@ -127,7 +127,15 @@ def surface_harness_request(
     # multi-field form (render_decision_card, Task 6) from ctx["requested_schema"].
     # SUPPRESS the raw `Spec: {json}` dump in that case — otherwise a truncated
     # JSON blob appears ABOVE the nice form. Render only spec['question'].
-    _has_form = bool((spec.get("requested_schema") or {}))
+    # v0.9.45: a free-text ASK_OPERATOR (kind=input, no schema) gets a synthesized
+    # one-field schema so the card renders an answer BOX (not Deny/Approve buttons)
+    # and the reconciler extracts the operator's typed value. Real schemas (missing
+    # -param / MCP elicitation) and non-input gates are untouched.
+    _eff_schema = spec.get("requested_schema") or {}
+    if not _eff_schema and kind_val == "input":
+        from systemu.runtime.elicitation import free_text_input_schema
+        _eff_schema = free_text_input_schema(spec.get("question") or "")
+    _has_form = bool(_eff_schema)
     body_lines = [
         f"Kind: {kind_val}  |  Risk: {verdict_risk}  |  Urgency: {urgency}  |  Blocking: {blocking}",
         "",
@@ -172,7 +180,7 @@ def surface_harness_request(
         # v0.9.35 (P1): elicitation form schema + the pending tool call so the
         # operator card renders a multi-field form and the reconciler can merge
         # typed answers back into the original call (empty for non-INPUT gates).
-        "requested_schema":  (spec.get("requested_schema") or {}),
+        "requested_schema":  _eff_schema,
         "pending_tool":      (spec.get("pending_tool") or {}),
         # v0.9.35 (P3): mark a scroll-PARAMETER confirmation gate so the
         # reconciler routes the typed answers to context substitution instead

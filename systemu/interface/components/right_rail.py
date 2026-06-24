@@ -261,4 +261,4 @@ def render_right_rail(vault, stream_ref: str = "") -> None:
                 pass
 
         _hdr_timer(2.0, _busy_tick)
-    live_runs_pane(stream_ref=stream_ref)
+    live_runs_pane(stream_ref=stream_ref, height_px=350)
