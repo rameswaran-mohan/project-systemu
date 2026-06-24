@@ -37,6 +37,7 @@ def reconcile_once(vault: "Vault", config: "Config") -> int:
 
     pending = _find_pending_dry_run_via_index(headers)
     if not pending:
+        _complete_deferred_enables(vault, config)
         return 0
 
     logger.info("[ToolReconciler] %d tool(s) pending dry-run", len(pending))
@@ -87,4 +88,65 @@ def reconcile_once(vault: "Vault", config: "Config") -> int:
             )
         processed += 1
 
+    _complete_deferred_enables(vault, config)
     return processed
+
+
+def _complete_deferred_enables(vault: "Vault", config: "Config") -> None:
+    """v0.9.44: close the "Enable & run" / dry-run RACE — and recover runs already
+    stuck by it.
+
+    The Inbox "Enable & run" gate enables each blocking tool, but Gate-3.5 holds a
+    tool that has NOT passed its dry-run yet. If the operator approves the gate
+    BEFORE the reconciler finishes the dry-run (very common — the gate appears
+    right after the forge gate), the enable is held and never retried: the tool
+    ends up DEPLOYED-but-disabled and the parked task hangs forever, even though
+    the heal sweep was wired into the resolver (it fired while the tool was still
+    disabled, so it was a no-op).
+
+    Every reconcile pass, for each RESOLVED "Enable & run" tools_blocked gate,
+    enable any of its tools that are now dry-run-passed-but-disabled and fire the
+    heal sweep so the parked activity re-dispatches. Idempotent: an already-enabled
+    tool is skipped, so this is safe to run on every 30s tick.
+    """
+    try:
+        decisions = vault.load_index("decisions") or []
+    except Exception:
+        logger.exception("[ToolReconciler] deferred-enable: could not load decisions")
+        return
+
+    from systemu.pipelines.tool_service import enable_tool, heal_activities_for_tool
+
+    for header in decisions:
+        if header.get("status") != "resolved":
+            continue
+        if not str(header.get("dedup_key") or "").startswith("tools_blocked:"):
+            continue
+        try:
+            dec = vault.get_decision(header["id"])
+        except Exception:
+            continue
+        if (getattr(dec, "choice", "") or "").strip().lower() != "enable & run":
+            continue
+        for tid in ((getattr(dec, "context", None) or {}).get("tool_ids") or []):
+            try:
+                tool = vault.get_tool(tid)
+            except Exception:
+                continue
+            if getattr(tool, "enabled", False):
+                continue
+            # Only enable once the dry-run has actually passed (Gate-3.5 intent).
+            if getattr(tool, "dry_run_status", "") != "passed":
+                continue
+            if enable_tool(tid, vault):
+                logger.info(
+                    "[ToolReconciler] completed deferred 'Enable & run' for '%s' "
+                    "(%s) — operator approved before the dry-run finished; healing "
+                    "parked tasks", getattr(tool, "name", tid), tid)
+                # heal makes LLM calls (decide_shadow) — run off the reconciler tick.
+                import threading
+                threading.Thread(
+                    target=heal_activities_for_tool,
+                    args=(tid, config, vault),
+                    daemon=True,
+                ).start()

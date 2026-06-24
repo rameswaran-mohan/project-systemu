@@ -192,3 +192,77 @@ class TestWiring:
         assert blocked_tools_of(act) == ["tool_0"]
         act.status = ActivityStatus.COMPLETED
         assert blocked_tools_of(act) == []
+
+
+class TestReconcilerCompletesDeferredEnable:
+    """v0.9.44: the Enable&run / dry-run RACE — operator approves "Enable & run"
+    before the reconciler finishes the dry-run, so Gate-3.5 holds the enable and
+    the tool ends DEPLOYED-but-disabled. The reconciler sweep must complete it."""
+
+    def _resolved_enable_gate(self, vault, tools):
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        act = _activity(vault, [t.id for t in tools])
+        dec_id = ensure_tools_blocked_gate(vault, act, tools)
+        OperatorDecisionQueue(vault).resolve(dec_id, choice="Enable & run")
+        return act
+
+    def test_deferred_enable_after_dry_run_race(self, vault, monkeypatch):
+        import systemu.pipelines.tool_service as ts
+        import systemu.scheduler.tool_reconciler as recon
+        # the race state: dry-run PASSED, DEPLOYED, but still disabled
+        tools = [_tool(1, dry="passed", status=ToolStatus.DEPLOYED, enabled=False)]
+        for t in tools:
+            vault.save_tool(t)
+        self._resolved_enable_gate(vault, tools)
+
+        healed = []
+        monkeypatch.setattr(ts, "heal_activities_for_tool",
+                            lambda tid, cfg, v: healed.append(tid))
+
+        class _Sync:   # run the heal thread synchronously for a deterministic assert
+            def __init__(self, target=None, args=(), daemon=None):
+                self._t, self._a = target, args
+
+            def start(self):
+                self._t(*self._a)
+        monkeypatch.setattr("threading.Thread", _Sync)
+
+        recon._complete_deferred_enables(vault, None)
+        assert vault.get_tool("tool_1").enabled is True      # enabled now
+        assert healed == ["tool_1"]                          # and the heal fired
+
+    def test_deferred_enable_skips_tool_without_dry_run(self, vault, monkeypatch):
+        import systemu.pipelines.tool_service as ts
+        import systemu.scheduler.tool_reconciler as recon
+        # dry-run NOT passed -> Gate-3.5 holds: the sweep must NOT enable it
+        tools = [_tool(1, dry="not_run", status=ToolStatus.FORGED, enabled=False)]
+        for t in tools:
+            vault.save_tool(t)
+        self._resolved_enable_gate(vault, tools)
+        healed = []
+        monkeypatch.setattr(ts, "heal_activities_for_tool",
+                            lambda *a, **k: healed.append(a))
+        recon._complete_deferred_enables(vault, None)
+        assert vault.get_tool("tool_1").enabled is False
+        assert healed == []
+
+    def test_deferred_enable_idempotent_when_already_enabled(self, vault, monkeypatch):
+        import systemu.pipelines.tool_service as ts
+        import systemu.scheduler.tool_reconciler as recon
+        tools = [_tool(1, dry="passed", status=ToolStatus.DEPLOYED, enabled=True)]
+        for t in tools:
+            vault.save_tool(t)
+        self._resolved_enable_gate(vault, tools)
+        healed = []
+        monkeypatch.setattr(ts, "heal_activities_for_tool",
+                            lambda *a, **k: healed.append(a))
+        recon._complete_deferred_enables(vault, None)
+        assert healed == []          # already enabled -> no re-enable, no re-heal
+
+    def test_reconciler_wires_deferred_enable(self):
+        import inspect
+
+        from systemu.scheduler import tool_reconciler
+        src = inspect.getsource(tool_reconciler)
+        assert "_complete_deferred_enables" in src
+        assert src.count("_complete_deferred_enables(vault, config)") >= 2  # both exit paths
