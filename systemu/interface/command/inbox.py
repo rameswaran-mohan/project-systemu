@@ -5,10 +5,13 @@ descriptor in context (kind="gate"). The harness path already lands here via
 harness_review.surface_harness_request."""
 from __future__ import annotations
 
+import logging
 from typing import List, Tuple
 
 from systemu.interface.command.gate import GateDescriptor
 from systemu.interface.command.result import CommandResult, CommandStatus
+
+logger = logging.getLogger(__name__)
 
 _APPROVE_LABELS = {"approve", "approve & apply", "approve & install", "forge",
                    "enable & run"}
@@ -89,6 +92,32 @@ def resolve_gate(decision, *, vault) -> CommandResult:
                 skipped.append(label)
             else:
                 failed.append(f"{label}: {res.summary}")
+        # v0.9.43: actually FIRE the heal sweep. The gate's contract is "the heal
+        # sweep re-runs the parked task once tools are ready," but only the Tools
+        # page ever called it — the Inbox "Enable & run" path enabled the tool and
+        # then stopped, leaving the parked activity stuck (forge demo hang). Trigger
+        # it here for every tool the gate covers; heal is idempotent (it only
+        # re-dispatches an activity once ALL its required tools are ready). It is
+        # blocking (decide_shadow makes LLM calls) → run in a daemon thread so the
+        # resolving Inbox/CLI caller returns immediately.
+        if enabled or skipped:
+            try:
+                import threading
+
+                from sharing_on.config import Config
+                from systemu.pipelines.tool_service import heal_activities_for_tool
+                _cfg = Config.from_env()
+                for tid in tool_ids:
+                    threading.Thread(
+                        target=heal_activities_for_tool,
+                        args=(tid, _cfg, vault),
+                        daemon=True,
+                    ).start()
+            except Exception:
+                logger.exception(
+                    "[Inbox] tools_blocked: failed to start heal sweep for %s",
+                    tool_ids,
+                )
         parts = []
         if enabled:
             parts.append(f"enabled {len(enabled)} tool(s)")

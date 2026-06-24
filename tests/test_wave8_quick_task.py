@@ -214,12 +214,115 @@ class TestQuickLoop:
         assert any('"final_turn": true' in p for p in llm.calls["payloads"])
 
     def test_ask_user_returns_needs_input(self, vault):
+        # No chat surface (default) -> historical needs_input terminal preserved.
         from systemu.pipelines.quick_task import run_quick_task
         llm = _fake_llm([{"action": "ASK_USER",
                           "question": "Which city are you in?"}])
         res = run_quick_task("find a spa", None, vault, llm_json=llm)
         assert res.status == "needs_input"
         assert res.question == "Which city are you in?"
+
+    def test_ask_user_resumes_with_operator_answer(self, vault, monkeypatch):
+        """v0.9.43: with a chat surface, ASK_USER PARKS, the operator's answer is
+        injected as a tool_result, and the SAME loop continues to a real answer."""
+        import systemu.pipelines.quick_task as qt
+        monkeypatch.setattr(qt, "_ask_operator_inline", lambda *a, **k: "blue")
+        llm = _fake_llm([
+            {"action": "ASK_USER", "question": "What color?"},
+            {"action": "ANSWER", "answer_md": "The color is blue.",
+             "completed": True},
+        ])
+        res = qt.run_quick_task("name the color", None, vault, llm_json=llm,
+                                chat_surface=True)
+        assert res.status == "success"
+        assert "blue" in res.answer_md
+        # the operator's answer reached the model as an ask_user tool_result
+        assert "ask_user" in llm.calls["payloads"][1]
+        assert "blue" in llm.calls["payloads"][1]
+
+    def test_ask_user_decline_falls_back_to_needs_input(self, vault, monkeypatch):
+        """v0.9.43: decline / timeout / cancel -> honest needs_input terminal."""
+        import systemu.pipelines.quick_task as qt
+        monkeypatch.setattr(qt, "_ask_operator_inline", lambda *a, **k: None)
+        llm = _fake_llm([{"action": "ASK_USER", "question": "Which file?"}])
+        res = qt.run_quick_task("summarize the file", None, vault, llm_json=llm,
+                                chat_surface=True)
+        assert res.status == "needs_input"
+
+    def test_ask_user_cap_stops_reask_loop(self, vault, monkeypatch):
+        """v0.9.43: a model that keeps re-asking is capped (no budget burn)."""
+        import systemu.pipelines.quick_task as qt
+        monkeypatch.setattr(qt, "_ask_operator_inline", lambda *a, **k: "again")
+        llm = _fake_llm([{"action": "ASK_USER", "question": "Huh?"}])  # always asks
+        res = qt.run_quick_task("do it", None, vault, llm_json=llm,
+                                chat_surface=True, max_iters=12,
+                                synthesize=lambda *a, **k: "summary")
+        assert res.status in ("failed", "partial")
+        assert res.iterations <= qt._ASK_USER_CAP + 1
+
+    def test_ask_operator_inline_posts_and_parses_answer(self, vault):
+        """v0.9.43: the helper posts a free-text structured_question and reads
+        back the operator's typed answer (parsed from the structured JSON)."""
+        import json as _json
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.pipelines.quick_task import _ask_operator_inline
+        q = OperatorDecisionQueue(vault)
+        dk = "quick_ask:test:1"
+        dec_id = q.post(
+            title="What word?", body="Answer to continue.", options=["Submit"],
+            context={"kind": "structured_question",
+                     "questions": [{"id": "answer", "prompt": "What word?",
+                                    "options": [], "allow_free_text": True}]},
+            dedup_key=dk)
+        q.resolve(dec_id, choice=_json.dumps({"answer": "Paris"}))
+        assert _ask_operator_inline(vault, "What word?", dedup_key=dk) == "Paris"
+
+    def test_ask_operator_inline_empty_answer_is_decline(self, vault):
+        """An empty typed answer reads as a decline (None)."""
+        import json as _json
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.pipelines.quick_task import _ask_operator_inline
+        q = OperatorDecisionQueue(vault)
+        dk = "quick_ask:test:2"
+        dec_id = q.post(
+            title="q", body="b", options=["Submit"],
+            context={"kind": "structured_question",
+                     "questions": [{"id": "answer", "prompt": "q",
+                                    "options": [], "allow_free_text": True}]},
+            dedup_key=dk)
+        q.resolve(dec_id, choice=_json.dumps({"answer": ""}))
+        assert _ask_operator_inline(vault, "q", dedup_key=dk) is None
+
+    def test_ask_operator_inline_cancel_expires_pending(self, vault):
+        """v0.9.43: an abandoned ask (cancel / timeout) is EXPIRED — it must NOT
+        linger pending in the 'Needs you' rail/badge."""
+        import threading
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.pipelines.quick_task import _ask_operator_inline
+        q = OperatorDecisionQueue(vault)
+        dk = "quick_ask:test:cancel"
+        ev = threading.Event()
+        ev.set()   # pre-cancelled -> the helper posts then immediately abandons
+        assert _ask_operator_inline(vault, "What word?", dedup_key=dk,
+                                    cancel_event=ev) is None
+        # the posted decision was expired, so it is no longer pending
+        assert all(d.dedup_key != dk for d in q.list_pending())
+
+    def test_ask_operator_inline_whitespace_is_decline(self, vault):
+        """v0.9.43: a whitespace-only typed answer reads as a decline (None)."""
+        import json as _json
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        from systemu.pipelines.quick_task import _ask_operator_inline
+        q = OperatorDecisionQueue(vault)
+        dk = "quick_ask:test:ws"
+        dec_id = q.post(
+            title="q", body="b", options=["Submit"],
+            context={"kind": "structured_question",
+                     "questions": [{"id": "answer", "prompt": "q",
+                                    "options": [], "allow_free_text": True}]},
+            dedup_key=dk)
+        q.resolve(dec_id, choice=_json.dumps({"answer": "   "}))
+        assert _ask_operator_inline(vault, "q", dedup_key=dk) is None
 
     def test_malformed_actions_twice_fail_honestly(self, vault):
         from systemu.pipelines.quick_task import run_quick_task

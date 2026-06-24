@@ -112,12 +112,74 @@ class TestExecutor:
         assert result.status.value == "noop"
         assert vault.get_tool("tool_1").enabled is False
 
+    def test_enable_and_run_fires_heal_sweep(self, vault, monkeypatch):
+        """v0.9.43: resolving "Enable & run" must FIRE the heal sweep that
+        re-dispatches the parked task. Previously only the Tools page called it,
+        so the Inbox/forge path enabled the tool and then left the task stuck —
+        the reported forge-demo hang."""
+        tools = [_tool(1, dry="passed")]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+
+        calls = []
+        import systemu.pipelines.tool_service as ts
+        monkeypatch.setattr(
+            ts, "heal_activities_for_tool",
+            lambda tid, cfg, v: calls.append(tid))
+        import sharing_on.config as cfgmod
+        monkeypatch.setattr(
+            cfgmod.Config, "from_env", classmethod(lambda cls: object()))
+        # Run the spawned heal thread synchronously for a deterministic assert.
+        import threading
+
+        class _SyncThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self._t, self._a = target, args
+
+            def start(self):
+                self._t(*self._a)
+
+        monkeypatch.setattr(threading, "Thread", _SyncThread)
+
+        decision = self._resolved(vault, act, tools, "Enable & run")
+        result = resolve_gate(decision, vault=vault)
+        assert result.status.value == "ok"
+        assert vault.get_tool("tool_1").enabled is True
+        assert calls == ["tool_1"]      # heal sweep fired for the enabled tool
+
+    def test_blocked_tool_does_not_fire_heal_sweep(self, vault, monkeypatch):
+        """A tool held by Gate-3.5 (dry-run not passed) is never enabled, so the
+        heal sweep must NOT fire — there is nothing newly ready to re-dispatch."""
+        tools = [_tool(1, dry="not_run")]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+
+        calls = []
+        import systemu.pipelines.tool_service as ts
+        monkeypatch.setattr(
+            ts, "heal_activities_for_tool",
+            lambda tid, cfg, v: calls.append(tid))
+
+        decision = self._resolved(vault, act, tools, "Enable & run")
+        result = resolve_gate(decision, vault=vault)
+        assert result.status.value == "error"
+        assert calls == []
+
 
 class TestWiring:
     def test_direct_task_posts_the_gate(self):
         import inspect
         from systemu.pipelines import direct_task
         assert "ensure_tools_blocked_gate" in inspect.getsource(direct_task)
+
+    def test_resolver_wires_the_heal_sweep(self):
+        """Guard: the tools_blocked resolver must reference the heal sweep so the
+        re-dispatch can never silently disappear again (v0.9.43 regression fix)."""
+        import inspect
+        from systemu.interface.command import inbox
+        assert "heal_activities_for_tool" in inspect.getsource(inbox)
 
     def test_work_page_warn_tint(self):
         from systemu.interface.pages.work import _status_class

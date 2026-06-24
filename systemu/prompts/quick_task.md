@@ -42,8 +42,10 @@ outside the JSON).
 {"action": "ASK_USER", "question": "<one specific question>"}
 ```
 - Use this for genuinely missing essentials, not for preferences you can
-  default sensibly. Asking ends this run; the operator's reply starts a new
-  one.
+  default sensibly. Asking PAUSES this run while the operator answers; their
+  answer then appears in your history as a `tool_result` with `tool: "ask_user"`
+  (read `parsed.answer`) — use it and CONTINUE toward the goal. Never re-ask a
+  question already answered in history.
 - Office essentials worth asking about when absent and not inferable (your
   operator-profile block may already answer them — check it first): the
   recipient/audience of an outbound deliverable, the source file/folder/

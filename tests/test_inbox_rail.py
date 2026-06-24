@@ -108,3 +108,82 @@ def test_approve_descriptor_refuses_command_gate():
         _approve_descriptor("dec_cmd", d, vault=_Vault())
     # It refused BEFORE resolving — no mis-resolve, no NOOP.
     assert resolved["called"] is False
+
+
+# ── v0.9.43: one-click reject/decline × ───────────────────────────────────────
+def test_row_carries_reject_label_safe_default():
+    """The reject × resolves the SAFE-DEFAULT (options[0]); the row carries it."""
+    d = _forge_descriptor()
+    rows = _rows([("dec_1", d)])
+    assert rows[0]["reject_label"] == d.options[0]
+    assert rows[0]["reject_label"] != d.options[-1]   # negative, not affirmative
+
+
+def test_command_gate_row_offers_one_click_reject():
+    """Render-only command gates carry NO approve_label (no one-click Approve)
+    but DO carry a reject_label (options[0]='Deny') — a one-click Deny is safe."""
+    d = _command_descriptor()
+    rows = _rows([("dec_cmd", d)])
+    assert rows[0]["render_only"] is True
+    assert rows[0]["approve_label"] == ""
+    assert rows[0]["reject_label"] == "Deny"
+    assert d.options[0] == "Deny"
+
+
+def test_no_options_has_empty_reject_label():
+    from systemu.interface.command.gate import GateDescriptor
+    d = GateDescriptor(title="bare", risk="low", options=[])
+    rows = _rows([("dec_3", d)])
+    assert rows[0]["reject_label"] == ""
+
+
+def test_reject_descriptor_resolves_safe_default_even_for_command(monkeypatch):
+    """_reject_descriptor resolves with options[0] (the negative) and runs
+    resolve_gate — the conservative mirror of _approve_descriptor. Unlike Approve
+    it does NOT refuse a command gate (a one-click Deny is safe)."""
+    import systemu.interface.command.inbox as inbox_mod
+    from systemu.interface.components import inbox_rail
+
+    calls = {}
+
+    class _Q:
+        def resolve(self, dec_id, *, choice):
+            calls["dec_id"], calls["choice"] = dec_id, choice
+            return {"id": dec_id, "choice": choice}
+
+    class _IQ:
+        def __init__(self, vault):
+            self._queue = _Q()
+
+    monkeypatch.setattr(inbox_mod, "InboxQueue", _IQ)
+    monkeypatch.setattr(
+        inbox_mod, "resolve_gate",
+        lambda resolved, *, vault: calls.setdefault("gate", resolved))
+
+    d = _command_descriptor()   # render-only — reject must NOT refuse it
+    inbox_rail._reject_descriptor("dec_cmd", d, vault=object())
+    assert calls["choice"] == d.options[0] == "Deny"
+    assert calls["gate"]["choice"] == "Deny"
+
+
+def test_decline_ask_resolves_empty_answer(monkeypatch):
+    """_decline_ask resolves a question with an empty structured answer — the
+    waiting run reads it as 'no answer' and degrades gracefully."""
+    import json
+
+    import systemu.interface.command.inbox as inbox_mod
+    from systemu.interface.components import inbox_rail
+
+    calls = {}
+
+    class _Q:
+        def resolve(self, dec_id, *, choice):
+            calls["dec_id"], calls["choice"] = dec_id, choice
+
+    class _IQ:
+        def __init__(self, vault):
+            self._queue = _Q()
+
+    monkeypatch.setattr(inbox_mod, "InboxQueue", _IQ)
+    inbox_rail._decline_ask("dec_ask", vault=object())
+    assert json.loads(calls["choice"]) == {"answer": ""}

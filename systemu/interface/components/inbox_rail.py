@@ -60,6 +60,10 @@ def _inbox_rail_rows(descriptors: List[Tuple[str, Any]]) -> List[Dict[str, Any]]
             # safe-default at index 0, affirmative last). Empty when no options
             # OR when the gate is render-only (no one-click quick-approve).
             "approve_label": "" if render_only else (options[-1] if options else ""),
+            # v0.9.43: the safe-default NEGATIVE (options[0] — Dismiss/Skip/Deny)
+            # drives the one-click reject ×. Surfaced even for render-only gates:
+            # a one-click Deny is safe (only one-click Approve is refused there).
+            "reject_label": options[0] if options else "",
         })
     return rows
 
@@ -91,6 +95,40 @@ def _approve_descriptor(dec_id: str, descriptor, *, vault) -> None:
     affirmative = options[-1]
     resolved = queue.resolve(dec_id, choice=affirmative)
     return resolve_gate(resolved, vault=vault)
+
+
+def _reject_descriptor(dec_id: str, descriptor, *, vault) -> None:
+    """v0.9.43: one-click REJECT a gate from the rail — resolve with the
+    SAFE-DEFAULT (options[0]: Dismiss / Skip / Deny), then ``resolve_gate``
+    (which records the negative WITHOUT executing). The conservative mirror of
+    ``_approve_descriptor``.
+
+    Unlike Approve, this is SAFE for command/MCP gates too: a one-click Deny is
+    fine (only a one-click Always-allow is dangerous), so render-only gates are
+    NOT refused here — the × gives them a one-click Deny while Approve still
+    routes through the full /insights Inbox.
+    """
+    from systemu.interface.command.inbox import InboxQueue, resolve_gate
+    queue = InboxQueue(vault)._queue
+    options = list(getattr(descriptor, "options", []) or [])
+    if not options:
+        return
+    resolved = queue.resolve(dec_id, choice=options[0])
+    return resolve_gate(resolved, vault=vault)
+
+
+def _decline_ask(dec_id: str, *, vault) -> None:
+    """v0.9.43: one-click DECLINE an operator question / credential ask — resolve
+    it with an empty structured answer. The waiting run (quick-lane block-poll /
+    shadow resume) treats an empty answer as 'no answer' and degrades or
+    terminates gracefully (the negative path of the ask loop). resolve()'s
+    membership check is bypassed for structured_question, so the JSON is
+    accepted."""
+    import json
+
+    from systemu.interface.command.inbox import InboxQueue
+    queue = InboxQueue(vault)._queue
+    queue.resolve(dec_id, choice=json.dumps({"answer": ""}))
 
 
 def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
@@ -147,6 +185,44 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
             )
             return
 
+        # v0.9.43: a small reject/decline × on EVERY card (top-right). For a
+        # gate it resolves the safe-default negative; for an ask it declines
+        # (empty answer). Async + to_thread + captured-client re-enter, mirroring
+        # the Approve handler (the 2s pane timer may dispose this slot mid-work).
+        def _render_reject_x(item_id: str, *, is_ask: bool, label: str) -> None:
+            async def _on_reject(_=None, iid=item_id, ask=is_ask):
+                import asyncio
+                try:
+                    client = ui.context.client
+                except Exception:
+                    client = None
+                try:
+                    if ask:
+                        await asyncio.to_thread(_decline_ask, iid, vault=vault)
+                        msg, typ = "Declined.", "info"
+                    else:
+                        desc = _descriptor_map().get(iid)
+                        if desc is None:
+                            ui.notify("Already resolved.", type="warning")
+                            _pane.refresh()
+                            return
+                        await asyncio.to_thread(
+                            _reject_descriptor, iid, desc, vault=vault)
+                        msg, typ = "Dismissed.", "info"
+                except Exception as exc:
+                    msg, typ = f"Couldn't dismiss: {exc}", "negative"
+                if client is not None:
+                    try:
+                        with client:
+                            ui.notify(msg, type=typ)
+                            _pane.refresh()
+                    except Exception:
+                        pass
+
+            ui.button(icon="close", on_click=_on_reject).props(
+                "flat dense round size=sm").classes("s-rail-x").tooltip(
+                    label or "Dismiss")
+
         # W5.1: non-gate asks (stuck-run questions, credential requests) used
         # to be invisible here — a parked run looked like "nothing waiting".
         # W7.3 layout: stacked card per item (pill on top, title wrapping to
@@ -156,6 +232,7 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
             with ui.element("div").classes("s-row-box s-rail-item"):
                 with ui.row().classes("w-full items-center justify-between"):
                     status_pill("question")
+                    _render_reject_x(ask["id"], is_ask=True, label="Decline")
                 ui.label(ask["title"]).classes("s-rail-title")
 
                 def _on_answer(_=None, did=ask["id"]):
@@ -170,6 +247,8 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
             with ui.element("div").classes("s-row-box s-rail-item"):
                 with ui.row().classes("w-full items-center justify-between"):
                     status_pill(row["risk"])
+                    _render_reject_x(row["id"], is_ask=False,
+                                     label=row.get("reject_label") or "Dismiss")
                 ui.label(row["title"]).classes("s-rail-title")
                 approve_label = row["approve_label"]
                 if row.get("render_only"):
@@ -178,7 +257,7 @@ def build_inbox_rail_section(vault, stream_ref: str = "") -> None:
                     # must NOT be one-click Always-allowed from the rail. Show a
                     # hint that points to the /insights Inbox (which routes
                     # through the dispatcher → command_gate_handler).
-                    ui.label("Resolve in Inbox →").classes("s-muted").style(
+                    ui.label("Approve in Inbox →").classes("s-muted").style(
                         "font-size: 11px;")
                 elif approve_label:
                     # W7.1: async + to_thread — Approve EXECUTES the gate

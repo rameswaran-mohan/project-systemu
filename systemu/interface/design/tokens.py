@@ -138,11 +138,16 @@ body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, v
 .s-mono {{ font-family: 'JetBrains Mono','SF Mono','Consolas',monospace; font-size: var(--type-xs); color: var(--color-muted); }}
 
 /* ── right-rail item cards (W7.3 — stacked: pill / wrapping title / actions) ── */
-.s-rail-item {{ display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; margin-bottom: 6px; }}
-.s-rail-title {{ font-size: var(--type-sm); color: var(--color-text); line-height: 1.3; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
+/* v0.9.43: tighter so the "Needs you" panel stays compact as gates pile up. */
+.s-rail-item {{ display: flex; flex-direction: column; gap: 3px; padding: 6px 9px; margin-bottom: 5px; }}
+.s-rail-title {{ font-size: 12px; color: var(--color-text); line-height: 1.25; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
 .s-rail-actions {{ display: flex; justify-content: flex-end; gap: 6px; }}
-/* v0.9.42: compact buttons inside the "Needs you" rail so many gates stay tidy. */
-.s-rail-actions .s-btn {{ padding: 2px 9px; font-size: 11px; }}
+/* v0.9.42/43: compact action buttons inside the "Needs you" rail so many gates stay tidy. */
+.s-rail-actions .s-btn {{ padding: 2px 8px; font-size: 10px; }}
+/* v0.9.43: the per-card reject/decline × — small, muted, danger-tinted on hover. */
+.s-rail-x {{ min-width: 0 !important; min-height: 0 !important; width: 22px; height: 22px; padding: 0; color: var(--color-muted); opacity: 0.6; }}
+.s-rail-x:hover {{ color: var(--color-danger); opacity: 1; }}
+.s-rail-x .q-icon {{ font-size: 15px; }}
 /* "Needs you" scroller: FIXED height (v0.9.42) so a long pending list scrolls
    internally and never pushes the "Live" pane below the fold. scrollbar-gutter
    keeps the content width constant whether or not the scrollbar is showing; the

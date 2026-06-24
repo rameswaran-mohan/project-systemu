@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 _MAX_RESULT_CHARS = 2000     # per-entry transcript clamp (context economy)
 _SAME_TOOL_FAIL_CAP = 3
 _MALFORMED_CAP = 2
+_ASK_USER_CAP = 3            # v0.9.43: cap operator questions per run (anti re-ask)
 _SYNTH_MAX_TOKENS = 700
 _MAX_PLANS = 3               # anti plan-thrash: cap re-plans per run
 # Keys whose non-empty presence in a tool payload counts as "usable content".
@@ -260,8 +261,15 @@ def run_quick_task(
     max_iters: int = 12,
     wall_clock_s: float = 240.0,
     cancel_event: Optional["threading.Event"] = None,
+    chat_surface: bool = False,
 ) -> QuickResult:
-    """Run one bounded ReAct loop and return the outcome. Never raises."""
+    """Run one bounded ReAct loop and return the outcome. Never raises.
+
+    v0.9.43: ``chat_surface=True`` (set by the chat wrapper when a live operator
+    is present) lets an ASK_USER PARK on an answerable decision and resume with
+    the typed answer instead of dead-ending. Default False keeps the historical
+    ``needs_input`` terminal for CLI / headless / direct callers.
+    """
     import threading  # noqa: F401  (typing/back-compat; Event is duck-checked)
     from systemu.core.utils import load_prompt
 
@@ -357,6 +365,7 @@ def run_quick_task(
     files: List[str] = []
     tool_calls = 0
     malformed_streak = 0
+    ask_count = 0                    # v0.9.43: operator questions asked this run
     fail_streaks: Dict[str, int] = {}
     failed_sigs: set = set()         # (tool|params) calls that already failed
     tool_errors: Dict[str, str] = {}  # last error text per tool (honest fail msg)
@@ -447,10 +456,52 @@ def run_quick_task(
 
         if kind == "ASK_USER":
             question = str(action.get("question") or "").strip()
-            return _finish(QuickResult(
-                status="needs_input", iterations=iteration,
-                question=question or "(no question given)",
-                answer_md=question))
+            # v0.9.43: holistic answer-and-resume. With a live operator chat
+            # surface, PARK on an answerable decision and BLOCK-POLL for the
+            # answer (the same wait strategy _poll_command_choice uses for
+            # command gates — the daemon thread stays alive, so all loop state
+            # is intact). Inject the answer as a tool_result the model AND the
+            # salvage paths understand, then CONTINUE the same loop. Without a
+            # chat surface (CLI / headless / direct callers) keep the historical
+            # needs_input terminal.
+            if not chat_surface:
+                return _finish(QuickResult(
+                    status="needs_input", iterations=iteration,
+                    question=question or "(no question given)",
+                    answer_md=question))
+            ask_count += 1
+            if ask_count > _ASK_USER_CAP:
+                return _terminate(
+                    f"asked the operator {ask_count} questions without reaching "
+                    f"an answer", iteration)
+            _publish("INFO",
+                     f"[{iteration}/{max_iters}] waiting for your answer…")
+            answer = _ask_operator_inline(
+                vault, question or "Input needed",
+                dedup_key=f"quick_ask:{execution_id}:{iteration}",
+                cancel_event=cancel_event)
+            if not answer:
+                # declined / cancelled / timed out -> honest terminal
+                if cancel_event is not None and cancel_event.is_set():
+                    return _finish(QuickResult(
+                        status="cancelled", error="cancelled by operator",
+                        iterations=iteration))
+                return _finish(QuickResult(
+                    status="needs_input", iterations=iteration,
+                    question=question or "(no question given)",
+                    answer_md=question))
+            history.append({
+                "role": "tool_result", "tool": "ask_user", "success": True,
+                "parsed": {
+                    "question": question, "answer": answer,
+                    "note": ("Operator answered your question — use this "
+                             "answer to continue toward the goal; do not ask it "
+                             "again."),
+                },
+            })
+            _publish("INFO",
+                     f"[{iteration}/{max_iters}] operator answered — continuing")
+            continue
 
         if kind == "PLAN":
             # Plan-first (adaptive): a non-trivial task decomposes into a short
@@ -650,6 +701,76 @@ def _poll_command_choice(vault, dedup_key: str, timeout: "float | None" = None):
     return None
 
 
+def _ask_operator_inline(vault, question: str, *, dedup_key: str,
+                         cancel_event=None, timeout: float = 600.0):
+    """v0.9.43: post the agent's ASK_USER question as an answerable operator
+    decision and BLOCK-POLL for the typed answer.
+
+    Mirrors ``_poll_command_choice``'s wait strategy: the chat lane runs on a
+    daemon thread that simply blocks, so the ReAct loop's state is preserved on
+    the stack (no snapshot/Supervisor needed). The decision is a single
+    free-text ``structured_question`` — the exact shape render_decision_card
+    needs to draw a free-text box — so it surfaces as an answerable card in the
+    "Needs you" rail. No ``chat_submission_id`` is set, so the Supervisor resume
+    paths (resume_on_decision / reconcile) stay provably inert.
+
+    Returns the operator's answer string, or None when the operator declines /
+    cancels (cancel_event) / the wait times out — the caller then falls back to
+    the honest needs_input terminal.
+    """
+    import json as _json
+    import time as _time
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+
+    queue = OperatorDecisionQueue(vault)
+    if queue.get_resolved_choice(dedup_key) is None:
+        try:
+            queue.post(
+                title=(question or "Input needed")[:80],
+                body="Answer to continue.",
+                options=["Submit"],   # placeholder; the free-text box is the input
+                context={
+                    "kind": "structured_question",
+                    "questions": [{"id": "answer", "prompt": question,
+                                   "options": [], "allow_free_text": True}],
+                    "quick_ask": True,
+                },
+                dedup_key=dedup_key,
+            )
+        except Exception:
+            logger.exception("[QuickTask] could not post ASK_USER decision")
+            return None
+
+    def _abandon():
+        # timeout / cancel: the decision is still PENDING — expire it so an
+        # abandoned question does not linger in the "Needs you" rail/badge.
+        # (A declined ask is already RESOLVED by the rail ×, so this no-ops it.)
+        try:
+            queue.expire_by_dedup_key(dedup_key)
+        except Exception:
+            logger.debug("[QuickTask] could not expire abandoned ask",
+                         exc_info=True)
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            _abandon()
+            return None
+        choice = queue.get_resolved_choice(dedup_key)
+        if choice is not None:
+            try:
+                data = _json.loads(choice)
+                val = data.get("answer") if isinstance(data, dict) else None
+            except Exception:
+                val = choice
+            if val is None:
+                return None
+            return str(val).strip() or None   # whitespace-only -> decline (None)
+        _time.sleep(1.0)
+    _abandon()
+    return None
+
+
 def _execute_tool(sandbox, tool, params: Dict[str, Any]):
     """Execute one tool through the EXACT runtime contract (W6 runner,
     subprocess isolation policy, dependency install). Sync wrapper — the
@@ -756,13 +877,18 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
 
     # v0.9.32: cancel_event (if the caller registered one in chat_task_registry)
     # rides through **kwargs into run_quick_task's loop-top cancel check.
+    # v0.9.43: a chat_ts means a live operator chat surface — let an ASK_USER
+    # PARK on an answerable decision and resume, instead of the needs_input
+    # dead-end. Non-chat callers (no chat_ts) keep the terminal.
+    kwargs.setdefault("chat_surface", chat_ts is not None)
     result = run_quick_task(prompt, config, vault, **kwargs)
 
-    # v0.9.32 (review FIX 5): the status written is result.status verbatim.
-    # needs_input is rendered by chat as the question itself, not a park (no
-    # decision row exists to resolve in v1), and "cancelled" is terminal — so
-    # no remap is applied here. (A dead pending_decision remap line — instantly
-    # overwritten by the line below it — was removed.)
+    # The status written is result.status verbatim. v0.9.43: a chat-surface
+    # ASK_USER now PARKS on an answerable decision and resumes inline (see
+    # _ask_operator_inline), so a chat task reaches a real terminal
+    # (success/partial/cancelled) — a residual "needs_input" only happens when
+    # the operator declined or the wait timed out (that decision is already
+    # expired/resolved), so it stays a plain terminal status here with no remap.
     status = result.status
     try:
         vault.update_chat_history_entry(ts, {
