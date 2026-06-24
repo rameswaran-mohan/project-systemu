@@ -19,7 +19,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20816384.svg)](https://doi.org/10.5281/zenodo.20816384)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20816383.svg)](https://doi.org/10.5281/zenodo.20816383)
 
 **Three ways to put it to work:**
 
@@ -202,7 +202,7 @@ Rameswaran Mohan, 2026. Preprint, not yet peer-reviewed; licensed
 is reproducible from [`cgb_eval/`](cgb_eval) and [`cgb_results/`](cgb_results) via
 `python -m cgb_eval.paper_numbers`.
 
-**Cite (DOI):** [10.5281/zenodo.20816384](https://doi.org/10.5281/zenodo.20816384)
+**Cite (DOI):** [10.5281/zenodo.20816383](https://doi.org/10.5281/zenodo.20816383)
 
 ```bibtex
 @misc{mohan2026reverseharness,
@@ -211,8 +211,8 @@ is reproducible from [`cgb_eval/`](cgb_eval) and [`cgb_results/`](cgb_results) v
   author = {Mohan, Rameswaran},
   year   = {2026},
   note   = {Preprint},
-  doi    = {10.5281/zenodo.20816384},
-  url    = {https://doi.org/10.5281/zenodo.20816384}
+  doi    = {10.5281/zenodo.20816383},
+  url    = {https://doi.org/10.5281/zenodo.20816383}
 }
 ```
 
