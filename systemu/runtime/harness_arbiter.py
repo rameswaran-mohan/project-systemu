@@ -450,6 +450,23 @@ def arbitrate(
     """
     ctx = context or {}
 
+    # ── 0. Per-ACTIVITY cumulative request cap (Fix #6) ────────────────────
+    # The per-run cap below resets on every resume/retry (each is a fresh
+    # run-tree), so a task could forge unboundedly across its retries. This
+    # cumulative counter (Governor sidecar keyed by activity_id) survives both
+    # resumes AND retries; check it FIRST so a runaway activity terminates.
+    requests_this_activity: int = int(ctx.get("requests_this_activity", 0) or 0)
+    if requests_this_activity >= policy.max_requests_per_activity:
+        _res = _result(
+            request, HarnessDecision.DENY, RiskBand.HIGH,
+            f"Per-ACTIVITY cumulative request cap ({policy.max_requests_per_activity}) "
+            "exceeded — this task has requested too many capabilities across its "
+            "retries/resumes. Proceed with current capabilities and COMPLETE or FAIL.",
+            alternatives=["complete with current capabilities", "split the task"],
+        )
+        _res["verdict"].cap_exceeded = True
+        return _res
+
     # ── 1. Per-run request cap ─────────────────────────────────────────────
     # v0.9.38 Bug 13: the cap is a HARD limit — DENY even for blocking requests.
     # A blocking ESCALATE here suspended the run for operator approval, which on

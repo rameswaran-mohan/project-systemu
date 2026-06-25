@@ -323,8 +323,11 @@ class TestResumeAfterGrantMissingSnapshot:
 
 class TestResumeAfterGrantSubmitShape:
     def test_priority_and_affinity_flags(self, tmp_path, monkeypatch):
-        """resume_after_grant must use priority=1, retry_count=1,
-        consult_affinity_log=False — mirrors the recalibration contract."""
+        """resume_after_grant must use priority=1, retry_count=0,
+        consult_affinity_log=False. (Fix #7: a successful grant-resume is
+        forward progress, not a failure-retry — it must NOT pre-consume a
+        MAX_RETRIES slot. The double-dispatch guard is the __HARNESS_GRANT__
+        snapshot stamp, not retry_count.)"""
         data_dir = tmp_path / "data"
         (data_dir / "audit").mkdir(parents=True, exist_ok=True)
         _write_test_snapshot(data_dir, "exec-S1",
@@ -357,7 +360,7 @@ class TestResumeAfterGrantSubmitShape:
         )
 
         assert captured["priority"] == 1
-        assert captured["retry_count"] == 1
+        assert captured["retry_count"] == 0   # Fix #7: grant-resume is not a retry
         assert captured["consult_affinity_log"] is False
         assert captured["resume_from_execution_id"] == "exec-S1"
         assert captured["origin"] == "manual"

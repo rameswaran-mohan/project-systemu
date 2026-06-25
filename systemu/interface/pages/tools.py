@@ -641,6 +641,19 @@ def _resolve_forge_gate_silently(tool_id: str, vault, *, choice: str) -> None:
         logger.debug("[Tools UI] forge gate cleanup skipped", exc_info=True)
 
 
+def _forge_review_eligible(tool) -> bool:
+    """Fix #1: a tool is reviewable in the spec→code dialog ONLY while PROPOSED.
+
+    Once FORGED/DEPLOYED, re-opening the review — e.g. a stale ``/tools?forge=<id>``
+    deep-link that survives a websocket reconnect / page rebuild — would loop the
+    operator back through gate 1 on an already-forged tool. Guard the open here so
+    every caller (the deep-link auto-open AND the Inbox 'Review & Forge' button) is
+    covered. Tolerates both the ToolStatus enum and its raw string value.
+    """
+    st = getattr(getattr(tool, "status", None), "value", getattr(tool, "status", ""))
+    return str(st) == "proposed"
+
+
 def _show_spec_review_dialog(tool_id: str) -> None:
     """Opens the two-gate spec→code review dialog for a PROPOSED tool."""
     state = AppState.get()
@@ -648,6 +661,12 @@ def _show_spec_review_dialog(tool_id: str) -> None:
         tool = state.vault.get_tool(tool_id)
     except KeyError:
         ui.notify("Tool not found in vault.", type="negative")
+        return
+    # Fix #1: don't re-open the review for an already-forged tool (loop guard).
+    if not _forge_review_eligible(tool):
+        _st = getattr(getattr(tool, "status", None), "value", getattr(tool, "status", ""))
+        ui.notify(f"'{tool.name}' is already forged ({_st}) — nothing to review.",
+                  type="info")
         return
 
     # Mutable container for the generated code (shared between async callbacks)
@@ -855,6 +874,14 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                         type="positive",
                     )
                     dlg.close()
+                    # Fix #1: drop the ?forge=<id> deep-link param so a later page
+                    # rebuild (e.g. a websocket reconnect during the blocking
+                    # enable/heal) can't re-open this dialog at gate 1 for the now-
+                    # forged tool.
+                    try:
+                        ui.run_javascript("window.history.replaceState(null, '', '/tools')")
+                    except Exception:
+                        pass
                     # v0.8.13 Fix 6c: a reviewed approval also installs the tool's
                     # declared deps + enables it + heals waiting activities. pip
                     # install is blocking, so offload off the UI loop (same pattern

@@ -867,7 +867,8 @@ class Supervisor:
             shadow_id=shadow_id,
             priority=1,
             reason=reason,
-            retry_count=1,            # treat like a retry so dedup guard allows it
+            retry_count=0,            # Fix #7: a successful grant-resume is forward
+            #                            progress, not a failure-retry — don't burn a slot.
             consult_affinity_log=False,
             resume_from_execution_id=execution_id,
             origin=resolved_origin,

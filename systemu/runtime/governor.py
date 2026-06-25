@@ -1241,6 +1241,39 @@ class Governor:
             logger.debug("[Governor] runtree request bump failed", exc_info=True)
             return None
 
+    def activity_path(self, activity_id: str, vault=None) -> Path:
+        root = self._vault_root(vault)
+        return root / "harness_ledger" / f"_activity_{activity_id}.json"
+
+    def next_activity_request(self, activity_id: str, execution_id: str, vault=None):
+        """Fix #6: atomically bump the per-ACTIVITY cumulative request counter
+        (survives resumes AND retries, unlike the per-run-tree counter). Returns
+        the PRE-increment count, or None on no activity_id / error."""
+        if not activity_id:
+            return None
+        try:
+            with _RUNTREE_LOCK:
+                p = self.activity_path(activity_id, vault)
+                data = {"requests": 0, "executions": []}
+                try:
+                    if p.exists():
+                        _d = json.loads(p.read_text(encoding="utf-8"))
+                        if isinstance(_d, dict):
+                            data = _d
+                except Exception:
+                    pass
+                pre = int(data.get("requests", 0) or 0)
+                execs = list(data.get("executions") or [])
+                if execution_id and execution_id not in execs:
+                    execs.append(execution_id)
+                data["requests"], data["executions"] = pre + 1, execs
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps(data), encoding="utf-8")
+                return pre
+        except Exception:
+            logger.debug("[Governor] activity request bump failed", exc_info=True)
+            return None
+
     def runtree_execution_ids(self, root_execution_id: str, vault=None) -> list:
         """Every execution_id that arbitrated a request under this run-tree."""
         if not root_execution_id:

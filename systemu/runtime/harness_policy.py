@@ -133,6 +133,9 @@ class HarnessPolicy:
 
     # ── ceiling / depth limits ────────────────────────────────────────────────
     max_requests_per_run:          int   = 8
+    max_requests_per_activity:     int   = 16   # Fix #6: cumulative cap across an
+    #                                            activity's resumes+retries (each is a
+    #                                            fresh run-tree, so the per-run cap resets)
     max_compute_ceiling:           float = 1.0
     max_subagent_depth:            int   = 1
     max_subagent_budget_fraction:  float = 0.5
@@ -243,6 +246,7 @@ class HarnessPolicy:
             # ``SYSTEMU_HARNESS_LLM_JUDGE`` (per design spec §8).
             llm_judge_enabled=_cfg_bool_env("llm_judge_enabled", "LLM_JUDGE", True),
             max_requests_per_run=_cfg_int("max_requests_per_run", 8),
+            max_requests_per_activity=_cfg_int("max_requests_per_activity", 16),
             max_compute_ceiling=_cfg_float("max_compute_ceiling", 1.0),
             max_subagent_depth=_cfg_int("max_subagent_depth", 1),
             max_subagent_budget_fraction=_cfg_float("max_subagent_budget_fraction", 0.5),

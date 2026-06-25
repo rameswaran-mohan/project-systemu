@@ -927,6 +927,36 @@ def _stuck_thresholds() -> tuple[int, int, bool]:
     return (no_progress, tool_fails, guard_on)
 
 
+_NO_PROGRESS_TAG = "__NO_PROGRESS_CARRY__::"
+
+
+def _encode_no_progress_note(iters_since_credit: int) -> str:
+    """Fix #5: sticky-note carrying the no-progress counter across a resume so the
+    resumed run doesn't restart its 'iterations since objective credit' at 0 and
+    re-do the same futile work from scratch."""
+    return f"{_NO_PROGRESS_TAG}{int(iters_since_credit)}"
+
+
+def _decode_no_progress_note(sticky_notes) -> int:
+    for n in (sticky_notes or []):
+        if isinstance(n, str) and n.startswith(_NO_PROGRESS_TAG):
+            try:
+                return int(n[len(_NO_PROGRESS_TAG):])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _should_force_finalize_stuck(*, coach_steers_used: int, max_steers: int,
+                                 stuck_round: int, finalize_after_rounds: int) -> bool:
+    """Fix #2/#4: once the auto-coach budget is spent AND the SAME objective has
+    been stuck for >= finalize_after_rounds rounds, stop coaching/re-parking and
+    force a terminal failure. finalize_after_rounds<=0 disables (back-compat)."""
+    if finalize_after_rounds <= 0:
+        return False
+    return coach_steers_used >= max(0, max_steers) and stuck_round >= finalize_after_rounds
+
+
 def _build_user_context_block(vault) -> str:
     """v0.9.0 (Layer 1): compact one-block summary of the user profile + up to
     5 most-recent facts. Returns "" when no profile is set.
@@ -3037,6 +3067,13 @@ class ShadowRuntime:
                                     int(k): v for k, v in
                                     _json.loads(_rounds_note.split("::", 1)[1]).items()
                                 }
+                            # Fix #5: restore the no-progress pressure so a resumed run
+                            # trips the stuck/force-finalize path instead of re-searching
+                            # from a clean slate.
+                            try:
+                                self._iters_since_obj_credit = _decode_no_progress_note(snap.sticky_notes)
+                            except Exception:
+                                pass
                             if _ans_note:
                                 _parts = _ans_note.split("::", 2)  # __STUCK_ANSWER__::obj_<id>::<choice_json>
                                 _obj_id = int(_parts[1].replace("obj_", ""))
@@ -4102,6 +4139,7 @@ class ShadowRuntime:
                     # each restart at 0 and blow past max_requests_per_run. Falls
                     # back to the per-exec count when no sidecar is writable
                     # (no vault / governor — test stubs keep their old behaviour).
+                    _act_pre = None
                     if governor is not None:
                         try:
                             _tree_pre = governor.next_runtree_request(
@@ -4110,6 +4148,16 @@ class ShadowRuntime:
                             _tree_pre = None
                         if _tree_pre is not None:
                             _pre_inc_requests = _tree_pre
+                        # Fix #6: bump the per-ACTIVITY cumulative counter (keyed by
+                        # activity_id — stable across resume AND retry, unlike the
+                        # per-run-tree counter), so a task can no longer forge
+                        # unboundedly across its retries. Pre-increment total feeds
+                        # the arbiter's per-activity cap below.
+                        try:
+                            _act_pre = governor.next_activity_request(
+                                getattr(activity, "id", ""), execution_id, self.vault)
+                        except Exception:
+                            _act_pre = None
                     try:
                         from systemu.runtime.governor import Governor
                         from systemu.core.models import (
@@ -4208,6 +4256,10 @@ class ShadowRuntime:
                             _pre_inc_requests,
                             int(getattr(self, "_subagent_depth", 0)),
                         )
+                        # Fix #6: thread the per-ACTIVITY cumulative pre-increment
+                        # count so the arbiter can enforce max_requests_per_activity
+                        # across this activity's resumes+retries.
+                        _arb_ctx["requests_this_activity"] = int(_act_pre or 0)
                         _verdict = _gov.arbitrate(_req, context=_arb_ctx)
                         # v0.9.41: a cap-exceeded DENY otherwise writes NO ledger row
                         # (only the GRANT path logs, via materialise), so the
@@ -4980,6 +5032,28 @@ class ShadowRuntime:
                                 # Retry the loop with the steer applied; do NOT escalate
                                 # to the operator this round.
                                 continue
+                        # Fix #2/#4: coach budget spent + still stuck on the same
+                        # objective for N rounds → fail fast instead of re-parking
+                        # (which just spawns more operator gates the agent can't
+                        # satisfy, e.g. an input file that doesn't exist).
+                        _fin_after = int(getattr(self.config, "auto_coach_finalize_after_rounds", 2) or 0)
+                        _round_now = self._stuck_round_for_obj.get(stuck_obj.id, 0) + 1
+                        if _should_force_finalize_stuck(
+                                coach_steers_used=self._coach_steers_used,
+                                max_steers=int(getattr(self.config, "auto_coach_max_steers", 2)),
+                                stuck_round=_round_now,
+                                finalize_after_rounds=_fin_after):
+                            logger.warning(
+                                "[Runtime] no-progress force-finalize: Objective %s stuck "
+                                "%d rounds after coach budget — %s",
+                                stuck_obj.id, _round_now, reason,
+                            )
+                            return self._finalize_stuck(
+                                context=context, status="partial", reason=reason,
+                                stuck_on=stuck_obj.id, completed=list(completed_objectives),
+                                iteration=iteration, tool_calls_made=tool_call_count,
+                                scroll=scroll, shadow=shadow, execution_id=execution_id,
+                                exec_start=exec_start, total_objectives=total_objectives)
                         # v0.8.22.1 (R1): persist a resume snapshot at stuck-park so
                         # the operator's answer (via the daemon re-dispatch handler)
                         # can resume this run with completed objectives intact.
@@ -5009,6 +5083,11 @@ class ShadowRuntime:
                             _snap.sticky_notes.append(
                                 "__STUCK_ROUNDS__::" + _json.dumps(self._stuck_round_for_obj)
                             )
+                            # Fix #5: carry the no-progress counter so the resumed run
+                            # keeps its 'iterations since objective credit' pressure
+                            # instead of restarting at 0 and re-doing futile work.
+                            _snap.sticky_notes.append(
+                                _encode_no_progress_note(self._iters_since_obj_credit))
                             write_snapshot(_snap)
                         except Exception:
                             logger.debug("[Runtime] stuck-park snapshot failed", exc_info=True)
