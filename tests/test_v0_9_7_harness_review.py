@@ -138,8 +138,12 @@ class TestSurfaceHarnessRequest:
         posted = captured_calls[0]
         assert posted["dedup_key"] == expected_dedup_key
 
-    def test_options_are_deny_approve_editspec(self):
-        """options[0] == 'Deny' (safe default), options contain Approve + Edit spec."""
+    def test_options_are_deny_approve(self):
+        """options[0] == 'Deny' (safe default), options are Deny + Approve only.
+
+        "Edit spec" was dropped — the inline "Edit" affordance resolves as
+        "Approve" with an amended spec, it is no longer a separate option.
+        """
         from systemu.interface.harness_review import surface_harness_request, _HARNESS_OPTIONS
 
         request = _make_request()
@@ -163,7 +167,7 @@ class TestSurfaceHarnessRequest:
 
         assert captured_options[0] == "Deny", "First option must be Deny (safe-by-default)"
         assert "Approve" in captured_options
-        assert "Edit spec" in captured_options
+        assert "Edit spec" not in captured_options
 
     def test_context_carries_harness_fields(self):
         """Posted context includes execution_id, request_id, harness_kind, etc."""

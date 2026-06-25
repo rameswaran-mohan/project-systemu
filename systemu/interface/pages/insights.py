@@ -380,6 +380,94 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
             )
             return   # structured branch handled — skip the flat option buttons
 
+        # Amend-then-approve: a harness CAPABILITY gate (not INPUT) gets Deny /
+        # Approve / Edit. "Edit" reveals a JSON editor of the spec; submit runs the
+        # deterministic safety+band check and resolves as "Approve" with the amended
+        # spec stamped. Logic lives in harness_spec_edit (tested) — this is wiring.
+        _hctx = card.get("context") or {}
+        _hkind = str(_hctx.get("harness_kind") or "").lower()
+        if _hctx.get("gate_type") == "harness" and _hkind and _hkind != "input":
+            import json as _json
+            from systemu.runtime.harness_spec_edit import (
+                spec_edit_view, validate_amended_spec, evaluate_amendment,
+            )
+            from systemu.interface.dashboard_state import AppState
+            _orig_spec = _hctx.get("spec") or {}
+            _edit_state = {"content": {"json": dict(_orig_spec)}}
+            _panel = ui.column().style("gap: 8px; margin-top: 8px;")
+            _panel.visible = False
+
+            with _panel:
+                ui.label("Edit spec (JSON) — Approve grants the amended spec")
+                ui.json_editor({"content": {"json": dict(_orig_spec)}},
+                               on_change=lambda e: _edit_state.update(content=e.content))
+
+                def _submit_amended(_e=None, did=card["id"], kind=_hkind,
+                                    orig=dict(_orig_spec), ctx=_hctx):
+                    content = _edit_state.get("content") or {}
+                    if "json" in content:
+                        edited = content["json"]
+                    else:
+                        try:
+                            edited = _json.loads(content.get("text") or "{}")
+                        except Exception:
+                            ui.notify("Invalid JSON — fix and retry", type="warning")
+                            return
+                    if not isinstance(edited, dict):
+                        ui.notify("Spec must be a JSON object", type="warning")
+                        return
+                    errs = validate_amended_spec(kind, edited, original_spec=orig)
+                    if errs:
+                        ui.notify("; ".join(errs), type="warning")
+                        return
+                    _state = AppState.get()
+                    res = evaluate_amendment(
+                        kind=kind, original_spec=orig, edited_spec=edited,
+                        arb_context=ctx.get("arb_context") or {},
+                        config=getattr(_state, "config", None),
+                    )
+                    if res["blocked"]:
+                        ui.notify(f"Blocked: {res['reason']}", type="negative")
+                        return
+                    patch = {"amended_spec": edited}
+                    if res["band_increase"]:
+                        # Typed re-confirmation for a risk-raising edit.
+                        with ui.dialog() as _dlg, ui.card():
+                            ui.label(f"This edit raises risk {res['from_band']} → "
+                                     f"{res['to_band']}. Type CONFIRM to approve.")
+                            _ci = ui.input("Type CONFIRM")
+
+                            def _do_confirm():
+                                if (_ci.value or "").strip() != "CONFIRM":
+                                    ui.notify("Type CONFIRM to proceed", type="warning")
+                                    return
+                                patch["amend_band_escalation"] = {
+                                    "from": res["from_band"], "to": res["to_band"],
+                                    "confirmed": True}
+                                _dlg.close()
+                                queue.resolve_with_context_patch(
+                                    did, choice="Approve", context_patch=patch)
+                                ui.notify("Approved (amended)", type="positive")
+                                on_resolved()
+                            ui.button("Confirm", on_click=_do_confirm)
+                            ui.button("Cancel", on_click=_dlg.close)
+                        _dlg.open()
+                        return
+                    queue.resolve_with_context_patch(
+                        did, choice="Approve", context_patch=patch)
+                    ui.notify("Approved (amended)", type="positive")
+                    on_resolved()
+
+                ui.button("Approve amended", on_click=_submit_amended)
+
+            with ui.row().style("gap: 8px;"):
+                ui.button("Deny", on_click=_make_handler(
+                    card["id"], card["dedup_key"], "Deny", queue))
+                ui.button("Approve", on_click=_make_handler(
+                    card["id"], card["dedup_key"], "Approve", queue))
+                ui.button("Edit", on_click=lambda: _panel.set_visibility(True))
+            return  # capability-gate branch handled — skip the flat-options loop
+
         with ui.row().style("gap: 8px;"):
             for opt in card["options"]:
                 ui.button(

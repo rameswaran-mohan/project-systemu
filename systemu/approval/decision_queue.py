@@ -305,6 +305,39 @@ class OperatorDecisionQueue:
             pass
         return decision
 
+    def resolve_with_context_patch(self, decision_id: str, *, choice: str,
+                                   context_patch: dict) -> "OperatorDecision":
+        """Atomically merge ``context_patch`` into the decision context AND resolve
+        it in a single reload+save. Avoids the write-then-resolve lost update
+        (``resolve`` reloads a fresh decision and would discard a separately
+        mutated copy). Used by the amend-then-approve flow to stamp ``amended_spec``
+        (and any band-escalation record) before resolving as "Approve".
+        """
+        try:
+            decision = self._vault.get_decision(decision_id)
+        except Exception as exc:
+            raise KeyError(f"OperatorDecision {decision_id} not found: {exc}")
+        # Same membership contract as resolve(): capability gates carry
+        # options=["Deny","Approve"], so choice="Approve" passes the strict check.
+        _ctx = decision.context or {}
+        _structured = _ctx.get("kind") == "structured_question"
+        _elicitation_form = bool(_ctx.get("requested_schema"))
+        _input_gate = str(_ctx.get("harness_kind") or "").lower() == "input"
+        if (not (_structured or _elicitation_form or _input_gate)
+                and choice not in decision.options):
+            raise ValueError(
+                f"choice {choice!r} not in options {decision.options!r} "
+                f"for decision {decision_id}"
+            )
+        decision.context = {**(decision.context or {}), **(context_patch or {})}
+        decision.status = "resolved"
+        decision.choice = choice
+        decision.resolved_at = datetime.now(tz=timezone.utc)
+        self._vault.save_decision(decision)
+        logger.info("[DecisionQueue] resolved+patched %s -> %r (keys=%s)",
+                    decision_id, choice, sorted((context_patch or {}).keys()))
+        return decision
+
     def consume_resolved_choice(self, dedup_key: str) -> Optional[str]:
         """Atomically read AND retire the newest RESOLVED choice for a dedup_key.
 

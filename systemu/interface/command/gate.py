@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 _SEVERITY_TO_RISK = {"blocker": "high", "warning": "medium", "info": "low"}
 
 # Mirrors harness_review._HARNESS_OPTIONS verbatim (index 0 is the safe default).
-_HARNESS_OPTIONS: List[str] = ["Deny", "Approve", "Edit spec"]
+_HARNESS_OPTIONS: List[str] = ["Deny", "Approve"]
 
 
 class GateDescriptor(BaseModel):

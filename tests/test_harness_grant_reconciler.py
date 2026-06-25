@@ -132,6 +132,34 @@ class _FakeGovernor:
                     "subagent": {"task": "do X", "depth_cap": 1}}
         return {"materialised": False, "reason": "unmaterialised kind"}
 
+    def grant(self, request, *, context, vault, config, execution_id,
+              prior_request=None, band_escalation_confirmed=False):
+        """Stand-in for the real ``Governor.grant`` (Task 5): the operator's
+        approval force-GRANTs, so we just materialise ONCE and return the real
+        grant() dict shape ``{materialised, verdict, result, operator_amended}``.
+
+        The fake has no policy/arbiter, so it cannot reproduce a hard-safety
+        DENY or a band-escalation guard — the reconciler suite exercises only
+        the force-grant path (unedited approve + amend-then-approve), which is
+        exactly what this returns. ``materialise`` is still the single call the
+        idempotency / no-real-forge assertions hinge on (``last_call``)."""
+        from systemu.core.models import (
+            HarnessVerdict, HarnessDecision, RiskBand,
+        )
+        gv = HarnessVerdict(
+            request_id=request.request_id,
+            decision=HarnessDecision.GRANT,
+            risk_band=RiskBand.LOW,
+            rationale=("operator approved via harness gate"
+                       + (" (amended)" if prior_request is not None else "")),
+        )
+        result = self.materialise(
+            request, gv, vault=vault, config=config, execution_id=execution_id,
+        )
+        return {"materialised": result.get("materialised", False),
+                "verdict": gv, "result": result,
+                "operator_amended": prior_request is not None}
+
 
 @pytest.fixture(autouse=True)
 def _patch_governor(monkeypatch):

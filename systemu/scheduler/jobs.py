@@ -381,27 +381,35 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
                         ),
                     }
             else:
-                # Approve / Edit spec → materialise the capability ONCE.
-                request = HarnessRequest(
-                    request_id=dctx.get("request_id", "") or "",
-                    kind=HarnessKind(harness_kind),
-                    spec=dctx.get("spec") or {},
-                    rationale=dctx.get("rationale", "") or "",
-                    fallback=dctx.get("fallback", "") or "",
+                # Approve (optionally amended) → Governor.grant materialises ONCE.
+                _amended = dctx.get("amended_spec")
+                _spec = _amended or dctx.get("spec") or {}
+
+                def _mk(spec):
+                    return HarnessRequest(
+                        request_id=dctx.get("request_id", "") or "",
+                        kind=HarnessKind(harness_kind),
+                        spec=spec or {},
+                        rationale=dctx.get("rationale", "") or "",
+                        fallback=dctx.get("fallback", "") or "",
+                    )
+
+                _request = _mk(_spec)
+                _prior = _mk(dctx.get("spec")) if _amended else None
+                _confirmed = bool((dctx.get("amend_band_escalation") or {}).get("confirmed"))
+                _g = Governor(config).grant(
+                    _request, context=dctx.get("arb_context") or {},
+                    vault=vault, config=config, execution_id=execution_id,
+                    prior_request=_prior, band_escalation_confirmed=_confirmed,
                 )
-                verdict = HarnessVerdict(
-                    request_id=request.request_id,
-                    decision=HarnessDecision.GRANT,
-                    risk_band=RiskBand(dctx.get("risk_band", "low"))
-                    if dctx.get("risk_band") in ("low", "medium", "high")
-                    else RiskBand.LOW,
-                    rationale="operator approved via harness gate",
-                )
-                materialised = Governor(config).materialise(
-                    request, verdict, vault=vault, config=config,
-                    execution_id=execution_id,
-                )
-                grant_payload = _map_grant_payload(harness_kind, materialised)
+                if _g.get("denied"):
+                    grant_payload = {
+                        "kind": harness_kind, "denied": True,
+                        "rationale": _g.get("reason") or "amend rejected",
+                        "amend_rejected": bool(_amended),
+                    }
+                else:
+                    grant_payload = _map_grant_payload(harness_kind, _g.get("result") or {})
 
             supervisor.resume_after_grant(
                 execution_id=execution_id,
@@ -508,7 +516,7 @@ def reconcile_resolved_mcp_oauth(*, vault, supervisor, data_dir=None) -> int:
                     try:
                         created = datetime.fromisoformat(str(created_raw))
                         if (now - created) > timedelta(seconds=MCP_OAUTH_PENDING_TIMEOUT_SECONDS) \
-                                and choice not in {"approve", "approved", "edit spec"}:
+                                and choice not in {"approve", "approved"}:
                             denied = True
                     except ValueError:
                         pass

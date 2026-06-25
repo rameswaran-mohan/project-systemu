@@ -321,9 +321,26 @@ def render_inbox_gate_cards(vault, *, on_resolved, empty_label: str = "") -> int
         if empty_label:
             ui.label(empty_label).classes("s-muted").style("padding: 12px;")
         return 0
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    from systemu.interface.pages.insights import render_decision_card
+    _queue = OperatorDecisionQueue(vault)
     for dec_id, descriptor in descriptors:
-        _render_unified_card(
-            dec_id, descriptor, vault=vault, on_resolved=on_resolved)
+        # Amend-then-approve: a harness CAPABILITY gate (not INPUT) renders via the
+        # full render_decision_card so the operator gets Deny / Approve / Edit (the
+        # JSON spec editor) here on the primary surface. Every other gate type keeps
+        # the unified triage card.
+        _routed = False
+        try:
+            _dec = vault.get_decision(dec_id)
+            _ctx = (_dec.context or {}) if _dec else {}
+            if (_ctx.get("gate_type") == "harness"
+                    and str(_ctx.get("harness_kind") or "").lower() not in ("", "input")):
+                render_decision_card(_dec.to_dict(), _queue, on_resolved)
+                _routed = True
+        except Exception:
+            logger.exception("[Inbox] harness gate card routing failed for %s", dec_id)
+        if not _routed:
+            _render_unified_card(dec_id, descriptor, vault=vault, on_resolved=on_resolved)
     return len(descriptors)
 
 

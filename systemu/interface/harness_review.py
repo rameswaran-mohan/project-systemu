@@ -53,13 +53,13 @@ except Exception:  # pragma: no cover
 #  Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-_HARNESS_OPTIONS: List[str] = ["Deny", "Approve", "Edit spec"]
+_HARNESS_OPTIONS: List[str] = ["Deny", "Approve"]
 """Decision options presented to the operator.
 
 Ordering contract (mirrors notify_user's actions[0]-is-safe rule):
   - index 0 → safe-default: Deny (refuse the capability request)
-  - index 1 → Approve (grant the capability at the operator's explicit choice)
-  - index 2 → Edit spec (approve but signal the spec needs revision)
+  - index 1 → Approve (grant; the inline "Edit" affordance resolves as "Approve"
+    after stamping amended_spec — it is NOT a separate option)
 """
 
 
@@ -75,6 +75,7 @@ def surface_harness_request(
     activity_id: str = "",
     shadow_id: str = "",
     vault,
+    arb_context: dict | None = None,
 ) -> str:
     """Surface an escalated HarnessRequest as an operator decision card.
 
@@ -175,6 +176,10 @@ def surface_harness_request(
         "blocking":          blocking,
         "verdict":           verdict_decision,
         "spec":              spec,
+        # Amend-then-approve: snapshot the arbitration context so the daemon
+        # Governor.grant re-arbitrates faithfully (best-effort; the hard-DENY
+        # gate is spec-intrinsic and does not depend on this).
+        "arb_context":       dict(arb_context or {}),
         "rationale":         rationale,
         "verdict_rationale": verdict_rationale,
         # v0.9.35 (P1): elicitation form schema + the pending tool call so the

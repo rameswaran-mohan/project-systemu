@@ -9,8 +9,8 @@ filters ``ctx.get("kind") == "gate"`` and skips the legacy
 The re-tag must PRESERVE the harness-specific context fields the future
 grant-resume work + current renderers depend on: execution_id / request_id /
 harness_kind / spec (and friends). The dedup key
-``harness:<execution_id>:<request_id>`` and the options
-``["Deny", "Approve", "Edit spec"]`` are unchanged.
+``harness:<execution_id>:<request_id>`` is unchanged; the options are
+``["Deny", "Approve"]`` (the dead "Edit spec" option was dropped).
 
 resolve_gate's harness branch stays render-only (QUEUED) — NOT exercised here.
 """
@@ -92,7 +92,7 @@ def test_harness_surfaces_as_gate_in_inbox(tmp_path):
         f"got {[d.dedup for _, d in descs]!r}"
     )
     desc = matches[0]
-    assert desc.options == ["Deny", "Approve", "Edit spec"]
+    assert desc.options == ["Deny", "Approve"]
 
 
 def test_harness_gate_preserves_harness_context_fields(tmp_path):

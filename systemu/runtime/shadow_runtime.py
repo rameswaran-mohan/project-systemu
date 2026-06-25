@@ -4354,7 +4354,7 @@ class ShadowRuntime:
                                 _did = surface_harness_request(
                                     _req, _verdict, execution_id=execution_id,
                                     activity_id=activity.id, shadow_id=shadow.id,
-                                    vault=self.vault,
+                                    vault=self.vault, arb_context=_arb_ctx,
                                 )
                                 logger.info(
                                     "[Runtime] harness blocking ESCALATE → parked "
@@ -4389,7 +4389,7 @@ class ShadowRuntime:
                                     _did = surface_harness_request(
                                         _req, _verdict, execution_id=execution_id,
                                         activity_id=activity.id, shadow_id=shadow.id,
-                                        vault=self.vault,
+                                        vault=self.vault, arb_context=_arb_ctx,
                                     )
                                     logger.info("[Runtime] harness ESCALATE surfaced to operator: %s", _did)
                                 except Exception:

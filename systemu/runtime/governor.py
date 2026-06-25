@@ -72,6 +72,22 @@ def _mint_lease_id() -> str:
     return "lease_" + uuid.uuid4().hex[:10]
 
 
+def _amend_meta(prior_request, request, verdict, band_escalation_confirmed: bool,
+                original_risk_band=None):
+    """Build the P6 provenance record for an operator-amended grant, or None for
+    an unedited approve. Annotates the single GRANT ledger row (no extra row)."""
+    if prior_request is None:
+        return None
+    return {
+        "operator_amended": True,
+        "original_spec": dict(getattr(prior_request, "spec", {}) or {}),
+        "amended_spec": dict(getattr(request, "spec", {}) or {}),
+        "original_risk_band": original_risk_band,
+        "fresh_risk_band": verdict.risk_band.value,
+        "band_escalation_confirmed": bool(band_escalation_confirmed),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Governor
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,6 +258,7 @@ class Governor:
         vault,
         config,
         execution_id: str,
+        amend_meta: dict | None = None,
     ) -> dict:
         """Materialise a GRANTed HarnessRequest into a real capability.
 
@@ -279,7 +296,7 @@ class Governor:
                 "reason": f"verdict is {verdict.decision.value} — not materialising",
             }
             self._ledger_append(
-                self._ledger_entry(request, verdict, outcome, execution_id),
+                self._ledger_entry(request, verdict, outcome, execution_id, amend_meta),
                 vault=vault,
                 execution_id=execution_id,
             )
@@ -289,7 +306,7 @@ class Governor:
         outcome = self._dispatch(request, verdict, vault=vault, config=config, execution_id=execution_id)
 
         self._ledger_append(
-            self._ledger_entry(request, verdict, outcome, execution_id),
+            self._ledger_entry(request, verdict, outcome, execution_id, amend_meta),
             vault=vault,
             execution_id=execution_id,
         )
@@ -311,6 +328,53 @@ class Governor:
             )
 
         return outcome
+
+    def grant(self, request: HarnessRequest, *, context, vault, config,
+              execution_id: str, prior_request: HarnessRequest | None = None,
+              band_escalation_confirmed: bool = False) -> dict:
+        """Single arbitrated front door to a grant.
+
+        Arbitrates the (possibly edited) request with the per-run cap neutralized
+        (the operator's approval is not a new request), then:
+          * hard-block on a hard-safety DENY (e.g. MCP SSRF) → return denied;
+          * if amended and the edit raises the risk band without confirmation →
+            return denied (daemon-enforced band guard);
+          * else force a GRANT verdict (operator authority — ESCALATE/cap-DENY
+            never suppress the grant) and materialise ONCE.
+
+        ``prior_request`` is the original (pre-amend) request, or None for an
+        unedited approve. Returns ``{materialised, denied?, reason?, verdict, result}``.
+        """
+        from systemu.runtime.harness_arbiter import arbitrate
+        from systemu.runtime.harness_spec_edit import band_rank
+
+        policy = HarnessPolicy.from_config(config)
+        ctx0 = {**(dict(context) if context else {}), "requests_this_run": 0}
+        v = arbitrate(request, policy, ctx0)["verdict"]
+        if v.decision == HarnessDecision.DENY:        # cap neutralized → hard rule
+            return {"materialised": False, "denied": True,
+                    "reason": v.rationale or "edit denied by policy", "verdict": v}
+        vp = None
+        if prior_request is not None:
+            vp = arbitrate(prior_request, policy, ctx0)["verdict"]
+            if band_rank(v.risk_band) > band_rank(vp.risk_band) and not band_escalation_confirmed:
+                return {"materialised": False, "denied": True, "verdict": v,
+                        "reason": (f"amend raises risk {vp.risk_band.value}"
+                                   f"->{v.risk_band.value}; not confirmed")}
+        gv = HarnessVerdict(
+            request_id=request.request_id, decision=HarnessDecision.GRANT,
+            risk_band=v.risk_band,
+            rationale=("operator approved via harness gate"
+                       + (" (amended)" if prior_request is not None else "")),
+        )
+        result = self.materialise(
+            request, gv, vault=vault, config=config, execution_id=execution_id,
+            amend_meta=_amend_meta(prior_request, request, gv, band_escalation_confirmed,
+                                   original_risk_band=(vp.risk_band.value if vp else None)),
+        )
+        return {"materialised": result.get("materialised", False),
+                "verdict": gv, "result": result,
+                "operator_amended": prior_request is not None}
 
     def revoke_leases(self, execution_id: str) -> int:
         """Mark all leases belonging to ``execution_id`` as revoked.
@@ -1063,8 +1127,9 @@ class Governor:
         verdict: HarnessVerdict,
         outcome: dict,
         execution_id: str,
+        amend_meta: dict | None = None,
     ) -> dict:
-        return {
+        entry = {
             "ts": _utcnow_iso(),
             "execution_id": execution_id,
             "request": {
@@ -1088,6 +1153,9 @@ class Governor:
             },
             "outcome": outcome,
         }
+        if amend_meta:
+            entry["amend"] = amend_meta   # P6 provenance — ignored by reconcile_outcomes
+        return entry
 
     def _ledger_append(
         self,
