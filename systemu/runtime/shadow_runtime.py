@@ -1129,12 +1129,20 @@ def _auto_approve_recalibration(
     the Tools page card, but happens automatically.
     """
     new_tool_id = result.new_tool_id or result.original_tool_id
+    # v0.9.48 Phase 3: route through the gated enable mechanism instead of
+    # laundering a failed dry-run to "skipped" + flipping .enabled directly. A
+    # tool whose dry_run_status isn't passed/skipped is refused, so we log and
+    # return WITHOUT resuming the activity.
     try:
-        new_tool = vault.get_tool(new_tool_id)
-        new_tool.enabled = True
-        if (getattr(new_tool, "dry_run_status", None) or "not_run") not in ("passed", "skipped"):
-            new_tool.dry_run_status = "skipped"
-        vault.save_tool(new_tool)
+        from systemu.pipelines import tool_service
+        if not tool_service.enable_tool(new_tool_id, vault):
+            status = getattr(vault.get_tool(new_tool_id), "dry_run_status", "not_run")
+            logger.warning(
+                "[Runtime] auto-approve: enable refused for %s "
+                "(dry_run_status=%s) — not resuming",
+                new_tool_id, status,
+            )
+            return
     except Exception:
         logger.exception("[Runtime] auto-approve: tool enable failed")
         return
@@ -1785,9 +1793,10 @@ def _coerce_scalar_parameter(value, tool_name: str, tools) -> dict:
         if getattr(t, "name", None) == tool_name:
             names = list(getattr(t, "parameter_names", []) or [])
             if not names:
+                from systemu.core.schema_utils import schema_param_names
                 schema = getattr(t, "parameters_schema", {}) or {}
                 if isinstance(schema, dict):
-                    names = list(schema.keys())
+                    names = schema_param_names(schema)
             break
     if len(names) == 1:
         return {names[0]: value}

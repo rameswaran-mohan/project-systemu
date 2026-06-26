@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from systemu.core.utils import utcnow
+from systemu.core.schema_utils import normalize_parameters_schema, schema_param_names
 from systemu.core.models import (
     Activity, ActivityStatus,
     Evolution, EvolutionStatus,
@@ -86,7 +87,7 @@ def _tool_header(t: Tool) -> Dict[str, Any]:
     return {
         "id": t.id, "name": t.name, "description": t.description,
         "tool_type": t.tool_type,
-        "parameter_names": list((t.parameters_schema or {}).keys()),
+        "parameter_names": schema_param_names(t.parameters_schema),
         "dependencies": t.dependencies or [],
         "status": t.status, "enabled": t.enabled,
         "forged_by_systemu": t.forged_by_systemu,
@@ -542,7 +543,7 @@ class Vault:
 
         # Render parameters from schema
         param_lines: List[str] = []
-        for pname, pdef in (tool.parameters_schema or {}).items():
+        for pname, pdef in normalize_parameters_schema(tool.parameters_schema or {}).items():
             ptype    = pdef.get("type", "any") if isinstance(pdef, dict) else "any"
             pdesc    = pdef.get("description", "") if isinstance(pdef, dict) else ""
             preq     = pdef.get("required", False) if isinstance(pdef, dict) else False

@@ -36,6 +36,7 @@ import json
 import logging
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -59,6 +60,23 @@ logger = logging.getLogger(__name__)
 # Governor instances (children mint their own Governor), so the lock must be at
 # module scope, not per-instance, to make the read-modify-write atomic.
 _RUNTREE_LOCK = threading.Lock()
+
+# v0.9.48 Phase 7 — bounded self-heal re-forge. A forged tool that fails its
+# dry-run with a CODE bug gets EXACTLY ONE Governor-gated re-forge (the dry-run
+# error is injected into the code prompt as an authoritative course-correction).
+REFORGE_CAP = 1
+
+
+@dataclass(frozen=True)
+class ReforgeDecision:
+    """Governor verdict for a dry-run-failure self-heal.
+
+    ``granted`` True only for a code-bug failure under the per-tool cap;
+    ``course_correction`` is the directive threaded into the re-forge code prompt.
+    """
+    granted: bool
+    reason: str = ""
+    course_correction: str = ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Internal helpers
@@ -375,6 +393,48 @@ class Governor:
         return {"materialised": result.get("materialised", False),
                 "verdict": gv, "result": result,
                 "operator_amended": prior_request is not None}
+
+    def review_reforge(self, tool, failure_error: str) -> "ReforgeDecision":
+        """Phase 7 — arbitrate a dry-run-failure self-heal and author its course
+        correction.
+
+        GRANTS exactly when both hold:
+          * the tool is still under its per-tool re-forge cap
+            (``forge_reattempts < REFORGE_CAP``) — the no-loop guarantee; and
+          * the failure classifies as a CODE bug (``DRY_RUN_FAILED_BUG``) — a
+            missing dependency (DEP_PENDING) or filesystem permission error
+            (FS_PERMISSION) is NOT a code-gen mistake and still routes to the
+            operator, never to a blind re-forge.
+
+        On a grant, ``course_correction`` carries the exact dry-run error plus an
+        AUTHORITATIVE directive so the code-writer fixes the specific failing call
+        even when the tool's own ``implementation_notes`` taught the bug. Pure +
+        deterministic (no LLM call) so it adds no latency to the reconcile tick.
+        """
+        from systemu.recovery.classifier import classify_dry_run_error
+
+        attempts = int(getattr(tool, "forge_reattempts", 0) or 0)
+        if attempts >= REFORGE_CAP:
+            return ReforgeDecision(False, reason=f"re-forge budget exhausted (cap={REFORGE_CAP})")
+        kind = classify_dry_run_error(failure_error or "").kind
+        if kind != "DRY_RUN_FAILED_BUG":
+            return ReforgeDecision(False, reason=f"{kind} routes to operator, not a code re-forge")
+        course_correction = (
+            "A PRIOR generation of this tool FAILED its dry-run with this exact error:\n"
+            f"  {(failure_error or '').strip()[:600]}\n"
+            "This error is AUTHORITATIVE — fix the specific call it names, overriding the "
+            "implementation_notes wherever they conflict. If it is a \"missing N required "
+            "positional argument(s)\" error, the call has the WRONG NUMBER OR ORDER of "
+            "positionals, not merely a missing trailing one: re-derive the library "
+            "function's COMPLETE documented signature, write it as a one-line comment, then "
+            "pass EVERY required positional in the correct order — an argument you already "
+            "pass may be bound to the wrong parameter."
+        )
+        logger.info(
+            "[Governor] review_reforge GRANT tool=%s (attempt %d/%d)",
+            getattr(tool, "name", "?"), attempts + 1, REFORGE_CAP,
+        )
+        return ReforgeDecision(True, reason="code-bug self-heal", course_correction=course_correction)
 
     def revoke_leases(self, execution_id: str) -> int:
         """Mark all leases belonging to ``execution_id`` as revoked.

@@ -65,6 +65,10 @@ def run(<param>: <type>, <param>: <type> = <default>, ...) -> dict:
 
 Follow `implementation_notes` exactly. Use the library and methods specified.
 
+### Previous-attempt feedback (self-heal)
+
+If the input JSON contains `previous_attempt_error`, a PRIOR generation of this exact tool FAILED its dry-run with that error. The error is **AUTHORITATIVE**: fix the specific call it names, and if it contradicts `implementation_notes` (e.g. a wrong positional-arg signature like `encrypt(output_path, output_file)` when the error says `encrypt() missing 1 required positional argument: 'outfile'`), follow the **error**, not the notes.
+
 | `tool_type`       | Library                        | Key pattern |
 |-------------------|-------------------------------|-------------|
 | `browser_action`  | `playwright` sync API         | `with sync_playwright() as p: browser = p.chromium.launch(headless=True); page = browser.new_page(); ...` |

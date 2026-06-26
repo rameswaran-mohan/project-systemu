@@ -778,7 +778,7 @@ including the explicit guidelines for AI-authored PRs.
 
 ## Project status
 
-**Pre-1.0** — current release **v0.9.47**. It's used daily, but APIs and
+**Pre-1.0** — current release **v0.9.48**. It's used daily, but APIs and
 behavior can still change. Full per-version history lives in
 [`release-notes/`](release-notes/).
 

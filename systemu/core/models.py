@@ -339,6 +339,10 @@ class Tool(BaseModel):
     # error, elapsed_ms) for operator inspection on the Tools page.
     dry_run_status:      str = "not_run"   # not_run | passed | failed | skipped
     dry_run_evidence:    Dict[str, Any] = {}
+    # v0.9.48 Phase 7: bounded self-heal counter. A dry-run CODE-bug failure gets
+    # exactly ONE Governor-gated re-forge (cap=1) that feeds the error back into
+    # the code prompt; this guarantees the retry never loops.
+    forge_reattempts:    int = 0
     # v0.5.0-a: rolling buffer of observed-successful param sets, capped
     # at 20 entries.  Used by v0.5.0-d's backward-compat replay when the
     # supervisor wants to bump the tool's version — replays each entry

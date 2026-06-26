@@ -112,3 +112,74 @@ def test_reconciler_publishes_event_on_dry_run_fail(tmp_path, monkeypatch):
     assert any(level == "WARNING" and category == "tool" for level, category, _ in published), (
         f"expected WARNING tool event published, got: {published}"
     )
+
+
+def _deferred_enable_setup(dry_run_status, evidence):
+    """Build a fake vault with one resolved 'Enable & run' tools_blocked
+    decision pointing at a single disabled tool with the given dry-run state.
+    """
+    from systemu.core.models import ToolStatus
+
+    tool = MagicMock()
+    tool.id = "tool_z"
+    tool.name = "z_tool"
+    tool.enabled = False
+    tool.status = ToolStatus.FORGED
+    tool.dry_run_status = dry_run_status
+    tool.dry_run_evidence = evidence
+
+    decision = MagicMock()
+    decision.choice = "Enable & run"
+    decision.context = {"tool_ids": ["tool_z"]}
+
+    fake_vault = MagicMock()
+    fake_vault.load_index.return_value = [
+        {"id": "dec_1", "status": "resolved", "dedup_key": "tools_blocked:abc"},
+    ]
+    fake_vault.get_decision.return_value = decision
+    fake_vault.get_tool.return_value = tool
+    return fake_vault, tool
+
+
+def test_deferred_enable_completes_for_operator_verify_skip(monkeypatch):
+    """Task 3.5(b): the deferred-enable reconciler must complete an
+    operator_verify SKIP, not only a 'passed' dry-run."""
+    from systemu.scheduler.tool_reconciler import _complete_deferred_enables
+
+    fake_vault, tool = _deferred_enable_setup(
+        "skipped", {"operator_verify": True},
+    )
+    enabled_calls = []
+    monkeypatch.setattr(
+        "systemu.pipelines.tool_service.enable_tool",
+        lambda tid, vault: enabled_calls.append(tid) or True,
+    )
+    monkeypatch.setattr(
+        "systemu.pipelines.tool_service.heal_activities_for_tool",
+        lambda *a, **k: None,
+    )
+
+    _complete_deferred_enables(fake_vault, MagicMock())
+
+    assert enabled_calls == ["tool_z"], (
+        f"operator_verify skip should reach enable_tool, got: {enabled_calls}"
+    )
+
+
+def test_deferred_enable_skips_safety_skip(monkeypatch):
+    """A plain safety-skip (no operator_verify flag) is NOT completed by the
+    deferred-enable path — it still requires 'passed'."""
+    from systemu.scheduler.tool_reconciler import _complete_deferred_enables
+
+    fake_vault, tool = _deferred_enable_setup("skipped", {})
+    enabled_calls = []
+    monkeypatch.setattr(
+        "systemu.pipelines.tool_service.enable_tool",
+        lambda tid, vault: enabled_calls.append(tid) or True,
+    )
+
+    _complete_deferred_enables(fake_vault, MagicMock())
+
+    assert enabled_calls == [], (
+        f"a non-operator-verify skip must not be auto-completed, got: {enabled_calls}"
+    )

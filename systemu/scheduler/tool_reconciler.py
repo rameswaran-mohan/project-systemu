@@ -38,6 +38,7 @@ def reconcile_once(vault: "Vault", config: "Config") -> int:
     pending = _find_pending_dry_run_via_index(headers)
     if not pending:
         _complete_deferred_enables(vault, config)
+        _fail_unsatisfiable_blocked_activities(vault, config)
         return 0
 
     logger.info("[ToolReconciler] %d tool(s) pending dry-run", len(pending))
@@ -75,21 +76,158 @@ def reconcile_once(vault: "Vault", config: "Config") -> int:
                 "[ToolReconciler] tool '%s' (%s) dry-run SKIPPED: %s",
                 tool.name, tool_id, getattr(result, "skip_reason", "unknown"),
             )
-        else:  # "failed"
-            vault.save_tool(tool)
-            log_event(
-                "WARNING", "tool",
-                f"Tool '{tool.name}' failed dry-run validation: {(result.error or '')[:200]}",
-                {"tool_id": tool_id, "tool_name": tool.name, "error": result.error},
-            )
-            logger.warning(
-                "[ToolReconciler] tool '%s' (%s) dry-run FAILED — left at FORGED",
-                tool.name, tool_id,
-            )
+        else:  # dry-run failed
+            err = result.error or ""
+            healed = False
+            # v0.9.48 Phase 7 — bounded, Governor-gated self-heal. Ask the Governor
+            # whether this failure is a re-forgeable CODE bug (under the per-tool
+            # cap); on a grant, re-forge ONCE — feeding the error back into the code
+            # prompt as an authoritative course-correction — and re-dry-run IN THIS
+            # TICK. `dry_run_status='failed'` is persisted only in the not-healed
+            # branch below, which runs before _fail_unsatisfiable_blocked_activities
+            # (end of this pass), so the reaper still fires exactly once, after the
+            # single attempt is spent. A dep/permission failure is NOT granted and
+            # falls straight through to the unchanged terminal path.
+            try:
+                from systemu.runtime.governor import Governor
+                decision = Governor(config).review_reforge(tool, err)
+            except Exception:
+                logger.debug("[ToolReconciler] review_reforge errored for %s", tool_id, exc_info=True)
+                decision = None
+            if decision is not None and getattr(decision, "granted", False):
+                tool.forge_reattempts = (getattr(tool, "forge_reattempts", 0) or 0) + 1
+                try:
+                    from systemu.pipelines.tool_forge import reforge_failed_tool_code
+                    forged = reforge_failed_tool_code(
+                        tool, config, vault, prior_failure=decision.course_correction)
+                    if forged is not None:
+                        result = dry_run_tool(tool, vault=vault, config=config)
+                        tool.dry_run_status = result.status
+                        if result.status in ("passed", "skipped"):
+                            if result.status == "passed":
+                                tool.status = ToolStatus.DEPLOYED
+                            vault.save_tool(tool)
+                            log_event(
+                                "SUCCESS", "tool",
+                                f"Tool '{tool.name}' self-healed on dry-run re-forge ({result.status})",
+                                {"tool_id": tool_id, "tool_name": tool.name},
+                            )
+                            logger.info(
+                                "[ToolReconciler] tool '%s' (%s) SELF-HEALED -> %s",
+                                tool.name, tool_id, result.status,
+                            )
+                            healed = True
+                except Exception:
+                    logger.exception("[ToolReconciler] re-forge self-heal crashed for %s", tool_id)
+            if not healed:
+                tool.dry_run_status = result.status   # terminal 'failed'
+                vault.save_tool(tool)
+                # v0.9.48 Phase 3: a fresh `failed` dry-run must auto-disable a tool
+                # that was already DEPLOYED+enabled, so it can't stay callable.
+                try:
+                    from systemu.pipelines.tool_service import disable_if_dry_run_failed
+                    disable_if_dry_run_failed(tool_id, vault)
+                except Exception:
+                    logger.debug(
+                        "[ToolReconciler] disable_if_dry_run_failed failed for %s",
+                        tool_id, exc_info=True,
+                    )
+                log_event(
+                    "WARNING", "tool",
+                    f"Tool '{tool.name}' failed dry-run validation: {(result.error or '')[:200]}",
+                    {"tool_id": tool_id, "tool_name": tool.name, "error": result.error},
+                )
+                logger.warning(
+                    "[ToolReconciler] tool '%s' (%s) dry-run FAILED — left at FORGED",
+                    tool.name, tool_id,
+                )
         processed += 1
 
     _complete_deferred_enables(vault, config)
+    _fail_unsatisfiable_blocked_activities(vault, config)
     return processed
+
+
+def _fail_unsatisfiable_blocked_activities(vault: "Vault", config: "Config") -> None:
+    """v0.9.48 Phase 4.2: the daemon-side safety net for a parked activity whose
+    awaited REQUIRED tool can never deploy — even if the operator never resolves
+    the tools_blocked gate.
+
+    Walks every PARTIAL activity; if its ``required_tool_ids`` include a tool with
+    ``dry_run_status == "failed"`` (STRICTLY — never ``!= "passed"``: a `skipped`/
+    operator-verify or `not_run` tool is NOT permanent and must NOT be reaped),
+    finalize the activity FAILED with the dry-run error surfaced, and flip its
+    parked ``waiting_on_tools`` chat entry. Idempotent — an already-terminal
+    activity is skipped (the index filter keeps only PARTIAL), so this is safe on
+    every 30s tick. Best-effort throughout; never raises into the reconcile loop.
+    """
+    from systemu.core.models import ActivityStatus
+    from systemu.runtime.activity_completion import mark_activity_failed
+    from systemu.interface.notifications import log_event
+
+    try:
+        partials = vault.list_activities(status=ActivityStatus.PARTIAL)
+    except Exception:
+        logger.debug("[ToolReconciler] reap: could not list PARTIAL activities", exc_info=True)
+        return
+
+    for header in partials:
+        act_id = header.get("id")
+        if not act_id:
+            continue
+        permanently_failed = []
+        for tid in (header.get("required_tool_ids") or []):
+            try:
+                tool = vault.get_tool(tid)
+            except Exception:
+                continue
+            if (getattr(tool, "dry_run_status", "") or "") == "failed":
+                err = (getattr(tool, "dry_run_evidence", None) or {}).get("error") or ""
+                permanently_failed.append((getattr(tool, "name", tid) or tid, err))
+        if not permanently_failed:
+            continue
+
+        names = ", ".join(n for n, _ in permanently_failed)
+        errs = " | ".join(f"{n}: {e}" for n, e in permanently_failed if e)
+        summary = (
+            f"Required tool(s) can never deploy (dry-run failed): {names}. "
+            + (f"Dry-run error: {errs}. " if errs else "")
+            + "Task finalized FAILED — re-forge a conforming tool to retry.")
+        if not mark_activity_failed(vault, act_id, summary=summary):
+            continue
+        # Best-effort: flip the parked waiting_on_tools chat entry to failed.
+        try:
+            for entry in vault.load_chat_history(limit=50):
+                if (entry.get("activity_id") == act_id
+                        and entry.get("status") == "waiting_on_tools"):
+                    vault.update_chat_history_entry(
+                        entry.get("ts"), {"status": "failed", "error": summary})
+                    break
+        except Exception:
+            logger.debug(
+                "[ToolReconciler] reap: could not flip chat entry for %s",
+                act_id, exc_info=True)
+        try:
+            log_event(
+                "ERROR", "activity",
+                f"Activity {act_id} finalized FAILED — un-deployable required tool(s): {names}",
+                {"activity_id": act_id, "tool_names": names, "dry_run_errors": errs})
+        except Exception:
+            logger.debug("[ToolReconciler] reap: log_event failed for %s", act_id, exc_info=True)
+        logger.info(
+            "[ToolReconciler] reaped unsatisfiable activity %s — un-deployable tool(s): %s",
+            act_id, names)
+
+
+def _is_operator_verify_skip(tool) -> bool:
+    """v0.9.48 Phase 3: True for a Phase 1 operator-verify skip — a tool whose
+    dry-run was skipped because the harness couldn't synthesize a representative
+    input (e.g. a real .docx) and the operator owns correctness. Such a tool is
+    enable-able, so the deferred-enable path must complete it like a `passed`."""
+    if (getattr(tool, "dry_run_status", "") or "") != "skipped":
+        return False
+    evidence = getattr(tool, "dry_run_evidence", None) or {}
+    return bool(isinstance(evidence, dict) and evidence.get("operator_verify"))
 
 
 def _complete_deferred_enables(vault: "Vault", config: "Config") -> None:
@@ -135,8 +273,10 @@ def _complete_deferred_enables(vault: "Vault", config: "Config") -> None:
                 continue
             if getattr(tool, "enabled", False):
                 continue
-            # Only enable once the dry-run has actually passed (Gate-3.5 intent).
-            if getattr(tool, "dry_run_status", "") != "passed":
+            # Only enable once the dry-run has actually passed (Gate-3.5 intent)
+            # OR it is a Phase 1 operator-verify skip (enable-able; operator owns
+            # correctness). enable_tool itself re-gates on passed/skipped.
+            if getattr(tool, "dry_run_status", "") != "passed" and not _is_operator_verify_skip(tool):
                 continue
             if enable_tool(tid, vault):
                 logger.info(

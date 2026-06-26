@@ -266,3 +266,151 @@ class TestReconcilerCompletesDeferredEnable:
         src = inspect.getsource(tool_reconciler)
         assert "_complete_deferred_enables" in src
         assert src.count("_complete_deferred_enables(vault, config)") >= 2  # both exit paths
+
+
+def _failed_tool(i: int, *, error="OOXMLFile.encrypt() missing 1 required positional argument: 'outfile'"):
+    """A tool whose dry-run is permanently FAILED (can never deploy), with the
+    dry-run error captured in evidence the way the dry-run pipeline records it."""
+    return Tool(
+        id=f"tool_{i}", name=f"tool_{i}", description=f"test tool {i}",
+        tool_type="api_call", status=ToolStatus.FORGED, enabled=False,
+        dry_run_status="failed", dry_run_evidence={"error": error},
+        implementation_path=f"vault/tools/implementations/tool_{i}.py",
+    )
+
+
+class TestExecutorFinalizesUndeployable:
+    """Phase 4.1 (Defect D): when the tools_blocked gate's activity awaits a
+    REQUIRED tool that can never deploy (dry_run_status == "failed") and nothing
+    was newly enabled, the parked activity must be FINALIZED FAILED with the
+    dry-run error surfaced — not left PARTIAL/waiting forever. A `not_run` tool
+    is still retryable (stays PARTIAL); a `skipped` tool is NEVER reaped."""
+
+    def _resolved(self, vault, act, tools, choice="Enable & run"):
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        dec_id = ensure_tools_blocked_gate(vault, act, tools)
+        OperatorDecisionQueue(vault).resolve(dec_id, choice=choice)
+        return vault.get_decision(dec_id)
+
+    def test_failed_required_tool_finalizes_activity(self, vault):
+        tools = [_failed_tool(1)]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        decision = self._resolved(vault, act, tools)
+        result = resolve_gate(decision, vault=vault)
+
+        assert result.status.value == "error"
+        assert vault.get_activity("act_blocked").status == ActivityStatus.FAILED
+        # the dry-run error is surfaced to the operator in the result summary
+        assert "outfile" in result.summary
+
+    def test_failed_tool_flips_waiting_chat_entry(self, vault):
+        tools = [_failed_tool(1)]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        vault.append_chat_history(
+            {"ts": "t-1", "activity_id": "act_blocked", "status": "waiting_on_tools"})
+        decision = self._resolved(vault, act, tools)
+        resolve_gate(decision, vault=vault)
+
+        flipped = [e for e in vault.load_chat_history(limit=50)
+                   if e.get("ts") == "t-1"]
+        assert flipped and flipped[0]["status"] == "failed"
+
+    def test_not_run_tool_keeps_activity_partial(self, vault):
+        # a never-dry-run tool is transient/retryable — must NOT be reaped.
+        tools = [_tool(1, dry="not_run")]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        decision = self._resolved(vault, act, tools)
+        result = resolve_gate(decision, vault=vault)
+
+        assert result.status.value == "error"   # held by Gate-3.5, loudly
+        assert vault.get_activity("act_blocked").status == ActivityStatus.PARTIAL
+
+    def test_skipped_tool_is_never_reaped(self, vault):
+        # Defect-B guard: a `skipped` tool (incl. an operator_verify skip) is
+        # NOT permanent — the activity must stay PARTIAL, never FAILED.
+        tools = [_tool(1, dry="skipped")]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        decision = self._resolved(vault, act, tools)
+        resolve_gate(decision, vault=vault)
+
+        assert vault.get_activity("act_blocked").status != ActivityStatus.FAILED
+
+    def test_failed_but_something_enabled_does_not_reap(self, vault):
+        # If at least one tool was newly enabled, the activity may still proceed —
+        # the `and not enabled` guard means we don't reap on a mixed result.
+        tools = [_tool(1, dry="passed"), _failed_tool(2)]
+        for t in tools:
+            vault.save_tool(t)
+        act = _activity(vault, [t.id for t in tools])
+        decision = self._resolved(vault, act, tools)
+        resolve_gate(decision, vault=vault)
+
+        assert vault.get_activity("act_blocked").status != ActivityStatus.FAILED
+
+
+class TestReconcilerReapsUnsatisfiable:
+    """Phase 4.2: the reconciler is the safety net for a parked activity whose
+    awaited REQUIRED tool can never deploy — even if the operator never resolves
+    the gate. Every reconcile tick, any PARTIAL activity whose required-tool set
+    has a `dry_run_status == "failed"` tool is finalized FAILED (idempotent)."""
+
+    def _partial_activity(self, vault, act_id, tool_ids):
+        act = Activity(
+            id=act_id, name="Blocked", scroll_id="scr_1",
+            status=ActivityStatus.PARTIAL, required_tool_ids=list(tool_ids),
+        )
+        vault.save_activity(act)
+        return act
+
+    def test_partial_with_failed_tool_is_reaped(self, vault):
+        import systemu.scheduler.tool_reconciler as recon
+        vault.save_tool(_failed_tool(1))
+        self._partial_activity(vault, "act_reap", ["tool_1"])
+
+        recon._fail_unsatisfiable_blocked_activities(vault, None)
+        assert vault.get_activity("act_reap").status == ActivityStatus.FAILED
+
+    def test_partial_with_not_run_tool_left_partial(self, vault):
+        import systemu.scheduler.tool_reconciler as recon
+        vault.save_tool(_tool(1, dry="not_run"))
+        self._partial_activity(vault, "act_wait", ["tool_1"])
+
+        recon._fail_unsatisfiable_blocked_activities(vault, None)
+        assert vault.get_activity("act_wait").status == ActivityStatus.PARTIAL
+
+    def test_partial_with_skipped_tool_left_partial(self, vault):
+        # Defect-B guard: a `skipped` tool is not permanent — never reaped.
+        import systemu.scheduler.tool_reconciler as recon
+        vault.save_tool(_tool(1, dry="skipped"))
+        self._partial_activity(vault, "act_skip", ["tool_1"])
+
+        recon._fail_unsatisfiable_blocked_activities(vault, None)
+        assert vault.get_activity("act_skip").status == ActivityStatus.PARTIAL
+
+    def test_reap_is_idempotent(self, vault):
+        # Second tick must be a no-op — an already-terminal activity is skipped.
+        import systemu.scheduler.tool_reconciler as recon
+        vault.save_tool(_failed_tool(1))
+        self._partial_activity(vault, "act_idem", ["tool_1"])
+
+        recon._fail_unsatisfiable_blocked_activities(vault, None)
+        assert vault.get_activity("act_idem").status == ActivityStatus.FAILED
+        # second pass: still FAILED, no crash
+        recon._fail_unsatisfiable_blocked_activities(vault, None)
+        assert vault.get_activity("act_idem").status == ActivityStatus.FAILED
+
+    def test_reconciler_wires_reaper_on_both_paths(self):
+        import inspect
+        from systemu.scheduler import tool_reconciler
+        src = inspect.getsource(tool_reconciler)
+        assert "_fail_unsatisfiable_blocked_activities" in src
+        # called on BOTH reconcile_once exit paths (next to _complete_deferred_enables)
+        assert src.count("_fail_unsatisfiable_blocked_activities(vault, config)") >= 2

@@ -92,6 +92,53 @@ def resolve_gate(decision, *, vault) -> CommandResult:
                 skipped.append(label)
             else:
                 failed.append(f"{label}: {res.summary}")
+
+        # v0.9.48 Phase 4.1: never silently stuck. If the gate's activity awaits a
+        # REQUIRED tool that can never deploy (dry_run_status == "failed" — STRICTLY,
+        # not `!= "passed"`: a `skipped`/operator-verify or `not_run` tool is NOT
+        # permanent) AND nothing was newly enabled, the parked activity would sit
+        # `waiting_on_tools`/PARTIAL forever. Finalize it FAILED with the dry-run
+        # error surfaced, flip its chat-history entry, and report ERROR. `not_run`
+        # and `skipped` tools are left untouched (transient / operator-owned).
+        activity_id = ctx.get("activity_id")
+        permanently_failed = []
+        for tid in tool_ids:
+            try:
+                t = vault.get_tool(tid)
+            except Exception:
+                continue
+            if (getattr(t, "dry_run_status", "") or "") == "failed":
+                err = (getattr(t, "dry_run_evidence", None) or {}).get("error") or ""
+                permanently_failed.append((getattr(t, "name", tid) or tid, err))
+        if activity_id and permanently_failed and not enabled:
+            from systemu.runtime.activity_completion import mark_activity_failed
+            from systemu.interface.notifications import log_event
+            names = ", ".join(n for n, _ in permanently_failed)
+            errs = " | ".join(f"{n}: {e}" for n, e in permanently_failed if e)
+            fail_summary = (
+                f"Required tool(s) can never deploy (dry-run failed): {names}. "
+                + (f"Dry-run error: {errs}. " if errs else "")
+                + "Task finalized FAILED — re-forge a conforming tool to retry.")
+            mark_activity_failed(vault, activity_id, summary=fail_summary)
+            # Best-effort: flip the parked waiting_on_tools chat entry to failed so
+            # the chat surface stops showing it as in-flight.
+            try:
+                for entry in vault.load_chat_history(limit=50):
+                    if (entry.get("activity_id") == activity_id
+                            and entry.get("status") == "waiting_on_tools"):
+                        vault.update_chat_history_entry(
+                            entry.get("ts"), {"status": "failed", "error": fail_summary})
+                        break
+            except Exception:
+                logger.debug(
+                    "[Inbox] tools_blocked: could not flip chat entry for %s",
+                    activity_id, exc_info=True)
+            log_event(
+                "ERROR", "activity",
+                f"Activity {activity_id} finalized FAILED — un-deployable required tool(s): {names}",
+                {"activity_id": activity_id, "tool_names": names, "dry_run_errors": errs})
+            return CommandResult(status=CommandStatus.ERROR, summary=fail_summary)
+
         # v0.9.43: actually FIRE the heal sweep. The gate's contract is "the heal
         # sweep re-runs the parked task once tools are ready," but only the Tools
         # page ever called it — the Inbox "Enable & run" path enabled the tool and

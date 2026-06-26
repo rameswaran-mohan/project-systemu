@@ -12,6 +12,7 @@ Also exposes:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any, Dict, Optional
 from sharing_on.config import Config
 from systemu.core.llm_router import llm_call_json
 from systemu.core.models import Activity, Scroll, Tool, ToolStatus, ToolType
+from systemu.core.schema_utils import normalize_parameters_schema, schema_param_names
 from systemu.core.utils import generate_id, load_prompt
 from systemu.interface.notifications import notify_user
 from systemu.vault.vault import Vault
@@ -250,7 +252,7 @@ def forge_tool_from_spec(
         if "description" in edited:
             tool.description = edited["description"]
         if "parameters_schema" in edited:
-            tool.parameters_schema = edited["parameters_schema"]
+            tool.parameters_schema = normalize_parameters_schema(edited["parameters_schema"])
         if "return_schema" in edited:
             tool.return_schema = edited["return_schema"]
         if "implementation_notes" in edited:
@@ -416,26 +418,78 @@ def forge_tool(
     return _generate_and_save_code(tool, scroll, config, vault)
 
 
+def check_run_conformance(implementation: str, declared_param_names) -> Optional[str]:
+    """Return None if the tool's ``run()`` can be called as ``run(**params)``.
+
+    The registry invokes every forged tool as ``run(**params)`` where ``params``
+    keys come from the declared ``parameters_schema``. A tool whose ``run()`` has
+    a required parameter that is NOT in the declared schema (and no ``**kwargs``
+    catch-all) can never be filled — it would fail at every call. Catch that
+    *signature* class at forge time. (A wrong library call inside the body is
+    caught by the dry-run harness, not here.)
+
+    Returns a human-readable error string when non-conforming, else None.
+    """
+    ns: Dict[str, Any] = {}
+    try:
+        exec(compile(implementation, "<forge_conformance>", "exec"), ns)
+    except Exception as exc:
+        return f"could not load module for conformance check: {exc}"
+    run = ns.get("run")
+    if not callable(run):
+        return "tool defines no callable run() — registry calls run(**params)"
+    try:
+        sig = inspect.signature(run)
+    except (TypeError, ValueError) as exc:
+        return f"run() signature is not introspectable: {exc}"
+    # A **kwargs catch-all can absorb any declared params -> always conformant.
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return None
+    declared = set(declared_param_names or [])
+    unfillable = [
+        n for n, p in sig.parameters.items()
+        if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        and p.default is inspect.Parameter.empty
+        and n not in declared
+    ]
+    if unfillable:
+        return ("run() has required parameter(s) not in the declared schema and no **kwargs: "
+                + ", ".join(unfillable) + f"; declared keys = {sorted(declared)}")
+    return None
+
+
 def _generate_and_save_code(
     tool: Tool,
     scroll: Scroll,
     config: Config,
     vault: Vault,
+    *,
+    prior_failure: Optional[str] = None,
 ) -> Optional[Tool]:
-    """Core code-generation step. Shared by forge_tool() and forge_tool_from_spec()."""
+    """Core code-generation step. Shared by forge_tool() and forge_tool_from_spec().
+
+    v0.9.48 Phase 7: when ``prior_failure`` is supplied (a Governor-authored
+    course-correction from a failed dry-run), it is threaded into the code prompt
+    as ``previous_attempt_error`` so the code-writer fixes the specific failing
+    call — overriding the tool's own (possibly wrong) implementation_notes.
+    """
     from systemu.interface.notifications import log_event, notify_user
 
     logger.info("[Forge] Generating implementation for '%s' ...", tool.name)
+
+    code_payload: Dict[str, Any] = {
+        "tool_spec":      tool.model_dump(mode="json"),
+        "scroll_context": scroll.narrative_md,
+    }
+    if prior_failure:
+        code_payload["previous_attempt_error"] = prior_failure
 
     # ── LLM call — isolated so a transient failure doesn't kill a batch ──────
     try:
         code_result = llm_call_json(
             tier=2,
             system=load_prompt("forge_tool_code.md"),
-            user=json.dumps({
-                "tool_spec":      tool.model_dump(mode="json"),
-                "scroll_context": scroll.narrative_md,
-            }),
+            user=json.dumps(code_payload),
             config=config,
             temperature=0.1,
             max_tokens=8192,
@@ -496,6 +550,29 @@ def _generate_and_save_code(
         )
         return None
 
+    # ── run() conformance gate — the registry calls run(**params); a tool whose ─
+    # run() has a required parameter outside the declared schema (and no **kwargs)
+    # can never be filled. Reject it here, BEFORE writing to disk, so a doomed
+    # tool never deploys.
+    conf_err = check_run_conformance(implementation, schema_param_names(tool.parameters_schema))
+    if conf_err:
+        logger.error("[Forge] '%s' failed run() conformance: %s", tool.name, conf_err)
+        log_event("ERROR", "tool",
+                  f"Forge failed — run() conformance error for '{tool.name}': {conf_err}",
+                  {"tool_id": tool.id, "conformance_error": conf_err})
+        notify_user(
+            title="Forge Failed — Conformance Error",
+            message=(
+                f"Tool '{tool.name}' run() does not conform to run(**params):\n"
+                f"  {conf_err}\n\n"
+                f"The tool remains PROPOSED. Open Tools Registry and click "
+                f"'Review & Forge' on '{tool.name}' to retry."
+            ),
+            actions=["OK"],
+            context={"notification_type": "forge_retry", "tool_id": tool.id},
+        )
+        return None
+
     # Write implementation file
     impl_dir  = Path(config.vault_dir) / "tools" / "implementations"
     impl_dir.mkdir(parents=True, exist_ok=True)
@@ -513,6 +590,27 @@ def _generate_and_save_code(
               f"Tool '{tool.name}' forged successfully → {impl_path.name}",
               {"tool_id": tool.id, "impl_path": str(impl_path)})
     return tool
+
+
+def reforge_failed_tool_code(tool: Tool, config: Config, vault: Vault, *,
+                             prior_failure: str) -> Optional[Tool]:
+    """v0.9.48 Phase 7 — re-generate ONLY the code for an already-forged tool,
+    feeding the dry-run failure back into the code prompt.
+
+    The reconciler (which drives the self-heal) holds no Scroll, so a minimal stub
+    scroll is built from the tool's own notes/description — consistent with how the
+    Governor's TOOL provisioner stubs a scroll. Reuses ``_generate_and_save_code``
+    so the syntax smoke-check, run()-conformance gate, and FORGED/enabled=False
+    save all still run on the regenerated code.
+    """
+    stub_scroll = Scroll(
+        id="reforge-stub",
+        name=tool.name,
+        source_session_id="",
+        raw_instructions_path="",
+        narrative_md=(tool.implementation_notes or tool.description or tool.name),
+    )
+    return _generate_and_save_code(tool, stub_scroll, config, vault, prior_failure=prior_failure)
 
 
 def _spec_and_forge_new(
@@ -580,7 +678,7 @@ def _spec_and_forge_new(
         name=spec_result.get("name", tool_name),
         description=spec_result.get("description", ""),
         tool_type=tool_type,
-        parameters_schema=spec_result.get("parameters_schema", {}),
+        parameters_schema=normalize_parameters_schema(spec_result.get("parameters_schema", {})),
         return_schema=spec_result.get("return_schema", {}),
         implementation_notes=spec_result.get("implementation_notes", ""),
         dependencies=spec_result.get("dependencies", []),
@@ -698,7 +796,7 @@ def propose_tools_from_specs(
             name=spec_result.get("name", name),
             description=spec_result.get("description", spec.description),
             tool_type=tool_type,
-            parameters_schema=spec_result.get("parameters_schema", {}),
+            parameters_schema=normalize_parameters_schema(spec_result.get("parameters_schema", {})),
             return_schema=spec_result.get("return_schema", {}),
             implementation_notes=spec_result.get("implementation_notes", ""),
             dependencies=spec_result.get("dependencies", []),

@@ -181,6 +181,25 @@ def _build_pending_decision_view_model(vault):
     ]
 
 
+def _json_safe(obj):
+    """JSON round-trip with ``default=str`` so any stray non-serializable value
+    (e.g. a callable) degrades to its repr instead of crashing orjson inside the
+    NiceGUI outbox (``Outbox._emit``). Mirrors the v0.9.45 Context-expansion
+    sanitize — now the single definition both json_editor payloads reuse."""
+    import json as _json
+    return _json.loads(_json.dumps(obj, default=str))
+
+
+def sanitize_card_payload(card: dict) -> dict:
+    """Defect-E defense-in-depth: deep-coerce a decision-card dict to JSON-safe
+    values so NO field (context / spec / options / …) can carry a callable into a
+    NiceGUI element prop and crash ``Outbox._emit`` -> orjson with
+    ``Type ... is not JSON serializable: function``."""
+    if not isinstance(card, dict):
+        return card
+    return _json_safe(card)
+
+
 def render_decision_card(card: dict, queue, on_resolved) -> None:
     """Render one OperatorDecision card with working resolve+dispatch buttons.
 
@@ -196,6 +215,10 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                      surface passes its own ``@ui.refreshable`` ``.refresh``
                      so the resolved card drops in-place without a full reload.
     """
+    # Defect-E: make the whole card JSON-safe before ANY element is built, so a
+    # stray callable in context/spec can't crash the NiceGUI outbox for everyone
+    # on the page. Belt-and-suspenders with the per-json_editor sanitize below.
+    card = sanitize_card_payload(card)
     with ui.card().style(
         f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
         f"border-radius: 12px; padding: 16px; margin-bottom: 12px;"
@@ -392,7 +415,9 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                 spec_edit_view, validate_amended_spec, evaluate_amendment,
             )
             from systemu.interface.dashboard_state import AppState
-            _orig_spec = _hctx.get("spec") or {}
+            # Defect-E: sanitize the spec before it seeds the JSON editor props —
+            # a callable surviving in context["spec"] would crash the outbox.
+            _orig_spec = _json_safe(_hctx.get("spec") or {})
             _edit_state = {"content": {"json": dict(_orig_spec)}}
             _panel = ui.column().style("gap: 8px; margin-top: 8px;")
             _panel.visible = False
@@ -486,7 +511,7 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                 # context raised "Type is not JSON serializable: function" (the
                 # recurring harness-card render error).
                 import json as _json
-                _safe_ctx = _json.loads(_json.dumps(card["context"], default=str))
+                _safe_ctx = _json_safe(card["context"])
                 ui.json_editor({"content": {"json": _safe_ctx}}).style(
                     "max-height: 200px;"
                 )

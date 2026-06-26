@@ -20,6 +20,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# v0.9.48 Phase 3: the single authoritative enable taxonomy. A tool may be
+# enabled only when its dry-run either passed or was skipped (the latter
+# covers both the safety-skip and the Phase 1 operator_verify skip — the
+# operator owns correctness). Only a `failed` (known-broken) status is refused
+# here, at the mechanism FLOOR, so NO caller (recalibration, tools_blocked, CLI,
+# the deferred-enable reconciler) can deploy a tool whose dry-run FAILED.
+# `not_run` stays enable-able at this floor: the reviewed-approve / dep-install
+# flows legitimately enable an operator-vetted tool that hasn't been dry-run yet.
+# Stricter "must have PASSED" validation is enforced by the paths that need it
+# (e.g. the readiness-gate verb). A tool that later records a `failed` dry-run is
+# auto-disabled (disable_if_dry_run_failed), so this floor stays safe.
+ENABLE_BLOCKED_DRY_RUN_STATUSES = frozenset({"failed"})
+
+
+def can_enable(tool) -> bool:
+    """False only when the tool's dry-run definitively FAILED — the floor that
+    keeps a known-broken tool from ever reaching DEPLOYED. passed / skipped /
+    not_run are all enable-able here."""
+    return (getattr(tool, "dry_run_status", "not_run") or "not_run") not in ENABLE_BLOCKED_DRY_RUN_STATUSES
+
+
 def enable_tool(tool_id: str, vault: "Vault") -> bool:
     """Enable a FORGED tool and advance it to DEPLOYED.
 
@@ -40,6 +61,25 @@ def enable_tool(tool_id: str, vault: "Vault") -> bool:
         return False
 
     if tool.enabled:
+        return False
+
+    # v0.9.48 Phase 3: the authoritative enable gate. Refuse to deploy a tool
+    # whose dry-run definitively FAILED. This closes every enable path at the
+    # mechanism so a `dry_run_status="failed"` tool can never reach DEPLOYED,
+    # regardless of which caller (recalibration launder, tools_blocked, CLI,
+    # deferred-enable) attempted it.
+    if not can_enable(tool):
+        log_event(
+            "WARNING", "tool",
+            f"Tool '{tool.name}' enable refused: "
+            f"dry_run_status={getattr(tool, 'dry_run_status', 'not_run')!r} "
+            f"(a failed dry-run is never enable-able)",
+            {"tool_id": tool.id},
+        )
+        logger.warning(
+            "[ToolService] enable_tool refused %s: dry_run_status=%s",
+            tool.id, getattr(tool, "dry_run_status", "not_run"),
+        )
         return False
 
     tool.enabled = True
@@ -84,6 +124,27 @@ def disable_tool(tool_id: str, vault: "Vault") -> bool:
     )
     logger.info("[ToolService] Tool '%s' disabled → FORGED", tool.name)
     return True
+
+
+def disable_if_dry_run_failed(tool_id: str, vault: "Vault") -> bool:
+    """v0.9.48 Phase 3: auto-disable a DEPLOYED+enabled tool whose FRESH dry-run
+    just recorded ``dry_run_status="failed"``.
+
+    Wired right after the dry-run persist in the scheduler (jobs.dry_run_one_tool
+    and tool_reconciler.reconcile_once) so a tool that was deployed earlier but
+    now fails validation can never stay callable. Only fires on a fresh dry-run
+    `failed` — runtime call failures are the circuit-breaker / recalibration
+    domain, not this one.
+
+    Returns True iff the tool was disabled.
+    """
+    try:
+        tool = vault.get_tool(tool_id)
+    except KeyError:
+        return False
+    if getattr(tool, "dry_run_status", None) == "failed" and getattr(tool, "enabled", False):
+        return disable_tool(tool_id, vault)
+    return False
 
 
 def heal_activities_for_tool(tool_id: str, config: "Config", vault: "Vault") -> None:

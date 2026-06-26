@@ -1012,6 +1012,13 @@ def dry_run_one_tool(tool_id: str) -> None:
             "timestamp": datetime.utcnow().isoformat(),
         }
         vault.save_tool(tool)
+        # v0.9.48 Phase 3: a fresh dry-run that failed must auto-disable a
+        # tool that was already DEPLOYED+enabled, so it can't stay callable.
+        try:
+            from systemu.pipelines.tool_service import disable_if_dry_run_failed
+            disable_if_dry_run_failed(tool.id, vault)
+        except Exception:
+            logger.debug("[Job] disable_if_dry_run_failed failed for %s", tool.id, exc_info=True)
         return
 
     success = bool(getattr(result, "success", True)) if result is not None else True
@@ -1034,6 +1041,13 @@ def dry_run_one_tool(tool_id: str) -> None:
             "timestamp": datetime.utcnow().isoformat(),
         }
     vault.save_tool(tool)
+    # v0.9.48 Phase 3: auto-disable on a fresh `failed` dry-run (no-op otherwise).
+    if tool.dry_run_status == "failed":
+        try:
+            from systemu.pipelines.tool_service import disable_if_dry_run_failed
+            disable_if_dry_run_failed(tool.id, vault)
+        except Exception:
+            logger.debug("[Job] disable_if_dry_run_failed failed for %s", tool.id, exc_info=True)
 
 
 def _emit_dry_run_fail_card(tool, error) -> None:

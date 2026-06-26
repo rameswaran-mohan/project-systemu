@@ -93,6 +93,10 @@ class DryRunResult:
     elapsed_ms:     int             = 0
     return_value:   Optional[Dict[str, Any]] = None
     replayed_count: int             = 0   # >0 in v0.5.0-d replay mode
+    # True when status=="skipped" because the harness could not synthesize a
+    # representative input for a file format (e.g. a real .docx) — the operator
+    # owns correctness, so the tool is STILL enable-able (unlike a hard "failed").
+    operator_verify: bool          = False
 
     def to_evidence(self) -> Dict[str, Any]:
         """Compact evidence dict for persistence into ``Tool.dry_run_evidence``."""
@@ -108,7 +112,23 @@ class DryRunResult:
                 if isinstance(self.return_value, dict) else None
             ),
             "replayed_count": self.replayed_count,
+            "operator_verify": self.operator_verify,
         }
+
+
+# Error-text signatures that mean "the harness fed an input this format-parsing
+# tool couldn't open" — NOT a logic/runtime bug in the tool.  A match routes the
+# verdict to a non-doomed operator_verify skip instead of a permanent failure.
+_FORMAT_PARSE_SIGNATURES = (
+    "packagenotfounderror", "not a zip file", "file is not a zip file",
+    "badzipfile", "unsupportedformat", "is encrypted", "invalid pdf",
+    "eof marker not found",
+)
+
+
+def _is_format_parse_failure(error_text: str) -> bool:
+    t = (error_text or "").lower()
+    return any(s in t for s in _FORMAT_PARSE_SIGNATURES)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,10 +208,24 @@ def dry_run_tool(
             return_value=result.get("parsed") or {},
             elapsed_ms=elapsed,
         )
+
+    # A format-parse failure means the harness couldn't synthesize a
+    # representative input (e.g. a real .docx) — NOT a logic bug in the tool.
+    # Route it to a non-doomed operator_verify skip so a correct file/format
+    # tool can still be enabled (operator owns correctness), never a hard fail.
+    err = str(result.get("error") or result.get("stderr") or "tool returned success=False")
+    if _is_format_parse_failure(err):
+        return DryRunResult(
+            success=False, status="skipped", operator_verify=True,
+            skip_reason="harness cannot synthesize a representative input for this file format — operator must verify",
+            params_used=params,
+            error=err[:1000],
+            elapsed_ms=elapsed,
+        )
     return DryRunResult(
         success=False, status="failed",
         params_used=params,
-        error=str(result.get("error") or result.get("stderr") or "tool returned success=False")[:1000],
+        error=err[:1000],
         return_value=result.get("parsed") or {},
         elapsed_ms=elapsed,
     )
@@ -287,23 +321,53 @@ def _generate_test_params(
         if isinstance(raw, dict):
             if raw.get("skip_dry_run"):
                 return ({}, {"skip": True, "skip_reason": raw.get("skip_reason") or "LLM advised skip"})
-            params = raw.get("params") or {}
-            if isinstance(params, dict):
-                return (params, {})
+            llm_params = raw.get("params")
+            if isinstance(llm_params, dict):
+                # Bug B (v0.9.48): the param-gen LLM sometimes returns a valid-but-
+                # EMPTY or PARTIAL result ({}, {"params": {}}, {"params": null}, or
+                # only some keys). Returning that verbatim called run() with missing
+                # required positionals -> a FALSE "run() missing N required positional
+                # argument(s)" dry-run failure for every file/multi-param tool (which
+                # also poisons the Phase-7 self-heal's course-correction). Backfill any
+                # missing keys from the schema-driven defaults (LLM values always win)
+                # so run(**params) is guaranteed every required param.
+                defaults = _schema_default_params(tool.parameters_schema or {}, tool_name=tool.name)
+                return ({**defaults, **llm_params}, {})
     except Exception:
         logger.debug("[ToolDryRun] LLM test-param gen failed — using schema defaults", exc_info=True)
 
-    return (_schema_default_params(tool.parameters_schema or {}), {})
+    return (_schema_default_params(tool.parameters_schema or {}, tool_name=tool.name), {})
 
 
-def _schema_default_params(schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Bare-bones fallback when the LLM is unavailable.
+_FIXTURE_EXTS = ("docx", "xlsx", "pptx", "pdf", "png", "jpg", "jpeg",
+                 "zip", "csv", "json", "txt", "xls", "doc")
 
-    Picks neutral defaults: empty string for strings, 0 for numbers,
-    empty containers for lists/dicts, None for unknown types.
+
+def _infer_fixture_ext(name: str, spec: Dict[str, Any], tool_name: Optional[str] = None) -> str:
+    """Best-effort extension for a path-like param, inferred from the param name,
+    the tool name, or the param's description (e.g. ``password_protect_docx`` ->
+    ``.docx``). Lets the fallback synthesize a FORMAT-VALID fixture so a correct
+    file/format tool passes dry-run instead of failing on a generic input."""
+    desc = spec.get("description") if isinstance(spec, dict) else ""
+    hay = " ".join(str(x).lower() for x in (name, tool_name or "", desc or ""))
+    for e in _FIXTURE_EXTS:
+        if e in hay:
+            return "." + e
+    return ""
+
+
+def _schema_default_params(schema: Dict[str, Any], tool_name: Optional[str] = None) -> Dict[str, Any]:
+    """Schema-driven fallback when the LLM test-param gen is unavailable.
+
+    Neutral defaults: 0 for numbers, empty containers, None for unknown — but
+    PATH-like params get a non-empty, sandbox-able placeholder (with an inferred
+    extension) and REQUIRED strings get a non-empty value, so a forged file tool
+    survives its own ``if not <arg>: required`` check AND gets a dry-run fixture.
     """
+    from systemu.core.schema_utils import normalize_parameters_schema
+
     out: Dict[str, Any] = {}
-    for name, spec in (schema or {}).items():
+    for name, spec in normalize_parameters_schema(schema or {}).items():
         if not isinstance(spec, dict):
             out[name] = None
             continue
@@ -312,7 +376,16 @@ def _schema_default_params(schema: Dict[str, Any]) -> Dict[str, Any]:
             continue
         t = (spec.get("type") or "").lower()
         if t == "string":
-            out[name] = ""
+            if _looks_like_path_key(name):
+                # Non-empty path so _sandbox_paths materializes a fixture; the
+                # inferred extension makes it format-valid where we can tell.
+                out[name] = "dry_run_input" + (_infer_fixture_ext(name, spec, tool_name) or ".dat")
+            elif spec.get("required"):
+                # A required non-path string (e.g. a password) — empty would trip
+                # the tool's own validation, so use a neutral non-empty value.
+                out[name] = "dryrun"
+            else:
+                out[name] = ""
         elif t in ("integer", "int", "number", "float"):
             out[name] = 0
         elif t == "boolean":
@@ -324,6 +397,91 @@ def _schema_default_params(schema: Dict[str, Any]) -> Dict[str, Any]:
         else:
             out[name] = None
     return out
+
+
+_PATH_SUFFIXES = ("_path", "_file", "_dir")
+_PATH_EXACT = {
+    "output_path", "file_path", "dest", "destination", "output_dir", "path",
+    "filepath", "out", "outfile", "input_path", "input_file", "infile",
+    "in_path", "src", "source", "source_path", "data_path", "file", "dir",
+}
+
+
+def _looks_like_path_key(k: str) -> bool:
+    """A key whose NAME implies it carries a filesystem path.
+
+    True for the exact known names (which now includes ``source_path``) or any
+    ``*_path`` / ``*_file`` / ``*_dir`` suffix.
+    """
+    kl = (k or "").lower()
+    return kl in _PATH_EXACT or kl.endswith(_PATH_SUFFIXES)
+
+
+def _value_looks_like_path(v: Any) -> bool:
+    """A value that LOOKS like a path — has a 1-5 char extension OR a separator."""
+    if not isinstance(v, str) or not v:
+        return False
+    return bool(re.search(r"\.(\w{1,5})$", v)) or ("/" in v) or ("\\" in v)
+
+
+def _is_dir_key(k: str) -> bool:
+    """A key whose NAME implies a *directory* (extensionless), so a bare dir name
+    like ``results`` is still sandboxed even though it has no extension/separator."""
+    kl = (k or "").lower()
+    return kl.endswith("_dir") or kl in {"dir", "output_dir"}
+
+
+# A 1x1 transparent PNG and a minimal one-page PDF — synthesized so a forged
+# tool that PARSES the input by format (Pillow, pypdf, etc.) doesn't choke on a
+# text payload during dry-run.  See _write_fixture_file.
+_PNG_1x1 = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d4944415478da6360000002000154a24f5d0000000049454e44ae426082"
+)
+_MIN_PDF = (
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n"
+    b"xref\n0 4\ntrailer<</Root 1 0 R/Size 4>>\n%%EOF\n"
+)
+
+
+def _write_fixture_file(p: Path, ext: str) -> None:
+    """Write a FORMAT-VALID dry-run fixture at ``p`` for the given extension.
+
+    Real-format bytes (a parseable empty ``.docx``/``.xlsx``, a ``%PDF`` header,
+    a PNG with the right magic, an empty but valid ``.zip``, a ``{}`` JSON) let a
+    forged file/format tool actually open its input during dry-run instead of
+    crashing on a text payload.  Any failure (missing optional lib, etc.) falls
+    back to the historical plain-text payload so the path still exists on disk.
+    """
+    e = (ext or "").lower().lstrip(".")
+    try:
+        if e == "docx":
+            import docx
+            docx.Document().save(str(p))
+            return
+        if e == "xlsx":
+            import openpyxl
+            openpyxl.Workbook().save(str(p))
+            return
+        if e == "pdf":
+            p.write_bytes(_MIN_PDF)
+            return
+        if e == "png":
+            p.write_bytes(_PNG_1x1)
+            return
+        if e == "zip":
+            import zipfile
+            with zipfile.ZipFile(str(p), "w"):
+                pass
+            return
+        if e == "json":
+            p.write_bytes(b"{}")
+            return
+    except Exception:
+        logger.debug("[ToolDryRun] format fixture for .%s failed; text fallback", e, exc_info=True)
+    p.write_bytes(b"dry-run test payload\n")
 
 
 def _sandbox_paths(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -344,15 +502,15 @@ def _sandbox_paths(params: Dict[str, Any]) -> Dict[str, Any]:
         return params
     sandbox = Path(tempfile.gettempdir()) / f"dry_run_{uuid.uuid4().hex[:8]}"
     sandbox.mkdir(parents=True, exist_ok=True)
-    pathy_keys = {
-        "output_path", "file_path", "dest", "destination", "output_dir",
-        "path", "filepath", "out", "outfile",
-        # input-side keys, so a tool that READS a file is dry-runnable:
-        "input_path", "input_file", "infile", "in_path", "src", "source", "data_path",
-    }
     out: Dict[str, Any] = {}
     for k, v in params.items():
-        if k in pathy_keys and isinstance(v, str) and v:
+        # Directory-style keys are recognized by name alone (a bare dir name like
+        # "results" has no extension/separator); other path keys also need a
+        # value that looks like a path so we don't sandbox an unrelated string.
+        is_pathy = isinstance(v, str) and bool(v) and (
+            (_looks_like_path_key(k) and _value_looks_like_path(v)) or _is_dir_key(k)
+        )
+        if is_pathy:
             ext_match = re.search(r"\.(\w{1,5})$", v)
             ext = ext_match.group(0) if ext_match else ""
             p = sandbox / f"{k}{ext}"
@@ -363,9 +521,10 @@ def _sandbox_paths(params: Dict[str, Any]) -> Dict[str, Any]:
                     # that mkdirs / writes into it still works.
                     p.mkdir(parents=True, exist_ok=True)
                 else:
-                    # Create a small test file so a tool that READS this path finds
-                    # content. (Output tools simply overwrite it; harmless.)
-                    p.write_bytes(b"dry-run test payload\n")
+                    # Create a FORMAT-VALID test file so a tool that READS this
+                    # path can actually parse it by format (docx/xlsx/pdf/png/zip/
+                    # json), not just find bytes. (Output tools overwrite it.)
+                    _write_fixture_file(p, ext)
             except Exception:
                 pass
         else:

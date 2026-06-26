@@ -421,15 +421,26 @@ def _on_enable_and_resume(rec: dict, ctx: dict, vault) -> None:
     if not new_tool_id:
         ui.notify("No new tool id on the card — cannot resume.", type="negative")
         return
+    # v0.9.48 Phase 3: route through the gated enable mechanism instead of
+    # laundering a failed dry-run to "skipped" + flipping .enabled directly.
+    # enable_tool refuses a tool whose dry_run_status isn't passed/skipped, so
+    # a broken (failed-dry-run) tool can no longer be deployed by this path.
     try:
-        # Mark the new tool enabled.
-        t = vault.get_tool(new_tool_id)
-        t.enabled = True
-        # If dry-run was passed, leave status alone; else mark passed
-        # (operator override of skipped status).
-        if (getattr(t, "dry_run_status", None) or "not_run") not in ("passed", "skipped"):
-            t.dry_run_status = "skipped"
-        vault.save_tool(t)
+        from systemu.pipelines import tool_service
+        if not tool_service.enable_tool(new_tool_id, vault):
+            t = vault.get_tool(new_tool_id)
+            status = getattr(t, "dry_run_status", "not_run")
+            ui.notify(
+                f"Cannot enable '{rec.get('new_tool_name', new_tool_id)}': "
+                f"dry-run status is {status!r} (needs passed/skipped). "
+                f"Not resuming.",
+                type="negative", multi_line=True,
+            )
+            logger.warning(
+                "Recalibration enable refused for %s (dry_run_status=%s) — not resuming",
+                new_tool_id, status,
+            )
+            return
     except Exception as exc:
         ui.notify(f"Could not enable tool: {exc}", type="negative")
         return
