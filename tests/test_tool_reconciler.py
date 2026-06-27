@@ -183,3 +183,71 @@ def test_deferred_enable_skips_safety_skip(monkeypatch):
     assert enabled_calls == [], (
         f"a non-operator-verify skip must not be auto-completed, got: {enabled_calls}"
     )
+
+
+# ── v0.9.49 F4: reaper finalizes a task parked on a declined/missing tool ─────
+# (a `proposed`/`not_run` tool whose forge is still PENDING — forge_rejected
+# False — must NOT be reaped: the operator may still approve it.)
+
+import pytest as _pytest
+
+
+@_pytest.fixture
+def real_vault(tmp_path):
+    from systemu.vault.vault import Vault
+    for sub in ("scrolls", "activities", "shadow_army", "skills", "tools", "evolutions"):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / "index.json").write_text("[]")
+    return Vault(str(tmp_path))
+
+
+def _f4_tool(v, tid, **kw):
+    from systemu.core.models import Tool, ToolStatus, ToolType
+    base = dict(id=tid, name=tid, description="d", tool_type=ToolType.PYTHON_FUNCTION,
+                status=ToolStatus.PROPOSED, implementation_path=f"p/{tid}.py",
+                parameters_schema={}, dry_run_status="not_run")
+    base.update(kw)
+    v.save_tool(Tool(**base))
+
+
+def _f4_act(v, aid, req):
+    from systemu.core.models import Activity, ActivityStatus
+    v.save_activity(Activity(id=aid, name="t", scroll_id="s",
+                             required_tool_ids=list(req), status=ActivityStatus.PARTIAL))
+
+
+def test_reaper_finalizes_declined_tool(real_vault):
+    from systemu.core.models import ActivityStatus
+    from systemu.scheduler.tool_reconciler import _fail_unsatisfiable_blocked_activities
+    _f4_tool(real_vault, "arc", forge_rejected=True)
+    _f4_act(real_vault, "a", ["arc"])
+    _fail_unsatisfiable_blocked_activities(real_vault, None)
+    assert real_vault.get_activity("a").status == ActivityStatus.FAILED
+
+
+def test_reaper_skips_pending_proposed_tool(real_vault):
+    from systemu.core.models import ActivityStatus
+    from systemu.scheduler.tool_reconciler import _fail_unsatisfiable_blocked_activities
+    _f4_tool(real_vault, "pend")   # proposed, forge_rejected False (gate still pending)
+    _f4_act(real_vault, "a", ["pend"])
+    _fail_unsatisfiable_blocked_activities(real_vault, None)
+    assert real_vault.get_activity("a").status == ActivityStatus.PARTIAL
+
+
+def test_reaper_finalizes_failed_dryrun_tool_regression(real_vault):
+    from systemu.core.models import ActivityStatus, ToolStatus
+    from systemu.scheduler.tool_reconciler import _fail_unsatisfiable_blocked_activities
+    _f4_tool(real_vault, "bad", status=ToolStatus.FORGED, dry_run_status="failed")
+    _f4_act(real_vault, "a", ["bad"])
+    _fail_unsatisfiable_blocked_activities(real_vault, None)
+    assert real_vault.get_activity("a").status == ActivityStatus.FAILED
+
+
+def test_reaper_idempotent_across_ticks(real_vault):
+    from systemu.core.models import ActivityStatus
+    from systemu.scheduler.tool_reconciler import _fail_unsatisfiable_blocked_activities
+    _f4_tool(real_vault, "arc", forge_rejected=True)
+    _f4_act(real_vault, "a", ["arc"])
+    _fail_unsatisfiable_blocked_activities(real_vault, None)
+    _fail_unsatisfiable_blocked_activities(real_vault, None)   # second tick: no crash
+    assert real_vault.get_activity("a").status == ActivityStatus.FAILED

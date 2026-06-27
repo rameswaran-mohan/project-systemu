@@ -22,6 +22,48 @@ _APPROVE_LABELS = {"approve", "approve & apply", "approve & install", "forge",
 _RENDER_ONLY_GATES = {"operator"}
 
 
+def _handle_forge_rejection(decision, vault) -> CommandResult:
+    """v0.9.49: the operator declined a ``forge:<tool_id>`` gate. Flag the tool
+    ``forge_rejected`` (so it's recognized as permanently unavailable) and finalize
+    every PARTIAL activity that required it, instead of leaving them parked forever.
+    Best-effort; never raises."""
+    from systemu.core.models import ActivityStatus
+    from systemu.runtime.activity_completion import finalize_unsatisfiable_activity
+
+    _, _, tool_id = (decision.dedup_key or "").partition(":")
+    if not tool_id:
+        return CommandResult(status=CommandStatus.NOOP,
+                             summary="Forge declined (no tool id in gate).")
+    name = tool_id
+    try:
+        tool = vault.get_tool(tool_id)
+        name = getattr(tool, "name", tool_id) or tool_id
+        tool.forge_rejected = True
+        vault.save_tool(tool)
+    except Exception:
+        logger.debug("[Inbox] forge-reject: could not flag tool %s", tool_id, exc_info=True)
+
+    finalized = 0
+    try:
+        for header in vault.list_activities(status=ActivityStatus.PARTIAL):
+            act_id = header.get("id")
+            if act_id and tool_id in (header.get("required_tool_ids") or []):
+                if finalize_unsatisfiable_activity(
+                        vault, act_id,
+                        context=f"Tool '{name}' was declined at forge review."):
+                    finalized += 1
+    except Exception:
+        logger.debug("[Inbox] forge-reject: finalize sweep failed for %s", tool_id, exc_info=True)
+
+    if finalized:
+        return CommandResult(
+            status=CommandStatus.OK,
+            summary=(f"Declined forging '{name}'; finalized {finalized} parked "
+                     f"task(s) that required it."))
+    return CommandResult(status=CommandStatus.NOOP,
+                         summary=f"Declined forging '{name}'.")
+
+
 def resolve_gate(decision, *, vault) -> CommandResult:
     """Execute the action a resolved gate authorizes (Approve EXECUTES).
 
@@ -43,6 +85,12 @@ def resolve_gate(decision, *, vault) -> CommandResult:
             status=CommandStatus.OK,
             summary=f"Operator decision recorded ({decision.choice}); run unblocked.",
         )
+
+    # v0.9.49: a DECLINED forge gate must finalize the tasks parked on that tool —
+    # not leave them hanging waiting_on_tools forever (the rejected-tool RCA).
+    # Detect it BEFORE the generic non-approve early-exit below.
+    if gate_type == "forge" and choice not in _APPROVE_LABELS:
+        return _handle_forge_rejection(decision, vault)
 
     if choice not in _APPROVE_LABELS:
         return CommandResult(
@@ -93,51 +141,25 @@ def resolve_gate(decision, *, vault) -> CommandResult:
             else:
                 failed.append(f"{label}: {res.summary}")
 
-        # v0.9.48 Phase 4.1: never silently stuck. If the gate's activity awaits a
-        # REQUIRED tool that can never deploy (dry_run_status == "failed" — STRICTLY,
-        # not `!= "passed"`: a `skipped`/operator-verify or `not_run` tool is NOT
-        # permanent) AND nothing was newly enabled, the parked activity would sit
-        # `waiting_on_tools`/PARTIAL forever. Finalize it FAILED with the dry-run
-        # error surfaced, flip its chat-history entry, and report ERROR. `not_run`
-        # and `skipped` tools are left untouched (transient / operator-owned).
+        # v0.9.49 (broadens v0.9.48 Phase 4.1): never silently stuck. If nothing
+        # was newly enabled and the parked activity awaits a tool that can never
+        # become available — dry-run FAILED, the forge was DECLINED, or the tool
+        # was never forged — finalize it cleanly instead of leaving it parked
+        # `waiting_on_tools` forever. The shared finalizer's ANY-unavailable rule
+        # covers the repro (one deployed tool + one declined tool) and is
+        # idempotent vs the F2 forge-reject event and the F4 reaper.
         activity_id = ctx.get("activity_id")
-        permanently_failed = []
-        for tid in tool_ids:
-            try:
-                t = vault.get_tool(tid)
-            except Exception:
-                continue
-            if (getattr(t, "dry_run_status", "") or "") == "failed":
-                err = (getattr(t, "dry_run_evidence", None) or {}).get("error") or ""
-                permanently_failed.append((getattr(t, "name", tid) or tid, err))
-        if activity_id and permanently_failed and not enabled:
-            from systemu.runtime.activity_completion import mark_activity_failed
+        if activity_id and not enabled:
+            from systemu.runtime.activity_completion import finalize_unsatisfiable_activity
             from systemu.interface.notifications import log_event
-            names = ", ".join(n for n, _ in permanently_failed)
-            errs = " | ".join(f"{n}: {e}" for n, e in permanently_failed if e)
-            fail_summary = (
-                f"Required tool(s) can never deploy (dry-run failed): {names}. "
-                + (f"Dry-run error: {errs}. " if errs else "")
-                + "Task finalized FAILED — re-forge a conforming tool to retry.")
-            mark_activity_failed(vault, activity_id, summary=fail_summary)
-            # Best-effort: flip the parked waiting_on_tools chat entry to failed so
-            # the chat surface stops showing it as in-flight.
-            try:
-                for entry in vault.load_chat_history(limit=50):
-                    if (entry.get("activity_id") == activity_id
-                            and entry.get("status") == "waiting_on_tools"):
-                        vault.update_chat_history_entry(
-                            entry.get("ts"), {"status": "failed", "error": fail_summary})
-                        break
-            except Exception:
-                logger.debug(
-                    "[Inbox] tools_blocked: could not flip chat entry for %s",
-                    activity_id, exc_info=True)
-            log_event(
-                "ERROR", "activity",
-                f"Activity {activity_id} finalized FAILED — un-deployable required tool(s): {names}",
-                {"activity_id": activity_id, "tool_names": names, "dry_run_errors": errs})
-            return CommandResult(status=CommandStatus.ERROR, summary=fail_summary)
+            reason = finalize_unsatisfiable_activity(
+                vault, activity_id, context="Enable & run could not proceed.")
+            if reason:
+                log_event(
+                    "ERROR", "activity",
+                    f"Activity {activity_id} finalized — {reason}",
+                    {"activity_id": activity_id})
+                return CommandResult(status=CommandStatus.ERROR, summary=reason)
 
         # v0.9.43: actually FIRE the heal sweep. The gate's contract is "the heal
         # sweep re-runs the parked task once tools are ready," but only the Tools

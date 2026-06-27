@@ -343,6 +343,10 @@ class Tool(BaseModel):
     # exactly ONE Governor-gated re-forge (cap=1) that feeds the error back into
     # the code prompt; this guarantees the retry never loops.
     forge_reattempts:    int = 0
+    # v0.9.49: set True when the operator DECLINES this tool's forge gate. Marks
+    # the tool permanently unavailable (vs a merely-pending forge), so a task
+    # parked on it is finalized cleanly instead of hanging forever.
+    forge_rejected:      bool = False
     # v0.5.0-a: rolling buffer of observed-successful param sets, capped
     # at 20 entries.  Used by v0.5.0-d's backward-compat replay when the
     # supervisor wants to bump the tool's version — replays each entry

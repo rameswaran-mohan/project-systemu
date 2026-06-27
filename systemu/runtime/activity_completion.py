@@ -64,3 +64,81 @@ def mark_activity_failed(vault, activity_id: str, *, status: str = "failed",
             activity_id, exc,
         )
         return False
+
+
+def _tool_unavailable_reason(vault, tool_id: str):
+    """v0.9.49: return a human reason iff ``tool_id`` can NEVER become available to
+    this run — its record is missing, the operator DECLINED its forge gate
+    (``forge_rejected``), or its dry-run permanently FAILED. Returns None for a
+    satisfiable tool, INCLUDING a ``proposed``/``not_run`` tool whose forge is
+    merely *pending* (``forge_rejected`` False) — that one the operator may still
+    approve, so it must not be treated as permanently blocked."""
+    try:
+        tool = vault.get_tool(tool_id)
+    except Exception:
+        return f"{tool_id} (tool record missing)"
+    name = getattr(tool, "name", tool_id) or tool_id
+    if getattr(tool, "forge_rejected", False):
+        return f"{name} (declined at forge review)"
+    if (getattr(tool, "dry_run_status", "") or "") == "failed":
+        err = (getattr(tool, "dry_run_evidence", None) or {}).get("error") or ""
+        return f"{name} (dry-run failed{': ' + err[:120] if err else ''})"
+    return None
+
+
+def _tool_is_permanently_unavailable(vault, tool_id: str) -> bool:
+    """True iff the tool can never become enable-able this run (see
+    ``_tool_unavailable_reason``). The single source of truth shared by the inbox
+    handlers and the reconciler reaper."""
+    return _tool_unavailable_reason(vault, tool_id) is not None
+
+
+def finalize_unsatisfiable_activity(vault, activity_id: str, *, context: str = "") -> str:
+    """v0.9.49: idempotently finalize a PARTIAL activity parked on a tool that can
+    never become available.
+
+    Returns the failure summary string (TRUTHY) when it finalizes, else ``""``
+    (falsy). Finalizes only when BOTH hold: the activity is currently
+    ``ActivityStatus.PARTIAL`` (idempotency + only-reap-parked guard — a second
+    call, or one racing the reaper, is a no-op once it's terminal), AND **ANY** of
+    its ``required_tool_ids`` is permanently unavailable (so a task with one
+    satisfiable tool + one declined/failed tool — the repro shape — is finalized,
+    while a task still waiting on a satisfiable tool is left alone). The summary
+    names the blocking tool(s) (incl. a failed tool's dry-run error) so the caller
+    can surface it; the terminal write delegates to ``mark_activity_failed`` and
+    the parked ``waiting_on_tools`` chat entry is flipped to ``failed``.
+    Best-effort throughout; never raises."""
+    try:
+        from systemu.core.models import ActivityStatus
+        activity = vault.get_activity(activity_id)
+    except Exception:
+        return ""
+    if getattr(activity, "status", None) != ActivityStatus.PARTIAL:
+        return ""
+    reasons = []
+    for tid in (getattr(activity, "required_tool_ids", None) or []):
+        r = _tool_unavailable_reason(vault, tid)
+        if r:
+            reasons.append(r)
+    if not reasons:
+        return ""
+
+    summary = ((context.strip() + " ") if context else "") + (
+        "Required tool(s) unavailable: " + "; ".join(reasons)
+        + ". Task finalized — re-run and approve/repair the tool(s) to retry.")
+    if not mark_activity_failed(vault, activity_id, summary=summary):
+        return ""
+    # Best-effort: flip the parked waiting_on_tools chat entry so the chat surface
+    # stops showing it as in-flight.
+    try:
+        for entry in vault.load_chat_history(limit=50):
+            if (entry.get("activity_id") == activity_id
+                    and entry.get("status") == "waiting_on_tools"):
+                vault.update_chat_history_entry(
+                    entry.get("ts"), {"status": "failed", "error": summary})
+                break
+    except Exception:
+        logger.debug(
+            "[ActivityCompletion] could not flip chat entry for %s",
+            activity_id, exc_info=True)
+    return summary

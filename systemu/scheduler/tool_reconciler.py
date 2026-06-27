@@ -153,16 +153,17 @@ def _fail_unsatisfiable_blocked_activities(vault: "Vault", config: "Config") -> 
     awaited REQUIRED tool can never deploy — even if the operator never resolves
     the tools_blocked gate.
 
-    Walks every PARTIAL activity; if its ``required_tool_ids`` include a tool with
-    ``dry_run_status == "failed"`` (STRICTLY — never ``!= "passed"``: a `skipped`/
-    operator-verify or `not_run` tool is NOT permanent and must NOT be reaped),
-    finalize the activity FAILED with the dry-run error surfaced, and flip its
-    parked ``waiting_on_tools`` chat entry. Idempotent — an already-terminal
-    activity is skipped (the index filter keeps only PARTIAL), so this is safe on
-    every 30s tick. Best-effort throughout; never raises into the reconcile loop.
+    Walks every PARTIAL activity and routes it through the shared
+    ``finalize_unsatisfiable_activity`` (v0.9.49): an activity is finalized iff ANY
+    required tool is permanently unavailable — its dry-run FAILED, the operator
+    DECLINED its forge gate (``forge_rejected``), or its record is missing. A
+    ``proposed``/``not_run`` tool whose forge is merely *pending* (``forge_rejected``
+    False) is NOT reaped — the operator may still approve it. Idempotent (the
+    finalizer only writes a PARTIAL activity) so it's safe on every 30s tick.
+    Best-effort throughout; never raises into the reconcile loop.
     """
     from systemu.core.models import ActivityStatus
-    from systemu.runtime.activity_completion import mark_activity_failed
+    from systemu.runtime.activity_completion import finalize_unsatisfiable_activity
     from systemu.interface.notifications import log_event
 
     try:
@@ -175,48 +176,21 @@ def _fail_unsatisfiable_blocked_activities(vault: "Vault", config: "Config") -> 
         act_id = header.get("id")
         if not act_id:
             continue
-        permanently_failed = []
-        for tid in (header.get("required_tool_ids") or []):
-            try:
-                tool = vault.get_tool(tid)
-            except Exception:
-                continue
-            if (getattr(tool, "dry_run_status", "") or "") == "failed":
-                err = (getattr(tool, "dry_run_evidence", None) or {}).get("error") or ""
-                permanently_failed.append((getattr(tool, "name", tid) or tid, err))
-        if not permanently_failed:
-            continue
-
-        names = ", ".join(n for n, _ in permanently_failed)
-        errs = " | ".join(f"{n}: {e}" for n, e in permanently_failed if e)
-        summary = (
-            f"Required tool(s) can never deploy (dry-run failed): {names}. "
-            + (f"Dry-run error: {errs}. " if errs else "")
-            + "Task finalized FAILED — re-forge a conforming tool to retry.")
-        if not mark_activity_failed(vault, act_id, summary=summary):
-            continue
-        # Best-effort: flip the parked waiting_on_tools chat entry to failed.
         try:
-            for entry in vault.load_chat_history(limit=50):
-                if (entry.get("activity_id") == act_id
-                        and entry.get("status") == "waiting_on_tools"):
-                    vault.update_chat_history_entry(
-                        entry.get("ts"), {"status": "failed", "error": summary})
-                    break
+            if finalize_unsatisfiable_activity(
+                    vault, act_id,
+                    context="Parked task could not become runnable."):
+                try:
+                    log_event(
+                        "ERROR", "activity",
+                        f"Activity {act_id} finalized — required tool(s) unavailable "
+                        f"(declined at forge review, failed validation, or missing)",
+                        {"activity_id": act_id})
+                except Exception:
+                    logger.debug("[ToolReconciler] reap: log_event failed for %s", act_id, exc_info=True)
+                logger.info("[ToolReconciler] reaped unsatisfiable activity %s", act_id)
         except Exception:
-            logger.debug(
-                "[ToolReconciler] reap: could not flip chat entry for %s",
-                act_id, exc_info=True)
-        try:
-            log_event(
-                "ERROR", "activity",
-                f"Activity {act_id} finalized FAILED — un-deployable required tool(s): {names}",
-                {"activity_id": act_id, "tool_names": names, "dry_run_errors": errs})
-        except Exception:
-            logger.debug("[ToolReconciler] reap: log_event failed for %s", act_id, exc_info=True)
-        logger.info(
-            "[ToolReconciler] reaped unsatisfiable activity %s — un-deployable tool(s): %s",
-            act_id, names)
+            logger.debug("[ToolReconciler] reap: finalize failed for %s", act_id, exc_info=True)
 
 
 def _is_operator_verify_skip(tool) -> bool:
