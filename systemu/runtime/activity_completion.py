@@ -67,12 +67,16 @@ def mark_activity_failed(vault, activity_id: str, *, status: str = "failed",
 
 
 def _tool_unavailable_reason(vault, tool_id: str):
-    """v0.9.49: return a human reason iff ``tool_id`` can NEVER become available to
-    this run — its record is missing, the operator DECLINED its forge gate
-    (``forge_rejected``), or its dry-run permanently FAILED. Returns None for a
-    satisfiable tool, INCLUDING a ``proposed``/``not_run`` tool whose forge is
-    merely *pending* (``forge_rejected`` False) — that one the operator may still
-    approve, so it must not be treated as permanently blocked."""
+    """v0.9.49 / v0.9.50: return a human reason iff ``tool_id`` can NEVER become
+    available to this run — its record is missing, the operator DECLINED its forge
+    gate (``forge_rejected``), or its dry-run failed for a PERMANENT reason (a
+    genuine code bug whose self-heal is exhausted). Returns None for a satisfiable
+    tool, INCLUDING (a) a ``proposed``/``not_run`` tool whose forge is merely
+    *pending*, and (b) v0.9.50: a tool whose dry-run failed for a TRANSIENT reason —
+    a dependency awaiting approval / mid-install (DEP_PENDING) or a filesystem-
+    permission error (FS_PERMISSION). Those must NOT finalize the parked task: the
+    tool may still deploy once the dep installs (the RCA: a dep-pending failure was
+    prematurely finalizing the task seconds before the dep finished installing)."""
     try:
         tool = vault.get_tool(tool_id)
     except Exception:
@@ -82,6 +86,11 @@ def _tool_unavailable_reason(vault, tool_id: str):
         return f"{name} (declined at forge review)"
     if (getattr(tool, "dry_run_status", "") or "") == "failed":
         err = (getattr(tool, "dry_run_evidence", None) or {}).get("error") or ""
+        # Only a genuine code bug is PERMANENT. A dep awaiting approval/install or
+        # a permission error is transient/operator-owned — leave the task parked.
+        from systemu.recovery.classifier import classify_dry_run_error
+        if classify_dry_run_error(err).kind != "DRY_RUN_FAILED_BUG":
+            return None
         return f"{name} (dry-run failed{': ' + err[:120] if err else ''})"
     return None
 

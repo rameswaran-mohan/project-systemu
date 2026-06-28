@@ -120,3 +120,38 @@ def test_finalize_is_idempotent(vault):
     assert finalize_unsatisfiable_activity(vault, "a4")
     # second call: activity is no longer PARTIAL → no-op
     assert not finalize_unsatisfiable_activity(vault, "a4")
+
+
+# ── v0.9.50: a dep-pending dry-run failure is TRANSIENT, not permanent ─────────
+# RCA: a tool whose dry-run "failed" only because a dependency awaited operator
+# approval was being finalized FAILED seconds before the dep finished installing.
+
+_DEP_MSG = "Tool 'create_pptx' needs operator approval to install: python-pptx"
+_BUG_MSG = "TypeError: run() missing 1 required positional argument: 'x'"
+
+
+def test_classifier_recognizes_dep_pending_approval():
+    from systemu.recovery.classifier import classify_dry_run_error
+    assert classify_dry_run_error(_DEP_MSG).kind == "DEP_PENDING"
+    assert classify_dry_run_error(_BUG_MSG).kind == "DRY_RUN_FAILED_BUG"
+
+
+def test_dep_pending_failed_tool_is_not_permanently_unavailable(vault):
+    from systemu.runtime.activity_completion import _tool_is_permanently_unavailable
+    _tool(vault, "t_dep", status=ToolStatus.FORGED, dry_run_status="failed", error=_DEP_MSG)
+    assert _tool_is_permanently_unavailable(vault, "t_dep") is False
+
+
+def test_code_bug_failed_tool_is_permanently_unavailable(vault):
+    from systemu.runtime.activity_completion import _tool_is_permanently_unavailable
+    _tool(vault, "t_bug", status=ToolStatus.FORGED, dry_run_status="failed", error=_BUG_MSG)
+    assert _tool_is_permanently_unavailable(vault, "t_bug") is True
+
+
+def test_finalize_leaves_dep_pending_task_parked(vault):
+    # the exact repro: one tool failing dry-run only because its dep awaits approval
+    from systemu.runtime.activity_completion import finalize_unsatisfiable_activity
+    _tool(vault, "t_dep", status=ToolStatus.FORGED, dry_run_status="failed", error=_DEP_MSG)
+    _activity(vault, "a_dep", ["t_dep"])
+    assert not finalize_unsatisfiable_activity(vault, "a_dep")
+    assert vault.get_activity("a_dep").status == ActivityStatus.PARTIAL

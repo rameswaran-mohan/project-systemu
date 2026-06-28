@@ -357,7 +357,14 @@ def build_inbox_page() -> None:
     ui.label(
         "Every decision the agent needs from you — one card, one place. "
         "Approve executes the authorized action."
-    ).classes("s-muted").style("font-size: 13px; margin-bottom: 16px;")
+    ).classes("s-muted").style("font-size: 13px; margin-bottom: 8px;")
+
+    # v0.9.50 (item 4): one-click path back to the Chat page where the operator
+    # added the task that produced these decisions. Outlined + primary so it's
+    # clearly visible (a muted flat button was too easy to miss).
+    ui.button("← Back to Chat",
+              on_click=lambda: ui.navigate.to("/chat?tab=compose")).props(
+        "outline dense color=primary").style("margin-bottom: 12px;")
 
     # W2.4: never silent when the gate policy pierces the safety floor
     # (no_floor / override→allow on dep|recovery) — uses gate_mode.floor_pierces.

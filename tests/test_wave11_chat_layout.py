@@ -38,8 +38,10 @@ class TestComposerFirst:
             "landing on Chat should put the cursor in the composer"
 
     def test_shortcut_is_discoverable(self):
+        # v0.9.50: Enter now runs the task (Shift+Enter for a newline); the hint
+        # must stay visible.
         src = _chat_src()
-        assert "Ctrl+Enter" in src, "the keyboard shortcut must be visible, not secret"
+        assert "Enter to run" in src, "the keyboard shortcut must be visible, not secret"
 
     def test_existing_contracts_hold(self):
         """W8.3 lane options and the prefill plumbing survive the reorder."""

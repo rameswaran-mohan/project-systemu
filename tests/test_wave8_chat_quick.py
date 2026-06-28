@@ -39,10 +39,12 @@ class TestChatWiring:
         from systemu.interface.pages import chat_page
         return inspect.getsource(chat_page)
 
-    def test_lane_control_defaults_to_quick(self):
+    def test_lane_control_defaults_to_run_now(self):
+        # v0.9.50: the default lane is "Workflow — run now" (the operator's
+        # common case); the quick lane is still offered, just not the default.
         src = self._src()
         assert '"quick"' in src and "Quick answer" in src
-        assert 'value="quick"' in src, "Quick must be the default lane"
+        assert 'value="run_now"' in src, "Workflow run-now must be the default lane"
 
     def test_quick_path_uses_submit_quick_task_in_thread(self):
         src = self._src()

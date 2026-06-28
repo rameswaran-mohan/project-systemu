@@ -25,6 +25,15 @@ def classify_dry_run_error(error_text: str, missing_packages: Optional[list] = N
     m = _IMPORT_RE.search(error_text)
     if m:
         return ClassifiedError(kind="DEP_PENDING", missing_package=m.group(1))
+    # v0.9.50: a dependency awaiting operator approval / mid-install is DEP_PENDING
+    # (transient), NOT a code bug — recognize the dependency-installer's messages so
+    # the failure doesn't get misclassified and prematurely finalize a parked task.
+    _low = error_text.lower()
+    if ("needs operator approval to install" in _low
+            or "blocked_pending_approval" in _low
+            or "pending approval" in _low
+            or "tools deps approve" in _low):
+        return ClassifiedError(kind="DEP_PENDING")
     if "PermissionError" in error_text:
         return ClassifiedError(kind="FS_PERMISSION")
     return ClassifiedError(kind="DRY_RUN_FAILED_BUG")

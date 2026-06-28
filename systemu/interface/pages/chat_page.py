@@ -127,7 +127,7 @@ def build_chat_page(prefill: str = "") -> None:
                 "run_now": "Workflow — run now",
                 "queue":   "Workflow — queue",
             },
-            value="quick",
+            value="run_now",
         ).props("inline dense").style(f"color: {THEME['text']};")
         ui.label(f"mode: {deployment}").style(
             f"font-size: 11px; color: {THEME['text_muted']}; margin-left: auto;"
@@ -150,7 +150,7 @@ def build_chat_page(prefill: str = "") -> None:
             f"font-weight: 700; padding: 12px 20px; font-size: 14px; align-self: flex-end;"
         )
 
-    ui.label("Ctrl+Enter to run  ·  /continue extends the previous task").classes(
+    ui.label("Enter to run  ·  Shift+Enter for a newline  ·  /continue extends the previous task").classes(
         "s-muted"
     ).style("font-size: 11px; margin-bottom: 4px;")
     status_label = ui.label("").style(
@@ -160,7 +160,7 @@ def build_chat_page(prefill: str = "") -> None:
     ui.separator().style(f"background: {THEME['border']}; margin: 8px 0;")
 
     # ── History panel (below the composer; newest first) ─────────────────────
-    history_col = ui.column().classes("w-full").style("gap: 10px; margin-bottom: 20px;")
+    history_col = ui.column().classes("w-full s-chat-history").style("gap: 10px; margin-bottom: 20px;")
 
     def _render_history() -> None:
         history_col.clear()
@@ -228,17 +228,33 @@ def build_chat_page(prefill: str = "") -> None:
                         f"background: {status_color}; color: white; "
                         f"border-radius: 6px; font-size: 11px; padding: 3px 8px; white-space: nowrap;"
                     )
-                    # v0.9.32 (D3.3): a running chat task can be cooperatively
-                    # stopped via the chat_task_registry token keyed on its ts.
-                    if status == "running":
-                        _raw_ts = entry.get("ts", "")
-                        _stop_style = (
-                            f"background: {THEME['danger']}; color: white; "
-                            f"border-radius: 6px; font-size: 10px; padding: 2px 8px;"
-                        )
-                        ui.button("Stop", on_click=_make_chat_stop_handler(_raw_ts)).props(
-                            "flat dense"
-                        ).style(_stop_style)
+                    # v0.9.50 (6c): per-job switches on the card's top-right — KILL a
+                    # running job (cooperative cancel via the chat_task_registry token
+                    # keyed on its ts, v0.9.32 D3.3), or RESTART a finished / killed /
+                    # stuck job by re-running its prompt through the same path.
+                    with ui.row().style("gap: 4px;"):
+                        # KILL when the job is still in flight — a workflow run
+                        # spends its active time at waiting_on_tools/pending_decision,
+                        # not "running", so gate on all non-terminal states (the
+                        # cancel_event is honored by both lanes). RESTART when terminal.
+                        if status in ("running", "waiting_on_tools",
+                                      "pending_decision", "needs_input"):
+                            _raw_ts = entry.get("ts", "")
+                            ui.button(icon="stop_circle",
+                                      on_click=_make_chat_stop_handler(_raw_ts)).props(
+                                "flat dense round size=sm color=negative"
+                            ).tooltip("Kill this job")
+                        elif status in ("success", "partial", "failed", "cancelled",
+                                        "skipped_no_shadow"):
+                            def _restart(_=None, _p=entry.get("prompt", "")):
+                                try:
+                                    prompt_input.set_value(_p)
+                                    _on_submit()
+                                except Exception:
+                                    logger.debug("[ChatPage] restart re-submit failed", exc_info=True)
+                            ui.button(icon="restart_alt", on_click=_restart).props(
+                                "flat dense round size=sm color=primary"
+                            ).tooltip("Run this task again")
 
             # W8.3: quick-lane entries carry the FULL answer — render it as
             # rich markdown (no 120-char truncation), list produced files,
@@ -437,8 +453,32 @@ def build_chat_page(prefill: str = "") -> None:
 
         threading.Thread(target=_run, daemon=True).start()
 
+        # v0.9.50 (6b): surface the running task immediately — re-render the
+        # history a few times so the just-appended "running" entry appears, and
+        # scroll it into view so the operator sees the job without scrolling.
+        def _surface(_=None) -> None:
+            try:
+                _render_history()
+                ui.run_javascript(
+                    "var el=document.querySelector('.s-chat-history'); "
+                    "if(el){el.scrollIntoView({behavior:'smooth', block:'start'});}")
+            except Exception:
+                pass
+        for _delay in (0.4, 1.2, 2.5):
+            try:
+                ui.timer(_delay, _surface, once=True)
+            except Exception:
+                pass
+
     submit_btn.on_click(_on_submit)
-    prompt_input.on("keydown.ctrl.enter", _on_submit)
+
+    def _on_enter(e) -> None:
+        # v0.9.50: Enter runs the task; Shift+Enter inserts a newline (chat UX).
+        # _on_submit reads the value at keydown (before any newline) then clears
+        # the field, so the default newline on plain Enter is harmless.
+        if not (getattr(e, "args", None) or {}).get("shiftKey"):
+            _on_submit()
+    prompt_input.on("keydown.enter", _on_enter, args=["shiftKey"])
 
 
 # ── v0.7.2: tabbed wrapper — Compose + Live Events ─────────────────────────

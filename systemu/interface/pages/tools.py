@@ -150,6 +150,12 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
     from systemu.interface.design.glossary import lore_sublabel
     ui.label(lore_sublabel("build")).classes("s-muted").style("margin-bottom: 8px;")
 
+    # v0.9.50: a visible escape back to Chat from the build/tools page (e.g. after
+    # a forge review), so the operator is never stranded here.
+    ui.button("← Back to Chat",
+              on_click=lambda: ui.navigate.to("/chat?tab=compose")).props(
+        "outline dense color=primary").style("margin-bottom: 12px;")
+
     # Deep-link: /tools?forge=<id> auto-opens the spec/code review dialog after
     # the page has rendered (ui.timer defers past the slot-stack build).  This
     # is scheduled before the no-tools early return so the deep-link still
@@ -885,12 +891,15 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                         type="positive",
                     )
                     dlg.close()
-                    # Fix #1: drop the ?forge=<id> deep-link param so a later page
-                    # rebuild (e.g. a websocket reconnect during the blocking
-                    # enable/heal) can't re-open this dialog at gate 1 for the now-
-                    # forged tool.
+                    # v0.9.50 (item 3): return the operator to the Inbox they
+                    # started the forge journey from, rather than stranding them on
+                    # the Tools page. DEFER the navigate past dlg.close() via a
+                    # one-shot timer — a navigate issued inline right after closing
+                    # the dialog gets swallowed by the closing modal's context (the
+                    # operator-reported "no redirect, stuck on Tools" bug). The
+                    # install/enable below continues server-side regardless.
                     try:
-                        ui.run_javascript("window.history.replaceState(null, '', '/tools')")
+                        ui.timer(0.15, lambda: ui.navigate.to("/inbox"), once=True)
                     except Exception:
                         pass
                     # v0.8.13 Fix 6c: a reviewed approval also installs the tool's
@@ -907,7 +916,7 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                                                     cfg=state.config, v=state.vault, c=_client):
                         try:
                             await asyncio.to_thread(_approve_install_and_enable, t_id, v, cfg)
-                            if c is not None:
+                            if c is not None and getattr(c, "has_socket_connection", True):
                                 with c:
                                     ui.notify(
                                         f"'{t_name}' enabled — deps installed, waiting tasks resumed.",
@@ -915,7 +924,7 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                                     )
                         except Exception as exc:
                             logger.exception("[Tools UI] approve-install-enable failed for %s", t_id)
-                            if c is not None:
+                            if c is not None and getattr(c, "has_socket_connection", True):
                                 with c:
                                     ui.notify(
                                         f"'{t_name}' forged but install/enable failed: {exc}",
