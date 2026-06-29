@@ -16,7 +16,7 @@ folds the `system` origin in/out. Unsubscribes on client disconnect.
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from nicegui import ui
 
@@ -105,13 +105,19 @@ def _load_llm_text(vault_root, llm_ref) -> str:
         return "(no LLM transcript for this event)"
 
 
-def render_event_details_body(details: Dict[str, Any]) -> None:
+def render_event_details_body(details: Dict[str, Any], *,
+                              context: Optional[Dict[str, Any]] = None) -> None:
     """Render an event's ``details`` payload (reasoning, tool params/result,
     lazy LLM transcript) — the body of the expand-arrow row.
 
     Module-level + surface-agnostic (BUG-2 fix): shared by this pane (the
     /insights Manual Logs feed) AND the /chat Live Events feed, so the
     expand-for-details affordance exists wherever events render.
+
+    v0.9.51: when the event's ``context`` ties it back to an activity, a
+    "Re-trigger" button lets the operator re-run that task in place — the
+    recovery affordance for a failed/cancelled/stuck run they expanded to
+    investigate (the event context carries ``activity_id``).
     """
     import json as _json
 
@@ -161,6 +167,21 @@ def render_event_details_body(details: Dict[str, Any]) -> None:
         except Exception:
             _rr = str(tool_result)
         ui.code(_rr).style("font-size: 11px; width: 100%;")
+
+    # v0.9.51 re-trigger affordance — when the event ties back to an activity,
+    # offer an in-place re-run (the recovery path for a failed/cancelled/stuck task
+    # the operator expanded to investigate). Quasar color/class props only (no new
+    # inline f-style → the UI-style lint baseline holds at 0-new).
+    _act_id = (context or {}).get("activity_id")
+    if _act_id:
+        def _retrigger(_=None, _aid=_act_id) -> None:
+            from systemu.interface.pages.work import rerun_workflow_by_activity
+            try:
+                ui.notify(rerun_workflow_by_activity(_aid), type="positive")
+            except Exception as _e:   # plain-language reason (no shadow / no activity)
+                ui.notify(str(_e), type="warning")
+        ui.button("↻ Re-trigger this task", on_click=_retrigger).props(
+            "flat dense size=sm color=primary").classes("q-mt-xs")
 
     # Lazy raw-LLM transcript: only fetched when the button is clicked.
     # W5.3: only offered when the event actually carries an llm_ref —
@@ -276,7 +297,7 @@ def build_supervisor_events_pane(
         ).style(
             f"font-size: 12px; color: {THEME['text']};"
         ):
-            render_event_details_body(ev.get("details") or {})
+            render_event_details_body(ev.get("details") or {}, context=ev.get("context"))
 
     @ui.refreshable
     def _pane():

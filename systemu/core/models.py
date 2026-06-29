@@ -326,6 +326,11 @@ class Tool(BaseModel):
     # v0.10.0 — the execution that runtime-forged this tool (provenance for the
     # "agent-built" view + the harness ledger). None for design-time/operator forges.
     forged_by_execution_id: Optional[str] = None
+    # v0.9.51 — real operator-referenced input files (paths/filenames pulled from
+    # the forging Scroll at forge time), persisted so the dry-run can GROUND its
+    # fixtures in real content. Only those that still exist on disk at dry-run time
+    # are used; otherwise the synthesizer falls back to a synthetic fixture.
+    grounding_inputs: List[str] = []
     # W2.2: forged (LLM-generated) tools execute in a subprocess by default;
     # the operator may opt a reviewed tool back into the in-process fast path
     # (~100-500ms faster per call) by setting this. Built-ins (not forged)

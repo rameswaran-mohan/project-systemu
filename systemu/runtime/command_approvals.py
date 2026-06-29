@@ -174,6 +174,32 @@ class CommandApprovalStore:
                         session_key, server, tool, session_id)
         return newly
 
+    def mark_resume_approved(self, sig: str) -> None:
+        """v0.9.52: record a SINGLE-USE approval for a command signature.
+
+        Set by the command-gate RESUME path so the resumed run honors the
+        operator's "Approve once" exactly once, across the park→resume boundary.
+        Unlike :meth:`approve` this is NOT a standing allow-list entry — it's a
+        one-shot bridge, consumed on the first :meth:`consume_resume_approved`.
+        """
+        with self._lock:
+            self._data = self._load()
+            pend: Dict[str, Any] = self._data.setdefault("resume_pending", {})
+            pend[sig] = {"marked_at": _now_iso()}
+            self._save()
+
+    def consume_resume_approved(self, sig: str) -> bool:
+        """Return True (and REMOVE the entry) iff a one-shot resume-approval is on
+        record for ``sig``. Single-use — a second check returns False."""
+        with self._lock:
+            self._data = self._load()
+            pend = self._data.get("resume_pending") or {}
+            if sig in pend:
+                del pend[sig]
+                self._save()
+                return True
+        return False
+
     def approve(
         self,
         sig: str,

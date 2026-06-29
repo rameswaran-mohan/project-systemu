@@ -2897,6 +2897,10 @@ class ShadowRuntime:
             # LLM-supplied tool kwarg.
             from systemu.runtime.mcp_run_ctx import set_mcp_session_id
             self._mcp_session_token = set_mcp_session_id(execution_id)
+            # v0.9.52: carry the run's execution_id so a command gate posted mid-run
+            # can stamp it into the decision context → the parked gate is resumable.
+            from systemu.runtime.chat_submission_ctx import set_execution_id
+            self._execution_id_token = set_execution_id(execution_id)
             exec_start   = __import__("time").time()
             tool_call_count = 0
             # v0.9.33 Bug 2/3: per-execution harness-request counter. Threaded
@@ -5190,6 +5194,11 @@ class ShadowRuntime:
             try:
                 from systemu.runtime.chat_submission_ctx import set_chat_submission_id
                 set_chat_submission_id(None, reset_token=self._chat_submission_token)
+            except Exception:
+                pass
+            try:
+                from systemu.runtime.chat_submission_ctx import set_execution_id
+                set_execution_id(None, reset_token=getattr(self, "_execution_id_token", None))
             except Exception:
                 pass
             try:

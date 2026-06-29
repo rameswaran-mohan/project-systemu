@@ -26,3 +26,25 @@ def set_chat_submission_id(value: Optional[str], *, reset_token: Any = None):
         _chat_submission_id_var.reset(reset_token)
         return None
     return _chat_submission_id_var.set(value)
+
+
+# v0.9.52: same carrier pattern for the active execution_id, so the command-gate
+# producer (ToolSandbox._maybe_gate_command) can stamp execution_id into the gate
+# decision's context — making a parked command gate RESUMABLE — without threading
+# execution_id through execute_tool's signature.
+_execution_id_var: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "execution_id", default=None
+)
+
+
+def current_execution_id() -> Optional[str]:
+    """Return the active execution_id (or None if not inside a run)."""
+    return _execution_id_var.get()
+
+
+def set_execution_id(value: Optional[str], *, reset_token: Any = None):
+    """Set or reset the active execution_id. Returns a token usable to reset."""
+    if reset_token is not None:
+        _execution_id_var.reset(reset_token)
+        return None
+    return _execution_id_var.set(value)

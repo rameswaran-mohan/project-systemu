@@ -63,51 +63,87 @@ def _dispatch_resume(decision, *, vault, supervisor,
     and continues).
     """
     dctx = decision.context or {}
-    if dctx.get("kind") != "structured_question":
+    kind = dctx.get("kind")
+    # v0.9.52: a parked COMMAND gate (kind="gate", gate_type="command") is now
+    # resumable too — previously only structured_question questions resumed, so a
+    # chat task that parked on a run_command approval hung forever on resolution.
+    is_cmd_gate = (kind == "gate" and dctx.get("gate_type") == "command")
+    if kind != "structured_question" and not is_cmd_gate:
         return False
     if not dctx.get("chat_submission_id"):
         return False
     if dctx.get("resume_dispatched"):
         return False
     execution_id = dctx.get("execution_id")
+    if not execution_id:
+        logger.info("[ResumeOnDecision] decision %s has no execution_id — skipping", decision.id)
+        return False
+
+    # A command gate doesn't carry activity_id/shadow_id (the sandbox doesn't know
+    # them), so derive them from the parked run's snapshot. structured_question
+    # carries them directly in its context.
     activity_id = dctx.get("activity_id")
     shadow_id = dctx.get("shadow_id")
-    objective_id = dctx.get("objective_id")
-    if not (execution_id and activity_id and shadow_id):
+    snap = None
+    try:
+        from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
+        snap = read_snapshot(execution_id, data_dir=data_dir)
+    except Exception:
+        snap = None
+    if snap is not None:
+        activity_id = activity_id or getattr(snap, "activity_id", None)
+        shadow_id = shadow_id or getattr(snap, "shadow_id", None)
+    if not (activity_id and shadow_id):
         logger.info(
             "[ResumeOnDecision] decision %s missing resume coords — skipping",
             decision.id,
         )
         return False
 
-    # Stash the operator's answer into the snapshot so resume is deterministic.
-    try:
-        from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
-        snap = read_snapshot(execution_id, data_dir=data_dir)
-        if snap is not None:
-            snap.sticky_notes.append(
-                f"__STUCK_ANSWER__::obj_{objective_id}::{decision.choice}"
-            )
-            write_snapshot(snap, data_dir=data_dir)
-    except Exception:
-        logger.debug(
-            "[ResumeOnDecision] could not stash answer in snapshot",
-            exc_info=True,
-        )
+    choice = (decision.choice or "").strip().lower()
+    if is_cmd_gate:
+        if choice in ("deny", ""):
+            # Operator denied a REQUIRED command → the task can't proceed; mark it
+            # FAILED rather than re-submitting (which would re-ask the same command
+            # → loop). Idempotent: only flips a non-terminal activity.
+            try:
+                from systemu.core.models import ActivityStatus
+                act = vault.get_activity(activity_id)
+                if getattr(act, "status", None) not in (
+                        ActivityStatus.COMPLETED, ActivityStatus.FAILED):
+                    act.status = ActivityStatus.FAILED
+                    vault.save_activity(act)
+            except Exception:
+                logger.debug("[ResumeOnDecision] command-deny finalize failed", exc_info=True)
+            _stamp_dispatched(decision, vault)
+            logger.info("[ResumeOnDecision] command gate DENIED for activity %s — finalized", activity_id)
+            return True
+        # Approve once / Always allow → mark a SINGLE-USE resume approval keyed by
+        # the command signature so the resumed run honors it exactly once (then
+        # re-asks for any later command), then re-submit the activity.
+        try:
+            from systemu.runtime.command_approvals import command_signature, init_default_store
+            from pathlib import Path as _P
+            sig = command_signature(dctx.get("command") or "", cwd=dctx.get("cwd") or "")
+            store = init_default_store(_P("data"))
+            if store is not None:
+                store.mark_resume_approved(sig)
+        except Exception:
+            logger.debug("[ResumeOnDecision] could not mark resume approval", exc_info=True)
+    else:
+        # structured_question: stash the operator's answer into the snapshot so the
+        # runtime applies it deterministically on resume.
+        objective_id = dctx.get("objective_id")
+        try:
+            if snap is not None:
+                snap.sticky_notes.append(
+                    f"__STUCK_ANSWER__::obj_{objective_id}::{decision.choice}"
+                )
+                write_snapshot(snap, data_dir=data_dir)
+        except Exception:
+            logger.debug("[ResumeOnDecision] could not stash answer in snapshot", exc_info=True)
 
-    # Stamp the persisted marker BEFORE submitting so a concurrent
-    # poll/event can't race in and double-dispatch.  If the save fails
-    # we still proceed (the in-memory _handled set covers same-process
-    # replay) — better one extra dispatch than a lost resume.
-    try:
-        decision.context["resume_dispatched"] = True
-        vault.save_decision(decision)
-    except Exception:
-        logger.debug(
-            "[ResumeOnDecision] could not stamp resume_dispatched on %s",
-            decision.id, exc_info=True,
-        )
-
+    _stamp_dispatched(decision, vault)
     _handled.add(decision.id)
     supervisor.submit(
         activity_id, shadow_id,
@@ -121,6 +157,19 @@ def _dispatch_resume(decision, *, vault, supervisor,
         activity_id, execution_id, decision.id,
     )
     return True
+
+
+def _stamp_dispatched(decision, vault) -> None:
+    """Stamp the persisted ``resume_dispatched`` marker so a concurrent poll/event
+    can't double-dispatch (across restarts, across both trigger paths)."""
+    try:
+        decision.context["resume_dispatched"] = True
+        vault.save_decision(decision)
+    except Exception:
+        logger.debug(
+            "[ResumeOnDecision] could not stamp resume_dispatched on %s",
+            decision.id, exc_info=True,
+        )
 
 
 def handle_decision_resolved(event: Dict[str, Any], *, vault, supervisor,

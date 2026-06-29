@@ -55,6 +55,8 @@ def test_reconciler_advances_forged_tools_on_dry_run_pass(tmp_path, monkeypatch)
         params_used = {}
         elapsed_ms = 10
         error = None
+        def to_evidence(self):
+            return {"status": self.status, "error": self.error}
     monkeypatch.setattr(
         "systemu.pipelines.tool_dry_run.dry_run_tool",
         lambda tool, **kw: _DryRunResult(),
@@ -96,6 +98,8 @@ def test_reconciler_publishes_event_on_dry_run_fail(tmp_path, monkeypatch):
         params_used = {}
         elapsed_ms = 10
         error = "import error"
+        def to_evidence(self):
+            return {"status": self.status, "error": self.error}
     monkeypatch.setattr(
         "systemu.pipelines.tool_dry_run.dry_run_tool",
         lambda tool, **kw: _DryRunResult(),

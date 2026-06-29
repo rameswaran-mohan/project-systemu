@@ -72,6 +72,27 @@ def _approved_packages_hint() -> list[str]:
 #  Public entry points
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _capture_grounding(tool: Tool, scroll: Optional["Scroll"]) -> None:
+    """v0.9.51 context-grounding: pull the operator's real input-file references out
+    of the forging scroll and persist them on the tool, so the dry-run can ground
+    its fixtures in real content. Only files that still EXIST on disk at dry-run
+    time are used (a bare filename / stale path is a harmless no-op → synthetic
+    fixture). Best-effort; never blocks a forge."""
+    if scroll is None:
+        return
+    try:
+        from systemu.pipelines.fixture_synth import extract_candidate_paths
+        paths = extract_candidate_paths(
+            getattr(scroll, "raw_request", "") or "",
+            getattr(scroll, "narrative_md", "") or "",
+            getattr(scroll, "intent", "") or "",
+        )
+        if paths:
+            tool.grounding_inputs = paths
+    except Exception:
+        logger.debug("[Forge] grounding capture failed for '%s'", tool.name, exc_info=True)
+
+
 def forge_proposed_tools(
     activity: Activity,
     config: Config,
@@ -148,12 +169,18 @@ def save_approved_code(
     implementation: str,
     config: Config,
     vault: Vault,
+    *,
+    scroll: Optional[Scroll] = None,
 ) -> Tool:
     """Gate 2 final step — persist user-approved code. Sets enabled=False.
 
     Called after the user reads the code preview and clicks 'Approve & Sign Off'.
     The tool is written to vault with status=FORGED and enabled=False.
     The user must then explicitly enable it in the Tools Registry page (Gate 3).
+
+    v0.9.51: when the forging ``scroll`` is supplied, the operator's real input-file
+    references are captured onto the tool so the immediate dry-run (below) grounds
+    its fixtures in real content.
     """
     from systemu.interface.notifications import log_event
 
@@ -175,6 +202,7 @@ def save_approved_code(
     tool.implementation_path = str(impl_path.relative_to(Path(config.vault_dir).parent))
     tool.status  = ToolStatus.FORGED
     tool.enabled = False   # Default-deny — user must flip toggle in Tools Registry
+    _capture_grounding(tool, scroll)   # v0.9.51: real inputs → dry-run grounding
     vault.save_tool(tool)
 
     logger.info("[Forge] Tool '%s' approved & saved → %s (enabled=False)", tool.name, impl_path)
@@ -583,6 +611,7 @@ def _generate_and_save_code(
     tool.implementation_path = str(impl_path.relative_to(Path(config.vault_dir).parent))
     tool.status  = ToolStatus.FORGED
     tool.enabled = False   # Gate 3: user must explicitly enable in Tools Registry
+    _capture_grounding(tool, scroll)   # v0.9.51: real inputs → dry-run grounding
     vault.save_tool(tool)
 
     logger.info("[Forge] Tool '%s' forged → %s", tool.name, impl_path)

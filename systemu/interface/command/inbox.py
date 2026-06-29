@@ -130,6 +130,19 @@ def resolve_gate(decision, *, vault) -> CommandResult:
         # enabled, the heal sweep / recovery Pass 2 re-runs the parked task.
         from systemu.interface.command.verbs import tools_enable
         tool_ids = (ctx.get("tool_ids") or [])
+        # v0.9.51: the operator is explicitly retrying, so give each blocking tool a
+        # FRESH dry-run under current code FIRST — a tool cached `failed` under older
+        # code (or before a fix) may now pass, in which case tools_enable below
+        # actually succeeds instead of reporting it stuck. force=True bypasses the
+        # once-per-session bound since this is a deliberate operator action.
+        _act_for_reval = ctx.get("activity_id")
+        if _act_for_reval:
+            try:
+                from systemu.scheduler.tool_reconciler import revalidate_blocking_failed_tools
+                from sharing_on.config import Config as _RevalCfg
+                revalidate_blocking_failed_tools(vault, _RevalCfg.from_env(), _act_for_reval, force=True)
+            except Exception:
+                logger.debug("[Inbox] tools_blocked: pre-enable re-validate failed", exc_info=True)
         enabled, skipped, failed = [], [], []
         for tid in tool_ids:
             res = tools_enable(tid, vault=vault)

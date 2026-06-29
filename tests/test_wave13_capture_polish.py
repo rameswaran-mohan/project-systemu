@@ -76,6 +76,35 @@ class TestRunAgain:
         with pytest.raises(ValueError, match="approve"):
             work.rerun_workflow("scroll_9")
 
+    def test_rerun_by_activity_id_resubmits(self, monkeypatch):
+        # v0.9.51 live-events Re-trigger: the event context carries activity_id
+        # (not scroll_id), so the button uses the by-activity path; it must look up
+        # by id and submit with the activity's own scroll_id.
+        from systemu.interface.pages import work
+        import systemu.runtime.supervisor as sup_mod
+        from systemu.interface import dashboard_state as ds
+
+        calls = []
+
+        class _Sup:
+            def submit(self, activity_id, shadow_id, **kw):
+                calls.append((activity_id, shadow_id, kw.get("reason"), kw.get("scroll_id")))
+                return "sub_x"
+
+        class _Vault:
+            def load_index(self, kind):
+                return [{"id": "act_2", "scroll_id": "scroll_5",
+                         "assigned_shadow_id": "shadow_3", "name": "Zip job"}]
+
+        class _State:
+            vault = _Vault()
+
+        monkeypatch.setattr(sup_mod.Supervisor, "get", classmethod(lambda cls: _Sup()))
+        monkeypatch.setattr(ds.AppState, "get", classmethod(lambda cls: _State()))
+        msg = work.rerun_workflow_by_activity("act_2")
+        assert calls == [("act_2", "shadow_3", "operator_rerun", "scroll_5")]
+        assert "Zip job" in msg
+
     def test_row_renders_the_button(self):
         from systemu.interface.pages import work
         src = inspect.getsource(work._render_row)

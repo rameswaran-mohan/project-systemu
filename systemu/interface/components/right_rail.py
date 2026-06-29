@@ -135,7 +135,7 @@ def live_runs_pane(stream_ref: str = "", *, height_px: int = 280) -> None:
             "font-size: 12px;"
         ):
             if row["details"]:
-                render_event_details_body(row["details"])
+                render_event_details_body(row["details"], context=ev.get("context"))
             if row["decision_id"]:
                 def _answer(_=None, did=row["decision_id"]):
                     from systemu.interface.dashboard_state import AppState

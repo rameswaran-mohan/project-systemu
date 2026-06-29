@@ -302,8 +302,11 @@ class TestExecutorFinalizesUndeployable:
 
         assert result.status.value == "error"
         assert vault.get_activity("act_blocked").status == ActivityStatus.FAILED
-        # the dry-run error is surfaced to the operator in the result summary
-        assert "outfile" in result.summary
+        # the dry-run error is surfaced to the operator in the result summary. v0.9.51:
+        # "Enable & run" force-re-validates the failed tool first, so the surfaced error
+        # is the FRESH dry-run error and the blocking tool is named — both confirm the
+        # failure is surfaced (not the stale string specifically).
+        assert "dry-run failed" in result.summary and "tool_1" in result.summary
 
     def test_failed_tool_flips_waiting_chat_entry(self, vault):
         tools = [_failed_tool(1)]

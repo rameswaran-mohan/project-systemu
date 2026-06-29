@@ -17,9 +17,116 @@ from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
+# (activity_id, tool_id) pairs already re-validated this daemon session — bounds the
+# demand-driven re-validation so a genuinely-broken tool re-validates at most once
+# per task that needs it and never loops. Cleared on daemon restart.
+_revalidated_pairs: set = set()
+
 if TYPE_CHECKING:
     from systemu.vault.vault import Vault
     from sharing_on.config import Config
+
+
+def recover_stale_dry_run_failures(vault: "Vault") -> int:
+    """One-shot, run on daemon startup: a tool whose dry-run FAILED under an OLDER
+    systemu version may now PASS under the current code (e.g. the v0.9.51
+    deterministic param-synth no longer injects junk keys like ``dry_run`` that
+    crashed a conformant ``run()``). Reset such FORGED tools to ``not_run`` so the
+    reconciler re-validates them under the current code.
+
+    Bounded by design: a failure already stamped with the CURRENT version is left
+    alone, so a genuinely-broken tool re-validates at most once per upgrade and can
+    never loop. Returns the number of tools reset."""
+    try:
+        from systemu import __version__ as current
+    except Exception:
+        return 0
+    try:
+        headers = vault.load_index("tools") or []
+    except Exception:
+        logger.debug("[ToolReconciler] stale-recovery: could not load tools index", exc_info=True)
+        return 0
+    reset = 0
+    for h in headers:
+        if not isinstance(h, dict):
+            continue
+        if str(h.get("status", "")).lower() != "forged" or h.get("dry_run_status") != "failed":
+            continue
+        try:
+            tool = vault.get_tool(h["id"])
+        except Exception:
+            continue
+        ev = getattr(tool, "dry_run_evidence", None) or {}
+        if ev.get("systemu_version") == current:
+            continue   # failed under current code → leave it (no re-validation loop)
+        tool.dry_run_status = "not_run"
+        tool.dry_run_evidence = {}
+        try:
+            vault.save_tool(tool)
+            reset += 1
+        except Exception:
+            logger.debug("[ToolReconciler] stale-recovery: could not reset %s",
+                         h.get("id"), exc_info=True)
+    if reset:
+        logger.info("[ToolReconciler] reset %d stale-failed tool(s) for re-validation "
+                    "under v%s", reset, current)
+    return reset
+
+
+def revalidate_blocking_failed_tools(vault: "Vault", config: "Config", act_id: str,
+                                     *, force: bool = False) -> int:
+    """ROOT fix for "a stale dry-run failure permanently blocks a task": before the
+    reaper gives up on a parked activity, give each of its REQUIRED tools that is
+    cached ``failed`` ONE fresh dry-run under the CURRENT code. A fix shipped since
+    (e.g. the v0.9.51 engine no longer injects a junk ``dry_run`` key), a re-forge,
+    an installed dependency, or a cleared transient may now make it pass — so a tool
+    that genuinely works is no longer condemned by a stale verdict.
+
+    Demand-driven (only tools blocking a real parked task) and always-on (runs on
+    every reconcile tick, NOT just daemon startup). Bounded to once per
+    (activity, tool) per session: a tool that re-fails is left ``failed`` (stamped
+    with the current version) and the reaper then finalizes the task — no loop.
+    Returns the number of tools that recovered to DEPLOYED."""
+    from systemu.pipelines.tool_dry_run import dry_run_tool
+    from systemu.core.models import ToolStatus
+
+    try:
+        act = vault.get_activity(act_id)
+    except Exception:
+        return 0
+    recovered = 0
+    for tid in (getattr(act, "required_tool_ids", None) or []):
+        key = (act_id, tid)
+        if key in _revalidated_pairs and not force:   # force= an explicit operator retry (Enable & run)
+            continue
+        try:
+            tool = vault.get_tool(tid)
+        except Exception:
+            continue
+        if (getattr(tool, "status", None) != ToolStatus.FORGED
+                or (getattr(tool, "dry_run_status", "") or "") != "failed"):
+            continue
+        _revalidated_pairs.add(key)   # mark BEFORE running so a crash can't re-loop
+        try:
+            result = dry_run_tool(tool, vault=vault, config=config)
+        except Exception:
+            logger.debug("[ToolReconciler] demand re-validate crashed for %s", tid, exc_info=True)
+            continue
+        tool.dry_run_status = result.status
+        tool.dry_run_evidence = result.to_evidence()
+        if result.status == "passed":
+            tool.status = ToolStatus.DEPLOYED
+            recovered += 1
+            logger.info("[ToolReconciler] demand re-validate: '%s' -> DEPLOYED "
+                        "(was stale-failed, needed by %s)", tool.name, act_id)
+        else:
+            logger.info("[ToolReconciler] demand re-validate: '%s' still %s "
+                        "(needed by %s)", tool.name, result.status, act_id)
+        try:
+            vault.save_tool(tool)
+        except Exception:
+            logger.debug("[ToolReconciler] demand re-validate: save failed for %s", tid, exc_info=True)
+    return recovered
 
 
 def reconcile_once(vault: "Vault", config: "Config") -> int:
@@ -62,6 +169,7 @@ def reconcile_once(vault: "Vault", config: "Config") -> int:
             continue
 
         tool.dry_run_status = result.status
+        tool.dry_run_evidence = result.to_evidence()   # v0.9.51: persist fresh verdict + version stamp
         if result.status == "passed":
             tool.status = ToolStatus.DEPLOYED
             vault.save_tool(tool)
@@ -103,6 +211,7 @@ def reconcile_once(vault: "Vault", config: "Config") -> int:
                     if forged is not None:
                         result = dry_run_tool(tool, vault=vault, config=config)
                         tool.dry_run_status = result.status
+                        tool.dry_run_evidence = result.to_evidence()
                         if result.status in ("passed", "skipped"):
                             if result.status == "passed":
                                 tool.status = ToolStatus.DEPLOYED
@@ -121,6 +230,7 @@ def reconcile_once(vault: "Vault", config: "Config") -> int:
                     logger.exception("[ToolReconciler] re-forge self-heal crashed for %s", tool_id)
             if not healed:
                 tool.dry_run_status = result.status   # terminal 'failed'
+                tool.dry_run_evidence = result.to_evidence()   # v0.9.51: stamp version so recovery is bounded
                 vault.save_tool(tool)
                 # v0.9.48 Phase 3: a fresh `failed` dry-run must auto-disable a tool
                 # that was already DEPLOYED+enabled, so it can't stay callable.
@@ -176,6 +286,14 @@ def _fail_unsatisfiable_blocked_activities(vault: "Vault", config: "Config") -> 
         act_id = header.get("id")
         if not act_id:
             continue
+        # ROOT fix: before condemning the task on a stale dry-run failure, give its
+        # required failed tools ONE fresh dry-run under current code (demand-driven,
+        # bounded). A tool that recovers to DEPLOYED makes the activity satisfiable,
+        # so the finalizer below skips it and the parked task can proceed.
+        try:
+            revalidate_blocking_failed_tools(vault, config, act_id)
+        except Exception:
+            logger.debug("[ToolReconciler] reap: demand re-validate failed for %s", act_id, exc_info=True)
         try:
             if finalize_unsatisfiable_activity(
                     vault, act_id,

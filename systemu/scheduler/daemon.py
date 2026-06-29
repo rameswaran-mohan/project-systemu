@@ -419,6 +419,16 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # pattern — best-effort; daemon boots even on migrator failure.
     _v0822_run_vault_migrator(vault, logger_=logger)
 
+    # v0.9.51: re-validate tools whose dry-run failed under an OLDER version — a
+    # fix in this upgrade may now make them pass (e.g. the deterministic param-synth
+    # no longer injects a junk `dry_run` key). Bounded: a current-version failure is
+    # left alone. Best-effort; never blocks boot.
+    try:
+        from systemu.scheduler.tool_reconciler import recover_stale_dry_run_failures
+        recover_stale_dry_run_failures(vault)
+    except Exception:
+        logger.exception("[Daemon] v0.9.51: stale dry-run recovery failed — continuing boot")
+
     # W12 (ship-blocker, audit-caught live): under the daemon there IS a
     # decision queue and a dashboard — operator asks must route there, not
     # silently auto-skip headless. Without this, the first recorded

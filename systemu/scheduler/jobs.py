@@ -108,14 +108,22 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
             logger.debug("[ResumeReconciler] could not load decision %s", did, exc_info=True)
             continue
         dctx = decision.context or {}
+        kind = dctx.get("kind")
+        # v0.9.52: command gates (kind="gate"/gate_type="command") are now resumable
+        # too — _dispatch_resume derives their activity/shadow from the snapshot.
+        is_cmd_gate = (kind == "gate" and dctx.get("gate_type") == "command")
         # Cheap filters before touching the dispatcher
-        if dctx.get("kind") != "structured_question":
+        if kind != "structured_question" and not is_cmd_gate:
             continue
         if dctx.get("resume_dispatched"):
             continue
         if not dctx.get("chat_submission_id"):
             continue
-        if not (dctx.get("execution_id") and dctx.get("activity_id") and dctx.get("shadow_id")):
+        if not dctx.get("execution_id"):
+            continue
+        # structured_question carries activity/shadow in context; a command gate
+        # derives them from the snapshot inside _dispatch_resume.
+        if not is_cmd_gate and not (dctx.get("activity_id") and dctx.get("shadow_id")):
             continue
         try:
             if _rod._dispatch_resume(

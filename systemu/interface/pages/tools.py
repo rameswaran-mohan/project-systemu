@@ -880,7 +880,11 @@ def _show_spec_review_dialog(tool_id: str) -> None:
                     )
                     return
                 try:
-                    save_approved_code(tool, _pending_code[0], state.config, state.vault)
+                    # v0.9.51: resolve the forging scroll so save_approved_code can
+                    # ground the dry-run in the operator's real input files.
+                    _gscroll = _find_scroll_for_tool(tool, state)
+                    save_approved_code(tool, _pending_code[0], state.config, state.vault,
+                                       scroll=_gscroll)
                     # Double-forge guard: this rich review path just forged the
                     # tool (human-reviewed code). Resolve the matching forge:
                     # Inbox gate as "Forge" so it can't be Approved again from

@@ -273,3 +273,66 @@ def test_skip_advice_still_honored():
                return_value={"skip_dry_run": True, "skip_reason": "destructive"}):
         params, meta = _generate_test_params(_multiparam_tool(), config=MagicMock())
     assert meta.get("skip") is True
+
+
+# ── v0.9.51 graceful degradation: failure on an UN-synthesizable constrained
+#    param routes to operator_verify, not a doomed "failed" ─────────────────────
+
+def _pattern_tool():
+    return Tool(
+        id="tool_code", name="make_code", description="d",
+        tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.FORGED, enabled=False,
+        implementation_path="vault/tools/impl/make_code.py",
+        parameters_schema={
+            "type": "object",
+            "properties": {"code": {"type": "string", "pattern": "^[A-Z]{3}-[0-9]{4}$"}},
+            "required": ["code"],
+        },
+    )
+
+
+def test_unresolved_constrained_param_failure_becomes_operator_verify(vault):
+    from systemu.pipelines.tool_dry_run import dry_run_tool
+    with patch("systemu.pipelines.tool_dry_run._execute",
+               return_value={"success": False, "error": "ValueError: code must match pattern"}):
+        r = dry_run_tool(_pattern_tool(), vault=vault, config=MagicMock(vault_dir="vault"))
+    assert r.status == "skipped" and r.operator_verify is True
+
+
+# ── v0.9.51 context-grounding: forge capture + dry-run read ───────────────────
+
+def test_capture_grounding_sets_tool_inputs_from_scroll():
+    from systemu.pipelines.tool_forge import _capture_grounding
+    from systemu.core.models import Scroll
+    t = _tool()
+    scroll = Scroll(id="s1", name="n", source_session_id="x",
+                    raw_instructions_path="", narrative_md="",
+                    raw_request="please password-protect report.docx")
+    _capture_grounding(t, scroll)
+    assert t.grounding_inputs == ["report.docx"]
+
+
+def test_capture_grounding_noop_without_scroll():
+    from systemu.pipelines.tool_forge import _capture_grounding
+    t = _tool()
+    _capture_grounding(t, None)
+    assert t.grounding_inputs == []
+
+
+def test_dry_run_grounds_params_from_tool_inputs(vault, tmp_path):
+    from systemu.pipelines.tool_dry_run import dry_run_tool
+    import docx
+    real = tmp_path / "report.docx"
+    d = docx.Document(); d.add_paragraph("REAL CONTENT"); d.save(str(real))
+    t = _tool()                          # name=encrypt_docx, param source_path
+    t.grounding_inputs = [str(real)]
+    captured = {}
+
+    def _fake_execute(tool, params, **kw):
+        captured["params"] = params
+        return {"success": True, "parsed": {}}
+
+    with patch("systemu.pipelines.tool_dry_run._execute", _fake_execute):
+        dry_run_tool(t, vault=vault, config=MagicMock(vault_dir="vault"))
+    used = captured["params"]["source_path"]
+    assert "REAL CONTENT" in docx.Document(used).paragraphs[0].text   # real, grounded

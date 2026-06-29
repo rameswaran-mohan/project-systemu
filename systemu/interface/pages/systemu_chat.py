@@ -456,7 +456,7 @@ def build_systemu_chat_page() -> None:
                         with ui.expansion("Details", value=False).classes(
                             "w-full s-muted"
                         ).style("font-size: 11px;"):
-                            render_event_details_body(event.get("details") or {})
+                            render_event_details_body(event.get("details") or {}, context=event.get("context"))
 
         # Auto-scroll (inject JS — runs in the browser)
         if _auto_scroll[0]:
@@ -638,7 +638,7 @@ def build_systemu_chat_page() -> None:
                         with ui.expansion("Details", value=False).classes(
                             "w-full s-muted"
                         ).style("font-size: 11px;"):
-                            render_event_details_body(event.get("details") or {})
+                            render_event_details_body(event.get("details") or {}, context=event.get("context"))
 
     def _handle_approval_dismissed(event: Dict[str, Any]) -> None:
         """Close any open approval card whose dedup_key matches.

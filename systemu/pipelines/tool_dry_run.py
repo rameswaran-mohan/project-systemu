@@ -100,6 +100,10 @@ class DryRunResult:
 
     def to_evidence(self) -> Dict[str, Any]:
         """Compact evidence dict for persistence into ``Tool.dry_run_evidence``."""
+        try:
+            from systemu import __version__ as _ver
+        except Exception:
+            _ver = ""
         return {
             "success":      self.success,
             "status":       self.status,
@@ -107,6 +111,11 @@ class DryRunResult:
             "error":        self.error,
             "skip_reason":  self.skip_reason,
             "elapsed_ms":   self.elapsed_ms,
+            # v0.9.51: stamp the systemu version this verdict was produced under, so
+            # a failure from an OLDER version can be re-validated after an upgrade
+            # (a fix may now make it pass) without re-running current-version
+            # failures (which would loop). See recover_stale_dry_run_failures.
+            "systemu_version": _ver,
             "return_value_summary": (
                 {k: str(v)[:120] for k, v in (self.return_value or {}).items()}
                 if isinstance(self.return_value, dict) else None
@@ -169,19 +178,26 @@ def dry_run_tool(
             elapsed_ms=_elapsed_ms(t0),
         )
 
-    # Generate test params (LLM with schema-driven fallback).
-    params, gen_meta = _generate_test_params(tool, config=config, prior_failure=prior_failure)
+    # v0.9.51: the PARAMS are now synthesized DETERMINISTICALLY by the recursive
+    # schema-walk engine (replaces the flat, scalar-only LLM-first param-gen +
+    # _sandbox_paths) — a real, valid, materialized value for every leaf at ANY
+    # nesting depth (object / array / array-of-objects / nested), which dissolves
+    # the per-shape whack-a-mole. The LLM is still consulted ONLY for the semantic
+    # SKIP judgment ("this tool shouldn't be dry-run", e.g. it has real side
+    # effects) — a call no schema encodes; its param suggestions are ignored in
+    # favor of the engine.
+    _, gen_meta = _generate_test_params(tool, config=config, prior_failure=prior_failure)
     if gen_meta.get("skip"):
         return DryRunResult(
             success=False, status="skipped",
             skip_reason=gen_meta.get("skip_reason"),
-            params_used=params,
             elapsed_ms=_elapsed_ms(t0),
         )
 
-    # Tmp-path sandbox: rewrite any path-like arg to a unique tmp dir so
-    # even tools that ignore dry_run=True don't trash real outputs.
-    params = _sandbox_paths(params)
+    from systemu.pipelines.fixture_synth import synthesize_params
+    _synth = synthesize_params(tool.parameters_schema or {}, tool_name=tool.name,
+                               grounding_paths=getattr(tool, "grounding_inputs", None))
+    params = _synth.params
 
     # Destructive heuristic: refuse if destructive AND tool didn't accept dry_run.
     try:
@@ -218,6 +234,19 @@ def dry_run_tool(
         return DryRunResult(
             success=False, status="skipped", operator_verify=True,
             skip_reason="harness cannot synthesize a representative input for this file format — operator must verify",
+            params_used=params,
+            error=err[:1000],
+            elapsed_ms=elapsed,
+        )
+    # v0.9.51: the synthesizer couldn't fully satisfy a constrained param (e.g. a
+    # `pattern`-bound string — it has no regex engine). A failure may BE that gap,
+    # not a tool bug, so degrade to a non-doomed operator_verify instead of a hard
+    # fail (the "never false-fail on a synthesis gap" contract).
+    if _synth.unresolved:
+        return DryRunResult(
+            success=False, status="skipped", operator_verify=True,
+            skip_reason=("harness could not synthesize constrained param(s) "
+                         + ", ".join(_synth.unresolved) + " — operator must verify"),
             params_used=params,
             error=err[:1000],
             elapsed_ms=elapsed,

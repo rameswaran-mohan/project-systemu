@@ -750,6 +750,14 @@ class ToolSandbox:
         if store is not None and store.is_approved(sig):
             return  # "Always allow" on record → run
 
+        # v0.9.52: one-shot RESUME approval. The command-gate resume path marks
+        # this signature when it re-submits a parked task that the operator
+        # approved; the resumed run honors it exactly ONCE here (consumed), so it
+        # proceeds past the command instead of re-asking in a loop. A LATER,
+        # unrelated command re-asks normally (the mark is single-use).
+        if store is not None and store.consume_resume_approved(sig):
+            return
+
         # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
         # exact decision with a non-Deny choice; honor it once without
         # persisting (the re-attempt threads resolved_dedup=dedup).
@@ -780,11 +788,27 @@ class ToolSandbox:
 
         descriptor = GateDescriptor.from_command(
             tool_name=tool_name, command=command, cwd=cwd)
+        # v0.9.52: stamp the run's resume coords (from the contextvar carriers) so a
+        # PARKED command gate is resumable — resume_on_decision re-submits the
+        # activity with resume_from_execution_id and derives activity/shadow from the
+        # snapshot. Without these the parked chat task hangs forever on resolution.
+        _resume_extras = {"command": command, "cwd": cwd}
+        try:
+            from systemu.runtime.chat_submission_ctx import (
+                current_chat_submission_id, current_execution_id)
+            _exec_id = current_execution_id()
+            _chat_sub = current_chat_submission_id()
+            if _exec_id:
+                _resume_extras["execution_id"] = _exec_id
+            if _chat_sub:
+                _resume_extras["chat_submission_id"] = _chat_sub
+        except Exception:
+            logger.debug("[Sandbox] could not read run coords for command gate", exc_info=True)
         dec_id = InboxQueue(self._vault).enqueue(
             descriptor,
             gate_type="command",
             policy=None,                  # floor gate — never auto-allow
-            context_extras={"command": command, "cwd": cwd},
+            context_extras=_resume_extras,
         )
         raise PendingOperatorDecision(
             decision_id=dec_id,

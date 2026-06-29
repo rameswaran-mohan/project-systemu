@@ -146,24 +146,38 @@ def can_rerun(row: Dict[str, Any]) -> bool:
     return str(row.get("status", "")).lower() in _RERUN_STATUSES
 
 
-def rerun_workflow(scroll_id: str) -> str:
-    """Resubmit the workflow's activity to its assigned shadow (a fresh
-    execution — Supervisor dedups in-flight duplicates). Returns the toast
-    message; raises with a plain-language reason when it can't."""
-    from systemu.interface.dashboard_state import AppState
-    from systemu.runtime.supervisor import Supervisor
-
-    vault = AppState.get().vault
-    acts = vault.load_index("activities") or []
-    act = next((a for a in acts if a.get("scroll_id") == scroll_id), None)
+def _resubmit_activity(act, *, label: str) -> str:
+    """Shared core: validate the activity has an assigned shadow, then resubmit a
+    fresh execution (Supervisor dedups in-flight duplicates). Raises with a
+    plain-language reason when it can't."""
     if act is None:
         raise ValueError("this workflow has no runnable activity yet")
     shadow_id = act.get("assigned_shadow_id")
     if not shadow_id:
         raise ValueError("no specialist assigned yet — approve the workflow first")
+    from systemu.runtime.supervisor import Supervisor
     Supervisor.get().submit(act["id"], shadow_id, reason="operator_rerun",
-                            scroll_id=scroll_id)
-    return f"Re-running '{act.get('name') or scroll_id}' — watch Live."
+                            scroll_id=act.get("scroll_id"))
+    return f"Re-running '{act.get('name') or label}' — watch Live."
+
+
+def rerun_workflow(scroll_id: str) -> str:
+    """Resubmit the workflow's activity (looked up by scroll_id) to its assigned
+    shadow. Returns the toast message; raises with a plain reason when it can't."""
+    from systemu.interface.dashboard_state import AppState
+    acts = AppState.get().vault.load_index("activities") or []
+    return _resubmit_activity(
+        next((a for a in acts if a.get("scroll_id") == scroll_id), None), label=scroll_id)
+
+
+def rerun_workflow_by_activity(activity_id: str) -> str:
+    """Resubmit by ACTIVITY id — used by the live-events Re-trigger button, whose
+    event context carries activity_id (not scroll_id). DRY sibling of
+    rerun_workflow."""
+    from systemu.interface.dashboard_state import AppState
+    acts = AppState.get().vault.load_index("activities") or []
+    return _resubmit_activity(
+        next((a for a in acts if a.get("id") == activity_id), None), label=activity_id)
 
 def _short_ts(iso: str) -> str:
     """ISO timestamp → human-readable (seconds precision)."""
