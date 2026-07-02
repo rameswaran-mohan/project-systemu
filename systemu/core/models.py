@@ -331,6 +331,14 @@ class Tool(BaseModel):
     # fixtures in real content. Only those that still exist on disk at dry-run time
     # are used; otherwise the synthesizer falls back to a synthetic fixture.
     grounding_inputs: List[str] = []
+    # G0 (spec UNIFIED-v2 §5.7) — the shared EffectTag vocabulary as plain
+    # string values (see runtime/effect_tags.py). Stored as List[str] rather than
+    # List[EffectTag] so this foundational model stays free of a runtime-layer
+    # import cycle. Backfilled onto legacy tools by the vault migrator; consumed
+    # by the action-governance gate (S1) and requirement/verification stamping.
+    # An EMPTY list is never "no effect" — a tool with no readable source is
+    # UNKNOWN-until-classified at the gate.
+    effect_tags: List[str] = []
     # W2.2: forged (LLM-generated) tools execute in a subprocess by default;
     # the operator may opt a reviewed tool back into the in-process fast path
     # (~100-500ms faster per call) by setting this. Built-ins (not forged)

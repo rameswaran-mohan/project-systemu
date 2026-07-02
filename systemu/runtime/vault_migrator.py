@@ -71,6 +71,108 @@ def _file_sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+_EFFECT_TAGS_SEED_FILENAME = ".effect_tags_seed"
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """tempfile + os.replace so an interrupted write leaves the target intact."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None) -> Dict[str, Any]:
+    """G0 — one-pass, idempotent backfill of ``Tool.effect_tags`` onto every vault
+    tool body, classified deterministically from its implementation source
+    (spec UNIFIED-v2 §5.7 / §9 G0).
+
+    Version-gated via ``.effect_tags_seed`` (independent of the seed-tool fast
+    path), so it runs once per version bump and is a no-op on every boot after.
+    NEVER raises — a classification failure on one tool must not break boot; it
+    leaves that tool's tags empty (⇒ UNKNOWN-at-gate) and moves on.
+    """
+    log = logger_ or logger
+    vault_dir = Path(vault_dir)
+    version = version or _installed_version()
+
+    try:
+        marker = vault_dir / _EFFECT_TAGS_SEED_FILENAME
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == str(version):
+            return {"fast_path": True, "effect_tags_seed": version}
+
+        idx_path = vault_dir / "tools" / "index.json"
+        if not idx_path.exists():
+            # no tool catalog yet — retry on a later boot (do NOT stamp)
+            return {"skipped": True, "reason": "no tool index"}
+
+        try:
+            entries = json.loads(idx_path.read_text(encoding="utf-8")) or []
+        except Exception as exc:  # noqa: BLE001
+            log.error("[EffectTagBackfill] cannot read tool index: %s", exc)
+            return {"skipped": True, "reason": f"index unreadable: {exc}"}
+
+        from systemu.runtime.effect_tags import classify_source
+
+        impl_dir = vault_dir / "tools" / "implementations"
+        stamped = 0
+        errors: list = []
+        for entry in entries:
+            tid = entry.get("id")
+            name = entry.get("name")
+            if not tid:
+                continue
+            body_path = vault_dir / "tools" / f"tool_{tid}.json"
+            if not body_path.exists():
+                continue
+            try:
+                body = json.loads(body_path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"read {tid}: {exc}")
+                continue
+
+            impl_rel = body.get("implementation_path") or (f"{name}.py" if name else "")
+            source = ""
+            if impl_rel:
+                impl_path = impl_dir / impl_rel
+                if impl_path.exists():
+                    try:
+                        source = impl_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"source {tid}: {exc}")
+
+            try:
+                tags = sorted(t.value for t in classify_source(source)) if source else []
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"classify {tid}: {exc}")
+                tags = []
+
+            body["effect_tags"] = tags
+            try:
+                _write_text_atomic(body_path, json.dumps(body, indent=2) + "\n")
+                stamped += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"write {tid}: {exc}")
+
+        try:
+            _write_text_atomic(marker, str(version))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"marker: {exc}")
+
+        log.info("[EffectTagBackfill] version=%s stamped=%d errors=%d", version, stamped, len(errors))
+        return {"fast_path": False, "effect_tags_seed": version, "stamped": stamped, "errors": errors}
+    except Exception as exc:  # noqa: BLE001 — never break boot
+        log.error("[EffectTagBackfill] unexpected failure (non-fatal): %s", exc)
+        return {"error": str(exc)}
+
+
 def _maybe_log_profile_notice(vault_dir) -> None:
     """v0.9.0 (Layer 1): if vault has no user_profile.json, log a one-line
     nudge so operators discover the wizard."""
@@ -94,6 +196,12 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     _maybe_log_profile_notice(vault_dir)
 
     installed = _installed_version()
+
+    # G0: backfill EffectTags independently of the seed-tool fast path, so a
+    # version bump that only adds the vocabulary still stamps every tool. Own
+    # version marker; never raises.
+    backfill_effect_tags(vault_dir, version=installed, logger_=log)
+
     vault_seed = _read_seed_version(vault_dir)
 
     # Fast path
