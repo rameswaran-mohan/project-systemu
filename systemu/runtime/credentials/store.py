@@ -37,6 +37,44 @@ class CredentialStore:
     def _file(self) -> Path:
         return self._base / ".credentials.json"
 
+    @property
+    def _names_file(self) -> Path:
+        # T1 (spec §5.10): a NAMES-ONLY registry so OnTheTable can project which
+        # credentials exist. The keyring backend cannot enumerate its entries, so
+        # names are tracked here on set/delete. NEVER contains a secret value.
+        return self._base / ".credential_names.json"
+
+    def _read_names(self) -> list:
+        try:
+            if self._names_file.exists():
+                data = json.loads(self._names_file.read_text(encoding="utf-8"))
+                return [n for n in data if isinstance(n, str)] if isinstance(data, list) else []
+        except Exception:
+            pass
+        return []
+
+    def _write_names(self, names: list) -> None:
+        try:
+            self._base.mkdir(parents=True, exist_ok=True)
+            self._names_file.write_text(json.dumps(sorted(set(names))), encoding="utf-8")
+        except Exception as exc:  # the name registry must never break credential I/O
+            logger.debug("[Credentials] name registry write failed: %s", exc)
+
+    def _record_name(self, key: str) -> None:
+        names = self._read_names()
+        if key not in names:
+            self._write_names(names + [key])
+
+    def _forget_name(self, key: str) -> None:
+        names = self._read_names()
+        if key in names:
+            self._write_names([n for n in names if n != key])
+
+    def list_names(self) -> list:
+        """The registered credential NAMES (no values) — the OnTheTable projection
+        surface (keyring cannot enumerate its own entries)."""
+        return sorted(self._read_names())
+
     def get(self, key: str) -> Optional[str]:
         if self._keyring is not None:
             try:
@@ -54,9 +92,12 @@ class CredentialStore:
                 return "keyring"
             except Exception as exc:
                 logger.warning("[Credentials] keyring set failed: %s", exc)
+            finally:
+                self._record_name(key)
         data = self._read_file()
         data[key] = value
         self._write_file(data)
+        self._record_name(key)
         return "file"
 
     def delete(self, key: str) -> None:
@@ -69,6 +110,7 @@ class CredentialStore:
         if key in data:
             del data[key]
             self._write_file(data)
+        self._forget_name(key)
 
     def status(self, key: str) -> dict:
         v = self.get(key)
@@ -79,7 +121,11 @@ class CredentialStore:
     def _read_file(self) -> dict:
         try:
             if self._file.exists():
-                return json.loads(self._file.read_text(encoding="utf-8"))
+                from systemu.runtime.credentials.at_rest import unprotect_json
+                # S5: decrypts a DPAPI envelope AND reads a legacy plaintext
+                # fallback file transparently (migrate-on-read).
+                data = unprotect_json(self._file.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
         except Exception as exc:
             # A corrupt/unreadable store must not masquerade as "no credentials"
             # — that silently hides real secrets and may trigger re-provisioning.
@@ -88,8 +134,11 @@ class CredentialStore:
         return {}
 
     def _write_file(self, data: dict) -> None:
+        from systemu.runtime.credentials.at_rest import protect_json
         self._base.mkdir(parents=True, exist_ok=True)
-        self._file.write_text(json.dumps(data), encoding="utf-8")
+        # S5: encrypt the fallback file at rest via DPAPI on Windows (0o600 is a
+        # Windows no-op); chmod stays as the POSIX-secondary control.
+        self._file.write_text(protect_json(data), encoding="utf-8")
         try:
             os.chmod(self._file, 0o600)
         except Exception:  # pragma: no cover - non-posix perms

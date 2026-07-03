@@ -209,8 +209,22 @@ def requires_subprocess_isolation(tool) -> bool:
     """
     if tool is None:
         return True
-    return bool(getattr(tool, "forged_by_systemu", False)) and \
-        not bool(getattr(tool, "trusted_inprocess", False))
+    forged = bool(getattr(tool, "forged_by_systemu", False))
+    # S1b / §13.3: a forged tool carrying a dangerous (external-mutation / money /
+    # send / oauth) effect_tag is NEVER eligible for the in-process fast path —
+    # even if the operator marked it trusted_inprocess. trusted_inprocess is a
+    # SPEED grant, not a GOVERNANCE grant, so it cannot let a money-capable
+    # actuator run in-daemon with an ambient secret. Closes the bypass.
+    if forged:
+        try:
+            from systemu.runtime.action_governance import requires_isolation
+            if requires_isolation(getattr(tool, "effect_tags", None) or ()):
+                return True
+        except Exception:
+            # never let a governance-import hiccup weaken isolation — fail toward
+            # MORE isolation for forged code.
+            return True
+    return forged and not bool(getattr(tool, "trusted_inprocess", False))
 
 
 def _must_use_subprocess(tool_type, dependencies) -> bool:

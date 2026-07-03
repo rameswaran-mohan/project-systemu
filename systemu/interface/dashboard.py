@@ -421,6 +421,13 @@ def _build_layout(page_title: str, current_path: str):
                     from systemu.interface.ui_helpers import safe_timer as _ny_timer
                     _ny_timer(2.0, _update_needs_you)
 
+                    # T1b: discoverable link to the read-only OnTheTable board
+                    # (spine-less, like /inbox). A quiet neutral pill next to
+                    # "Needs you"; no count/timer — it's a static entry point.
+                    ui.link("On the table", "/table").classes("s-pill").style(
+                        "text-decoration: none; cursor: pointer;"
+                    )
+
                     # ＋New — the global creation menu (Record session / Submit
                     # task).  Trigger uses the design-system primitive (token
                     # classes, no inline f-style); the dropdown uses the
@@ -824,6 +831,7 @@ def register_routes() -> None:
     from systemu.interface.pages.inbox_page                 import build_inbox_page
     from systemu.interface.pages.workflow_detail           import build_workflow_detail_page
     from systemu.interface.pages.work                      import build_work_page
+    from systemu.interface.pages.table                     import build_table_page
     from systemu.interface.pages import recover as _recover_page_module  # noqa: F401  # registers /recover/<scope>/<id>
 
     def _redirect_to_welcome_if_needed() -> bool:
@@ -852,6 +860,16 @@ def register_routes() -> None:
             return
         with _build_layout("Home", "/"):
             build_console_page()
+
+    # ── OnTheTable (T1b: read-only inventory board) ───────────────────────
+    # Spine-less like /inbox and /welcome — claims its own path, no nav
+    # highlight. Reached via the header "On the table" link.
+    @ui.page("/table")
+    def page_table():
+        if _redirect_to_welcome_if_needed():
+            return
+        with _build_layout("On the table", "/table"):
+            build_table_page()
 
     # ── Welcome (W9.1: first-run onboarding wizard) ───────────────────────
     @ui.page("/welcome")

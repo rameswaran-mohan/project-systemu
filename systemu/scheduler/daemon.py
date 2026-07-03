@@ -554,6 +554,28 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # T1b (spec §5.10): OnTheTable projection reconciler — keeps the read-only
+    # /table snapshot warm by projecting the operational stores (MCP servers,
+    # tool catalog, credential names) into <vault>/table/items.json. Read-only,
+    # deterministic, idempotent, never raises (a bad tick leaves the last
+    # snapshot in place). The page also projects on demand, so this is warmth,
+    # not correctness.
+    from systemu.runtime.table_reconciler import reconcile_once as _reconcile_table
+    def _reconcile_table_job():
+        try:
+            _reconcile_table(vault)
+        except Exception:
+            logger.exception("[Daemon] table reconciler job crashed")
+
+    scheduler.add_job(
+        _reconcile_table_job,
+        trigger="interval",
+        seconds=60,
+        id="table_reconciler",
+        name="OnTheTable Projection Reconciler",
+        replace_existing=True,
+    )
+
     # Recovery scan-to-queue + stale-gate reconciler: recovery has no persisted
     # producer (diagnoses are on-demand scans), so this daemon job IS the
     # producer — it scans the vault, enqueues a recovery gate for every current

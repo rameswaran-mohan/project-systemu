@@ -34,18 +34,24 @@ class VaultTokenStore:
         if not self.path.exists():
             return {}
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            from systemu.runtime.credentials.at_rest import unprotect_json
+            # S5: transparently decrypts a DPAPI envelope AND reads a legacy
+            # plaintext token file (migrate-on-read — upgraded on next save).
+            data = unprotect_json(self.path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
         except Exception:
             logger.debug("[MCP-OAuth] token store unreadable at %s", self.path, exc_info=True)
             return {}
 
     def save(self, tokens: Dict[str, Any]) -> None:
+        from systemu.runtime.credentials.at_rest import protect_json
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        # Write then tighten perms to 0600 before the atomic replace, so the
-        # final file is never briefly world-readable.
-        tmp.write_text(json.dumps(tokens, indent=2), encoding="utf-8")
+        # S5: encrypt at rest via DPAPI on Windows (0o600 is a Windows no-op).
+        # The chmod stays as the POSIX-secondary control. Write then tighten
+        # perms before the atomic replace, so the final file is never briefly
+        # world-readable.
+        tmp.write_text(protect_json(tokens), encoding="utf-8")
         try:
             os.chmod(tmp, 0o600)
         except OSError:
