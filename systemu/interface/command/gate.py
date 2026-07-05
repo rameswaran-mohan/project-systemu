@@ -201,6 +201,38 @@ class GateDescriptor(BaseModel):
         )
 
     @classmethod
+    def from_tool(cls, *, tool_name: str, sig: str, verdict: str = "require_approval",
+                  reason: str = "", effect_tags=None) -> "GateDescriptor":
+        """Build a GateDescriptor for a gated forged/registry tool call (S1b, THE
+        CRUX). Mirrors ``from_command``: safe_default "Deny" (index 0, fail-closed),
+        dedup keyed on the EXACT tool signature (``tool:<sig>``) so re-attempts and
+        "Always allow" collapse to one row. The signature ``sig`` is
+        ``command_approvals.tool_signature(...)`` computed at the gate; it is stamped
+        into the decision's ``context_extras`` by the caller (Task 4 reads it on
+        resume — never recomputed there).
+
+        ``verdict`` is the ``Verdict`` value (str) from ``evaluate_action`` — DENY
+        posts the SAME card (safe_default Deny); the DENY-specific typed-confirm is a
+        later follow-up (S1b.1). Risk is "high" for a DENY, "medium" otherwise."""
+        options = ["Deny", "Approve once", "Always allow"]
+        tags = ", ".join(sorted(str(t) for t in (effect_tags or []))) or "unclassified"
+        inspect = f"tool: {tool_name}\neffects: {tags}\nverdict: {verdict}"
+        if reason:
+            inspect += f"\n\nReason: {reason}"
+        risk = "high" if str(verdict).lower() == "deny" else "medium"
+        return cls(
+            title=f"Run tool: {tool_name}",
+            risk=risk,
+            inspect=inspect,
+            options=options,
+            safe_default=options[0],
+            what_approve_does=(
+                f"Runs the {tool_name!r} tool ({tags}). 'Always allow' remembers "
+                "this exact tool body + effect set + host class."),
+            dedup=f"tool:{sig}",
+        )
+
+    @classmethod
     def from_mcp_call(cls, *, server: str, tool: str, params: dict,
                       destructive: bool = True) -> "GateDescriptor":
         """Build a GateDescriptor for an MCP tool call (v0.9.34 P0, §3.3 L3).

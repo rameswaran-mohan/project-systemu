@@ -467,6 +467,19 @@ class InboxQueue:
             created_at=now,
             resolved_at=now,
         ))
+        # S1b (PLAN-11): this row is born-resolved and bypasses post()/resolve()
+        # entirely, so without this it would be invisible to the approval-
+        # fatigue counters (an auto-policy "Always allow" grant). Count it as
+        # a resolved gate card. Best-effort: never break the auto-grant audit.
+        try:
+            from pathlib import Path
+
+            from systemu.runtime.metrics_store import MetricsStore
+            MetricsStore(Path(vault.root) / "metrics").record_resolution(
+                0.0, ts=now.timestamp(), choice=affirmative)
+        except Exception:
+            logger.debug(
+                "[inbox] metrics record_resolution (auto-allow) failed", exc_info=True)
 
     def list_descriptors(self) -> List[Tuple[str, GateDescriptor]]:
         out: List[Tuple[str, GateDescriptor]] = []

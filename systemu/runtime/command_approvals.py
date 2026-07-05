@@ -104,6 +104,22 @@ def mcp_session_key(server: str, tool: str, session_id: str) -> str:
     return hashlib.sha1(raw).hexdigest()
 
 
+def tool_signature(name: str, body_hash: str, effect_tags, *, host_class: str = "") -> str:
+    """IMPL-1 approval key for a forged/registry tool (S1b live action gate).
+
+    Order-insensitive over effect_tags (sorted before hashing); a changed
+    body_hash, tag set, or host_class invalidates the blessing. host_class
+    defaults to "" so non-network tools get a stable 3-tuple signature.
+    Disjoint from mcp_signature via the "tool" domain prefix. body_hash and
+    host_class are computed elsewhere and passed in as strings — this
+    function does no filesystem/host work.
+    """
+    norm_name = (name or "").strip()
+    tags = "\x00".join(sorted(str(t).strip() for t in (effect_tags or [])))
+    raw = f"tool\x00{norm_name}\x00{body_hash}\x00{tags}\x00{host_class}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
 class CommandApprovalStore:
     """Persistent allow-list of operator-approved command signatures.
 

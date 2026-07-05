@@ -354,8 +354,13 @@ def _enable(vault, server, tool, annotations):
 
 
 def test_readonly_tool_is_not_gated(tmp_path, monkeypatch):
-    """readOnlyHint == True ⇒ Tier R ⇒ NO gate (enqueue never called)."""
+    """readOnlyHint == True ⇒ Tier R ⇒ NO gate (enqueue never called) — for an
+    ALREADY-TRUSTED (pinned) tool. S1b Task 5: a first-use/unpinned read-only
+    tool no longer gets this free pass (see test_s1b_mcp_firstuse.py); pinning
+    the hash here is what makes the tool classification_trusted for this
+    regression floor."""
     from systemu.runtime.mcp import dispatch
+    from systemu.runtime.mcp import connections as conn
 
     called = {"enqueue": False}
 
@@ -368,6 +373,7 @@ def test_readonly_tool_is_not_gated(tmp_path, monkeypatch):
 
     v = _Vault(tmp_path)
     _enable(v, "http://h", "read_inbox", {"readOnlyHint": True})
+    conn.set_tool_hash(v, "http://h", "read_inbox", "deadbeef")  # pin ⇒ trusted
     # Must NOT raise and NOT enqueue.
     dispatch._gate_mcp_call("http://h", "read_inbox", {}, vault=v,
                             config=_Cfg(), session_id="run_A")
@@ -626,9 +632,12 @@ def test_call_action_tool_gates_before_transport(tmp_path, monkeypatch):
 
 
 def test_call_readonly_tool_runs_and_guards_output(tmp_path, monkeypatch):
-    """Happy path: a read-only enabled tool runs the transport (no gate) and the
-    output is wrapped by the L4 guard."""
+    """Happy path: a TRUSTED (pinned) read-only enabled tool runs the transport
+    (no gate) and the output is wrapped by the L4 guard. S1b Task 5: pinning
+    the hash is what makes this tool classification_trusted; an unpinned
+    first-use tool now gates instead (test_s1b_mcp_firstuse.py)."""
     from systemu.runtime.mcp import dispatch
+    from systemu.runtime.mcp import connections as conn
     import systemu.runtime.mcp.client as mcp_client
 
     monkeypatch.setattr(
@@ -638,6 +647,7 @@ def test_call_readonly_tool_runs_and_guards_output(tmp_path, monkeypatch):
 
     v = _Vault(tmp_path)
     _enable(v, "http://h", "read_inbox", {"readOnlyHint": True})
+    conn.set_tool_hash(v, "http://h", "read_inbox", "deadbeef")  # pin ⇒ trusted
     out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
                                  config=_Cfg(), session_id="run_A")
     assert out["success"] is True
@@ -648,13 +658,18 @@ def test_call_readonly_tool_runs_and_guards_output(tmp_path, monkeypatch):
 
 
 def test_call_propagates_transport_failure(tmp_path, monkeypatch):
+    """Uses a TRUSTED (pinned) read-only tool so the call reaches the
+    transport (see S1b Task 5 note above) — this test is about transport
+    failure propagation, not the first-use gate."""
     from systemu.runtime.mcp import dispatch
+    from systemu.runtime.mcp import connections as conn
     import systemu.runtime.mcp.client as mcp_client
 
     monkeypatch.setattr(mcp_client, "mcp_call_tool",
                         lambda **kw: {"success": False, "error": "HTTP 500: boom"})
     v = _Vault(tmp_path)
     _enable(v, "http://h", "read_inbox", {"readOnlyHint": True})
+    conn.set_tool_hash(v, "http://h", "read_inbox", "deadbeef")  # pin ⇒ trusted
     out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
                                  config=_Cfg(), session_id="run_A")
     assert out["success"] is False

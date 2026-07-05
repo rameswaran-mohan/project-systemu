@@ -175,6 +175,11 @@ class TestQuickLaneInclusion:
                             description="Find an invoice",
                             schema={"type": "object"},
                             annotations={"readOnlyHint": True})
+        # S1b Task 5: an UNPINNED (first-use) tool now gates regardless of
+        # readOnlyHint. Pin it here to simulate a tool already seen before —
+        # this test is about quick-lane dispatch/index inclusion, not the
+        # first-use gate (see tests/test_s1b_mcp_firstuse.py for that).
+        cx.set_tool_hash(vault, server, "lookup_invoice", "test-pinned-hash")
 
         # v0.9.36 P2: the call now routes through the SDK-isolated manager
         # (httpx REST stub dropped). Mock the manager's transport-level call_tool
@@ -234,6 +239,10 @@ class TestQuickLaneInclusion:
         cx.set_tool_enabled(vault, "http://x", "ghost_tool", True,
                             description="", schema={},
                             annotations={"readOnlyHint": True})
+        # S1b Task 5: pin the hash so this (otherwise first-use) tool is
+        # classification_trusted and the Tier-R short-circuit still applies —
+        # this test targets empty-response-is-failure, not first-use gating.
+        cx.set_tool_hash(vault, "http://x", "ghost_tool", "test-pinned-hash")
         monkeypatch.setattr(client, "mcp_call_tool",
                             lambda **k: {"success": True, "response": {}})
         llm = self._llm([

@@ -247,6 +247,34 @@ def test_reaper_finalizes_failed_dryrun_tool_regression(real_vault):
     assert real_vault.get_activity("a").status == ActivityStatus.FAILED
 
 
+def test_reaper_revalidation_skip_does_not_uncondemn_failed_tool(real_vault):
+    """S1b regression lock: the fail-closed egress guard makes a re-validation of
+    an untagged / unreadable-source tool return ``skipped`` (never ``passed``).
+    A ``skipped`` re-validation must NOT overwrite the tool's condemned ``failed``
+    status — otherwise the tool flips back to pending and the blocked activity is
+    left PARTIAL forever instead of being finalized. Before the reaper fix this
+    activity stayed PARTIAL; after it, the tool stays ``failed`` and the reaper
+    finalizes the activity FAILED.
+    """
+    from systemu.core.models import ActivityStatus, ToolStatus
+    import systemu.scheduler.tool_reconciler as recon
+
+    # A stale-failed FORGED tool with EMPTY effect_tags and a NON-EXISTENT impl
+    # file (p/skipme.py) — so dry_run_tool's fail-closed guard returns "skipped".
+    _f4_tool(real_vault, "skipme", status=ToolStatus.FORGED, dry_run_status="failed",
+             effect_tags=[])
+    _f4_act(real_vault, "a", ["skipme"])
+    # Clear the once-per-(activity,tool) revalidation memo so this run re-validates.
+    recon._revalidated_pairs.discard(("a", "skipme"))
+
+    recon._fail_unsatisfiable_blocked_activities(real_vault, None)
+
+    # The re-validation returned "skipped"; the tool must stay condemned…
+    assert real_vault.get_tool("skipme").dry_run_status == "failed"
+    # …and the reaper must still finalize the blocked activity FAILED (not PARTIAL).
+    assert real_vault.get_activity("a").status == ActivityStatus.FAILED
+
+
 def test_reaper_idempotent_across_ticks(real_vault):
     from systemu.core.models import ActivityStatus
     from systemu.scheduler.tool_reconciler import _fail_unsatisfiable_blocked_activities

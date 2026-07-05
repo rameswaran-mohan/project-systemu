@@ -112,20 +112,30 @@ def revalidate_blocking_failed_tools(vault: "Vault", config: "Config", act_id: s
         except Exception:
             logger.debug("[ToolReconciler] demand re-validate crashed for %s", tid, exc_info=True)
             continue
-        tool.dry_run_status = result.status
-        tool.dry_run_evidence = result.to_evidence()
         if result.status == "passed":
+            # Only a fresh PASS may recover an already-condemned tool. Since the
+            # S1b fail-closed egress guard makes any net/shell/untagged tool
+            # deterministically SKIP its dry-run, a "skipped" result can never be
+            # evidence of recovery — and a "failed" result is a re-fail. Neither
+            # may un-condemn the tool: overwriting `failed` with `skipped` would
+            # silently flip it back to pending and leave the blocked activity
+            # parked forever instead of letting the reaper finalize it. So we
+            # only mutate state on a pass; on skip/fail we leave the tool `failed`.
+            tool.dry_run_status = result.status
+            tool.dry_run_evidence = result.to_evidence()
             tool.status = ToolStatus.DEPLOYED
             recovered += 1
             logger.info("[ToolReconciler] demand re-validate: '%s' -> DEPLOYED "
                         "(was stale-failed, needed by %s)", tool.name, act_id)
+            try:
+                vault.save_tool(tool)
+            except Exception:
+                logger.debug("[ToolReconciler] demand re-validate: save failed for %s", tid, exc_info=True)
         else:
-            logger.info("[ToolReconciler] demand re-validate: '%s' still %s "
-                        "(needed by %s)", tool.name, result.status, act_id)
-        try:
-            vault.save_tool(tool)
-        except Exception:
-            logger.debug("[ToolReconciler] demand re-validate: save failed for %s", tid, exc_info=True)
+            # Left `failed` on purpose (see above) — the reaper still finalizes.
+            logger.info("[ToolReconciler] demand re-validate: '%s' fresh result %s "
+                        "does not recover a failed tool — left failed (needed by %s)",
+                        tool.name, result.status, act_id)
     return recovered
 
 

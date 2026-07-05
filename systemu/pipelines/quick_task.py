@@ -794,6 +794,7 @@ def _execute_tool(sandbox, tool, params: Dict[str, Any]):
             tool_type=getattr(tool.tool_type, "value", tool.tool_type),
             force_subprocess=requires_subprocess_isolation(tool),
             _command_gate_resolved=resolved_dedup,
+            tool=tool,   # S1b: thread the Tool so the sandbox action gate can score it
         ))
 
     def _denied(msg: str):

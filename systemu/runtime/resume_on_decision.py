@@ -67,8 +67,14 @@ def _dispatch_resume(decision, *, vault, supervisor,
     # v0.9.52: a parked COMMAND gate (kind="gate", gate_type="command") is now
     # resumable too — previously only structured_question questions resumed, so a
     # chat task that parked on a run_command approval hung forever on resolution.
-    is_cmd_gate = (kind == "gate" and dctx.get("gate_type") == "command")
-    if kind != "structured_question" and not is_cmd_gate:
+    # S1b (Task 4): a gate_type="tool" action gate resumes the SAME way (its
+    # activity/shadow also derive from the snapshot; its Deny/Approve branches are
+    # gate_type-discriminated below so the command path stays byte-for-byte).
+    gate_type = dctx.get("gate_type")
+    is_cmd_gate = (kind == "gate" and gate_type == "command")
+    is_tool_gate = (kind == "gate" and gate_type == "tool")
+    is_gate = is_cmd_gate or is_tool_gate
+    if kind != "structured_question" and not is_gate:
         return False
     if not dctx.get("chat_submission_id"):
         return False
@@ -79,8 +85,8 @@ def _dispatch_resume(decision, *, vault, supervisor,
         logger.info("[ResumeOnDecision] decision %s has no execution_id — skipping", decision.id)
         return False
 
-    # A command gate doesn't carry activity_id/shadow_id (the sandbox doesn't know
-    # them), so derive them from the parked run's snapshot. structured_question
+    # A command/tool gate doesn't carry activity_id/shadow_id (the sandbox doesn't
+    # know them), so derive them from the parked run's snapshot. structured_question
     # carries them directly in its context.
     activity_id = dctx.get("activity_id")
     shadow_id = dctx.get("shadow_id")
@@ -101,11 +107,12 @@ def _dispatch_resume(decision, *, vault, supervisor,
         return False
 
     choice = (decision.choice or "").strip().lower()
-    if is_cmd_gate:
+    if is_gate:
         if choice in ("deny", ""):
-            # Operator denied a REQUIRED command → the task can't proceed; mark it
-            # FAILED rather than re-submitting (which would re-ask the same command
-            # → loop). Idempotent: only flips a non-terminal activity.
+            # Operator denied a REQUIRED command/tool → the task can't proceed; mark
+            # it FAILED rather than re-submitting (which would re-ask the same action
+            # → loop). Idempotent: only flips a non-terminal activity. gate_type-
+            # agnostic — a tool gate finalizes identically to a command gate.
             try:
                 from systemu.core.models import ActivityStatus
                 act = vault.get_activity(activity_id)
@@ -114,22 +121,43 @@ def _dispatch_resume(decision, *, vault, supervisor,
                     act.status = ActivityStatus.FAILED
                     vault.save_activity(act)
             except Exception:
-                logger.debug("[ResumeOnDecision] command-deny finalize failed", exc_info=True)
+                logger.debug("[ResumeOnDecision] gate-deny finalize failed", exc_info=True)
             _stamp_dispatched(decision, vault)
-            logger.info("[ResumeOnDecision] command gate DENIED for activity %s — finalized", activity_id)
+            logger.info("[ResumeOnDecision] %s gate DENIED for activity %s — finalized",
+                        gate_type, activity_id)
             return True
-        # Approve once / Always allow → mark a SINGLE-USE resume approval keyed by
-        # the command signature so the resumed run honors it exactly once (then
-        # re-asks for any later command), then re-submit the activity.
-        try:
-            from systemu.runtime.command_approvals import command_signature, init_default_store
-            from pathlib import Path as _P
-            sig = command_signature(dctx.get("command") or "", cwd=dctx.get("cwd") or "")
-            store = init_default_store(_P("data"))
-            if store is not None:
-                store.mark_resume_approved(sig)
-        except Exception:
-            logger.debug("[ResumeOnDecision] could not mark resume approval", exc_info=True)
+        if is_tool_gate:
+            # S1b (Task 4): three-way split, SCOPED TO tool gates. The signature is
+            # the value STAMPED into the context by the gate (Task 3) — read it back,
+            # NEVER recompute (no tool object is in scope here). "Always allow" →
+            # STANDING allow-list (store.approve); "Approve once" → SINGLE-USE resume
+            # bridge honored exactly once (store.mark_resume_approved), then re-submit.
+            try:
+                from systemu.runtime.command_approvals import init_default_store
+                from pathlib import Path as _P
+                sig = dctx.get("tool_signature")
+                store = init_default_store(_P("data"))
+                if store is not None and sig:
+                    if choice == "always allow":
+                        store.approve(sig)
+                    else:
+                        store.mark_resume_approved(sig)
+            except Exception:
+                logger.debug("[ResumeOnDecision] could not record tool approval", exc_info=True)
+        else:
+            # Command gate (byte-for-byte unchanged from v0.9.52): Approve once /
+            # Always allow → mark a SINGLE-USE resume approval keyed by the command
+            # signature so the resumed run honors it exactly once (then re-asks for
+            # any later command), then re-submit the activity.
+            try:
+                from systemu.runtime.command_approvals import command_signature, init_default_store
+                from pathlib import Path as _P
+                sig = command_signature(dctx.get("command") or "", cwd=dctx.get("cwd") or "")
+                store = init_default_store(_P("data"))
+                if store is not None:
+                    store.mark_resume_approved(sig)
+            except Exception:
+                logger.debug("[ResumeOnDecision] could not mark resume approval", exc_info=True)
     else:
         # structured_question: stash the operator's answer into the snapshot so the
         # runtime applies it deterministically on resume.

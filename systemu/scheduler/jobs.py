@@ -111,9 +111,14 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
         kind = dctx.get("kind")
         # v0.9.52: command gates (kind="gate"/gate_type="command") are now resumable
         # too — _dispatch_resume derives their activity/shadow from the snapshot.
-        is_cmd_gate = (kind == "gate" and dctx.get("gate_type") == "command")
+        # S1b (Task 4): gate_type="tool" action gates resume the same way (also
+        # snapshot-derived), so the pre-filter must exempt them identically.
+        gate_type = dctx.get("gate_type")
+        is_cmd_gate = (kind == "gate" and gate_type == "command")
+        is_tool_gate = (kind == "gate" and gate_type == "tool")
+        is_gate = is_cmd_gate or is_tool_gate
         # Cheap filters before touching the dispatcher
-        if kind != "structured_question" and not is_cmd_gate:
+        if kind != "structured_question" and not is_gate:
             continue
         if dctx.get("resume_dispatched"):
             continue
@@ -121,9 +126,9 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
             continue
         if not dctx.get("execution_id"):
             continue
-        # structured_question carries activity/shadow in context; a command gate
+        # structured_question carries activity/shadow in context; a command/tool gate
         # derives them from the snapshot inside _dispatch_resume.
-        if not is_cmd_gate and not (dctx.get("activity_id") and dctx.get("shadow_id")):
+        if not is_gate and not (dctx.get("activity_id") and dctx.get("shadow_id")):
             continue
         try:
             if _rod._dispatch_resume(

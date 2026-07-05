@@ -40,6 +40,22 @@ if TYPE_CHECKING:
 _VALID_STATUS = ("pending", "resolved", "expired")
 
 
+def _metrics(vault: "Vault"):
+    """Best-effort ``MetricsStore`` bound to this vault's root.
+
+    S1b (PLAN-11) approval-fatigue counters. Callers MUST wrap every use of
+    the returned store — INCLUDING this constructor call — in try/except: a
+    metrics failure (construction error, ``vault.root`` unusable, or a store
+    write error) must never break decision posting/resolving. This function
+    does NOT swallow construction errors itself; it lets them propagate to the
+    caller's try/except, which every current call site has.
+    """
+    from pathlib import Path as _Path
+
+    from systemu.runtime.metrics_store import MetricsStore
+    return MetricsStore(_Path(vault.root) / "metrics")
+
+
 @dataclass
 class OperatorDecision:
     """A single operator decision record.
@@ -158,6 +174,18 @@ class OperatorDecisionQueue:
             "[DecisionQueue] posted '%s' (id=%s, dedup_key=%r, options=%s)",
             title, decision.id, dedup_key, options,
         )
+        # S1b (PLAN-11): count a newly-CREATED card. Only reached on the
+        # non-dedup branch above (the dedup short-circuit returns earlier),
+        # so a re-attempted command that collapses onto an existing pending
+        # card is never double-counted. Best-effort: never break posting.
+        try:
+            kind = (decision.context or {}).get("kind")
+            if kind == "gate":
+                _metrics(self._vault).incr("gate_cards_created")
+            elif kind == "structured_question":
+                _metrics(self._vault).incr("asks_created")
+        except Exception:
+            logger.debug("[DecisionQueue] metrics incr (created) failed", exc_info=True)
         # v0.8.22 (C): emit EventBus event so chat UI can render an inline card.
         # W5.3: self-describing event — top-level ts/level/message so EVERY
         # pane (incl. the right-rail Live stream, which reads event["message"])
@@ -286,6 +314,7 @@ class OperatorDecisionQueue:
             "[DecisionQueue] resolved %s -> %r (dedup_key=%r)",
             decision_id, choice, decision.dedup_key,
         )
+        self._record_resolution(decision)
         # v0.8.22 (C): emit EventBus event so the chat UI hides the inline card.
         # W5.3: self-describing (ts/level/message) — see post() note.
         try:
@@ -336,6 +365,7 @@ class OperatorDecisionQueue:
         self._vault.save_decision(decision)
         logger.info("[DecisionQueue] resolved+patched %s -> %r (keys=%s)",
                     decision_id, choice, sorted((context_patch or {}).keys()))
+        self._record_resolution(decision)
         return decision
 
     def consume_resolved_choice(self, dedup_key: str) -> Optional[str]:
@@ -439,6 +469,34 @@ class OperatorDecisionQueue:
         return True
 
     # ── Private helpers ──────────────────────────────────────────────
+
+    def _record_resolution(self, decision: "OperatorDecision") -> None:
+        """S1b (PLAN-11): record a resolution against the approval-fatigue
+        metrics store. Called from BOTH ``resolve`` and
+        ``resolve_with_context_patch`` (the two decision-resolving paths) so
+        the single-writer invariant holds — ``consume_resolved_choice``
+        (resolved -> consumed) and ``expire_by_dedup_key`` (pending ->
+        expired) are NOT resolutions and must never call this.
+
+        Best-effort: a metrics failure must never break decision resolving.
+        """
+        try:
+            kind = (decision.context or {}).get("kind")
+            if kind == "gate":
+                created_at = decision.created_at
+                resolved_at = decision.resolved_at
+                latency_ms = (
+                    (resolved_at - created_at).total_seconds() * 1000
+                    if created_at is not None and resolved_at is not None
+                    else 0.0
+                )
+                ts = resolved_at.timestamp() if resolved_at is not None else 0.0
+                _metrics(self._vault).record_resolution(
+                    latency_ms, ts=ts, choice=decision.choice or "")
+            elif kind == "structured_question":
+                _metrics(self._vault).incr("asks_resolved")
+        except Exception:
+            logger.debug("[DecisionQueue] metrics record_resolution failed", exc_info=True)
 
     def _find_pending_by_dedup_key(self, dedup_key: str) -> Optional[OperatorDecision]:
         try:

@@ -213,6 +213,21 @@ def dry_run_tool(
         # Conservative: if we can't evaluate, proceed — tmp-path sandbox is a strong floor.
         pass
 
+    # IMPL-3 (S1b): net-egress guard. A freshly-forged tool may not have gone
+    # through any review — the destructive-call heuristic above is a NAME/PARAM
+    # guess and misses network verbs entirely. Without this, dry_run_tool would
+    # happily _execute() a tool that phones home. S2 (the OS-level egress jail)
+    # doesn't exist yet, so this is the only thing standing between an unreviewed
+    # forged tool and a live network call during what is supposed to be a dry run.
+    net_skip = _net_egress_skip_reason(tool, config)
+    if net_skip:
+        return DryRunResult(
+            success=False, status="skipped",
+            skip_reason=net_skip,
+            params_used=params,
+            elapsed_ms=_elapsed_ms(t0),
+        )
+
     # Execute via the existing sandbox.
     result = _execute(tool, params, vault=vault, config=config)
     elapsed = _elapsed_ms(t0)
@@ -286,6 +301,16 @@ def replay_against_history(
         return DryRunResult(
             success=True, status="passed",
             replayed_count=0,
+            elapsed_ms=_elapsed_ms(t0),
+        )
+
+    # IMPL-3 (S1b): same net-egress guard as dry_run_tool — replay must not let
+    # a net-tagged tool phone home either, since it runs unattended off history.
+    net_skip = _net_egress_skip_reason(tool, config)
+    if net_skip:
+        return DryRunResult(
+            success=False, status="skipped",
+            skip_reason=net_skip,
             elapsed_ms=_elapsed_ms(t0),
         )
 
@@ -610,6 +635,81 @@ def _execute(
     except Exception as exc:
         logger.exception("[ToolDryRun] sandbox execution crashed")
         return {"success": False, "error": f"sandbox crash: {exc}"}
+
+
+# IMPL-3 (S1b): the ONLY effect tags that affirmatively prove a tool cannot
+# egress — the three purely-local classes from effect_tags.EffectTag
+# (local_read / local_write / local_delete). Everything else is a reason NOT to
+# execute the body during a dry-run:
+#   * net verbs (net_read / net_mutate / send_message / money_move / oauth_call)
+#     — obvious egress; net_read is included DELIBERATELY (a dry-run must not
+#     phone home even for a read: it leaks presence, burns a rate-limited quota).
+#   * shell_exec — a shell can `curl` out, so it is egress-capable.
+#   * unknown — classify_source couldn't resolve the source (unparseable).
+#   * EMPTY / undeterminable — no declared tags AND the source scan yielded
+#     nothing (unreadable file, or an aliased import like `import requests as r`
+#     that the AST classifier doesn't recognize).
+# This guard FAILS CLOSED: it proceeds ONLY when it can prove non-egress, i.e.
+# the effective tags are non-empty and a subset of SAFE_LOCAL. This matches the
+# live S1 gate's "empty ⇒ UNKNOWN ⇒ don't trust" principle — the dry-run must be
+# at least as safe as the gated live path.
+_SAFE_LOCAL_TAGS = {"local_read", "local_write", "local_delete"}
+
+
+def _resolve_impl_path(tool: "Tool", config: "Config") -> Optional[Path]:
+    """Resolve ``tool.implementation_path`` to an on-disk path the same way
+    ``_execute`` / ``ToolSandbox.execute_tool`` does: relative paths are
+    anchored off ``vault_root.parent`` (vault_root == ``config.vault_dir``)."""
+    impl_rel = getattr(tool, "implementation_path", None)
+    if not impl_rel:
+        return None
+    impl_path = Path(impl_rel)
+    if not impl_path.is_absolute():
+        try:
+            vault_root = Path(config.vault_dir).resolve()
+        except Exception:
+            return None
+        impl_path = vault_root.parent / impl_rel
+    return impl_path
+
+
+def _net_egress_skip_reason(tool: "Tool", config: Optional["Config"] = None) -> Optional[str]:
+    """Fail-closed egress guard: return a skip reason UNLESS the tool can be
+    affirmatively proven non-egress, in which case return ``None`` (proceed).
+
+    The effective tag set is the declared ``effect_tags``, or — when those are
+    empty (a freshly-forged tool often has none stamped yet) — a deterministic
+    ``classify_source`` scan of the implementation file. The dry-run proceeds
+    ONLY when that set is non-empty AND a subset of :data:`_SAFE_LOCAL_TAGS`
+    (local_read/write/delete). Any other outcome — net verbs, ``shell_exec``,
+    ``unknown``, or an EMPTY/undeterminable set (unreadable/unparseable source,
+    or an aliased import the AST scan misses) — SKIPS, so no unreviewed body can
+    egress under the "dry run" label. This mirrors the live S1 gate's
+    "empty ⇒ UNKNOWN ⇒ don't trust" stance.
+    """
+    try:
+        tags = {str(t).strip().lower() for t in (tool.effect_tags or [])}
+    except Exception:
+        tags = set()
+
+    if not tags and config is not None:
+        try:
+            from systemu.runtime.effect_tags import classify_source
+            impl_path = _resolve_impl_path(tool, config)
+            if impl_path is not None and impl_path.exists():
+                source = impl_path.read_text(encoding="utf-8", errors="replace")
+                tags = {t.value if hasattr(t, "value") else str(t)
+                        for t in classify_source(source)}
+        except Exception:
+            logger.debug("[ToolDryRun] classify_source fallback failed", exc_info=True)
+
+    # PROCEED only when we can PROVE non-egress: non-empty and purely local.
+    if tags and tags <= _SAFE_LOCAL_TAGS:
+        return None
+    return (
+        "cannot verify non-egress (net/shell/unknown/undeterminable tags) — "
+        "dry-run skipped; operator verifies live"
+    )
 
 
 def _looks_destructive(tool: "Tool") -> bool:

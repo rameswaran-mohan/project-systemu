@@ -93,6 +93,25 @@ def _inject_sandbox_kwargs(handler, params: Dict[str, Any], output_dir: str) -> 
 # which lowercases to the same text the substring denylist scans.
 _FORCE_FLAG_RE = re.compile(r"--force(?![-\w])")
 
+
+def _small_args_preview(parameters: Any, *, max_keys: int = 8, max_len: int = 80) -> Dict[str, Any]:
+    """A small, bounded args preview for the ActionContext (S1b tool gate).
+
+    Truncates values so a large payload never bloats the gate card or the
+    should_mask secret scan. Non-dict params collapse to a single key."""
+    if not isinstance(parameters, dict):
+        return {"value": str(parameters)[:max_len]}
+    out: Dict[str, Any] = {}
+    for i, (k, v) in enumerate(parameters.items()):
+        if i >= max_keys:
+            break
+        s = v if isinstance(v, (int, float, bool)) else str(v)
+        if isinstance(s, str) and len(s) > max_len:
+            s = s[:max_len] + "…"
+        out[str(k)] = s
+    return out
+
+
 # Programs that only READ system/file state. Deliberately tight: anything
 # not provably read-only keeps the safety gate.
 _READONLY_PROGRAMS = {
@@ -577,6 +596,7 @@ class ToolSandbox:
             timeout=timeout,
             tool_type=getattr(tool, "tool_type", None),
             force_subprocess=requires_subprocess_isolation(tool),   # W2.2
+            tool=tool,   # S1b: thread the Tool so the sandbox action gate can score it
         )
         return tr.to_dict()
 
@@ -596,6 +616,7 @@ class ToolSandbox:
         tool_type: Optional[str] = None,
         force_subprocess: bool = False,
         _command_gate_resolved: Optional[str] = None,
+        tool: Optional[Any] = None,
     ) -> ToolResult:
         """Execute a tool implementation script with the given parameters.
 
@@ -646,6 +667,17 @@ class ToolSandbox:
         # already-approved signatures fall through and run.
         self._maybe_gate_command(tool_name, parameters,
                                  resolved_dedup=_command_gate_resolved)
+
+        # ── S1b (THE CRUX): per-tool live action gate ─────────────────────
+        # The SAME chokepoint gates effectful forged/registry tools via the
+        # deterministic action governor (evaluate_action). A REQUIRE_APPROVAL /
+        # DENY verdict on an un-approved tool posts a gate_type='tool' card and
+        # raises the SAME PendingOperatorDecision the command gate raises, so the
+        # existing quick-lane park/poll/resume machinery catches it unchanged. A
+        # benign local (ALLOW) tool falls through and runs. No-op when the Tool
+        # is out of scope (tool=None) — legacy/registry-less path unchanged.
+        self._maybe_gate_tool(tool, tool_name, parameters,
+                              resolved_dedup=_command_gate_resolved)
 
         # ── Fast path: ToolRegistry (direct Python function call) ─────────
         # Browser/Playwright tools MUST go through the subprocess path — their
@@ -832,6 +864,164 @@ class ToolSandbox:
                      "Open the dashboard Inbox and choose Deny / Approve once "
                      "/ Always allow."),
         )
+
+    def _maybe_gate_tool(self, tool, tool_name: str, parameters: Dict[str, Any],
+                         *, resolved_dedup: Optional[str] = None) -> None:
+        """S1b (THE CRUX): the live per-tool action gate (IMPL-1).
+
+        Builds an ``ActionContext`` from the Tool's EffectTags + target-network
+        signal, runs the deterministic ``evaluate_action`` governor, and — for a
+        REQUIRE_APPROVAL / DENY verdict on a tool whose signature isn't already
+        approved — posts a ``gate_type='tool'`` gate and raises the SAME
+        ``PendingOperatorDecision`` the command gate raises. ALLOW/MASK fall
+        through (run unchanged).
+
+        No-op when ``tool is None`` — the v2 code-registry fast path and any
+        legacy caller without a Tool in scope stay unchanged for now (they are
+        wired incrementally). ``resolved_dedup`` is the quick-lane one-shot
+        resume/approve-once token: on the re-call the resume-approved signature
+        is consumed here (mirrors ``_maybe_gate_command``).
+        """
+        if tool is None:
+            return  # no Tool to gate — legacy/registry-less path unchanged
+
+        from systemu.runtime.action_governance import (
+            ActionContext, Verdict, evaluate_action)
+
+        effect_tags = {str(t) for t in (getattr(tool, "effect_tags", None) or [])}
+
+        # D1 host/target — DEFERRED until a real host resolver lands (a later
+        # task). `target_is_network` means "an actually-RESOLVED untrusted host"
+        # (derived from `ctx.target`), NOT "the tool carries a net tag" — the two
+        # are different, and conflating them is a bug: `_effective_tags`
+        # (action_governance.py) escalates a network-reachable target from
+        # net_read UP to net_mutate, which would over-gate every network-READING
+        # tool (weather lookups, page fetches, API GETs) that the governor is
+        # meant to ALLOW frictionlessly (test_action_governance::test_net_read_allow).
+        # We have NO host resolver yet, so `target` stays None and both the network
+        # flag and `host_class` stay UNCONDITIONALLY empty. `evaluate_action`
+        # already routes every effect from `effect_tags` alone: net_read ⇒ ALLOW
+        # (frictionless majority); net_mutate / send_message / oauth_call /
+        # money_move / local_delete ⇒ REQUIRE_APPROVAL (via _APPROVAL_TAGS);
+        # empty ⇒ UNKNOWN ⇒ REQUIRE_APPROVAL. When a host resolver exists it will
+        # populate `target` + `target_is_network` from the RESOLVED host, and
+        # `host_class` will re-enter the signature — a deliberate future change.
+        target_is_network = False
+        host_class = ""
+
+        # D2 body-hash: sha1 of the resolved implementation file; fall back to
+        # id:version for a built-in / v2 code-registered tool with no impl path.
+        body_hash = self._tool_body_hash(tool)
+
+        # D3 signature: computed HERE and stamped into the gate context_extras so
+        # the resume path (Task 4) reads it back rather than recomputing.
+        from systemu.runtime.command_approvals import tool_signature
+        sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
+                             effect_tags, host_class=host_class)
+
+        ctx = ActionContext(
+            tool=getattr(tool, "name", tool_name),
+            effect_tags=effect_tags,
+            is_destructive_param=self.is_destructive_call(tool_name, parameters),
+            target=None,
+            target_is_network=target_is_network,
+            classification_trusted=True,
+            args_preview=_small_args_preview(parameters),
+        )
+        verdict, reason = evaluate_action(ctx)
+
+        if verdict in (Verdict.ALLOW, Verdict.MASK):
+            return  # frictionless majority — run unchanged
+
+        # Resolve the approval store (fail-closed: no store → still gate).
+        from systemu.runtime.command_approvals import init_default_store
+        store = self._command_approvals
+        if store is None:
+            try:
+                store = init_default_store(Path("data"))
+            except Exception:
+                store = None
+        if store is not None and store.is_approved(sig):
+            return  # "Always allow" on record → run
+        # One-shot resume-approval (park→resume bridge): honored exactly once.
+        if store is not None and store.consume_resume_approved(sig):
+            return
+        # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
+        # exact decision with a non-Deny choice; honor once without persisting.
+        dedup = f"tool:{sig}"
+        if resolved_dedup and resolved_dedup == dedup:
+            try:
+                from systemu.approval.decision_queue import OperatorDecisionQueue
+                choice = OperatorDecisionQueue(self._vault).consume_resolved_choice(dedup)
+                if choice is not None and (choice or "").strip().lower() != "deny":
+                    return
+            except Exception:
+                logger.debug("[Sandbox] tool-gate approve-once bypass check failed; "
+                             "falling through to re-gate (fail-closed)",
+                             exc_info=True)
+
+        # Not approved → post the gate and raise (mirror _maybe_gate_command).
+        from systemu.approval.exceptions import PendingOperatorDecision
+        from systemu.interface.command.gate import GateDescriptor
+        from systemu.interface.command.inbox import InboxQueue
+
+        descriptor = GateDescriptor.from_tool(
+            tool_name=getattr(tool, "name", tool_name),
+            sig=sig,
+            verdict=getattr(verdict, "value", str(verdict)),
+            reason=reason,
+            effect_tags=effect_tags,
+        )
+        # D3: stamp the signature (+ tool name) so the resume path reads it back;
+        # carry the run's resume coords so a PARKED tool gate is resumable.
+        _resume_extras = {
+            "tool_signature": sig,
+            "tool_name": getattr(tool, "name", tool_name),
+            "tool_id": getattr(tool, "id", "") or "",
+        }
+        try:
+            from systemu.runtime.chat_submission_ctx import (
+                current_chat_submission_id, current_execution_id)
+            _exec_id = current_execution_id()
+            _chat_sub = current_chat_submission_id()
+            if _exec_id:
+                _resume_extras["execution_id"] = _exec_id
+            if _chat_sub:
+                _resume_extras["chat_submission_id"] = _chat_sub
+        except Exception:
+            logger.debug("[Sandbox] could not read run coords for tool gate", exc_info=True)
+        dec_id = InboxQueue(self._vault).enqueue(
+            descriptor,
+            gate_type="tool",
+            policy=None,                  # floor gate — never auto-allow
+            context_extras=_resume_extras,
+        )
+        raise PendingOperatorDecision(
+            decision_id=dec_id,
+            dedup_key=descriptor.dedup,
+            options=descriptor.options,
+            message=(f"Operator approval required to run tool `{getattr(tool, 'name', tool_name)}`. "
+                     "Open the dashboard Inbox and choose Deny / Approve once "
+                     "/ Always allow."),
+        )
+
+    def _tool_body_hash(self, tool) -> str:
+        """D2 body-hash: sha1 of the resolved implementation file's bytes. Falls
+        back to ``<id>:<version>`` for a built-in / v2 code-registered tool with
+        no on-disk implementation path (or if the file can't be read)."""
+        import hashlib
+        impl_path = (getattr(tool, "implementation_path", None)
+                     or getattr(tool, "impl_path", None) or "")
+        if impl_path:
+            try:
+                p = Path(impl_path)
+                if not p.is_absolute():
+                    p = self.vault_root.parent / impl_path
+                return hashlib.sha1(p.resolve().read_bytes()).hexdigest()
+            except Exception:
+                logger.debug("[Sandbox] tool body-hash read failed for %s; "
+                             "falling back to id:version", impl_path, exc_info=True)
+        return f"{getattr(tool, 'id', '')}:{getattr(tool, 'version', '')}"
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 

@@ -169,18 +169,37 @@ def _gate_mcp_call(server: str, tool: str, params: Dict[str, Any], *,
                    resolved_dedup: Optional[str] = None) -> None:
     """L3 action gate. Mirrors tool_sandbox._maybe_gate_command, risk-tiered.
 
-    No-op for Tier R (read-only). For Tier A/D: short-circuit on Always-allow
+    No-op for Tier R (read-only) ONLY when the tool is CLASSIFICATION-TRUSTED
+    (S1b Task 5, spec §5.5.1/§15-UX gap-close): a discovered/registry/
+    first-use tool that self-declares ``readOnlyHint: True`` does NOT get a
+    free pass on its first call — a malicious or misdescribed server could
+    otherwise claim read-only and skip the gate entirely. Trust is derived
+    from ``connections.get_tool_hash`` — None means the tool definition has
+    never been pinned (first-seen); non-None means it survived at least one
+    prior gated/approved call and the rug-pull re-hash keeps re-pinning it on
+    every subsequent use. An env/registry-discovered server that hasn't been
+    per-tool pinned is untrusted for this purpose too (same ``get_tool_hash``
+    signal — env-autotrust only grants L2 availability, never an L3 free
+    pass). Once trusted, Tier R calls stay ungated as before (no fatigue).
+
+    For Tier A/D, and for untrusted Tier R: short-circuit on Always-allow
     (always) and session-trust (Tier A only — Tier D still per-call); honor a
     one-shot ``resolved_dedup`` bypass; else post the mcp_call floor gate and
     raise PendingOperatorDecision.
 
     Fail-closed: any failure to RESOLVE the store leaves the gate active.
     """
-    from systemu.runtime.mcp.connections import get_enabled_meta
+    from systemu.runtime.mcp.connections import get_enabled_meta, get_tool_hash
     meta = get_enabled_meta(vault, server, tool) or {}
     tier = _tier_for(meta.get("annotations") or {})
-    if tier == "R":
-        return  # read-only → never gate
+
+    # classification_trusted: read the pin state BEFORE call_mcp_tool's
+    # rug-pull re-hash (dispatch.py ~:354-377) has a chance to pin it — this
+    # function runs from call_mcp_tool at ~:343-344, strictly before the pin
+    # at ~:369, so first-use is observed here on its true first call.
+    classification_trusted = get_tool_hash(vault, server, tool) is not None
+    if tier == "R" and classification_trusted:
+        return  # read-only AND already trusted (pinned) → never gate
 
     destructive = tier == "D"
 

@@ -29,18 +29,52 @@ def vault(tmp_path: Path) -> Vault:
 
 def _add_tool(vault: Vault, name: str, body: str, *, enabled: bool = True,
               status: ToolStatus = ToolStatus.DEPLOYED) -> Tool:
-    """Register a module-style tool with a real implementation file."""
+    """Register a module-style tool with a real implementation file.
+
+    S1b: the live per-tool action gate (``ToolSandbox._maybe_gate_tool``)
+    treats an UNTAGGED tool as UNKNOWN effect ⇒ REQUIRE_APPROVAL — exactly
+    what the forge pipeline avoids by backfilling ``effect_tags`` from
+    ``classify_source`` at forge time. Mirror that here so a test tool is
+    classified the SAME way a real forged tool would be, instead of being
+    unrealistically untagged.
+    """
+    from systemu.runtime.effect_tags import classify_source
+
     impl = Path(vault.root) / "tools" / "implementations" / f"{name}.py"
     impl.write_text(body, encoding="utf-8")
+    effect_tags = sorted(t.value for t in classify_source(body))
     tool = Tool(
         id=generate_id("tool"), name=name, description=f"test tool {name}",
         tool_type=ToolType.PYTHON_FUNCTION, status=status, enabled=enabled,
         implementation_path=str(impl),
         forged_by_systemu=True,   # exercises the W6 subprocess runner path
         parameter_names=["x"],
+        effect_tags=effect_tags,
     )
     vault.save_tool(tool)
     return tool
+
+
+def _pre_approve_tool(tool: Tool, tmp_path: Path):
+    """Bless a tool signature the way an operator's "Always allow" would,
+    for a test tool that ``classify_source`` cannot resolve (empty body /
+    no recognizable I/O sink ⇒ UNKNOWN ⇒ REQUIRE_APPROVAL — a legitimate
+    gate, not a test-tagging gap). Computes the signature EXACTLY the way
+    ``ToolSandbox._maybe_gate_tool`` does (name + body sha1 + sorted
+    effect_tags + host_class=""), then returns a ``ToolSandbox`` wired to
+    the pre-populated store so ``run_quick_task(..., sandbox=...)`` picks
+    it up instead of the default ``data/`` store."""
+    import hashlib
+
+    from systemu.runtime.command_approvals import CommandApprovalStore, tool_signature
+    from systemu.runtime.tool_sandbox import ToolSandbox
+
+    body_hash = hashlib.sha1(Path(tool.implementation_path).read_bytes()).hexdigest()
+    sig = tool_signature(tool.name, body_hash, set(tool.effect_tags or []),
+                         host_class="")
+    store = CommandApprovalStore(tmp_path / "command_approvals.json")
+    store.approve(sig, command=tool.name)
+    return store
 
 
 _ECHO_BODY = (
@@ -114,13 +148,20 @@ class TestQuickLoop:
         _add_tool(vault, "echo_tool", _ECHO_BODY, status=ToolStatus.PROPOSED)
         assert _enabled_tool_records(vault) == []
 
-    def test_iteration_cap_salvages_partial_from_gathered_data(self, vault):
+    def test_iteration_cap_salvages_partial_from_gathered_data(self, vault, tmp_path):
         """RCA 2026-06-13: the loop gathered real data (web_read → a restaurant)
         but never emitted ANSWER, then DROPPED it on budget exhaustion. It must
         now synthesize an honest PARTIAL from the gathered observation — the
         answer was sitting in history — not return a bare 'failed'."""
         from systemu.pipelines.quick_task import run_quick_task
-        _add_tool(vault, "echo_tool", _ECHO_BODY)
+        from systemu.runtime.tool_sandbox import ToolSandbox
+        tool = _add_tool(vault, "echo_tool", _ECHO_BODY)
+        # echo_tool's body has no recognizable I/O sink (it just returns a
+        # literal dict) -> classify_source legitimately yields {} -> UNKNOWN
+        # -> REQUIRE_APPROVAL. That's a correctly-gated tool, not a tagging
+        # gap, so bless it the way an operator's "Always allow" would.
+        store = _pre_approve_tool(tool, tmp_path)
+        sandbox = ToolSandbox(vault.root, vault=vault, command_approvals=store)
         llm = _fake_llm([{"action": "TOOL_CALL", "tool": "echo_tool",
                           "params": {"x": "Lassiwala Dhaba 4.0 stars"}}])
         synth_calls = {"n": 0}
@@ -131,7 +172,8 @@ class TestQuickLoop:
             return "Best match: **Lassiwala Dhaba** (4.0/5)."
 
         res = run_quick_task("best punjabi restaurant near me", None, vault,
-                             llm_json=llm, max_iters=3, synthesize=fake_synth)
+                             llm_json=llm, max_iters=3, synthesize=fake_synth,
+                             sandbox=sandbox)
         assert res.status == "partial"
         assert "Lassiwala Dhaba" in res.answer_md
         assert synth_calls["n"] == 1

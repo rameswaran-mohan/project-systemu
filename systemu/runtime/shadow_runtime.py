@@ -5520,6 +5520,7 @@ class ShadowRuntime:
             extra_packages=tool_obj.dependencies or [],
             tool_type=getattr(tool_obj.tool_type, "value", tool_obj.tool_type),
             force_subprocess=requires_subprocess_isolation(tool_obj),
+            tool=tool_obj,   # S1b: thread the Tool so the sandbox action gate can score it
         )
 
         # v0.9.1 (T8 must-wire): apply max_result_size_chars truncation.

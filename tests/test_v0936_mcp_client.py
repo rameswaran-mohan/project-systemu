@@ -586,6 +586,12 @@ class TestDispatchRugPullOnUse:
         from sharing_on.config import Config
         c.set_tool_enabled(mcp_vault, "http://s", "echo", True, description="d",
                            annotations={"readOnlyHint": True})
+        # S1b Task 5: an unpinned (first-use) tool now gates regardless of
+        # readOnlyHint, and this test's stub vault has no decision-queue
+        # backing (would error/hang on a real gate post). Pin the hash so
+        # this tool is classification_trusted — this test targets vault=
+        # threading, not first-use gating (see test_s1b_mcp_firstuse.py).
+        c.set_tool_hash(mcp_vault, "http://s", "echo", "test-pinned-hash")
         seen = {}
 
         def fake_call(*, server, name, params, config, vault=None, timeout=30.0):
@@ -594,7 +600,6 @@ class TestDispatchRugPullOnUse:
 
         import systemu.runtime.mcp.client as mc
         monkeypatch.setattr(mc, "mcp_call_tool", fake_call)
-        # No pin yet -> first use pins, passes through.
         monkeypatch.setattr(mc, "mcp_list_tools",
                             lambda *a, **k: {"success": True, "tools": []})
         out = d.call_mcp_tool("http://s", "echo", {"text": "hi"},

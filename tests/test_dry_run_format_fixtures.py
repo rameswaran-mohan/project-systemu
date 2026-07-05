@@ -181,6 +181,10 @@ def _tool():
         id="tool_fmt", name="encrypt_docx", description="d",
         tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.FORGED, enabled=False,
         implementation_path="vault/tools/impl/encrypt_docx.py",
+        # Local-only I/O (reads a source .docx, writes the encrypted output), so
+        # the S1b fail-closed egress guard classifies it <= SAFE_LOCAL and lets
+        # the dry-run proceed to the mocked _execute (no network/shell effect).
+        effect_tags=["local_read", "local_write"],
         parameters_schema={
             "type": "object",
             "properties": {"source_path": {"type": "string"}},
@@ -283,6 +287,9 @@ def _pattern_tool():
         id="tool_code", name="make_code", description="d",
         tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.FORGED, enabled=False,
         implementation_path="vault/tools/impl/make_code.py",
+        # Local-only (produces a code string / writes output), no egress — tagged
+        # local so the S1b fail-closed guard proceeds to the mocked _execute.
+        effect_tags=["local_write"],
         parameters_schema={
             "type": "object",
             "properties": {"code": {"type": "string", "pattern": "^[A-Z]{3}-[0-9]{4}$"}},

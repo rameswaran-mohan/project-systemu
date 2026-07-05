@@ -126,8 +126,20 @@ def _load_tool_meta(impl: Path) -> dict:
 def _register_impl(vault: Vault, name: str, impl: Path) -> Tool:
     """Save a full Tool record for an implementation file already inside the
     temp vault. enabled + DEPLOYED so the quick lane's readiness gate admits
-    it; forged_by_systemu so the W6 subprocess-isolation path is exercised."""
+    it; forged_by_systemu so the W6 subprocess-isolation path is exercised.
+
+    S1b: the live per-tool action gate treats an untagged tool as UNKNOWN
+    effect (dangerous-until-proven) and gates it. In production the forge
+    pipeline backfills ``effect_tags`` from ``classify_source`` at forge
+    time — mirror that here so these golden-task registrations are tagged
+    the same way a real forged tool would be, instead of unrealistically
+    shipping with no tags.
+    """
+    from systemu.runtime.effect_tags import classify_source
+
     meta = _load_tool_meta(impl)
+    body = impl.read_text(encoding="utf-8")
+    effect_tags = sorted(t.value for t in classify_source(body))
     tool = Tool(
         id=generate_id("tool"),
         name=name,
@@ -139,6 +151,7 @@ def _register_impl(vault: Vault, name: str, impl: Path) -> Tool:
         forged_by_systemu=True,
         dependencies=list(meta.get("dependencies") or []),
         parameter_names=_PARAMETER_NAMES.get(name, []),
+        effect_tags=effect_tags,
     )
     vault.save_tool(tool)
     return tool
@@ -159,6 +172,29 @@ def _register_inline_tool(vault: Vault, name: str, body: str) -> Tool:
     impl = Path(vault.root) / "tools" / "implementations" / f"{name}.py"
     impl.write_text(body, encoding="utf-8")
     return _register_impl(vault, name, impl)
+
+
+def _pre_approve_tool(tool: Tool, tmp_path: Path):
+    """Bless a tool signature the way an operator's "Always allow" would,
+    for a tool whose body ``classify_source`` genuinely cannot resolve to a
+    known low-risk effect (e.g. no recognizable I/O sink, or a body that
+    only returns a literal) — a legitimately-gated UNKNOWN, not a tagging
+    gap. Computes the signature EXACTLY the way
+    ``ToolSandbox._maybe_gate_tool`` does (name + body sha1 + sorted
+    effect_tags + host_class=""), then returns a ``ToolSandbox`` wired to
+    the pre-populated store so ``run_quick_task(..., sandbox=...)`` picks
+    it up instead of the default ``data/`` store."""
+    import hashlib
+
+    from systemu.runtime.command_approvals import CommandApprovalStore, tool_signature
+    from systemu.runtime.tool_sandbox import ToolSandbox
+
+    body_hash = hashlib.sha1(Path(tool.implementation_path).read_bytes()).hexdigest()
+    sig = tool_signature(tool.name, body_hash, set(tool.effect_tags or []),
+                         host_class="")
+    store = CommandApprovalStore(tmp_path / "command_approvals.json")
+    store.approve(sig, command=tool.name)
+    return store
 
 
 def _fake_llm(script):
@@ -346,8 +382,18 @@ class TestGoldenTasks:
         point the only place the seeded filenames can appear is the real
         file_list_dir result (the later write params aren't in history yet)."""
         from systemu.pipelines.quick_task import run_quick_task
-        _register_real_tool(vault, "file_list_dir")
+        from systemu.runtime.tool_sandbox import ToolSandbox
+        list_dir_tool = _register_real_tool(vault, "file_list_dir")
         _register_real_tool(vault, "write_markdown_file")
+        # file_list_dir's body walks the filesystem with Path.exists/is_dir/
+        # glob — none of which classify_source recognizes as a read sink
+        # (it only knows read_text/read_bytes/open()), so it legitimately
+        # classifies to {} -> UNKNOWN -> REQUIRE_APPROVAL. That is a
+        # correctly-gated tool (dangerous-until-proven), not a tagging gap,
+        # so bless it the way an operator's "Always allow" would.
+        store = _pre_approve_tool(list_dir_tool, tmp_path)
+        sandbox = ToolSandbox(vault.root, vault=vault, config=cfg,
+                              command_approvals=store)
 
         inbox = tmp_path / "inbox"
         inbox.mkdir()
@@ -368,7 +414,7 @@ class TestGoldenTasks:
         ])
 
         res = run_quick_task("Index the inbox folder as markdown", cfg, vault,
-                             llm_json=llm)
+                             llm_json=llm, sandbox=sandbox)
 
         assert res.status == "success" and res.tool_calls == 2
         listings = _tool_results(llm.calls["payloads"][1], "file_list_dir")
@@ -382,21 +428,30 @@ class TestGoldenTasks:
             assert f"- {name}" in written
         assert str(index_md.resolve()) in res.files_produced
 
-    def test_golden_failing_tool_fails_the_run_honestly(self, vault, cfg):
+    def test_golden_failing_tool_fails_the_run_honestly(self, vault, cfg, tmp_path):
         """Golden 6: the honest-failure contract. A tool that reports
         success=False on every call must end the run as `failed` with an
         error naming the tool after the 3-strike streak — the exact governor
         the v0.9.13 no-ops disarmed (empty stdout read as success, so the
         streak never counted and runs looped silently)."""
         from systemu.pipelines.quick_task import run_quick_task
-        _register_inline_tool(vault, "broken_export", _FAIL_BODY)
+        from systemu.runtime.tool_sandbox import ToolSandbox
+        tool = _register_inline_tool(vault, "broken_export", _FAIL_BODY)
+        # _FAIL_BODY has no recognizable I/O sink (it only returns a literal
+        # failure dict) -> classify_source legitimately yields {} -> UNKNOWN
+        # -> REQUIRE_APPROVAL. Bless it so the run fails for the RIGHT reason
+        # (the tool's own reported failure), not because the gate denied it.
+        store = _pre_approve_tool(tool, tmp_path)
+        sandbox = ToolSandbox(vault.root, vault=vault, config=cfg,
+                              command_approvals=store)
 
         llm = _fake_llm([
             {"action": "TOOL_CALL", "tool": "broken_export",
              "params": {"report": "q2"}, "reasoning": "export the report"},
         ])
 
-        res = run_quick_task("Export the Q2 report", cfg, vault, llm_json=llm)
+        res = run_quick_task("Export the Q2 report", cfg, vault, llm_json=llm,
+                             sandbox=sandbox)
 
         assert res.status == "failed"
         assert "broken_export" in (res.error or ""), \

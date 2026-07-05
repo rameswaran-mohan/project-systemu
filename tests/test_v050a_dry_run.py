@@ -238,6 +238,9 @@ class TestReplayAgainstHistory:
         from systemu.pipelines.tool_dry_run import replay_against_history
         t = _make_tool()
         t.implementation_path = "vault/tools/implementations/t.py"
+        # Local-only tool — tagged so the S1b fail-closed egress guard proceeds
+        # to the mocked _execute (this test exercises replay routing, not egress).
+        t.effect_tags = ["local_write"]
         t.last_successful_params = [{"x": "1"}, {"x": "2"}, {"x": "3"}]
         config = MagicMock(); config.openrouter_api_key = "test"; config.vault_dir = "vault"
 
@@ -253,6 +256,9 @@ class TestReplayAgainstHistory:
         from systemu.pipelines.tool_dry_run import replay_against_history
         t = _make_tool()
         t.implementation_path = "vault/tools/implementations/t.py"
+        # Local-only tool — tagged so the fail-closed egress guard proceeds to
+        # the mocked _execute (this test exercises replay-regression routing).
+        t.effect_tags = ["local_write"]
         t.last_successful_params = [{"x": "1"}, {"x": "bad"}, {"x": "3"}]
         config = MagicMock(); config.openrouter_api_key = "test"; config.vault_dir = "vault"
 
