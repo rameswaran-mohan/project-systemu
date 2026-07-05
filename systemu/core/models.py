@@ -123,6 +123,12 @@ class Objective(BaseModel):
     # with a StateDelta to judge whether the work happened. None = legacy
     # behavior (credit on tool success).
     verifier:         Optional[str] = None
+    # G1 (R-A2 / SPEC §5.2): a mutable+durable objective graph carries where each
+    # node came from and whether its effect demands external ground-truth verification.
+    # Defaults reproduce today's behavior: scroll-refiner objectives are "planner"-origin
+    # and require no external check, so legacy on-disk objectives validate unchanged.
+    origin: Literal["planner", "discovery", "retry", "backchain"] = "planner"
+    requires_external_verification: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

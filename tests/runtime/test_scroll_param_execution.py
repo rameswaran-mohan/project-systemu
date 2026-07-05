@@ -261,10 +261,17 @@ def test_substituted_params_flow_into_built_user_payload():
 
 
 def test_execute_sources_prompt_from_context_after_substitution():
-    # Wiring guard for the seam-(e) fix in execute(): the loop must refresh
-    # scroll_json + re-parse objectives from context when a substitution replaced
-    # them (identity check), and source the payload intent from context.
+    # Wiring guard for the seam-(e) fix. G1 Task 5 folded the objectives-refresh
+    # (identity check + re-parse from context.scroll_json) into the module-level
+    # _resolve_objectives_for_run helper, which execute() now calls. The wiring is
+    # preserved — the guard just follows it to its new home:
+    #   * execute() delegates the objectives fold to _resolve_objectives_for_run,
+    #     and still sources the payload intent from context.
+    #   * the helper carries the param-substitution identity check + re-parse.
     src = inspect.getsource(_sr.ShadowRuntime.execute)
-    assert "context.scroll_json is not scroll_json" in src
-    assert ".model_validate(o) for o in scroll_json" in src
+    assert "_resolve_objectives_for_run(" in src
     assert 'getattr(context, "scroll_intent"' in src
+
+    helper_src = inspect.getsource(_sr._resolve_objectives_for_run)
+    assert "ctx_scroll_json is not scroll_json" in helper_src
+    assert ".model_validate(o) for o in ctx_scroll_json" in helper_src

@@ -93,7 +93,18 @@ def _dispatch_resume(decision, *, vault, supervisor,
     snap = None
     try:
         from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
-        snap = read_snapshot(execution_id, data_dir=data_dir)
+        from systemu.runtime.snapshot_migrations import SnapshotRefused
+        try:
+            snap = read_snapshot(execution_id, data_dir=data_dir)
+        except SnapshotRefused as _refused:
+            # DEC-9: schema newer than this build supports. Don't proceed as if
+            # there were simply no snapshot — log loudly. Any resume this path
+            # dispatches re-reads the snapshot in shadow_runtime.execute (the single
+            # fresh-vs-resume chokepoint), which refuses it there, so the run fails
+            # honestly rather than starting fresh.
+            logger.error("[ResumeOnDecision] snapshot refused for %s: %s",
+                         execution_id, _refused)
+            snap = None
     except Exception:
         snap = None
     if snap is not None:

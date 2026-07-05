@@ -773,6 +773,53 @@ def tool_is_runtime_ready(status) -> bool:
     return status in _RUNTIME_READY_STATUSES
 
 
+def _resolve_objectives_for_run(
+    *,
+    use_objectives: bool,
+    objectives: list,
+    scroll_json: list,
+    context,
+    resume_objective_graph,
+):
+    """Decide the authoritative objective list for this run, folding two rebuild
+    sources into one place with explicit precedence (G1 / R-A2):
+
+      1. A persisted, non-empty ``objective_graph`` from the resume snapshot —
+         the durable mutated graph. Wins over everything (it IS the resumed state).
+      2. A param-substitution grant that replaced ``context.scroll_json``
+         (v0.9.35 seam-fix; identity check). Rebuild from ``context.scroll_json``.
+      3. Neither — return ``objectives`` / ``scroll_json`` UNCHANGED, by identity.
+         This is the AC6 byte-identical path: ``pending_objs`` derives purely from
+         ``objectives``, so identity-preservation ⇒ byte-identical schedule.
+
+    Returns ``(objectives, scroll_json)``.
+    """
+    if not use_objectives:
+        return objectives, scroll_json
+    from systemu.core.models import Objective as _Objective
+
+    # 1. Persisted mutated graph wins.
+    #    KNOWN LIMITATION (unreachable at G1 — nothing writes a non-empty graph yet):
+    #    if BOTH a persisted graph AND a param-substitution grant are present on the
+    #    same resume, the param-sub is dropped here rather than applied onto the graph.
+    #    The task that wires runtime graph mutation must merge param-sub into the graph.
+    if resume_objective_graph:
+        rebuilt = [
+            o if isinstance(o, _Objective) else _Objective.model_validate(o)
+            for o in resume_objective_graph
+        ]
+        return rebuilt, [o.model_dump(mode="json") for o in rebuilt]
+
+    # 2. Param-substitution seam-fix (unchanged behavior, identity-guarded).
+    ctx_scroll_json = getattr(context, "scroll_json", None)
+    if ctx_scroll_json is not None and ctx_scroll_json is not scroll_json:
+        rebuilt = [_Objective.model_validate(o) for o in ctx_scroll_json]
+        return rebuilt, ctx_scroll_json
+
+    # 3. Static scroll tree — untouched, byte-identical (AC6).
+    return objectives, scroll_json
+
+
 def _gen_execution_id() -> str:
     return f"exec_{secrets.token_hex(4)}"
 
@@ -3021,12 +3068,34 @@ class ShadowRuntime:
             # and pre-populate sticky notes + completed_objectives so the new
             # run picks up where the prior one left off.  Snapshot is consumed
             # (deleted) after read so a subsequent restart starts clean.
+            # G1 (R-A2): the mutated objective graph + id-allocator floor peeled
+            # from a resume snapshot; None on a fresh run (→ static scroll tree).
+            _resume_objective_graph = None
+            _resume_next_objective_id = None
             if resume_from_execution_id:
                 try:
                     from systemu.runtime.execution_snapshot import (
                         apply_to_context, delete_snapshot, read_snapshot,
                     )
-                    snap = read_snapshot(resume_from_execution_id)
+                    from systemu.runtime.snapshot_migrations import SnapshotRefused
+                    try:
+                        snap = read_snapshot(resume_from_execution_id)
+                    except SnapshotRefused as _refused:
+                        # DEC-9: a newer-than-supported snapshot must not silently
+                        # start fresh (that could re-execute effectful actions).
+                        # This is THE fresh-vs-resume chokepoint — fail honestly.
+                        logger.error("[Runtime] resume refused: %s", _refused)
+                        return {
+                            "status": "failure",
+                            # DEC-9: this build cannot read a newer/garbage snapshot;
+                            # re-running won't fix it, and retrying FRESH (the supervisor's
+                            # generic failure→retry path drops resume_from_execution_id)
+                            # would re-execute the parked run's effects. Mark structural so
+                            # _should_retry routes it straight to terminal — never a fresh retry.
+                            "structural_failure": True,
+                            "error": f"resume refused: {_refused}",
+                            "execution_id": execution_id,
+                        }
                     if snap is not None:
                         apply_to_context(snap, context=context)
                         if use_objectives and snap.completed_objective_ids:
@@ -3161,6 +3230,15 @@ class ShadowRuntime:
                             len(snap.completed_objective_ids),
                             len(snap.sticky_notes),
                         )
+                        # G1 (R-A2): peel the durable objective graph before the
+                        # snapshot is consumed. Applied below at the single
+                        # authoritative objectives-rebuild site.
+                        try:
+                            _resume_objective_graph = list(getattr(snap, "objective_graph", []) or [])
+                            _resume_next_objective_id = getattr(snap, "next_objective_id", None)
+                        except Exception:
+                            _resume_objective_graph = None
+                            _resume_next_objective_id = None
                         delete_snapshot(resume_from_execution_id)
                     else:
                         logger.info(
@@ -3594,12 +3672,33 @@ class ShadowRuntime:
             # them — otherwise the substitution wrote to fields the prompt never
             # reads. Strict no-op unless the objects were actually replaced
             # (identity check), so standard/narrow runs are byte-identical.
-            if (use_objectives
-                    and getattr(context, "scroll_json", None) is not None
-                    and context.scroll_json is not scroll_json):
-                from systemu.core.models import Objective as _Objective
-                scroll_json = context.scroll_json
-                objectives = [_Objective.model_validate(o) for o in scroll_json]
+            #
+            # v0.9.35 param-substitution seam-fix + G1 (R-A2) persisted-graph
+            # rehydrate, folded into one authoritative objectives assignment with
+            # explicit precedence (persisted graph > param-sub > static scroll tree).
+            objectives, scroll_json = _resolve_objectives_for_run(
+                use_objectives=use_objectives,
+                objectives=objectives,
+                scroll_json=scroll_json,
+                context=context,
+                resume_objective_graph=_resume_objective_graph,
+            )
+            # G1 (R-A2): the fold may have swapped `objectives` for a longer persisted
+            # graph — re-derive the completion denominator so the gate/progress logs
+            # count the ACTUAL objectives this run must satisfy (not the stale scroll tree).
+            total_objectives = len(objectives)
+            # G1: id-allocator floor for post-resume inserts. Monotonic and
+            # collision-proof: never sits below max(existing id)+1, so a
+            # corrupt/hand-edited restored value can't seed an id collision; a
+            # legitimately-advanced restored value (>= floor) wins. Stashed on
+            # context so capture_from_context persists it on the next snapshot.
+            _floor = max((o.id for o in objectives), default=0) + 1
+            next_objective_id = (
+                max(_resume_next_objective_id, _floor)
+                if _resume_next_objective_id is not None
+                else _floor
+            )
+            context._next_objective_id = next_objective_id
 
             while iteration < _iter_budget:
                 iteration += 1

@@ -38,6 +38,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from systemu.core.models import Objective
+from systemu.runtime.snapshot_migrations import (
+    CURRENT_SCHEMA_VERSION, SnapshotRefused, migrate_snapshot_dict,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +83,12 @@ class ExecutionSnapshot:
     # outcome reconciliation stay scoped to the whole tree, not one execution.
     root_execution_id:        Optional[str] = None
     snapshotted_at:           str = ""
+    # G1 (R-A2): the mutable+durable objective graph + its id allocator floor,
+    # plus a schema version for the SnapshotMigrator (DEC-9, later task). Defaults
+    # reproduce a legacy (pre-G1) snapshot: empty graph, floor allocator, unversioned=1.
+    objective_graph:          List["Objective"] = field(default_factory=list)
+    next_objective_id:        int = 1
+    schema_version:           int = 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +105,7 @@ def write_snapshot(
     """Persist ``snapshot`` to disk; returns the file path on success."""
     target = _snapshot_path(Path(data_dir or "data"), snapshot.execution_id)
     snapshot.snapshotted_at = snapshot.snapshotted_at or _now_iso()
+    snapshot.schema_version = CURRENT_SCHEMA_VERSION
     try:
         with _lock:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +141,7 @@ def read_snapshot(
             data = json.loads(target.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return None
+        data = migrate_snapshot_dict(data, path=target)   # DEC-9: may raise SnapshotRefused
         return ExecutionSnapshot(
             execution_id=data.get("execution_id", execution_id),
             shadow_id=data.get("shadow_id", ""),
@@ -145,7 +158,15 @@ def read_snapshot(
             subagent_depth=int(data.get("subagent_depth", 0)),
             root_execution_id=data.get("root_execution_id"),
             snapshotted_at=data.get("snapshotted_at", ""),
+            schema_version=int(data.get("schema_version", 1)),
+            next_objective_id=int(data.get("next_objective_id", 1) or 1),  # 1-based allocator floor; 0/absent -> 1 (matches capture)
+            objective_graph=[Objective(**o) for o in data.get("objective_graph", [])],
         )
+    except SnapshotRefused:
+        # DEC-9: a newer-than-supported snapshot must refuse LOUDLY — never
+        # degrade to None (which the resume caller reads as "start fresh",
+        # potentially re-executing effectful actions).
+        raise
     except Exception:
         logger.exception("[ExecSnapshot] read failed for %s", execution_id)
         return None
@@ -188,6 +209,9 @@ def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
         "subagent_depth":          snapshot.subagent_depth,
         "root_execution_id":       snapshot.root_execution_id,
         "snapshotted_at":          snapshot.snapshotted_at,
+        "schema_version":          snapshot.schema_version,
+        "next_objective_id":       snapshot.next_objective_id,
+        "objective_graph":         [o.model_dump(mode="json") for o in snapshot.objective_graph],
     }
 
 
@@ -245,6 +269,8 @@ def capture_from_context(
         requests_this_run=int(requests_this_run),
         subagent_depth=int(subagent_depth),
         root_execution_id=root_execution_id,
+        objective_graph=list(getattr(context, "_objective_graph", []) or []),
+        next_objective_id=int(getattr(context, "_next_objective_id", 1) or 1),
     )
 
 

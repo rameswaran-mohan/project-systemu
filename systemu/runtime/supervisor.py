@@ -827,6 +827,7 @@ class Supervisor:
         # ── Idempotency guard — read snapshot; check for existing grant stamp ──
         try:
             from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
+            from systemu.runtime.snapshot_migrations import SnapshotRefused
             snap = read_snapshot(execution_id)
             if snap is None:
                 logger.warning(
@@ -852,6 +853,17 @@ class Supervisor:
                 f"{grant_key}::{_json.dumps(grant_payload, separators=(',', ':'))}"
             )
             write_snapshot(snap)
+        except SnapshotRefused:
+            # DEC-9: schema newer than this build supports. The re-submit below
+            # re-reads the snapshot in shadow_runtime.execute, which refuses it at
+            # the single fresh-vs-resume chokepoint — so the grant-resume fails
+            # honestly there (terminal failure with a clear reason), NOT a fresh
+            # start. Log loudly here instead of the vague "best-effort" line.
+            logger.error(
+                "[Supervisor] resume_after_grant: snapshot for %s is refused "
+                "(schema newer than supported) — resume will be refused at "
+                "execution; not re-executing fresh.", execution_id,
+            )
         except Exception:
             logger.exception(
                 "[Supervisor] resume_after_grant: snapshot read/write failed for %s "
