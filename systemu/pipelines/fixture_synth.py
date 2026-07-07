@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 
 _MAX_DEPTH = 6  # recursion floor (also bounds pathological/cyclic schemas)
 
+# Private sentinel for the resolved-schema-value seam: a const/enum/default leaf
+# routes its resolved value through leaf_fn as ``schema_value=<value>`` so a custom
+# leaf_fn (the requirement binder) can observe it. A private sentinel (not None) is
+# required so a leaf whose resolved value is legitimately None/False/0 still works.
+class _Sentinel:
+    __slots__ = ()
+    def __repr__(self):  # pragma: no cover - debug aid only
+        return "<fixture_synth._SENTINEL>"
+
+
+_SENTINEL = _Sentinel()
+
 # ── format-valid fixture bytes (lifted from tool_dry_run so a forged file/format
 #    tool can actually OPEN its input during dry-run instead of choking on text) ──
 _FIXTURE_EXTS = ("docx", "xlsx", "pptx", "pdf", "png", "jpg", "jpeg",
@@ -293,18 +305,67 @@ def _materialize(kind: str, ext: str, key: str, ctx: _Ctx) -> str:
     return str(p)
 
 
-def _walk(node, *, key: str, required: bool, root, ctx: _Ctx, depth: int, seen) -> Any:
+def _synth_leaf(node, *, key: str, required: bool, kind: str, ext: str,
+                ctx: _Ctx, path: tuple = (), schema_value=_SENTINEL,
+                schema_value_kind=None) -> Any:
+    """Produce the terminal-value for a scalar/path leaf — the DEFAULT ``leaf_fn``.
+
+    ``kind`` is the path-oracle's classification (``"file"``/``"dir"`` for a path
+    leaf, ``""`` otherwise) and ``ext`` its inferred fixture extension, both computed
+    once by ``_walk`` from ``looks_like_path``. This reproduces the pre-refactor
+    inline leaf body byte-for-byte: same ``_materialize`` calls, same
+    ``ctx.unresolved`` flag, same ``_gen_string``/``_gen_number`` values. ``path`` is
+    accepted (so a custom binder ``leaf_fn`` shares this call site) but unused here.
+
+    ``schema_value``/``schema_value_kind`` carry a RESOLVED const/enum/default value
+    (``schema_value_kind`` = "const"|"enum"|"default"). When set, this returns
+    ``schema_value`` VERBATIM — byte-identical to the pre-refactor early-return in
+    ``_walk`` (``return node["const"]`` / ``enum[0]`` / ``default``). A custom binder
+    leaf_fn instead records a Requirement for it."""
+    if schema_value is not _SENTINEL:                     # a const/enum/default leaf
+        return schema_value                              # verbatim (old early-return)
+    if kind:                                              # oracle classified a path leaf
+        return _materialize(kind, ext, key, ctx)
+    t = _first_type(node.get("type"))
+    if t == "string":
+        # A `pattern`-bound required string can't be guaranteed without a regex
+        # engine — emit a best-effort value but FLAG it so the caller can degrade a
+        # downstream dry-run failure to operator_verify instead of a doomed fail.
+        if node.get("pattern") and required:
+            ctx.unresolved.append(key or "(pattern)")
+        return _gen_string(node, required)
+    if t in ("integer", "int"):
+        return _gen_number(node, True)
+    if t in ("number", "float"):
+        return _gen_number(node, False)
+    if t == "boolean":
+        return False
+    # unknown/no type — if it has properties treat as object (handled in _walk); else
+    # a bare leaf we can't type → None (the caller's required-field check / operator
+    # _verify covers it).
+    return None
+
+
+def _walk(node, *, key: str, required: bool, root, ctx: _Ctx, depth: int, seen,
+          leaf_fn=_synth_leaf, path: tuple = ()) -> Any:
     if depth > _MAX_DEPTH or not isinstance(node, dict):
         return None
     node, seen = _resolve_ref(node, root, seen)
     if node is None:
         return None
+    # A const/enum/default leaf resolves to a fixed value. Route it THROUGH leaf_fn
+    # (not an early return) so a custom leaf_fn — the requirement binder — observes it
+    # with schema_value/schema_value_kind set. The default _synth_leaf returns
+    # schema_value verbatim, byte-identical to the old early-return.
     if "const" in node:
-        return node["const"]
+        return leaf_fn(node, key=key, required=required, kind="", ext="", ctx=ctx,
+                       path=path, schema_value=node["const"], schema_value_kind="const")
     if node.get("enum"):
-        return node["enum"][0]
+        return leaf_fn(node, key=key, required=required, kind="", ext="", ctx=ctx,
+                       path=path, schema_value=node["enum"][0], schema_value_kind="enum")
     if node.get("default") is not None:
-        return node["default"]
+        return leaf_fn(node, key=key, required=required, kind="", ext="", ctx=ctx,
+                       path=path, schema_value=node["default"], schema_value_kind="default")
     for comb in ("allOf", "anyOf", "oneOf"):
         branches = node.get(comb)
         if branches:
@@ -314,9 +375,11 @@ def _walk(node, *, key: str, required: bool, root, ctx: _Ctx, depth: int, seen) 
                     if isinstance(s, dict):
                         merged.update(s)
                 merged.update({k: v for k, v in node.items() if k != comb})
-                return _walk(merged, key=key, required=required, root=root, ctx=ctx, depth=depth, seen=seen)
+                return _walk(merged, key=key, required=required, root=root, ctx=ctx,
+                             depth=depth, seen=seen, leaf_fn=leaf_fn, path=path)
             for branch in branches:                       # anyOf/oneOf: first synthesizable
-                v = _walk(branch, key=key, required=required, root=root, ctx=ctx, depth=depth + 1, seen=seen)
+                v = _walk(branch, key=key, required=required, root=root, ctx=ctx,
+                          depth=depth + 1, seen=seen, leaf_fn=leaf_fn, path=path)
                 if v is not None:
                     return v
             return None
@@ -333,40 +396,37 @@ def _walk(node, *, key: str, required: bool, root, ctx: _Ctx, depth: int, seen) 
         req = set(node["required"]) if "required" in node else set(props.keys())
         for name in sorted(props, key=lambda n: n not in req):   # required first
             out[name] = _walk(props[name], key=name, required=(name in req),
-                              root=root, ctx=ctx, depth=depth + 1, seen=seen)
+                              root=root, ctx=ctx, depth=depth + 1, seen=seen,
+                              leaf_fn=leaf_fn, path=path + (name,))
         ap = node.get("additionalProperties")
         if isinstance(ap, dict):
             out["sample_key"] = _walk(ap, key="sample_key", required=False,
-                                      root=root, ctx=ctx, depth=depth + 1, seen=seen)
+                                      root=root, ctx=ctx, depth=depth + 1, seen=seen,
+                                      leaf_fn=leaf_fn, path=path + ("sample_key",))
         return out
     if t in ("array", "list"):
         items = node.get("items") or node.get("prefixItems") or {}
         if isinstance(items, list):                              # tuple schema
-            return [_walk(s, key=key, required=True, root=root, ctx=ctx, depth=depth + 1, seen=seen)
+            return [_walk(s, key=key, required=True, root=root, ctx=ctx,
+                          depth=depth + 1, seen=seen, leaf_fn=leaf_fn, path=path + ("[]",))
                     for s in items]
         n = max(int(node.get("minItems") or 1), 1)               # ≥1 so a path-list is exercised
-        return [_walk(items, key=key, required=True, root=root, ctx=ctx, depth=depth + 1, seen=seen)
+        return [_walk(items, key=key, required=True, root=root, ctx=ctx,
+                      depth=depth + 1, seen=seen, leaf_fn=leaf_fn, path=path + ("[]",))
                 for _ in range(n)]
-    if t == "string":
-        is_path, kind, ext = looks_like_path(key, node, tool_name=ctx.tool_name)
-        if is_path:
-            return _materialize(kind, ext, key, ctx)
-        # A `pattern`-bound required string can't be guaranteed without a regex
-        # engine — emit a best-effort value but FLAG it so the caller can degrade a
-        # downstream dry-run failure to operator_verify instead of a doomed fail.
-        if node.get("pattern") and required:
-            ctx.unresolved.append(key or "(pattern)")
-        return _gen_string(node, required)
-    if t in ("integer", "int"):
-        return _gen_number(node, True)
-    if t in ("number", "float"):
-        return _gen_number(node, False)
-    if t == "boolean":
-        return False
+    if t in ("string", "integer", "int", "number", "float", "boolean"):
+        kind, ext = "", ""
+        if t == "string":
+            is_path, kind_, ext_ = looks_like_path(key, node, tool_name=ctx.tool_name)
+            if is_path:
+                kind, ext = kind_, ext_
+        return leaf_fn(node, key=key, required=required, kind=kind, ext=ext,
+                       ctx=ctx, path=path)
     # unknown/no type — if it has properties treat as object (handled above); else
     # a bare leaf we can't type → None (the caller's required-field check / operator
-    # _verify covers it).
-    return None
+    # _verify covers it). Route through leaf_fn (default reproduces the None).
+    return leaf_fn(node, key=key, required=required, kind="", ext="",
+                   ctx=ctx, path=path)
 
 
 @dataclass

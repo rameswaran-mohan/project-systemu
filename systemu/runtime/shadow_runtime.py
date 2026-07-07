@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional
 from sharing_on.config import Config
 from systemu.core.llm_router import llm_call_json
 from systemu.core.models import Activity, Shadow, Skill, Tool, ToolStatus
+# R-A10 (§5.2): module-level so tests can spy/patch `shadow_runtime.run_open_world_planner`.
+from systemu.runtime.open_world_planner import run_open_world_planner
 from systemu.core.utils import load_prompt, utcnow
 from systemu.interface.notifications import confirm, notify_user, log_event
 from systemu.runtime.context_builder import ExecutionContext
@@ -311,6 +313,75 @@ def recredit_on_resume(
         credited=False, state=ObjectiveState(rejection_count=0),
         feedback_message=verdict["reason"],
     )
+
+
+def _recredit_blocked_ids(objective_graph) -> set:
+    """R-A10 B9 (Fix C): objective ids the durable-evidence recredit-on-resume hook
+    must NOT re-credit — those gated on a still-MISSING runtime_error requirement.
+
+    Derives the set from the PERSISTED objective graph (which carries the B9
+    backchain mutation), NOT the static scroll tree the recredit loop iterates:
+
+      missing     = ids of graph nodes with a runtime_error requirement in state
+                    "missing" (an unsatisfied backchain credential/decision precede)
+      blocked_ids = missing ∪ every node that (transitively) depends_on a missing one
+
+    Transitive closure over ``depends_on`` (a chained precede → precede → target
+    is all-or-nothing; the closure is cheap and closes that leak). Entries may be
+    Objective instances (the read-path coerces to these) OR plain JSON dicts
+    (defensive) — read via a dict/attr shim.
+
+    DEFENSIVE: a ``[]``/None graph (legacy pre-G1 snapshot) → set() → the recredit
+    loop is byte-unchanged. Never raises — any structural surprise degrades to the
+    empty set (zero legacy behavior change), never a crash."""
+    try:
+        graph = list(objective_graph or [])
+        if not graph:
+            return set()
+
+        def _field(node, name, default=None):
+            if isinstance(node, dict):
+                return node.get(name, default)
+            return getattr(node, name, default)
+
+        def _req_field(req, name, default=None):
+            if isinstance(req, dict):
+                return req.get(name, default)
+            return getattr(req, name, default)
+
+        missing: set = set()
+        for node in graph:
+            _id = _field(node, "id")
+            if _id is None:
+                continue
+            for r in (_field(node, "requirements", None) or []):
+                if (_req_field(r, "source") == "runtime_error"
+                        and _req_field(r, "state") == "missing"):
+                    missing.add(_id)
+                    break
+
+        if not missing:
+            return set()
+
+        # id -> its depends_on list, for the transitive closure.
+        deps_by_id = {
+            _field(n, "id"): list(_field(n, "depends_on", None) or [])
+            for n in graph if _field(n, "id") is not None
+        }
+        blocked = set(missing)
+        changed = True
+        while changed:
+            changed = False
+            for _nid, _deps in deps_by_id.items():
+                if _nid in blocked:
+                    continue
+                if any(d in blocked for d in _deps):
+                    blocked.add(_nid)
+                    changed = True
+        return blocked
+    except Exception:
+        logger.debug("[Runtime] _recredit_blocked_ids failed — treating as none", exc_info=True)
+        return set()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -655,6 +726,82 @@ def _build_llm_tool_catalog(vault=None, config=None) -> List[Dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+#  R-A10 B10 — RequirementReport producer + ask_bundle → elicitation rail
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _populate_requirement_report(context, *, objectives, capability, situation,
+                                 vault=None, config=None) -> None:
+    """B10 producer wiring: invoke ``build_requirement_report`` and stash the
+    result on ``context._requirement_report`` (B6 captures + resume-restores +
+    persists it), then — if the report carries a non-empty ``ask_bundle`` —
+    surface the FIRST requirement through the elicitation rail (single-card).
+
+    FAIL-SAFE (like R-A9's survey stage): ANY binder/render error is logged and
+    swallowed — the run proceeds EXACTLY as today (no report, no crash, no hang).
+
+    AC6-SAFE: a report with an EMPTY ask_bundle (no missing requirements) surfaces
+    NO elicitation AND is stashed-NEUTRAL — ``context._requirement_report`` is left
+    UNSET so ``capture_from_context`` persists ``None`` (the value a run without a
+    producer already had). Only a report carrying REAL gaps (a non-empty ask_bundle,
+    worth restoring on resume) is stashed. This mirrors the ``_objective_graph``
+    conditional: a no-gap run is byte-identical to today's snapshot (no perturbation).
+
+    Single-card SCOPE: only the FIRST ask_bundle requirement is surfaced. The
+    batched multi-requirement scope card (one card, N requirements) + re-plan-on-
+    resume is deferred to **R-A12**; B10 gives the binder a live consumer. The
+    accepted value is NOT bound back into the objective/schema here — that
+    bind-back (and the resume-driven re-plan) is R-A12 scope too; B10 is
+    surfaced-only so the operator gets the card and the run suspends via the rail.
+
+    ``PendingChoiceRequest`` (raised while awaiting the operator) is allowed to
+    PROPAGATE — the suspend IS the rail and the caller sits in the resume-aware
+    spine. It is NOT swallowed by the fail-safe guard below.
+    """
+    from systemu.approval.exceptions import PendingChoiceRequest
+
+    # Build the report (fail-safe). build_requirement_report never raises by
+    # contract, but we guard anyway so a producer-side surprise can't crash the run.
+    try:
+        from systemu.runtime.requirement_binder import build_requirement_report
+        report = build_requirement_report(objectives, capability, situation, context)
+        report_dict = report.model_dump()
+    except PendingChoiceRequest:
+        raise                                    # never here, but keep the rail honest
+    except Exception:
+        logger.debug(
+            "[Runtime] requirement-report producer skipped (non-fatal)",
+            exc_info=True,
+        )
+        return
+
+    # AC6 no-op: no missing requirements ⇒ leave the snapshot BYTE-IDENTICAL. We do
+    # NOT stash an empty-ask report (that would flip the persisted requirement_report
+    # from None → {} on every run); a resume needs nothing restored when there's no
+    # gap. Only a report with REAL gaps is stashed + surfaced.
+    ask = (report_dict or {}).get("ask_bundle") or []
+    if not ask:
+        return
+
+    # A report with real gaps: stash it (B6 persists + resume-restores) and surface.
+    context._requirement_report = report_dict
+
+    # Single-card: surface the FIRST requirement (batched card = R-A12). Let a
+    # PendingChoiceRequest PROPAGATE (the suspend is the rail); swallow only
+    # NON-suspend errors so a render glitch can't crash the run.
+    try:
+        from systemu.runtime.elicitation import surface_ask_bundle_requirement
+        surface_ask_bundle_requirement(ask[0], vault=vault, config=config)
+    except PendingChoiceRequest:
+        raise
+    except Exception:
+        logger.debug(
+            "[Runtime] ask_bundle surface skipped (non-fatal)",
+            exc_info=True,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #  v0.9.2 (Layer 2) — Episodic memory capture hook
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -781,16 +928,31 @@ def _resolve_objectives_for_run(
     context,
     resume_objective_graph,
 ):
-    """Decide the authoritative objective list for this run, folding two rebuild
-    sources into one place with explicit precedence (G1 / R-A2):
+    """Decide the authoritative objective list for this run, folding the rebuild
+    sources into one place with explicit precedence (G1 / R-A2 / R-A10 B12):
 
-      1. A persisted, non-empty ``objective_graph`` from the resume snapshot —
-         the durable mutated graph. Wins over everything (it IS the resumed state).
-      2. A param-substitution grant that replaced ``context.scroll_json``
+      0. BOTH a persisted, non-empty ``objective_graph`` AND a param-substitution
+         grant present on the same (doubly-mutated) resume → MERGE by re-applying the
+         operator's ACTUAL string-substitution to the graph nodes (RISK-3): the graph
+         is authoritative for STRUCTURE (which objectives + which ``requirements``
+         exist, ``depends_on`` incl. inserted precede ids, ``origin``,
+         ``requires_external_verification``), and EVERY string leaf of each graph node
+         is re-substituted with the operator's ``(old → new)`` pairs — so a value
+         substituted inside ``requirements`` (or any other leaf) is NO LONGER silently
+         dropped. Graph nodes with no param-sub counterpart (inserted precedes) are
+         substituted too (harmless — their strings don't contain the old value). This
+         prevents branch 1 from silently DROPPING the operator's substituted values on
+         a resume that also inserted a precede (planner/backchain).
+      1. A persisted, non-empty ``objective_graph`` (no param-sub) — the durable
+         mutated graph. Rebuild from it (it IS the resumed state).
+      2. A param-substitution grant that replaced ``context.scroll_json`` (no graph)
          (v0.9.35 seam-fix; identity check). Rebuild from ``context.scroll_json``.
       3. Neither — return ``objectives`` / ``scroll_json`` UNCHANGED, by identity.
          This is the AC6 byte-identical path: ``pending_objs`` derives purely from
          ``objectives``, so identity-preservation ⇒ byte-identical schedule.
+
+    Precedence order: merge(graph, param-sub) > graph-only > param-sub-only >
+    static identity.
 
     Returns ``(objectives, scroll_json)``.
     """
@@ -798,11 +960,20 @@ def _resolve_objectives_for_run(
         return objectives, scroll_json
     from systemu.core.models import Objective as _Objective
 
-    # 1. Persisted mutated graph wins.
-    #    KNOWN LIMITATION (unreachable at G1 — nothing writes a non-empty graph yet):
-    #    if BOTH a persisted graph AND a param-substitution grant are present on the
-    #    same resume, the param-sub is dropped here rather than applied onto the graph.
-    #    The task that wires runtime graph mutation must merge param-sub into the graph.
+    ctx_scroll_json = getattr(context, "scroll_json", None)
+    _has_paramsub = ctx_scroll_json is not None and ctx_scroll_json is not scroll_json
+
+    # 0. Doubly-mutated resume — MERGE the param-sub onto the persisted graph (B12 /
+    #    RISK-3). Only fires when BOTH sources are present, so branches 2/3 (esp. the
+    #    AC6 identity floor) are byte-unchanged: a no-replanning run never reaches here.
+    if resume_objective_graph and _has_paramsub:
+        return _merge_paramsub_onto_graph(
+            resume_objective_graph, ctx_scroll_json, _Objective,
+            paramsub_pairs=getattr(context, "_paramsub_pairs", None),
+            pre_sub_scroll_json=scroll_json,
+        )
+
+    # 1. Persisted mutated graph wins (no param-sub to fold in).
     if resume_objective_graph:
         rebuilt = [
             o if isinstance(o, _Objective) else _Objective.model_validate(o)
@@ -811,13 +982,156 @@ def _resolve_objectives_for_run(
         return rebuilt, [o.model_dump(mode="json") for o in rebuilt]
 
     # 2. Param-substitution seam-fix (unchanged behavior, identity-guarded).
-    ctx_scroll_json = getattr(context, "scroll_json", None)
-    if ctx_scroll_json is not None and ctx_scroll_json is not scroll_json:
+    if _has_paramsub:
         rebuilt = [_Objective.model_validate(o) for o in ctx_scroll_json]
         return rebuilt, ctx_scroll_json
 
     # 3. Static scroll tree — untouched, byte-identical (AC6).
     return objectives, scroll_json
+
+
+def _derive_paramsub_pairs_by_diff(pre_sub_scroll_json, ctx_scroll_json):
+    """FALLBACK: reconstruct ``(old_s, new_s)`` substitution pairs by diffing
+    corresponding STRING leaves of the pre-sub scroll against the post-sub
+    ``ctx_scroll_json`` for matched objective ids.
+
+    Used only when the grant-apply site could NOT thread the exact pairs
+    (``context._paramsub_pairs`` absent). This is coarser than the real pairs
+    (it emits whole-leaf ``old → new`` pairs, so a sub-token replacement inside a
+    DIFFERENT field may not be captured), but it re-substitutes the leaves that
+    actually changed and never fabricates a pair. The threaded-pairs path is
+    strongly preferred and is what the runtime uses.
+    """
+    pre_by_id: Dict[Any, Dict[str, Any]] = {}
+    for raw in (pre_sub_scroll_json or []):
+        d = raw if isinstance(raw, dict) else raw.model_dump(mode="json")
+        oid = d.get("id")
+        if oid is not None:
+            pre_by_id[oid] = d
+
+    pairs: list = []
+    seen: set = set()
+
+    def _walk(pre: Any, post: Any) -> None:
+        if isinstance(pre, str) and isinstance(post, str):
+            if pre and pre != post and (pre, post) not in seen:
+                seen.add((pre, post))
+                pairs.append((pre, post))
+            return
+        if isinstance(pre, dict) and isinstance(post, dict):
+            for k in pre.keys() & post.keys():
+                _walk(pre[k], post[k])
+            return
+        if isinstance(pre, list) and isinstance(post, list):
+            for a, b in zip(pre, post):
+                _walk(a, b)
+            return
+
+    for raw in (ctx_scroll_json or []):
+        d = raw if isinstance(raw, dict) else raw.model_dump(mode="json")
+        oid = d.get("id")
+        pre = pre_by_id.get(oid)
+        if pre is not None:
+            _walk(pre, d)
+    return pairs
+
+
+def _merge_paramsub_onto_graph(
+    resume_objective_graph,
+    ctx_scroll_json,
+    _Objective,
+    *,
+    paramsub_pairs=None,
+    pre_sub_scroll_json=None,
+):
+    """B12 (RISK-3): merge a param-sub grant onto a persisted objective graph by
+    RE-APPLYING the operator's actual string-substitution to the graph nodes.
+
+    The graph is the STRUCTURAL base (inserted precedes + ``depends_on`` wiring +
+    backchain-added ``requirements`` + ``origin`` + ``requires_external_verification``).
+    Rather than overlaying a hand-listed set of value fields from the param-subbed
+    objects (which silently DROPPED substituted values living in fields NOT on the
+    list — e.g. inside ``requirements``'s ``schema_path`` / ``rationale`` /
+    ``bound_value_ref``), we replay the SAME ``_replace_in_obj(node, old, new)`` that
+    ``substitute_parameters`` applied, for each ``(old, new)`` pair. This makes each
+    merged node = graph STRUCTURE (id, ``depends_on``, inserts, which ``requirements``
+    exist) + EVERY string leaf substituted (goal, success_criteria, hints values,
+    verifier, AND each requirement's string leaves) — complete by construction.
+
+    The pairs come THREADED from the grant-apply site (``context._paramsub_pairs`` —
+    exactly what ``substitute_parameters`` computed). When they're unavailable we fall
+    back to deriving them by diffing ``pre_sub_scroll_json`` against
+    ``ctx_scroll_json`` for matched ids (see ``_derive_paramsub_pairs_by_diff``).
+
+    Inserted precedes (graph-only nodes) are substituted too — harmless, their strings
+    just don't contain the old value. Same ``id`` preserved throughout.
+
+    Returns ``(objectives, scroll_json_dump)``.
+    """
+    from systemu.runtime.param_resolution import _replace_in_obj
+
+    graph_objs = [
+        o if isinstance(o, _Objective) else _Objective.model_validate(o)
+        for o in resume_objective_graph
+    ]
+
+    pairs = list(paramsub_pairs or [])
+    if not pairs:
+        # No threaded pairs — reconstruct them from the pre/post scroll diff.
+        pairs = _derive_paramsub_pairs_by_diff(pre_sub_scroll_json, ctx_scroll_json)
+
+    merged: list = []
+    for g in graph_objs:
+        orig = g.model_dump(mode="json")           # the pre-substitution graph node
+        node = orig
+        for old_s, new_s in pairs:
+            node = _replace_in_obj(node, old_s, new_s)
+
+        # RESTORE the graph-authoritative STRUCTURAL fields: the graph is authoritative
+        # for STRUCTURE (incl. the Literal/enum-typed fields), param-sub only rewrites
+        # VALUE leaves. Without this, a substitution whose OLD value IS/contains a literal
+        # token (a capture equal to "operator" / "missing" / "input" / "planner") rewrites
+        # the enum → _Objective.model_validate raises → the resume CRASHES (HIGH). We keep
+        # the substituted VALUE leaves (goal, success_criteria, hints values, requirements'
+        # schema_path/rationale/bound_value_ref) and pin the enums back to the original.
+        if isinstance(node, dict) and isinstance(orig, dict):
+            node = dict(node)
+            # Objective.origin — Literal["planner","discovery","retry","backchain"].
+            if "origin" in orig:
+                node["origin"] = orig["origin"]
+            # int/list structural fields _replace_in_obj can't touch (int/list scalars),
+            # but restore defensively in case a stringified variant ever appears.
+            if "id" in orig:
+                node["id"] = orig["id"]
+            if "depends_on" in orig:
+                node["depends_on"] = orig["depends_on"]
+            # Each Requirement's Literal fields (state/kind/source/value_origin) are
+            # graph-authoritative; requirements are same-order (graph-authoritative), so
+            # restore by index. VALUE leaves inside each requirement stay substituted.
+            orig_reqs = orig.get("requirements")
+            node_reqs = node.get("requirements")
+            if isinstance(orig_reqs, list) and isinstance(node_reqs, list):
+                restored_reqs = []
+                for i, nr in enumerate(node_reqs):
+                    if isinstance(nr, dict) and i < len(orig_reqs) and isinstance(orig_reqs[i], dict):
+                        nr = dict(nr)
+                        for _lit in ("state", "kind", "source", "value_origin"):
+                            if _lit in orig_reqs[i]:
+                                nr[_lit] = orig_reqs[i][_lit]
+                    restored_reqs.append(nr)
+                node["requirements"] = restored_reqs
+
+        # BELT-AND-SUSPENDERS: the resume must NEVER crash on a param-sub. If the
+        # substituted+restored node still fails validation (a value leaf the structural
+        # restore can't cover), fall back to the ORIGINAL (un-substituted) graph node.
+        try:
+            merged.append(_Objective.model_validate(node))
+        except Exception:
+            logger.debug("[B12] param-sub node failed validation; falling back to the "
+                         "original graph node (no resume crash)", exc_info=True)
+            merged.append(g if isinstance(g, _Objective) else _Objective.model_validate(orig))
+
+    return merged, [o.model_dump(mode="json") for o in merged]
 
 
 def _gen_execution_id() -> str:
@@ -2697,6 +3011,302 @@ class ShadowRuntime:
             current_ab=current_ab, iter_budget=iter_budget,
         )
 
+    def _apply_fold_depth_exemption(self, *, tool_name, loop_guard):
+        """R-A10 B9 (AC4 / Fix 2): neutralize the stuck bounds for a folded runtime
+        error — a DISCOVERED REQUIREMENT is not lack of progress. Resets the
+        no-progress counter, drops this tool's same-tool-fail / consec-fail streaks,
+        and clears the loop-guard streaks so the fold's retry isn't counted against a
+        stall verdict (LoopGuard has no reset(); clear inline). Shared by the
+        fresh-fold path AND the idempotent-pending no-op so a repeated 401 on a
+        still-missing credential NEVER counts toward the stuck bound. Never raises."""
+        self._iters_since_obj_credit = 0
+        self._same_tool_fail_streak.pop(tool_name, None)
+        self._consec_tool_fails.pop(tool_name, None)
+        try:
+            if getattr(loop_guard, "_fail_tool", None) == tool_name:
+                loop_guard._fail_tool = None
+                loop_guard._fail_streak = 0
+            loop_guard._leader = None
+            loop_guard._streak = 0
+            loop_guard._pingpong_streak = 0
+        except Exception:
+            logger.debug("[Runtime B9] loop_guard clear skipped", exc_info=True)
+
+    def _fold_runtime_error_and_suspend(
+        self, *, objectives, completed_objectives, decision, sub, tool_name,
+        context, scroll, shadow, activity, execution_id, root_eid, iteration,
+        current_ab, harness_requests_this_run, loop_guard, revoke_harness_leases,
+    ):
+        """R-A10 B9 (AC4): fold an auth/semantic http_error into a Requirement +
+        backchain precede-objective, EXEMPT the stuck counters, and SUSPEND via the
+        INPUT rail so the operator supplies the credential/decision.
+
+        Returns ``{"objectives": <new tree>, "result": <suspend dict>}`` on a
+        successful fold, ``{"objectives": <tree>, "already_pending": True}`` on an
+        idempotent-pending no-op (exemption applied, seam must skip the stuck path),
+        or ``None`` when the fold degrades (unresolvable current objective /
+        genuinely unfoldable) so the caller falls through to the normal
+        reflection + stuck path. NEVER raises — any failure returns ``None``."""
+        try:
+            from systemu.runtime.runtime_fold import fold_runtime_error
+
+            # Resolve the CURRENT objective — the one whose tool call is in flight.
+            # Prefer the decision's explicit claim; else the audit helper (first
+            # not-yet-completed objective whose deps are satisfied).
+            _cur = decision.get("completes_objective")
+            if not isinstance(_cur, int):
+                _cur = _current_objective_id_for_audit(objectives, completed_objectives)
+            # A derived id of 0 means "no current objective" → can't fold safely.
+            if not _cur:
+                return None
+
+            # Derive a service hint for the credential/decision ask. Prefer the
+            # tool's declared service/host; fall back to the tool name.
+            _service_hint = None
+            try:
+                _service_hint = (decision.get("service")
+                                 or (decision.get("parameters") or {}).get("service"))
+            except Exception:
+                _service_hint = None
+
+            _next_id = int(getattr(context, "_next_objective_id", 0)
+                           or (max((getattr(o, "id", 0) for o in objectives), default=0) + 1))
+            _fold = fold_runtime_error(
+                objectives=objectives,
+                current_obj_id=_cur,
+                sub=sub,
+                tool_name=tool_name,
+                service_hint=_service_hint,
+                next_id=_next_id,
+            )
+            if _fold is None:
+                return None
+
+            # ── Fix 2: IDEMPOTENT-PENDING — a precede for this service is already
+            # inserted and still missing (a repeated 401 across the loop / a resume).
+            # STILL apply the depth-exemption so this iteration NEVER counts toward
+            # the stuck bound, then signal the seam to skip _update_stuck_counters /
+            # loop_guard.record / _stuck_trigger for this iteration (the run stays
+            # parked on the still-pending precede — it is not lack of progress). We do
+            # NOT re-suspend/re-surface a second operator card (the first is still
+            # pending); we just neutralize the counters and continue.
+            if getattr(_fold, "already_pending", False):
+                self._apply_fold_depth_exemption(tool_name=tool_name, loop_guard=loop_guard)
+                logger.info(
+                    "[Runtime B9] idempotent-pending %s error on %s — precede already "
+                    "pending; stuck counters exempt, iteration skipped", sub, tool_name,
+                )
+                return {"objectives": objectives, "already_pending": True}
+
+            new_objectives = _fold.objectives
+
+            # ── Fix A (HIGH, safety): UN-CREDIT the precede on a wrong-credential
+            # RE-ASK. The reuse path (fold_runtime_error) flips a satisfied precede's
+            # requirement state="have"→"missing" and re-suspends, but that precede was
+            # CREDITED into completed_objectives on the prior resume. If we leave the
+            # credit, the ORIGINAL objective's depends_on gate stays OPEN with the
+            # credential now missing — the LLM could advance/COMPLETE it via any other
+            # succeeding action and finish the run UNAUTHENTICATED. Discard the re-ask
+            # id from EVERY set that tracks precede completion (completed_objectives +
+            # the resume precede-credit set) BEFORE the re-suspend snapshot is written,
+            # so the gate RE-CLOSES and the re-suspend snapshot rehydrates honestly.
+            _reask_pid = getattr(_fold, "reask_precede_id", None)
+            if isinstance(_reask_pid, int):
+                try:
+                    completed_objectives.discard(_reask_pid)
+                except Exception:
+                    logger.debug("[Runtime B9] re-ask un-credit: completed_objectives.discard failed",
+                                 exc_info=True)
+                try:
+                    self._resume_completed_precedes.discard(_reask_pid)
+                except Exception:
+                    pass
+                logger.info(
+                    "[Runtime B9] wrong-credential re-ask: precede %d UN-CREDITED "
+                    "(gate re-closed; original objective waits for the new credential)",
+                    _reask_pid,
+                )
+
+            # Persist the authoritative post-fold graph (B5) so a resume rehydrates
+            # the inserted precede, and bump the id-allocator floor.
+            try:
+                context._objective_graph = [
+                    o.model_dump(mode="json") for o in new_objectives
+                ]
+            except Exception:
+                logger.debug("[Runtime B9] objective_graph persist skipped", exc_info=True)
+            context._next_objective_id = _fold.next_id
+
+            # ── DEPTH-EXEMPTION (AC4) ─────────────────────────────────────────
+            # This failure is a DISCOVERED REQUIREMENT, not lack of progress —
+            # neutralize the stuck bounds like the coach-steer reset so it can never
+            # push the run toward the no-progress / same-tool-fail terminal.
+            self._apply_fold_depth_exemption(tool_name=tool_name, loop_guard=loop_guard)
+
+            # ── Build the INPUT request for the missing credential/decision ──
+            # Fix 1: carry the FAILED tool's original params + the inserted precede id
+            # so the resume rail re-dispatches the tool and the resume site can
+            # satisfy + credit the precede.
+            try:
+                _failed_params = dict(decision.get("parameters") or {})
+            except Exception:
+                _failed_params = {}
+            _req = self._build_runtime_fold_input_request(
+                sub=sub, tool_name=tool_name, requirement=_fold.requirement,
+                pending_params=_failed_params, precede_id=_fold.precede_id,
+            )
+
+            # Snapshot + __HARNESS_PENDING__ (mirror the blocking-ESCALATE rail).
+            try:
+                from systemu.runtime.execution_snapshot import (
+                    capture_from_context, write_snapshot,
+                )
+                _snap = capture_from_context(
+                    execution_id=execution_id,
+                    shadow_id=getattr(shadow, "id", ""),
+                    scroll_id=getattr(scroll, "id", ""),
+                    iteration=iteration,
+                    current_action_block=current_ab,
+                    completed_objectives=set(completed_objectives),
+                    context=context,
+                    activity_id=getattr(activity, "id", ""),
+                    requests_this_run=harness_requests_this_run,
+                    subagent_depth=int(getattr(self, "_subagent_depth", 0)),
+                    root_execution_id=root_eid,
+                )
+                import json as _json
+                _snap.sticky_notes.append(
+                    f"__HARNESS_PENDING__::{execution_id}::"
+                    + _json.dumps({
+                        "request_id": _req.request_id,
+                        "kind":       _req.kind.value,
+                        "spec":       _req.spec,
+                        "fallback":   _req.fallback,
+                    })
+                )
+                write_snapshot(_snap)
+            except Exception:
+                logger.debug("[Runtime B9] fold suspend snapshot failed", exc_info=True)
+
+            try:
+                from systemu.interface.harness_review import surface_harness_request
+                from systemu.core.models import HarnessVerdict, HarnessDecision
+                _verdict = HarnessVerdict(
+                    request_id=_req.request_id,
+                    decision=HarnessDecision.ESCALATE,
+                    rationale=("Runtime error folded into an operator requirement "
+                               f"({_fold.requirement.kind})."),
+                )
+                _did = surface_harness_request(
+                    _req, _verdict, execution_id=execution_id,
+                    activity_id=getattr(activity, "id", ""),
+                    shadow_id=getattr(shadow, "id", ""),
+                    vault=self.vault,
+                )
+                logger.info(
+                    "[Runtime B9] %s http_error folded into %s requirement → parked "
+                    "(operator card %s)", sub, _fold.requirement.kind, _did,
+                )
+            except Exception:
+                logger.debug("[Runtime B9] surface_harness_request failed", exc_info=True)
+
+            revoke_harness_leases(record_run=False, reconcile=False)
+            _susp = context.build_result(
+                status="suspended_harness_escalation",
+                final_summary=(
+                    f"Parked awaiting operator input: {tool_name} failed with a "
+                    f"{'credential' if sub == 'auth' else 'bad-request'} error; a "
+                    f"{_fold.requirement.kind} requirement was folded into the plan."
+                ),
+            )
+            _susp["activity_id"] = getattr(activity, "id", "")
+            _susp["shadow_id"]   = getattr(shadow, "id", "")
+            return {"objectives": new_objectives, "result": _susp}
+        except Exception:
+            logger.debug("[Runtime B9] fold-and-suspend degraded to None", exc_info=True)
+            return None
+
+    def _build_runtime_fold_input_request(
+        self, *, sub, tool_name, requirement,
+        pending_params=None, precede_id=None,
+    ):
+        """Build the ``kind=INPUT`` HarnessRequest for a B9 fold — a credential
+        (auth) or decision (semantic) the operator must supply before the failed
+        objective retries. Mirrors the missing-param INPUT rail shape.
+
+        Fix 1: carries ``pending_tool`` (the failed tool + its ORIGINAL params) so
+        the PROVEN resume re-dispatch rail (``_apply_harness_grant_async``'s
+        ``pending_tool`` + ``param_answers`` branch → merge + RE-DISPATCH) satisfies
+        the credential/decision and re-runs the call — instead of only injecting an
+        advisory observation (which never delivered the credential to the tool). For
+        an auth fold the credential field is a SECRET (URL-mode: stored out-of-band
+        into the credential store/env, never typed, never in the form or logs). The
+        ``runtime_fold`` markers (kind / schema_path / precede_id) let the resume
+        site satisfy the backchain precede + credit it into ``completed_objectives``
+        so the original objective's ``depends_on`` gate opens and it retries."""
+        from systemu.core.models import HarnessRequest, HarnessKind
+        if sub == "auth":
+            _q = (f"'{tool_name}' failed to authenticate (401/403). Provide the "
+                  f"credential for {requirement.schema_path} so it can retry.")
+            _schema = {
+                "type": "object",
+                "properties": {
+                    "credential": {
+                        "type": "string",
+                        # 'password' format ⇒ is_secret_field() ⇒ URL-mode.
+                        "format": "password",
+                        "description": (f"Credential / token for "
+                                        f"{requirement.schema_path}."),
+                    },
+                },
+                "required": ["credential"],
+            }
+            _secret = ["credential"]
+        else:  # semantic
+            _q = (f"'{tool_name}' failed with a bad-request error (422/404). "
+                  f"How should the request be corrected?")
+            _schema = {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "description": ("How to correct the request "
+                                        "(the missing decision)."),
+                    },
+                },
+                "required": ["decision"],
+            }
+            _secret = []
+        _spec = {
+            "question": _q,
+            "requested_schema": _schema,
+            "secret_fields": _secret,
+            # Fix 1: carry the failed tool + its ORIGINAL params so the resume rail
+            # re-dispatches (auth: URL-mode secret is in the store/env by then;
+            # semantic: the operator's decision merges into the params). Same shape
+            # the missing-required INPUT rail uses (harness_review rides pending_tool
+            # through to the reconciler → grant_payload → _apply_harness_grant_async).
+            "pending_tool": {
+                "tool_name": tool_name,
+                "parameters": dict(pending_params or {}),
+            },
+            # Fold markers — the resume site reads these to satisfy + credit the precede.
+            "runtime_fold": True,
+            "requirement_kind": requirement.kind,
+            "requirement_schema_path": requirement.schema_path,
+        }
+        if precede_id is not None:
+            _spec["precede_id"] = int(precede_id)
+        return HarnessRequest(
+            kind=HarnessKind.INPUT,
+            spec=_spec,
+            rationale=requirement.rationale or (
+                f"Runtime {sub} error on {tool_name} folded into a "
+                f"{requirement.kind} requirement."),
+            fallback="",
+            blocking=True,
+        )
+
     def _resolve_scroll_parameters(self, scroll):
         """v0.9.35 (Phase 3): build the INPUT elicitation request for a
         BROAD-generalized scroll's captured ``parameters``.
@@ -2772,7 +3382,9 @@ class ShadowRuntime:
             # v0.9.35 (P3): the operator confirmed/edited the recorded scroll
             # parameters. Substitute the chosen values into the live objectives/
             # intent/constraints the agent sees — NO tool re-dispatch.
-            from systemu.runtime.param_resolution import substitute_parameters
+            from systemu.runtime.param_resolution import (
+                substitute_parameters, paramsub_pairs,
+            )
             _answers = payload.get("param_answers") or {}
             _params = list(getattr(self, "_scroll_parameters", None) or [])
             new_json, new_intent, new_constraints, resolved = substitute_parameters(
@@ -2784,6 +3396,13 @@ class ShadowRuntime:
             context.scroll_json = new_json
             context.scroll_intent = new_intent
             self._scroll_constraints = new_constraints
+            # B12 (RISK-3): stash the EXACT (old→new) substitution pairs this grant
+            # applied so a resume that ALSO carries a persisted objective graph can
+            # re-apply the identical string-substitution to the graph nodes (every
+            # string leaf — requirements included), instead of overlaying a hand-listed
+            # subset of value fields and silently DROPPING substituted values inside
+            # requirements/other leaves. See _merge_paramsub_onto_graph.
+            context._paramsub_pairs = paramsub_pairs(_params, _answers)
             context.add_observation({
                 "type": "parameters_resolved",
                 "message": (
@@ -2798,7 +3417,28 @@ class ShadowRuntime:
                 and "param_answers" in payload):
             _pending = payload.get("pending_tool") or {}
             _answers = payload.get("param_answers") or {}
-            if not _answers:
+            # Fix 1: a B9 runtime_fold AUTH grant carries an EMPTY param_answers by
+            # design — the credential is a SECRET supplied out-of-band (URL-mode)
+            # into the credential store/env, so it never flows through the form.
+            # Re-dispatch anyway: the retried tool re-reads the credential from env.
+            # (A NON-fold empty answer still means "declined" and must not re-dispatch.)
+            _is_runtime_fold = bool(payload.get("runtime_fold"))
+            if _is_runtime_fold:
+                # Fix 1: record the fold's satisfy+credit intent for the resume site
+                # (which owns the rehydrated graph + completed_objectives). We stash
+                # the operator value (for a SEMANTIC decision it's in param_answers;
+                # for an AUTH credential the value is a URL-mode secret held out of
+                # band — only a marker is stashed, never the secret).
+                try:
+                    self._resume_fold_credit = {
+                        "precede_id": payload.get("precede_id"),
+                        "requirement_kind": payload.get("requirement_kind"),
+                        "requirement_schema_path": payload.get("requirement_schema_path"),
+                        "operator_value": (dict(_answers) if _answers else None),
+                    }
+                except Exception:
+                    self._resume_fold_credit = None
+            if not _answers and not _is_runtime_fold:
                 context.add_observation({
                     "type": "harness_grant_failed",
                     "message": (
@@ -2840,6 +3480,121 @@ class ShadowRuntime:
             payload, context=context, tools=tools, tool_index=tool_index,
             current_ab=current_ab, iter_budget=iter_budget,
         )
+
+    def _apply_resume_fold_credit(self, *, objectives, completed_objectives, context):
+        """R-A10 B9 (Fix 1): on a runtime_fold resume, satisfy the backchain precede's
+        Requirement and CREDIT its id into ``completed_objectives`` so the original
+        objective's ``depends_on`` gate opens and it retries.
+
+        Locates the precede by the stashed ``precede_id`` (else by the matching
+        ``origin="backchain"`` runtime_error requirement whose ``schema_path`` equals
+        the fold's ``requirement_schema_path``). Flips its Requirement
+        ``state`` "missing"→"have" (the model's terminal/bound state — there is no
+        "satisfied" literal), stashes the operator value on ``bound_value_ref`` (never
+        a raw secret — a marker only), and adds the precede id to
+        ``completed_objectives`` using the SAME mechanism the standard
+        ``completes_objective`` credit path uses. Returns the (possibly rebuilt)
+        objective list. NEVER raises — a structural miss just credits nothing."""
+        _fc = getattr(self, "_resume_fold_credit", None) or {}
+        _pid = _fc.get("precede_id")
+        _schema = _fc.get("requirement_schema_path")
+        _kind = _fc.get("requirement_kind")
+        _op_value = _fc.get("operator_value")
+
+        def _is_target(o):
+            if _pid is not None and getattr(o, "id", None) == _pid:
+                return True
+            if getattr(o, "origin", None) != "backchain":
+                return False
+            for r in (getattr(o, "requirements", None) or []):
+                if (getattr(r, "source", None) == "runtime_error"
+                        and getattr(r, "schema_path", None) == _schema):
+                    return True
+            return False
+
+        _target = next((o for o in objectives if _is_target(o)), None)
+        if _target is None:
+            logger.debug("[Runtime B9] resume fold-credit: no matching precede (pid=%s schema=%s)",
+                         _pid, _schema)
+            return objectives
+
+        _tid = getattr(_target, "id", None)
+
+        # Fix (schema-None over-flip guard): decide WHICH runtime_error requirement
+        # this credit satisfies. When a schema_path is stashed, match on it (precise).
+        # When it is None (the value_origin was stripped upstream), do NOT flip ALL
+        # runtime_error requirements — a precede could carry more than one (e.g. a
+        # credential AND a decision) and the operator supplied only one. Narrow by the
+        # fold's requirement_kind; if that too is unknown, flip only the FIRST
+        # runtime_error requirement (never flip-all).
+        def _flip_matches(r) -> bool:
+            if getattr(r, "source", None) != "runtime_error":
+                return False
+            if _schema is not None:
+                return getattr(r, "schema_path", None) == _schema
+            if _kind is not None:
+                return getattr(r, "kind", None) == _kind
+            return True  # unknown schema + unknown kind → first-match fallback below
+
+        # For the ambiguous (schema None) path, flip at most ONE requirement so a
+        # multi-requirement precede never over-credits the operator's single answer.
+        _flip_one_only = _schema is None
+        _flipped = False
+
+        # Flip the folded Requirement "missing"→"have" + stash a value REFERENCE
+        # (never the raw secret). Rebuild via model_copy so the durable graph carries
+        # the satisfied state on the next snapshot.
+        try:
+            _new_reqs = []
+            for r in (getattr(_target, "requirements", None) or []):
+                if _flip_matches(r) and not (_flip_one_only and _flipped):
+                    _ref = None
+                    if isinstance(_op_value, dict) and _op_value:
+                        # decision fold: the value is non-secret → a compact reference.
+                        _ref = "operator:" + ",".join(sorted(_op_value.keys()))
+                    else:
+                        # credential fold: the value is a URL-mode secret held out of
+                        # band — record only that it was supplied, never the value.
+                        _ref = "operator:credential"
+                    _new_reqs.append(r.model_copy(update={"state": "have",
+                                                          "bound_value_ref": _ref}))
+                    _flipped = True
+                else:
+                    _new_reqs.append(r)
+            _new_target = _target.model_copy(update={"requirements": _new_reqs})
+            objectives = [(_new_target if getattr(o, "id", None) == _tid else o)
+                          for o in objectives]
+        except Exception:
+            logger.debug("[Runtime B9] resume fold-credit: requirement flip skipped",
+                         exc_info=True)
+
+        # CREDIT the precede id — same mechanism as the standard completes_objective
+        # path (completed_objectives.add). This opens the original objective's gate.
+        if isinstance(_tid, int):
+            completed_objectives.add(_tid)
+            try:
+                self._resume_completed_precedes.add(_tid)
+            except Exception:
+                pass
+            # Reset the stuck counters (crediting an objective resets them everywhere).
+            try:
+                self._update_stuck_counters(
+                    action="RESUME_FOLD_CREDIT", tool_name=None,
+                    tool_success=True, credited_obj_id=_tid,
+                )
+            except Exception:
+                self._iters_since_obj_credit = 0
+            # Re-persist the durable graph so the satisfied precede + credit survive
+            # the next snapshot.
+            try:
+                context._objective_graph = [o.model_dump(mode="json") for o in objectives]
+            except Exception:
+                logger.debug("[Runtime B9] resume fold-credit: graph persist skipped",
+                             exc_info=True)
+            logger.info("[Runtime B9] resume fold-credit: precede %d satisfied + credited "
+                        "(%d/%d objectives now complete)",
+                        _tid, len(completed_objectives), len(objectives))
+        return objectives
 
     def _build_memory_context_for_prompt(self) -> str:
         """LLM-facing memory view (consolidated, not the raw execution_log).
@@ -2923,6 +3678,8 @@ class ShadowRuntime:
         self._research_loop_steers_used = 0
         self._resume_stuck_answer = None  # v0.8.22.1 (R6): (obj_id, answer) lifted from snapshot
         self._resume_harness_grant = None  # v0.9.7 grant-resume: payload lifted from snapshot
+        self._resume_fold_credit = None    # R-A10 B9 (Fix 1): satisfy+credit intent for a resumed runtime_fold precede
+        self._resume_completed_precedes = set()  # R-A10 B9 (Fix 1): precede ids credited on this resume
         # v0.9.1 (Layer 4): reset verifier bookkeeping per run.
         self._objective_states.clear()
         self._fresh_work_since_last_verifier_call = False
@@ -3072,6 +3829,11 @@ class ShadowRuntime:
             # from a resume snapshot; None on a fresh run (→ static scroll tree).
             _resume_objective_graph = None
             _resume_next_objective_id = None
+            # R-A9 (Task 9): the cached situational-inventory (report, stamps) peeled
+            # from a resume snapshot; None/{} on a fresh run (→ cold survey). Fed to
+            # survey_situation's `cache` below so unchanged slices are reused (AC3).
+            _resume_situation_report = None
+            _resume_situation_stamps: Dict[str, Any] = {}
             if resume_from_execution_id:
                 try:
                     from systemu.runtime.execution_snapshot import (
@@ -3107,9 +3869,31 @@ class ShadowRuntime:
                             # case where the shadow completed work but the snapshot was taken
                             # before the verifier ran (e.g., mid-run restart).
                             try:
+                                # R-A10 B9 (Fix C, HIGH/safety): the durable-evidence
+                                # recredit hook must NOT re-credit an objective that is
+                                # gated on a still-MISSING runtime_error requirement (a
+                                # backchain credential/decision precede — or an objective
+                                # that depends_on one). objective_verifier.run short-
+                                # circuits to verified=True for a legacy verifier=None
+                                # objective BEFORE any durable check, so without this
+                                # guard the recredit loop — which iterates the STATIC
+                                # scroll tree (no depends_on / no requirements) — would
+                                # trivially re-credit the credential-gated objective with
+                                # the credential still absent → an unauthenticated
+                                # "success" that UNDOES B9's Fix A gate. The "which
+                                # objectives are blocked" fact lives on the PERSISTED
+                                # graph (snap.objective_graph carries the B9 mutation),
+                                # NOT the static `objectives` this loop iterates. A
+                                # working credential is delivered ONLY via B9's explicit
+                                # _apply_resume_fold_credit path, never this shortcut.
+                                # ADDITIVE + scoped to runtime_error requirements: legacy
+                                # snapshots (empty/None graph, no runtime_error reqs) →
+                                # blocked_ids == set() → legacy recredit byte-unchanged.
+                                blocked_ids = _recredit_blocked_ids(snap.objective_graph)
                                 _uncredited = [
                                     o for o in objectives
                                     if o.id not in completed_objectives
+                                    and o.id not in blocked_ids
                                 ]
                                 for _uc_obj in _uncredited:
                                     _rc = recredit_on_resume(
@@ -3192,8 +3976,32 @@ class ShadowRuntime:
                                             "fallback", _ppayload.get("fallback", ""))
                                         _gpayload.setdefault(
                                             "kind", _ppayload.get("kind", ""))
+                                        # Fix 1 (B9): a runtime_fold pending request
+                                        # carries pending_tool + the fold markers in
+                                        # its SPEC. The daemon reconciler only forwards
+                                        # pending_tool/param_answers on the grant; lift
+                                        # the fold markers off the pending spec here so
+                                        # the resume rail (a) re-dispatches even when
+                                        # the credential went URL-mode (empty answers)
+                                        # and (b) can satisfy + credit the precede.
+                                        _pspec = _ppayload.get("spec") or {}
+                                        if isinstance(_pspec, dict) and _pspec.get("runtime_fold"):
+                                            _gpayload.setdefault("runtime_fold", True)
+                                            for _k in ("requirement_kind",
+                                                       "requirement_schema_path",
+                                                       "precede_id"):
+                                                if _pspec.get(_k) is not None:
+                                                    _gpayload.setdefault(_k, _pspec[_k])
+                                            # If the reconciler didn't forward a
+                                            # pending_tool (older path), fall back to
+                                            # the one on the pending spec.
+                                            if not _gpayload.get("pending_tool") and _pspec.get("pending_tool"):
+                                                _gpayload["pending_tool"] = _pspec["pending_tool"]
+                                            _gpayload.setdefault("param_answers", {})
                                     except Exception:
-                                        pass
+                                        logger.debug(
+                                            "[Runtime B9] pending-spec fold-marker lift skipped",
+                                            exc_info=True)
                                 self._resume_harness_grant = _gpayload
                         except Exception:
                             logger.debug("[Runtime] resume harness-grant parse failed",
@@ -3239,6 +4047,28 @@ class ShadowRuntime:
                         except Exception:
                             _resume_objective_graph = None
                             _resume_next_objective_id = None
+                        # R-A9 (Task 9): peel the cached situational-inventory
+                        # (report, stamps) before the snapshot is consumed, so the
+                        # pre-plan survey below can reuse unchanged slices (AC3).
+                        try:
+                            _resume_situation_report = getattr(snap, "situation_report", None)
+                            _rss = getattr(snap, "situation_stamps", {})
+                            _resume_situation_stamps = dict(_rss) if isinstance(_rss, dict) else {}
+                        except Exception:
+                            _resume_situation_report = None
+                            _resume_situation_stamps = {}
+                        # Fix 2 (de-dup): the objective_graph + requirement_report
+                        # re-seed formerly duplicated here is now the SOLE
+                        # responsibility of apply_to_context (called above at the top
+                        # of this `if snap is not None:` block, well before this point
+                        # and before delete_snapshot). apply_to_context is the re-seed
+                        # AUTHORITY — see execution_snapshot.apply_to_context. Keeping a
+                        # second copy here risked divergence: this block's
+                        # requirement_report write was UNCONDITIONAL (it clobbered a
+                        # pre-set report with a snapshot's None), whereas apply guards on
+                        # `is not None`. Once B10 adds a requirement_report producer that
+                        # divergence becomes reachable, so the duplicate is removed and
+                        # apply's guarded re-seed wins.
                         delete_snapshot(resume_from_execution_id)
                     else:
                         logger.info(
@@ -3683,14 +4513,118 @@ class ShadowRuntime:
                 context=context,
                 resume_objective_graph=_resume_objective_graph,
             )
+
+            # ── R-A10 B9 (Fix 1): satisfy + credit a resumed runtime_fold precede ──
+            # A runtime_fold grant was applied above; the operator supplied the
+            # credential/decision. Now that the graph is rehydrated, flip the
+            # backchain precede's Requirement "missing"→"have" (stash the operator
+            # value on it) and CREDIT the precede id into completed_objectives so the
+            # original objective's depends_on gate opens and it retries. Fail-safe.
+            if use_objectives and getattr(self, "_resume_fold_credit", None):
+                try:
+                    objectives = self._apply_resume_fold_credit(
+                        objectives=objectives,
+                        completed_objectives=completed_objectives,
+                        context=context,
+                    )
+                except Exception:
+                    logger.debug("[Runtime B9] resume fold-credit skipped", exc_info=True)
+                finally:
+                    self._resume_fold_credit = None
+
+            # ── R-A9 (§5.1): situational-inventory pre-plan stage ──────────────
+            # MOVED UP (R-A10 B7): the survey MUST run BEFORE the open-world planner
+            # (which reads context._situation_report) and BEFORE the completion
+            # denominator / id-floor / B5 write (which the planner's inserts feed).
+            # Behavior-preserving: the survey only READS scroll/self.vault/the resume
+            # cache and stashes context._situation_report/_situation_stamps — it does
+            # NOT use total_objectives/next_objective_id/objectives, so moving it
+            # ahead of them changes nothing (R-A9 asserts behavior, not line order).
+            #
+            # Defensive, FAIL-SAFE, NON-BLOCKING. survey_situation is internally
+            # per-source-timeout-bounded and runs its blocking builders off-loop
+            # (asyncio.to_thread); we ALSO wrap it in an OVERALL timeout as belt-and-
+            # suspenders, and swallow ANY failure/timeout so the run is left EXACTLY
+            # as it is today (no report, no crash, no hang, no operator card — AC7).
+            # On a resume the peeled (report, stamps) feed the survey's cache so
+            # unchanged slices are reused (AC3). It ONLY stashes on context — it never
+            # touches `objectives`, the schedule, or any decision (AC6 no-perturbation).
+            try:
+                from systemu.runtime.situational_inventory import survey_situation
+                import asyncio as _asyncio
+                _cache = (
+                    {"report": _resume_situation_report,
+                     "stamps": _resume_situation_stamps}
+                    if _resume_situation_report else None
+                )
+                _report, _stamps = await _asyncio.wait_for(
+                    survey_situation(scroll, vault=self.vault, cache=_cache),
+                    timeout=20.0,   # overall bound over the per-source timeouts
+                )
+                context._situation_report = _report.model_dump()
+                context._situation_stamps = _stamps
+            except Exception:
+                logger.debug(
+                    "[Runtime] situational inventory survey skipped (non-fatal)",
+                    exc_info=True,
+                )
+
+            # ── R-A10 (§5.2): run-time open-world PLANNER stage ────────────────
+            # FRESH runs only. A resume rehydrates any prior planner inserts from the
+            # persisted objective_graph (fold branch 1); re-running the planner would
+            # DOUBLE-insert them and could perturb a resumed schedule, so we gate on
+            # `not resume_from_execution_id` — the resume REQUEST itself (the same
+            # fresh-vs-resume chokepoint DEC-9 uses). Even a resume whose snapshot was
+            # missing/corrupt must not re-plan (that is exactly the double-insert
+            # hazard), so we key off the request, not the peeled graph.
+            #
+            # FAIL-SAFE + AC6: run_open_world_planner returns the SAME `objectives`
+            # object BY IDENTITY on a "no precede-objectives" decision (or any bad
+            # LLM response). We only rebind `objectives` here, so an empty decision
+            # leaves `objectives is scroll.objectives` true → the B5 write below skips
+            # → a no-replanning run stays byte-identical. Any error → static tree.
+            if (use_objectives and not resume_from_execution_id
+                    and getattr(context, "_situation_report", None)):
+                try:
+                    # id-floor for the planner's inserts: monotonic past both the
+                    # current max id and any resume-restored allocator value. The
+                    # AUTHORITATIVE next_objective_id below is recomputed AFTER the
+                    # planner so it reflects the inserts.
+                    _pre_floor = max((o.id for o in objectives), default=0) + 1
+                    # planner runs only on fresh runs (gated on `not
+                    # resume_from_execution_id`), so _resume_next_objective_id is
+                    # always None here → this reduces to _pre_floor; the ternary
+                    # mirrors the authoritative recompute at ~:3806 for symmetry.
+                    _planner_next = (
+                        max(_resume_next_objective_id, _pre_floor)
+                        if _resume_next_objective_id is not None
+                        else _pre_floor
+                    )
+                    objectives = await run_open_world_planner(
+                        objectives=objectives,
+                        scroll_intent=getattr(context, "scroll_intent", None) or scroll.intent,
+                        situation_report=context._situation_report,
+                        config=self.config,
+                        next_id=_planner_next,
+                        scroll=scroll,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Runtime] open-world planner skipped (non-fatal)",
+                        exc_info=True,
+                    )
+                    # objectives untouched → static tree (AC6 fail-safe).
+
             # G1 (R-A2): the fold may have swapped `objectives` for a longer persisted
-            # graph — re-derive the completion denominator so the gate/progress logs
-            # count the ACTUAL objectives this run must satisfy (not the stale scroll tree).
+            # graph, and the R-A10 planner may have inserted precede-objectives —
+            # re-derive the completion denominator so the gate/progress logs count the
+            # ACTUAL objectives this run must satisfy (not the stale scroll tree).
             total_objectives = len(objectives)
             # G1: id-allocator floor for post-resume inserts. Monotonic and
             # collision-proof: never sits below max(existing id)+1, so a
             # corrupt/hand-edited restored value can't seed an id collision; a
-            # legitimately-advanced restored value (>= floor) wins. Stashed on
+            # legitimately-advanced restored value (>= floor) wins. Computed ONCE
+            # here (AFTER the planner) so it reflects any inserted ids. Stashed on
             # context so capture_from_context persists it on the next snapshot.
             _floor = max((o.id for o in objectives), default=0) + 1
             next_objective_id = (
@@ -3699,6 +4633,50 @@ class ShadowRuntime:
                 else _floor
             )
             context._next_objective_id = next_objective_id
+            # R-A10 (RISK-2): persist the authoritative post-fold objective graph
+            # so a mutation (persisted graph / planner insert / param-sub) survives
+            # the NEXT snapshot — capture_from_context reads context._objective_graph.
+            # CONDITIONAL on divergence from the static scroll tree BY IDENTITY: a
+            # never-mutated run has `objectives is scroll.objectives` (the fold's
+            # branch-3 identity return AND the planner's no-insert identity return),
+            # so we leave _objective_graph UNSET → capture persists [] and the next
+            # resume takes the identity branch (AC6 byte-identical schedule, snapshot
+            # bytes UNCHANGED vs G1). A mutated / planner-inserted / param-sub /
+            # resumed-from-graph run diverged → we write the graph so it re-persists
+            # (and a resumed run keeps re-persisting it, not [] on the second
+            # snapshot — the resume block re-seeds _objective_graph below).
+            if use_objectives and objectives is not scroll.objectives:
+                context._objective_graph = [o.model_dump(mode="json") for o in objectives]
+
+            # ── R-A10 (§5.3 / §5.6): RequirementReport producer (B10) ──────────
+            # Invoke build_requirement_report so context._requirement_report gets a
+            # real producer (B6 persists + resume-restores it). FRESH runs only —
+            # a resume rehydrates the prior report from the snapshot via
+            # apply_to_context, so re-producing here would clobber it (the same
+            # fresh-vs-resume chokepoint the planner uses).
+            #
+            # CAPABILITY-RESOLUTION (grounded): an Objective carries NO declared /
+            # resolvable target capability pre-loop (the LLM selects a tool per
+            # objective INSIDE the loop), so a clean per-objective capability is
+            # NOT available here. Rather than fabricate a capability GUESS, we pass
+            # the resolvable capability we have — none, pre-loop — which makes the
+            # binder return an EMPTY report: a no-op that establishes the producer
+            # seam + the persistence round-trip WITHOUT a hallucinated diff. The
+            # mid-loop binder-in-loop (where a real per-objective capability IS
+            # selected, and the ask_bundle carries real gaps) is R-A12.
+            #
+            # FAIL-SAFE + AC6: _populate_requirement_report swallows any binder/
+            # render error (empty ask_bundle ⇒ no elicitation, no perturbation), and
+            # lets a PendingChoiceRequest PROPAGATE (the suspend is the rail).
+            if use_objectives and not resume_from_execution_id:
+                _populate_requirement_report(
+                    context,
+                    objectives=objectives,
+                    capability=None,   # no per-objective capability pre-loop (R-A12)
+                    situation=getattr(context, "_situation_report", None) or {},
+                    vault=self.vault,
+                    config=self.config,
+                )
 
             while iteration < _iter_budget:
                 iteration += 1
@@ -4023,23 +5001,63 @@ class ShadowRuntime:
                         except Exception:
                             logger.debug("[Runtime] goal-level verify errored", exc_info=True)
 
+                    # R-A10 B9 (Fix C, ROOT-CAUSE): the credential-gate must hold at the
+                    # COMPLETE goal-level accept too. A goal-verifier PASS (_goal_ok)
+                    # knows NOTHING about the backchain precede, so on its own it would
+                    # finalize status="success" while a required credential/decision is
+                    # still missing. If _recredit_blocked_ids over the LIVE objective list
+                    # (which after a fold carries the precede + the original's updated
+                    # depends_on) reports ANY objective still gated on a missing
+                    # runtime_error requirement, the goal CANNOT be truly complete — reject
+                    # the COMPLETE and steer the shadow to work the prerequisite instead of
+                    # finalizing. ADDITIVE + scoped: empty for any non-credential-gated run
+                    # → legacy/normal COMPLETE handling is byte-unchanged.
+                    _blocked_ids = _recredit_blocked_ids(objectives) if use_objectives else set()
+                    if use_objectives and _blocked_ids:
+                        _goal_ok = False  # a known-missing credential defeats a goal-level pass
+
                     # Reject premature COMPLETE when objectives are still pending,
-                    # UNLESS goal-level verification accepted it.
-                    if use_objectives and len(completed_objectives) < total_objectives and not _goal_ok:
+                    # UNLESS goal-level verification accepted it — OR when a credential
+                    # gate is still open (blocked non-empty), which always rejects.
+                    if use_objectives and (
+                            _blocked_ids
+                            or (len(completed_objectives) < total_objectives and not _goal_ok)):
                         missing = [obj.id for obj in objectives if obj.id not in completed_objectives]
-                        logger.warning(
-                            "[Runtime] COMPLETE rejected — %d/%d objectives still pending: %s",
-                            len(missing), total_objectives, missing,
-                        )
-                        context.add_observation(
-                            {
-                                "warning": (
-                                    f"COMPLETE rejected: {len(missing)} objective(s) not yet "
-                                    f"verified: {missing}. Finish all objectives before COMPLETE."
-                                )
-                            },
-                            current_ab,
-                        )
+                        if _blocked_ids:
+                            logger.warning(
+                                "[Runtime B9] COMPLETE rejected — objective(s) %s blocked on a "
+                                "missing runtime_error requirement (credential/decision gate); the "
+                                "goal cannot be complete until the operator supplies it.",
+                                sorted(_blocked_ids),
+                            )
+                            context.add_observation(
+                                {
+                                    "type": "objective_blocked_credential_gate",
+                                    "objective_id": sorted(_blocked_ids)[0],
+                                    "message": (
+                                        f"COMPLETE rejected: objective(s) {sorted(_blocked_ids)} "
+                                        f"are blocked on a missing credential/decision requirement "
+                                        f"(runtime_error). The goal cannot be complete until that "
+                                        f"requirement is satisfied by the operator — work the "
+                                        f"prerequisite objective."
+                                    ),
+                                },
+                                current_ab,
+                            )
+                        else:
+                            logger.warning(
+                                "[Runtime] COMPLETE rejected — %d/%d objectives still pending: %s",
+                                len(missing), total_objectives, missing,
+                            )
+                            context.add_observation(
+                                {
+                                    "warning": (
+                                        f"COMPLETE rejected: {len(missing)} objective(s) not yet "
+                                        f"verified: {missing}. Finish all objectives before COMPLETE."
+                                    )
+                                },
+                                current_ab,
+                            )
                         continue  # Return to loop — shadow must finish remaining objectives
 
                     summary = decision.get("summary", "Task completed.")
@@ -4708,6 +5726,65 @@ class ShadowRuntime:
                     except Exception:
                         pass
 
+                    # ── R-A10 B9 (AC4): runtime-error-as-requirement fold ──────────
+                    # A tool failure that is really a MISSING REQUIREMENT (a 401/403
+                    # auth failure, a 422/404 bad-request) should NOT count toward the
+                    # stuck bound and fail the run. Fold it into a Requirement + a
+                    # backchain precede-objective, EXEMPT the stuck counters (this is a
+                    # discovered requirement, not a lack of progress), and SUSPEND via
+                    # the INPUT rail so the operator supplies the credential/decision;
+                    # on resume the precede is satisfied and the original objective
+                    # retries. A 500/other http_error or a non-http failure falls
+                    # through UNCHANGED to the normal reflection + stuck path below.
+                    if use_objectives and result is not None and not getattr(result, "success", False):
+                        try:
+                            from systemu.runtime.failure_classifier import (
+                                classify_tool_result, http_error_subclass,
+                            )
+                            _cls = classify_tool_result(result)
+                            _sub = (http_error_subclass(result)
+                                    if _cls.category == "http_error" else "other")
+                        except Exception:
+                            _sub = "other"
+                        if _sub in ("auth", "semantic"):
+                            _fold_susp = self._fold_runtime_error_and_suspend(
+                                objectives=objectives,
+                                completed_objectives=completed_objectives,
+                                decision=decision,
+                                sub=_sub,
+                                tool_name=tool_name,
+                                context=context,
+                                scroll=scroll,
+                                shadow=shadow,
+                                activity=activity,
+                                execution_id=execution_id,
+                                root_eid=root_eid,
+                                iteration=iteration,
+                                current_ab=current_ab,
+                                harness_requests_this_run=harness_requests_this_run,
+                                loop_guard=loop_guard,
+                                revoke_harness_leases=_revoke_harness_leases,
+                            )
+                            if _fold_susp is not None and _fold_susp.get("already_pending"):
+                                # Fix 2: idempotent-pending — a precede for this
+                                # service is already inserted and still missing (a
+                                # repeated 401 across the loop). The exemption was
+                                # applied inside the fold; SKIP _update_stuck_counters /
+                                # loop_guard.record / _stuck_trigger for this iteration
+                                # so this failure NEVER counts toward the stuck bound,
+                                # and continue the loop (the run stays parked on the
+                                # still-pending precede — it is not lack of progress).
+                                objectives = _fold_susp["objectives"]
+                                continue
+                            if _fold_susp is not None:
+                                # The fold mutated the tree in place-of-return; adopt it
+                                # so any post-suspend bookkeeping sees the new schedule.
+                                objectives = _fold_susp["objectives"]
+                                return _fold_susp["result"]
+                            # else: fold degraded (unresolvable obj / genuinely
+                            # unfoldable) → fall through to the normal reflection +
+                            # stuck path (a repeated-pending case never reaches here).
+
                     # v0.8.21: stuck-guard — record tool outcome.
                     # (objective-credit reset is applied below at the credit site.)
                     self._update_stuck_counters(
@@ -4879,7 +5956,44 @@ class ShadowRuntime:
                         # A failed tool (result.success=False) cannot advance the objective —
                         # the shadow must try again or choose a different approach.
                         completed_obj = decision.get("completes_objective")
-                        if isinstance(completed_obj, int) and completed_obj not in completed_objectives:
+                        # R-A10 B9 (Fix C, ROOT-CAUSE): the credential-gate must hold at
+                        # THIS live credit site too, not only the resume-recredit hook.
+                        # An objective that (per _recredit_blocked_ids over the LIVE
+                        # objective list — which after a fold carries the backchain
+                        # precede + the original's updated depends_on) is gated on a
+                        # still-MISSING runtime_error requirement — the precede itself,
+                        # OR anything transitively depending on it — must NEVER be
+                        # credited here. objective_verifier soft-passes verified=True for
+                        # a verifier=None objective BEFORE any durable check, so without
+                        # this guard a resume WITHOUT an operator credential could credit
+                        # the precede then the original on succeeding tool calls and reach
+                        # status="success" with the credential still absent. The ONLY
+                        # sanctioned path that clears the gate is _apply_resume_fold_credit
+                        # flipping the requirement missing→have. ADDITIVE + scoped:
+                        # _recredit_blocked_ids is empty for any objective list with no
+                        # missing runtime_error requirement → legacy/normal runs unchanged.
+                        _blocked_ids = _recredit_blocked_ids(objectives)
+                        if isinstance(completed_obj, int) and completed_obj in _blocked_ids:
+                            logger.warning(
+                                "[Runtime B9] live credit SKIPPED for obj=%d — blocked on a "
+                                "missing runtime_error requirement (credential/decision gate); "
+                                "only the operator-supplied credential path can clear it.",
+                                completed_obj,
+                            )
+                            context.add_observation(
+                                {
+                                    "type": "objective_blocked_credential_gate",
+                                    "objective_id": completed_obj,
+                                    "message": (
+                                        f"Objective {completed_obj} is blocked on a missing "
+                                        f"credential/decision requirement (runtime_error); it "
+                                        f"cannot be completed until that requirement is satisfied "
+                                        f"by the operator — work the prerequisite objective."
+                                    ),
+                                },
+                                current_ab,
+                            )
+                        elif isinstance(completed_obj, int) and completed_obj not in completed_objectives:
                             if result is not None and result.success:
                                 # v0.9.1 (Layer 4): run the durable-outcome verifier before
                                 # crediting.  Best-effort: verifier errors fall through to the
@@ -5062,11 +6176,31 @@ class ShadowRuntime:
                         # fragile (impl-path / path-mangling / delta-timing all reject
                         # legitimate work); the goal verifier (epoch baseline) just
                         # checks whether the GOAL's artifact exists. Default OFF.
-                        if _intent_engine_enabled(self.config) and _adherence != "strict" and _intent_goal_success(
+                        #
+                        # R-A10 B9 (Fix C, ROOT-CAUSE): the credential-gate must hold here
+                        # too. _intent_goal_success knows NOTHING about the backchain
+                        # precede, so a goal-level pass would otherwise finalize
+                        # status="success" while a required credential/decision is still
+                        # missing. If _recredit_blocked_ids over the LIVE objective list
+                        # reports ANY objective still gated on a missing runtime_error
+                        # requirement, the goal cannot be truly complete — SKIP the accept
+                        # and fall through to the honest park path below. ADDITIVE +
+                        # scoped: empty for any non-credential-gated run → unchanged.
+                        _stuck_blocked_ids = _recredit_blocked_ids(objectives)
+                        if _stuck_blocked_ids:
+                            logger.info(
+                                "[Runtime B9] stuck-park goal-accept SKIPPED — objective(s) %s "
+                                "blocked on a missing runtime_error requirement (credential/"
+                                "decision gate); parking honestly instead of finalizing success.",
+                                sorted(_stuck_blocked_ids),
+                            )
+                        if (not _stuck_blocked_ids
+                                and _intent_engine_enabled(self.config) and _adherence != "strict"
+                                and _intent_goal_success(
                                 vault=self.vault, config=self.config,
                                 user_profile=getattr(self, "user_profile", None),
                                 scroll=scroll, execution_id=execution_id,
-                                summary=(decision.get("summary") if isinstance(decision, dict) else None)):
+                                summary=(decision.get("summary") if isinstance(decision, dict) else None))):
                             logger.info(
                                 "[Runtime] intent-engine: goal met at stuck-park — "
                                 "finalizing SUCCESS instead of parking (%d/%d objectives credited).",

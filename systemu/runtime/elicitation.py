@@ -183,6 +183,100 @@ def _elicitation_request_id(message: str, requested_schema: Dict[str, Any]) -> s
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  R-A10 B10 — a RequirementReport.ask_bundle Requirement → the elicitation rail
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _schema_path_leaf(schema_path: str) -> str:
+    """The trailing leaf of a Requirement.schema_path (e.g. ``"auth/api_key"`` →
+    ``"api_key"``). Array-item markers (the literal ``"[]"``) and empty segments
+    are skipped so the field name is a real leaf, never ``""`` or ``"[]"``."""
+    segs = [s for s in str(schema_path or "").split("/") if s and s != "[]"]
+    return segs[-1] if segs else (str(schema_path) or "field")
+
+
+def requirement_to_field(req: Any) -> Dict[str, Any]:
+    """Map ONE ``Requirement`` (B3 binder output) to an elicitation FIELD dict —
+    the ``{name, type, description, [format], [default]}`` shape
+    :func:`elicitation_schema_from_fields` consumes.
+
+    Mapping (spec §5.6 / the B10 plan):
+      * ``name``        = the LEAF of ``schema_path``.
+      * ``type``        = ``"string"`` for every kind (the rail's primitive default;
+                          a richer type is inferred from the enum below when present).
+      * ``credential``  additionally carries ``format="password"`` so
+                          :func:`is_secret_field` routes it URL-mode (never the form).
+      * ``description`` = the requirement's ``rationale`` (WHY it's asked).
+      * ``default``     = the pre-filled non-secret bound value from
+                          ``bound_value_ref`` — a one-click confirm. A SECRET's
+                          bound_value_ref is a REFERENCE (never the plaintext), so a
+                          credential is NEVER pre-filled: no secret value in ``default``.
+
+    A decision requirement that carries options (``enum`` on a future extension)
+    would render a choice; today Requirement has no options field, so a decision is
+    a plain string field (still a usable ask).
+    """
+    kind = _get_attr(req, "kind") or "input"
+    schema_path = _get_attr(req, "schema_path") or ""
+    rationale = _get_attr(req, "rationale") or ""
+    bound_ref = _get_attr(req, "bound_value_ref")
+
+    field: Dict[str, Any] = {
+        "name": _schema_path_leaf(schema_path),
+        "type": "string",
+        "description": rationale,
+    }
+    if kind == "credential":
+        # URL-mode marker → is_secret_field True; NEVER pre-fill a secret default.
+        field["format"] = "password"
+        return field
+
+    # Non-secret: pre-fill the bound value as the schema default (a one-click
+    # confirm). Guard on the name too — a name that reads as a secret must NOT get
+    # a pre-filled default even if the kind is not "credential" (defense-in-depth).
+    if bound_ref is not None and not is_secret_field(field):
+        field["default"] = bound_ref
+    return field
+
+
+def _get_attr(obj, name):
+    """Read ``name`` off a pydantic model OR a plain dict, tolerantly (None on miss)."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def surface_ask_bundle_requirement(req: Any, *, vault=None, config=None) -> Dict[str, Any]:
+    """Render ONE ``Requirement`` through the park/ask/resume rail and return the
+    accept/decline/cancel envelope.
+
+    Builds a SINGLE-field ``requested_schema`` from
+    :func:`requirement_to_field`, then drives :func:`resolve_structured_input`
+    with a clear ask ``message`` that carries the requirement's rationale. The
+    suspend IS the rail: a ``PendingChoiceRequest`` raised while awaiting the
+    operator PROPAGATES (it is deliberately NOT caught here — the caller sits in
+    the resume-aware spine). Headless / no-queue ⇒ ``resolve_structured_input``
+    returns a fail-closed ``cancel`` (never hangs, never fabricates).
+
+    SINGLE requirement ONLY. The batched multi-requirement scope card (one card,
+    N requirements) + re-plan-on-resume is deferred to **R-A12**; B10 surfaces the
+    FIRST ask_bundle requirement so the producer has a live consumer.
+    """
+    field = requirement_to_field(req)
+    schema = elicitation_schema_from_fields([field])
+    rationale = _get_attr(req, "rationale") or ""
+    leaf = field.get("name") or "input"
+    message = f"Input needed for '{leaf}'."
+    if rationale:
+        message = f"{message} {rationale}"
+    return resolve_structured_input(
+        message=message,
+        requested_schema=schema,
+        vault=vault,
+        config=config,
+    )
+
+
 def resolve_structured_input(
     *,
     message: str,

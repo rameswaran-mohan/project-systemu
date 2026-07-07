@@ -89,6 +89,17 @@ class ExecutionSnapshot:
     objective_graph:          List["Objective"] = field(default_factory=list)
     next_objective_id:        int = 1
     schema_version:           int = 1
+    # R-A9 (Situational Inventory §5.1): survey_situation caches its SituationReport
+    # here as a plain dict (SituationReport.model_dump()) so the snapshot stays
+    # store-agnostic + cycle-free (we deliberately do NOT import SituationReport),
+    # plus the freshness stamps used for invalidation-aware re-survey.
+    situation_report:         Optional[dict] = None
+    situation_stamps:         dict = field(default_factory=dict)
+    # R-A10 (step B6): the binder's RequirementReport cached here as a plain dict
+    # (RequirementReport.model_dump()) so a resumed run does not re-ask the
+    # operator. Store-agnostic + cycle-free — we deliberately do NOT import
+    # RequirementReport (mirrors situation_report).
+    requirement_report:       Optional[dict] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,7 +171,24 @@ def read_snapshot(
             snapshotted_at=data.get("snapshotted_at", ""),
             schema_version=int(data.get("schema_version", 1)),
             next_objective_id=int(data.get("next_objective_id", 1) or 1),  # 1-based allocator floor; 0/absent -> 1 (matches capture)
-            objective_graph=[Objective(**o) for o in data.get("objective_graph", [])],
+            # Fix 1 (read-path poison guard): reuse _coerce_objectives so read and
+            # capture handle a corrupt/hand-edited entry the SAME way (drop-with-warning),
+            # not oppositely. A bare `[Objective(**o) for ...]` comp raised on ONE bad
+            # entry → the broad except below returned None → the resume caller read that
+            # as "no snapshot, start fresh" (DEC-9 re-execute-effects hazard). Now a
+            # single malformed entry degrades to "resume with the good objectives". The
+            # top-level isinstance(list) guard mirrors the situation/requirement_report
+            # guards on the lines below.
+            objective_graph=_coerce_objectives(
+                data.get("objective_graph", []) if isinstance(data.get("objective_graph"), list) else []
+            ),
+            # R-A9: guard a poisoned/garbage cache — a non-dict report degrades to
+            # None (=> a re-survey, never a crash); a non-dict stamps degrades to {}.
+            situation_report=(lambda _v: _v if isinstance(_v, dict) else None)(data.get("situation_report")),
+            situation_stamps=dict(data.get("situation_stamps") or {}) if isinstance(data.get("situation_stamps"), dict) else {},
+            # R-A10: guard a poisoned/garbage cache — a non-dict report degrades to
+            # None (=> re-ask the operator, never a crash).
+            requirement_report=(lambda _v: _v if isinstance(_v, dict) else None)(data.get("requirement_report")),
         )
     except SnapshotRefused:
         # DEC-9: a newer-than-supported snapshot must refuse LOUDLY — never
@@ -212,11 +240,32 @@ def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
         "schema_version":          snapshot.schema_version,
         "next_objective_id":       snapshot.next_objective_id,
         "objective_graph":         [o.model_dump(mode="json") for o in snapshot.objective_graph],
+        "situation_report":        snapshot.situation_report,
+        "situation_stamps":        snapshot.situation_stamps,
+        "requirement_report":      snapshot.requirement_report,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers used by shadow_runtime to capture / restore
+
+def _coerce_objectives(graph) -> List["Objective"]:
+    """Normalise a context._objective_graph into a list of Objective instances.
+
+    R-A10 (RISK-2): the runtime may stash the objective graph on the context as
+    either Objective instances OR plain JSON dicts (model_dump). ExecutionSnapshot._to_dict
+    requires Objective instances (it calls o.model_dump). Coerce here so both
+    representations round-trip and a malformed entry is skipped (never crashes the
+    snapshot). Objective already imported at module top.
+    """
+    out: List["Objective"] = []
+    for o in graph or []:
+        try:
+            out.append(o if isinstance(o, Objective) else Objective(**o))
+        except Exception:
+            logger.debug("[ExecSnapshot] dropped malformed objective_graph entry", exc_info=True)
+    return out
+
 
 def capture_from_context(
     *,
@@ -269,8 +318,11 @@ def capture_from_context(
         requests_this_run=int(requests_this_run),
         subagent_depth=int(subagent_depth),
         root_execution_id=root_execution_id,
-        objective_graph=list(getattr(context, "_objective_graph", []) or []),
+        objective_graph=_coerce_objectives(getattr(context, "_objective_graph", []) or []),
         next_objective_id=int(getattr(context, "_next_objective_id", 1) or 1),
+        situation_report=getattr(context, "_situation_report", None),
+        situation_stamps=dict(getattr(context, "_situation_stamps", {}) or {}),
+        requirement_report=getattr(context, "_requirement_report", None),
     )
 
 
@@ -291,6 +343,36 @@ def apply_to_context(snapshot: ExecutionSnapshot, *, context) -> None:
             context.add_sticky_note(note)
     except Exception:
         pass
+
+    # R-A10 (RISK-2): re-seed the durable objective graph + the B6 requirement
+    # report onto the context so a resumed MUTATED run keeps re-persisting them on
+    # its NEXT capture (capture_from_context reads context._objective_graph /
+    # ._requirement_report). CONDITIONAL on a non-empty graph — an empty graph
+    # leaves _objective_graph UNSET so a never-mutated resume still captures []
+    # (AC6 byte-identical, snapshot bytes unchanged). requirement_report re-seeds
+    # verbatim (None → None is harmless). The shadow_runtime resume block also
+    # re-seeds these before delete_snapshot; this makes the helper self-contained
+    # for any future caller (idempotent).
+    try:
+        if snapshot.objective_graph:
+            context._objective_graph = [
+                o.model_dump(mode="json") if hasattr(o, "model_dump") else dict(o)
+                for o in snapshot.objective_graph
+            ]
+        # Fix 3: also re-seed the id-allocator floor so the helper honors its
+        # "self-contained for any future caller (idempotent)" contract. Without this
+        # an apply→capture cycle collapsed next_objective_id from N to 1 for a caller
+        # relying SOLELY on the helper. SAFE for the live shadow_runtime path: it
+        # peels _resume_next_objective_id separately and OVERWRITES
+        # context._next_objective_id with max(_resume_next_objective_id, _floor)
+        # AFTER apply runs (:3105 « :3737), so AC6 snapshot bytes are unchanged.
+        _nid = getattr(snapshot, "next_objective_id", None)
+        if _nid is not None:
+            context._next_objective_id = int(_nid)
+        if getattr(snapshot, "requirement_report", None) is not None:
+            context._requirement_report = snapshot.requirement_report
+    except Exception:
+        logger.debug("[ExecSnapshot] apply graph/req-report re-seed failed", exc_info=True)
 
     # Summarise the recent history into the one-shot reflection block.
     try:

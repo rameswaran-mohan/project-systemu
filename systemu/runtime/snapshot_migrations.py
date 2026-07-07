@@ -23,8 +23,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 # Bump this whenever a migration is added. v1 = pre-G1 (unversioned);
-# v2 = G1 adds objective_graph + next_objective_id.
-CURRENT_SCHEMA_VERSION = 2
+# v2 = G1 adds objective_graph + next_objective_id;
+# v3 = R-A9 adds situation_report + situation_stamps;
+# v4 = R-A10 adds requirement_report.
+CURRENT_SCHEMA_VERSION = 4
 
 
 class SnapshotRefused(Exception):
@@ -52,9 +54,24 @@ def _migrate_1_to_2(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _migrate_2_to_3(data: Dict[str, Any]) -> Dict[str, Any]:
+    """v2 -> v3 (R-A9): add the situational-inventory cache keys, defaulted empty."""
+    data.setdefault("situation_report", None)
+    data.setdefault("situation_stamps", {})
+    return data
+
+
+def _migrate_3_to_4(data: Dict[str, Any]) -> Dict[str, Any]:
+    """v3 -> v4 (R-A10): add the requirement-report cache key, defaulted None."""
+    data.setdefault("requirement_report", None)
+    return data
+
+
 # Registry: {from_version: fn}. Keys must be contiguous from 1..CURRENT-1.
 _MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     1: _migrate_1_to_2,
+    2: _migrate_2_to_3,
+    3: _migrate_3_to_4,
 }
 
 

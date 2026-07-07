@@ -129,6 +129,31 @@ class Objective(BaseModel):
     # and require no external check, so legacy on-disk objectives validate unchanged.
     origin: Literal["planner", "discovery", "retry", "backchain"] = "planner"
     requires_external_verification: bool = False
+    # R-A10 (§5.3): each objective carries a computed RequirementSet — "what's
+    # missing" is a schema-diff, not a guess. Additive default [] → legacy scrolls
+    # validate unchanged. Lands the G1-deferred field.
+    requirements: List["Requirement"] = []
+
+
+class Requirement(BaseModel):
+    """§5.3 — one required capability-schema leaf, bound or missing (BIND-mode)."""
+    kind: Literal["input", "credential", "decision", "capability"]
+    schema_path: str                       # JSON-pointer into the capability schema
+    state: Literal["have", "resolvable", "missing"]
+    source: Literal["schema", "situation", "runtime_error", "run_context", "operator_profile"]
+    # value_origin ⇐ the source object's origin_class (table_store.py:55 canonical
+    # IMMUTABLE taint: operator|systemu_authored|content_derived). IMPL-5 — copied
+    # from the bind source, NEVER recomputed; content_derived never silent-binds.
+    value_origin: Optional[Literal["operator", "systemu_authored", "content_derived"]] = None
+    bound_value_ref: Optional[str] = None  # a REFERENCE, never the raw value/secret
+    confidence: float = 0.0                # feeds the T_high gate
+    rationale: str = ""
+
+
+class RequirementReport(BaseModel):
+    """§5.3 — the run's requirement diff feeding the pull/scope card (§5.6)."""
+    per_objective: Dict[int, List[Requirement]] = {}
+    ask_bundle: List[Requirement] = []     # deduped subset failing T_high or content_derived
 
 
 # ─────────────────────────────────────────────────────────────────────────────

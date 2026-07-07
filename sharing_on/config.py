@@ -422,6 +422,16 @@ class Config:
     supervisor_llm_budget_per_run:        int   = 10     # Tier-3+Tier-1 supervisor calls per execution
     supervisor_tier_routine:              str   = "tier_3"
     supervisor_tier_intervention:         str   = "tier_1"
+    # R-A10 B11 (DEC-12): per-stage MODEL-MATRIX tier knobs, mirroring the
+    # supervisor_tier_* string-field shape. Resolved to an int via the
+    # execution_mind.py:447 idiom (1 if "1" in label else (3 if "3" in ...)).
+    # Defaults per docs/MODEL-MATRIX.md: planner/binder = tier1 (deepest
+    # reasoning + advisory bind-judgment), parser = tier3 (mechanical
+    # schema-shaped transforms). verifier_tier (int, =3) already exists below
+    # and is intentionally NOT duplicated here.
+    planner_tier:                         str   = "tier1"
+    binder_tier:                          str   = "tier1"
+    parser_tier:                          str   = "tier3"
     supervisor_directive_timeout_s:       float = 5.0
     supervisor_llm_budget_per_hour_usd:   float = 5.0
     supervisor_llm_budget_per_day_usd:    float = 50.0
@@ -571,6 +581,13 @@ class Config:
                 "SYSTEMU_SUPERVISOR_TIER_ROUTINE", "tier_3").lower(),
             supervisor_tier_intervention=os.getenv(
                 "SYSTEMU_SUPERVISOR_TIER_INTERVENTION", "tier_1").lower(),
+            # R-A10 B11 (DEC-12): per-stage MODEL-MATRIX tier knobs.
+            planner_tier=os.getenv(
+                "SYSTEMU_PLANNER_TIER", "tier1").lower(),
+            binder_tier=os.getenv(
+                "SYSTEMU_BINDER_TIER", "tier1").lower(),
+            parser_tier=os.getenv(
+                "SYSTEMU_PARSER_TIER", "tier3").lower(),
             supervisor_directive_timeout_s=float(
                 os.getenv("SYSTEMU_SUPERVISOR_TIMEOUT_S", "5.0")),
             supervisor_llm_budget_per_hour_usd=float(

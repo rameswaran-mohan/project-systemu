@@ -76,3 +76,38 @@ def is_budget_class(model: Optional[str]) -> bool:
         return False
     lowered = str(model).lower()
     return any(marker in lowered for marker in _BUDGET_MARKERS)
+
+
+# R-A10 B11 (DEC-20a) — MODEL-MATRIX `locality` classifier.
+#
+# A pinned static id-prefix map: which deployment locality class a model id
+# belongs to. Vocabulary (docs/MODEL-MATRIX.md):
+#   * local_capable  — a local `ollama/*` model can serve this stage now/soon.
+#   * cloud_required — needs a frontier cloud model (e.g. claude-sonnet-*);
+#                      no local model qualifies.
+#   * cloud_default  — runs cloud today (flash-class + the catch-all); a local
+#                      model may qualify later per its fixtures.
+# NOTHING consumes this at runtime yet — it rides the artifact for R-P3b's
+# privacy page and future PCM (DEC-20b). It is a pinned constant, not a
+# hot-path classifier. Order matters: the first matching prefix/marker wins.
+_LOCALITY_PREFIXES = (
+    ("ollama/", "local_capable"),
+    ("anthropic/claude-sonnet", "cloud_required"),
+)
+_LOCALITY_DEFAULT = "cloud_default"
+
+
+def locality_of(model_id: str) -> str:
+    """Classify *model_id* into its MODEL-MATRIX locality class (DEC-20a).
+
+    `ollama/*` ⇒ local_capable; `anthropic/claude-sonnet*` ⇒ cloud_required;
+    flash-class (`*-flash*`) and everything else (incl. empty/unknown) ⇒
+    cloud_default. Never raises — an unclassifiable id is `cloud_default`.
+    """
+    lowered = str(model_id or "").lower()
+    for prefix, locality in _LOCALITY_PREFIXES:
+        if lowered.startswith(prefix):
+            return locality
+    if "-flash" in lowered:
+        return "cloud_default"
+    return _LOCALITY_DEFAULT

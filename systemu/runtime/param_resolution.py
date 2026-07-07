@@ -62,6 +62,34 @@ def _replace_in_obj(obj: Any, old: str, new: str) -> Any:
     return obj
 
 
+def paramsub_pairs(
+    parameters: List[Any], answers: Dict[str, Any]
+) -> List[tuple]:
+    """Compute the ``(old_s, new_s)`` literal-substitution pairs that
+    :func:`substitute_parameters` will apply, in application order.
+
+    Single source of truth for "what string does each parameter rewrite, to
+    what": each pair is ``(captured_default_str, resolved_str)`` and is emitted
+    only when both sides stringify AND differ (a no-op pair is never emitted).
+    Callers that need to re-apply the SAME substitution to another object (e.g.
+    the B12 param-sub × graph merge in ``shadow_runtime``) reuse this so they can
+    replay ``_replace_in_obj`` for each pair rather than guessing field names.
+    """
+    pairs: List[tuple] = []
+    for p in (parameters or []):
+        d = p if isinstance(p, dict) else p.model_dump(mode="json")
+        name = d.get("name")
+        if not name:
+            continue
+        captured = d.get("default")
+        chosen = answers.get(name, captured) if answers else captured
+        old_s = "" if captured is None else str(captured)
+        new_s = "" if chosen is None else str(chosen)
+        if old_s and old_s != new_s:
+            pairs.append((old_s, new_s))
+    return pairs
+
+
 def substitute_parameters(
     parameters: List[Any],
     answers: Dict[str, Any],
@@ -78,7 +106,11 @@ def substitute_parameters(
     / constraints is replaced with the resolved value (slot substitution).
 
     Returns ``(scroll_json, intent, constraints, resolved)`` — all copies; the
-    inputs are never mutated. Empty ``parameters`` ⇒ identity (no-op)."""
+    inputs are never mutated. Empty ``parameters`` ⇒ identity (no-op).
+
+    The actual ``(old_s, new_s)`` pairs applied here are exposed by
+    :func:`paramsub_pairs` (same computation) so a later resume can re-apply the
+    identical substitution to a persisted objective graph."""
     new_json = copy.deepcopy(scroll_json or [])
     new_intent = intent or ""
     new_constraints = copy.deepcopy(constraints or {})
