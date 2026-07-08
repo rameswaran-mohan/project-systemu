@@ -28,14 +28,31 @@ Rate limiting
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Any, Callable, Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
-from .gateway import OutboundMessage
+from .gateway import InlineButton, OutboundMessage, mask_outbound
 
 logger = logging.getLogger(__name__)
+
+
+def _decision_resolution_on() -> bool:
+    """R-P1 master switch: is Telegram-driven decision resolution enabled?
+
+    Reads the env directly (mirrors ``Config.messaging_decision_resolution``'s
+    ``default_factory``) so this pure translator needs no Config instance. ON
+    unless the var is off/false/0.
+    """
+    return os.getenv("SHARING_ON_MESSAGING_DECISION_RESOLUTION", "on").lower() \
+        not in ("off", "false", "0")
+
+
+def _push_detail() -> str:
+    """R-P1: how much context to include in a decision push (summary|full)."""
+    return os.getenv("SHARING_ON_MESSAGING_PUSH_DETAIL", "summary").lower()
 
 
 # Per-category rate limits.  (max_pushes, window_seconds).  Approval
@@ -149,13 +166,14 @@ def translate_event(event: Dict[str, Any]) -> Optional[OutboundMessage]:
     # 0a) W10.1: pending operator decisions (the modern needs-you flow —
     # W5.3 made these events self-describing). Unlimited bucket: the
     # operator MUST hear about these while away. Resolutions are noise.
+    #
+    # R-P1: extend the push with a short [tag] + inline option buttons (or a
+    # /answer reply hint, or a "needs the dashboard" note), keyed on the parked
+    # decision's PERSISTED resolution_class + shape. Buttons are opt-in per
+    # recognized shape, never the default. Every span here is MASK-redacted (the
+    # gateway masks again — belt and suspenders).
     if category == "operator_decision_posted":
-        title = ctx.get("title") or message
-        return OutboundMessage(
-            text=(f"🔔 Needs you: {title}\n\n"
-                  f"Open the dashboard Inbox to answer."),
-            category="approval",
-        )
+        return _render_decision_push(ctx, fallback_title=message)
     if category in {"operator_decision_resolved", "operator_decision_expired"}:
         return None
 
@@ -227,3 +245,92 @@ def translate_event(event: Dict[str, Any]) -> Optional[OutboundMessage]:
 
     # Everything else — drop.
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  R-P1 decision push rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _DecShim:
+    """Minimal decision-like object (``.options`` + ``.context``) built from the
+    enriched ``operator_decision_posted`` event so ``render_options`` — which
+    reads only those two attributes — can run without a vault lookup."""
+
+    __slots__ = ("options", "context")
+
+    def __init__(self, options: List[str], context: Dict[str, Any]) -> None:
+        self.options = list(options or [])
+        self.context = dict(context or {})
+
+
+_DASHBOARD_HINT = "Open the dashboard Inbox to answer."
+
+
+def _render_decision_push(
+    ctx: Dict[str, Any], *, fallback_title: str
+) -> Optional[OutboundMessage]:
+    """Build the OutboundMessage for a posted operator decision (R-P1).
+
+    ``ctx`` is the enriched event context: ``title``, ``options``, ``tag``, and
+    ``decision_context`` (the persisted ``OperatorDecision.context``, carrying
+    ``resolution_class`` / ``gate_type`` / ``requested_schema`` / ``body``).
+
+    Honours ``messaging_decision_resolution`` (off ⇒ old dashboard text, no
+    buttons) and ``messaging_push_detail`` (summary|full). MASK-redacts the
+    detail (the gateway masks again).
+    """
+    from .decision_bridge import (
+        callback_token,
+        render_options,
+        SURFACE_BUTTONS,
+        SURFACE_REPLY,
+    )
+
+    title = ctx.get("title") or fallback_title
+    tag = ctx.get("tag") or ""
+    options = ctx.get("options") or []
+    decision_context = ctx.get("decision_context") or {}
+
+    headline = mask_outbound(f"[{tag}] {title}" if tag else f"Needs you: {title}")
+
+    # Master switch off, or no tag to reference — fall back to the old
+    # dashboard-only push (no buttons, no remote-resolution affordance).
+    if not _decision_resolution_on() or not tag:
+        return OutboundMessage(
+            text=f"🔔 {headline}\n\n{_DASHBOARD_HINT}",
+            category="approval",
+        )
+
+    decision = _DecShim(options, decision_context)
+    surface_hint, rendered = render_options(decision, tag=tag)
+
+    # Optional detail body (full mode only), MASK-redacted.
+    detail = ""
+    if _push_detail() == "full":
+        body = str(decision_context.get("body") or "").strip()
+        if body:
+            detail = "\n\n" + mask_outbound(body)
+
+    if surface_hint == SURFACE_BUTTONS and rendered:
+        buttons = [
+            InlineButton(label=mask_outbound(label), callback=callback_token(tag, key))
+            for key, label in rendered
+        ]
+        return OutboundMessage(
+            text=f"🔔 {headline}{detail}",
+            inline_buttons=buttons,
+            category="approval",
+        )
+
+    if surface_hint == SURFACE_REPLY:
+        return OutboundMessage(
+            text=(f"🔔 {headline}{detail}\n\n"
+                  f"Reply with /answer {tag} <value>."),
+            category="approval",
+        )
+
+    # dashboard_only (floor / absent class / multi-field / 5+ / unknown shape).
+    return OutboundMessage(
+        text=f"🔔 {headline}{detail}\n\n{_DASHBOARD_HINT}",
+        category="approval",
+    )

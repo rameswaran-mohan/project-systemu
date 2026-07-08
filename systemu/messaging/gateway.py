@@ -120,6 +120,78 @@ def parse_command(
 #  Allowlist
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Outbound MASK  (R-P1 — no secret ever leaves in a push)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ``mask_outbound`` is the single outbound chokepoint: every gateway calls it in
+# ``push()`` on the message text AND every button label, so a secret can never
+# leave the process in a notification. It is deliberately CONSERVATIVE — it
+# redacts header values (Authorization / Cookie) and things that look like a
+# credential token (bearer / OpenAI ``sk-…`` / AWS ``AKIA…`` / a JWT / a long
+# hex or high-entropy run), and leaves normal prose alone.
+#
+# The token vocabulary reuses ``runtime.elicitation``'s secret name tokens (the
+# same words that force a field URL-mode) so the two secret surfaces stay in sync.
+
+_MASK = "***"
+
+# Token-name words that mark a "<name>: <value>" or "<name>=<value>" pair whose
+# VALUE must be redacted. Reused from the elicitation secret detector so the
+# outbound mask and the inbound URL-mode split share one vocabulary.
+try:  # lazy — keep messaging importable even if the runtime pkg shifts.
+    from systemu.runtime.elicitation import _SECRET_NAME_TOKENS as _SECRET_TOKENS
+except Exception:  # pragma: no cover - defensive fallback
+    _SECRET_TOKENS = (
+        "password", "passwd", "secret", "token", "api_key", "apikey",
+        "access_key", "private_key", "client_secret", "credential", "auth",
+    )
+
+# Header/kv value redaction: "Authorization: …", "Cookie: …", "api_key=…", etc.
+# Matches the token word, an optional bearer/basic scheme, then the value run up
+# to end-of-line (headers/kv pairs are one value per line).
+_HEADER_TOKENS = ("authorization", "cookie", "set-cookie", "proxy-authorization")
+_KV_SECRET_RE = re.compile(
+    r"(?i)\b(" + "|".join(
+        re.escape(t) for t in sorted(set(_HEADER_TOKENS) | set(_SECRET_TOKENS),
+                                     key=len, reverse=True)
+    ) + r")\b\s*[:=]\s*\S+",
+)
+
+# Bearer scheme with a token: "Bearer <token>", "Basic <b64>".
+_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/]{6,}=*")
+
+# Token SHAPES (value-only, no name needed).
+_TOKEN_SHAPE_RES = (
+    re.compile(r"\bsk-[A-Za-z0-9\-]{8,}"),                 # OpenAI-style sk-…
+    re.compile(r"\bAKIA[0-9A-Z]{12,}"),                    # AWS access-key id
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}"),  # JWT
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}"),                 # GitHub PAT
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"),        # Slack token
+    re.compile(r"\b[A-Fa-f0-9]{40,}\b"),                   # long hex (sha/keys)
+)
+
+
+def mask_outbound(text: str) -> str:
+    """Redact secret-looking spans in an outbound push string.
+
+    Conservative: redacts header/kv secret values, bearer/basic schemes, and
+    token shapes (``sk-…``, ``AKIA…``, JWT, ``ghp_…``, Slack, long hex) to
+    ``***``; leaves ordinary prose untouched. Never raises (returns the input
+    unchanged on any error).
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        out = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}: {_MASK}", text)
+        out = _BEARER_RE.sub(_MASK, out)
+        for rx in _TOKEN_SHAPE_RES:
+            out = rx.sub(_MASK, out)
+        return out
+    except Exception:  # pragma: no cover - masking must never break a push
+        return text
+
+
 def allowlist_from_env(env_var: str) -> Set[str]:
     """Parse a comma-separated allowlist env var into a set of user IDs.
 

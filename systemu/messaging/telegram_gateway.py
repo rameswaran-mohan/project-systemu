@@ -31,16 +31,54 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set
 from .gateway import (
     Gateway,
     InboundCommand,
+    InlineButton,
     OutboundMessage,
     allowlist_from_env,
     dispatch,
+    mask_outbound,
     parse_command,
 )
+from .decision_bridge import parse_callback, resolve_from_channel
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  R-P1 inbound: the button-tap → resolver seam
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ``route_callback`` is the PURE parse+route seam a tapped inline button hits. It
+# has NO dependency on a live python-telegram-bot Application, so it is testable
+# directly. The PTB ``_handle_callback_query`` adapter (below) is a thin shell
+# that extracts the wire fields and calls this. A typed ``/answer`` command
+# (``handlers.handle_answer``) feeds the SAME ``resolve_from_channel`` resolver —
+# button tap and slash command converge on one server-side gate.
+
+_BAD_BUTTON_REPLY = (
+    "Sorry, I couldn't read that button — open the dashboard Inbox."
+)
+
+
+def route_callback(callback_data, sender_id: str) -> tuple[str, str]:
+    """Route a Telegram inline-button ``callback_data`` to the resolver.
+
+    ``parse_callback`` first (garbage / unparseable → a friendly no-op that NEVER
+    calls the resolver), then ``resolve_from_channel(tag, choice_key,
+    sender_id=..., channel="telegram")``. ``sender_id`` is passed THROUGH verbatim
+    so the resolver's own allowlist re-check (defense in depth) can fire.
+
+    Returns ``(outcome, reply_text)``. Never raises.
+    """
+    parsed = parse_callback(callback_data)
+    if parsed is None:
+        return ("BAD", _BAD_BUTTON_REPLY)
+    tag, choice_key = parsed
+    return resolve_from_channel(
+        tag, choice_key, sender_id=str(sender_id), channel="telegram",
+    )
 
 
 class TelegramGateway:
@@ -115,6 +153,12 @@ class TelegramGateway:
             )
             return
 
+        # R-P1 MASK chokepoint: redact any secret-looking span before it leaves
+        # the process — the message text AND every inline button label. This is
+        # the single place EVERY outbound push funnels through, so nothing can
+        # bypass the mask.
+        message = self._mask_message(message)
+
         recipients = [message.user_id] if message.user_id else sorted(self.allowlist)
         for user_id in recipients:
             try:
@@ -124,6 +168,22 @@ class TelegramGateway:
                     "[TelegramGateway] failed to push to %s: %s", user_id, exc,
                 )
 
+    @staticmethod
+    def _mask_message(message: OutboundMessage) -> OutboundMessage:
+        """Return a copy of *message* with the text and every inline-button label
+        run through :func:`mask_outbound`. Callbacks are opaque tokens (never
+        secret-bearing) so they're left intact."""
+        masked_buttons = [
+            InlineButton(label=mask_outbound(b.label), callback=b.callback)
+            for b in (message.inline_buttons or [])
+        ]
+        return OutboundMessage(
+            text=mask_outbound(message.text),
+            user_id=message.user_id,
+            inline_buttons=masked_buttons,
+            category=message.category,
+        )
+
     # ── Internals ──────────────────────────────────────────────────
 
     def _run_poll_loop(self) -> None:
@@ -131,6 +191,7 @@ class TelegramGateway:
         try:
             from telegram.ext import (
                 Application,
+                CallbackQueryHandler,
                 CommandHandler,
                 MessageHandler,
                 filters,
@@ -151,6 +212,12 @@ class TelegramGateway:
                 self._app.add_handler(
                     CommandHandler(cmd, self._wrap_command_handler(cmd))
                 )
+            # Inline-button taps (parked-decision resolution) → route_callback →
+            # the SAME resolve_from_channel a /answer command hits. Registered
+            # once, catches every callback query.
+            self._app.add_handler(
+                CallbackQueryHandler(self._handle_callback_query)
+            )
             # Plain-text fallback → /chat
             self._app.add_handler(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_plain_text)
@@ -194,6 +261,42 @@ class TelegramGateway:
             return
         reply = dispatch(cmd, self.command_handlers)
         await update.message.reply_text(reply)
+
+    async def _handle_callback_query(self, update, context):
+        """PTB adapter for an inline-button tap.
+
+        Thin: extract ``callback_query.data`` + ``effective_user.id``, route
+        through :func:`route_callback` (which parses + resolves), then ACK the
+        tap. Telegram requires every callback query to be answered or the
+        client shows a perpetual spinner, so we answer even on the no-op path.
+        The reply text is surfaced in the answer toast; on a successful resolve
+        we also edit the original message so the operator sees it's done.
+        """
+        query = update.callback_query
+        data = getattr(query, "data", None)
+        sender_id = str(update.effective_user.id)
+        try:
+            outcome, reply = route_callback(data, sender_id)
+        except Exception:  # defensive: an adapter must never bubble to PTB
+            logger.exception("[TelegramGateway] callback routing crashed")
+            outcome, reply = ("BAD", _BAD_BUTTON_REPLY)
+        # ACK the tap (dismisses the client spinner); show the reply as a toast.
+        try:
+            await query.answer(reply)
+        except Exception:
+            # A too-long toast or a stale query id must not break the flow.
+            try:
+                await query.answer()
+            except Exception:
+                logger.debug("[TelegramGateway] callback answer failed",
+                             exc_info=True)
+        # On a resolved tap, replace the buttons/message so it can't be re-tapped.
+        if outcome == "OK":
+            try:
+                await query.edit_message_text(reply)
+            except Exception:
+                logger.debug("[TelegramGateway] edit_message_text failed",
+                             exc_info=True)
 
     def _send_to(self, user_id: str, message: OutboundMessage) -> None:
         """Synchronous wrapper around the async send_message call."""

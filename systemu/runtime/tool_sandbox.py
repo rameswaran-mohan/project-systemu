@@ -838,7 +838,23 @@ class ToolSandbox:
         # PARKED command gate is resumable — resume_on_decision re-submits the
         # activity with resume_from_execution_id and derives activity/shadow from the
         # snapshot. Without these the parked chat task hangs forever on resolution.
-        _resume_extras = {"command": command, "cwd": cwd}
+        # R-P1 SEC-1 (Part C): persist the safety evidence classify_resolution()
+        # reads. A command gate ONLY posts here for a DESTRUCTIVE, non-approved
+        # shell command (the early ``is_destructive_call`` return above skips
+        # provably-read-only ones) — so it is destructive BY CONSTRUCTION and
+        # floors regardless (finding 4: a destructive command must not be a phone
+        # tap). We still stamp all three keys honestly: ``verdict`` is
+        # require_approval (a posting command gate is always a "needs approval"),
+        # ``effect_tags`` is empty (shell commands aren't effect-tag classified at
+        # this seam), and ``destructive`` is True (the floor trigger). Without
+        # these keys the classifier would floor on ABSENCE anyway; stamping them
+        # makes the floor explicit + auditable rather than incidental.
+        _resume_extras = {
+            "command": command, "cwd": cwd,
+            "verdict": "require_approval",
+            "effect_tags": [],
+            "destructive": True,
+        }
         try:
             from systemu.runtime.chat_submission_ctx import (
                 current_chat_submission_id, current_execution_id)
@@ -974,10 +990,23 @@ class ToolSandbox:
         )
         # D3: stamp the signature (+ tool name) so the resume path reads it back;
         # carry the run's resume coords so a PARKED tool gate is resumable.
+        #
+        # R-P1 SEC-1 (Part C): PERSIST the safety evidence classify_resolution()
+        # needs to keep a BENIGN tool gate remotely resolvable — without these two
+        # keys the fail-closed classifier floors EVERY tool gate (verdict/
+        # effect_tags absent → floor), making R-P1 inert. ``verdict`` is the
+        # evaluate_action Verdict value (require_approval / deny); ``effect_tags``
+        # is the tool's declared effect set (a list — the money/irreversible floor
+        # reads it). ``destructive`` is the destructive-param signal, stamped for
+        # defense in depth (a destructive tool call floors even with a clean
+        # verdict + empty effect_tags).
         _resume_extras = {
             "tool_signature": sig,
             "tool_name": getattr(tool, "name", tool_name),
             "tool_id": getattr(tool, "id", "") or "",
+            "verdict": getattr(verdict, "value", str(verdict)),
+            "effect_tags": sorted(effect_tags),
+            "destructive": ctx.is_destructive_param,
         }
         try:
             from systemu.runtime.chat_submission_ctx import (

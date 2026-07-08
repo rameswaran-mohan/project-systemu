@@ -496,6 +496,25 @@ class Config:
         default_factory=lambda: os.getenv("SYSTEMU_DASHBOARD_PASSPHRASE_HASH", "")
     )
 
+    # R-P1 (Reach — resolve parked decisions from Telegram): messaging knobs.
+    # Populated via default_factory so they flow through from_env() (which does
+    # not override default_factory fields).
+    #   messaging_decision_resolution — master switch for Telegram-driven
+    #     decision resolution. ON unless SHARING_ON_MESSAGING_DECISION_RESOLUTION
+    #     is off/false/0.
+    #   messaging_push_detail — how much context to push (summary|full).
+    #   dashboard_base_url — base URL woven into pushed decision links; empty ⇒
+    #     no absolute link is emitted.
+    messaging_decision_resolution: bool = field(
+        default_factory=lambda: os.getenv("SHARING_ON_MESSAGING_DECISION_RESOLUTION", "on").lower() not in ("off", "false", "0")
+    )
+    messaging_push_detail: str = field(
+        default_factory=lambda: os.getenv("SHARING_ON_MESSAGING_PUSH_DETAIL", "summary").lower()
+    )
+    dashboard_base_url: str = field(
+        default_factory=lambda: os.getenv("SHARING_ON_DASHBOARD_BASE_URL", "")
+    )
+
     @classmethod
     def from_env(cls) -> "Config":
         """Build config from environment variables with sensible defaults."""

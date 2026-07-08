@@ -14,8 +14,17 @@ import logging
 from typing import Callable, Dict
 
 from .gateway import InboundCommand
+from .decision_bridge import resolve_from_channel
 
 logger = logging.getLogger(__name__)
+
+# Recognized choice keys for /answer <tag> <choice>. A bare 1..4 maps to a1..a4.
+_ANSWER_CHOICE_KEYS = {"a1", "a2", "a3", "a4"}
+_ANSWER_USAGE = (
+    "Usage: /answer <tag> <a1..a4>\n"
+    "The <tag> is the short code on the decision message; the choice is the "
+    "option to pick (a1, a2, a3, a4 — or just 1, 2, 3, 4)."
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,6 +49,7 @@ def handle_help(_: InboundCommand) -> str:
         "/shadows              — list shadows\n"
         "/approve <scroll_id>  — approve a pending scroll\n"
         "/reject  <scroll_id>  — reject a pending scroll\n"
+        "/answer <tag> <a1-a4> — resolve a parked decision (or tap its button)\n"
         "/help                 — this message\n"
         "\nPlain text without a leading / is treated as /chat."
     )
@@ -190,6 +200,48 @@ def handle_reject(cmd: InboundCommand) -> str:
         return f"Could not reject {scroll_id}: {exc}"
 
 
+def _normalize_choice(raw: str) -> str | None:
+    """Map a user-typed choice to a canonical ``a1..a4`` key, or None if invalid.
+
+    Accepts an explicit ``a1..a4`` (case-insensitive) OR a bare ``1..4``. Anything
+    else (out-of-range number, a word, an ``a5``) is rejected so the caller can
+    show a usage hint rather than guess.
+    """
+    token = (raw or "").strip().lower()
+    if token in _ANSWER_CHOICE_KEYS:
+        return token
+    if token.isdigit():
+        n = int(token)
+        if 1 <= n <= 4:
+            return f"a{n}"
+    return None
+
+
+def handle_answer(cmd: InboundCommand) -> str:
+    """Resolve a parked decision from chat: ``/answer <tag> <a1..a4>``.
+
+    The typed sibling of tapping an inline button — both feed the SAME
+    server-side resolver (``resolve_from_channel``), gated by the persisted
+    SEC-1 ``resolution_class`` bit and the sender allowlist. We only parse the
+    tag + choice here; every safety check lives in the resolver.
+    """
+    parts = (cmd.args or "").split()
+    if len(parts) < 2:
+        return _ANSWER_USAGE
+    tag, raw_choice = parts[0], parts[1]
+    choice = _normalize_choice(raw_choice)
+    if choice is None:
+        return _ANSWER_USAGE
+    try:
+        _outcome, message = resolve_from_channel(
+            tag, choice, sender_id=cmd.user_id or "", channel="telegram",
+        )
+        return message
+    except Exception as exc:
+        logger.exception("[Handler] /answer failed")
+        return f"Sorry — /answer failed: {exc}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Default handler bundle
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,4 +257,5 @@ def default_handlers() -> Dict[str, Callable[[InboundCommand], str]]:
         "shadows":    handle_shadows,
         "approve":    handle_approve,
         "reject":     handle_reject,
+        "answer":     handle_answer,
     }

@@ -169,6 +169,24 @@ class OperatorDecisionQueue:
             created_at=datetime.now(tz=timezone.utc),
             resolved_at=None,
         )
+        # R-P1 SEC-1: stamp a persisted, fail-closed remote-resolvability class
+        # at the decision-creation chokepoint. ALLOWLIST-style: default "floor";
+        # only positively-recognized safe shapes become "remotely_resolvable".
+        # Additive (decision.context is a fresh dict) and persisted (it rides in
+        # to_dict()'s "context"). A caller that already stamped a class is NOT
+        # overwritten — a caller can only tighten, and a resumed/re-posted
+        # decision must never be silently upgraded. Import is lazy to avoid any
+        # approval<->messaging import cycle; a failure fails CLOSED to "floor".
+        if "resolution_class" not in decision.context:
+            try:
+                from systemu.messaging.decision_bridge import classify_resolution
+                decision.context["resolution_class"] = classify_resolution(decision.context)
+            except Exception:
+                logger.warning(
+                    "[DecisionQueue] classify_resolution failed for %s — "
+                    "defaulting resolution_class=floor (fail-closed).",
+                    decision.id, exc_info=True)
+                decision.context["resolution_class"] = "floor"
         self._vault.save_decision(decision)
         logger.info(
             "[DecisionQueue] posted '%s' (id=%s, dedup_key=%r, options=%s)",
@@ -192,6 +210,25 @@ class OperatorDecisionQueue:
         # renders it; the bare-context shape drew a blank "[INFO] " line.
         try:
             from systemu.interface.event_bus import EventBus
+            # R-P1: enrich the event so the Telegram push (event_pusher) can
+            # render a [tag] + inline option buttons WITHOUT a vault re-read on
+            # the pure-translator path. ``tag`` is the short deterministic
+            # decision tag; ``decision_context`` carries the persisted
+            # resolution_class / gate_type / requested_schema / body that
+            # render_options keys on. Computed best-effort — a tag/enrich failure
+            # falls back to the plain "open the dashboard" push.
+            try:
+                from systemu.messaging.decision_bridge import (
+                    decision_tag, disambiguate_tag,
+                )
+                open_tags = {
+                    decision_tag(d.id)
+                    for d in self.list_pending()
+                    if d.id != decision.id
+                }
+                tag = disambiguate_tag(decision.id, open_tags)
+            except Exception:
+                tag = ""
             EventBus.get().publish({
                 "ts": decision.created_at.isoformat(),
                 "level": "WARNING",
@@ -202,6 +239,14 @@ class OperatorDecisionQueue:
                     "dedup_key": decision.dedup_key,
                     "title": decision.title,
                     "options": list(decision.options),
+                    "tag": tag,
+                    # The persisted decision context (resolution_class etc.) plus
+                    # the body, so render_options + full-detail push have what
+                    # they need off the event alone.
+                    "decision_context": {
+                        **dict(decision.context or {}),
+                        "body": decision.body,
+                    },
                     "chat_submission_id": (decision.context or {}).get("chat_submission_id"),
                 },
             })
