@@ -87,8 +87,9 @@ def test_poisoned_report_degrades_to_none(tmp_path):
     assert loaded.situation_stamps == {}
 
 
-def test_migrator_current_is_4():
-    assert CURRENT_SCHEMA_VERSION == 4
+def test_migrator_current_is_5():
+    # S4 bumped CURRENT_SCHEMA_VERSION 4 -> 5 (adds external_evidence).
+    assert CURRENT_SCHEMA_VERSION == 5
 
 
 def test_migrate_v2_to_v3_defaults_keys():

@@ -100,6 +100,13 @@ class ExecutionSnapshot:
     # operator. Store-agnostic + cycle-free — we deliberately do NOT import
     # RequirementReport (mirrors situation_report).
     requirement_report:       Optional[dict] = None
+    # S4 (fail-closed external-effect credit): the external-evidence store, a plain
+    # dict {str(objective_id): ExternalEvidence.model_dump()} so a resumed run keeps
+    # its fail-closed evidence and does NOT silently re-credit an unverified external
+    # effect. Store-agnostic + cycle-free — we deliberately do NOT import
+    # ExternalEvidence (mirrors requirement_report). Default {} = no evidence = no
+    # external credit (fail-closed).
+    external_evidence:        dict = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,6 +196,9 @@ def read_snapshot(
             # R-A10: guard a poisoned/garbage cache — a non-dict report degrades to
             # None (=> re-ask the operator, never a crash).
             requirement_report=(lambda _v: _v if isinstance(_v, dict) else None)(data.get("requirement_report")),
+            # S4: guard a poisoned/garbage store — a non-dict external_evidence
+            # degrades to {} (=> no external credit, fail-closed; never a crash).
+            external_evidence=dict(data.get("external_evidence") or {}) if isinstance(data.get("external_evidence"), dict) else {},
         )
     except SnapshotRefused:
         # DEC-9: a newer-than-supported snapshot must refuse LOUDLY — never
@@ -243,6 +253,7 @@ def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
         "situation_report":        snapshot.situation_report,
         "situation_stamps":        snapshot.situation_stamps,
         "requirement_report":      snapshot.requirement_report,
+        "external_evidence":       snapshot.external_evidence,
     }
 
 
@@ -323,6 +334,7 @@ def capture_from_context(
         situation_report=getattr(context, "_situation_report", None),
         situation_stamps=dict(getattr(context, "_situation_stamps", {}) or {}),
         requirement_report=getattr(context, "_requirement_report", None),
+        external_evidence=dict(getattr(context, "_external_evidence", {}) or {}),
     )
 
 
@@ -371,8 +383,16 @@ def apply_to_context(snapshot: ExecutionSnapshot, *, context) -> None:
             context._next_objective_id = int(_nid)
         if getattr(snapshot, "requirement_report", None) is not None:
             context._requirement_report = snapshot.requirement_report
+        # S4: re-seed the fail-closed external-evidence store so a resumed run keeps
+        # its persisted evidence (a confirmed external effect survives resume; an
+        # unconfirmed one stays unconfirmed → no silent re-credit). CONDITIONAL on a
+        # non-empty store so a never-touched resume leaves _external_evidence UNSET
+        # (byte-identical snapshot on the next capture).
+        _ee = getattr(snapshot, "external_evidence", None)
+        if _ee:
+            context._external_evidence = dict(_ee)
     except Exception:
-        logger.debug("[ExecSnapshot] apply graph/req-report re-seed failed", exc_info=True)
+        logger.debug("[ExecSnapshot] apply graph/req-report/evidence re-seed failed", exc_info=True)
 
     # Summarise the recent history into the one-shot reflection block.
     try:

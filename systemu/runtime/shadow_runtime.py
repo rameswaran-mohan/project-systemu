@@ -384,6 +384,263 @@ def _recredit_blocked_ids(objective_graph) -> set:
         return set()
 
 
+# ── S4 (fail-closed external-effect credit): external-evidence store helpers ──
+def _read_external_ok(context, objective_id) -> bool:
+    """S4 — the FAIL-CLOSED external-evidence gate read.
+
+    Returns True ONLY when a persisted ExternalEvidence for ``objective_id`` has
+    ``confirmed is True`` (a deterministic matcher, S3/R-A7, set it — NEVER an LLM,
+    NEVER S4). Returns FALSE on an absent id, a non-dict store, a malformed entry,
+    or ANY exception — it NEVER raises (mirrors ``_recredit_blocked_ids``'s
+    defensive posture). No LLM path.
+
+    Key normalisation: JSON round-trips dict keys to str, so the on-disk store is
+    str-keyed; we look up both ``str(objective_id)`` and the raw id so an int
+    objective_id still matches a str-keyed store. ``confirmed`` must be the bool
+    ``True`` (an ``is True`` check) — a truthy non-bool (1, "yes") is a malformed
+    entry the fail-closed read must NOT trust."""
+    try:
+        store = getattr(context, "_external_evidence", None)
+        if not isinstance(store, dict):
+            return False
+        entry = store.get(str(objective_id))
+        if entry is None:
+            entry = store.get(objective_id)      # tolerate an int-keyed in-memory store
+        if not isinstance(entry, dict):
+            return False
+        return entry.get("confirmed") is True     # fail-closed: only a real bool True credits
+    except Exception:
+        logger.debug("[Runtime] _read_external_ok failed — fail-closed False", exc_info=True)
+        return False
+
+
+def _persist_external_evidence(context, evidence) -> None:
+    """S4 — write ``evidence`` (an ExternalEvidence) into
+    ``context._external_evidence[str(objective_id)]`` as a plain dict so it
+    round-trips through the snapshot store. Fail-safe: creates the store if the
+    context lacks one; swallows any bad input (None context / bad evidence) —
+    never raises."""
+    try:
+        oid = getattr(evidence, "objective_id", None)
+        if oid is None:
+            return
+        payload = (evidence.model_dump(mode="json")
+                   if hasattr(evidence, "model_dump") else dict(evidence))
+        store = getattr(context, "_external_evidence", None)
+        if not isinstance(store, dict):
+            store = {}
+            context._external_evidence = store
+        store[str(oid)] = payload
+    except Exception:
+        logger.debug("[Runtime] _persist_external_evidence failed (swallowed)", exc_info=True)
+
+
+# ── S3 / R-A7 wave-3a — wiring the ExternalVerifier at the credit seam ────────
+#
+# A DETERMINISTIC-ONLY hook: for a requires_external_verification objective, after
+# a successful effectful TOOL_CALL it builds an evidence_input from the tool
+# result + a pre-submit freshness snapshot, classifies the effect (money-move via
+# money_move_net_applies), calls ExternalVerifier.verify(...), and PERSISTS the
+# resulting ExternalEvidence into the store. It NEVER touches the S4 credit
+# decision (only _persist_external_evidence) and NEVER calls an LLM. Guarded by
+# the caller on `_needs_external` so a non-external objective is byte-identical.
+
+def _external_from_result(result) -> "dict":
+    """Pull the tool's self-declared external-verification envelope out of a
+    ToolResult. A tool that participates in external verification exposes an
+    ``external`` sub-dict on ``result.parsed`` carrying the strategy + the
+    submission-unique token + (for the hardened api_readback path) the
+    ``readback_url``/``submit_host`` and a freshness proof. Never raises; a tool
+    that exposes nothing returns ``{}`` (⇒ the verifier fails closed)."""
+    try:
+        parsed = getattr(result, "parsed", None)
+        if not isinstance(parsed, dict):
+            return {}
+        ext = parsed.get("external")
+        if isinstance(ext, dict):
+            return dict(ext)
+        return {}
+    except Exception:
+        return {}
+
+
+def _capture_presubmit_external_snapshot(decision) -> "dict":
+    """Capture the PRE-SUBMIT freshness snapshot BEFORE an effectful call issues.
+
+    The freshness proof (token-freshness / create-once) is what lets the hardened
+    api_readback confirm THIS run produced the effect: a token already present
+    pre-submit is stale. A tool that supports a pre-submit probe exposes it on the
+    decision's parameters as ``presubmit_tokens`` (a distinguishing set the
+    expected tokens are NOT in) and/or ``pre_submit_absent`` (a pre-submit
+    readback found the effect absent — the strongest proof).
+
+    Fail-closed default: when a clean pre-submit snapshot is NOT available for a
+    given tool shape (nothing exposed), return ``pre_submit_absent=False`` + an
+    EMPTY ``presubmit_tokens`` — freshness is then UNPROVABLE and the hardened
+    _api_readback REFUSES (never a silent confirm). Never raises."""
+    snap = {"presubmit_tokens": [], "pre_submit_absent": False}
+    try:
+        params = decision.get("parameters") if isinstance(decision, dict) else None
+        if isinstance(params, dict):
+            pt = params.get("presubmit_tokens")
+            if isinstance(pt, (list, tuple, set)):
+                snap["presubmit_tokens"] = [str(x) for x in pt]
+            if params.get("pre_submit_absent") is True:
+                snap["pre_submit_absent"] = True
+    except Exception:
+        logger.debug("[Runtime] presubmit snapshot capture failed — fail-closed",
+                     exc_info=True)
+    return snap
+
+
+def _classify_external_effect(objective, decision, tool) -> "Optional[str]":
+    """Deterministic effect classification for the verifier's money-move gate.
+
+    Computes the money-move disjunction (BLOCKER-3) over the objective goal text,
+    the call parameters, and the tool's effect tags. When the net applies, return
+    the ``money_move`` effect class so ExternalVerifier.verify()'s internal
+    money-move gate catches it (verify() ORs effect_class into the objective's tag
+    set). Otherwise return the tool's declared effect class (or None). No LLM."""
+    try:
+        from systemu.runtime.financial_signal import money_move_net_applies
+        from systemu.runtime.effect_tags import EffectTag
+        goal = ""
+        for attr in ("goal", "text", "success_criteria"):
+            v = getattr(objective, attr, None)
+            if isinstance(v, str) and v:
+                goal += " " + v
+        params = decision.get("parameters") if isinstance(decision, dict) else None
+        effect_tags = list(getattr(tool, "effect_tags", None) or [])
+        requires_external = bool(
+            getattr(objective, "requires_external_verification", False))
+        if money_move_net_applies(effect_tags, goal, params, requires_external):
+            return EffectTag.MONEY_MOVE.value
+        # otherwise pass through the tool's first declared effect tag (advisory).
+        return effect_tags[0] if effect_tags else None
+    except Exception:
+        # a classification failure must NOT open the money-move gate — but the
+        # verify() money-move gate ALSO recomputes _is_money_move over the
+        # objective, so returning None here never weakens the gate.
+        logger.debug("[Runtime] external effect classification failed", exc_info=True)
+        return None
+
+
+def _build_external_api_client(runtime, ev_in):
+    """Resolve the api_readback transport for the hardened path.
+
+    Precedence:
+      1. an injected client on the runtime (``runtime._external_api_client``) —
+         production wires a real independent-https reader here; tests inject a mock.
+      2. an in-memory adapter over a ``readback_envelope`` the tool already
+         captured from its OWN independent post-submit readback (deterministic —
+         no live I/O in the hook, no LLM).
+      3. None — the hardened path then reports "no api_client" and fails closed.
+    """
+    injected = getattr(runtime, "_external_api_client", None)
+    if injected is not None:
+        return injected
+    envelope = ev_in.get("readback_envelope") if isinstance(ev_in, dict) else None
+    if envelope is not None:
+        class _EnvelopeClient:
+            def __init__(self, env):
+                self._env = env
+            def readback(self, url):  # noqa: D401 — matches the verifier contract
+                return self._env
+        return _EnvelopeClient(envelope)
+    return None
+
+
+def _run_external_verification(runtime, *, objective, decision, tool, result,
+                               presubmit):
+    """Build the evidence_input, classify the effect, run ExternalVerifier.verify
+    over the HARDENED api_readback path (host-pin + https + token-freshness), and
+    return the ExternalEvidence. DETERMINISTIC-ONLY (no LLM). Never raises — any
+    failure yields an unconfirmed evidence (fail-closed)."""
+    from systemu.runtime.external_verifier import ExternalVerifier
+    from systemu.core.models import ExternalEvidence
+    try:
+        ev_in = dict(_external_from_result(result))
+        # thread the PRE-SUBMIT freshness snapshot in (a tool-provided proof on
+        # the result envelope wins; otherwise the decision-captured snapshot). The
+        # snapshot NEVER upgrades a tool that already proved absence.
+        if not ev_in.get("pre_submit_absent"):
+            if presubmit.get("pre_submit_absent") is True:
+                ev_in["pre_submit_absent"] = True
+        if not ev_in.get("presubmit_tokens"):
+            ev_in["presubmit_tokens"] = list(presubmit.get("presubmit_tokens") or [])
+        effect_class = _classify_external_effect(objective, decision, tool)
+        api_client = _build_external_api_client(runtime, ev_in)
+        verifier = ExternalVerifier(api_client=api_client)
+        return verifier.verify(objective, effect_class, ev_in)
+    except Exception:
+        logger.debug("[Runtime] external verification hook failed — fail-closed",
+                     exc_info=True)
+        oid = getattr(objective, "id", 0) or 0
+        return ExternalEvidence(objective_id=oid, confirmed=False)
+
+
+# ── S3 / R-A7 wave-3b — IMPL-6 mid-run ambiguous-outcome detector ─────────────
+#
+# A transport-ambiguous failure of an EFFECTFUL call is one where the effect MIGHT
+# have landed even though the client saw a failure — a timeout AFTER send, a
+# connection reset, or a 5xx-after-send. Those are the ONLY failures IMPL-6
+# intercepts (before any retry), and ONLY for a requires_external_verification
+# objective. A CLEAN, unambiguous failure (a 4xx the server rejected before any
+# effect, a validation error) provably never landed, so today's retry behavior is
+# safe and IMPL-6 stays out of it → the call is byte-identical to today.
+
+# error substrings that mark a transport-ambiguous failure (effect may have
+# landed after send). Timeouts are handled via result.timed_out separately.
+_IMPL6_AMBIGUOUS_HINTS = (
+    "timed out", "timeout",
+    "connection reset", "reset by peer", "econnreset",
+    "connection aborted", "broken pipe",
+    "500", "502", "503", "504",
+    "bad gateway", "gateway timeout", "service unavailable",
+    "internal server error",
+)
+
+# substrings that mark a CLEAN, unambiguous failure — the effect provably never
+# landed (server rejected the request before any state change). NOT an IMPL-6 case.
+_IMPL6_CLEAN_HINTS = (
+    "400", "401", "403", "404", "409", "422",
+    "bad request", "unauthorized", "forbidden", "not found",
+    "validation", "invalid",
+)
+
+
+def _is_ambiguous_effectful_failure(*, objective, result_dict) -> bool:
+    """True IFF this is a transport-ambiguous failure of an EFFECTFUL call that
+    IMPL-6 must intercept before any retry: the objective is
+    requires_external_verification AND the failure is genuinely ambiguous (the
+    effect MIGHT have landed after send). Non-external or clean-failure ⇒ False
+    (today's retry behavior is unchanged). Never raises."""
+    try:
+        if not bool(getattr(objective, "requires_external_verification", False)):
+            return False
+        if not isinstance(result_dict, dict):
+            return False
+        if result_dict.get("success") is True:
+            return False
+        # a timeout AFTER send is the canonical ambiguous case.
+        if result_dict.get("timed_out") is True:
+            return True
+        blob = " ".join(
+            str(result_dict.get(k) or "")
+            for k in ("error", "error_type", "classified_reason", "stderr")
+        ).lower()
+        # a CLEAN client-side rejection (4xx / validation) is NOT ambiguous — the
+        # effect never landed, so today's retry is safe. Check this FIRST so a
+        # "400 invalid" never trips an ambiguous hint.
+        if any(h in blob for h in _IMPL6_CLEAN_HINTS):
+            return False
+        return any(h in blob for h in _IMPL6_AMBIGUOUS_HINTS)
+    except Exception:
+        logger.debug("[Runtime IMPL-6] ambiguous-failure detect errored — treating "
+                     "as not-ambiguous (today's behavior)", exc_info=True)
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -3032,6 +3289,84 @@ class ShadowRuntime:
         except Exception:
             logger.debug("[Runtime B9] loop_guard clear skipped", exc_info=True)
 
+    # ── S3 / R-A7 wave-3b — IMPL-6 mid-run ambiguous-outcome handler ───────────
+    def _impl6_handle_ambiguous(self, *, objective, decision, result, context,
+                                tools=None):
+        """Run the IMPL-6 read-back-before-retry for a transport-ambiguous failure
+        of an effectful call, keyed to the CLIENT idempotency key that was injected
+        BEFORE send. Returns an ``Impl6Outcome`` (or None on error — the caller
+        then falls through to today's retry behavior).
+
+        The idempotency key + readback URL come from the tool's self-declared
+        ``external`` envelope on ``result.parsed`` (the same envelope
+        _external_from_result reads at the credit seam) — a tool participating in
+        external verification exposes:
+          * ``idempotency_key`` — the CLIENT key it stamped the submit with, OR
+          * the runtime-minted key stashed on ``self._impl6_client_key`` when the
+            runtime injected it at the MCP transport.
+        Absent a client key or a keyable read-back, handle_ambiguous_effect returns
+        an INDETERMINATE outcome (operator card), NEVER confirmed-absent."""
+        from systemu.runtime.external_verifier import ExternalVerifier
+        try:
+            ext = _external_from_result(result)
+            # the CLIENT key: the tool's declared key wins; else the runtime-minted
+            # key stashed when it injected the header at the transport.
+            key = (str(ext.get("idempotency_key") or "").strip()
+                   or str(getattr(self, "_impl6_client_key", "") or "").strip())
+            readback_url = ext.get("readback_url")
+            submit_host = ext.get("submit_host")
+            effect_class = _classify_external_effect(
+                objective, decision,
+                next((t for t in (tools or [])
+                      if getattr(t, "name", None) == decision.get("tool_name")), None))
+            api_client = _build_external_api_client(self, ext)
+            verifier = ExternalVerifier(api_client=api_client)
+            return verifier.handle_ambiguous_effect(
+                objective=objective, effect_class=effect_class,
+                idempotency_key=key, readback_url=readback_url,
+                submit_host=submit_host)
+        except Exception:
+            logger.debug("[Runtime IMPL-6] _impl6_handle_ambiguous errored", exc_info=True)
+            return None
+
+    def _impl6_enqueue_operator_card(self, *, objective, execution_id, detail=""):
+        """Enqueue the IMPL-6 mid-run operator card (reuses the wave-3a InboxQueue
+        operator rail) when the read-back is indeterminate. Never raises; returns
+        the card id or None."""
+        try:
+            from systemu.interface.command.gate import GateDescriptor
+            oid = getattr(objective, "id", 0)
+            descriptor = GateDescriptor(
+                title=("Operator: an effectful external call failed AMBIGUOUSLY — "
+                       "confirm the outcome before any retry"),
+                risk="high",
+                inspect=(
+                    f"Objective {oid}: an effectful external submit failed in a "
+                    "TRANSPORT-AMBIGUOUS way (a timeout after send / connection reset "
+                    "/ 5xx-after-send). The effect MAY OR MAY NOT have landed, and the "
+                    "outcome could NOT be read back deterministically "
+                    f"({detail or 'no idempotency primitive to key the read-back'}). "
+                    "Re-submitting could DOUBLE-SUBMIT (e.g. a duplicate payment). "
+                    "Confirm the prior submit's outcome before authorising a retry."),
+                options=["Do not retry (park)",
+                         "Retry — I confirm the effect did NOT go through"],
+                safe_default="Do not retry (park)",
+                what_approve_does=(
+                    "Authorises the shadow to RE-EXECUTE the external submit. Only "
+                    "choose this if you have verified the effect did not already occur."),
+                dedup=f"external_ambiguous:{execution_id}:{oid}",
+            )
+            return InboxQueue(self.vault).enqueue(
+                descriptor, gate_type="operator", body="",
+                context_extras={
+                    "kind": "external_ambiguous_guard",
+                    "objective_id": oid,
+                    "execution_id": execution_id,
+                })
+        except Exception:
+            logger.debug("[Runtime IMPL-6] operator-card enqueue failed", exc_info=True)
+            return None
+
     def _fold_runtime_error_and_suspend(
         self, *, objectives, completed_objectives, decision, sub, tool_name,
         context, scroll, shadow, activity, execution_id, root_eid, iteration,
@@ -3896,6 +4231,44 @@ class ShadowRuntime:
                                     and o.id not in blocked_ids
                                 ]
                                 for _uc_obj in _uncredited:
+                                    # S4 (fail-closed external-effect credit): an
+                                    # objective demanding external ground-truth is
+                                    # re-credited on resume ONLY from the STORED
+                                    # ExternalEvidence.confirmed bit — the epoch-delta
+                                    # local verifier (recredit_on_resume) would soft-pass
+                                    # a verifier=None objective and silently re-credit an
+                                    # unverified external effect. SHORT-CIRCUIT before it:
+                                    # no re-fetch / no re-verify, the stored bit decides.
+                                    # Non-external objectives fall through to the unchanged
+                                    # recredit path below.
+                                    if getattr(_uc_obj, "requires_external_verification", False):
+                                        if _read_external_ok(context, _uc_obj.id):
+                                            completed_objectives.add(_uc_obj.id)
+                                            logger.info(
+                                                "[Runtime S4] resume re-credit: external obj=%d "
+                                                "cleared by a stored confirmed ExternalEvidence.",
+                                                _uc_obj.id,
+                                            )
+                                        else:
+                                            logger.warning(
+                                                "[Runtime S4] resume re-credit SKIPPED for external "
+                                                "obj=%d — no stored confirmed evidence (local "
+                                                "epoch-delta verifier is advisory-only).",
+                                                _uc_obj.id,
+                                            )
+                                            context.add_observation(
+                                                {
+                                                    "type": "UNVERIFIED_EXTERNAL",
+                                                    "objective_id": _uc_obj.id,
+                                                    "message": (
+                                                        "external-effect objective not re-credited "
+                                                        "on resume — no confirmed independent "
+                                                        "evidence"
+                                                    ),
+                                                },
+                                                current_ab,
+                                            )
+                                        continue
                                     _rc = recredit_on_resume(
                                         objective=_uc_obj,
                                         vault=self.vault,
@@ -3917,6 +4290,93 @@ class ShadowRuntime:
                                     "[Runtime] recredit_on_resume hook crashed — skipping",
                                     exc_info=True,
                                 )
+                        # ── S3 / R-A7 wave-3a — RESUME no-silent-re-submit guard ──
+                        # A resume whose external objective is still UNCONFIRMED (no
+                        # stored ExternalEvidence.confirmed) must NOT let the loop
+                        # SILENTLY re-execute its effectful submit path — a blind
+                        # re-submit is a double-submit hazard. Surface an OPERATOR CARD
+                        # (the existing InboxQueue rail) and PARK instead: only an
+                        # explicit operator decision may authorise a re-submit. This
+                        # STACKS on S4's resume short-circuit (which already credits a
+                        # CONFIRMED bit with no re-fetch); it fires ONLY when an external
+                        # objective is genuinely uncredited + unconfirmed on a resume, so
+                        # a non-external resume is byte-identical. Fail-safe: any error
+                        # in the guard degrades to NOT parking (the S4 gate still fails
+                        # the credit closed downstream).
+                        if use_objectives:
+                            try:
+                                _resub_ext = [
+                                    o for o in objectives
+                                    if getattr(o, "requires_external_verification", False)
+                                    and o.id not in completed_objectives
+                                    and o.id not in _recredit_blocked_ids(
+                                        getattr(snap, "objective_graph", []) or [])
+                                    and not _read_external_ok(context, o.id)
+                                ]
+                            except Exception:
+                                logger.debug(
+                                    "[Runtime S3] resubmit-guard scan failed — not parking",
+                                    exc_info=True)
+                                _resub_ext = []
+                            if _resub_ext:
+                                _card_id = None
+                                try:
+                                    _oids = ", ".join(str(o.id) for o in _resub_ext)
+                                    _descriptor = GateDescriptor(
+                                        title=("Operator: authorise re-submit of an "
+                                               "unverified external effect"),
+                                        risk="high",
+                                        inspect=(
+                                            "Resuming a run with external-effect "
+                                            f"objective(s) [{_oids}] that have NO "
+                                            "confirmed independent evidence. Re-running "
+                                            "the submit could DOUBLE-SUBMIT (e.g. a "
+                                            "duplicate payment). Confirm the prior "
+                                            "submit's outcome before re-submitting."),
+                                        options=["Do not re-submit (park)",
+                                                 "Re-submit — I confirm it did NOT go through"],
+                                        safe_default="Do not re-submit (park)",
+                                        what_approve_does=(
+                                            "Authorises the shadow to RE-EXECUTE the "
+                                            "external submit. Only choose this if you "
+                                            "have verified the effect did not already "
+                                            "occur."),
+                                        dedup=f"external_resubmit:{execution_id}:{_oids}",
+                                    )
+                                    _card_id = InboxQueue(self.vault).enqueue(
+                                        _descriptor,
+                                        gate_type="operator",
+                                        body="",
+                                        context_extras={
+                                            "kind": "external_resubmit_guard",
+                                            "objective_ids": [o.id for o in _resub_ext],
+                                            "execution_id": execution_id,
+                                        },
+                                    )
+                                    logger.warning(
+                                        "[Runtime S3] resume PARKED — external obj(s) [%s] "
+                                        "unconfirmed; operator card %s raised to authorise "
+                                        "any re-submit (no silent re-submit).",
+                                        _oids, _card_id,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "[Runtime S3] resubmit-guard card enqueue failed",
+                                        exc_info=True)
+                                _susp = context.build_result(
+                                    status="suspended_external_resubmit",
+                                    final_summary=(
+                                        "Parked awaiting operator decision: a resumed "
+                                        "external-effect objective has no confirmed "
+                                        "evidence; re-submitting could double-submit. "
+                                        "The operator must confirm the prior outcome "
+                                        "before any re-submit."),
+                                )
+                                _susp["activity_id"] = getattr(activity, "id", "")
+                                _susp["shadow_id"] = getattr(shadow, "id", "")
+                                if _card_id is not None:
+                                    _susp["operator_card_id"] = _card_id
+                                return _susp
                         if not use_objectives and snap.current_action_block:
                             current_ab = max(current_ab, int(snap.current_action_block))
                         # v0.8.22.1 (R6): if the operator answered a stuck decision,
@@ -5016,13 +5476,67 @@ class ShadowRuntime:
                     if use_objectives and _blocked_ids:
                         _goal_ok = False  # a known-missing credential defeats a goal-level pass
 
+                    # S4 (fail-closed external-effect credit): an uncredited
+                    # external-effect objective defeats a goal-level PASS at the
+                    # COMPLETE accept too. The goal verifier judges only LOCAL
+                    # StateDelta and is BLIND to external effects — a PASS there
+                    # would otherwise finalize status="success" while a pending
+                    # requires_external_verification objective never got confirmed
+                    # ExternalEvidence (it correctly failed closed at the per-objective
+                    # site + emitted UNVERIFIED_EXTERNAL). Mirror the B9 _blocked_ids
+                    # gate: a pending external objective with no persisted confirmed
+                    # evidence (_read_external_ok is not True) forces reject. ADDITIVE
+                    # + scoped: _ext_pending_ids is empty for any run with no pending
+                    # external objective → non-external / legacy COMPLETE handling is
+                    # BYTE-IDENTICAL (exactly like the B9 gate).
+                    _ext_pending_ids = {
+                        _o.id for _o in objectives
+                        if _o.id not in completed_objectives
+                        and getattr(_o, "requires_external_verification", False)
+                        and _read_external_ok(context, _o.id) is not True
+                    } if use_objectives else set()
+                    if _ext_pending_ids:
+                        _goal_ok = False  # a pending unconfirmed external effect defeats a goal-level pass
+
                     # Reject premature COMPLETE when objectives are still pending,
                     # UNLESS goal-level verification accepted it — OR when a credential
-                    # gate is still open (blocked non-empty), which always rejects.
+                    # gate is still open (blocked non-empty), which always rejects — OR
+                    # when a pending external objective lacks confirmed evidence
+                    # (_ext_pending_ids non-empty), which always rejects. These compose:
+                    # the B9 and S4 gates each independently force reject and neither
+                    # weakens the other.
                     if use_objectives and (
                             _blocked_ids
+                            or _ext_pending_ids
                             or (len(completed_objectives) < total_objectives and not _goal_ok)):
                         missing = [obj.id for obj in objectives if obj.id not in completed_objectives]
+                        if _ext_pending_ids and not _blocked_ids:
+                            # S4: steer the shadow to obtain confirmed external evidence
+                            # rather than re-attempting COMPLETE (mirrors the per-objective
+                            # UNVERIFIED_EXTERNAL site + the B9 credential-gate branch).
+                            logger.warning(
+                                "[Runtime S4] COMPLETE rejected — external-effect "
+                                "objective(s) %s pending without confirmed independent "
+                                "evidence; the goal verifier is blind to external effects. "
+                                "Obtain confirmed evidence before COMPLETE.",
+                                sorted(_ext_pending_ids),
+                            )
+                            for _eid in sorted(_ext_pending_ids):
+                                context.add_observation(
+                                    {
+                                        "type": "UNVERIFIED_EXTERNAL",
+                                        "objective_id": _eid,
+                                        "message": (
+                                            "COMPLETE rejected: external-effect objective "
+                                            f"{_eid} has no confirmed independent evidence "
+                                            "(the goal verifier cannot see external effects). "
+                                            "Obtain confirmed evidence for the external "
+                                            "objective before finalizing."
+                                        ),
+                                    },
+                                    current_ab,
+                                )
+                            continue  # Return to loop — shadow must confirm the external effect
                         if _blocked_ids:
                             logger.warning(
                                 "[Runtime B9] COMPLETE rejected — objective(s) %s blocked on a "
@@ -5596,6 +6110,28 @@ class ShadowRuntime:
 
                 # ── TOOL_CALL ──────────────────────────────────────────────────────
                 elif action == "TOOL_CALL":
+                    # ── S3 / R-A7 wave-3a — PRE-SUBMIT freshness snapshot ──
+                    # Before the effectful call issues, capture the pre-submit
+                    # tokens/state that prove token-freshness (a token that already
+                    # existed pre-submit is stale and cannot confirm). Guarded on the
+                    # claimed objective being external so a non-external call is
+                    # unchanged. Cheap + deterministic; fail-closed when no clean
+                    # snapshot is available (empty tokens ⇒ freshness UNPROVABLE ⇒
+                    # the hardened readback refuses). Threaded into the verifier hook
+                    # at the credit seam via ``_presubmit_external_snapshot``.
+                    self._presubmit_external_snapshot = None
+                    try:
+                        _co = decision.get("completes_objective")
+                        if isinstance(_co, int) and use_objectives:
+                            _co_obj = next(
+                                (o for o in objectives if o.id == _co), None)
+                            if _co_obj is not None and getattr(
+                                    _co_obj, "requires_external_verification", False):
+                                self._presubmit_external_snapshot = (
+                                    _capture_presubmit_external_snapshot(decision))
+                    except Exception:
+                        logger.debug("[Runtime] presubmit snapshot guard failed",
+                                     exc_info=True)
                     result = await self._handle_tool_call(
                         decision, tools, context, current_ab, dry_run,
                         shadow=shadow, execution_id=execution_id,
@@ -5922,6 +6458,87 @@ class ShadowRuntime:
                         _dispatch_refinery(shadow, scroll, _ff_res, context, self.config, self.vault)
                         return _ff_res
 
+                    # ── S3 / R-A7 wave-3b — IMPL-6 ambiguous-outcome protocol ──
+                    # On a TRANSPORT-AMBIGUOUS failure of an EFFECTFUL
+                    # (requires_external_verification) call — a timeout AFTER send,
+                    # a connection reset, a 5xx-after-send — the effect MIGHT have
+                    # landed. Run a read-back keyed to the CLIENT idempotency key
+                    # (minted+injected BEFORE send) BEFORE any retry decision (i.e.
+                    # before the circuit breaker below):
+                    #   * confirmed-present ⇒ persist ExternalEvidence(confirmed) +
+                    #     route to the credit path — NO re-submit (fall through to
+                    #     the credit seam, which now sees result.success via the
+                    #     evidence bit); suppress the retry.
+                    #   * confirmed-absent  ⇒ a retry is SAFE — fall through to
+                    #     today's failure/retry behavior (the loop re-issues).
+                    #   * indeterminate / no-primitive ⇒ operator card + PARK —
+                    #     never a silent retry, never confirmed-absent. Uses the
+                    #     same InboxQueue operator-card rail as the wave-3a resume
+                    #     guard. Guarded on the detector → a non-external / clean
+                    #     failure is byte-identical to today.
+                    if not result.success and use_objectives:
+                        try:
+                            _co_i6 = decision.get("completes_objective")
+                            _obj_i6 = (
+                                next((o for o in objectives if o.id == _co_i6), None)
+                                if isinstance(_co_i6, int) else None)
+                            if _obj_i6 is not None and _is_ambiguous_effectful_failure(
+                                    objective=_obj_i6,
+                                    result_dict=(result.to_dict()
+                                                 if hasattr(result, "to_dict") else {})):
+                                _i6_out = self._impl6_handle_ambiguous(
+                                    objective=_obj_i6, decision=decision,
+                                    result=result, context=context, tools=tools)
+                                if _i6_out is not None:
+                                    if _i6_out.decision == "indeterminate":
+                                        # operator card + PARK — no silent retry.
+                                        _card_id = self._impl6_enqueue_operator_card(
+                                            objective=_obj_i6, execution_id=execution_id,
+                                            detail=_i6_out.detail)
+                                        _susp = context.build_result(
+                                            status="suspended_external_ambiguous",
+                                            final_summary=(
+                                                "Parked awaiting operator decision: an "
+                                                "effectful external call failed AMBIGUOUSLY "
+                                                "(the effect may or may not have landed) and "
+                                                "the outcome could not be read back "
+                                                "deterministically. Re-submitting could "
+                                                "double-submit; the operator must confirm the "
+                                                "prior outcome before any retry."),
+                                        )
+                                        _susp["activity_id"] = getattr(activity, "id", "")
+                                        _susp["shadow_id"] = getattr(shadow, "id", "")
+                                        if _card_id is not None:
+                                            _susp["operator_card_id"] = _card_id
+                                        logger.warning(
+                                            "[Runtime IMPL-6] PARKED obj=%d — ambiguous "
+                                            "effectful failure, read-back indeterminate "
+                                            "(%s); operator card %s (no silent retry).",
+                                            getattr(_obj_i6, "id", 0), _i6_out.detail,
+                                            _card_id)
+                                        return _susp
+                                    if _i6_out.decision == "confirmed_present":
+                                        # the effect LANDED — persist the confirmed
+                                        # evidence + route to the CREDIT path with NO
+                                        # re-submit. Flip result.success so the credit
+                                        # seam runs; the S4 gate then credits on the
+                                        # persisted confirmed bit (_external_ok).
+                                        _persist_external_evidence(
+                                            context, _i6_out.evidence)
+                                        result.success = True
+                                        logger.warning(
+                                            "[Runtime IMPL-6] obj=%d ambiguous failure but "
+                                            "read-back CONFIRMED the effect landed "
+                                            "(idempotency key present) — crediting with NO "
+                                            "re-submit.", getattr(_obj_i6, "id", 0))
+                                    # confirmed_absent ⇒ fall through to today's
+                                    # retry behavior (a retry is SAFE).
+                        except Exception:
+                            logger.debug(
+                                "[Runtime IMPL-6] ambiguous-outcome hook errored — "
+                                "falling through to today's retry behavior",
+                                exc_info=True)
+
                     # v0.6.9: iteration-loop circuit breaker — bail when the LLM
                     # is stuck re-invoking the same broken tool with the same
                     # failure class. Saves 20+ wasted iterations on a recoverable
@@ -5999,6 +6616,61 @@ class ShadowRuntime:
                                 # crediting.  Best-effort: verifier errors fall through to the
                                 # legacy credit so a bad verifier config can't stall the run.
                                 _do_credit = True
+                                # S4 (fail-closed external-effect credit): resolve the
+                                # Objective being credited and read whether it demands
+                                # external ground-truth. For a requires_external_verification
+                                # objective the LOCAL verifier below is ADVISORY-ONLY — the
+                                # credit DECISION is the persisted ExternalEvidence.confirmed
+                                # bit (_read_external_ok), computed BEFORE the legacy try so it
+                                # is available in BOTH the try's conjunct and the except's
+                                # fail-closed branch. Non-external → _needs_external False →
+                                # ALL S4 logic is skipped and this site is byte-identical.
+                                _s4_obj = next(
+                                    (o for o in objectives if o.id == completed_obj), None)
+                                _needs_external = bool(getattr(
+                                    _s4_obj, "requires_external_verification", False))
+                                # ── S3 / R-A7 wave-3a — run the DETERMINISTIC external
+                                # verifier and POPULATE the store, BEFORE the S4 gate
+                                # reads it. This is the ONLY thing S3 adds at the seam:
+                                # it never touches the credit-decision code below (it
+                                # only calls _persist_external_evidence). Guarded on
+                                # _needs_external → a non-external objective is
+                                # byte-identical. Deterministic-only (no LLM): the hook
+                                # runs ExternalVerifier over the tool result + the
+                                # pre-submit freshness snapshot; a confirmed match sets
+                                # ExternalEvidence.confirmed, which _read_external_ok
+                                # (below) then credits. Fail-closed on any error (the
+                                # helper never raises). Skip re-verify when a confirmed
+                                # bit already exists (e.g. seeded on resume) so we never
+                                # re-fetch a proven effect.
+                                if _needs_external and _s4_obj is not None:
+                                    try:
+                                        if not _read_external_ok(context, completed_obj):
+                                            _presub = (
+                                                getattr(self,
+                                                        "_presubmit_external_snapshot", None)
+                                                or {"presubmit_tokens": [],
+                                                    "pre_submit_absent": False})
+                                            _tool_for_ext = next(
+                                                (t for t in tools
+                                                 if getattr(t, "name", None)
+                                                 == decision.get("tool_name")), None)
+                                            _ev = _run_external_verification(
+                                                self, objective=_s4_obj,
+                                                decision=decision, tool=_tool_for_ext,
+                                                result=result, presubmit=_presub)
+                                            _persist_external_evidence(context, _ev)
+                                    except Exception:
+                                        logger.debug(
+                                            "[Runtime S3] external verifier hook "
+                                            "errored — fail-closed (no confirm)",
+                                            exc_info=True)
+                                    finally:
+                                        # one-shot: consume the pre-submit snapshot.
+                                        self._presubmit_external_snapshot = None
+                                _external_ok = (
+                                    _read_external_ok(context, completed_obj)
+                                    if _needs_external else False)
                                 try:
                                     _obj_for_verify = next(
                                         (o for o in objectives if o.id == completed_obj), None)
@@ -6059,6 +6731,54 @@ class ShadowRuntime:
                                         "[Runtime] v0.9.1 verifier hook crashed — crediting without verify",
                                         exc_info=True,
                                     )
+                                    # S4: for an external-effect objective the legacy
+                                    # "credit without verify" fall-through is UNSAFE — a
+                                    # crash in the credit path (TLS/timeout on an
+                                    # independent readback, a bad verifier) must NEVER
+                                    # credit an unverified external effect. Fail CLOSED.
+                                    # Non-external keeps the exact legacy except behavior
+                                    # (_do_credit stays True).
+                                    if _needs_external:
+                                        _do_credit = False
+
+                                # S4 (§5.8 — external evidence is AUTHORITATIVE): an
+                                # external-effect objective credits ONLY on the persisted
+                                # ExternalEvidence.confirmed bit (_external_ok). The local
+                                # verifier's verdict (_do_credit above) is ADVISORY-ONLY —
+                                # it judges LOCAL StateDelta and CANNOT see an external
+                                # effect, so it does NOT gate the credit. Re-ground the
+                                # decision on _external_ok alone (NOT a conjunct): a
+                                # confirmed external bit CREDITS even on a local hard-reject
+                                # (a false local reject on a confirmed money-move would
+                                # otherwise block the credit and risk a double-submit on
+                                # retry), and a soft-pass WITHOUT a confirmed bit still does
+                                # NOT credit (_external_ok False). The local verifier still
+                                # RAN above (its verifier_rejection observation is the
+                                # advisory/audit trail). The except-branch above still fails
+                                # CLOSED (_do_credit=False) for external. Any not-credited
+                                # external objective emits an UNVERIFIED_EXTERNAL steering
+                                # observation (mirrors the B9 credential-gate note). Guarded
+                                # on _needs_external → non-external is byte-identical.
+                                if _needs_external:
+                                    _do_credit = _external_ok
+                                    if not _do_credit:
+                                        logger.warning(
+                                            "[Runtime S4] external-effect obj=%d NOT credited "
+                                            "— no confirmed independent evidence (local verifier "
+                                            "is advisory-only for external effects).",
+                                            completed_obj,
+                                        )
+                                        context.add_observation(
+                                            {
+                                                "type": "UNVERIFIED_EXTERNAL",
+                                                "objective_id": completed_obj,
+                                                "message": (
+                                                    "external-effect objective not credited — "
+                                                    "no confirmed independent evidence"
+                                                ),
+                                            },
+                                            current_ab,
+                                        )
 
                                 if _do_credit:
                                     completed_objectives.add(completed_obj)
@@ -6194,7 +6914,48 @@ class ShadowRuntime:
                                 "decision gate); parking honestly instead of finalizing success.",
                                 sorted(_stuck_blocked_ids),
                             )
+                        # S4 (fail-closed external-effect credit): the stuck-park
+                        # goal-accept is a SEPARATE finalization route that also
+                        # finalizes status="success" via _intent_goal_success, which
+                        # (like the goal verifier) judges only LOCAL state and is BLIND
+                        # to external effects. Mirror the B9 skip: a pending
+                        # requires_external_verification objective with no persisted
+                        # confirmed ExternalEvidence forces the goal-accept to be SKIPPED
+                        # so the run parks/degrades to 'partial' honestly instead of
+                        # crediting an unverified external effect. ADDITIVE + scoped:
+                        # _stuck_ext_pending is empty for any run with no pending external
+                        # objective → the non-external stuck-park is BYTE-IDENTICAL.
+                        _stuck_ext_pending = {
+                            _o.id for _o in objectives
+                            if _o.id not in completed_objectives
+                            and getattr(_o, "requires_external_verification", False)
+                            and _read_external_ok(context, _o.id) is not True
+                        }
+                        if _stuck_ext_pending:
+                            logger.warning(
+                                "[Runtime S4] stuck-park goal-accept SKIPPED — external-"
+                                "effect objective(s) %s pending without confirmed "
+                                "independent evidence; parking honestly instead of "
+                                "finalizing success (the goal probe is blind to external "
+                                "effects).",
+                                sorted(_stuck_ext_pending),
+                            )
+                            for _eid in sorted(_stuck_ext_pending):
+                                context.add_observation(
+                                    {
+                                        "type": "UNVERIFIED_EXTERNAL",
+                                        "objective_id": _eid,
+                                        "message": (
+                                            "stuck-park goal-accept skipped: external-effect "
+                                            f"objective {_eid} has no confirmed independent "
+                                            "evidence. Obtain confirmed evidence for the "
+                                            "external objective before it can be credited."
+                                        ),
+                                    },
+                                    current_ab,
+                                )
                         if (not _stuck_blocked_ids
+                                and not _stuck_ext_pending
                                 and _intent_engine_enabled(self.config) and _adherence != "strict"
                                 and _intent_goal_success(
                                 vault=self.vault, config=self.config,

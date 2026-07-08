@@ -468,7 +468,17 @@ def _emit_requirement(bc: _BindCtx, *, kind, schema_path, state, source, value_o
 def _requires_external_verification(capability) -> bool:
     """Dangerous-until-proven: an external / irreversible / money / UNKNOWN effect
     (or an EMPTY tag list = UNKNOWN-until-classified) ⇒ True. A capability whose
-    effects are ALL benign local-reads ⇒ False."""
+    effects are ALL benign local-reads ⇒ False.
+
+    S4 Step 0 (the None-capability guard): a ``None``/absent capability is NOT a
+    real EffectTag classification — it is "no capability resolved yet". The only
+    live binder call pre-loop passes ``capability=None`` (shadow_runtime's
+    producer), so absent this guard EVERY objective would be stamped
+    ``requires_external_verification=True`` off a phantom classification. The
+    trigger must reflect a REAL EffectTag; the real per-objective capability lands
+    with R-A12. Until then a None capability ⇒ False (do NOT stamp external)."""
+    if capability is None:
+        return False                             # S4: no real classification ⇒ don't stamp
     try:
         from systemu.runtime.effect_tags import coerce, EffectTag
     except Exception:
@@ -539,9 +549,13 @@ def compute_requirements(objective, capability, situation, ctx) -> List[Any]:
     never raises."""
     try:
         # AC4: stamp dangerous-until-proven onto the objective (best-effort — a stamp
-        # failure never blocks the diff).
+        # failure never blocks the diff). S4 Step 0: only stamp when a REAL capability
+        # is present — a None/absent capability is not a classification (the pre-loop
+        # producer passes None; stamping off it would flip EVERY objective to True).
+        # _requires_external_verification(None) also returns False (defence-in-depth).
         try:
-            if objective is not None and hasattr(objective, "requires_external_verification"):
+            if (objective is not None and capability is not None
+                    and hasattr(objective, "requires_external_verification")):
                 objective.requires_external_verification = _requires_external_verification(capability)
         except Exception:
             logger.debug("[binder] could not stamp requires_external_verification", exc_info=True)

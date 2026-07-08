@@ -21,6 +21,26 @@ logger = logging.getLogger(__name__)
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "summarize_session.md"
 
 
+def _has_llm_provider(config) -> bool:
+    """True iff at least one LLM provider key is configured.
+
+    Mirrors ``open_world_planner._has_llm_provider`` (replicated here rather than
+    imported to keep this module free of a runtime-package import at load time).
+    When NO provider key is set the Tier-1 summarize call below cannot succeed —
+    it can only 401 or, keyless/offline, stall through the router's retry ladder
+    (``_API_TIMEOUT_SECONDS`` × ``_NETWORK_MAX_RETRIES``, ~380s) before failing.
+    ``capture`` already degrades to ``None`` on that failure, so short-circuiting
+    here is behavior-equivalent — just fast. Never raises (a missing attr → unset)."""
+    for attr in ("openrouter_api_key", "google_api_key",
+                 "anthropic_api_key", "openai_api_key"):
+        try:
+            if (getattr(config, attr, "") or "").strip():
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _load_system_prompt() -> str:
     return _PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -51,6 +71,8 @@ def capture(
 
     Returns the persisted SessionSummary, or None when:
     - config.episodic_memory_enabled is False
+    - no LLM provider key is configured (behavior-equivalent to a failed call —
+      skips the doomed Tier-1 call instead of stalling on it; see _has_llm_provider)
     - LLM call fails (degraded — logged at WARNING)
     - a SessionSummary already exists for this session_id (idempotent skip)
     """
@@ -61,6 +83,16 @@ def capture(
     existing = vault.query_session_summaries(limit=None)
     if any(s.session_id == session_id for s in existing):
         logger.debug("[Episodic] session_id %s already summarized; skipping", session_id)
+        return None
+
+    # No configured LLM provider → the Tier-1 summarize call cannot succeed (it
+    # would 401, or — keyless/offline — stall through the router's retry ladder for
+    # ~380s before failing). ``capture`` already returns None on that failure, so
+    # short-circuit to the SAME degraded value now: behavior-equivalent, just fast.
+    # This keeps keyless/offline production runs (and the hermetic test suite) from
+    # a doomed end-of-run LLM call.
+    if not _has_llm_provider(config):
+        logger.debug("[Episodic] no LLM provider configured; skipping summarize for %s", session_id)
         return None
 
     user_payload = {

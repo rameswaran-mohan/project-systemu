@@ -25,8 +25,9 @@ from typing import Any, Callable, Dict, Optional
 # Bump this whenever a migration is added. v1 = pre-G1 (unversioned);
 # v2 = G1 adds objective_graph + next_objective_id;
 # v3 = R-A9 adds situation_report + situation_stamps;
-# v4 = R-A10 adds requirement_report.
-CURRENT_SCHEMA_VERSION = 4
+# v4 = R-A10 adds requirement_report;
+# v5 = S4 adds external_evidence (fail-closed external-effect credit store).
+CURRENT_SCHEMA_VERSION = 5
 
 
 class SnapshotRefused(Exception):
@@ -67,11 +68,19 @@ def _migrate_3_to_4(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _migrate_4_to_5(data: Dict[str, Any]) -> Dict[str, Any]:
+    """v4 -> v5 (S4): add the external-evidence store key, defaulted empty {}.
+    Fail-closed: a legacy snapshot has no external evidence ⇒ no external credit."""
+    data.setdefault("external_evidence", {})
+    return data
+
+
 # Registry: {from_version: fn}. Keys must be contiguous from 1..CURRENT-1.
 _MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
     3: _migrate_3_to_4,
+    4: _migrate_4_to_5,
 }
 
 

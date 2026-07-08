@@ -87,22 +87,24 @@ def test_poisoned_requirement_report_degrades_to_none(tmp_path):
     assert loaded.requirement_report is None
 
 
-def test_migrator_current_is_4():
-    assert CURRENT_SCHEMA_VERSION == 4
+def test_migrator_current_is_5():
+    # S4 bumped CURRENT_SCHEMA_VERSION 4 -> 5 (adds external_evidence).
+    assert CURRENT_SCHEMA_VERSION == 5
 
 
 def test_migrate_v3_to_v4_defaults_key():
     data = {"schema_version": 3, "situation_report": None, "situation_stamps": {}}
     out = migrate_snapshot_dict(dict(data))
-    assert out["schema_version"] == 4
+    # v3 migrates through 3->4->5; assert the R-A10 key still lands at the v4 step.
+    assert out["schema_version"] == CURRENT_SCHEMA_VERSION
     assert out["requirement_report"] is None
 
 
-def test_migrate_v1_to_v4_full_chain():
-    """A v1 dict migrates through 1->2->3->4 (full chain), gaining all new keys."""
+def test_migrate_v1_to_v5_full_chain():
+    """A v1 dict migrates through 1->2->3->4->5 (full chain), gaining all new keys."""
     data = {"schema_version": 1}
     out = migrate_snapshot_dict(dict(data))
-    assert out["schema_version"] == 4
+    assert out["schema_version"] == 5
     # G1 keys added at 1->2
     assert out["objective_graph"] == []
     assert out["next_objective_id"] == 1
@@ -111,3 +113,5 @@ def test_migrate_v1_to_v4_full_chain():
     assert out["situation_stamps"] == {}
     # R-A10 key added at 3->4
     assert out["requirement_report"] is None
+    # S4 key added at 4->5
+    assert out["external_evidence"] == {}

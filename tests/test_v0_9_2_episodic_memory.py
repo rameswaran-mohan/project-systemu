@@ -188,7 +188,7 @@ class TestEpisodicMemoryCapture:
             chat_result="Done. See /tmp/burritos.json.",
             files_produced=["/tmp/burritos.json"],
             status="success",
-            config=Config(),
+            config=Config(openrouter_api_key="test-key"),
         )
         assert summary is not None
         assert summary.session_id == "sess_test"
@@ -205,7 +205,7 @@ class TestEpisodicMemoryCapture:
         episodic_memory.capture(
             vault=v, session_id="sess_X", intent="x",
             chat_result=None, files_produced=[], status="success",
-            config=Config())
+            config=Config(openrouter_api_key="test-key"))
         out = v.query_session_summaries(limit=10)
         assert len(out) == 1
         assert out[0].session_id == "sess_X"
@@ -249,11 +249,11 @@ class TestEpisodicMemoryCapture:
         episodic_memory.capture(
             vault=v, session_id="sess_dup", intent="x",
             chat_result=None, files_produced=[], status="success",
-            config=Config())
+            config=Config(openrouter_api_key="test-key"))
         episodic_memory.capture(
             vault=v, session_id="sess_dup", intent="x",
             chat_result=None, files_produced=[], status="success",
-            config=Config())
+            config=Config(openrouter_api_key="test-key"))
         out = v.query_session_summaries(limit=10)
         assert len(out) == 1
 
@@ -270,7 +270,8 @@ class TestSessionTools:
         episodic_memory.capture(
             vault=v, session_id="sess_burrito",
             intent="find burritos", chat_result=None,
-            files_produced=[], status="success", config=Config())
+            files_produced=[], status="success",
+            config=Config(openrouter_api_key="test-key"))
 
         results = session_search(vault=v, query="burrito", limit=5)
         assert isinstance(results, list)
@@ -290,7 +291,8 @@ class TestSessionTools:
         episodic_memory.capture(
             vault=v, session_id="sess_recall",
             intent="x", chat_result=None,
-            files_produced=[], status="success", config=Config())
+            files_produced=[], status="success",
+            config=Config(openrouter_api_key="test-key"))
 
         result = session_recall(vault=v, session_id="sess_recall")
         assert result is not None
@@ -377,11 +379,12 @@ class TestCliSession:
             vault=v, session_id="sess_burrito",
             intent="find burritos", chat_result=None,
             files_produced=["/tmp/burritos.json"],
-            status="success", config=Config())
+            status="success", config=Config(openrouter_api_key="test-key"))
         episodic_memory.capture(
             vault=v, session_id="sess_ramen",
             intent="find ramen", chat_result=None,
-            files_produced=[], status="success", config=Config())
+            files_produced=[], status="success",
+            config=Config(openrouter_api_key="test-key"))
         return v
 
     def test_session_list(self, tmp_path, monkeypatch):

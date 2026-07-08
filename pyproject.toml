@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.9.60"
+version = "0.9.61"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 license = {text = "MIT"}
@@ -139,6 +139,8 @@ markers = [
     "e2e: end-to-end live tests (skipped by default)",
     "smoke: boot the real dashboard + exercise it on uvicorn's serving loop (opt-in pre-release gate)",
     "slow: long-running tests",
+    "real_survey: exercises the REAL R-A9 situational-inventory survey (opts out of the conftest survey stub)",
+    "full_budget: opts out of any conftest budget/iteration cap (needs the real ladder)",
 ]
 
 [tool.setuptools]

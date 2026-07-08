@@ -156,6 +156,32 @@ class RequirementReport(BaseModel):
     ask_bundle: List[Requirement] = []     # deduped subset failing T_high or content_derived
 
 
+class ExternalEvidence(BaseModel):
+    """S4 (fail-closed external-effect credit) — a persisted record that a
+    DETERMINISTIC matcher (S3 / R-A7) observed real external ground-truth for an
+    objective's external effect.
+
+    ``confirmed`` is a plain bool set ONLY by that deterministic matcher — NEVER
+    by an LLM, and NEVER by S4 (this wave builds the model + store + fail-closed
+    read helper only). The credit gate reads ``confirmed is True`` as the sole
+    permission to credit a ``requires_external_verification`` objective; the
+    default (False) is fail-closed — no evidence ⇒ no credit."""
+    objective_id: int
+    confirmed:    bool = False
+    method:       str = ""                 # e.g. "api_readback" — how it was matched
+    detail:       str = ""                 # short human-readable note (never a secret)
+    stamped_at:   Optional[str] = None
+    # ── S3 / R-A7 IMPL-6 (additive; NO snapshot bump, NO migration) ──────────
+    # These ride the existing v5 dict store: S4's _read_external_ok only inspects
+    # ``confirmed``, and _persist writes model_dump(mode="json"), so extra keys
+    # round-trip and a pre-IMPL-6 dict lacking them simply takes these defaults.
+    # A LATER wave (loop wiring) populates them from the deterministic pre/post-
+    # submit idempotency readback; wave 1 only reserves the shape.
+    idempotency_key:   str = ""            # token the submit was tagged with
+    pre_submit_absent: bool = False        # a readback confirmed the effect ABSENT pre-submit
+    presubmit_tokens:  List[str] = []      # distinguishing tokens absent pre-submit (create-once proof)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  ScrollParameter  (v0.9.35 — generalization toggle)
 # ─────────────────────────────────────────────────────────────────────────────
