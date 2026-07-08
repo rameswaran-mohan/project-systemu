@@ -487,6 +487,15 @@ class Config:
         default_factory=lambda: int(os.getenv("SYSTEMU_STATE_DELTA_MAX_FILES_PER_SECTION", "50"))
     )
 
+    # R-SEC1: dashboard authentication. The dashboard passphrase is stored as a
+    # scrypt HASH (never the raw passphrase). For Docker/headless deployment the
+    # hash is supplied via SYSTEMU_DASHBOARD_PASSPHRASE_HASH. Empty ⇒ no hash
+    # configured. Populated via default_factory so it flows through from_env()
+    # (which does not override default_factory fields).
+    dashboard_passphrase_hash: str = field(
+        default_factory=lambda: os.getenv("SYSTEMU_DASHBOARD_PASSPHRASE_HASH", "")
+    )
+
     @classmethod
     def from_env(cls) -> "Config":
         """Build config from environment variables with sensible defaults."""

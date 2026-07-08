@@ -50,6 +50,9 @@ services:
       SYSTEMU_STORAGE: "file"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # R-SEC1: a non-loopback (0.0.0.0) dashboard REQUIRES a passphrase or it refuses
+      # to start. Set SYSTEMU_DASHBOARD_PASSPHRASE_HASH (from `systemu doctor --set-passphrase`).
+      SYSTEMU_DASHBOARD_PASSPHRASE_HASH: "${SYSTEMU_DASHBOARD_PASSPHRASE_HASH:-}"
       # v0.8.0.3: dashboard project root. Captures, refine handoff, and
       # subprocess CWDs anchor here. /data is the mounted volume root so
       # captures/ ends up at /data/captures/ alongside /data/vault/.
@@ -108,6 +111,9 @@ services:
       SYSTEMU_VAULT_DIR: "/data/vault"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # R-SEC1: a non-loopback (0.0.0.0) dashboard REQUIRES a passphrase or it refuses
+      # to start. Set SYSTEMU_DASHBOARD_PASSPHRASE_HASH (from `systemu doctor --set-passphrase`).
+      SYSTEMU_DASHBOARD_PASSPHRASE_HASH: "${SYSTEMU_DASHBOARD_PASSPHRASE_HASH:-}"
       # v0.8.0.3: dashboard project root. Captures, refine handoff, and
       # subprocess CWDs anchor here. /data is the mounted volume root so
       # captures/ ends up at /data/captures/ alongside /data/vault/.
@@ -237,6 +243,9 @@ services:
       SYSTEMU_VAULT_DIR: "/data/vault"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # R-SEC1: a non-loopback (0.0.0.0) dashboard REQUIRES a passphrase or it refuses
+      # to start. Set SYSTEMU_DASHBOARD_PASSPHRASE_HASH (from `systemu doctor --set-passphrase`).
+      SYSTEMU_DASHBOARD_PASSPHRASE_HASH: "${SYSTEMU_DASHBOARD_PASSPHRASE_HASH:-}"
       # v0.8.0.3: dashboard project root. Captures, refine handoff, and
       # subprocess CWDs anchor here. /data is the mounted volume root so
       # captures/ ends up at /data/captures/ alongside /data/vault/.
@@ -310,6 +319,9 @@ services:
       SYSTEMU_TOOL_BACKEND: "docker"
       SYSTEMU_OUTPUT_DIR: "/app/systemu/outputs"
       SYSTEMU_DASHBOARD_HOST: "0.0.0.0"
+      # R-SEC1: a non-loopback (0.0.0.0) dashboard REQUIRES a passphrase or it refuses
+      # to start. Set SYSTEMU_DASHBOARD_PASSPHRASE_HASH (from `systemu doctor --set-passphrase`).
+      SYSTEMU_DASHBOARD_PASSPHRASE_HASH: "${SYSTEMU_DASHBOARD_PASSPHRASE_HASH:-}"
       # v0.8.0.3: dashboard project root. Captures, refine handoff, and
       # subprocess CWDs anchor here. /data is the mounted volume root so
       # captures/ ends up at /data/captures/ alongside /data/vault/.

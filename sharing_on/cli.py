@@ -1104,21 +1104,106 @@ def _infer_scope(scope_id: str):
     return None
 
 
+def _read_set_passphrase(passphrase: Optional[str]) -> str:
+    """Resolve the passphrase for ``doctor --set-passphrase``.
+
+    Precedence (non-interactive first, for testability):
+      1. ``--passphrase VALUE`` (may be empty -> caller errors out).
+      2. a single line piped on stdin when stdin is NOT a TTY.
+      3. an interactive ``getpass`` prompt, asked twice and confirmed.
+
+    Never echoes the passphrase. Returns the raw passphrase (possibly empty —
+    the caller is responsible for rejecting empties).
+    """
+    if passphrase is not None:
+        return passphrase
+
+    # Non-TTY stdin (piped / CliRunner input): read a single line.
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().rstrip("\n").rstrip("\r")
+
+    # Interactive: prompt twice and confirm they match.
+    import getpass
+    first = getpass.getpass("Dashboard passphrase: ")
+    second = getpass.getpass("Confirm passphrase: ")
+    if first != second:
+        click.echo("ERROR: passphrases did not match — nothing was stored.", err=True)
+        sys.exit(2)
+    return first
+
+
+def _doctor_set_passphrase(passphrase: Optional[str], vault_dir: Optional[str]) -> None:
+    """Set the dashboard login passphrase and print the Docker env hash line.
+
+    Stores a scrypt hash in the vault secret store via
+    :func:`systemu.runtime.dashboard_auth.set_passphrase`, then reads it back
+    and prints ``SYSTEMU_DASHBOARD_PASSPHRASE_HASH=<hash>`` so headless / Docker
+    operators can paste it into their environment. The raw passphrase is never
+    printed. Errors out non-zero (without storing) on an empty passphrase.
+    """
+    from systemu.runtime import dashboard_auth
+
+    if vault_dir is None:
+        from sharing_on.config import Config
+        vault_dir = Config.from_env().vault_dir
+
+    pw = _read_set_passphrase(passphrase)
+    if not pw:
+        click.echo("ERROR: empty passphrase — nothing was stored.", err=True)
+        sys.exit(2)
+
+    dashboard_auth.set_passphrase(vault_dir, pw)
+    stored = dashboard_auth.get_passphrase_hash_vault(vault_dir)
+    if not stored:
+        click.echo("ERROR: failed to store the passphrase.", err=True)
+        sys.exit(1)
+
+    click.echo(f"✓ Dashboard passphrase set (vault: {vault_dir}).")
+    click.echo(
+        "\nFor Docker / headless deploys, set this env var (safe to copy — "
+        "it is a one-way scrypt hash, not the passphrase):"
+    )
+    click.echo(f"SYSTEMU_DASHBOARD_PASSPHRASE_HASH={stored}")
+
+
 @cli.command()
-@click.argument("scope_id")
+@click.argument("scope_id", required=False)
 @click.option("--apply", "apply_mode", is_flag=True,
               help="Apply auto-recoverable actions (install-dep / enable-tool / "
                    "reset-memory) via the shared recovery dispatchers — the same "
                    "apply path the web recovery panel uses. Gate reviews are skipped.")
-def doctor(scope_id: str, apply_mode: bool):
+@click.option("--set-passphrase", "set_passphrase_mode", is_flag=True,
+              help="Set the dashboard login passphrase (R-SEC1). Reads --passphrase, "
+                   "else stdin, else prompts interactively (twice). Prints the "
+                   "SYSTEMU_DASHBOARD_PASSPHRASE_HASH= env line for Docker/headless "
+                   "deployers. Does not require a scope_id.")
+@click.option("--passphrase", "passphrase", default=None,
+              help="Passphrase value for --set-passphrase (non-interactive). "
+                   "Prefer stdin/prompt to keep it out of your shell history.")
+@click.option("--vault", "vault_dir", default=None,
+              help="Vault directory for --set-passphrase (defaults to Config.vault_dir).")
+def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
+           passphrase: Optional[str], vault_dir: Optional[str]):
     """Diagnose pending gates for a scroll/activity/shadow/tool.
 
     \b
     Examples:
       sharing_on doctor scr_abc123
       sharing_on doctor tool_xyz789
+      sharing_on doctor --set-passphrase
     """
     import os
+
+    if set_passphrase_mode:
+        _doctor_set_passphrase(passphrase, vault_dir)
+        return
+
+    if not scope_id:
+        click.echo(
+            "ERROR: SCOPE_ID is required (or pass --set-passphrase).", err=True
+        )
+        sys.exit(2)
+
     from systemu.recovery.engine import RecoveryEngine
     from systemu.storage.sqlite.vault import SqliteVault
 

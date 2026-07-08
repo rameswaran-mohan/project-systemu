@@ -75,6 +75,167 @@ from systemu.interface.design.icons import icon as _icon
 # missing file never breaks the dashboard. Shipped via the package-data glob.
 _BRAND_LOGO = Path(__file__).resolve().parent / "assets" / "logo.png"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  R-SEC1: route-guard middleware (authentication enforcement)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Rule: when a passphrase is configured (state.dashboard_auth_active is True)
+# EVERY dashboard route requires an authenticated session — unauthenticated
+# browser navigation → 302 /login, an unauthenticated XHR/API request → 401.
+# When no passphrase is configured (the loopback default) the guard is a STRICT
+# pass-through no-op, so the existing UI regression floor is unchanged.
+#
+# The security core is factored into two pure functions (``_is_auth_allowlisted``
+# and ``_guard_decision``) so the allow/deny logic can be unit-tested exhaustively
+# without a live server. ``_install_route_guard`` wraps them in a Starlette HTTP
+# middleware that FAILS CLOSED on any internal error and never touches
+# ``app.storage.user`` outside a request context in a way that can raise open.
+
+# Path prefixes that are ALWAYS exempt — the NiceGUI framework infra the login
+# page depends on. /_nicegui/* (static JS + the websocket) MUST be exempt or the
+# login page can never load its own assets; /assets + /static are our font/static
+# mounts. These are matched ONLY on a SEGMENT boundary (p == pre or p startswith
+# pre + "/") — Finding B: a raw ``startswith`` treated /assets-export,
+# /staticdata, /_nicegui_admin, … as allowlisted, a latent auth bypass.
+_AUTH_ALLOWLIST_PREFIXES = ("/_nicegui", "/_nicegui_ws", "/assets", "/static")
+# Exact-match exemptions — the login page itself + the favicon fetched pre-auth
+# by the browser chrome. Exact (not prefix) so /login-history etc. stay guarded.
+_AUTH_ALLOWLIST_EXACT = ("/login", "/favicon.ico")
+
+
+def _is_auth_allowlisted(path: str) -> bool:
+    """True iff ``path`` is exempt from the auth guard (login page + framework
+    infra). Pure + defensive: a non-str / odd path is treated as NOT allowlisted
+    (fail-closed — an unexpected shape gets guarded, never waved through).
+
+    Finding B: prefix matches require a SEGMENT boundary — ``p == pre`` or
+    ``p.startswith(pre + "/")`` — so ``/assets`` allows ``/assets`` and
+    ``/assets/fonts/x.woff2`` but NOT ``/assets-export``. Exact entries
+    (``/login``, ``/favicon.ico``) match verbatim, so ``/login-history`` and
+    ``/loginX`` stay guarded."""
+    try:
+        p = path or ""
+        if p in _AUTH_ALLOWLIST_EXACT:
+            return True
+        for pre in _AUTH_ALLOWLIST_PREFIXES:
+            if p == pre or p.startswith(pre + "/"):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _guard_decision(path: str, accept_header: str, *, authed: bool, active: bool) -> str:
+    """The pure route-guard decision. Returns one of ``"pass"``, ``"redirect"``
+    (302 → /login for a browser navigation), or ``"401"`` (JSON, for XHR/API).
+
+    * ``active`` False → always ``"pass"`` (no passphrase configured; no-op).
+    * allowlisted path → ``"pass"`` (login page + framework infra).
+    * ``authed`` True → ``"pass"``.
+    * otherwise: ``"redirect"`` when the caller looks like an HTML browser
+      navigation (``text/html`` in Accept), else ``"401"`` — a missing/JSON
+      Accept is treated as a non-navigation so we never 302-loop an API client.
+    """
+    if not active:
+        return "pass"
+    if _is_auth_allowlisted(path):
+        return "pass"
+    if authed:
+        return "pass"
+    if "text/html" in (accept_header or ""):
+        return "redirect"
+    return "401"
+
+
+# Holder for the state object the (single) installed guard reads. NiceGUI's
+# ``app`` is a process-wide singleton, so the guard middleware must be added
+# EXACTLY ONCE — re-installing on a second run_dashboard() call would stack a
+# second guard on the shared app (and Starlette forbids adding middleware once
+# the app has started). We install one guard that reads the CURRENT state from
+# this holder; re-installation just re-points the holder.
+_ROUTE_GUARD_STATE: "list" = [None]
+_ROUTE_GUARD_INSTALLED: "list[bool]" = [False]
+
+
+def _install_route_guard(ng_app, state) -> None:
+    """Register the authentication route-guard middleware on ``ng_app`` (once).
+
+    ``state`` is the live ``AppState`` — the guard reads ``dashboard_auth_active``
+    off it on EVERY request (so a later posture change is honoured) via
+    ``getattr(state, "dashboard_auth_active", False)``. Fails closed: any error
+    inside the guard denies the request (redirect for HTML / 401 otherwise); it
+    never raises open, and never lets ``app.storage.user`` access (which raises
+    outside a request context) leak a request through.
+
+    Idempotent: the middleware is added to ``ng_app`` only on the first call;
+    subsequent calls just re-point the state holder so a re-``run_dashboard`` (or
+    a second call within the same process) never stacks a duplicate guard.
+    """
+    from starlette.responses import RedirectResponse, JSONResponse
+
+    # Re-point the holder to the current state on every call.
+    _ROUTE_GUARD_STATE[0] = state
+    if _ROUTE_GUARD_INSTALLED[0]:
+        return  # guard already on the app; the holder swap above is enough.
+
+    def _deny(accept_header: str):
+        if "text/html" in (accept_header or ""):
+            return RedirectResponse("/login", status_code=302)
+        return JSONResponse({"detail": "authentication required"}, status_code=401)
+
+    def _compute_decision(request) -> str:
+        """Compute pass|redirect|401 for a request. FAILS CLOSED: any error in
+        the guard's OWN logic denies (deny for HTML → redirect else 401). This
+        deliberately wraps ONLY the decision — the pass-through ``call_next`` is
+        outside it, so a DOWNSTREAM render error is never masked as an auth
+        redirect (it propagates as its real 500)."""
+        try:
+            _state = _ROUTE_GUARD_STATE[0]
+            active = bool(getattr(_state, "dashboard_auth_active", False))
+            if not active:
+                return "pass"                    # regression floor: strict no-op.
+            path = request.url.path
+            accept = request.headers.get("accept", "")
+            # Allowlisted paths never need a session (login page + infra) — do
+            # NOT touch app.storage.user for these (it can raise on infra paths).
+            if _is_auth_allowlisted(path):
+                return "pass"
+            # Resolve the session flag defensively — app.storage.user raises
+            # outside a request/websocket context; treat any failure as UNAUTHED.
+            authed = False
+            try:
+                from nicegui import app as _ng_app
+                authed = _ng_app.storage.user.get("authed") is True
+            except Exception:
+                authed = False
+            return _guard_decision(path, accept, authed=authed, active=active)
+        except Exception:
+            logger.warning("[Dashboard] route guard error — failing closed",
+                           exc_info=True)
+            # Fail CLOSED: deny. HTML → redirect, else 401.
+            try:
+                accept = request.headers.get("accept", "")
+            except Exception:
+                accept = ""
+            return "redirect" if "text/html" in (accept or "") else "401"
+
+    @ng_app.middleware("http")
+    async def _auth_guard(request, call_next):
+        decision = _compute_decision(request)
+        if decision != "pass":
+            try:
+                accept = request.headers.get("accept", "")
+            except Exception:
+                accept = ""
+            return _deny(accept)
+        # Pass-through is OUTSIDE the fail-closed wrapper: a downstream handler
+        # error surfaces as its real status, never as a spurious auth redirect.
+        return await call_next(request)
+
+    _ROUTE_GUARD_INSTALLED[0] = True
+
+
 NAV_SPINES = [
     ("/",         _icon("home"),     "Home"),
     ("/work",     _icon("work"),     "Work"),      # Slice 2a: workflow-centric list (scrolls+activities fold in)
@@ -253,6 +414,21 @@ def _build_layout(page_title: str, current_path: str):
                 ui.label(f"{_host}:{_port}").style(
                     f"font-size: 11px; color: {THEME['text_muted']};"
                 )
+                # R-SEC1: a Sign-out link — shown ONLY when authentication is
+                # enforced (a passphrase is configured). When auth is inactive
+                # (loopback default) nothing renders here, so the existing UI
+                # regression floor is untouched.
+                try:
+                    from systemu.interface.dashboard_state import AppState as _AuthState
+                    if getattr(_AuthState.get(), "dashboard_auth_active", False):
+                        from systemu.interface.pages.login import logout as _logout
+                        ui.link("Sign out", "#").on(
+                            "click", lambda _e: _logout()
+                        ).classes("s-muted").style(
+                            "font-size: 11px; margin-top: 6px; cursor: pointer;"
+                        )
+                except Exception:
+                    pass  # never let the sign-out link break the sidebar
 
         # ── Main content area ──
         with ui.column().style(
@@ -833,6 +1009,7 @@ def register_routes() -> None:
     from systemu.interface.pages.work                      import build_work_page
     from systemu.interface.pages.table                     import build_table_page
     from systemu.interface.pages import recover as _recover_page_module  # noqa: F401  # registers /recover/<scope>/<id>
+    from systemu.interface.pages import login as _login_page_module        # noqa: F401  # R-SEC1: registers /login
 
     def _redirect_to_welcome_if_needed() -> bool:
         """W11.4: funnel fresh installs to /welcome from EVERY route until
@@ -1049,6 +1226,49 @@ def run_dashboard(
     _origin_host = "localhost" if host in ("0.0.0.0", "::", "") else host
     os.environ["SYSTEMU_DASHBOARD_ORIGIN"] = f"http://{_origin_host}:{port}"
 
+    # ── R-SEC1: fail-closed exposure gate + session secret ──────────────────
+    # The rule (systemu.runtime.dashboard_auth.exposure_check):
+    #   non-loopback bind + no passphrase  -> REFUSE to start (never bind);
+    #   loopback bind + no passphrase       -> start, but WARN it's unauthenticated;
+    #   any bind + passphrase configured    -> start.
+    # The exposure check itself MUST run (its SystemExit must propagate);
+    # only the TLS niceties below are best-effort. `_dash_storage_secret` is
+    # always resolved (falls back to None) so ui.run always gets a secret when
+    # the module is present.
+    _vault = config.vault_dir
+    _dash_storage_secret = None
+    _dash_ssl_kwargs: dict = {}
+    from systemu.runtime import dashboard_auth as _dash_auth
+    _verdict = _dash_auth.exposure_check(host, _dash_auth.is_configured(config, _vault))
+    if not _verdict.may_start:
+        logger.critical("[Dashboard] %s", _verdict.reason)
+        raise SystemExit(3)                         # fail-closed: never bind
+    if _verdict.warn:
+        logger.warning("[Dashboard] No dashboard passphrase set — the UI is UNAUTHENTICATED "
+                        "(loopback only). Set SYSTEMU_DASHBOARD_PASSPHRASE_HASH or run "
+                        "`systemu doctor --set-passphrase` before exposing beyond 127.0.0.1.")
+    # A stable, persisted session secret so NiceGUI's per-user storage survives
+    # restarts — always set, independent of the auth posture.
+    try:
+        _dash_storage_secret = _dash_auth.session_secret(_vault)
+    except Exception:
+        logger.warning("[Dashboard] could not resolve session secret", exc_info=True)
+    # TLS passthrough (spec design 6): serve HTTPS when both env vars are set.
+    try:
+        _tls_cert = os.getenv("SYSTEMU_TLS_CERT")
+        _tls_key = os.getenv("SYSTEMU_TLS_KEY")
+        if _tls_cert and _tls_key:
+            _dash_ssl_kwargs = {"ssl_certfile": _tls_cert, "ssl_keyfile": _tls_key}
+        elif not _dash_auth.is_loopback(host):
+            logger.warning(
+                "[Dashboard] Binding %r over PLAINTEXT HTTP (no TLS). Set "
+                "SYSTEMU_TLS_CERT and SYSTEMU_TLS_KEY to serve HTTPS, or put a "
+                "TLS-terminating reverse proxy in front before exposing beyond "
+                "loopback.", host,
+            )
+    except Exception:
+        logger.debug("[Dashboard] TLS env passthrough skipped", exc_info=True)
+
     try:
         from nicegui import ui, app as ng_app
     except ImportError:
@@ -1087,6 +1307,23 @@ def run_dashboard(
             exc, exc_info=True,
         )
         return
+
+    # R-SEC1: record the auth posture on the live state (advisory; never fatal).
+    try:
+        state.dashboard_auth_active = _verdict.require_auth
+    except Exception:
+        pass
+
+    # R-SEC1: install the authentication route-guard middleware. When a
+    # passphrase is configured (state.dashboard_auth_active True) EVERY route
+    # requires an authenticated session; otherwise the guard is a strict no-op.
+    # Registered here — after state + the fonts mount, before ui.run — so it
+    # wraps the whole request chain. Never fatal: a wiring failure logs + falls
+    # through (the exposure gate above already refused any unsafe bind).
+    try:
+        _install_route_guard(ng_app, state)
+    except Exception:
+        logger.warning("[Dashboard] could not install auth route guard", exc_info=True)
 
     # ── Start Supervisor (Phase 2) ─────────────────────────────────────────
     # Initializes the activity queue, dispatcher thread, and heartbeat watchdog.
@@ -1190,12 +1427,18 @@ def run_dashboard(
         reload=reload,
         show=False,          # Don't auto-open browser
         uvicorn_logging_level="warning",
+        # R-SEC1: stable, persisted secret so NiceGUI's per-user storage
+        # (app.storage.user) survives restarts and is signed against tampering.
+        storage_secret=_dash_storage_secret,
         # v0.7.3 Bug #11 fix — default uvicorn WS max-message is 16MB but
         # starlette / NiceGUI's full-state sync can exceed this with a busy
         # vault (scrolls + tools + skills + activities all rendering). Raise
         # to 64MB so click events keep propagating after the initial sync.
         # NiceGUI passes unknown kwargs through to uvicorn.run().
         ws_max_size=64 * 1024 * 1024,
+        # R-SEC1: TLS passthrough — ssl_certfile/ssl_keyfile when both env vars
+        # are set (empty dict otherwise, so behaviour is unchanged by default).
+        **_dash_ssl_kwargs,
     )
 
 
