@@ -22,22 +22,26 @@ from systemu.runtime.snapshot_migrations import (
 )
 
 
-def test_migrator_current_is_5():
-    assert CURRENT_SCHEMA_VERSION == 5
+def test_migrator_current_is_6():
+    # R-A12a bumped CURRENT_SCHEMA_VERSION 5 -> 6 (adds pending_waits).
+    assert CURRENT_SCHEMA_VERSION == 6
 
 
 def test_migrate_v4_to_v5_defaults_key():
+    # v4 migrates through 4->5->...; assert external_evidence lands at the v5 step
+    # and the dict reaches the current schema version.
     data = {"schema_version": 4, "requirement_report": None}
     out = migrate_snapshot_dict(dict(data))
-    assert out["schema_version"] == 5
+    assert out["schema_version"] == CURRENT_SCHEMA_VERSION
     assert out["external_evidence"] == {}
 
 
 def test_migrate_v1_to_v5_full_chain():
-    """A v1 dict migrates 1->2->3->4->5, gaining every new key incl. external_evidence."""
+    """A v1 dict migrates 1->2->3->4->5->... , gaining every new key incl.
+    external_evidence and landing at the current schema version (v6+ after R-A12a)."""
     data = {"schema_version": 1}
     out = migrate_snapshot_dict(dict(data))
-    assert out["schema_version"] == 5
+    assert out["schema_version"] == CURRENT_SCHEMA_VERSION
     # G1 (1->2)
     assert out["objective_graph"] == []
     assert out["next_objective_id"] == 1

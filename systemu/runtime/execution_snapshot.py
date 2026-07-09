@@ -107,6 +107,11 @@ class ExecutionSnapshot:
     # ExternalEvidence (mirrors requirement_report). Default {} = no evidence = no
     # external credit (fail-closed).
     external_evidence:        dict = field(default_factory=dict)
+    # R-A12a (durable external-event retry timers): the pending-waits list, a plain
+    # list of dicts so a resumed run keeps its durable retry timers and re-arms them
+    # instead of dropping (or double-firing) an in-flight wait. Store-agnostic +
+    # cycle-free (mirrors external_evidence). Default [] = no pending waits.
+    pending_waits:            List[dict] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,6 +204,9 @@ def read_snapshot(
             # S4: guard a poisoned/garbage store — a non-dict external_evidence
             # degrades to {} (=> no external credit, fail-closed; never a crash).
             external_evidence=dict(data.get("external_evidence") or {}) if isinstance(data.get("external_evidence"), dict) else {},
+            # R-A12a: guard a poisoned/garbage store — a non-list pending_waits
+            # degrades to [] (=> no phantom timers; never a crash).
+            pending_waits=list(data.get("pending_waits") or []) if isinstance(data.get("pending_waits"), list) else [],
         )
     except SnapshotRefused:
         # DEC-9: a newer-than-supported snapshot must refuse LOUDLY — never
@@ -254,6 +262,7 @@ def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
         "situation_stamps":        snapshot.situation_stamps,
         "requirement_report":      snapshot.requirement_report,
         "external_evidence":       snapshot.external_evidence,
+        "pending_waits":           snapshot.pending_waits,
     }
 
 
@@ -335,6 +344,7 @@ def capture_from_context(
         situation_stamps=dict(getattr(context, "_situation_stamps", {}) or {}),
         requirement_report=getattr(context, "_requirement_report", None),
         external_evidence=dict(getattr(context, "_external_evidence", {}) or {}),
+        pending_waits=list(getattr(context, "_pending_waits", []) or []),
     )
 
 
@@ -391,6 +401,13 @@ def apply_to_context(snapshot: ExecutionSnapshot, *, context) -> None:
         _ee = getattr(snapshot, "external_evidence", None)
         if _ee:
             context._external_evidence = dict(_ee)
+        # R-A12a: re-seed the durable pending-waits so a resumed run re-arms its
+        # in-flight external-event retry timers instead of dropping them. CONDITIONAL
+        # on a non-empty list so a never-armed resume leaves _pending_waits UNSET
+        # (byte-identical snapshot on the next capture; mirrors external_evidence).
+        _pw = getattr(snapshot, "pending_waits", None)
+        if _pw:
+            context._pending_waits = list(_pw)
     except Exception:
         logger.debug("[ExecSnapshot] apply graph/req-report/evidence re-seed failed", exc_info=True)
 

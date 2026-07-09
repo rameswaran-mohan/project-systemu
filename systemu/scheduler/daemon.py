@@ -652,6 +652,21 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # R-A12a external-event wait reconciler: fires durable retry timers persisted in
+    # ExecutionSnapshot.pending_waits (armed by the supervisor's retry path instead of
+    # an in-process threading.Timer, so a retry armed before a restart still fires). It
+    # is the 4th CONC-MAP-allowed write_snapshot writer (DEC-10 reviewed) and mutates a
+    # run's snapshot ONLY while that run is PARKED (per-execution_id invariant).
+    from systemu.scheduler.jobs import _external_wait_reconciler_job
+    scheduler.add_job(
+        _external_wait_reconciler_job,
+        trigger="interval",
+        seconds=15,
+        id="external_wait_reconciler",
+        name="External-Event Wait Reconciler",
+        replace_existing=True,
+    )
+
     scheduler.start()
 
     # One-shot recovery sweep — fires 5 seconds after startup to heal any

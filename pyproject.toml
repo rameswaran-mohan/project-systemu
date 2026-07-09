@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.9.64"
+version = "0.9.65"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 license = {text = "MIT"}

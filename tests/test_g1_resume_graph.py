@@ -159,7 +159,7 @@ def _make_handle_result_supervisor():
     return s
 
 
-def test_resume_refused_failure_is_terminal_not_retried_fresh(monkeypatch):
+def test_resume_refused_failure_is_terminal_not_retried_fresh(monkeypatch, tmp_path):
     """A 'resume refused' failure must be structural → _handle_result must NOT
     schedule a fresh retry submit (which would drop resume_from_execution_id and
     re-run objectives from scratch)."""
@@ -207,18 +207,26 @@ def test_resume_refused_failure_is_terminal_not_retried_fresh(monkeypatch):
     assert sup._dead_letters[0]["structural"] is True
 
     # Counter-proof of WHY the flag matters: the identical failure dict WITHOUT
-    # the structural flag (what caller #1 returned before this fix) DOES fire a
-    # fresh-retry Timer — a submit() with no resume_from_execution_id → objectives
-    # from scratch. This is the exact hazard the structural flag closes.
+    # the structural flag (what caller #1 returned before this fix) DOES retry.
+    # R-A12a (timer→durable-wait migration): the retry is now armed as a DURABLE
+    # ``pending_wait`` on the run's ExecutionSnapshot (which survives a restart),
+    # not an in-process ``threading.Timer``. It is still a FRESH run — the record
+    # carries NO resume_from_execution_id, so a reconciler resubmit re-runs
+    # objectives from scratch. This is the exact hazard the structural flag closes.
+    from systemu.runtime.execution_snapshot import read_snapshot
     timer_calls.clear()
     sup2 = _make_handle_result_supervisor()
+    sup2._snapshot_data_dir = tmp_path   # R-A12a: isolate the durable wait at tmp
     unflagged = dict(refusal)
     unflagged.pop("structural_failure")
     sup2._handle_result(payload, unflagged)
-    assert len(timer_calls) == 1, "unflagged failure must retry (proves the flag is load-bearing)"
-    _t_args, _t_kwargs = timer_calls[0]
-    # The retry submit carries NO resume_from_execution_id → fresh run.
-    assert "resume_from_execution_id" not in _t_kwargs.get("kwargs", {})
+    # No fresh-retry Timer — the retry is durable, deferred to the reconciler.
+    assert timer_calls == []
+    snap = read_snapshot("exec_x", data_dir=tmp_path)
+    assert snap is not None and len(snap.pending_waits) == 1, \
+        "unflagged failure must arm a durable retry (proves the flag is load-bearing)"
+    # The durable record carries NO resume hint → the reconciler resubmits FRESH.
+    assert "resume_from_execution_id" not in snap.pending_waits[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

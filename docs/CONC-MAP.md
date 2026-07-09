@@ -49,7 +49,7 @@ multi-writer × missing-serialization.
 
 | Store | Writer(s) → home thread | Ser. | Owner | Risk |
 |---|---|---|---|---|
-| **ExecutionSnapshot** `data/audit/exec_*/resume_snapshot.json` | shadow loop (`shadow_runtime`), `supervisor.resume_after_grant`, `resume_on_decision._dispatch_resume` → shadow thread + APScheduler + EventBus-thread; **+ CLI / `army execute` / Huey-worker (cross-proc)** | `A` + process-local `_lock` | **per-execution_id (1 logical run)** | **HIGH — the R-A12 target** |
+| **ExecutionSnapshot** `data/audit/exec_*/resume_snapshot.json` | shadow loop (`shadow_runtime`), `supervisor.resume_after_grant`, `resume_on_decision._dispatch_resume`, **`jobs.external_wait_reconciler` (R-A12a — 4th writer, PARKED-runs only)** → shadow thread + APScheduler + EventBus-thread; **+ CLI / `army execute` / Huey-worker (cross-proc)** | `A` + process-local `_lock` | **per-execution_id (1 logical run)** | **HIGH — the R-A12 target** |
 | `decisions` (`decisions/index.json` + `<id>.json`) | `OperatorDecisionQueue.post/resolve`, reconcilers (`jobs`), inbox handler, `resume_on_decision` stamp, **CLI proc**, **telegram-gateway thread** (R-P1) | `A`, **unlocked index RMW** | multi | **HIGH** |
 | Fatigue metrics `metrics/metrics.json` | `incr` at gate creation (exec thread) vs `record_resolution` (dashboard/telegram/CLI) | `A`, **unlocked RMW** | multi | MED |
 | vault collection indexes (`scrolls`/`activities`/`tools`/`skills`/`shadows`/`notifications`) | many across `pipelines/`+`runtime/`+`scheduler/`+`interface/` (+ reconciler↔loop combos: `save_tool`, `save_activity`) | `A`, **unlocked index RMW** | multi | MED |
@@ -72,10 +72,13 @@ ExecutionSnapshot, table_store, command_approvals, metrics_store, dashboard_auth
 
 ## Multi-writer hot-spots (ranked)
 
-1. **ExecutionSnapshot** — 3 in-tree writer paths + cross-process (Huey/`army execute`). Guarded
-   only by a **process-local** `_lock` + atomic replace; the reconciler↔EventBus dual-trigger has
-   a TOCTOU on the best-effort `resume_dispatched` flag. Safe **today** because resume writes
-   happen only while a run is *parked* (per-execution_id → one logical owner at a time).
+1. **ExecutionSnapshot** — 4 in-tree writer paths (incl. R-A12a `external_wait_reconciler`) +
+   cross-process (Huey/`army execute`). Guarded only by a **process-local** `_lock` + atomic
+   replace; the reconciler↔EventBus dual-trigger has a TOCTOU on the best-effort
+   `resume_dispatched` flag. Safe **today** because every snapshot write (resume rail +
+   `external_wait_reconciler`) happens only while a run is *parked* (per-execution_id → one logical
+   owner at a time): the reconciler skips any run the supervisor reports live, and stamps
+   `dispatched` BEFORE re-submit (at-most-once).
 2. **`decisions`** — telegram + dashboard + reconcilers + runtime + CLI; unlocked `index.json`
    RMW and an unlocked `queue.resolve` get→mutate→save with a status TOCTOU.
 3. **Fatigue `metrics.json`** — exec-thread create vs UI/telegram/CLI resolve, unlocked RMW.
@@ -87,21 +90,31 @@ ExecutionSnapshot, table_store, command_approvals, metrics_store, dashboard_auth
 
 ---
 
-## The R-A12 precondition (why this gate exists)
+## The R-A12 precondition (SATISFIED — R-A12a)
 
-R-A12 adds `external_wait_reconciler`, a **new background writer on `ExecutionSnapshot`** (a
-`pending_waits` field that does not exist yet). It would become a **4th** concurrent snapshot
+R-A12a added `external_wait_reconciler` (`scheduler/jobs.py`), a **new background writer on
+`ExecutionSnapshot`** (the `pending_waits` field, schema v6). It is the **4th** concurrent snapshot
 writer, and in Huey mode it runs in a *different process* from the shadow loop — where the
-process-local `_lock` gives **no** protection. Before it ships, R-A12 must:
+process-local `_lock` gives **no** protection. The three preconditions are now met:
 
-1. **Add it to the writer allowlist** in `test_conc_map_writer_ownership.py` (the test will fail
-   until then) and to the table above — the conscious review checkpoint.
-2. **Preserve the per-execution_id parked-run invariant**: the reconciler may write a snapshot
-   only while its run is *not live* (parked), so the run's own loop is not concurrently writing
-   the same file. Assert/enforce this, don't assume it.
-3. **Close the cross-process gap** for the `pending_waits` write path (an OS file lock or a
-   single-owner discipline for that field), since `_lock` is process-local and Huey/CLI writers
-   exist. At minimum, document that `pending_waits` is written by exactly one owner.
+1. ✅ **Added to the writer allowlist** in `test_conc_map_writer_ownership.py` (and the table
+   above) — the conscious DEC-10 review checkpoint. The guardrail was observed failing on the
+   unlisted `write_snapshot` caller, then satisfied.
+2. ✅ **Per-execution_id parked-run invariant enforced, not assumed**: `external_wait_reconciler`
+   calls `_run_is_live(supervisor, activity_id)` (scans the supervisor `_running` set + pending
+   queue) and skips the ENTIRE run — writing no snapshot — for any run reported live, so it never
+   races the run's own loop. A CANCELLED run's waits are expired (no resubmit). Covered by
+   `tests/test_ra12a_external_wait_reconciler.py::test_live_run_wait_not_touched` +
+   `::test_cancelled_run_wait_is_noop`.
+3. ⚠️ **Cross-process gap — mitigated by single-owner discipline, not an OS lock.** `pending_waits`
+   is written by exactly one owner *at a time* because writes happen only on PARKED runs and
+   `dispatched` is stamped+persisted BEFORE the re-submit (at-most-once — a crash after the stamp
+   never double-submits; `::test_stamp_before_submit_idempotency`). The residual: the daemon's
+   `_running` set does NOT see a run executing in a *separate* Huey/`army execute` process, so the
+   liveness check is process-local. This is acceptable for retry waits (a wait exists only because
+   the run already FAILED and is genuinely parked awaiting a delayed retry — it is not executing
+   anywhere until re-submitted); a true OS file lock on `pending_waits` remains the belt-and-braces
+   fix, deferred with the hot-spot #6 cross-process work (R-P2 / R-W4).
 
 Full CONC-MAP enforcement (locks on hot-spots #2–#5) stays a precondition of R-P2 watchers and
 the R-W4 world gardener, unchanged.

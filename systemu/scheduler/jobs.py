@@ -586,6 +586,288 @@ def _mcp_oauth_reconciler_job() -> None:
         logger.exception("[McpOAuthReconciler] job crashed")
 
 
+# R-A12a: durable external-event retry timers (pending_waits) live on the
+# ExecutionSnapshot; this reconciler is their FIRE path. A wait whose run has been
+# parked longer than this staleness bound is abandoned (dropped, never resubmitted)
+# so a forgotten/orphaned timer can't grow the scan or resubmit forever.
+EXTERNAL_WAIT_STALE_SECONDS = int(
+    os.environ.get("SYSTEMU_EXTERNAL_WAIT_STALE_SECONDS", str(24 * 60 * 60))  # 24h
+)
+
+
+def _run_is_live(supervisor, activity_id: str) -> bool:
+    """True if the supervisor reports ``activity_id`` as executing now (a running
+    worker thread) OR queued-to-run — i.e. NOT parked.
+
+    The parked-run invariant (CONC-MAP / DEC-10): the reconciler may write a run's
+    snapshot ONLY while that run is not live, so the run's own loop is never
+    concurrently writing the same file. When we cannot tell (an unexpected error
+    reading the running set), conservatively report *live* so we never mutate a
+    possibly-live snapshot.
+    """
+    if not activity_id or supervisor is None:
+        return False
+    import contextlib
+    running = getattr(supervisor, "_running", None)
+    if isinstance(running, dict):
+        lock = getattr(supervisor, "_running_lock", None)
+        try:
+            with (lock or contextlib.nullcontext()):
+                for entry in list(running.values()):
+                    payload = entry.get("payload", {}) if isinstance(entry, dict) else {}
+                    if payload.get("activity_id") == activity_id:
+                        return True
+        except Exception:
+            return True   # unsure → treat as live (never mutate a live snapshot)
+    pending = getattr(supervisor, "_pending_activity_ids", None)
+    if pending is not None:
+        plock = getattr(supervisor, "_pending_lock", None)
+        try:
+            with (plock or contextlib.nullcontext()):
+                if activity_id in pending:
+                    return True
+        except Exception:
+            return True
+    return False
+
+
+def _run_is_terminal(vault, activity_id: str) -> bool:
+    """True if ``activity_id`` already reached a terminal, NON-retry-pending state
+    per ``ActivityStatus`` — COMPLETED (a concurrent re-run by the hourly sweep /
+    startup_recovery_sweep / an operator manual re-run already SUCCEEDED), FAILED
+    (dead-lettered / structural blocker), or CANCELLED (operator interrupt).
+
+    Generalizes/absorbs the old ``_run_is_cancelled`` (CANCELLED is a subset). A
+    wait on such a run must never resubmit: the activity has already finished, so
+    re-running it would spuriously replay its effectful actions (the HIGH review
+    finding this drop closes) — and for CANCELLED specifically it would resurrect a
+    run the operator stopped (IMPL-11).
+
+    STEP-0 correctness (verified against supervisor.py ~:1455 + activity_completion.py):
+    the supervisor's retry path does NOT mark the activity terminal — it leaves it
+    non-terminal (ASSIGNED) so the reconciler can resubmit it. ASSIGNED is therefore
+    deliberately EXCLUDED from this set, so a legitimately-retry-pending activity is
+    never over-dropped and its durable retry still fires.
+
+    When the activity cannot be resolved (deleted / vault error), returns False —
+    don't claim terminal; the exhausted/stale drop still bounds a truly orphaned wait.
+    """
+    if not activity_id or vault is None:
+        return False
+    try:
+        from systemu.core.models import ActivityStatus
+        activity = vault.get_activity(activity_id)
+        return getattr(activity, "status", None) in (
+            ActivityStatus.COMPLETED,
+            ActivityStatus.FAILED,
+            ActivityStatus.CANCELLED,
+        )
+    except Exception:
+        return False
+
+
+def _scan_wait_execution_ids(data_dir) -> list:
+    """Return every execution_id that has a persisted snapshot on disk.
+
+    pending_waits live INSIDE the ExecutionSnapshot (there is no bounded parked-run
+    index that maps cleanly to execution_ids — ActivityStatus has no distinct
+    retry-pending state, and the activity carries no execution_id), so candidate runs
+    are found by scanning ``data_dir/audit/exec_*/resume_snapshot.json``. Growth is
+    bounded by the staleness drop (a forgotten wait is dropped, then its snapshot is
+    consumed by the resume). Best-effort: a bad directory is skipped.
+    """
+    from pathlib import Path
+    audit = Path(data_dir or "data") / "audit"
+    if not audit.is_dir():
+        return []
+    out: list = []
+    try:
+        for exec_dir in audit.glob("exec_*"):
+            if not (exec_dir / "resume_snapshot.json").is_file():
+                continue
+            eid = exec_dir.name[len("exec_"):]
+            if eid:
+                out.append(eid)
+    except Exception:
+        logger.debug("[ExternalWaitReconciler] snapshot scan failed", exc_info=True)
+    return out
+
+
+def external_wait_reconciler(*, vault, supervisor, data_dir=None, now=None) -> int:
+    """Daemon-tick FIRE path for durable external-event retry timers (R-A12a).
+
+    Durable retry waits are persisted in ``ExecutionSnapshot.pending_waits`` (armed
+    by the supervisor's retry path instead of an in-process ``threading.Timer``, so a
+    retry armed before a restart still fires afterwards). This poll finds due,
+    undispatched waits on **parked** (not live), **non-terminal** runs, re-submits
+    the retry via the supervisor, and stamps the wait ``dispatched``.
+
+    CONC-MAP / DEC-10 — this is the **4th** ``write_snapshot`` caller. It preserves
+    the per-execution_id parked-run invariant: a run the supervisor reports as live is
+    skipped ENTIRELY (its snapshot is never written here), because the process-local
+    ``_lock`` gives no cross-process protection. ``dispatched`` is persisted BEFORE the
+    re-submit, so a crash after the stamp can never double-submit (at-most-once retry —
+    dropping a retry is safer than re-running an activity twice). Idempotent across
+    ticks + restarts.
+
+    Per-wait handling (mirrors the mcp_oauth clean-timeout at :527-535):
+      * run LIVE            → skip the whole run (parked invariant); no snapshot write.
+      * run TERMINAL        → drop the wait (stamp dispatched, no resubmit): the
+                              activity already reached COMPLETED (a concurrent re-run
+                              succeeded) / FAILED (dead-lettered) / CANCELLED (operator
+                              interrupt), so resubmitting would spuriously re-execute a
+                              finished activity (the HIGH review finding) — CANCELLED is
+                              a subset (IMPL-11). ASSIGNED (retry-pending) is NOT terminal.
+      * exhausted / stale   → drop the wait (stamp dispatched, no resubmit).
+      * otherwise (due)     → stamp dispatched + persist FIRST, THEN supervisor.submit.
+
+    Fully defensive: a corrupt/refused snapshot is skipped; a per-wait failure is
+    logged and skipped; the tick never raises. Returns the number of retries actually
+    re-submitted.
+    """
+    import time as _time
+    from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
+    from systemu.runtime.pending_waits import due_waits, is_exhausted, mark_dispatched
+
+    now = now if now is not None else _time.time()
+    dispatched = 0
+
+    for execution_id in _scan_wait_execution_ids(data_dir):
+        # Load the snapshot defensively — a corrupt / schema-refused file is skipped,
+        # never crashing the tick.
+        try:
+            snap = read_snapshot(execution_id, data_dir=data_dir)
+        except Exception:
+            logger.debug("[ExternalWaitReconciler] unreadable snapshot for %s — skipping",
+                         execution_id, exc_info=True)
+            continue
+        if snap is None:
+            continue
+
+        due = due_waits(snap.pending_waits, now=now)
+        if not due:
+            continue
+
+        run_activity_id = snap.activity_id or (due[0].get("activity_id") if due else None)
+
+        # Parked-run invariant: NEVER touch a live run's snapshot. Skip the whole run
+        # so we can't race the run's own loop writing the same file.
+        if _run_is_live(supervisor, run_activity_id):
+            logger.debug("[ExternalWaitReconciler] run %s is live — skipping (parked invariant)",
+                         execution_id)
+            continue
+
+        terminal = _run_is_terminal(vault, run_activity_id)
+
+        waits = list(snap.pending_waits)
+        pending_persist = False   # unpersisted no-submit stamps (terminal / exhausted / stale)
+
+        for wait in due:
+            wait_id = wait.get("wait_id")
+            try:
+                # 1) terminal run (completed / dead-lettered / cancelled) → drop the
+                #    wait (no resubmit). The activity already finished; firing the
+                #    retry would re-execute it and replay its effects. ASSIGNED
+                #    (retry-pending) is NOT terminal, so a legitimate retry still fires.
+                if terminal:
+                    logger.debug(
+                        "[ExternalWaitReconciler] dropping wait %s on run %s — activity "
+                        "%s already terminal (no resubmit)",
+                        wait_id, execution_id, run_activity_id,
+                    )
+                    waits = mark_dispatched(waits, wait_id)
+                    pending_persist = True
+                    continue
+                # 2) exhausted or stale → drop (no resubmit, no infinite loop).
+                exhausted = is_exhausted(wait)
+                created_at = wait.get("created_at")
+                is_stale = (
+                    isinstance(created_at, (int, float))
+                    and (now - float(created_at)) > EXTERNAL_WAIT_STALE_SECONDS
+                )
+                if exhausted or is_stale:
+                    logger.info(
+                        "[ExternalWaitReconciler] dropping %s wait %s on run %s "
+                        "(attempt=%s/%s)", "exhausted" if exhausted else "stale",
+                        wait_id, execution_id, wait.get("attempt"), wait.get("max_attempts"),
+                    )
+                    waits = mark_dispatched(waits, wait_id)
+                    pending_persist = True
+                    continue
+                # 3) due + live-safe + not cancelled → STAMP + PERSIST FIRST, then submit.
+                prev = waits
+                stamped = mark_dispatched(waits, wait_id)
+                snap.pending_waits = stamped
+                if write_snapshot(snap, data_dir=data_dir) is None:
+                    # Persist failed → the on-disk wait is still undispatched; do NOT
+                    # submit (a submit without a durable stamp risks a double-submit next
+                    # tick). Revert in-memory and retry on a later tick.
+                    snap.pending_waits = prev
+                    waits = prev
+                    logger.warning(
+                        "[ExternalWaitReconciler] snapshot persist failed before submit "
+                        "for %s wait %s — will retry next tick", execution_id, wait_id,
+                    )
+                    continue
+                waits = stamped
+                pending_persist = False   # the write above persisted ALL stamps so far
+                supervisor.submit(
+                    wait.get("activity_id") or snap.activity_id,
+                    wait.get("shadow_id") or snap.shadow_id,
+                    reason=f"external_wait:{execution_id}"[:120],
+                    # ADVANCE the attempt: the wait carries the FAILED run's attempt; the
+                    # resubmit must run at attempt+1 (matching the old threading.Timer's
+                    # retry_count+1) so a repeatedly-failing activity terminates at
+                    # MAX_RETRIES instead of looping forever at the same attempt.
+                    retry_count=int(wait.get("attempt", 0) or 0) + 1,
+                    consult_affinity_log=False,
+                    resume_from_execution_id=wait.get("execution_id") or execution_id,
+                    origin="system",
+                )
+                dispatched += 1
+            except Exception:
+                # A per-wait failure (submit raised, etc.) is logged and skipped; the tick
+                # continues. If the stamp was already persisted above, the wait is consumed
+                # (at-most-once) — never re-fired.
+                logger.exception(
+                    "[ExternalWaitReconciler] wait %s on run %s failed — skipping",
+                    wait_id, execution_id,
+                )
+                continue
+
+        # Persist any accumulated no-submit stamps (cancel / exhausted / stale) once.
+        if pending_persist:
+            try:
+                snap.pending_waits = waits
+                write_snapshot(snap, data_dir=data_dir)
+            except Exception:
+                logger.debug("[ExternalWaitReconciler] persist of expired waits failed for %s",
+                             execution_id, exc_info=True)
+
+    if dispatched:
+        logger.info("[ExternalWaitReconciler] re-dispatched %d durable retry wait(s)", dispatched)
+    return dispatched
+
+
+def _external_wait_reconciler_job() -> None:
+    """APScheduler entry: thin wrapper around ``external_wait_reconciler`` using the
+    daemon-initialised globals. Mirrors ``_mcp_oauth_reconciler_job``; never crashes
+    the tick."""
+    if _vault is None:
+        return
+    try:
+        from systemu.runtime.supervisor import Supervisor
+        supervisor = Supervisor.get()
+    except Exception:
+        return
+    try:
+        from pathlib import Path
+        external_wait_reconciler(vault=_vault, supervisor=supervisor,
+                                 data_dir=Path("data"))
+    except Exception:
+        logger.exception("[ExternalWaitReconciler] job crashed")
+
+
 def _harness_grant_reconciler_job() -> None:
     """APScheduler entry: thin wrapper around ``reconcile_resolved_harness_grants``
     using the daemon-initialised globals.  Pulls the live Supervisor on demand.

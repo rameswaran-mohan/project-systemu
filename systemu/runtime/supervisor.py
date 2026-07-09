@@ -57,6 +57,7 @@ import os
 import queue
 import threading
 import time
+import types
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1179,6 +1180,141 @@ class Supervisor:
         return (status in ("failure", "partial")
                 and retry_count < MAX_RETRIES and not structural)
 
+    def _arm_durable_retry(
+        self,
+        *,
+        execution_id: Optional[str],
+        activity_id: str,
+        shadow_id: str,
+        root_execution_id: Optional[str],
+        scroll_id: str,
+        delay_s: float,
+        attempt: int,
+        max_attempts: int,
+        now: float,
+    ) -> Optional[dict]:
+        """R-A12a: arm a DURABLE retry wait on the run's ExecutionSnapshot.
+
+        Replaces the in-process ``threading.Timer`` the retry path used to arm.
+        A Timer is lost if the daemon restarts during the 5–10 s back-off window,
+        so the transiently-failed activity is silently never retried. A
+        ``pending_wait`` record persisted on the ExecutionSnapshot survives the
+        restart; a separate reconciler fires it when ``fire_at`` is due and
+        replays ``submit(activity_id, shadow_id, retry_count=attempt+1, …)`` — the
+        record carries exactly those ids so the reconciler needs no other state.
+
+        The gate is unchanged: this is only reached when ``_should_retry`` is True
+        (i.e. ``attempt < max_attempts``), so the armed record is never exhausted.
+
+        ``execution_id`` may be absent — the generic worker-thread exception path
+        builds a result dict with no ``execution_id`` (and no ``root_execution_id``) —
+        so we fall back to a synthetic key derived from the activity, the ``shadow_id``
+        (this run's assigned shadow — run-stable but run-distinguishing), and the
+        attempt. Folding ``shadow_id`` in makes the key RUN-UNIQUE: two DISTINCT runs
+        of the same activity that both fail at the same attempt on this path get
+        DISTINCT snapshot homes / ``wait_id``s, so a later run's retry is never deduped
+        away against an earlier run's surviving (dropped-but-not-deleted) snapshot. It
+        stays STABLE for the same run + attempt (no uuid4/now), so a re-arm of that
+        same run + attempt is still idempotent — durability for exactly the recurring
+        failures durability matters most for.
+
+        Best-effort: a persistence failure is logged and must NOT crash
+        result-handling — the daemon keeps running; the blast radius of a lost arm
+        is the same one lost Timer as before. Returns the armed record, or None on
+        failure. ``now`` (wall clock) is injected by the caller — it belongs at
+        this arm site, never inside the pure ``pending_waits`` helpers.
+        """
+        from systemu.runtime import pending_waits as _pw
+        from systemu.runtime.execution_snapshot import (
+            ExecutionSnapshot, read_snapshot, write_snapshot,
+        )
+
+        # A missing execution_id (worker-thread exception path) still needs a durable
+        # home + a stable dedupe key. Derive one from activity + shadow_id + attempt:
+        # shadow_id makes the key RUN-UNIQUE (distinct runs → distinct keys) while
+        # staying stable within a run+attempt (so a re-arm is still idempotent).
+        eid = execution_id or f"retryarm-{activity_id}-{shadow_id}-{attempt}"
+        rec = _pw.make_retry_wait(
+            execution_id=eid,
+            activity_id=activity_id,
+            shadow_id=shadow_id,
+            root_execution_id=root_execution_id or eid,
+            delay_s=delay_s,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            now=now,
+        )
+        # Default None → the module's ./data dir, matching every other snapshot
+        # writer (shadow_runtime + resume_after_grant) so the reconciler scans one
+        # place. Tests set ``_snapshot_data_dir`` to isolate at a tmp dir.
+        data_dir = getattr(self, "_snapshot_data_dir", None)
+        try:
+            snap = read_snapshot(eid, data_dir=data_dir)
+            if snap is None:
+                # No snapshot on disk (the common transient-failure case — the run
+                # never suspended). Mint a minimal one whose sole job is to carry
+                # the durable wait for the reconciler to find and fire.
+                snap = ExecutionSnapshot(
+                    execution_id=eid,
+                    shadow_id=shadow_id,
+                    scroll_id=scroll_id or "",
+                    activity_id=activity_id,
+                )
+            # Dedupe by wait_id via arm_wait against a tiny shim exposing the same
+            # ``_pending_waits`` attribute an ExecutionContext would — one source of
+            # dedupe truth, shared with the shadow_runtime arm path.
+            shim = types.SimpleNamespace(_pending_waits=list(snap.pending_waits or []))
+            _pw.arm_wait(shim, rec)
+            snap.pending_waits = shim._pending_waits
+            write_snapshot(snap, data_dir=data_dir)
+            return rec
+        except Exception:
+            logger.exception(
+                "[Supervisor] durable retry-arm failed for %s (attempt %s) — "
+                "the retry is NOT durable across a restart", activity_id, attempt,
+            )
+            return None
+
+    def _expire_pending_waits_on_cancel(self, execution_id: Optional[str]) -> None:
+        """R-A12a / IMPL-11: proactively expire a cancelled run's durable retry
+        timers so none can ever resubmit a run the operator stopped.
+
+        The cancelled result dict carries the run's ``execution_id`` (``build_result``
+        stamps it), so we can locate the run's snapshot directly — read it, flag
+        EVERY ``pending_wait`` ``dispatched`` (``expire_all``), and re-persist. This
+        clears the timers PROMPTLY at cancel time rather than leaving them dangling
+        until the ``external_wait_reconciler`` next skips / staleness-drops them (that
+        per-tick ``_run_is_cancelled`` check remains the belt-and-braces guarantee —
+        this is the proactive companion, not a replacement).
+
+        CONC-MAP / DEC-10: supervisor.py is an allowed ``write_snapshot`` writer, and
+        this runs on the cancelled run's OWN worker thread inside ``_handle_result``
+        after the shadow loop has returned — the run's loop is no longer writing this
+        snapshot, so there is no concurrent-writer race on the file.
+
+        Best-effort: a missing execution_id (defensive), a snapshot that never
+        existed, or any persistence hiccup must NEVER break the cancel finalizer —
+        the terminal CANCELLED mark has already been written by the caller and the
+        reconciler still bounds any surviving wait.
+        """
+        if not execution_id:
+            return
+        try:
+            from systemu.runtime import pending_waits as _pw
+            from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
+            data_dir = getattr(self, "_snapshot_data_dir", None)
+            snap = read_snapshot(execution_id, data_dir=data_dir)
+            if snap is None or not snap.pending_waits:
+                return
+            snap.pending_waits = _pw.expire_all(snap.pending_waits)
+            write_snapshot(snap, data_dir=data_dir)
+        except Exception:
+            logger.debug(
+                "[Supervisor] expire-pending-waits-on-cancel failed for "
+                "execution_id=%s — the reconciler's CANCELLED-check still bounds "
+                "any surviving wait", execution_id, exc_info=True,
+            )
+
     def _handle_result(self, payload: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Post-execution: log result, decide retry vs dead-letter, trigger LLM analysis."""
         activity_id = payload["activity_id"]
@@ -1228,6 +1364,12 @@ class Supervisor:
             except Exception:
                 logger.warning("[Supervisor] mark_activity_failed(cancelled) failed for %s",
                                activity_id, exc_info=True)
+            # R-A12a / IMPL-11: expire this run's durable pending_waits so a retry
+            # timer can never resubmit a run the operator just cancelled. Best-effort
+            # (own try/except inside) — a persistence hiccup must not break the cancel
+            # finalizer, and the reconciler's per-tick CANCELLED-check still bounds any
+            # surviving wait (defense in depth).
+            self._expire_pending_waits_on_cancel(result.get("execution_id"))
             self._publish(
                 f"🚫 Cancelled by operator: {self._aname(activity_id)}",
                 level="WARNING",
@@ -1309,18 +1451,38 @@ class Supervisor:
                 context={"activity_id": activity_id, "retry_count": retry_count + 1},
                 origin=payload.get("origin"),   # v0.8.16
             )
-            threading.Timer(
-                wait_s,
-                self.submit,
-                kwargs={
-                    "activity_id": activity_id,
-                    "shadow_id":   shadow_id,
-                    "priority":    payload.get("priority", 5),
-                    "reason":      f"retry-{retry_count + 1}",
-                    "retry_count": retry_count + 1,
-                    "origin":      payload.get("origin"),   # v0.8.16: preserve origin across retries
-                },
-            ).start()
+            # R-A12a: arm a DURABLE retry wait on the run's ExecutionSnapshot
+            # instead of an in-process ``threading.Timer``. A Timer is lost if the
+            # daemon restarts during the 5–10 s back-off window → the activity is
+            # silently never retried. The pending_wait record survives the restart;
+            # a separate reconciler fires it when due and replays the essential
+            # submit(...) kwargs it carries — activity_id, shadow_id, and
+            # retry_count=attempt+1. Unlike the old Timer path (a FRESH submit with no
+            # resume hint), the reconciler resubmits with
+            # resume_from_execution_id=<the failed run's execution_id> — a RESUME from
+            # the persisted snapshot/checkpoint, NOT a from-scratch re-run. This is
+            # deliberately SAFER: the resumed run replays fewer effectful blocks (it
+            # picks up after the last durable checkpoint rather than re-doing completed
+            # work) and fail-closed-parks any external objective, so a transient
+            # failure mid-run doesn't re-fire side effects on retry. priority/origin
+            # are NOT carried by the record (the reconciler re-derives them, priority→5
+            # / origin from reason).
+            # The activity is NOT dead-lettered / marked terminally failed here — it
+            # stays non-terminal (ASSIGNED) so the reconciler can resubmit it. (That
+            # non-terminal ASSIGNED state is exactly what the reconciler's terminal-drop
+            # check keys off: a COMPLETED/FAILED/CANCELLED activity is dropped, an
+            # ASSIGNED retry-pending one still fires — see jobs._run_is_terminal.)
+            self._arm_durable_retry(
+                execution_id=result.get("execution_id"),
+                activity_id=activity_id,
+                shadow_id=shadow_id,
+                root_execution_id=result.get("root_execution_id"),
+                scroll_id=payload.get("scroll_id") or result.get("scroll_id") or "",
+                delay_s=wait_s,
+                attempt=retry_count,
+                max_attempts=MAX_RETRIES,
+                now=time.time(),
+            )
         else:
             # Dead letter
             dl_entry = {

@@ -26,8 +26,9 @@ from typing import Any, Callable, Dict, Optional
 # v2 = G1 adds objective_graph + next_objective_id;
 # v3 = R-A9 adds situation_report + situation_stamps;
 # v4 = R-A10 adds requirement_report;
-# v5 = S4 adds external_evidence (fail-closed external-effect credit store).
-CURRENT_SCHEMA_VERSION = 5
+# v5 = S4 adds external_evidence (fail-closed external-effect credit store);
+# v6 = R-A12a adds pending_waits (durable external-event retry timers).
+CURRENT_SCHEMA_VERSION = 6
 
 
 class SnapshotRefused(Exception):
@@ -75,12 +76,20 @@ def _migrate_4_to_5(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _migrate_5_to_6(data: Dict[str, Any]) -> Dict[str, Any]:
+    """v5 -> v6 (R-A12a): add the pending-waits carrier key, defaulted empty [].
+    A legacy snapshot has no durable retry timers ⇒ nothing to re-arm."""
+    data.setdefault("pending_waits", [])
+    return data
+
+
 # Registry: {from_version: fn}. Keys must be contiguous from 1..CURRENT-1.
 _MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
     3: _migrate_3_to_4,
     4: _migrate_4_to_5,
+    5: _migrate_5_to_6,
 }
 
 

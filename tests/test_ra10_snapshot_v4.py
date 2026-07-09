@@ -87,9 +87,9 @@ def test_poisoned_requirement_report_degrades_to_none(tmp_path):
     assert loaded.requirement_report is None
 
 
-def test_migrator_current_is_5():
-    # S4 bumped CURRENT_SCHEMA_VERSION 4 -> 5 (adds external_evidence).
-    assert CURRENT_SCHEMA_VERSION == 5
+def test_migrator_current_is_6():
+    # R-A12a bumped CURRENT_SCHEMA_VERSION 5 -> 6 (adds pending_waits).
+    assert CURRENT_SCHEMA_VERSION == 6
 
 
 def test_migrate_v3_to_v4_defaults_key():
@@ -101,10 +101,11 @@ def test_migrate_v3_to_v4_defaults_key():
 
 
 def test_migrate_v1_to_v5_full_chain():
-    """A v1 dict migrates through 1->2->3->4->5 (full chain), gaining all new keys."""
+    """A v1 dict migrates through 1->2->3->4->5->... (full chain), gaining all new
+    keys and landing at the current schema version (v6+ after R-A12a)."""
     data = {"schema_version": 1}
     out = migrate_snapshot_dict(dict(data))
-    assert out["schema_version"] == 5
+    assert out["schema_version"] == CURRENT_SCHEMA_VERSION
     # G1 keys added at 1->2
     assert out["objective_graph"] == []
     assert out["next_objective_id"] == 1

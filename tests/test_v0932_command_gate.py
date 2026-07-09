@@ -475,23 +475,32 @@ def test_command_gate_blocked_is_terminal_no_retry_no_postmortem(monkeypatch):
                for level, msg in counters["published"])
 
 
-def test_failure_status_still_retries(monkeypatch):
+def test_failure_status_still_retries(monkeypatch, tmp_path):
     """Guard: a genuine transient failure (status='failure') is unaffected by
-    FIX-1 — it still schedules a retry (proves the new branch is scoped)."""
-    sup = _bare_supervisor()
-    counters = {"retry_submit": 0}
+    FIX-1 — it still schedules a retry (proves the new branch is scoped).
 
-    # threading.Timer(...).start() calls self.submit — intercept the Timer so
-    # the retry counter increments synchronously without a real timer thread.
+    R-A12a (timer→durable-wait migration): "schedules a retry" now means arming a
+    DURABLE ``pending_wait`` on the run's ExecutionSnapshot (which survives a
+    daemon restart), NOT constructing an in-process ``threading.Timer`` that fires
+    ``submit()`` synchronously. This asserts the durable wait is armed and that NO
+    Timer was constructed and NO synchronous resubmit happened — the correct
+    stronger contract, not a weakening of the original "a transient failure retries"
+    guard."""
+    from systemu.runtime.execution_snapshot import read_snapshot
+    sup = _bare_supervisor()
+    sup._snapshot_data_dir = tmp_path   # R-A12a: isolate the durable wait at tmp
+    counters = {"retry_submit": 0}
     import systemu.runtime.supervisor as sup_mod
 
-    class _FakeTimer:
-        def __init__(self, wait, fn, kwargs=None):
-            self.fn, self.kwargs = fn, kwargs or {}
-        def start(self):
-            self.fn(**self.kwargs)
+    timers = []
 
-    monkeypatch.setattr(sup_mod.threading, "Timer", _FakeTimer)
+    class _RecordingTimer:
+        def __init__(self, *a, **kw):
+            timers.append((a, kw))
+        def start(self):
+            pass
+
+    monkeypatch.setattr(sup_mod.threading, "Timer", _RecordingTimer)
     monkeypatch.setattr(sup, "submit",
                         lambda **kw: counters.__setitem__(
                             "retry_submit", counters["retry_submit"] + 1))
@@ -500,9 +509,16 @@ def test_failure_status_still_retries(monkeypatch):
                         lambda *a, **k: None)
 
     payload = {"activity_id": "act_2", "shadow_id": "shд_2", "retry_count": 0}
-    result = {"status": "failure", "error": "boom"}
+    result = {"status": "failure", "error": "boom", "execution_id": "exec_r2"}
     sup._handle_result(payload, result)
-    assert counters["retry_submit"] == 1
+
+    # No in-process Timer, no synchronous resubmit — the retry is durable.
+    assert timers == []
+    assert counters["retry_submit"] == 0
+    # A durable retry wait was armed on the snapshot for the reconciler to fire.
+    snap = read_snapshot("exec_r2", data_dir=tmp_path)
+    assert snap is not None and len(snap.pending_waits) == 1
+    assert snap.pending_waits[0]["activity_id"] == "act_2"
 
 
 # ── REVIEW FIX-2: "Approve once" is single-use ────────────────────────────────

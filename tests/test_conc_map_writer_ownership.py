@@ -62,10 +62,14 @@ WRITER_OWNERSHIP = {
             "runtime/shadow_runtime.py",      # the shadow execution loop (per-run thread)
             "runtime/resume_on_decision.py",  # __STUCK_ANSWER__ sticky (parked-run resume)
             "runtime/supervisor.py",          # __HARNESS_GRANT__ sticky (parked-run resume)
+            # R-A12a external_wait_reconciler (DEC-10 reviewed): writes pending_waits
+            # ONLY on PARKED runs, per-execution_id invariant
+            "scheduler/jobs.py",
         },
         "def": "runtime/execution_snapshot.py",
-        "note": ("DEC-10 R-A12 GUARD — external_wait_reconciler will become a 4th "
-                 "writer here; add it (and CONC-MAP.md) only WITH the concurrency review."),
+        "note": ("DEC-10 R-A12 GUARD — external_wait_reconciler (scheduler/jobs.py) is "
+                 "the reviewed 4th writer: writes pending_waits ONLY on PARKED runs "
+                 "(per-execution_id invariant). Any FURTHER writer needs the same review."),
     },
     "OnTheTable (<root>/table/items.json)": {
         "call": "save_items(",
