@@ -414,6 +414,31 @@ def _read_external_ok(context, objective_id) -> bool:
         return False
 
 
+def _augment_summary_with_committed_effects(summary: str, context) -> str:
+    """IMPL-7 / §5.6 — append the DETERMINISTIC committed-effects ledger to a
+    HANDOFF / terminal-BLOCKED / stuck / partial ``final_summary``.
+
+    Renders ONLY from persisted ``ExternalEvidence`` (via ``render_committed_effects``,
+    which credits solely ``confirmed is True`` entries — set by the deterministic
+    S3/R-A7 matcher, NEVER an LLM) — never from model prose. So a handoff that is
+    precise about what it needs is ALSO honest about what it already did.
+
+    A no-op (returns ``summary`` unchanged) when there are zero confirmed effects,
+    when the context has no ``_external_evidence`` store, or on ANY error — it NEVER
+    raises, so it can never break a terminal/handoff finalize. getattr-guarded so a
+    context without the store is safe."""
+    try:
+        from systemu.runtime.committed_effects import render_committed_effects
+        _ledger = render_committed_effects(
+            getattr(context, "_external_evidence", {}) or {})
+        if _ledger:
+            return f"{summary}\n\n{_ledger}"
+    except Exception:
+        logger.debug("[Runtime IMPL-7] committed-effects augment failed (swallowed)",
+                     exc_info=True)
+    return summary
+
+
 def _persist_external_evidence(context, evidence) -> None:
     """S4 — write ``evidence`` (an ExternalEvidence) into
     ``context._external_evidence[str(objective_id)]`` as a plain dict so it
@@ -2881,6 +2906,9 @@ class ShadowRuntime:
         else:
             _summary = f"Stuck on objective {stuck_on}: {reason}"
             _err = "StuckLoopDetected"
+        # IMPL-7 / §5.6: a stuck/partial/cancelled terminal is a HANDOFF — be honest
+        # about the external effects already committed this run (deterministic).
+        _summary = _augment_summary_with_committed_effects(_summary, context)
         res = context.build_result(
             status=status,
             final_summary=_summary,
@@ -3548,11 +3576,11 @@ class ShadowRuntime:
             revoke_harness_leases(record_run=False, reconcile=False)
             _susp = context.build_result(
                 status="suspended_harness_escalation",
-                final_summary=(
+                final_summary=_augment_summary_with_committed_effects(
                     f"Parked awaiting operator input: {tool_name} failed with a "
                     f"{'credential' if sub == 'auth' else 'bad-request'} error; a "
-                    f"{_fold.requirement.kind} requirement was folded into the plan."
-                ),
+                    f"{_fold.requirement.kind} requirement was folded into the plan.",
+                    context),
             )
             _susp["activity_id"] = getattr(activity, "id", "")
             _susp["shadow_id"]   = getattr(shadow, "id", "")
@@ -4365,12 +4393,13 @@ class ShadowRuntime:
                                         exc_info=True)
                                 _susp = context.build_result(
                                     status="suspended_external_resubmit",
-                                    final_summary=(
+                                    final_summary=_augment_summary_with_committed_effects(
                                         "Parked awaiting operator decision: a resumed "
                                         "external-effect objective has no confirmed "
                                         "evidence; re-submitting could double-submit. "
                                         "The operator must confirm the prior outcome "
-                                        "before any re-submit."),
+                                        "before any re-submit.",
+                                        context),
                                 )
                                 _susp["activity_id"] = getattr(activity, "id", "")
                                 _susp["shadow_id"] = getattr(shadow, "id", "")
@@ -4899,10 +4928,10 @@ class ShadowRuntime:
                         _revoke_harness_leases(record_run=False, reconcile=False)   # v0.9.37 Bug 11: defer reconcile to terminal
                         _susp = context.build_result(
                             status="suspended_harness_escalation",
-                            final_summary=(
+                            final_summary=_augment_summary_with_committed_effects(
                                 "Parked awaiting operator confirmation of recorded "
-                                "task parameters."
-                            ),
+                                "task parameters.",
+                                context),
                         )
                         _susp["activity_id"] = activity.id
                         _susp["shadow_id"]   = shadow.id
@@ -6067,10 +6096,10 @@ class ShadowRuntime:
                             # Supervisor's _handle_result / reconciler read.
                             _susp = context.build_result(
                                 status="suspended_harness_escalation",
-                                final_summary=(
+                                final_summary=_augment_summary_with_committed_effects(
                                     "Parked awaiting operator harness decision: "
-                                    f"{_req.kind.value} — {_verdict.rationale}"
-                                ),
+                                    f"{_req.kind.value} — {_verdict.rationale}",
+                                    context),
                             )
                             _susp["activity_id"] = activity.id
                             _susp["shadow_id"]   = shadow.id
@@ -6239,11 +6268,11 @@ class ShadowRuntime:
                         _revoke_harness_leases(record_run=False, reconcile=False)   # v0.9.37 Bug 11: defer reconcile to terminal
                         _susp = context.build_result(
                             status="suspended_harness_escalation",
-                            final_summary=(
+                            final_summary=_augment_summary_with_committed_effects(
                                 "Parked awaiting operator input: missing required "
                                 f"parameter(s) for tool "
-                                f"{decision.get('tool_name', '') or '?'}."
-                            ),
+                                f"{decision.get('tool_name', '') or '?'}.",
+                                context),
                         )
                         _susp["activity_id"] = activity.id
                         _susp["shadow_id"]   = shadow.id
@@ -6497,14 +6526,15 @@ class ShadowRuntime:
                                             detail=_i6_out.detail)
                                         _susp = context.build_result(
                                             status="suspended_external_ambiguous",
-                                            final_summary=(
+                                            final_summary=_augment_summary_with_committed_effects(
                                                 "Parked awaiting operator decision: an "
                                                 "effectful external call failed AMBIGUOUSLY "
                                                 "(the effect may or may not have landed) and "
                                                 "the outcome could not be read back "
                                                 "deterministically. Re-submitting could "
                                                 "double-submit; the operator must confirm the "
-                                                "prior outcome before any retry."),
+                                                "prior outcome before any retry.",
+                                                context),
                                         )
                                         _susp["activity_id"] = getattr(activity, "id", "")
                                         _susp["shadow_id"] = getattr(shadow, "id", "")
@@ -7164,9 +7194,12 @@ class ShadowRuntime:
                 _parts.append("Not completed: " + "; ".join(_pending) + ".")
             if _failed_tools:
                 _parts.append("Tools that structurally failed: " + ", ".join(_failed_tools) + ".")
+            # IMPL-7 / §5.6: a max-iterations partial is a HANDOFF — enumerate the
+            # external effects already committed this run (deterministic, honest).
+            _mi_summary = _augment_summary_with_committed_effects(" ".join(_parts), context)
             res = context.build_result(
                 status="partial",
-                final_summary=" ".join(_parts),
+                final_summary=_mi_summary,
                 error="MaxIterationsExceeded",
             )
             res["structural_failure"] = bool(_failed_tools)
