@@ -101,42 +101,26 @@ class _BindCtx:
     tool_name: str = ""
     reqs: List[Any] = field(default_factory=list)
     t_high: float = T_HIGH
+    reference_text: str = ""          # R-A11a §5.4: the objective goal text the resolver reads
 
 
 # ── source #1: a granted-root salient FileHandle ─────────────────────────────
 def _bind_filehandle(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, str, str, float]]:
-    """Return ``(bound_ref, source, value_origin, confidence)`` for a path leaf that
-    resolves to a granted-root salient handle, re-gated through
-    ``is_within_granted``; else None. Only INPUT-ish path leaves bind here."""
-    roots = _situation_list(bc.situation, "roots")
-    if not roots:
+    """R-A11a §5.4: resolve a path leaf to a granted-root file by SCORING the objective's
+    reference text against the situation's salient handles (was: blind first-salient @0.9).
+    Preserves the 4-tuple contract and the IMPL-5 clamp — a resolved FILE is inherently
+    content_derived, so it NEVER silent-binds (the _needs_ask gate forces the confirm)."""
+    from systemu.runtime.reference_resolver import resolve_reference
+    try:
+        verdict = resolve_reference(bc.reference_text, situation=bc.situation,
+                                    granted=bc.granted, key=key)
+    except Exception:
+        logger.debug("[binder] reference_resolver raised; leaf falls through", exc_info=True)
         return None
-    for root in roots:
-        salient = _get(root, "salient") or []
-        if not isinstance(salient, list):
-            continue
-        for fh in salient:
-            path = _get(fh, "path")
-            if not path or not isinstance(path, str):
-                continue
-            # Re-gate: even a surveyed handle must still be within a granted root
-            # (defense-in-depth — a revoked/moved root drops the candidate).
-            if bc.granted is not None:
-                try:
-                    if not bc.granted.is_within_granted(path):
-                        continue
-                except Exception:
-                    continue
-            # IMPL-5 taint-derivation: a FILE handle is INHERENTLY content_derived (a
-            # file's bytes are untrusted). We DERIVE the taint from the source KIND, we
-            # do NOT trust the object's claimed ``origin_class`` — a poisoned/rehydrated
-            # survey handle forging ``origin_class="operator"`` must never launder a file
-            # value into the trusted axis. So CLAMP to content_derived regardless.
-            origin = _CONTENT_DERIVED
-            # a content-file bind is HIGH confidence as a MATCH, but content_derived
-            # forces the ask regardless (the gate handles that).
-            return (f"file:{path}", "situation", origin, 0.9)
-    return None
+    if verdict.state != "resolvable" or not verdict.referent:
+        return None                                   # → falls through → input/missing ask-for-path
+    # CLAMP to content_derived regardless of score (IMPL-5 fail-untrusted).
+    return (f"file:{verdict.referent}", "situation", _CONTENT_DERIVED, float(verdict.confidence))
 
 
 # ── source #2: run-context / a prior objective's output ──────────────────────
@@ -573,7 +557,10 @@ def compute_requirements(objective, capability, situation, ctx) -> List[Any]:
 
         tool_name = str(_get(capability, "name") or "")
         sit = situation if isinstance(situation, dict) else {}
-        bc = _BindCtx(situation=sit, ctx=ctx, granted=granted, tool_name=tool_name)
+        _goal = str(_get(objective, "goal") or "") if objective is not None else ""
+        _crit = str(_get(objective, "success_criteria") or "") if objective is not None else ""
+        bc = _BindCtx(situation=sit, ctx=ctx, granted=granted, tool_name=tool_name,
+                      reference_text=(_goal + " " + _crit).strip())
         _diff_schema(bc, root)
         return bc.reqs
     except Exception:

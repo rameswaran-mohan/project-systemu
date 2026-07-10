@@ -21,6 +21,7 @@ The ACs below pin each behavior the binder must satisfy:
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -90,7 +91,12 @@ def test_ac2_granted_root_path_leaf_binds_but_content_derived_not_silent(tmp_pat
     """A required ``files`` (path) leaf resolving to a granted-root salient handle
     binds (state="have") with source="situation" and value_origin="content_derived"
     — but because it is content_derived it is FORCED into the ask_bundle (one-click
-    confirm), never silent-bound."""
+    confirm), never silent-bound.
+
+    R-A11a: the binder no longer blind-binds the first salient — the objective goal
+    now REFERENCES the file ("open the report document") so the scorer selects it, and
+    a recent mtime makes the (overlap+ext+recency) score clear T_high → state="have"
+    (the scored replacement for the old first-salient @0.9)."""
     root = tmp_path / "granted"
     root.mkdir()
     salient_file = root / "report.docx"
@@ -106,7 +112,7 @@ def test_ac2_granted_root_path_leaf_binds_but_content_derived_not_silent(tmp_pat
                 "name": "report.docx",
                 "ext": ".docx",
                 "size": 1,
-                "mtime": 0.0,
+                "mtime": time.time(),
                 "origin_class": "content_derived",
                 "source_kind": "file",
             }],
@@ -115,8 +121,9 @@ def test_ac2_granted_root_path_leaf_binds_but_content_derived_not_silent(tmp_pat
     ctx = _FakeCtx(situation=situation,
                    granted_roots=_FakeGrantedRoots([str(root)]))
     cap = _tool("open_doc", {"files": {"type": "string", "description": "path to input file"}})
+    obj = _obj(goal="open the report document")
 
-    reqs = compute_requirements(_obj(), cap, situation, ctx)
+    reqs = compute_requirements(obj, cap, situation, ctx)
     files = [r for r in reqs if r.schema_path.endswith("files")]
     assert files, "the required path leaf should produce a Requirement"
     r = files[0]
@@ -126,7 +133,7 @@ def test_ac2_granted_root_path_leaf_binds_but_content_derived_not_silent(tmp_pat
     assert r.value_origin == "content_derived"      # IMPL-5: copied from the FileHandle
     assert r.bound_value_ref                          # a reference to the bound path
 
-    report = build_requirement_report([_obj()], cap, situation, ctx)
+    report = build_requirement_report([obj], cap, situation, ctx)
     assert any(a.schema_path.endswith("files") for a in report.ask_bundle), \
         "content_derived bind must be forced into the ask_bundle (never silent)"
 
@@ -197,8 +204,11 @@ def test_ac6_content_derived_only_candidate_never_silent(tmp_path):
     }])
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([str(root)]))
     cap = _tool("ingest", {"source_path": {"type": "string", "description": "input csv path"}})
+    # R-A11a: the goal REFERENCES the salient file so the scorer selects it (was a
+    # blind first-salient bind); the content_derived clamp + never-silent invariant hold.
+    obj = _obj(goal="ingest the data")
 
-    report = build_requirement_report([_obj()], cap, situation, ctx)
+    report = build_requirement_report([obj], cap, situation, ctx)
     src = [r for r in report.per_objective[1] if r.schema_path.endswith("source_path")]
     assert src and src[0].value_origin == "content_derived"
     assert any(a.schema_path.endswith("source_path") for a in report.ask_bundle), \
@@ -413,15 +423,18 @@ def test_whole_objective_swallow_bogus_origin_class_clamped(tmp_path):
     }])
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([str(root)]))
     cap = _tool("ingest", {"source_path": {"type": "string", "description": "input csv path"}})
+    # R-A11a: the goal REFERENCES the salient file so the scorer selects it (was a
+    # blind first-salient bind); the file bind is CLAMPED content_derived regardless.
+    obj = _obj(goal="ingest the data")
 
-    reqs = compute_requirements(_obj(), cap, situation, ctx)
+    reqs = compute_requirements(obj, cap, situation, ctx)
     assert isinstance(reqs, list) and reqs, "a bogus origin must not empty the whole objective"
     src = [r for r in reqs if r.schema_path.endswith("source_path")]
     assert src, "the matched leaf must still produce a Requirement"
     r = src[0]
     assert r.value_origin == "content_derived"          # clamped (fail-untrusted)
 
-    report = build_requirement_report([_obj()], cap, situation, ctx)
+    report = build_requirement_report([obj], cap, situation, ctx)
     assert any(a.schema_path.endswith("source_path") for a in report.ask_bundle), \
         "the clamped content_derived bind must route to the ask_bundle (never silent)"
 
@@ -511,15 +524,18 @@ def test_forged_filehandle_operator_origin_is_clamped_to_content_derived(tmp_pat
     ctx = _FakeCtx(situation=situation,
                    granted_roots=_FakeGrantedRoots([str(root)]))
     cap = _tool("open_doc", {"files": {"type": "string", "description": "path to input file"}})
+    # R-A11a: the goal REFERENCES the salient file so the scorer selects it (was a
+    # blind first-salient bind); the forged operator origin is CLAMPED content_derived.
+    obj = _obj(goal="open the report document")
 
-    reqs = compute_requirements(_obj(), cap, situation, ctx)
+    reqs = compute_requirements(obj, cap, situation, ctx)
     files = [r for r in reqs if r.schema_path.endswith("files")]
     assert files, "the required path leaf should produce a Requirement"
     r = files[0]
     assert r.value_origin == "content_derived", \
         "a file handle's forged operator origin must be clamped to content_derived"
 
-    report = build_requirement_report([_obj()], cap, situation, ctx)
+    report = build_requirement_report([obj], cap, situation, ctx)
     assert any(a.schema_path.endswith("files") for a in report.ask_bundle), \
         "the clamped (content_derived) file bind must route to the ask_bundle (never silent)"
 
