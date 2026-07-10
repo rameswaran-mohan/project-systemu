@@ -160,6 +160,19 @@ def rank_tools(query: str, tools: list[dict], k: int = 8) -> list[dict]:
     return [tool for _, _, tool in scored[:k]]
 
 
+def rank_tools_scored(query: str, tools: list[dict], k: int = 8) -> list[tuple[float, dict]]:
+    """Like :func:`rank_tools` but return ``(score, tool)`` pairs, highest score
+    first (ties broken by original index). Exposes the score so callers can apply
+    a confidence floor (R-A11b-2 discovery-before-forge auto-reuse). Deterministic;
+    reuses the same ``_score``/``_tokenize`` as ``rank_tools``."""
+    if not tools:
+        return []
+    query_tokens = _tokenize(query)
+    scored = [(_score(query_tokens, tool), i, tool) for i, tool in enumerate(tools)]
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [(float(s), tool) for s, _, tool in scored[:k]]
+
+
 def ensure_core(ranked: list[dict], tools: Iterable[dict]) -> list[dict]:
     """Union *ranked* with always-available core tools present in *tools*.
 

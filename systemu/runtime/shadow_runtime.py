@@ -3010,8 +3010,14 @@ class ShadowRuntime:
             if mat.get("tool") is not None:
                 # ── TOOL: resolve → deploy inline → offer back ──
                 _tref = mat.get("tool")
+                _tid = mat.get("tool_id")
                 _nt = None
                 for _resolve in (
+                    # R-A11b-2: prefer the exact id (the reuse branch re-verified
+                    # THIS id; resolving by name could bind a same-named PROPOSED
+                    # twin — status-blind find_tool_by_name). Forge outcomes carry
+                    # tool_id too, so this tightens both paths.
+                    lambda: self.vault.get_tool(_tid) if _tid else None,
                     lambda: self.vault.get_tool(_tref),
                     lambda: self.vault.find_tool_by_name(_tref),
                 ):
@@ -5933,6 +5939,47 @@ class ShadowRuntime:
                         # count so the arbiter can enforce max_requests_per_activity
                         # across this activity's resumes+retries.
                         _arb_ctx["requests_this_activity"] = int(_act_pre or 0)
+                        # ── Seam A (R-A11b-2): discovery-before-forge auto-reuse ──
+                        # For a kind=tool forge request only, run ONE deterministic
+                        # pass over the DEPLOYED+enabled vault catalog. A confident
+                        # match → inject its name into enabled_tools (activating the
+                        # arbiter's LOW-GRANT reuse branch) + stash reuse_tool_id so
+                        # Seam B reuses it instead of forging. Always stash the pass
+                        # summary so the operator card / ledger cite it (AC2). Keep
+                        # the SAME arbitrate() call so BOTH v0.9.47 caps still count.
+                        # Fail-safe: any error leaves _arb_ctx unchanged → forge.
+                        _disc = None
+                        if _req.kind == HarnessKind.TOOL and self.vault is not None:
+                            try:
+                                from systemu.runtime.discovery_pass import (
+                                    deployed_enabled_catalog, discovery_pass,
+                                )
+                                _cat = deployed_enabled_catalog(self.vault)
+                                _disc = discovery_pass(
+                                    (_req.spec or {}).get("name", ""),
+                                    _req.rationale or "",
+                                    _cat,
+                                )
+                                _req.spec["discovery"] = {
+                                    "searched": _disc.searched,
+                                    "best_score": _disc.best_score,
+                                    "floor": _disc.floor,
+                                }
+                                if _disc.reuse_tool_id:
+                                    # Inject the REQUESTED name (what the arbiter's
+                                    # is_reuse checks: spec.name in enabled_tools), NOT
+                                    # the matched tool name — so the LOW-GRANT reuse
+                                    # branch fires EXACTLY when discovery decided to
+                                    # reuse (an exact-name match), regardless of case.
+                                    # Seam B resolves the actual tool by reuse_tool_id.
+                                    _arb_ctx["enabled_tools"] = [
+                                        (_req.spec or {}).get("name", "")]
+                                    _req.spec["reuse_tool_id"] = _disc.reuse_tool_id
+                                    _req.spec["reuse_score"] = _disc.best_score
+                            except Exception:
+                                logger.debug("[Runtime] discovery pass failed — "
+                                             "falling through to forge", exc_info=True)
+                                _disc = None
                         _verdict = _gov.arbitrate(_req, context=_arb_ctx)
                         # v0.9.41: a cap-exceeded DENY otherwise writes NO ledger row
                         # (only the GRANT path logs, via materialise), so the
@@ -5952,6 +5999,28 @@ class ShadowRuntime:
                             except Exception:
                                 logger.debug("[Runtime] cap-deny ledger write failed",
                                              exc_info=True)
+                        # R-A11b-2 MISS audit: a kind=tool forge that ran a
+                        # discovery pass but did NOT reuse (no confident match)
+                        # records the pass so the operator sees the forge was
+                        # requested only AFTER discovery found nothing (AC2). Uses
+                        # the same sanctioned manual-append path as the cap-deny row.
+                        if (_disc is not None and not _disc.reuse_tool_id
+                                and _verdict.decision != HarnessDecision.GRANT):
+                            try:
+                                _gov._ledger_append(
+                                    _gov._ledger_entry(
+                                        _req, _verdict,
+                                        {"discovery_miss": {
+                                            "searched": _disc.searched,
+                                            "best_score": _disc.best_score,
+                                            "floor": _disc.floor,
+                                        }},
+                                        execution_id),
+                                    vault=self.vault, execution_id=execution_id,
+                                )
+                            except Exception:
+                                logger.debug("[Runtime] discovery-miss ledger write "
+                                             "failed", exc_info=True)
                         if _verdict.decision == HarnessDecision.GRANT:
                             _mat = _gov.materialise(
                                 _req, _verdict, vault=self.vault,

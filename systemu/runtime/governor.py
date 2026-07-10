@@ -572,6 +572,35 @@ class Governor:
         spec = request.spec or {}
         tool_name = spec.get("name", "")
 
+        # ── Seam B (R-A11b-2): discovery-before-forge auto-reuse ──────────────
+        # Seam A resolved a confident vault match and stashed its id. Reuse the
+        # EXISTING tool instead of forging a duplicate — but re-verify at lease
+        # time (Rider 2, TOCTOU): by provision time the match may be disabled /
+        # tombstoned / re-forged (signature invalidated). On ANY staleness fall
+        # through to the honest forge below. Reuse writes NO PROPOSED Tool and
+        # calls NO forge (v0.9.47 Fix #1: a stray PROPOSED re-triggers the
+        # gate-1 forge-review deep-link).
+        reuse_id = str(spec.get("reuse_tool_id", "") or "").strip()
+        if reuse_id:
+            reused = self._reuse_existing_tool(
+                reuse_id, request, verdict, vault=vault, execution_id=execution_id)
+            if reused is not None:
+                return reused
+            # Seam A decided to reuse (this verdict is a LOW reuse-grant), but the
+            # target went stale between arbitration and now (disabled / tombstoned /
+            # re-forged). Do NOT silently forge here: forging under the LOW reuse-grant
+            # would deploy NEW, UNREVIEWED code, skipping the HIGH forge-review
+            # escalation a real forge request gets. Signal not-materialised → the agent
+            # re-requests → a fresh arbitration gives a genuine forge its own HIGH
+            # escalate. (Near-nil synchronous window; a correctness/defense-in-depth
+            # guard — adversarial-review finding #6.)
+            logger.info(
+                "[Governor] reuse target %s went stale before lease — NOT forging "
+                "under the reuse grant; agent must re-request (execution_id=%s)",
+                reuse_id, execution_id)
+            return {"materialised": False, "reason": "reuse_target_stale",
+                    "tool_id": reuse_id}
+
         try:
             # Build a minimal Tool record with PROPOSED status so forge_proposed_tools
             # can pick it up and generate code.
@@ -654,6 +683,54 @@ class Governor:
             "lease_id": lease_id,
             "tool": forged_tool.name,
             "tool_id": forged_tool.id,
+        }
+
+    def _reuse_existing_tool(
+        self,
+        reuse_tool_id: str,
+        request: HarnessRequest,
+        verdict: HarnessVerdict,
+        *,
+        vault,
+        execution_id: str,
+    ) -> Optional[dict]:
+        """Seam B reuse with a TOCTOU re-verify. Returns the reuse materialise
+        outcome on a STILL-valid DEPLOYED+enabled+not-``forge_rejected`` match,
+        else ``None`` so the caller forges. Re-verifies the SPECIFIC id (a
+        re-forge mints a new id → the old id 404s → fall through, never bind a
+        different tool). Never raises."""
+        from systemu.core.models import ToolStatus
+
+        try:
+            tool = vault.get_tool(reuse_tool_id)
+        except Exception:
+            tool = None
+        # TOCTOU re-verify (Rider 2): identical to Seam A's filter + forge_rejected.
+        if tool is None:
+            return None
+        if getattr(tool, "status", None) != ToolStatus.DEPLOYED:
+            return None
+        if not getattr(tool, "enabled", False):
+            return None
+        if bool(getattr(tool, "forge_rejected", False)):
+            return None
+
+        lease_id: str = verdict.lease_id or _mint_lease_id()
+        self._register_lease(lease_id, request, execution_id)
+        logger.info(
+            "[Governor] REUSED existing tool '%s' (id=%s) — forge avoided, "
+            "lease_id=%s execution_id=%s",
+            tool.name, tool.id, lease_id, execution_id,
+        )
+        spec = request.spec or {}
+        return {
+            "materialised": True,
+            "reused": True,
+            "forge_avoided": True,
+            "lease_id": lease_id,
+            "tool": tool.name,        # NAME — _apply_materialised_grant resolves+offers it back
+            "tool_id": tool.id,
+            "reuse_score": spec.get("reuse_score"),
         }
 
     def _provision_skill(
