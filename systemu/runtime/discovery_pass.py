@@ -70,10 +70,11 @@ def discovery_pass(
     catalog: list[dict[str, Any]],
     floor: float = REUSE_FLOOR,
 ) -> DiscoveryResult:
-    """ONE deterministic ranking pass. ``reuse_tool_id`` is set ONLY when the top
-    candidate clears the floor OR is an exact normalized-name match (Tool.name is
-    already lowercase snake_case per the model validator, so equality is a strong
-    identity signal — the design's "exact/near-exact name" clause). Never raises.
+    """ONE deterministic pass. ``reuse_tool_id`` is set ONLY on an EXACT normalized-
+    name match (Tool.name is already lowercase snake_case per the model validator, so
+    equality is a strong identity signal). A fuzzy / score-based match is NOT a reuse
+    trigger — ``best_score`` is computed purely as the audit / near-match signal and
+    the ``floor`` is only its yardstick (see the block below). Never raises.
     """
     searched = len(catalog or [])
     if not catalog:

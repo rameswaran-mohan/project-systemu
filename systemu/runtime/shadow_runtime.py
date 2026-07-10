@@ -3012,21 +3012,34 @@ class ShadowRuntime:
                 _tref = mat.get("tool")
                 _tid = mat.get("tool_id")
                 _nt = None
-                for _resolve in (
-                    # R-A11b-2: prefer the exact id (the reuse branch re-verified
-                    # THIS id; resolving by name could bind a same-named PROPOSED
-                    # twin — status-blind find_tool_by_name). Forge outcomes carry
-                    # tool_id too, so this tightens both paths.
-                    lambda: self.vault.get_tool(_tid) if _tid else None,
-                    lambda: self.vault.get_tool(_tref),
-                    lambda: self.vault.find_tool_by_name(_tref),
-                ):
+                if mat.get("reused"):
+                    # ── REUSE: resolve STRICTLY by the re-verified id ──
+                    # Seam B re-verified THIS specific id (DEPLOYED+enabled+not-
+                    # rejected). Do NOT fall back to status-blind name resolution: if
+                    # the id vanished cross-process in the sub-ms window between Seam B
+                    # and here, find_tool_by_name(name) could pick a same-named PROPOSED
+                    # twin and deploy_forged_tool it → UNREVIEWED code deployed under the
+                    # LOW reuse grant (a forge-review bypass — the same class Seam B
+                    # guards). A 404 here = genuinely stale ⇒ _nt stays None (the
+                    # harness_granted_pending branch handles it; NO twin deploy).
                     try:
-                        _nt = _resolve()
-                        if _nt is not None:
-                            break
+                        _nt = self.vault.get_tool(_tid) if _tid else None
                     except Exception:
                         _nt = None
+                else:
+                    for _resolve in (
+                        # Forge: prefer the exact id (the freshly-forged tool), then
+                        # name fallbacks for legacy/robustness.
+                        lambda: self.vault.get_tool(_tid) if _tid else None,
+                        lambda: self.vault.get_tool(_tref),
+                        lambda: self.vault.find_tool_by_name(_tref),
+                    ):
+                        try:
+                            _nt = _resolve()
+                            if _nt is not None:
+                                break
+                        except Exception:
+                            _nt = None
                 # v0.9.7 Phase 2: deploy the freshly-forged tool
                 # synchronously (dry-run → DEPLOYED + enabled) so it
                 # is callable in THIS run, not just a future one.

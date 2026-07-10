@@ -51,3 +51,18 @@ def test_cap_deny_is_hard_not_escalate_suspend():
     req = HarnessRequest(kind=HarnessKind.TOOL, spec={"name": "fetch_weather"})
     v = arbitrate(req, policy, ctx)["verdict"]
     assert v.decision == HarnessDecision.DENY
+
+
+def test_reuse_resolves_strictly_by_id_no_name_fallback():
+    """Re-review hardening: a REUSE outcome resolves the granted tool STRICTLY by the
+    re-verified tool_id — it must NOT fall back to status-blind find_tool_by_name,
+    which could bind a same-named PROPOSED twin (if the id vanished cross-process) and
+    deploy it as UNREVIEWED code under the LOW reuse grant. The name fallback lives in
+    the forge (else) branch only."""
+    src = inspect.getsource(ShadowRuntime._apply_materialised_grant)
+    assert 'mat.get("reused")' in src, "the reuse branch must be a distinct guard"
+    i_reuse = src.find('mat.get("reused")')
+    i_fallback = src.find("find_tool_by_name")
+    # the reuse-branch guard precedes the name fallback, and the fallback is in the
+    # else (forge) branch — so a reuse never reaches status-blind name resolution.
+    assert 0 < i_reuse < i_fallback
