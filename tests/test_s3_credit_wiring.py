@@ -30,7 +30,10 @@ from unittest.mock import patch
 #  Harness (mirrors tests/test_s4_failclosed_primary.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_entities_objs(tmp_path, objectives):
+def _build_entities_objs(tmp_path, objectives, *, tool=None):
+    """Build a hermetic vault with a Shadow + Tool + Scroll + Activity. ``tool``
+    (R-A13b-2i) overrides the default bare ``api_tool`` with a caller-supplied Tool
+    entity (e.g. a schema-bearing fixture effectful tool for the AC)."""
     from systemu.vault.vault import Vault
     from systemu.core.models import (
         Activity, Shadow, ShadowStatus, Tool, ToolStatus, ToolType, Scroll,
@@ -48,17 +51,18 @@ def _build_entities_objs(tmp_path, objectives):
     shadow = Shadow(id="shadow_s3w", name="S3W Shadow", description="t",
                     system_prompt="t", status=ShadowStatus.AWAKENED)
     vault.save_shadow(shadow)
-    tool = Tool(id="tool_s3w", name="api_tool", description="t",
-                tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.DEPLOYED,
-                enabled=True,
-                implementation_path="vault/tools/implementations/api_tool.py")
+    if tool is None:
+        tool = Tool(id="tool_s3w", name="api_tool", description="t",
+                    tool_type=ToolType.PYTHON_FUNCTION, status=ToolStatus.DEPLOYED,
+                    enabled=True,
+                    implementation_path="vault/tools/implementations/api_tool.py")
     vault.save_tool(tool)
     scroll = Scroll(id="scroll_s3w", name="S3W Scroll", source_session_id="s",
                     raw_instructions_path="", narrative_md="",
                     objectives=objectives)
     vault.save_scroll(scroll)
     activity = Activity(id="act_s3w", name="S3W Activity", scroll_id=scroll.id,
-                        required_tool_ids=["tool_s3w"], required_skill_ids=[],
+                        required_tool_ids=[tool.id], required_skill_ids=[],
                         assigned_shadow_id=shadow.id)
     vault.save_activity(activity)
     return vault, shadow, activity
@@ -105,9 +109,35 @@ class _EchoReadbackClient:
                 "response_body": "row present: " + " ".join(self._echo)}
 
 
+class _CreateOnceReadbackClient:
+    """A mock independent readback transport that models a CREATE-ONCE resource: the
+    token is ABSENT until the effect is submitted (``mark_submitted``), then ECHOED.
+
+    This is what lets the runtime's INDEPENDENT pre-submit probe prove freshness
+    (absent pre-submit) and the post-submit verify match the echo — WITHOUT the tool
+    self-attesting freshness (the R-A13b-2i money-move anti-replay contract). The
+    drive-execute harness calls ``mark_submitted`` at the submit boundary."""
+
+    def __init__(self, echo_tokens):
+        self._echo = list(echo_tokens)
+        self._submitted = False
+        self.urls = []
+
+    def mark_submitted(self):
+        self._submitted = True
+
+    def readback(self, url):
+        self.urls.append(url)
+        if not self._submitted:
+            return {"observed_tokens": [], "response_body": "not found (pre-submit)"}
+        return {"observed_tokens": list(self._echo),
+                "response_body": "row present: " + " ".join(self._echo)}
+
+
 def _drive_live_credit(tmp_path, monkeypatch, *, objectives, claim_obj_id,
                        tool_parsed, api_client=None, verify_should_raise=False,
-                       completion_side_effect=_softpass_outcome, spy_obs=None):
+                       completion_side_effect=_softpass_outcome, spy_obs=None,
+                       decision_params=None, tool=None):
     """Drive execute() so the LLM issues one succeeding TOOL_CALL that CLAIMS
     ``claim_obj_id`` with ``result.parsed = tool_parsed``, then a deterministic
     terminal FAIL. Returns ``(runtime, result, context)``.
@@ -116,12 +146,18 @@ def _drive_live_credit(tmp_path, monkeypatch, *, objectives, claim_obj_id,
     verifier's readback transport (``runtime._external_api_client``).
     ``verify_should_raise`` monkeypatches the router to raise on ANY LLM call so
     a test can prove the deterministic hook needs no model.
+    ``decision_params`` (R-A13b-2i) seeds the TOOL_CALL's ``parameters`` — used to
+    carry a pre-submit ``external`` directive so the runtime's independent
+    pre-submit freshness probe can run. At the submit boundary the harness calls
+    ``api_client.mark_submitted()`` (if present) so a create-once client flips from
+    absent (pre-submit probe) to present (post-submit verify).
     """
     from sharing_on.config import Config
     from systemu.runtime.shadow_runtime import ShadowRuntime
     import systemu.runtime.shadow_runtime as _sr
 
-    vault, shadow, activity = _build_entities_objs(tmp_path, objectives)
+    vault, shadow, activity = _build_entities_objs(tmp_path, objectives, tool=tool)
+    _tool_name = tool.name if tool is not None else "api_tool"
     cfg = Config()
     cfg.vault_dir = str(tmp_path)
     cfg.output_dir = str(tmp_path / "outputs")
@@ -139,6 +175,10 @@ def _drive_live_credit(tmp_path, monkeypatch, *, objectives, claim_obj_id,
     from systemu.runtime.tool_sandbox import ToolResult
 
     async def _handle(decision, tools, context, current_ab, dry_run, **kw):
+        # the submit boundary: a create-once readback client flips absent→present.
+        _c = getattr(runtime, "_external_api_client", None)
+        if _c is not None and hasattr(_c, "mark_submitted"):
+            _c.mark_submitted()
         return ToolResult(success=True, parsed=dict(tool_parsed))
     monkeypatch.setattr(runtime, "_handle_tool_call", _handle)
 
@@ -158,7 +198,8 @@ def _drive_live_credit(tmp_path, monkeypatch, *, objectives, claim_obj_id,
         monkeypatch.setattr(_cb.ExecutionContext, "add_observation", _spy_add)
 
     decisions = [
-        {"action": "TOOL_CALL", "tool_name": "api_tool", "parameters": {},
+        {"action": "TOOL_CALL", "tool_name": _tool_name,
+         "parameters": dict(decision_params or {}),
          "completes_objective": claim_obj_id, "reasoning": "do the external effect"},
         {"action": "FAIL", "reason": "reached only if the objective was NOT credited"},
     ]
@@ -204,32 +245,37 @@ def test_fresh_api_readback_echo_credits_external(tmp_path, monkeypatch):
     CONFIRMS, the wiring persists it, and _read_external_ok credits the objective
     (the run finalizes success)."""
     token = "sub-XZ-777-unique"
-    client = _EchoReadbackClient(echo_tokens=[token])
+    url = "https://api.example.com/rows/777"
+    # R-A13b-2i: this is a money-move (external + unclassified) ⇒ freshness may come
+    # ONLY from the runtime's independent pre-submit probe, never a tool self-report.
+    # A create-once client is ABSENT pre-submit (probe) → PRESENT post-submit (echo).
+    client = _CreateOnceReadbackClient(echo_tokens=[token])
+    directive = {"readback_url": url, "expected_tokens": [token],
+                 "submit_host": "api.example.com"}
     tool_parsed = {
         "ok": True,
-        # what the tool exposes for external verification:
+        # what the tool exposes for external verification (DIRECTIVES only):
         "external": {
             "strategy": "api_readback",
             "expected_tokens": [token],
             "submission_token": token,
-            "readback_url": "https://api.example.com/rows/777",
+            "readback_url": url,
             "submit_host": "api.example.com",
-            # freshness proof: a pre-submit readback found the effect ABSENT.
-            "pre_submit_absent": True,
         },
     }
     runtime, result, ctx = _drive_live_credit(
         tmp_path, monkeypatch, objectives=[_external_obj()], claim_obj_id=1,
-        tool_parsed=tool_parsed, api_client=client)
+        tool_parsed=tool_parsed, api_client=client,
+        decision_params={"external": directive})
 
     assert result.get("status") == "success", (
-        "a fresh, host-pinned, https, token-echoed api_readback must confirm and "
-        f"credit the external objective; got {result.get('status')}")
-    # the wiring persisted a confirmed ExternalEvidence taking the HARDENED path
-    # (the mock readback client was actually invoked on the pinned url).
-    assert client.urls == ["https://api.example.com/rows/777"], (
-        "the hardened api_readback path must fetch via the injected client on the "
-        f"pinned https url; client saw {client.urls}")
+        "a fresh, host-pinned, https, token-echoed api_readback (freshness proven by "
+        f"the runtime probe) must confirm + credit; got {result.get('status')}")
+    # the wiring took the HARDENED path: the injected client was read PRE-submit
+    # (the freshness probe) AND POST-submit (the verify) on the pinned url.
+    assert client.urls == [url, url], (
+        "the runtime probe (pre-submit) + hardened readback (post-submit) must both "
+        f"fetch via the injected client on the pinned https url; client saw {client.urls}")
     store = getattr(ctx, "_external_evidence", {})
     ev = store.get("1") or store.get(1)
     assert ev and ev.get("confirmed") is True, (
@@ -357,20 +403,23 @@ def test_deterministic_only_router_raise_still_credits(tmp_path, monkeypatch):
     api_readback still confirms + credits — proving the verifier hook sets
     ``confirmed`` from a DETERMINISTIC token match, never from a model."""
     token = "det-only-999"
-    client = _EchoReadbackClient(echo_tokens=[token])
+    url = "https://api.example.com/rows/999"
+    client = _CreateOnceReadbackClient(echo_tokens=[token])   # absent → present
+    directive = {"readback_url": url, "expected_tokens": [token],
+                 "submit_host": "api.example.com"}
     tool_parsed = {
         "ok": True,
         "external": {
             "strategy": "api_readback",
             "expected_tokens": [token],
-            "readback_url": "https://api.example.com/rows/999",
+            "readback_url": url,
             "submit_host": "api.example.com",
-            "pre_submit_absent": True,
         },
     }
     runtime, result, ctx = _drive_live_credit(
         tmp_path, monkeypatch, objectives=[_external_obj()], claim_obj_id=1,
-        tool_parsed=tool_parsed, api_client=client, verify_should_raise=True)
+        tool_parsed=tool_parsed, api_client=client, verify_should_raise=True,
+        decision_params={"external": directive})
 
     assert result.get("status") == "success", (
         "the deterministic verifier hook must confirm/credit with NO LLM — a "

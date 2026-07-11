@@ -346,25 +346,31 @@ class ExternalVerifier:
                 return ev  # unknown strategy ⇒ fail-closed
 
             confirmed, method, detail = handler(objective, effect_class, evidence_input)
-            # ── the MONEY-MOVE hard gate (BLOCKER-3 + BLOCKER-2) ──
-            # If the objective is caught by the money-move net, only a STRONG
-            # deterministic strategy may confirm; advisory strategies are demoted
-            # to confirmed=False no matter what they observed.
+            # ── the MONEY-MOVE hard gate (BLOCKER-3 + BLOCKER-2 + C2) ──
+            # A money-move may be confirmed ONLY by a HARDENED api_readback: an
+            # INDEPENDENT, host-pinned, https, provably-FRESH re-read (``readback_url``
+            # present). EVERY other channel is demoted, because none of them supply
+            # that proof in this runtime:
+            #   * web_assertion / operator_attest — advisory (a false positive there
+            #     is a double-submit hazard).
+            #   * LEGACY inline api_readback (no ``readback_url``) — bare token
+            #     equality, no host-pin/https/create-once proof (BLOCKER-2).
+            #   * email_confirm (C2) — although listed in ``_MONEY_MOVE_STRONG``, in
+            #     THIS runtime it is never handed an injected ``email_client`` (see
+            #     shadow_runtime._run_external_verification, which builds ONLY an
+            #     api_client), so ``_email_confirm`` self-confirms on the TOOL's own
+            #     inline ``observed_tokens`` — no independent fetch, no host-pin, no
+            #     freshness gate. A money-move must NOT credit off a self-report.
+            # ⇒ only ``method == "api_readback"`` WITH a ``readback_url`` survives.
             if confirmed and self._is_money_move(objective, effect_class):
-                # BLOCKER-2: the LEGACY inline api_readback path (no readback_url)
-                # does bare token equality with NO host-pin/https/create-once proof.
-                # Although "api_readback" is nominally a STRONG method, the inline
-                # variant lacks the hardened proof a money-move requires — so it is
-                # NOT strong enough here. Demote it like any advisory strategy.
-                legacy_inline_readback = (
+                hardened_readback = (
                     method == "api_readback"
-                    and not evidence_input.get("readback_url"))
-                if method not in self._MONEY_MOVE_STRONG or legacy_inline_readback:
+                    and bool(evidence_input.get("readback_url")))
+                if not hardened_readback:
                     confirmed = False
-                    detail = (detail + " | money-move: advisory strategy cannot confirm").strip(" |")
-                    if legacy_inline_readback:
-                        detail = (detail
-                                  + " (inline api_readback lacks hardened readback_url path)")
+                    detail = (detail
+                              + " | money-move requires independent hardened readback"
+                              ).strip(" |")
 
             ev.confirmed = bool(confirmed)
             ev.method = method
@@ -600,11 +606,14 @@ class ExternalVerifier:
         if not readback_url:
             return "indeterminate", "no readback_url for idempotency read-back"
 
-        # host-pin + https-only (mirror the hardened _api_readback gate): the read-
-        # back must hit the SAME authenticated host over https, else refuse.
+        # host-pin + https-only (mirror the hardened _api_readback gate EXACTLY):
+        # the read-back must hit the SAME authenticated host over https, else refuse.
+        # An EMPTY submit_host is UNPINNED ⇒ fail closed (an unpinned readback could
+        # confirm off an attacker-chosen host) — parity with _api_readback's
+        # `if not submit_host or rb_host != submit_host`.
         sub_host = str(submit_host or "").lower().strip()
         rb_host = _url_host(readback_url)
-        if sub_host and rb_host and rb_host != sub_host:
+        if not sub_host or rb_host != sub_host:
             return "indeterminate", "host-pin refused: readback host != submit host"
         if _url_scheme(readback_url) != "https":
             return "indeterminate", "https required for idempotency read-back"

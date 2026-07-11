@@ -272,6 +272,82 @@ def test_no_idempotency_key_at_all_falls_to_operator_card():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  HARDENING 2 — host-pin parity: an EMPTY submit_host must FAIL CLOSED.
+#
+#  The hardened _api_readback fails closed on an empty submit_host
+#  (`if not submit_host or rb_host != submit_host: <reject>`), but _impl6_readback
+#  only rejected on a MISMATCH (`if sub_host and rb_host and rb_host != sub_host`)
+#  — so an EMPTY submit_host BYPASSED the pin and a would-confirm envelope was read
+#  as confirmed_present (an UNPINNED readback confirming a money-move). Make the
+#  IMPL-6 pin match _api_readback: an unpinned (empty submit_host) readback is
+#  inadmissible ⇒ indeterminate, NEVER confirmed_present.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_impl6_readback_empty_submit_host_fails_closed():
+    """_impl6_readback with a would-CONFIRM envelope (supports_idempotency +
+    processed_idempotency_keys containing the key) but an EMPTY submit_host must
+    return indeterminate (unpinned readback inadmissible), NOT confirmed_present."""
+    key = mint_idempotency_key()
+    client = _MockIdemReadbackClient(processed_keys=[key], supports_idempotency=True)
+    v = ExternalVerifier(api_client=client)
+
+    # EMPTY submit_host — the readback is UNPINNED.
+    decision, _detail = v._impl6_readback(
+        idempotency_key=key,
+        readback_url="https://api.example.com/pay?idem=" + key,
+        submit_host="",
+    )
+    assert decision == "indeterminate", (
+        "an UNPINNED (empty submit_host) idempotency readback must fail closed to "
+        f"indeterminate, never confirmed_present; got {decision!r}")
+    assert decision != "confirmed_present"
+
+    # None submit_host is likewise unpinned ⇒ indeterminate.
+    decision_none, _ = v._impl6_readback(
+        idempotency_key=key,
+        readback_url="https://api.example.com/pay?idem=" + key,
+        submit_host=None,
+    )
+    assert decision_none == "indeterminate"
+
+
+def test_impl6_readback_matching_submit_host_still_confirms():
+    """No regression: a NON-empty, MATCHING submit_host still confirms_present."""
+    key = mint_idempotency_key()
+    client = _MockIdemReadbackClient(processed_keys=[key], supports_idempotency=True)
+    v = ExternalVerifier(api_client=client)
+
+    decision, _ = v._impl6_readback(
+        idempotency_key=key,
+        readback_url="https://api.example.com/pay?idem=" + key,
+        submit_host="api.example.com",
+    )
+    assert decision == "confirmed_present"
+
+
+def test_handle_ambiguous_empty_submit_host_never_credits_money_move():
+    """End-to-end: an ambiguous money-move whose readback WOULD confirm but whose
+    submit_host is EMPTY must route to the operator card (indeterminate), never
+    credit — an unpinned confirmation could be an attacker-chosen host."""
+    key = mint_idempotency_key()
+    client = _MockIdemReadbackClient(processed_keys=[key], supports_idempotency=True)
+    v = ExternalVerifier(api_client=client)
+    obj = _Obj(9, text="pay the vendor", params={"amount": 5000},
+               effect_tags={EffectTag.MONEY_MOVE})
+
+    outcome = v.handle_ambiguous_effect(
+        objective=obj, effect_class="money_move", idempotency_key=key,
+        readback_url="https://api.example.com/pay?idem=" + key,
+        submit_host="",   # UNPINNED
+    )
+    assert outcome.decision == "indeterminate"
+    assert outcome.decision != "confirmed_present"
+    assert outcome.operator_card is True
+    assert outcome.allow_retry is False
+    assert outcome.evidence is None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  5. SERVER-TOKEN KEYING IS THE BUG — a server-token impl FAILS this test
 # ═════════════════════════════════════════════════════════════════════════════
 

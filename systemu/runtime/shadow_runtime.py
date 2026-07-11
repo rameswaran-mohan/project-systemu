@@ -482,8 +482,25 @@ def _external_from_result(result) -> "dict":
     ToolResult. A tool that participates in external verification exposes an
     ``external`` sub-dict on ``result.parsed`` carrying the strategy + the
     submission-unique token + (for the hardened api_readback path) the
-    ``readback_url``/``submit_host`` and a freshness proof. Never raises; a tool
-    that exposes nothing returns ``{}`` (⇒ the verifier fails closed)."""
+    ``readback_url``/``submit_host``. Never raises; a tool that exposes nothing
+    returns ``{}`` (⇒ the verifier fails closed).
+
+    ── R-A13b-2i: the ``parsed['external']`` DIRECTIVE contract ──
+    The envelope carries DIRECTIVES only — *where/how* to look, NEVER a confirmation:
+        {
+          "strategy":        "api_readback" | "email_confirm" | "web_assertion" | ...,
+          "expected_tokens": [<submission-unique token(s) to match on read-back>],
+          "readback_url":    "https://<submit_host>/…"  (hardened path; https + host-pin),
+          "submit_host":     "<host the effect was submitted to>",
+          "idempotency_key": "<client key>"             (IMPL-6 anti-double-submit),
+        }
+    The independent client fetches ``readback_url`` and the deterministic matcher runs
+    RUNTIME-side, so a directive can never forge a confirmation. FRESHNESS is NOT a
+    directive field for a money-move: it comes ONLY from the runtime's independent
+    pre-submit probe (``_capture_presubmit_external_snapshot``) — a tool-carried
+    ``pre_submit_absent``/``presubmit_tokens`` is trusted for NON-money effects only.
+    The same directive is mirrored on the pre-submit call's ``parameters['external']``
+    so the probe can read the create-once target BEFORE the effect issues."""
     try:
         parsed = getattr(result, "parsed", None)
         if not isinstance(parsed, dict):
@@ -496,29 +513,115 @@ def _external_from_result(result) -> "dict":
         return {}
 
 
-def _capture_presubmit_external_snapshot(decision) -> "dict":
+def _presubmit_probe_directive(params) -> "Optional[dict]":
+    """Extract the PRE-SUBMIT readback directive from a decision's parameters. A
+    tool participating in external verification declares, on the call it is about to
+    submit, a ``parameters['external']`` directive mirroring the result envelope
+    (``readback_url`` + ``expected_tokens`` + ``submit_host``) so the runtime can do
+    an INDEPENDENT create-once probe BEFORE the effect issues. Returns the directive
+    (with a non-empty readback_url + expected_tokens) or None. Never raises."""
+    try:
+        if not isinstance(params, dict):
+            return None
+        directive = params.get("external")
+        if not isinstance(directive, dict):
+            return None
+        if directive.get("readback_url") and directive.get("expected_tokens"):
+            return directive
+        return None
+    except Exception:
+        return None
+
+
+def _probe_presubmit_absence(runtime, directive) -> "Optional[dict]":
+    """Do an INDEPENDENT, host-pinned, https readback of the create-once target
+    BEFORE submit via ``runtime._external_api_client`` and record whether the
+    expected tokens are ABSENT pre-submit.
+
+    Returns ``{presubmit_tokens, pre_submit_absent}`` (the authoritative, non-self-
+    reported freshness snapshot) or None when no probe could run (no client / no
+    admissible directive / any error) ⇒ freshness stays UNPROVABLE (fail-closed).
+    Never raises. Mirrors the _api_readback host-pin + https gate so the probe reads
+    exactly the target the post-submit verify will."""
+    try:
+        client = getattr(runtime, "_external_api_client", None)
+        if client is None or not hasattr(client, "readback"):
+            return None
+        from systemu.runtime.external_verifier import (
+            _as_token_list, _tokens_all_present, _url_host, _url_scheme,
+            ExternalVerifier)
+        url = directive.get("readback_url")
+        expected = _as_token_list(directive.get("expected_tokens"))
+        submit_host = str(directive.get("submit_host") or "").lower().strip()
+        if not url or not expected:
+            return None
+        # host-pin + https (same admissibility the hardened readback enforces).
+        if _url_scheme(url) != "https":
+            return None
+        if not submit_host or _url_host(url) != submit_host:
+            return None
+        envelope = client.readback(url)
+        observed = ExternalVerifier._observed_from_envelope(envelope)
+        # a create-once token ALREADY present pre-submit is STALE (replay) — record
+        # it so the freshness gate refuses; otherwise the effect is absent pre-submit.
+        present = [str(e) for e in expected if _tokens_all_present([e], observed)]
+        # C3: record the EXACT (url, tokens) this probe read so the money-move branch
+        # can bind the freshness proof to the resource verify actually credits — a
+        # probe of URL_A must NOT vouch for a credit at a DIFFERENT URL_B.
+        base = {"probed_url": str(url), "probed_tokens": list(expected)}
+        if present:
+            base.update({"presubmit_tokens": present, "pre_submit_absent": False})
+        else:
+            base.update({"presubmit_tokens": [], "pre_submit_absent": True})
+        return base
+    except Exception:
+        logger.debug("[Runtime] presubmit probe failed — fail-closed (no snapshot)",
+                     exc_info=True)
+        return None
+
+
+def _capture_presubmit_external_snapshot(decision, *, runtime=None) -> "dict":
     """Capture the PRE-SUBMIT freshness snapshot BEFORE an effectful call issues.
 
     The freshness proof (token-freshness / create-once) is what lets the hardened
     api_readback confirm THIS run produced the effect: a token already present
-    pre-submit is stale. A tool that supports a pre-submit probe exposes it on the
-    decision's parameters as ``presubmit_tokens`` (a distinguishing set the
-    expected tokens are NOT in) and/or ``pre_submit_absent`` (a pre-submit
-    readback found the effect absent — the strongest proof).
+    pre-submit is stale. Two sources, in order of authority:
 
-    Fail-closed default: when a clean pre-submit snapshot is NOT available for a
-    given tool shape (nothing exposed), return ``pre_submit_absent=False`` + an
-    EMPTY ``presubmit_tokens`` — freshness is then UNPROVABLE and the hardened
-    _api_readback REFUSES (never a silent confirm). Never raises."""
-    snap = {"presubmit_tokens": [], "pre_submit_absent": False}
+      1. a REAL independent pre-submit PROBE (R-A13b-2i): when the decision carries a
+         ``parameters['external']`` readback directive and the runtime has an
+         injected independent client, read the create-once target back and record
+         token ABSENCE (``probe_ran=True`` — the ONLY freshness source a money-move
+         will trust; a tool cannot self-attest it).
+      2. a tool/decision self-report on ``parameters`` (``presubmit_tokens`` /
+         ``pre_submit_absent``) — the already-wired NON-money fallback only.
+
+    Fail-closed default: with neither a probe nor a self-report, return
+    ``pre_submit_absent=False`` + EMPTY ``presubmit_tokens`` (+ ``probe_ran=False``)
+    — freshness is then UNPROVABLE and the hardened _api_readback REFUSES. Never
+    raises."""
+    snap = {"presubmit_tokens": [], "pre_submit_absent": False, "probe_ran": False,
+            "probed_url": "", "probed_tokens": []}
     try:
         params = decision.get("parameters") if isinstance(decision, dict) else None
+        # (2) the decision/tool self-report (non-money fallback).
         if isinstance(params, dict):
             pt = params.get("presubmit_tokens")
             if isinstance(pt, (list, tuple, set)):
                 snap["presubmit_tokens"] = [str(x) for x in pt]
             if params.get("pre_submit_absent") is True:
                 snap["pre_submit_absent"] = True
+        # (1) the REAL independent probe (authoritative — overwrites the self-report).
+        directive = _presubmit_probe_directive(params)
+        if directive is not None and runtime is not None:
+            probe = _probe_presubmit_absence(runtime, directive)
+            if probe is not None:
+                snap["presubmit_tokens"] = probe["presubmit_tokens"]
+                snap["pre_submit_absent"] = probe["pre_submit_absent"]
+                snap["probe_ran"] = True
+                # C3: carry the EXACT resource the probe read so the money-move
+                # verify branch can require the credited envelope to match it.
+                snap["probed_url"] = str(probe.get("probed_url") or "")
+                snap["probed_tokens"] = list(probe.get("probed_tokens") or [])
     except Exception:
         logger.debug("[Runtime] presubmit snapshot capture failed — fail-closed",
                      exc_info=True)
@@ -557,20 +660,54 @@ def _classify_external_effect(objective, decision, tool) -> "Optional[str]":
         return None
 
 
-def _build_external_api_client(runtime, ev_in):
+def _is_money_move_seam(objective, decision, tool) -> bool:
+    """SAFETY (R-A13b-2i) — a FAIL-CLOSED money-move test used to (a) FORBID the
+    branch-2 self-reported readback and (b) FORBID tool-self-carried freshness. Any
+    error ⇒ True (treat as money-move ⇒ trust ONLY the injected independent client +
+    the runtime probe). Mirrors ``_classify_external_effect``'s money-move disjunct
+    (the ExternalVerifier's own money-move gate recomputes this over the objective —
+    keeping the two consistent)."""
+    try:
+        from systemu.runtime.financial_signal import money_move_net_applies
+        goal = ""
+        for attr in ("goal", "text", "success_criteria"):
+            v = getattr(objective, attr, None)
+            if isinstance(v, str) and v:
+                goal += " " + v
+        params = decision.get("parameters") if isinstance(decision, dict) else None
+        effect_tags = list(getattr(tool, "effect_tags", None) or [])
+        requires_external = bool(
+            getattr(objective, "requires_external_verification", False))
+        return bool(money_move_net_applies(effect_tags, goal, params, requires_external))
+    except Exception:
+        logger.debug("[Runtime] money-move seam classification failed — fail-closed "
+                     "(treating as money-move)", exc_info=True)
+        return True
+
+
+def _build_external_api_client(runtime, ev_in, *, is_money_move=False):
     """Resolve the api_readback transport for the hardened path.
 
     Precedence:
       1. an injected client on the runtime (``runtime._external_api_client``) —
-         production wires a real independent-https reader here; tests inject a mock.
-      2. an in-memory adapter over a ``readback_envelope`` the tool already
-         captured from its OWN independent post-submit readback (deterministic —
-         no live I/O in the hook, no LLM).
+         production wires a real independent-https reader here (ProdReadbackClient);
+         tests inject a mock.
+      2. (NON-money ONLY) an in-memory adapter over a ``readback_envelope`` the tool
+         already captured from its OWN post-submit readback (deterministic — no live
+         I/O in the hook, no LLM).
       3. None — the hardened path then reports "no api_client" and fails closed.
+
+    R-A13b-2i (self-attestation hole): a MONEY-MOVE may NEVER resolve to branch-2 —
+    a tool echoing its own ``readback_envelope`` would self-confirm a money-move. So
+    for ``is_money_move`` we SKIP branch-2 entirely: with no injected independent
+    client there is NO admissible transport ⇒ None ⇒ fail closed (would-PARK).
     """
     injected = getattr(runtime, "_external_api_client", None)
     if injected is not None:
         return injected
+    if is_money_move:
+        # no independent client + money-move ⇒ NO self-reported fallback is admissible.
+        return None
     envelope = ev_in.get("readback_envelope") if isinstance(ev_in, dict) else None
     if envelope is not None:
         class _EnvelopeClient:
@@ -592,16 +729,53 @@ def _run_external_verification(runtime, *, objective, decision, tool, result,
     from systemu.core.models import ExternalEvidence
     try:
         ev_in = dict(_external_from_result(result))
-        # thread the PRE-SUBMIT freshness snapshot in (a tool-provided proof on
-        # the result envelope wins; otherwise the decision-captured snapshot). The
-        # snapshot NEVER upgrades a tool that already proved absence.
-        if not ev_in.get("pre_submit_absent"):
-            if presubmit.get("pre_submit_absent") is True:
-                ev_in["pre_submit_absent"] = True
-        if not ev_in.get("presubmit_tokens"):
-            ev_in["presubmit_tokens"] = list(presubmit.get("presubmit_tokens") or [])
+        is_money = _is_money_move_seam(objective, decision, tool)
+        # ── PRE-SUBMIT freshness threading (R-A13b-2i anti-replay) ──
+        if is_money:
+            # SECURITY: a money-move's freshness proof may come ONLY from the
+            # runtime's INDEPENDENT pre-submit probe — NEVER the tool's own envelope
+            # NOR a decision-param self-report (both are forgeable ⇒ replay). Trust
+            # the snapshot ONLY when a real probe ran; else zero it (⇒ freshness
+            # unprovable ⇒ the hardened readback refuses). This OVERWRITES any
+            # tool-carried pre_submit_absent/presubmit_tokens on ev_in.
+            #
+            # C3: the proof must ALSO be BOUND to the exact resource verify credits.
+            # The probe read ``probed_url``/``probed_tokens`` (pre-submit); verify
+            # credits off the RESULT envelope's readback_url/expected_tokens. A probe
+            # of a benign-absent URL_A cannot vouch for a credit at a DIFFERENT,
+            # pre-existing URL_B (a stale receipt). So trust probe_ran ONLY when the
+            # envelope's url == the probed url AND EVERY credited token was among the
+            # tokens the probe proved absent (env_tokens ⊆ probed_tokens — the
+            # security-sound direction: never bless an un-probed token). Any mismatch
+            # ⇒ zero the freshness ⇒ the hardened readback refuses ⇒ would-PARK.
+            probe_binds = False
+            if presubmit.get("probe_ran"):
+                env_url = str(ev_in.get("readback_url") or "").strip()
+                probed_url = str(presubmit.get("probed_url") or "").strip()
+                from systemu.runtime.external_verifier import _as_token_list as _atl
+                env_tokens = set(_atl(ev_in.get("expected_tokens")))
+                probed_tokens = set(_atl(presubmit.get("probed_tokens")))
+                probe_binds = bool(
+                    env_url and probed_url and env_url == probed_url
+                    and env_tokens and env_tokens <= probed_tokens)
+            if probe_binds:
+                ev_in["pre_submit_absent"] = presubmit.get("pre_submit_absent") is True
+                ev_in["presubmit_tokens"] = list(presubmit.get("presubmit_tokens") or [])
+            else:
+                ev_in["pre_submit_absent"] = False
+                ev_in["presubmit_tokens"] = []
+        else:
+            # NON-money (byte-identical to pre-2i): a tool-provided proof on the
+            # result envelope wins; otherwise the runtime snapshot fills in. The
+            # snapshot NEVER upgrades a tool that already proved absence.
+            if not ev_in.get("pre_submit_absent"):
+                if presubmit.get("pre_submit_absent") is True:
+                    ev_in["pre_submit_absent"] = True
+            if not ev_in.get("presubmit_tokens"):
+                ev_in["presubmit_tokens"] = list(presubmit.get("presubmit_tokens") or [])
         effect_class = _classify_external_effect(objective, decision, tool)
-        api_client = _build_external_api_client(runtime, ev_in)
+        api_client = _build_external_api_client(
+            runtime, ev_in, is_money_move=is_money)
         verifier = ExternalVerifier(api_client=api_client)
         return verifier.verify(objective, effect_class, ev_in)
     except Exception:
@@ -2711,6 +2885,19 @@ class ShadowRuntime:
         # depth guard (harness_arbiter._arbitrate_subagent) and the v2 delegation
         # refusal (in _handle_tool_call) both see real nesting.
         self._subagent_depth = self._init_subagent_depth(config)
+        # R-A13b-2i: inject the PRODUCTION independent-https readback client so the
+        # hardened api_readback path (and the SHADOW park-surface meter) can perform a
+        # real, INDEPENDENT read-back — resolving _build_external_api_client's branch-1
+        # in a live run. GATED on the S4 stamp net being armed (mode != off): OFF sets
+        # NOTHING, so there is no client (byte-identical) and no outbound GET when the
+        # net is disarmed. Tests may override runtime._external_api_client with a mock.
+        try:
+            from systemu.runtime.requirement_binder import _s4_stamp_mode
+            if _s4_stamp_mode() != "off":
+                from systemu.runtime.readback_client import ProdReadbackClient
+                self._external_api_client = ProdReadbackClient()
+        except Exception:
+            logger.debug("[Runtime] prod readback client injection skipped", exc_info=True)
         # v0.9.1.1 fix: load user_profile once at init so _resolve_verifier_output_dir
         # can actually prefer user_profile.default_output_dir over config.output_dir.
         try:
@@ -3492,11 +3679,13 @@ class ShadowRuntime:
                    or str(getattr(self, "_impl6_client_key", "") or "").strip())
             readback_url = ext.get("readback_url")
             submit_host = ext.get("submit_host")
-            effect_class = _classify_external_effect(
-                objective, decision,
-                next((t for t in (tools or [])
-                      if getattr(t, "name", None) == decision.get("tool_name")), None))
-            api_client = _build_external_api_client(self, ext)
+            _impl6_tool = next(
+                (t for t in (tools or [])
+                 if getattr(t, "name", None) == decision.get("tool_name")), None)
+            effect_class = _classify_external_effect(objective, decision, _impl6_tool)
+            api_client = _build_external_api_client(
+                self, ext,
+                is_money_move=_is_money_move_seam(objective, decision, _impl6_tool))
             verifier = ExternalVerifier(api_client=api_client)
             return verifier.handle_ambiguous_effect(
                 objective=objective, effect_class=effect_class,
@@ -6514,12 +6703,16 @@ class ShadowRuntime:
                     # ── S3 / R-A7 wave-3a — PRE-SUBMIT freshness snapshot ──
                     # Before the effectful call issues, capture the pre-submit
                     # tokens/state that prove token-freshness (a token that already
-                    # existed pre-submit is stale and cannot confirm). Guarded on the
-                    # claimed objective being external so a non-external call is
-                    # unchanged. Cheap + deterministic; fail-closed when no clean
-                    # snapshot is available (empty tokens ⇒ freshness UNPROVABLE ⇒
-                    # the hardened readback refuses). Threaded into the verifier hook
-                    # at the credit seam via ``_presubmit_external_snapshot``.
+                    # existed pre-submit is stale and cannot confirm). R-A13b-2i: fire
+                    # on the ARMED view (live requires_external_verification OR the
+                    # SHADOW _s4_stamp_shadow, via _armed_meter_objective) so capture
+                    # and the meter's verify agree on the armed net — SHADOW never
+                    # writes the live field, so the un-widened guard never captured and
+                    # even a correct echo would-PARKED (the SEAM-3 artifact). The
+                    # capture body now runs a REAL independent pre-submit probe
+                    # (runtime=self). Cheap + deterministic; fail-closed when no clean
+                    # snapshot is available. Threaded into the verifier hook at the
+                    # credit seam via ``_presubmit_external_snapshot``.
                     self._presubmit_external_snapshot = None
                     try:
                         _co = decision.get("completes_objective")
@@ -6527,9 +6720,11 @@ class ShadowRuntime:
                             _co_obj = next(
                                 (o for o in objectives if o.id == _co), None)
                             if _co_obj is not None and getattr(
-                                    _co_obj, "requires_external_verification", False):
+                                    _armed_meter_objective(_co_obj),
+                                    "requires_external_verification", False):
                                 self._presubmit_external_snapshot = (
-                                    _capture_presubmit_external_snapshot(decision))
+                                    _capture_presubmit_external_snapshot(
+                                        decision, runtime=self))
                     except Exception:
                         logger.debug("[Runtime] presubmit snapshot guard failed",
                                      exc_info=True)

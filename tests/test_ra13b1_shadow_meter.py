@@ -22,6 +22,7 @@ from __future__ import annotations
 from test_s3_credit_wiring import (  # the REAL drive-execute harness (no tests/__init__.py)
     _drive_live_credit,
     _EchoReadbackClient,
+    _CreateOnceReadbackClient,
 )
 
 
@@ -69,30 +70,37 @@ def test_shadow_meter_records_would_credit(tmp_path, monkeypatch):
     monkeypatch.setenv("SYSTEMU_S4_STAMP", "shadow")
     _stamp_shadow_on_resolve(monkeypatch)
     token = "sub-shadow-777"
-    client = _EchoReadbackClient(echo_tokens=[token])
+    url = "https://api.example.com/rows/777"
+    # R-A13b-2i: the armed meter runs a money-move net (external + unclassified) ⇒
+    # freshness comes from the runtime pre-submit probe (create-once client), not a
+    # tool self-report.
+    client = _CreateOnceReadbackClient(echo_tokens=[token])
+    directive = {"readback_url": url, "expected_tokens": [token],
+                 "submit_host": "api.example.com"}
     tool_parsed = {
         "ok": True,
         "external": {
             "strategy": "api_readback",
             "expected_tokens": [token],
             "submission_token": token,
-            "readback_url": "https://api.example.com/rows/777",
+            "readback_url": url,
             "submit_host": "api.example.com",
-            "pre_submit_absent": True,   # freshness proof on the envelope
         },
     }
     obs = []
     runtime, result, ctx = _drive_live_credit(
         tmp_path, monkeypatch, objectives=[_shadow_obj()], claim_obj_id=1,
-        tool_parsed=tool_parsed, api_client=client, spy_obs=obs)
+        tool_parsed=tool_parsed, api_client=client, spy_obs=obs,
+        decision_params={"external": directive})
 
     # the run completes normally — credited via the NORMAL local-verifier path
     # (the meter did NOT change the credit outcome).
     assert result.get("status") == "success", (
         f"the shadow meter must not change the run outcome; got {result.get('status')}")
-    # the mock readback client WAS driven through the real S3 chain at the seam.
-    assert client.urls == ["https://api.example.com/rows/777"], (
-        f"the meter must run _run_external_verification via the injected client; saw {client.urls}")
+    # the mock readback client WAS driven through the real S3 chain at the seam —
+    # pre-submit (freshness probe) AND post-submit (verify).
+    assert client.urls == [url, url], (
+        f"the meter must probe (pre-submit) + verify (post-submit) via the injected client; saw {client.urls}")
     # RECORD 1: a shadow=True would_credit entry in the run-local evidence store.
     store = getattr(ctx, "_external_evidence", {}) or {}
     ev = store.get("1") or store.get(1)
@@ -140,14 +148,16 @@ def test_shadow_meter_distinction_is_measurable(tmp_path, monkeypatch):
     monkeypatch.setenv("SYSTEMU_S4_STAMP", "shadow")
     _stamp_shadow_on_resolve(monkeypatch)
     token = "sub-dist-1"
-    client = _EchoReadbackClient(echo_tokens=[token])
+    url = "https://api.example.com/rows/1"
+    client = _CreateOnceReadbackClient(echo_tokens=[token])
+    directive = {"readback_url": url, "expected_tokens": [token],
+                 "submit_host": "api.example.com"}
     good = {"ok": True, "external": {
         "strategy": "api_readback", "expected_tokens": [token],
-        "readback_url": "https://api.example.com/rows/1", "submit_host": "api.example.com",
-        "pre_submit_absent": True}}
+        "readback_url": url, "submit_host": "api.example.com"}}
     rt_c, _, ctx_c = _drive_live_credit(
         tmp_path / "credit", monkeypatch, objectives=[_shadow_obj()], claim_obj_id=1,
-        tool_parsed=good, api_client=client)
+        tool_parsed=good, api_client=client, decision_params={"external": directive})
     rt_p, _, ctx_p = _drive_live_credit(
         tmp_path / "park", monkeypatch, objectives=[_shadow_obj()], claim_obj_id=1,
         tool_parsed={"ok": True})
@@ -177,14 +187,16 @@ def test_shadow_would_credit_does_not_leak_into_committed_ledger(tmp_path, monke
     monkeypatch.setenv("SYSTEMU_S4_STAMP", "shadow")
     _stamp_shadow_on_resolve(monkeypatch)
     token = "sub-ledger-1"
-    client = _EchoReadbackClient(echo_tokens=[token])
+    url = "https://api.example.com/rows/1"
+    client = _CreateOnceReadbackClient(echo_tokens=[token])
+    directive = {"readback_url": url, "expected_tokens": [token],
+                 "submit_host": "api.example.com"}
     tool_parsed = {"ok": True, "external": {
         "strategy": "api_readback", "expected_tokens": [token],
-        "readback_url": "https://api.example.com/rows/1", "submit_host": "api.example.com",
-        "pre_submit_absent": True}}
+        "readback_url": url, "submit_host": "api.example.com"}}
     runtime, result, ctx = _drive_live_credit(
         tmp_path, monkeypatch, objectives=[_shadow_obj()], claim_obj_id=1,
-        tool_parsed=tool_parsed, api_client=client)
+        tool_parsed=tool_parsed, api_client=client, decision_params={"external": directive})
 
     store = getattr(ctx, "_external_evidence", {}) or {}
     ev = store.get("1") or store.get(1)
@@ -269,14 +281,20 @@ def test_fix_b_strong_api_readback_still_credits_when_armed(tmp_path):
     obj = Objective(id=1, goal="POST the row to the external API",
                     success_criteria="row visible", requires_external_verification=False)
     obj.__dict__["_s4_stamp_shadow"] = True
+    # R-A13b-2i: the tool emits DIRECTIVES only (no self-attested freshness); the
+    # freshness comes from the runtime probe snapshot (probe_ran=True, absent).
     result = ToolResult(success=True, parsed={"ok": True, "external": {
         "strategy": "api_readback", "expected_tokens": [token],
-        "readback_url": "https://api.example.com/rows/1", "submit_host": "api.example.com",
-        "pre_submit_absent": True}})
+        "readback_url": "https://api.example.com/rows/1", "submit_host": "api.example.com"}})
     decision = {"tool_name": "api_tool", "parameters": {}}
     tool = SimpleNamespace(name="api_tool", effect_tags=[])
     rt = SimpleNamespace(_external_api_client=_EchoReadbackClient(echo_tokens=[token]))
-    presub = {"presubmit_tokens": [], "pre_submit_absent": False}
+    # C3: a well-formed probe snapshot records the EXACT url + tokens it read; the
+    # money-move freshness binding requires the credited envelope to match them
+    # (env_url == probed_url, env_tokens ⊆ probed_tokens). Here both name the same
+    # resource the envelope credits, so the fresh probe binds and still credits.
+    presub = {"presubmit_tokens": [], "pre_submit_absent": True, "probe_ran": True,
+              "probed_url": "https://api.example.com/rows/1", "probed_tokens": [token]}
 
     armed = _armed_meter_objective(obj)
     ev = _run_external_verification(
