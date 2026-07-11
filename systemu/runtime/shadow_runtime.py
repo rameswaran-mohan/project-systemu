@@ -3761,6 +3761,141 @@ class ShadowRuntime:
             logger.debug("[Runtime IMPL-6] operator-card enqueue failed", exc_info=True)
             return None
 
+    def _enqueue_operator_attest_and_suspend(
+        self, *, objective, execution_id, context, result, decision, tool,
+        activity, shadow):
+        """R-A13 Stage-3a — enqueue the operator_attest ENFORCE-fallback card + SUSPEND.
+
+        Called at the not-credited external branch (ENFORCE only) when an external
+        effect could not be independently confirmed AND no independent readback
+        channel was even available. Builds the RENDER-ONLY attest card over the RAW
+        (redacted) evidence envelope (never the agent's prose), enqueues it on the
+        InboxQueue operator rail carrying the marker + the enqueue-time effect
+        classification the resume applier needs, and returns the suspend result dict.
+        The credit itself is NEVER granted here — that is the resume-time
+        verify(operator_attest) path. Fully guarded — returns None on ANY error so the
+        caller falls back to the existing silent not-credit behavior. Money-move is
+        excluded by the CALLER (this method assumes a non-money effect)."""
+        try:
+            from systemu.runtime.external_verifier import ExternalVerifier
+            oid = getattr(objective, "id", 0)
+            # the enqueue-time effect classification: the effectful tool is resolvable
+            # HERE (decision.tool_name) but NOT at resume, and a requires_external
+            # objective with no KNOWN effect tag is money-move via the fail-closed
+            # fallback — so the resume applier must be handed a known non-money
+            # effect_class to let verify() credit. Carried in the card context.
+            effect_class = _classify_external_effect(objective, decision, tool)
+            # render-only card over the RAW, REDACTED evidence envelope; the builder
+            # sets dedup = operator_attest:{oid} and options ["Dismiss","Attest occurred"].
+            descriptor = ExternalVerifier().build_operator_attest_artifact(
+                objective,
+                evidence_input={"raw_evidence": _external_from_result(result)})
+            card_id = InboxQueue(self.vault).enqueue(
+                descriptor, gate_type="operator", body="",
+                context_extras={
+                    "kind_marker": "operator_attest",
+                    "objective_id": oid,
+                    "execution_id": execution_id,
+                    "is_money_move": False,
+                    "effect_class": effect_class,
+                    # carried so _dispatch_resume / the reconciler re-dispatch this
+                    # operator gate (both require a chat_submission_id in context).
+                    "chat_submission_id": getattr(self, "_chat_submission_id", None),
+                })
+            _susp = context.build_result(
+                status="suspended_operator_attest",
+                final_summary=_augment_summary_with_committed_effects(
+                    "Parked awaiting operator attestation: an external effect could "
+                    "not be independently confirmed and no independent readback "
+                    "channel was available. Only the operator may vouch it occurred "
+                    "(a money-move can never be credited this way).", context))
+            _susp["activity_id"] = getattr(activity, "id", "")
+            _susp["shadow_id"] = getattr(shadow, "id", "")
+            if card_id is not None:
+                _susp["operator_card_id"] = card_id
+            logger.warning(
+                "[Runtime S4-ATTEST] PARKED obj=%d — unconfirmed external effect, no "
+                "independent channel; operator-attest card %s (ENFORCE fallback).",
+                oid, card_id)
+            return _susp
+        except Exception:
+            logger.debug("[Runtime S4-ATTEST] attest enqueue/suspend failed — "
+                         "falling back to silent not-credit", exc_info=True)
+            return None
+
+    def _apply_operator_attest_sticky(self, snap, objectives, context) -> None:
+        """R-A13 Stage-3a — the resume-start APPLIER for a resolved operator-attest.
+
+        Peels the ``__OPERATOR_ATTEST__::obj_<id>::<json>`` sticky (mirrors the
+        ``__STUCK_ANSWER__`` peel) and, for choice == "Attest occurred" ONLY (Dismiss
+        / anything else ⇒ NO credit, the safe default), and ONLY when the objective is
+        NOT a money-move (fail-closed skip — attestation can NEVER credit a money-move),
+        runs ``ExternalVerifier.verify(strategy="operator_attest", attested=True)`` with
+        the enqueue-time ``effect_class`` and PERSISTS the resulting evidence. The
+        credit then lands via the S4 resume short-circuit reading the confirmed bit —
+        the effectful tool is NEVER re-invoked, and the credit routes through the verify
+        STRATEGY (money-move-gated), never ``build_operator_attest_artifact``.
+
+        Ordered BEFORE the recredit loop / resubmit guard so the short-circuit credits
+        and the guard does not re-park. Gated on ENFORCE (behind the flag). Never
+        raises — any error yields no credit (fail-closed)."""
+        try:
+            from systemu.runtime.requirement_binder import _s4_stamp_mode as _s4_mode_b
+            if _s4_mode_b() != "enforce":
+                return
+            notes = list(getattr(snap, "sticky_notes", None) or [])
+            note = next((n for n in notes
+                         if isinstance(n, str)
+                         and n.startswith("__OPERATOR_ATTEST__::")), None)
+            if not note:
+                return
+            import json as _json
+            _parts = note.split("::", 2)  # __OPERATOR_ATTEST__::obj_<id>::<json>
+            oid = int(_parts[1].replace("obj_", ""))
+            try:
+                payload = _json.loads(_parts[2])
+            except Exception:
+                payload = {"choice": _parts[2]}
+            choice = str(payload.get("choice") or "").strip().lower()
+            if choice != "attest occurred":
+                # Dismiss / any non-affirmative choice ⇒ NO credit (the safe default).
+                logger.info(
+                    "[Runtime S4-ATTEST] resume: operator did NOT attest obj=%d "
+                    "(choice=%r) — not credited.", oid, payload.get("choice"))
+                return
+            effect_class = payload.get("effect_class")
+            objective = next(
+                (o for o in objectives if getattr(o, "id", None) == oid), None)
+            if objective is None:
+                return
+            # gate (b): FAIL-CLOSED money-move skip at CREDIT time, INDEPENDENT of the
+            # enqueue gate. The effectful tool is not linked to the objective at resume,
+            # so re-run the money-move net with a surrogate carrying the enqueue-time
+            # effect_class (a money-move goal still trips is_financial_signal alone).
+            import types as _types
+            _surrogate = _types.SimpleNamespace(
+                effect_tags=[effect_class] if effect_class else [])
+            if _is_money_move_seam(objective, None, _surrogate):
+                logger.warning(
+                    "[Runtime S4-ATTEST] resume: obj=%d re-classified money-move at "
+                    "credit time — attestation REFUSED (a money-move can never credit "
+                    "via attest).", oid)
+                return
+            # the credit ENGINE: verify(operator_attest) confirms a NON-money effect;
+            # its own money-move gate (gate c) demotes a money-move to confirmed=False.
+            from systemu.runtime.external_verifier import ExternalVerifier
+            ev = ExternalVerifier().verify(
+                objective, effect_class,
+                {"strategy": "operator_attest", "attested": True})
+            _persist_external_evidence(context, ev)
+            logger.warning(
+                "[Runtime S4-ATTEST] resume: operator attested obj=%d — persisted %s "
+                "evidence (confirmed=%s) for the S4 credit.", oid,
+                getattr(ev, "method", "?"), getattr(ev, "confirmed", None))
+        except Exception:
+            logger.debug("[Runtime S4-ATTEST] resume applier errored — no credit "
+                         "(fail-closed)", exc_info=True)
+
     def _fold_runtime_error_and_suspend(
         self, *, objectives, completed_objectives, decision, sub, tool_name,
         context, scroll, shadow, activity, execution_id, root_eid, iteration,
@@ -4636,6 +4771,56 @@ class ShadowRuntime:
                         }
                     if snap is not None:
                         apply_to_context(snap, context=context)
+                        # R-A13 Stage-3a — apply a resolved operator-attest sticky
+                        # BEFORE the recredit loop + the resubmit guard, so the S4
+                        # resume short-circuit credits the objective from the applier's
+                        # persisted confirmed bit and the guard does NOT re-park. Gated
+                        # on ENFORCE inside the applier; a no-op without an
+                        # __OPERATOR_ATTEST__ sticky (none is ever minted in OFF/SHADOW,
+                        # so those modes are byte-identical). Never raises.
+                        if use_objectives:
+                            self._apply_operator_attest_sticky(snap, objectives, context)
+                            # R-A13 Stage-3a (double-submit FIX): HOIST the S4
+                            # external-evidence CREDIT short-circuit OUT of the
+                            # ``snap.completed_objective_ids`` guard below. That guard is
+                            # only truthy when the snapshot carried a completed sibling,
+                            # so a parked external objective with NO completed sibling
+                            # (a single external objective — e.g. the operator-attest
+                            # resume for it) was NEVER credited, even though the applier
+                            # (or a confirmed api_readback) had already persisted its
+                            # confirmed bit. The resubmit guard then EXCLUDED it (already
+                            # ``_read_external_ok``) so the run neither parked nor
+                            # credited → it fell through and the LLM RE-DROVE the
+                            # effectful tool = a double-submit. Credit confirmed externals
+                            # HERE, regardless of the completed set. It is CREDIT-ONLY
+                            # (the unconfirmed-external observation stays in the block
+                            # below / the resubmit guard) and SKIPS ids the snapshot
+                            # already lists as completed (those are seeded below), so
+                            # every OTHER case — non-empty completed, OFF/SHADOW — is
+                            # byte-identical: it credits EXACTLY the confirmed externals
+                            # the old short-circuit did, and the sole change is that an
+                            # empty-completed confirmed external now credits. Idempotent
+                            # via the completed_objectives set. Fail-safe: never raises.
+                            try:
+                                _seed_ids = set(snap.completed_objective_ids or [])
+                                _ext_blocked = _recredit_blocked_ids(
+                                    getattr(snap, "objective_graph", None))
+                                for _ext_obj in objectives:
+                                    if (getattr(_ext_obj, "requires_external_verification", False)
+                                            and _ext_obj.id not in completed_objectives
+                                            and _ext_obj.id not in _seed_ids
+                                            and _ext_obj.id not in _ext_blocked
+                                            and _read_external_ok(context, _ext_obj.id)):
+                                        completed_objectives.add(_ext_obj.id)
+                                        logger.info(
+                                            "[Runtime S4] resume re-credit: external obj=%d "
+                                            "cleared by a stored confirmed ExternalEvidence.",
+                                            _ext_obj.id,
+                                        )
+                            except Exception:
+                                logger.debug(
+                                    "[Runtime S4] hoisted external resume re-credit "
+                                    "crashed — skipping", exc_info=True)
                         if use_objectives and snap.completed_objective_ids:
                             # Restore completed objective ids — the runtime won't
                             # ask the LLM to redo them.
@@ -7404,6 +7589,55 @@ class ShadowRuntime:
                                             },
                                             current_ab,
                                         )
+                                        # ── R-A13 Stage-3a — operator_attest ENFORCE
+                                        # fallback (behind the flag) ──
+                                        # When the external effect could NOT be
+                                        # independently confirmed AND no independent
+                                        # readback channel was even available (no
+                                        # readback_url in the envelope ⇒ independent
+                                        # confirmation was IMPOSSIBLE, so attest is the
+                                        # genuine FALLBACK, not a shortcut — the
+                                        # anti-fatigue guardrail), AND the objective is
+                                        # NOT a money-move (attestation can never credit a
+                                        # money-move), surface an operator-attest card +
+                                        # PARK. OFF/SHADOW never enter (the enforce
+                                        # conjunct) so they are byte-identical; the
+                                        # UNVERIFIED_EXTERNAL observation above is
+                                        # UNCHANGED. Fully guarded — ANY error falls back
+                                        # to the existing silent not-credit behavior.
+                                        try:
+                                            from systemu.runtime.requirement_binder import (
+                                                _s4_stamp_mode as _s4_mode_a)
+                                            if _s4_mode_a() == "enforce":
+                                                _attest_tool = next(
+                                                    (t for t in tools
+                                                     if getattr(t, "name", None)
+                                                     == decision.get("tool_name")), None)
+                                                _ev_in_a = _external_from_result(result)
+                                                _no_indep_channel = not bool(
+                                                    _ev_in_a.get("readback_url")
+                                                    if isinstance(_ev_in_a, dict) else None)
+                                                if (_no_indep_channel
+                                                        and not _is_money_move_seam(
+                                                            _s4_obj, decision,
+                                                            _attest_tool)):
+                                                    _susp_attest = (
+                                                        self._enqueue_operator_attest_and_suspend(
+                                                            objective=_s4_obj,
+                                                            execution_id=execution_id,
+                                                            context=context,
+                                                            result=result,
+                                                            decision=decision,
+                                                            tool=_attest_tool,
+                                                            activity=activity,
+                                                            shadow=shadow))
+                                                    if _susp_attest is not None:
+                                                        return _susp_attest
+                                        except Exception:
+                                            logger.debug(
+                                                "[Runtime S4-ATTEST] enqueue guard "
+                                                "errored — no-op (existing not-credit "
+                                                "behavior)", exc_info=True)
 
                                 # ── R-A13b-1: SHADOW park-surface METER (RECORD-ONLY) ──
                                 # When the objective WOULD-stamp under the current S4

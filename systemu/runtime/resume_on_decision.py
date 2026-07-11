@@ -74,7 +74,12 @@ def _dispatch_resume(decision, *, vault, supervisor,
     is_cmd_gate = (kind == "gate" and gate_type == "command")
     is_tool_gate = (kind == "gate" and gate_type == "tool")
     is_gate = is_cmd_gate or is_tool_gate
-    if kind != "structured_question" and not is_gate:
+    # R-A13 Stage-3a: an operator-attest card (gate_type="operator") resumes too. Its
+    # `kind` is overwritten to "gate" by gate.to_decision_context, so key off the
+    # sibling kind_marker (NOT `kind`). It stashes an __OPERATOR_ATTEST__ sticky the
+    # resume-start applier peels; activity/shadow derive from the snapshot like a gate.
+    is_attest = (dctx.get("kind_marker") == "operator_attest")
+    if kind != "structured_question" and not is_gate and not is_attest:
         return False
     if not dctx.get("chat_submission_id"):
         return False
@@ -169,6 +174,29 @@ def _dispatch_resume(decision, *, vault, supervisor,
                     store.mark_resume_approved(sig)
             except Exception:
                 logger.debug("[ResumeOnDecision] could not mark resume approval", exc_info=True)
+    elif is_attest:
+        # R-A13 Stage-3a: stash the operator's attest CHOICE + the enqueue-time effect
+        # classification (a JSON payload the resume-start applier peels) so the applier
+        # can run verify(operator_attest) with the KNOWN non-money effect_class — a
+        # requires_external objective with no known effect tag is money-move via the
+        # fail-closed fallback and could otherwise never credit. Never a money-move at
+        # enqueue (the enqueue gate excludes it); the applier + verify re-gate anyway.
+        import json as _json
+        objective_id = dctx.get("objective_id")
+        try:
+            if snap is not None:
+                _payload = _json.dumps({
+                    "choice": decision.choice,
+                    "effect_class": dctx.get("effect_class"),
+                    "is_money_move": bool(dctx.get("is_money_move")),
+                })
+                snap.sticky_notes.append(
+                    f"__OPERATOR_ATTEST__::obj_{objective_id}::{_payload}"
+                )
+                write_snapshot(snap, data_dir=data_dir)
+        except Exception:
+            logger.debug("[ResumeOnDecision] could not stash attest answer in snapshot",
+                         exc_info=True)
     else:
         # structured_question: stash the operator's answer into the snapshot so the
         # runtime applies it deterministically on resume.

@@ -117,8 +117,13 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
         is_cmd_gate = (kind == "gate" and gate_type == "command")
         is_tool_gate = (kind == "gate" and gate_type == "tool")
         is_gate = is_cmd_gate or is_tool_gate
+        # R-A13 Stage-3a: an operator-attest card resumes too (its `kind` is
+        # overwritten to "gate", so key off the kind_marker sibling). Like a gate, it
+        # derives activity/shadow from the snapshot, so it is exempt from the
+        # in-context resume-coords filter below.
+        is_attest = (dctx.get("kind_marker") == "operator_attest")
         # Cheap filters before touching the dispatcher
-        if kind != "structured_question" and not is_gate:
+        if kind != "structured_question" and not is_gate and not is_attest:
             continue
         if dctx.get("resume_dispatched"):
             continue
@@ -127,8 +132,10 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
         if not dctx.get("execution_id"):
             continue
         # structured_question carries activity/shadow in context; a command/tool gate
-        # derives them from the snapshot inside _dispatch_resume.
-        if not is_gate and not (dctx.get("activity_id") and dctx.get("shadow_id")):
+        # and an operator-attest card derive them from the snapshot inside
+        # _dispatch_resume.
+        if (not is_gate and not is_attest
+                and not (dctx.get("activity_id") and dctx.get("shadow_id"))):
             continue
         try:
             if _rod._dispatch_resume(
