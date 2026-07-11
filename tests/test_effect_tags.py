@@ -126,6 +126,65 @@ def test_no_sinks_yields_empty_set():
 
 
 # --------------------------------------------------------------------------- #
+# R-A13b-2ii-a — curated SEMANTIC classes (money_move / send_message) through
+# classify_source (the REAL entry the S1 gate + backfill + meter all consume)
+# --------------------------------------------------------------------------- #
+
+def test_classify_money_move_via_import_and_attr_chain():
+    tags = _tags("import stripe\ndef run(**k):\n    return stripe.PaymentIntent.create(**k)")
+    assert EffectTag.MONEY_MOVE.value in tags
+
+
+def test_classify_send_message_via_smtplib_sendmail():
+    tags = _tags("import smtplib\ndef run():\n    s = smtplib.SMTP('h')\n    s.sendmail('a','b','c')")
+    assert EffectTag.SEND_MESSAGE.value in tags
+
+
+def test_classify_money_move_via_url_host_literal():
+    tags = _tags("import requests\nrequests.post('https://api.stripe.com/v1/charges', json={})")
+    assert EffectTag.MONEY_MOVE.value in tags
+    # both net_mutate (structural POST) and money_move (host) are present — a UNION
+    # with money_move is the safe both-match case (monotonic).
+    assert EffectTag.NET_MUTATE.value in tags
+
+
+def test_classify_send_message_via_url_host_literal():
+    tags = _tags("import requests\nrequests.post('https://api.twilio.com/2010/Messages.json', data={})")
+    assert EffectTag.SEND_MESSAGE.value in tags
+
+
+def test_classify_plain_post_is_net_mutate_only_not_money_or_send():
+    tags = _tags("import requests\nrequests.post('https://example.com/x', json={})")
+    assert EffectTag.NET_MUTATE.value in tags
+    assert EffectTag.MONEY_MOVE.value not in tags
+    assert EffectTag.SEND_MESSAGE.value not in tags
+
+
+def test_classify_benign_get_still_net_read_only():
+    tags = _tags("import requests\nrequests.get('https://api.stripe.com/v1/charges')")
+    # a GET to a money host is a READ, not a money-move BY METHOD — but the host
+    # literal still adds money_move (conservative/monotonic). net_read stays present.
+    assert EffectTag.NET_READ.value in tags
+
+
+def test_classify_money_move_is_monotonic_never_dropped():
+    # a source that is money on TWO axes (import + attr) never yields a set WITHOUT it.
+    src = "import stripe\nstripe.Charge.create(amount=5)\n"
+    for _ in range(3):
+        assert EffectTag.MONEY_MOVE.value in _tags(src)
+
+
+def test_classify_send_message_via_twilio_attr_chain():
+    tags = _tags("import twilio\ndef run(client):\n    return client.messages.create(to='x')")
+    assert EffectTag.SEND_MESSAGE.value in tags
+
+
+def test_classify_source_still_never_raises_with_signals():
+    # never-raises contract holds with the new axes engaged: unparseable ⇒ {UNKNOWN}.
+    assert _tags("import stripe\nstripe.") == {EffectTag.UNKNOWN.value}
+
+
+# --------------------------------------------------------------------------- #
 # vault backfill (legacy tools gain effect_tags; idempotent)
 # --------------------------------------------------------------------------- #
 
@@ -192,3 +251,77 @@ def test_backfill_never_raises_on_missing_impl(tmp_path):
     # impl file does not exist — must not raise, must still stamp (empty)
     vm.backfill_effect_tags(tmp_path, version="0.9.53")
     assert "effect_tags" in json.loads((tools / "tool_x.json").read_text(encoding="utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+# R-A13b-2ii-a — the backfill money-move FLOOR (a money signal always wins)
+# --------------------------------------------------------------------------- #
+
+def test_backfill_stamps_money_move_from_stripe_source(tmp_path):
+    from systemu.runtime import vault_migrator as vm
+
+    body_path = _seed_tool(
+        tmp_path, "pay1", "payer",
+        "import stripe\ndef run(**k):\n    return stripe.PaymentIntent.create(**k)",
+    )
+    vm.backfill_effect_tags(tmp_path, version="0.9.73")
+    tags = json.loads(body_path.read_text(encoding="utf-8"))["effect_tags"]
+    assert EffectTag.MONEY_MOVE.value in tags
+
+
+def test_backfill_stamps_send_message_from_smtplib_source(tmp_path):
+    from systemu.runtime import vault_migrator as vm
+
+    body_path = _seed_tool(
+        tmp_path, "msg1", "mailer",
+        "import smtplib\ndef run():\n    s = smtplib.SMTP('h')\n    s.sendmail('a','b','c')",
+    )
+    vm.backfill_effect_tags(tmp_path, version="0.9.73")
+    tags = json.loads(body_path.read_text(encoding="utf-8"))["effect_tags"]
+    assert EffectTag.SEND_MESSAGE.value in tags
+    # a send-message tool is NOT a money-move (the floor is money-only).
+    assert EffectTag.MONEY_MOVE.value not in tags
+
+
+def test_backfill_benign_tool_gets_no_money_or_send(tmp_path):
+    from systemu.runtime import vault_migrator as vm
+
+    body_path = _seed_tool(
+        tmp_path, "b1", "reader",
+        "import requests\ndef run():\n    return requests.get('https://example.com/x')",
+    )
+    vm.backfill_effect_tags(tmp_path, version="0.9.73")
+    tags = json.loads(body_path.read_text(encoding="utf-8"))["effect_tags"]
+    assert EffectTag.MONEY_MOVE.value not in tags
+    assert EffectTag.SEND_MESSAGE.value not in tags
+
+
+def test_backfill_floor_catches_money_attr_ref_without_call(tmp_path):
+    """The FLOOR is an INDEPENDENT re-derivation, not a by-product of the structural
+    scan: even a money attr-chain the call-based visitor misses (an UNCALLED
+    reference — a decorator/partial/assignment) still floors to money_move via
+    any_money_move_signal. This is the defense-in-depth half of the merge."""
+    from systemu.runtime import vault_migrator as vm
+
+    body_path = _seed_tool(
+        tmp_path, "pay3", "deferred",
+        "import os\ndef run(client):\n    fn = client.PaymentIntent.create\n    return fn",
+    )
+    vm.backfill_effect_tags(tmp_path, version="0.9.73")
+    tags = json.loads(body_path.read_text(encoding="utf-8"))["effect_tags"]
+    assert EffectTag.MONEY_MOVE.value in tags
+
+
+def test_backfill_money_move_floor_is_idempotent(tmp_path):
+    from systemu.runtime import vault_migrator as vm
+
+    body_path = _seed_tool(
+        tmp_path, "pay2", "charger2",
+        "import requests\nrequests.post('https://api.stripe.com/v1/charges', json={})",
+    )
+    vm.backfill_effect_tags(tmp_path, version="0.9.73")
+    first = json.loads(body_path.read_text(encoding="utf-8"))["effect_tags"]
+    vm.backfill_effect_tags(tmp_path, version="0.9.73")
+    second = json.loads(body_path.read_text(encoding="utf-8"))["effect_tags"]
+    assert first == second
+    assert EffectTag.MONEY_MOVE.value in second

@@ -119,7 +119,8 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
             log.error("[EffectTagBackfill] cannot read tool index: %s", exc)
             return {"skipped": True, "reason": f"index unreadable: {exc}"}
 
-        from systemu.runtime.effect_tags import classify_source
+        from systemu.runtime.effect_tags import classify_source, EffectTag
+        from systemu.runtime import effect_signals
 
         impl_dir = vault_dir / "tools" / "implementations"
         stamped = 0
@@ -148,8 +149,19 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
                     except Exception as exc:  # noqa: BLE001
                         errors.append(f"source {tid}: {exc}")
 
+            # R-A13b-2ii-a — MERGE the structural+curated scan with the MONOTONIC
+            # money-move FLOOR: any independent money signal (import/host/attr) ALWAYS
+            # adds MONEY_MOVE, so a money-move tool can never be stamped WITHOUT it
+            # (the fail-closed-on-money-move guarantee; the floor is re-derived from
+            # source each version → idempotent). (2ii-b's `declared` merge is deferred.)
             try:
-                tags = sorted(t.value for t in classify_source(source)) if source else []
+                if source:
+                    tagset = {t.value for t in classify_source(source)}
+                    if effect_signals.any_money_move_signal(source):
+                        tagset.add(EffectTag.MONEY_MOVE.value)
+                    tags = sorted(tagset)
+                else:
+                    tags = []
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"classify {tid}: {exc}")
                 tags = []

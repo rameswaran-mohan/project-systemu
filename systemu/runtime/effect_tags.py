@@ -18,6 +18,14 @@ properties are load-bearing:
 Nothing here imports :mod:`systemu.core.models` — the vocabulary is foundational
 and must stay import-cycle-free (``core.models`` stores ``effect_tags`` as plain
 strings and never imports this module).
+
+**Cycle note (R-A13b-2ii-a).** :func:`classify_source` consults the curated
+:mod:`systemu.runtime.effect_signals` map to emit the SEMANTIC classes
+(``money_move``/``send_message``) the structural scan cannot reach. That module
+imports ``EffectTag`` from HERE at its top, so this module must import it **LAZILY
+inside** :func:`classify_source` (never at module top) — whichever module loads
+first fully initializes ``effect_tags`` (no top-level ``effect_signals`` import)
+before ``effect_signals`` pulls ``EffectTag`` back, so there is no import cycle.
 """
 from __future__ import annotations
 
@@ -127,8 +135,38 @@ _WRITE_MODE_CHARS = ("w", "a", "x", "+")
 
 
 class _EffectVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, sig=None) -> None:
         self.tags: Set[EffectTag] = set()
+        # the curated effect_signals module (lazily injected by classify_source);
+        # None ⇒ semantic classification degrades to the structural scan (defensive).
+        self._sig = sig
+
+    def _add_class(self, cls) -> None:
+        """Add the EffectTag for a curated class VALUE (e.g. "money_move"); no-op on
+        None / an unknown value. Keeps the never-raises contract."""
+        if not cls:
+            return
+        try:
+            self.tags.add(EffectTag(cls))
+        except ValueError:
+            pass
+
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802 (ast API)
+        if self._sig is not None:
+            for alias in node.names:
+                self._add_class(self._sig.class_for_import(alias.name))
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
+        if self._sig is not None and node.module:
+            self._add_class(self._sig.class_for_import(node.module))
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802
+        # a URL / host string literal names a curated endpoint (host-suffix match).
+        if self._sig is not None and isinstance(node.value, str):
+            self._add_class(self._sig.class_for_host(node.value))
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 (ast API)
         func = node.func
@@ -172,6 +210,17 @@ class _EffectVisitor(ast.NodeVisitor):
             elif attr in _ATTR_ONLY_NET_MUTATE:
                 self.tags.add(EffectTag.NET_MUTATE)
 
+            # R-A13b-2ii-a — curated SEMANTIC classes (money_move/send_message) by
+            # attr/method chain. Test the QUALIFIED 2-component chain
+            # ("PaymentIntent.create"/"messages.create") AND the bare attr
+            # ("sendmail"/"chat_postMessage"); the table omits generic verbs so a
+            # bare ".create"/".get" never over-hits.
+            if self._sig is not None:
+                self._add_class(self._sig.class_for_attrchain(attr))
+                if isinstance(func.value, ast.Attribute):
+                    self._add_class(self._sig.class_for_attrchain(
+                        f"{func.value.attr}.{attr}"))
+
         self.generic_visit(node)
 
     @staticmethod
@@ -208,6 +257,13 @@ def classify_source(code: str) -> Set[EffectTag]:
         tree = ast.parse(code)
     except SyntaxError:
         return {EffectTag.UNKNOWN}
-    visitor = _EffectVisitor()
+    # LAZY import (see the module docstring's cycle note): effect_signals imports the
+    # EffectTag enum from THIS module, so importing it here — after effect_tags is
+    # fully loaded — is cycle-free. A failure degrades to the structural scan.
+    try:
+        from systemu.runtime import effect_signals as _sig
+    except Exception:
+        _sig = None
+    visitor = _EffectVisitor(_sig)
     visitor.visit(tree)
     return visitor.tags

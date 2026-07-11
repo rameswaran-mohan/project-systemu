@@ -628,6 +628,33 @@ def _capture_presubmit_external_snapshot(decision, *, runtime=None) -> "dict":
     return snap
 
 
+# R-A13b-2ii-a — the meter-bucket severity order. money_move dominates (via the
+# money_move_net_applies short-circuit) but this also fixes the NON-money multi-tag
+# bucket: a net_mutate+send_message tool must bucket under send_message, not the
+# alphabetically-first net_mutate. Higher position = more severe.
+_EFFECT_SEVERITY = (
+    "money_move", "send_message", "oauth_call", "net_mutate",
+    "local_delete", "shell_exec", "local_write", "net_read", "local_read",
+)
+
+
+def _most_severe_effect(effect_tags) -> "Optional[str]":
+    """Pick the MOST-severe tag (by `_EFFECT_SEVERITY`) from a tool's effect_tags, so
+    the meter buckets a multi-tag tool under its most-significant effect. An
+    unlisted/exotic tag ranks least-severe but is still returned when it is the only
+    candidate (preserves the pre-fix "return something" behaviour). Empty ⇒ None."""
+    if not effect_tags:
+        return None
+    def _rank(t):
+        v = str(getattr(t, "value", t)).strip().lower()
+        try:
+            return _EFFECT_SEVERITY.index(v)
+        except ValueError:
+            return len(_EFFECT_SEVERITY)
+    chosen = min(effect_tags, key=_rank)   # min is stable → first-seen on a tie
+    return str(getattr(chosen, "value", chosen)).strip().lower()
+
+
 def _classify_external_effect(objective, decision, tool) -> "Optional[str]":
     """Deterministic effect classification for the verifier's money-move gate.
 
@@ -650,8 +677,9 @@ def _classify_external_effect(objective, decision, tool) -> "Optional[str]":
             getattr(objective, "requires_external_verification", False))
         if money_move_net_applies(effect_tags, goal, params, requires_external):
             return EffectTag.MONEY_MOVE.value
-        # otherwise pass through the tool's first declared effect tag (advisory).
-        return effect_tags[0] if effect_tags else None
+        # otherwise pass through the tool's MOST-SEVERE declared effect tag (advisory)
+        # — not the alphabetically-first tag, which mis-buckets multi-tag tools.
+        return _most_severe_effect(effect_tags)
     except Exception:
         # a classification failure must NOT open the money-move gate — but the
         # verify() money-move gate ALSO recomputes _is_money_move over the
