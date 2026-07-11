@@ -745,6 +745,39 @@ def _harness_arbitration_context(pre_inc_count: int, subagent_depth: int) -> dic
     }
 
 
+def _apply_nested_answers(target: dict, answers: dict) -> None:
+    """R-A13a — merge operator answers into ``target`` (a tool's pending parameters) at
+    each answer key's schema_path position. A key WITHOUT '/' sets a top-level param —
+    IDENTICAL to the pre-R-A13a flat merge (the v0.9.35 missing_required rail keys by
+    top-level name, never '/'). A key WITH '/' (the bundled scope card keys by full
+    schema_path, e.g. 'message/subject') sets the nested position, creating intermediate
+    dicts. A '[]' segment (an array element) is not resolvable to a single position → the
+    key is set flat (Stage-1 limitation; array-element bind-back is deferred) — never
+    dropped."""
+    for k, v in (answers or {}).items():
+        segs = str(k).split("/")
+        if len(segs) == 1 or any(s == "[]" for s in segs):
+            target[k] = v
+            continue
+        cur = target
+        ok = True
+        for seg in segs[:-1]:
+            nxt = cur.get(seg) if isinstance(cur, dict) else None
+            if isinstance(nxt, dict):
+                cur = nxt
+            elif nxt is None:
+                nxt = {}
+                cur[seg] = nxt
+                cur = nxt
+            else:                                # a scalar occupies the slot → don't clobber
+                ok = False
+                break
+        if ok:
+            cur[segs[-1]] = v
+        else:
+            target[k] = v                        # fail-safe: never drop the answer
+
+
 def _runtime_depth_from_config(config) -> int:
     """v0.9.33 Bug 3: read a runtime's subagent nesting depth off its config.
 
@@ -3689,6 +3722,52 @@ class ShadowRuntime:
             blocking=True,
         )
 
+    def _build_bundled_scope_card(self, tool_name, ask_bundle, parameters, reasoning=""):
+        """R-A13a §5.6 — one INPUT HarnessRequest for a cross-objective ask_bundle, each
+        requirement mapped to a form slot keyed by its FULL schema_path (NOT the leaf —
+        the leaf would collide same-named nested paths and lose nesting). Mirrors the
+        missing_required INPUT shape (:7381-7439): carries requested_schema + pending_tool
+        so the SAME resume rail re-dispatches with the operator's answers nested back in.
+        Returns None when the bundle yields no form slot."""
+        from systemu.core.models import HarnessRequest, HarnessKind
+        from systemu.runtime.elicitation import (
+            elicitation_schema_from_fields, split_secret_fields,
+        )
+        fields = []
+        for r in (ask_bundle or []):
+            sp = getattr(r, "schema_path", None)
+            if not sp:
+                continue
+            # R-A13a Stage 1: an ARRAY-element gap (schema_path with a '[]' segment)
+            # cannot round-trip yet — _apply_nested_answers flat-stores a '[]'-keyed
+            # answer the tool never reads, so surfacing it poses an ask the operator's
+            # answer can NOT fill. SKIP it: the top-level missing_required backstop asks
+            # for the array param satisfiably on the next call. (Array-element bind-back
+            # is a named Stage-1+ follow-up — adversarial-review LOW finding.)
+            if "[]" in str(sp):
+                continue
+            f = {"name": str(sp), "type": "string",
+                 "description": getattr(r, "rationale", "") or str(sp)}
+            if getattr(r, "kind", None) == "credential":
+                f["format"] = "password"          # → is_secret_field ⇒ URL-mode
+            fields.append(f)
+        if not fields:
+            return None
+        form_fields, secret_fields = split_secret_fields(fields)
+        return HarnessRequest(
+            kind=HarnessKind.INPUT,
+            spec={
+                "question": (f"'{tool_name}' needs {len(fields)} value(s) to proceed."),
+                "requested_schema": elicitation_schema_from_fields(form_fields),
+                "secret_fields": [f["name"] for f in secret_fields],
+                "pending_tool": {"tool_name": tool_name, "parameters": dict(parameters or {})},
+            },
+            rationale=(f"Requirements for '{tool_name}': "
+                       f"{', '.join(f['name'] for f in fields)}."),
+            fallback=reasoning or "",
+            blocking=True,
+        )
+
     def _resolve_scroll_parameters(self, scroll):
         """v0.9.35 (Phase 3): build the INPUT elicitation request for a
         BROAD-generalized scroll's captured ``parameters``.
@@ -3829,8 +3908,9 @@ class ShadowRuntime:
                     ),
                 }, current_ab)
                 return iter_budget
-            _merged = dict(_pending.get("parameters") or {})
-            _merged.update(_answers)
+            import copy as _copy
+            _merged = _copy.deepcopy(dict(_pending.get("parameters") or {}))
+            _apply_nested_answers(_merged, _answers)
             _decision = {
                 "tool_name": _pending.get("tool_name", ""),
                 "parameters": _merged,
@@ -6221,6 +6301,119 @@ class ShadowRuntime:
 
                 # ── TOOL_CALL ──────────────────────────────────────────────────────
                 elif action == "TOOL_CALL":
+                    # ── R-A13a (§5.5/§5.6) — MID-LOOP per-objective requirement binder ──
+                    # The LLM has now chosen a tool + its params for this objective, so a
+                    # REAL per-objective capability is resolvable (unlike the pre-loop
+                    # producer's capability=None). Run the binder with the call's provided
+                    # params (source #0, path-descent): a fully-provided call ⇒ EMPTY
+                    # ask_bundle ⇒ fall through UNCHANGED; a genuine (incl. NESTED) gap ⇒
+                    # a bundled scope card on the WORKING harness_request rail ⇒ SUSPEND.
+                    # Placed before the pre-submit guard because Stage 2/3 will need the
+                    # stamp landed first; with S4_STAMP=OFF the binder writes no stamp, so
+                    # ordering is inert today. Fully guarded: a missing tool / non-int
+                    # objective / no schema / any binder error is a NO-OP.
+                    if use_objectives:
+                        try:
+                            _b_tool = next(
+                                (t for t in tools if getattr(t, "name", None)
+                                 == decision.get("tool_name")), None)
+                            _b_co = decision.get("completes_objective")
+                            _b_obj = (next((o for o in objectives if o.id == _b_co), None)
+                                      if isinstance(_b_co, int) else None)
+                            _b_report = None
+                            if (_b_tool is not None and _b_obj is not None
+                                    and getattr(_b_tool, "parameters_schema", None)):
+                                from systemu.runtime.requirement_binder import (
+                                    build_requirement_report)
+                                _b_report = build_requirement_report(
+                                    [_b_obj], _b_tool,
+                                    getattr(context, "_situation_report", None) or {},
+                                    context,
+                                    provided_params=decision.get("parameters") or {})
+                            _b_ask = list(getattr(_b_report, "ask_bundle", None) or []) \
+                                if _b_report is not None else []
+                        except Exception:
+                            logger.debug("[Runtime] R-A13a mid-loop binder skipped (non-fatal)",
+                                         exc_info=True)
+                            _b_ask = []
+                        if _b_ask:
+                            try:
+                                _b_req = self._build_bundled_scope_card(
+                                    decision.get("tool_name") or "?", _b_ask,
+                                    decision.get("parameters") or {},
+                                    decision.get("reasoning", ""))
+                            except Exception:
+                                _b_req = None
+                                logger.debug("[Runtime] R-A13a card build failed — "
+                                             "falling through (fail-safe)", exc_info=True)
+                            if _b_req is not None:
+                                # Surface via the WORKING rail (mirror the missing_required
+                                # suspend rail). Headless with no queue ⇒ fall through (let
+                                # the tool call proceed / missing_required handle it) rather
+                                # than wedge.
+                                from systemu.interface.notifications import (
+                                    is_headless, _get_decision_queue)
+                                if not (_get_decision_queue() is None and is_headless()):
+                                    try:
+                                        from systemu.runtime.governor import Governor
+                                        _b_gov = governor or Governor(self.config)
+                                        _b_arb = _harness_arbitration_context(
+                                            harness_requests_this_run,
+                                            int(getattr(self, "_subagent_depth", 0)))
+                                        _b_verdict = _b_gov.arbitrate(_b_req, context=_b_arb)
+                                    except Exception:
+                                        _b_verdict = None
+                                    if _b_verdict is not None:
+                                        try:
+                                            from systemu.runtime.execution_snapshot import (
+                                                capture_from_context, write_snapshot)
+                                            import json as _json
+                                            _b_snap = capture_from_context(
+                                                execution_id=execution_id,
+                                                shadow_id=getattr(shadow, "id", ""),
+                                                scroll_id=getattr(scroll, "id", ""),
+                                                iteration=iteration,
+                                                current_action_block=current_ab,
+                                                completed_objectives=set(completed_objectives),
+                                                context=context,
+                                                activity_id=getattr(activity, "id", ""),
+                                                requests_this_run=harness_requests_this_run,
+                                                subagent_depth=int(getattr(self, "_subagent_depth", 0)),
+                                                root_execution_id=root_eid)
+                                            _b_snap.sticky_notes.append(
+                                                f"__HARNESS_PENDING__::{execution_id}::"
+                                                + _json.dumps({
+                                                    "request_id": _b_req.request_id,
+                                                    "kind": _b_req.kind.value,
+                                                    "spec": _b_req.spec,
+                                                    "fallback": _b_req.fallback}))
+                                            write_snapshot(_b_snap)
+                                        except Exception:
+                                            logger.debug("[Runtime] R-A13a snapshot failed",
+                                                         exc_info=True)
+                                        try:
+                                            from systemu.interface.harness_review import (
+                                                surface_harness_request)
+                                            _b_did = surface_harness_request(
+                                                _b_req, _b_verdict, execution_id=execution_id,
+                                                activity_id=activity.id, shadow_id=shadow.id,
+                                                vault=self.vault)
+                                            logger.info("[Runtime] R-A13a bundled scope card "
+                                                        "parked (operator card %s)", _b_did)
+                                        except Exception:
+                                            logger.debug("[Runtime] R-A13a surface failed",
+                                                         exc_info=True)
+                                        _revoke_harness_leases(record_run=False, reconcile=False)
+                                        _b_susp = context.build_result(
+                                            status="suspended_harness_escalation",
+                                            final_summary=_augment_summary_with_committed_effects(
+                                                "Parked awaiting operator input: requirement(s) "
+                                                f"for tool {decision.get('tool_name') or '?'}.",
+                                                context))
+                                        _b_susp["activity_id"] = activity.id
+                                        _b_susp["shadow_id"] = shadow.id
+                                        return _b_susp
+
                     # ── S3 / R-A7 wave-3a — PRE-SUBMIT freshness snapshot ──
                     # Before the effectful call issues, capture the pre-submit
                     # tokens/state that prove token-freshness (a token that already

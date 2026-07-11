@@ -140,7 +140,11 @@ class Requirement(BaseModel):
     kind: Literal["input", "credential", "decision", "capability"]
     schema_path: str                       # JSON-pointer into the capability schema
     state: Literal["have", "resolvable", "missing"]
-    source: Literal["schema", "situation", "runtime_error", "run_context", "operator_profile"]
+    # R-A12c: "provided" = a value the CURRENT tool-call already supplied
+    # (decision.parameters at the tool-call seam). Additive — legacy Requirements
+    # never carry it, so on-disk data validates unchanged.
+    source: Literal["schema", "situation", "runtime_error", "run_context",
+                    "operator_profile", "provided"]
     # value_origin ⇐ the source object's origin_class (table_store.py:55 canonical
     # IMMUTABLE taint: operator|systemu_authored|content_derived). IMPL-5 — copied
     # from the bind source, NEVER recomputed; content_derived never silent-binds.
@@ -396,6 +400,13 @@ class Tool(BaseModel):
     # An EMPTY list is never "no effect" — a tool with no readable source is
     # UNKNOWN-until-classified at the gate.
     effect_tags: List[str] = []
+    # R-A12c INT-1 (spec §5.8): the name of an S3 external-verification evidence
+    # channel this tool can produce (e.g. "api_readback"). None = no channel — the
+    # tool cannot yet furnish `confirmed` external ground-truth. INTERIM: the
+    # requirement binder stamps `requires_external_verification=True` ONLY where this
+    # is non-empty, so today (no shipped tool declares a channel) NO objective parks
+    # UNVERIFIED_EXTERNAL. Removed as a gate at R-A13 when S3 evidence goes live.
+    external_verification_channel: Optional[str] = None
     # W2.2: forged (LLM-generated) tools execute in a subprocess by default;
     # the operator may opt a reviewed tool back into the in-process fast path
     # (~100-500ms faster per call) by setting this. Built-ins (not forged)

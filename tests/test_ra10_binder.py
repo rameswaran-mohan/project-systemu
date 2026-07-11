@@ -58,7 +58,7 @@ class _FakeCtx:
         self.vault = None
 
 
-def _tool(name, schema, *, effect_tags=None):
+def _tool(name, schema, *, effect_tags=None, channel=None):
     return Tool(
         id="tool_" + name,
         name=name,
@@ -66,6 +66,7 @@ def _tool(name, schema, *, effect_tags=None):
         tool_type="python_function",
         parameters_schema=schema,
         effect_tags=list(effect_tags or []),
+        external_verification_channel=channel,
     )
 
 
@@ -248,28 +249,32 @@ def test_ac3_nested_array_leaf_diffed_at_depth(tmp_path):
 
 
 # ── AC4: unknown/net EffectTag ⇒ requires_external_verification=True ──────────
-def test_ac4_unknown_effect_tag_stamps_external_verification():
+# DEC-24 + S4_STAMP (supersedes INT-1): the DEC-24 classifier restores the
+# unconditional dangerous ⇒ stamp VALUE (no channel gate); the WRITE is asserted
+# under S4_STAMP=enforce (OFF, the default, never writes it — Stage 1).
+def test_ac4_unknown_effect_tag_stamps_external_verification(monkeypatch):
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("mystery", {"x": {"type": "string"}}, effect_tags=["unknown"])
-
     obj = _obj()
     compute_requirements(obj, cap, situation, ctx)
     assert obj.requires_external_verification is True
 
 
-def test_ac4_net_mutate_effect_tag_stamps_external_verification():
+def test_ac4_net_mutate_effect_tag_stamps_external_verification(monkeypatch):
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("poster", {"x": {"type": "string"}}, effect_tags=["net_mutate"])
-
     obj = _obj()
     compute_requirements(obj, cap, situation, ctx)
     assert obj.requires_external_verification is True
 
 
-def test_ac4_local_read_only_does_not_stamp():
+def test_ac4_local_read_only_does_not_stamp(monkeypatch):
     """A purely local-read capability is NOT dangerous-until-proven."""
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("reader", {"x": {"type": "string"}}, effect_tags=["local_read"])
@@ -279,13 +284,13 @@ def test_ac4_local_read_only_does_not_stamp():
     assert obj.requires_external_verification is False
 
 
-def test_ac4_empty_effect_tags_is_unknown_stamps():
+def test_ac4_empty_effect_tags_is_unknown_stamps(monkeypatch):
     """An EMPTY effect_tags list is UNKNOWN-until-classified, not 'no effect' ⇒
-    dangerous-until-proven."""
+    DEC-24 dangerous ⇒ True (BLOCKER-3 restored; no channel gate)."""
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("blank", {"x": {"type": "string"}}, effect_tags=[])
-
     obj = _obj()
     compute_requirements(obj, cap, situation, ctx)
     assert obj.requires_external_verification is True

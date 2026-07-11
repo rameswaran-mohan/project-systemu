@@ -93,8 +93,10 @@ class _BindCtx:
 
     ``situation`` is the SituationReport dict; ``ctx`` the run context; ``granted``
     the GrantedRootsStore (re-gate for source #1); ``tool_name`` feeds the path
-    oracle. The source *accessors* live on the bind functions, not here — this only
-    holds the raw material + the output list."""
+    oracle. ``provided_params`` (R-A12c) are the CURRENT tool-call's already-supplied
+    parameters (``decision.parameters`` at the tool-call seam) — source #0 reads them.
+    The source *accessors* live on the bind functions, not here — this only holds the
+    raw material + the output list."""
     situation: dict
     ctx: Any
     granted: Any
@@ -102,6 +104,63 @@ class _BindCtx:
     reqs: List[Any] = field(default_factory=list)
     t_high: float = T_HIGH
     reference_text: str = ""          # R-A11a §5.4: the objective goal text the resolver reads
+    # R-A12c: the tool-call's already-supplied params (decision.parameters). A dict or
+    # None; source #0 (_bind_provided_params) binds a required leaf whose key is present.
+    provided_params: Optional[dict] = None
+
+
+def _descend_provided(container, segs):
+    """Resolve the value at a schema-walk PATH inside a provided-params tree. ``segs`` are
+    fixture_synth._walk's accumulator segments: a property name descends a dict; the literal
+    ``'[]'`` iterates a list (EVERY element must supply the remaining sub-path — a
+    fully-provided array). Returns the bound value (the first element's, for an array), or
+    None if any segment is absent / None / type-mismatched (⇒ a real gap)."""
+    cur = container
+    for i, seg in enumerate(segs):
+        if seg == "[]":
+            if not isinstance(cur, list) or not cur:
+                return None
+            rest = segs[i + 1:]
+            first = None
+            for el in cur:
+                v = _descend_provided(el, rest) if rest else el
+                if v is None:
+                    return None
+                if first is None:
+                    first = v
+            return first
+        if not isinstance(cur, dict) or seg not in cur:
+            return None
+        cur = cur.get(seg)
+        if cur is None:
+            return None
+    return cur
+
+
+# ── source #0: a param the CURRENT tool-call ALREADY supplied (R-A12c / R-A13a) ──
+def _bind_provided_params(bc: _BindCtx, key: str, spec: dict,
+                          path: tuple = ()) -> Optional[Tuple[str, str, str, float]]:
+    """Bind a required leaf from the CURRENT tool-call's provided params, resolved BY the
+    schema-walk ``path`` (R-A13a) — NOT a flat ``key in dict`` (which falsely flagged a
+    nested/array/oneOf leaf the LLM DID supply nested: the R-A12c over-ask defects #2/#3).
+
+    IMPL-5 taint (the judgment call): raw provided params carry NO taint signal, so an
+    LLM-emitted plan value is ``systemu_authored`` (systemu's own reasoning, non-content ⇒
+    binds silently, state="have", never asked — the over-ask fix). NOT laundering: there is
+    no content_derived signal on raw provided params to preserve; a future per-key taint map
+    slots in here and would route content_derived → the ask."""
+    params = getattr(bc, "provided_params", None)
+    if not isinstance(params, dict):
+        return None
+    segs = [s for s in (path or ())]
+    if not segs:                                  # top-level leaf (or path not threaded)
+        segs = [key] if key else []
+    if not segs:
+        return None
+    val = _descend_provided(params, segs)
+    if val is None:                               # absent / None ⇒ not a supplied value
+        return None
+    return (f"provided:{'/'.join(str(s) for s in segs)}", "provided", _SYSTEMU, 1.0)
 
 
 # ── source #1: a granted-root salient FileHandle ─────────────────────────────
@@ -285,9 +344,10 @@ def _bind_schema_default(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[s
     return None
 
 
-# the ordered bind pipeline (spec §5.3)
-_SOURCES = (_bind_filehandle, _bind_run_context, _bind_inventory_entry,
-            _bind_profile, _bind_schema_default)
+# the ordered bind pipeline (spec §5.3). R-A12c: _bind_provided_params is FIRST — a
+# value the current tool-call already supplied wins over inventory / schema default.
+_SOURCES = (_bind_provided_params, _bind_filehandle, _bind_run_context,
+            _bind_inventory_entry, _bind_profile, _bind_schema_default)
 
 
 # ── small tolerant readers (TableItem-or-dict, list-or-missing) ──────────────
@@ -373,7 +433,12 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
 
         # A const/enum/default leaf: bind from source #5 (schema) — systemu's own
         # authored catalog value. It is a ``have`` (systemu_authored is trusted).
-        if schema_value is not _SENTINEL:
+        # R-A12c: UNLESS the current tool-call already supplied this param — a provided
+        # value wins over a schema default. _walk routes a default leaf straight through
+        # leaf_fn with schema_value set (never consulting _SOURCES), so we must defer to
+        # the provided source HERE; when present, fall through to the _SOURCES loop where
+        # _bind_provided_params (first) binds it.
+        if schema_value is not _SENTINEL and _bind_provided_params(bc, key, spec, path) is None:
             _emit_requirement(bc, kind=("input" if is_path else "decision"),
                               schema_path=schema_path, state="have", source="schema",
                               value_origin=_SYSTEMU,
@@ -386,7 +451,10 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
         bound = None
         for src in _SOURCES:
             try:
-                bound = src(bc, key, spec)
+                if src is _bind_provided_params:
+                    bound = src(bc, key, spec, path)
+                else:
+                    bound = src(bc, key, spec)
             except Exception:
                 logger.debug("[binder] source %s raised on %s",
                              getattr(src, "__name__", src), schema_path, exc_info=True)
@@ -448,34 +516,59 @@ def _emit_requirement(bc: _BindCtx, *, kind, schema_path, state, source, value_o
     ))
 
 
-# ── EffectTag → requires_external_verification (AC4, §5.8) ────────────────────
-def _requires_external_verification(capability) -> bool:
-    """Dangerous-until-proven: an external / irreversible / money / UNKNOWN effect
-    (or an EMPTY tag list = UNKNOWN-until-classified) ⇒ True. A capability whose
-    effects are ALL benign local-reads ⇒ False.
+def _s4_stamp_mode() -> str:
+    """R-A13a §5.8 — the 3-state S4 stamp obligation (NEVER operator-facing; Stage 3
+    removes it). Read from SYSTEMU_S4_STAMP:
+      'off' (default) — never WRITE requires_external_verification (Stage 1);
+      'shadow'        — compute + record to a shadow attr, do NOT write the live field
+                        (Stage 2, feeds the park-surface report);
+      'enforce'       — write the live field (Stage 3)."""
+    import os
+    v = str(os.environ.get("SYSTEMU_S4_STAMP", "off") or "off").strip().lower()
+    return v if v in {"off", "shadow", "enforce"} else "off"
 
-    S4 Step 0 (the None-capability guard): a ``None``/absent capability is NOT a
-    real EffectTag classification — it is "no capability resolved yet". The only
-    live binder call pre-loop passes ``capability=None`` (shadow_runtime's
-    producer), so absent this guard EVERY objective would be stamped
-    ``requires_external_verification=True`` off a phantom classification. The
-    trigger must reflect a REAL EffectTag; the real per-objective capability lands
-    with R-A12. Until then a None capability ⇒ False (do NOT stamp external)."""
+
+# DEC-24: the POSITIVE set of effects that demand external ground-truth. UNKNOWN + an
+# empty tag list still stamp (BLOCKER-3). NOT effect_tags.HIGH_SEVERITY (that has
+# LOCAL_DELETE and drops OAUTH_CALL).
+def _stamp_effect_values() -> frozenset:
+    from systemu.runtime.effect_tags import EffectTag
+    return frozenset({EffectTag.NET_MUTATE.value, EffectTag.MONEY_MOVE.value,
+                      EffectTag.SEND_MESSAGE.value, EffectTag.OAUTH_CALL.value})
+
+
+# ── EffectTag → requires_external_verification (DEC-24, §5.8) ─────────────────
+def _requires_external_verification(capability) -> bool:
+    """DEC-24: an effect in the positive _STAMP_EFFECTS set — or an UNKNOWN / empty tag
+    list (UNKNOWN-until-classified, BLOCKER-3) — demands external verification ⇒ True; all
+    other classes (local_read/write/delete, shell_exec, net_read) ⇒ False.
+
+    S4 Step 0: a None/absent capability is NOT a classification (the pre-loop producer
+    passes None) ⇒ False. NOTE: this is the VALUE only; whether it is WRITTEN onto the
+    objective is governed independently by _s4_stamp_mode() (off/shadow/enforce)."""
     if capability is None:
-        return False                             # S4: no real classification ⇒ don't stamp
+        return False
+    return _effect_tags_are_dangerous(capability)
+
+
+def _effect_tags_are_dangerous(capability) -> bool:
+    """The DEC-24 EffectTag classification (kept SEPARATE from the write-gate so the two
+    concerns stay orthogonal): any tag in _STAMP_EFFECTS ⇒ True; UNKNOWN ⇒ True; an empty /
+    unreadable tag list ⇒ True (UNKNOWN-until-classified); otherwise False. Unavailable
+    classifier ⇒ fail-safe True."""
     try:
         from systemu.runtime.effect_tags import coerce, EffectTag
     except Exception:
-        return True                              # can't classify ⇒ fail-safe dangerous
+        return True
     tags = _get(capability, "effect_tags") or []
     if not isinstance(tags, list) or not tags:
-        return True                              # [] = UNKNOWN-until-classified ⇒ dangerous
-    # the effects considered "provably safe to skip external ground-truth":
-    _BENIGN = {EffectTag.LOCAL_READ.value}
+        return True                              # [] = UNKNOWN-until-classified ⇒ stamp
+    stamp = _stamp_effect_values()
     for raw in tags:
         v = coerce(raw)
-        if v not in _BENIGN:
-            return True                          # any non-benign / UNKNOWN effect ⇒ dangerous
+        v = getattr(v, "value", v)               # coerce → str value (defensive)
+        if v == EffectTag.UNKNOWN.value or v in stamp:
+            return True
     return False
 
 
@@ -523,12 +616,14 @@ def _normalized_root(schema: dict) -> dict:
 
 
 # ── the public entry (§5.3) ──────────────────────────────────────────────────
-def compute_requirements(objective, capability, situation, ctx) -> List[Any]:
+def compute_requirements(objective, capability, situation, ctx, provided_params=None) -> List[Any]:
     """Compute the per-objective ``list[Requirement]`` by BIND-mode schema-diff.
 
-    Reads ``capability``'s schema, diffs every REQUIRED leaf against the 5 sources,
+    Reads ``capability``'s schema, diffs every REQUIRED leaf against the ordered sources,
     applies the T_high + content_derived gate (IMPL-5), and stamps
     ``requires_external_verification`` on ``objective`` from the EffectTag (AC4/§5.8).
+    ``provided_params`` (R-A12c) are the CURRENT tool-call's already-supplied params —
+    a required leaf present there binds (source #0) instead of generating a spurious ask.
     Defensive: a broken schema / missing situation yields [] or a best-effort list,
     never raises."""
     try:
@@ -540,7 +635,19 @@ def compute_requirements(objective, capability, situation, ctx) -> List[Any]:
         try:
             if (objective is not None and capability is not None
                     and hasattr(objective, "requires_external_verification")):
-                objective.requires_external_verification = _requires_external_verification(capability)
+                _mode = _s4_stamp_mode()
+                if _mode != "off":
+                    _stamp = _requires_external_verification(capability)
+                    if _mode == "enforce":
+                        objective.requires_external_verification = _stamp
+                    else:  # 'shadow' — record without writing the live gate-read field
+                        logger.debug("[binder S4-SHADOW] obj=%s would-stamp "
+                                     "requires_external_verification=%s",
+                                     _get(objective, "id"), _stamp)
+                        try:
+                            objective.__dict__["_s4_stamp_shadow"] = _stamp
+                        except Exception:
+                            pass
         except Exception:
             logger.debug("[binder] could not stamp requires_external_verification", exc_info=True)
 
@@ -559,8 +666,10 @@ def compute_requirements(objective, capability, situation, ctx) -> List[Any]:
         sit = situation if isinstance(situation, dict) else {}
         _goal = str(_get(objective, "goal") or "") if objective is not None else ""
         _crit = str(_get(objective, "success_criteria") or "") if objective is not None else ""
+        pp = provided_params if isinstance(provided_params, dict) else None
         bc = _BindCtx(situation=sit, ctx=ctx, granted=granted, tool_name=tool_name,
-                      reference_text=(_goal + " " + _crit).strip())
+                      reference_text=(_goal + " " + _crit).strip(),
+                      provided_params=pp)
         _diff_schema(bc, root)
         return bc.reqs
     except Exception:
@@ -592,11 +701,12 @@ def _needs_ask(req) -> bool:
     return _get(req, "value_origin") == _CONTENT_DERIVED
 
 
-def build_requirement_report(objectives, capability, situation, ctx):
+def build_requirement_report(objectives, capability, situation, ctx, provided_params=None):
     """Aggregate ``compute_requirements`` across objectives into a RequirementReport:
     ``per_objective`` + a DEDUPED ``ask_bundle`` (every non-'have' requirement). The
     per-objective core is ``compute_requirements``; this is the §5.6 pull/scope-card
-    feed. Defensive: never raises."""
+    feed. ``provided_params`` (R-A12c) threads the tool-call's already-supplied params
+    through to the per-objective diff. Defensive: never raises."""
     from systemu.core.models import RequirementReport
 
     per: Dict[int, List[Any]] = {}
@@ -604,7 +714,8 @@ def build_requirement_report(objectives, capability, situation, ctx):
     seen_keys = set()
     for obj in objectives or []:
         try:
-            reqs = compute_requirements(obj, capability, situation, ctx)
+            reqs = compute_requirements(obj, capability, situation, ctx,
+                                        provided_params=provided_params)
         except Exception:
             reqs = []
         oid = _get(obj, "id")

@@ -44,7 +44,7 @@ class _FakeCtx:
         self.vault = None
 
 
-def _tool(name, schema, *, effect_tags=None):
+def _tool(name, schema, *, effect_tags=None, channel=None):
     return Tool(
         id="tool_" + name,
         name=name,
@@ -52,6 +52,7 @@ def _tool(name, schema, *, effect_tags=None):
         tool_type="python_function",
         parameters_schema=schema,
         effect_tags=list(effect_tags or []),
+        external_verification_channel=channel,
     )
 
 
@@ -87,8 +88,13 @@ def test_none_capability_helper_returns_false():
     assert _requires_external_verification(None) is False
 
 
-# ── AC4 re-assertions: the guard must NOT over-correct real classifications ───
-def test_ac4_unknown_tag_still_stamps():
+# ── AC4 re-assertions, DEC-24 + S4_STAMP (supersedes INT-1): the DEC-24 classifier
+# restores the unconditional dangerous ⇒ stamp VALUE (net_mutate/unknown/empty ⇒ True;
+# local_read ⇒ False — no channel gate). Whether that value is WRITTEN is governed by
+# S4_STAMP (off/shadow/enforce); the WRITE is asserted under enforce (OFF, the default,
+# never writes it — Stage 1). R-A13 Stage 3 removes the flag and writes live.
+def test_ac4_unknown_tag_still_stamps(monkeypatch):
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("mystery", {"x": {"type": "string"}}, effect_tags=["unknown"])
@@ -97,9 +103,9 @@ def test_ac4_unknown_tag_still_stamps():
     assert obj.requires_external_verification is True
 
 
-def test_ac4_empty_tags_still_stamps():
-    """An EMPTY effect_tags list on a REAL capability is UNKNOWN-until-classified
-    (dangerous) — the guard keys on capability-is-None, not on empty tags."""
+def test_ac4_empty_tags_still_stamps(monkeypatch):
+    """An EMPTY effect_tags list is UNKNOWN-until-classified ⇒ DEC-24 True (BLOCKER-3)."""
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("blank", {"x": {"type": "string"}}, effect_tags=[])
@@ -108,7 +114,8 @@ def test_ac4_empty_tags_still_stamps():
     assert obj.requires_external_verification is True
 
 
-def test_ac4_net_mutate_still_stamps():
+def test_ac4_net_mutate_still_stamps(monkeypatch):
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("poster", {"x": {"type": "string"}}, effect_tags=["net_mutate"])
@@ -117,7 +124,8 @@ def test_ac4_net_mutate_still_stamps():
     assert obj.requires_external_verification is True
 
 
-def test_ac4_local_read_still_does_not_stamp():
+def test_ac4_local_read_still_does_not_stamp(monkeypatch):
+    monkeypatch.setenv("SYSTEMU_S4_STAMP", "enforce")
     situation = _situation()
     ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
     cap = _tool("reader", {"x": {"type": "string"}}, effect_tags=["local_read"])
