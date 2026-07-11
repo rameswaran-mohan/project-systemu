@@ -18,6 +18,7 @@ from systemu.runtime.effect_tags import EffectTag, classify_source
 
 _MONEY = EffectTag.MONEY_MOVE.value
 _SEND = EffectTag.SEND_MESSAGE.value
+_OAUTH = EffectTag.OAUTH_CALL.value
 
 
 # ── import/module roots ──────────────────────────────────────────────────────
@@ -259,3 +260,108 @@ def test_classify_source_benign_lookalike_not_money_via_broadened_table():
     tags = {t.value for t in classify_source(
         "import requests\nrequests.get('https://checkout.example.com/status')")}
     assert _MONEY not in tags and _SEND not in tags, tags
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  R-A13b-2ii-b — OAUTH_CALL curated signals (symmetric with the money/send tables).
+#  CONSERVATIVE: oauth over-classification is lower-stakes than money, but avoid
+#  benign false hits — prefer HOSTS over generic method names.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── oauth import roots (distinctive OAuth-only packages) ─────────────────────
+
+@pytest.mark.parametrize("root", [
+    "requests_oauthlib", "oauthlib", "authlib", "google_auth_oauthlib", "msal"])
+def test_class_for_import_oauth(root):
+    assert es.class_for_import(root) == _OAUTH
+
+
+@pytest.mark.parametrize("root", [
+    "requests_oauthlib.oauth2_session", "authlib.integrations.requests_client"])
+def test_class_for_import_oauth_dotted_root(root):
+    # the ROOT (first dotted component) resolves; sub-modules ride the root.
+    assert es.class_for_import(root) == _OAUTH
+
+
+@pytest.mark.parametrize("root", [
+    # benign lookalikes / unrelated packages that merely contain a substring:
+    "oauth", "oauthx", "authlibrary", "msalx", "requests", "requests_toolbelt"])
+def test_class_for_import_oauth_lookalike_is_none(root):
+    assert es.class_for_import(root) is None
+
+
+# ── oauth hosts (dedicated OAuth-only endpoints; dot-guarded suffix) ─────────
+
+@pytest.mark.parametrize("url", [
+    "https://accounts.google.com/o/oauth2/v2/auth",
+    "https://oauth2.googleapis.com/token",
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+])
+def test_class_for_host_oauth(url):
+    assert es.class_for_host(url) == _OAUTH
+
+
+@pytest.mark.parametrize("url", [
+    # github.com is DELIBERATELY not curated (too broad — would false-hit any GitHub
+    # API tool; its token endpoint shares the bare github.com host).
+    "https://github.com/login/oauth/access_token",
+    "https://api.github.com/user",
+    "https://notaccounts.google.com.evil.com/x",   # dot-guard
+    "https://example.com/oauth/token",             # generic path, uncurated host
+])
+def test_class_for_host_oauth_uncurated_is_none(url):
+    assert es.class_for_host(url) is None
+
+
+# ── oauth attr chains (distinctive OAuth-flow methods) ───────────────────────
+
+@pytest.mark.parametrize("chain", ["fetch_token", "authorize_access_token"])
+def test_class_for_attrchain_oauth(chain):
+    assert es.class_for_attrchain(chain) == _OAUTH
+
+
+@pytest.mark.parametrize("chain", [
+    # bare generic token verbs deliberately absent (too generic — a dict key /
+    # attribute everywhere).
+    "refresh_token", "token", "get_token", "create"])
+def test_class_for_attrchain_oauth_generic_is_none(chain):
+    assert es.class_for_attrchain(chain) is None
+
+
+# ── classify_source emits oauth_call on each axis ────────────────────────────
+
+def test_classify_source_oauth_via_import():
+    tags = {t.value for t in classify_source(
+        "import requests_oauthlib\ndef run(**k):\n    return requests_oauthlib.OAuth2Session()")}
+    assert _OAUTH in tags, tags
+
+
+def test_classify_source_oauth_via_host_literal():
+    tags = {t.value for t in classify_source(
+        "import requests\nrequests.post('https://oauth2.googleapis.com/token', data={})")}
+    assert _OAUTH in tags, tags
+
+
+def test_classify_source_oauth_via_attr_chain():
+    tags = {t.value for t in classify_source(
+        "def run(sess):\n    return sess.fetch_token(token_url='https://x/token')")}
+    assert _OAUTH in tags, tags
+
+
+# ── oauth is NOT money (the floor must stay money-only) ──────────────────────
+
+@pytest.mark.parametrize("src", [
+    "import requests_oauthlib\nrequests_oauthlib.OAuth2Session()",
+    "import requests\nrequests.post('https://oauth2.googleapis.com/token', data={})",
+    "def run(sess):\n    return sess.fetch_token(token_url='https://x/token')",
+])
+def test_oauth_is_not_money_move(src):
+    assert es.any_money_move_signal(src) is False, src
+
+
+def test_classify_source_benign_not_oauth():
+    # a plain get to a non-oauth host / a benign import must NOT stamp oauth_call.
+    for src in ("import requests\nrequests.get('https://example.com/x')",
+                "import os\nos.path.join('a', 'b')"):
+        tags = {t.value for t in classify_source(src)}
+        assert _OAUTH not in tags, (src, tags)

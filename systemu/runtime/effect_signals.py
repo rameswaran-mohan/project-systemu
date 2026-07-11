@@ -1,11 +1,14 @@
 # systemu/runtime/effect_signals.py
-"""R-A13b-2ii-a §5.7 — curated import/host/attr → effect-CLASS signal tables.
+"""R-A13b-2ii §5.7 — curated import/host/attr → effect-CLASS signal tables.
 
 The `_EffectVisitor` (`effect_tags.py`) is a STRUCTURAL AST scan: it can see a POST but
 not WHICH endpoint, so it structurally cannot emit the SEMANTIC classes MONEY_MOVE /
-SEND_MESSAGE (Stripe/Twilio/Slack all look like generic POSTs). This module is the
-curated semantic map it consults — pure data + a few pure lookups, exactly as
-`reference_synonyms` split the phrase→extension table out of the classifier.
+SEND_MESSAGE / OAUTH_CALL (Stripe/Twilio/Slack/Google-OAuth all look like generic POSTs).
+This module is the curated semantic map it consults — pure data + a few pure lookups,
+exactly as `reference_synonyms` split the phrase→extension table out of the classifier.
+
+R-A13b-2ii-b added OAUTH_CALL signals (CONSERVATIVE — prefer HOSTS over generic method
+names; oauth is NOT money, so `any_money_move_signal` is unaffected).
 
 Cycle-free: imports ONLY `ast` (stdlib) and the `EffectTag` enum. `effect_tags` must
 import THIS module LAZILY (inside `classify_source`) so there is no import cycle — see
@@ -26,6 +29,7 @@ from systemu.runtime.effect_tags import EffectTag
 
 _MONEY = EffectTag.MONEY_MOVE.value
 _SEND = EffectTag.SEND_MESSAGE.value
+_OAUTH = EffectTag.OAUTH_CALL.value
 
 
 # ── import / module roots ────────────────────────────────────────────────────
@@ -62,6 +66,15 @@ _IMPORT_ROOTS: "dict[str, str]" = {
     "telegram": _SEND,
     "smtplib": _SEND,
     "mailgun": _SEND,
+    # oauth-call SDKs (R-A13b-2ii-b). Each root below is a DISTINCTIVE, OAuth-only
+    # package name (no common non-oauth package shares it). CONSERVATIVE — oauth
+    # over-classification is lower-stakes than money, but a false hit on a benign
+    # tool is still avoided; the bare `oauth` root is deliberately absent (too broad).
+    "requests_oauthlib": _OAUTH,   # OAuth1Session / OAuth2Session
+    "oauthlib": _OAUTH,            # the lower-level OAuth library
+    "authlib": _OAUTH,            # Authlib client/server
+    "google_auth_oauthlib": _OAUTH,  # google-auth-oauthlib flow
+    "msal": _OAUTH,               # Microsoft Authentication Library
 }
 
 # ── URL hosts (exact or host-suffix match, dot-guarded) ──────────────────────
@@ -99,6 +112,12 @@ _HOSTS: "dict[str, str]" = {
     # send-message hosts — broadened (dedicated transactional-message APIs, send-only)
     "api.postmarkapp.com": _SEND,     # Postmark transactional email
     "api.resend.com": _SEND,          # Resend transactional email
+    # oauth-call hosts (R-A13b-2ii-b) — DEDICATED OAuth/identity endpoints only.
+    # `github.com` is DELIBERATELY absent: its token endpoint shares the bare
+    # `github.com` host, so curating it would false-hit every GitHub API tool.
+    "accounts.google.com": _OAUTH,        # Google OAuth consent + token
+    "oauth2.googleapis.com": _OAUTH,      # Google OAuth2 token endpoint
+    "login.microsoftonline.com": _OAUTH,  # Microsoft identity platform
 }
 
 # hosts that need a pattern rather than a fixed suffix (AWS SES SMTP, region-varying).
@@ -121,6 +140,11 @@ _ATTR_CHAINS: "dict[str, str]" = {
     "chat_postMessage": _SEND,     # Slack SDK: client.chat_postMessage(...)
     "sendmail": _SEND,             # smtplib: server.sendmail(...)
     "send_message": _SEND,
+    # oauth-call (R-A13b-2ii-b) — DISTINCTIVE OAuth-flow methods only. A bare generic
+    # token verb (`refresh_token`/`get_token`/`token`) is deliberately absent — it is a
+    # dict key / attribute everywhere and would over-hit benign code.
+    "fetch_token": _OAUTH,             # requests_oauthlib / authlib: session.fetch_token(...)
+    "authorize_access_token": _OAUTH,  # authlib: oauth.<provider>.authorize_access_token()
 }
 
 

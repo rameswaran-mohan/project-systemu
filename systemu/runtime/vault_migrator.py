@@ -7,6 +7,7 @@ wrapped by daemon try/except so a migration failure can't break boot.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.resources
 import json
@@ -15,7 +16,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,73 @@ def _write_text_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _declared_effect_tags(source) -> Set[str]:
+    """R-A13b-2ii-b — a tool's SELF-DECLARED effect classes from its module-level
+    ``TOOL_META = {..., "effect_tags": [...]}`` dict literal.
+
+    AST-parse only — this NEVER imports the tool module (importing risks side effects +
+    missing third-party deps; the registry itself defers import). We walk the MODULE-LEVEL
+    body for a ``TOOL_META`` assignment whose value is a dict literal, then
+    ``ast.literal_eval`` JUST the ``effect_tags`` value (robust to a future TOOL_META with
+    non-literal values on other keys). Each entry is coerced to a KNOWN tag value; anything
+    unknown / blank is skipped. NEVER raises → ``set()`` on any error.
+
+    The backfill PREFERS this declared set over the structural scan but the MONOTONIC
+    money-move FLOOR still unions ``money_move`` in, so a declaration can RAISE severity but
+    can NEVER declare-away a scanner-detected money-move (the fail-closed-on-money guarantee).
+    """
+    if not isinstance(source, str) or not source.strip():
+        return set()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    try:
+        from systemu.runtime.effect_tags import coerce, EffectTag
+        unknown = EffectTag.UNKNOWN.value
+
+        raw = None
+        found = False
+        for node in tree.body:  # MODULE-LEVEL statements only (a nested TOOL_META is ignored)
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == "TOOL_META" for t in targets):
+                continue
+            if not isinstance(value, ast.Dict):
+                continue
+            for k, v in zip(value.keys, value.values):
+                if isinstance(k, ast.Constant) and k.value == "effect_tags":
+                    try:
+                        raw = ast.literal_eval(v)
+                    except Exception:  # noqa: BLE001 — non-literal ⇒ unreadable, fall back
+                        raw = None
+                    found = True
+            if found:
+                break  # first module-level TOOL_META wins
+
+        if raw is None:
+            return set()
+        if isinstance(raw, (str, bytes)):
+            items = [raw]
+        elif isinstance(raw, (list, tuple, set, frozenset)):
+            items = list(raw)
+        else:
+            return set()
+
+        out: Set[str] = set()
+        for item in items:
+            val = coerce(item)
+            if val and val != unknown:
+                out.add(val)
+        return out
+    except Exception:  # noqa: BLE001 — declaration is best-effort; never break boot
+        return set()
+
+
 def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None) -> Dict[str, Any]:
     """G0 — one-pass, idempotent backfill of ``Tool.effect_tags`` onto every vault
     tool body, classified deterministically from its implementation source
@@ -149,15 +217,19 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
                     except Exception as exc:  # noqa: BLE001
                         errors.append(f"source {tid}: {exc}")
 
-            # R-A13b-2ii-a — MERGE the structural+curated scan with the MONOTONIC
-            # money-move FLOOR: any independent money signal (import/host/attr) ALWAYS
-            # adds MONEY_MOVE, so a money-move tool can never be stamped WITHOUT it
-            # (the fail-closed-on-money-move guarantee; the floor is re-derived from
-            # source each version → idempotent). (2ii-b's `declared` merge is deferred.)
+            # R-A13b-2ii — PREFER a tool's SELF-DECLARED effect_tags (TOOL_META) over the
+            # structural+curated scan, then apply the MONOTONIC money-move FLOOR: any
+            # independent money signal (import/host/attr) ALWAYS adds MONEY_MOVE, so a
+            # money-move tool can never be stamped WITHOUT it (the fail-closed-on-money
+            # guarantee). A declaration can RAISE severity (2ii-b) but the floor means it
+            # can NEVER declare-away a scanner-detected money-move. The floor is re-derived
+            # from source each version → idempotent.
             try:
                 if source:
-                    tagset = {t.value for t in classify_source(source)}
-                    if effect_signals.any_money_move_signal(source):
+                    declared = _declared_effect_tags(source)          # self-report (2ii-b)
+                    scanned = {t.value for t in classify_source(source)}
+                    tagset = set(declared) if declared else scanned   # declared PREFERRED
+                    if effect_signals.any_money_move_signal(source):  # MONOTONIC money FLOOR
                         tagset.add(EffectTag.MONEY_MOVE.value)
                     tags = sorted(tagset)
                 else:
