@@ -408,6 +408,13 @@ def _read_external_ok(context, objective_id) -> bool:
             entry = store.get(objective_id)      # tolerate an int-keyed in-memory store
         if not isinstance(entry, dict):
             return False
+        # R-A13b-1: a RECORD-ONLY shadow-meter entry (shadow=True) is NEVER a live
+        # credit signal — it may carry confirmed=True purely as the would-credit
+        # measurement. Refuse it so a shadow record can never credit an objective,
+        # even across a SHADOW→ENFORCE resume mode-flip. A live entry never carries
+        # ``shadow`` ⇒ OFF/ENFORCE are byte-identical.
+        if entry.get("shadow") is True:
+            return False
         return entry.get("confirmed") is True     # fail-closed: only a real bool True credits
     except Exception:
         logger.debug("[Runtime] _read_external_ok failed — fail-closed False", exc_info=True)
@@ -602,6 +609,96 @@ def _run_external_verification(runtime, *, objective, decision, tool, result,
                      exc_info=True)
         oid = getattr(objective, "id", 0) or 0
         return ExternalEvidence(objective_id=oid, confirmed=False)
+
+
+# ── R-A13b-1 — the SHADOW park-surface METER (record-only) ────────────────────
+#
+# Stage 2 of the 3-stage external-verification activation: a RECORD-ONLY branch at
+# the S4 credit seam. When an objective WOULD-stamp under the current S4 stamp mode
+# but the LIVE gate field was NOT written (SHADOW — the binder set _s4_stamp_shadow
+# only), run S3 evidence production ANYWAY, compute would-credit/would-park, and
+# RECORD it to the sink (context._external_evidence + the metrics_store bucket) — but
+# do NOT credit, enqueue a card, or suspend. This measures the REAL park-surface the
+# net would present, without arming it. Fully fail-safe: any error is a no-op. OFF and
+# ENFORCE never reach this (the caller guards on shadow-mode + _s4_stamp_shadow), so
+# they are byte-identical.
+
+def _armed_meter_objective(objective):
+    """Return a NON-MUTATING shallow copy of ``objective`` with the SHADOW
+    would-stamp state reflected onto the LIVE ``requires_external_verification``
+    field, so the meter measures the SAME armed net ENFORCE would run (invariant
+    I5 — faithful park-surface).
+
+    Why this matters: the external-verifier's money-move demotion is conditioned on
+    ``requires_external_verification`` (ExternalVerifier._is_money_move →
+    money_move_net_applies' fail-closed disjunct for an UNKNOWN effect). SHADOW
+    NEVER writes that live field (the binder sets only ``_s4_stamp_shadow``), so an
+    un-armed meter would run a WEAKER net and record a spurious would-CREDIT where
+    ENFORCE would-PARK — UNDER-counting the very park surface the Stage-3 arm gate
+    reads. Reflecting the would-stamp onto a copy closes that gap.
+
+    Record-only + fail-safe: the real objective is NEVER mutated (a shallow copy
+    isolates the write to the copy's ``__dict__``); on any copy error we return the
+    original objective (the meter degrades to the weaker net rather than crash)."""
+    try:
+        would_stamp = bool(getattr(objective, "_s4_stamp_shadow", False))
+        if not would_stamp:
+            return objective
+        import copy as _copy
+        armed = _copy.copy(objective)          # shallow: a NEW __dict__, no mutation of the original
+        try:
+            armed.requires_external_verification = True
+        except Exception:
+            armed.__dict__["requires_external_verification"] = True
+        return armed
+    except Exception:
+        logger.debug("[Runtime S4-METER] armed-objective copy failed — measuring un-armed",
+                     exc_info=True)
+        return objective
+
+
+def _record_s4_shadow_meter(runtime, context, *, objective, decision, tool, result,
+                            presubmit) -> None:
+    """Run S3 evidence production for a would-stamp SHADOW objective and RECORD the
+    would-credit/would-park outcome. RECORD-ONLY — never touches the credit decision.
+    Never raises."""
+    try:
+        # I5 (faithful park-surface): measure the ARMED net. The real objective is
+        # never mutated (record-only) — the copy reflects the would-stamp onto the
+        # live requires_external_verification field the money-move demotion reads.
+        _armed = _armed_meter_objective(objective)
+        ev = _run_external_verification(runtime, objective=_armed, decision=decision,
+                                        tool=tool, result=result, presubmit=presubmit)
+        would_credit = bool(getattr(ev, "confirmed", False))
+        effect_class = _classify_external_effect(_armed, decision, tool) or "unknown"
+        # run-local sink: reuse the single-writer persist, then AUGMENT the stored
+        # entry with the shadow-meter tags (shadow=True keeps _read_external_ok from
+        # ever mistaking it for a live credit).
+        try:
+            _persist_external_evidence(context, ev)
+            oid = getattr(objective, "id", None)
+            store = getattr(context, "_external_evidence", None)
+            entry = store.get(str(oid)) if (isinstance(store, dict) and oid is not None) else None
+            if isinstance(entry, dict):
+                entry["shadow"] = True
+                entry["would_credit"] = would_credit
+                entry["would_park"] = not would_credit
+                entry["effect_class"] = effect_class
+        except Exception:
+            logger.debug("[Runtime S4-METER] shadow evidence persist failed (swallowed)",
+                         exc_info=True)
+        # cross-run aggregation: the SINGLE pinnable metrics writer-site (CONC-MAP).
+        try:
+            from systemu.runtime.metrics_store import MetricsStore
+            MetricsStore(Path(runtime.vault.root) / "metrics").incr_s4_shadow_meter(
+                effect_class, would_credit=would_credit)
+        except Exception:
+            logger.debug("[Runtime S4-METER] metrics incr failed (swallowed)", exc_info=True)
+        logger.debug("[Runtime S4-METER] obj=%s effect=%s → %s (record-only)",
+                     getattr(objective, "id", None), effect_class,
+                     "would_credit" if would_credit else "would_park")
+    except Exception:
+        logger.debug("[Runtime S4-METER] shadow meter errored — no-op", exc_info=True)
 
 
 # ── S3 / R-A7 wave-3b — IMPL-6 mid-run ambiguous-outcome detector ─────────────
@@ -7084,6 +7181,35 @@ class ShadowRuntime:
                                             },
                                             current_ab,
                                         )
+
+                                # ── R-A13b-1: SHADOW park-surface METER (RECORD-ONLY) ──
+                                # When the objective WOULD-stamp under the current S4
+                                # stamp mode but the LIVE gate field was NOT written
+                                # (SHADOW: _needs_external False + _s4_stamp_shadow True),
+                                # run S3 evidence production and RECORD would-credit/
+                                # would-park — but NEVER credit/card/suspend. Additive:
+                                # OFF/ENFORCE never enter this branch (byte-identical);
+                                # _do_credit is already finalized above and is untouched.
+                                # Fully fail-safe (guarded end-to-end).
+                                try:
+                                    from systemu.runtime.requirement_binder import (
+                                        _s4_stamp_mode as _s4_mode)
+                                    if (not _needs_external and _s4_obj is not None
+                                            and _s4_mode() == "shadow"
+                                            and bool(getattr(_s4_obj, "_s4_stamp_shadow", False))):
+                                        _meter_tool = next(
+                                            (t for t in tools if getattr(t, "name", None)
+                                             == decision.get("tool_name")), None)
+                                        _meter_presub = (
+                                            getattr(self, "_presubmit_external_snapshot", None)
+                                            or {"presubmit_tokens": [], "pre_submit_absent": False})
+                                        _record_s4_shadow_meter(
+                                            self, context, objective=_s4_obj, decision=decision,
+                                            tool=_meter_tool, result=result,
+                                            presubmit=_meter_presub)
+                                except Exception:
+                                    logger.debug("[Runtime S4-METER] meter guard errored — no-op",
+                                                 exc_info=True)
 
                                 if _do_credit:
                                     completed_objectives.add(completed_obj)

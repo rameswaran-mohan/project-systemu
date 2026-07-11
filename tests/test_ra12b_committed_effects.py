@@ -73,6 +73,35 @@ class TestRenderCommittedEffects:
         assert out.startswith("Already committed this run:")
         assert "created issue #412" in out
 
+    def test_shadow_meter_entry_is_skipped(self):
+        """R-A13b-1 FIX A — a RECORD-ONLY shadow-meter measurement (shadow=True,
+        even when it carries confirmed=True as its would-credit measurement) is an
+        instrumentation artifact and MUST NOT render in the operator committed-
+        effects ledger — symmetric with _read_external_ok, which also refuses a
+        shadow entry. A LIVE (shadow-absent) confirmed entry STILL renders."""
+        from systemu.runtime.committed_effects import (
+            render_committed_effects, committed_effect_details)
+        ev = {
+            # a LIVE confirmed effect (ENFORCE path) — MUST still render.
+            "1": {"confirmed": True, "detail": "created issue #412"},
+            # a shadow-meter would-credit measurement — MUST be suppressed.
+            "2": {"confirmed": True, "shadow": True, "would_credit": True,
+                  "detail": "token echo matched (host-pinned https, fresh)"},
+        }
+        details = committed_effect_details(ev)
+        assert details == ["created issue #412"], details
+        out = render_committed_effects(ev)
+        assert "created issue #412" in out
+        assert "token echo matched" not in out
+
+    def test_shadow_only_store_renders_nothing(self):
+        """A store containing ONLY shadow-meter entries renders an EMPTY ledger — a
+        SHADOW run's summary is identical to a no-meter SHADOW run (no leak)."""
+        from systemu.runtime.committed_effects import render_committed_effects
+        assert render_committed_effects(
+            {"1": {"confirmed": True, "shadow": True, "would_credit": True,
+                   "detail": "token echo matched (fresh)"}}) == ""
+
 
 # ── Part B — the wiring seam ────────────────────────────────────────────────
 class TestFinalizerWiring:

@@ -38,8 +38,10 @@ def committed_effect_details(external_evidence: dict) -> List[str]:
     own ``objective_id``). Entries whose key/id is not an int sort deterministically
     AFTER the int-keyed ones (by their detail text) so the output is still stable.
 
-    Filters out: a non-dict store, a non-dict entry, an entry not ``confirmed is
-    True``, and an entry with a missing/blank/non-str ``detail``. Never raises.
+    Filters out: a non-dict store, a non-dict entry, a RECORD-ONLY shadow-meter
+    entry (``shadow is True`` — an instrumentation artifact, never a committed
+    effect), an entry not ``confirmed is True``, and an entry with a
+    missing/blank/non-str ``detail``. Never raises.
     """
     if not isinstance(external_evidence, dict):
         return []
@@ -48,6 +50,15 @@ def committed_effect_details(external_evidence: dict) -> List[str]:
     for key, entry in external_evidence.items():
         try:
             if not isinstance(entry, dict):
+                continue
+            # R-A13b-1: a RECORD-ONLY shadow-meter measurement (shadow=True) is an
+            # instrumentation artifact, NEVER an operator-facing committed effect —
+            # even when it carries confirmed=True purely as its would-credit
+            # measurement. Skip it, symmetric with _read_external_ok (shadow_runtime.py),
+            # which also refuses a shadow entry. A shadow-meter would-credit belongs
+            # only to the metrics report, not this ledger; a LIVE entry never carries
+            # ``shadow`` ⇒ the operator ledger is unchanged for OFF/ENFORCE runs.
+            if entry.get("shadow") is True:
                 continue
             # fail-closed: ONLY the real bool True credits (mirrors _read_external_ok).
             if entry.get("confirmed") is not True:

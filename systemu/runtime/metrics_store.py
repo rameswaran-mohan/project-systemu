@@ -99,6 +99,38 @@ class MetricsStore:
         state[key] = int(state.get(key, 0) or 0) + 1
         self._write_atomic(state)
 
+    def incr_s4_shadow_meter(self, effect_class: Any, *, would_credit: bool) -> None:
+        """R-A13b-1 — the SHADOW park-surface meter's cross-run counter.
+
+        The SINGLE pinnable writer-site for the S4 credit-seam shadow meter (see
+        docs/CONC-MAP.md + tests/test_conc_map_writer_ownership.py). Records, per
+        effect-class, ``{would_stamp, would_credit, would_park}`` under the
+        ``s4_shadow`` bucket: every call bumps ``would_stamp`` and exactly one of
+        ``would_credit`` / ``would_park``. A None/blank effect-class buckets as
+        ``"unknown"`` (mirrors the DEC-24 UNKNOWN-until-classified convention).
+        RECORD-ONLY — this store never gates a credit. Runs on the shadow exec
+        thread (same single writer as ``incr``); atomic + defensive."""
+        state = self._load()
+        bucket = state.get("s4_shadow")
+        if not isinstance(bucket, dict):
+            bucket = {}
+        ec = str(effect_class).strip().lower() if effect_class else "unknown"
+        cell = bucket.get(ec)
+        if not isinstance(cell, dict):
+            cell = {"would_stamp": 0, "would_credit": 0, "would_park": 0}
+        cell["would_stamp"] = int(cell.get("would_stamp", 0) or 0) + 1
+        _outcome = "would_credit" if would_credit else "would_park"
+        cell[_outcome] = int(cell.get(_outcome, 0) or 0) + 1
+        bucket[ec] = cell
+        state["s4_shadow"] = bucket
+        self._write_atomic(state)
+
+    def shadow_meter_snapshot(self) -> Dict[str, Any]:
+        """The R-A13b-1 park-surface report: ``{effect_class: {would_stamp,
+        would_credit, would_park}}``. Defensive — a missing/corrupt bucket ⇒ {}."""
+        bucket = self._load().get("s4_shadow")
+        return dict(bucket) if isinstance(bucket, dict) else {}
+
     def record_resolution(self, latency_ms: float, ts: float, choice: str = "") -> None:
         """Record a gate-card resolution: latency sample, resolved count,
         choice-specific counter, and bulk-approve detection against the

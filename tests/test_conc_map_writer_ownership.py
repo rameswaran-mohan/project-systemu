@@ -83,6 +83,14 @@ WRITER_OWNERSHIP = {
         "def": "runtime/metrics_store.py",
         "note": "Resolution-side writer set; creation side is incr() on the exec thread.",
     },
+    "S4 shadow meter (<root>/metrics/metrics.json — s4_shadow bucket)": {
+        "call": "incr_s4_shadow_meter(",
+        "allowed": {"runtime/shadow_runtime.py"},  # the record-only meter at the credit seam
+        "def": "runtime/metrics_store.py",
+        "note": ("R-A13b-1 park-surface meter: the SOLE writer is the shadow exec loop's "
+                 "credit-seam meter branch (record-only, same single writer thread as incr()). "
+                 "Any further writer needs a DEC-10 review + this allowlist update."),
+    },
     "R-P1 resolve audit (<root>/messaging/resolve_audit.jsonl)": {
         "call": "_audit(",
         "allowed": {"messaging/decision_bridge.py"},
