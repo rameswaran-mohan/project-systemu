@@ -1478,6 +1478,54 @@ def debug_tool_metrics(low_success: bool, threshold: float, min_calls: int):
     console.print(table)
 
 
+@debug_group.command("s4-shadow-meter")
+@click.option("--min-runs", default=20, type=int,
+              help="Coverage threshold for the Stage-3 arm-gate (default 20).")
+@click.pass_context
+def debug_s4_shadow_meter(ctx, min_runs: int):
+    """SHADOW park-surface report for the external-verification net (R-A13b-2iii).
+
+    Reads the record-only ``s4_shadow`` meter (``<vault>/metrics/metrics.json``) and
+    renders, per effect-class, ``would_stamp / would_credit / would_park / park_rate``,
+    then prints the pure Stage-3 arm-gate verdict (READY / NOT_READY + reasons).
+
+    READ-ONLY diagnostics — this command never writes the meter, the credit path, or any
+    store. The verdict is NOT ``would_park==0``: it requires coverage >= --min-runs, no
+    benign class stamping (effect_tags mis-wire ⇒ spurious park), and every stamped class
+    with an actual credit channel (a stamp-only class ⇒ dead channel ⇒ spurious park).
+    """
+    from systemu.runtime.metrics_store import MetricsStore
+    from systemu.runtime.s4_activation import (
+        arm_verdict_line, format_shadow_meter_rows,
+    )
+    _, vault = _get_vault_and_config(ctx)
+    snapshot = MetricsStore(Path(vault.root) / "metrics").shadow_meter_snapshot()
+    if not snapshot:
+        console.print(
+            "[dim]no shadow-meter data yet — run in SHADOW mode "
+            "(SYSTEMU_S4_STAMP=shadow) to accumulate.[/dim]"
+        )
+        return
+
+    table = Table(title="🛰️  S4 SHADOW park-surface meter", show_lines=False)
+    table.add_column("Effect class", style="cyan")
+    table.add_column("Stamp",  justify="right")
+    table.add_column("Credit", justify="right", style="green")
+    table.add_column("Park",   justify="right", style="yellow")
+    table.add_column("Park rate", justify="right", style="bold")
+    for r in format_shadow_meter_rows(snapshot):
+        table.add_row(
+            r["effect_class"],
+            str(r["would_stamp"]),
+            str(r["would_credit"]),
+            str(r["would_park"]),
+            f"{r['park_rate']:.2f}",
+        )
+    console.print(table)
+    # verdict via click.echo (unwrapped plain stdout so operators + tests read it whole).
+    click.echo(arm_verdict_line(snapshot, min_runs=min_runs))
+
+
 @debug_group.command("rejection-log")
 @click.option("--clear", is_flag=True, help="Wipe the rejection store after listing.")
 @click.option("--window-hours", default=None, type=int,
