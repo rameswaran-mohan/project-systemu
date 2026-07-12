@@ -910,7 +910,17 @@ def _mcp_actuation_link(runtime, context, *, objective, decision, result) -> boo
         aresult = ActionResult(
             success=bool(getattr(result, "success", False)),
             response=response, raw=parsed)
-        ev = McpActuationModality(runtime).capture_evidence(action, aresult)
+        # thread the PRE-SUBMIT freshness snapshot (captured before the mutation, one-
+        # shot) so a money-move MCP effect with a curated readback template can be
+        # credited on a provably-fresh readback; consume it. None ⇒ the modality's
+        # default (probe_ran=False) ⇒ money-move stays fail-closed.
+        _mcp_presub = getattr(runtime, "_mcp_presubmit_snapshot", None)
+        try:
+            runtime._mcp_presubmit_snapshot = None
+        except Exception:
+            pass
+        ev = McpActuationModality(runtime).capture_evidence(
+            action, aresult, presubmit=_mcp_presub)
         # PERSIST the receipt regardless of gating (best-effort provenance for DEC-13).
         if ev is not None:
             _persist_external_evidence(context, ev)
@@ -7071,6 +7081,30 @@ class ShadowRuntime:
                                         decision, runtime=self))
                     except Exception:
                         logger.debug("[Runtime] presubmit snapshot guard failed",
+                                     exc_info=True)
+                    # R-A14a: for a KNOWN-mutation money-move MCP call whose readback
+                    # target is knowable PRE-SUBMIT (a curated idempotency template),
+                    # run the independent pre-submit freshness probe BEFORE the mutation
+                    # and stash it for the credit-seam capture_evidence. DORMANT + no-op
+                    # when no template is curated (probe_ran=False) → byte-identical to
+                    # today until a real money-move MCP tool is curated.
+                    self._mcp_presubmit_snapshot = None
+                    try:
+                        _mcp_entry = _known_mutation_mcp_entry(decision)
+                        if _mcp_entry is not None and _is_money_move_seam(
+                                None, decision, _mcp_entry):
+                            from systemu.runtime.actuation.mcp_modality import (
+                                McpActuationModality)
+                            from systemu.runtime.actuation.modality import Action as _Act
+                            _mcp_probe_action = _Act(
+                                modality="mcp",
+                                name=(decision.get("tool_name") or ""),
+                                params=(decision.get("parameters") or {}),
+                                is_mutation=True, objective=None, tool=_mcp_entry)
+                            self._mcp_presubmit_snapshot = (
+                                McpActuationModality(self).probe_presubmit(_mcp_probe_action))
+                    except Exception:
+                        logger.debug("[Runtime R-A14a] mcp pre-submit probe guard failed",
                                      exc_info=True)
                     result = await self._handle_tool_call(
                         decision, tools, context, current_ab, dry_run,

@@ -115,8 +115,35 @@ class McpActuationModality:
                 raw=out)
         return ActionResult(success=True, response=(out or {}).get("response"), raw=out)
 
+    def probe_presubmit(self, action: Action) -> dict:
+        """Run the PRE-SUBMIT freshness probe for a money-move MCP mutation whose
+        readback target is knowable BEFORE the mutation (a client-provided
+        idempotency token + a curated readback template). MUST be called BEFORE the
+        mutation. Returns a freshness snapshot: ``probe_ran`` + ``presubmit_tokens``
+        + ``pre_submit_absent`` + ``probed_url``/``probed_tokens``. Returns a
+        ``probe_ran=False`` snapshot when no probe could run (no curated template, no
+        client, or any error) ⇒ freshness UNPROVABLE ⇒ the reused money-move gate
+        keeps the effect fail-closed. Never raises."""
+        unproven = {"presubmit_tokens": [], "pre_submit_absent": False,
+                    "probe_ran": False, "probed_url": "", "probed_tokens": []}
+        try:
+            from systemu.runtime.actuation.mcp_readback import presubmit_directive_from_params
+            directive = presubmit_directive_from_params(
+                getattr(action, "name", None), getattr(action, "params", None) or {})
+            if directive is None:
+                return dict(unproven)
+            from systemu.runtime.shadow_runtime import _probe_presubmit_absence
+            probe = _probe_presubmit_absence(self._runtime, directive)
+            if not probe:
+                return dict(unproven)
+            return {"probe_ran": True, **probe}
+        except Exception:
+            logger.debug("[McpModality] probe_presubmit failed — unprovable (fail-closed)",
+                         exc_info=True)
+            return dict(unproven)
+
     def capture_evidence(
-        self, action: Action, result: ActionResult
+        self, action: Action, result: ActionResult, *, presubmit: Optional[dict] = None
     ) -> Optional[ExternalEvidence]:
         """Turn a KNOWN-mutation MCP result into an ``ExternalEvidence`` by REUSING the
         money-move-safe verification engine (never a new confirm path).
@@ -133,7 +160,7 @@ class McpActuationModality:
             is_money = self._is_money_move(action)
             if directive is None and not is_money:
                 return None  # non-money mutation, no evidence channel → today's behavior
-            return self._verify(action, directive or {})
+            return self._verify(action, directive or {}, presubmit=presubmit)
         except Exception:
             logger.debug("[McpModality] capture_evidence failed — fail-closed", exc_info=True)
             # a money-move must NEVER silently credit: hand back an UNCONFIRMED evidence
@@ -146,20 +173,26 @@ class McpActuationModality:
             return None
 
     # ── internals ────────────────────────────────────────────────────────────
-    def _verify(self, action: Action, directive: dict) -> ExternalEvidence:
+    def _verify(self, action: Action, directive: dict, *,
+                presubmit: Optional[dict] = None) -> ExternalEvidence:
         """Drive the EXISTING credit-seam engine (host-pin + https + freshness +
         money-move gate + branch-2 skip), returning its ExternalEvidence. The directive
         is threaded exactly as a tool's ``parsed['external']`` envelope so
         ``_run_external_verification`` treats an MCP mutation identically to any other
-        externally-verified effect. No pre-submit probe runs for MCP in slices 1+2, so a
-        money-move (whose freshness may come ONLY from a real probe) fails closed unless
-        it self-supplied nothing hardened — the reused engine enforces that."""
+        externally-verified effect.
+
+        ``presubmit`` (from ``probe_presubmit``, run BEFORE the mutation) supplies the
+        freshness proof: with ``probe_ran=True`` + the probed url/tokens bound to the
+        credited resource, the reused engine credits a money-move; absent a probe
+        (the default), a money-move stays fail-closed (freshness unprovable). The
+        reused engine — not this method — enforces the money-move gate."""
         import types as _types
         from systemu.runtime.shadow_runtime import _run_external_verification
         shim = _types.SimpleNamespace(parsed={"external": dict(directive)})
         decision = {"parameters": dict(action.params or {})}
-        presub = {"presubmit_tokens": [], "pre_submit_absent": False,
-                  "probe_ran": False, "probed_url": "", "probed_tokens": []}
+        presub = presubmit if presubmit is not None else {
+            "presubmit_tokens": [], "pre_submit_absent": False,
+            "probe_ran": False, "probed_url": "", "probed_tokens": []}
         return _run_external_verification(
             self._runtime, objective=action.objective, decision=decision,
             tool=action.tool, result=shim, presubmit=presub)
