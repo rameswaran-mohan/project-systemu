@@ -1199,10 +1199,13 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
         return
 
     if not scope_id:
-        click.echo(
-            "ERROR: SCOPE_ID is required (or pass --set-passphrase).", err=True
-        )
-        sys.exit(2)
+        # R-UX1 (SPEC §15-UX UX-4): bare `doctor` = whole-system self-diagnosis
+        # ("why is nothing happening?") — provider / keyring / daemon health plus
+        # the ONE cross-OS capability profile. `doctor <scope_id>` still diagnoses
+        # a specific scroll/activity/shadow/tool below. Exits nonzero on a real
+        # (blocking) problem.
+        from systemu.interface.cli_commands import run_self_diagnosis
+        sys.exit(run_self_diagnosis())
 
     from systemu.recovery.engine import RecoveryEngine
     from systemu.storage.sqlite.vault import SqliteVault

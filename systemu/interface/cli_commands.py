@@ -1370,6 +1370,107 @@ def daemon_status(ctx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  doctor — self-diagnosis (R-UX1 / SPEC §15-UX UX-4)
+# ─────────────────────────────────────────────────────────────────────────────
+#  A NEW top-level command (distinct from `tools deps doctor`, which scans
+#  cross-tool dep conflicts). When a user sees "nothing happening", `doctor`
+#  answers WHY — killed/absent provider, locked keyring, dead daemon — and
+#  renders the ONE deterministic platform capability profile. Exits NONZERO
+#  when a real (blocking) problem is present.
+
+def _render_doctor_report(report: dict) -> None:
+    """Paint the self-diagnosis report (never prints a secret VALUE)."""
+    prof = report["profile"]
+
+    # -- headline status --------------------------------------------------
+    if report["ok"]:
+        if any(p["severity"] == "warning" for p in report["problems"]):
+            console.print("[yellow]▲ Systemu is usable, with warnings.[/yellow]")
+        else:
+            console.print("[green]● Systemu looks healthy.[/green]")
+    else:
+        console.print("[red]✗ Systemu has a blocking problem — see below.[/red]")
+
+    # -- problems ---------------------------------------------------------
+    if report["problems"]:
+        tbl = Table(title="Diagnosis", show_header=True, header_style="bold")
+        tbl.add_column("", width=3)
+        tbl.add_column("Problem")
+        tbl.add_column("Fix")
+        for p in report["problems"]:
+            mark = "[red]✗[/red]" if p["blocking"] else "[yellow]▲[/yellow]"
+            tbl.add_row(mark, p["message"], p.get("cta", ""))
+        console.print(tbl)
+
+    # -- live status ------------------------------------------------------
+    prov = report["provider"]
+    prov_txt = ("not configured" if not prov["configured"]
+                else ("unreachable" if prov["reachable"] is False else "configured"))
+    kr = report["keyring"]
+    kr_txt = f"{kr['backend']}{' (LOCKED)' if kr['locked'] else ''}"
+    dae = report["daemon"]["running"]
+    dae_txt = "running" if dae else ("not running" if dae is False else "unknown")
+
+    status = Table(show_header=True, header_style="bold", title="Status")
+    status.add_column("Check")
+    status.add_column("Value")
+    status.add_row("LLM provider", prov_txt)
+    status.add_row("Keyring backend", kr_txt)
+    status.add_row("Daemon", dae_txt)
+    status.add_row("systemu version", report["versions"].get("systemu", "?"))
+    status.add_row("python version", report["versions"].get("python", "?"))
+    if report.get("last_error"):
+        status.add_row("Last error", str(report["last_error"]))
+    console.print(status)
+
+    # -- the platform capability profile (the ONE cross-OS map) -----------
+    cap = Table(show_header=True, header_style="bold", title="Platform capability profile")
+    cap.add_column("Capability")
+    cap.add_column("Value")
+    cap.add_row("OS / arch", f"{prof['os']} ({prof['os_family']}) / {prof['arch']}")
+    cap.add_row("Docker mode", "yes" if prof["docker_mode"] else "no")
+    cap.add_row("Capture available", "yes" if prof["capture_available"] else "no")
+    cap.add_row("Keyring backend", prof["keyring_backend"])
+    cap.add_row("Forged-network jail", prof["forged_net_jail"])
+    cap.add_row("Provider configured", "yes" if prof["provider_configured"] else "no")
+    console.print(cap)
+
+    # -- DEP-10 host-capability honesty rows ------------------------------
+    hc = Table(show_header=True, header_style="bold",
+               title="Host capabilities (DEP-10 — never faked in a container)")
+    hc.add_column("Capability")
+    hc.add_column("Available")
+    hc.add_column("Via")
+    hc.add_column("Note")
+    for row in prof["host_capabilities"]:
+        hc.add_row(row["label"], "yes" if row["available"] else "no",
+                   row["via"], row["note"] or "—")
+    console.print(hc)
+
+
+def run_self_diagnosis() -> int:
+    """Build + render the whole-system self-diagnosis and return its exit code
+    (nonzero on a blocking problem). Shared by ``doctor_cmd`` here and the
+    bare ``sharing_on doctor`` (no scope_id) entry point."""
+    from systemu.runtime import platform_profile as pp
+
+    report = pp.build_doctor_report()
+    _render_doctor_report(report)
+    return pp.report_exit_code(report)
+
+
+@click.command("doctor")
+def doctor_cmd():
+    """Self-diagnosis: WHY is nothing happening? Reports provider / keyring /
+    daemon health and the platform capability profile. Exits nonzero on a real
+    problem (killed provider, locked keyring)."""
+    code = run_self_diagnosis()
+    if code != 0:
+        import sys as _sys
+        _sys.exit(code)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  debug group (v0.4.0-0)
 # ─────────────────────────────────────────────────────────────────────────────
 #  Operator-facing diagnostics for failure-mode analysis.  Lives under a

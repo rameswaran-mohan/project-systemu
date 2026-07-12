@@ -1103,6 +1103,15 @@ def register_routes() -> None:
         with _build_layout("Insights", "/insights"):
             build_insights_page(default_tab=tab)
 
+    # ── Health (R-UX1: self-diagnosis + the cross-OS capability profile) ──
+    # Spine-less like /welcome — the "why is nothing happening?" page. Always
+    # reachable (no welcome redirect: a broken install must be diagnosable).
+    @ui.page("/health")
+    def page_health():
+        from systemu.interface.pages.health import build_health_page
+        with _build_layout("Health", "/health"):
+            build_health_page()
+
     @ui.page("/memory/{shadow_id}")
     def page_shadow_memory(shadow_id: str):
         if _redirect_to_welcome_if_needed():

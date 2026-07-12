@@ -17,6 +17,35 @@ def mask_secret(value: Optional[str]) -> str:
     return f"<redacted:{value[-4:]}>" if len(value) >= 4 else "<redacted>"
 
 
+def usable_keyring():
+    """Return the ``keyring`` module iff a REAL OS keyring backend is usable on
+    this host, else ``None``.
+
+    ``keyring.get_keyring()`` does not raise on a headless box with no
+    Keychain/SecretService — it returns a ``fail``/``null`` sentinel backend
+    that only raises at get/set time. Treating that sentinel as "present" would
+    (a) route every secret through a doomed set() that then falls back anyway,
+    and (b) make the profile report a keyring that cannot actually hold a
+    secret. So we reject the sentinel backends here — this is the single
+    source-of-truth probe consumed by both the store and ``platform_profile``.
+    Import-guarded: never raises.
+    """
+    try:
+        import keyring
+        backend = keyring.get_keyring()
+    except Exception:
+        return None
+    module = (type(backend).__module__ or "").lower()
+    if "fail" in module or "null" in module:
+        return None
+    try:
+        if float(getattr(backend, "priority", 1)) <= 0:
+            return None
+    except Exception:
+        pass
+    return keyring
+
+
 class CredentialStore:
     """keyring-backed secret store; falls back to a 0600 JSON file under the vault dir."""
 
@@ -25,13 +54,16 @@ class CredentialStore:
         self._keyring = self._init_keyring()
 
     def _init_keyring(self):
-        try:
-            import keyring
-            keyring.get_keyring()
-            return keyring
-        except Exception as exc:  # pragma: no cover - env dependent
-            logger.warning("[Credentials] keyring unavailable (%s); using 0600 file fallback", exc)
-            return None
+        # DEP-1/6: prefer the OS keyring. usable_keyring() rejects the fail/null
+        # sentinel backends so a secret is NEVER routed through a doomed keyring
+        # write when there is no real backend — the flagged plaintext fallback
+        # is used instead. The warning FLAGS that last-resort loudly.
+        kr = usable_keyring()
+        if kr is None:
+            logger.warning(
+                "[Credentials] no usable OS keyring backend — secrets fall back "
+                "to a flagged at-rest file (DPAPI on Windows, 0600 plaintext on POSIX)")
+        return kr
 
     @property
     def _file(self) -> Path:
