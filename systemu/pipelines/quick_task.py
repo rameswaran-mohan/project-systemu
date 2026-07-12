@@ -930,6 +930,11 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
             "error": result.error,
             "files_produced": list(result.files_produced),
             "lane": "quick",
+            # R-P3a: persist the run's DURABLE cost rows onto the chat entry so the
+            # quick-lane per-run cost chip survives a reload (the live ledger is
+            # in-process only) + the run's execution_id for the exec-id meta.
+            "execution_id": getattr(result, "execution_id", "") or "",
+            "cost": list(getattr(result, "cost", []) or []),
         })
     except Exception:
         logger.debug("[QuickTask] could not update chat history", exc_info=True)

@@ -217,6 +217,18 @@ def build_chat_page(prefill: str = "") -> None:
                         meta += f"  ·  shadow: {resolve_name(sid, vault)}"
                     if exec_id:
                         meta += f"  ·  exec: {short_id(exec_id)}"
+                    # R-P3a: the quick-lane per-run cost drill-down. The Home daily
+                    # total spans BOTH lanes; without this the quick lane was the one
+                    # lane with no per-run cost surface (its runs aren't Work rows).
+                    # Key on the entry's DURABLE cost rows (persisted onto the entry so
+                    # the chip survives a reload); fall back to the live ledger by eid.
+                    try:
+                        from systemu.runtime import costing as _costing
+                        _chip = _costing.cost_chip_for(entry.get("cost") or exec_id)
+                        if _chip:
+                            meta += "  ·  " + _chip
+                    except Exception:
+                        pass
                     miss = entry.get("missing_tools") or []
                     if status == "waiting_on_tools" and miss:
                         meta += "  ·  needs: " + ", ".join(miss[:4])

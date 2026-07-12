@@ -439,3 +439,14 @@ def chip_text(summary: CostSummary) -> str:
     total_tok = int(summary.tokens_in) + int(summary.tokens_out)
     money = format_money(summary.total) if summary.total_known else "—"
     return f"{money} · {format_tokens(total_tok)} tok"
+
+
+def cost_chip_for(run: Any) -> Optional[str]:
+    """The per-run cost chip for a surface, or ``None`` when the run had no LLM
+    usage (so a zero-cost run shows no chip). ``run`` is anything ``cost_of``
+    accepts (an execution_id, a record, or usage rows). Used by BOTH lanes — the
+    Work row and the quick-lane chat entry — so neither is a cost blind spot."""
+    summary = cost_of(run)
+    if (summary.tokens_in + summary.tokens_out) <= 0:
+        return None
+    return chip_text(summary)

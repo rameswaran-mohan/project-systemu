@@ -263,3 +263,15 @@ def test_currency_override_is_case_insensitive_single_currency(monkeypatch):
     summary = costing.cost_of(rows)
     assert summary.total_known is True, "a single (case-different) currency must still price"
     assert summary.total is not None and summary.total.currency == "USD"
+
+
+def test_cost_chip_for_helper():
+    """cost_chip_for: a run with usage → a chip string; a zero-usage run → None
+    (no chip); an unknown model → tokens + '—' (never a fabricated number)."""
+    known = next(iter(costing.shipped_prices()))
+    assert costing.cost_chip_for([]) is None                       # zero usage → no chip
+    assert costing.cost_chip_for(
+        [{"model": known, "tokens_in": 1000, "tokens_out": 1000}]) is not None
+    unknown_chip = costing.cost_chip_for(
+        [{"model": "who/unknown", "tokens_in": 500, "tokens_out": 500}])
+    assert unknown_chip is not None and unknown_chip.startswith("—")   # tokens shown, cost —
