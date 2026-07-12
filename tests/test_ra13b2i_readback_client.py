@@ -200,3 +200,193 @@ def test_redirect_is_not_followed():
     # exactly ONE request (the redirect was not followed) and no observable body.
     assert transport.calls == 1, "a redirect must NOT be followed (host-pin defeat)"
     assert out == {}, out
+
+
+# ── DNS-rebind TOCTOU CLOSE — socket-IP-pin ────────────────────────────────────
+#
+# The SSRF gate resolves a hostname and validates every address public, but httpx
+# would RE-RESOLVE at connect (a DNS rebind between validate and connect could reach
+# an internal host). The fix does ONE resolve and PINS the socket to that vetted IP:
+# the request URL host becomes the vetted IP (socket connects there, no 2nd DNS
+# query), while the Host header + TLS SNI/cert-verification stay the ORIGINAL
+# hostname via the httpx `sni_hostname` request extension.
+
+
+class _CapturingTransport(httpx.MockTransport):
+    """A MockTransport that RECORDS the request it receives so a test can assert the
+    socket was pinned (url.host == vetted IP), the Host header + sni_hostname stayed
+    the original hostname, and body parse still works."""
+
+    def __init__(self, handler):
+        self.calls = 0
+        self.seen = []  # list of dicts captured per request
+
+        def _capturing(request):
+            self.calls += 1
+            self.seen.append({
+                "url_host": request.url.host,
+                "host_header": request.headers.get("host"),
+                "sni": request.extensions.get("sni_hostname"),
+            })
+            return handler(request)
+
+        super().__init__(_capturing)
+
+
+def test_pin_applied_hostname_connects_to_vetted_ip(monkeypatch):
+    """PIN APPLIED: a hostname url whose getaddrinfo returns a PUBLIC IP → the request
+    the transport sees targets that vetted IP, with Host + sni_hostname == the original
+    hostname, and the token/body parse is unchanged."""
+    import systemu.runtime.readback_client as rc
+
+    def _fake_getaddrinfo(host, *a, **k):
+        return [(0, 0, 0, "", ("93.184.216.34", 0))]   # a PUBLIC IPv4
+
+    monkeypatch.setattr(rc.socket, "getaddrinfo", _fake_getaddrinfo)
+
+    def _handler(request):
+        return httpx.Response(
+            200, headers={"content-type": "application/json"},
+            json={"id": "row-777", "token": "sub-abc-1"})
+
+    transport = _CapturingTransport(_handler)
+    client = ProdReadbackClient(transport=transport)
+    out = client.readback("https://api.example.com/rows/777")
+
+    assert transport.calls == 1
+    seen = transport.seen[0]
+    assert seen["url_host"] == "93.184.216.34", seen        # socket → the VETTED IP
+    assert seen["host_header"] == "api.example.com", seen   # Host stays the hostname
+    assert seen["sni"] == "api.example.com", seen           # TLS SNI/cert stays hostname
+    # the read-back envelope is unchanged by the pin.
+    assert "sub-abc-1" in out.get("observed_tokens", []), out
+    assert "row-777" in out.get("observed_tokens", []), out
+    assert "sub-abc-1" in out.get("response_body", ""), out
+
+
+def test_pin_applied_preserves_nondefault_port_and_ipv6_bracketing(monkeypatch):
+    """A non-default port survives the rewrite (Host gets `:port`) and an IPv6 pinned
+    literal is bracketed in the request URL."""
+    import systemu.runtime.readback_client as rc
+
+    def _fake_getaddrinfo(host, *a, **k):
+        return [(0, 0, 0, "", ("2606:4700:4700::1111", 0, 0, 0))]  # a PUBLIC IPv6
+
+    monkeypatch.setattr(rc.socket, "getaddrinfo", _fake_getaddrinfo)
+    transport = _CapturingTransport(
+        lambda r: httpx.Response(200, headers={"content-type": "text/plain"}, text="ok"))
+    client = ProdReadbackClient(transport=transport)
+    out = client.readback("https://api.example.com:8443/rows/1")
+
+    assert transport.calls == 1
+    seen = transport.seen[0]
+    assert seen["url_host"] == "2606:4700:4700::1111", seen     # pinned IPv6 (unbracketed host attr)
+    assert seen["host_header"] == "api.example.com:8443", seen  # non-default port kept
+    assert seen["sni"] == "api.example.com", seen
+    assert out.get("response_body") == "ok", out
+
+
+def test_rebind_defeat_single_resolve_and_pinned_ip(monkeypatch):
+    """REBIND-DEFEAT: getaddrinfo is called EXACTLY ONCE and the connect targets the
+    FIRST vetted IP — even a would-be second (differing) resolve never happens, so the
+    rebind window is closed."""
+    import systemu.runtime.readback_client as rc
+
+    calls = {"n": 0}
+    responses = [
+        [(0, 0, 0, "", ("93.184.216.34", 0))],     # 1st resolve — a PUBLIC IP (vetted)
+        [(0, 0, 0, "", ("169.254.169.254", 0))],   # a rebind would flip to IMDS — must NEVER be used
+    ]
+
+    def _fake_getaddrinfo(host, *a, **k):
+        idx = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        return responses[idx]
+
+    monkeypatch.setattr(rc.socket, "getaddrinfo", _fake_getaddrinfo)
+    transport = _CapturingTransport(
+        lambda r: httpx.Response(200, headers={"content-type": "text/plain"}, text="ok"))
+    client = ProdReadbackClient(transport=transport)
+    out = client.readback("https://api.example.com/x")
+
+    assert calls["n"] == 1, "the readback path must resolve the hostname EXACTLY ONCE"
+    assert transport.calls == 1
+    # the socket targets the FIRST vetted IP, never the rebound metadata address.
+    assert transport.seen[0]["url_host"] == "93.184.216.34", transport.seen
+    assert out.get("response_body") == "ok", out
+
+
+@pytest.mark.parametrize("resolved", [
+    "127.0.0.1",            # loopback
+    "10.0.0.5",             # RFC1918 private
+    "169.254.169.254",      # cloud-metadata link-local
+    "2002:a9fe:a9fe::",     # 6to4 embedding 169.254.169.254 (IMDS)
+])
+def test_hostname_resolving_to_private_is_refused_no_connect(monkeypatch, resolved):
+    """RESOLVES-TO-PRIVATE → REFUSED: a hostname that resolves to a private / loopback /
+    metadata / 6to4-embedded-internal address → {} and NO request issued (fail-closed)."""
+    import systemu.runtime.readback_client as rc
+
+    fam = 0 if ":" not in resolved else 0
+    tup = (resolved, 0) if ":" not in resolved else (resolved, 0, 0, 0)
+
+    def _fake_getaddrinfo(host, *a, **k):
+        return [(0, 0, 0, "", tup)]
+
+    monkeypatch.setattr(rc.socket, "getaddrinfo", _fake_getaddrinfo)
+    transport = _SpyTransport(lambda r: httpx.Response(200, text="should never run"))
+    client = ProdReadbackClient(transport=transport)
+    out = client.readback("https://evil.example.com/x")
+    assert out == {}, (resolved, out)
+    assert transport.calls == 0, f"resolve→{resolved} must be refused before any connect"
+
+
+def test_hostname_resolution_failure_is_refused(monkeypatch):
+    """A getaddrinfo failure ⇒ refuse (fail-closed), no connect."""
+    import systemu.runtime.readback_client as rc
+
+    def _boom(host, *a, **k):
+        raise OSError("name resolution failed")
+
+    monkeypatch.setattr(rc.socket, "getaddrinfo", _boom)
+    transport = _SpyTransport(lambda r: httpx.Response(200, text="should never run"))
+    client = ProdReadbackClient(transport=transport)
+    out = client.readback("https://api.example.com/x")
+    assert out == {}, out
+    assert transport.calls == 0
+
+
+def test_literal_public_ip_url_connects_direct_no_rewrite():
+    """LITERAL-IP (public): connect directly to the literal — NO host rewrite, NO
+    sni_hostname (the URL host is already the pinned IP)."""
+    def _handler(request):
+        return httpx.Response(200, headers={"content-type": "text/plain"}, text="ok")
+
+    transport = _CapturingTransport(_handler)
+    client = ProdReadbackClient(transport=transport)
+    out = client.readback("https://93.184.216.34/rows/1")
+
+    assert transport.calls == 1
+    seen = transport.seen[0]
+    assert seen["url_host"] == "93.184.216.34", seen   # unchanged literal
+    assert seen["sni"] is None, seen                    # no rewrite ⇒ no sni extension
+    assert out.get("response_body") == "ok", out
+
+
+def test_resolve_pinned_ip_returns_first_vetted_public(monkeypatch):
+    """Unit: _resolve_pinned_ip returns the FIRST vetted public IP, None if any address
+    is non-global (fail-closed on a mixed set)."""
+    import systemu.runtime.readback_client as rc
+
+    def _all_public(host, *a, **k):
+        return [(0, 0, 0, "", ("93.184.216.34", 0)),
+                (0, 0, 0, "", ("93.184.216.35", 0))]
+
+    monkeypatch.setattr(rc.socket, "getaddrinfo", _all_public)
+    assert rc._resolve_pinned_ip("api.example.com") == "93.184.216.34"
+
+    def _mixed(host, *a, **k):
+        return [(0, 0, 0, "", ("93.184.216.34", 0)),     # public
+                (0, 0, 0, "", ("10.0.0.5", 0))]          # private ⇒ whole set refused
+    monkeypatch.setattr(rc.socket, "getaddrinfo", _mixed)
+    assert rc._resolve_pinned_ip("api.example.com") is None
