@@ -465,6 +465,28 @@ def _persist_external_evidence(context, evidence) -> None:
         store[str(oid)] = payload
     except Exception:
         logger.debug("[Runtime] _persist_external_evidence failed (swallowed)", exc_info=True)
+        return
+
+    # fold-in #3: ALSO write a DURABLE, DISPLAY-ONLY copy of the receipt so the UI
+    # can render a verified/claimed badge after the run completes (the live
+    # context._external_evidence rides the ExecutionSnapshot, which is deleted on
+    # completion). This is purely additive + best-effort: the credit gate reads the
+    # live in-run evidence above (UNCHANGED), and NOTHING but the UI reads this
+    # store, so a tampered receipts.json can never credit an effect.
+    try:
+        from systemu.runtime import receipts_store
+        from systemu.runtime.chat_submission_ctx import current_execution_id
+        eid = current_execution_id()
+        if eid:
+            receipts_store.write_receipt(eid, oid, {
+                "objective_id": oid,
+                "confirmed": payload.get("confirmed") is True,
+                "method": payload.get("method"),
+                "detail": payload.get("detail"),
+                "stamped_at": payload.get("stamped_at"),
+            })
+    except Exception:
+        logger.debug("[Runtime] durable receipt write skipped (swallowed)", exc_info=True)
 
 
 # ── S3 / R-A7 wave-3a — wiring the ExternalVerifier at the credit seam ────────

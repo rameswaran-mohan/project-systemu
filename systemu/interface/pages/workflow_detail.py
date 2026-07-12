@@ -121,6 +121,12 @@ def build_workflow_detail_page(workflow_id: str) -> None:
     if snap.execution_id:
         _build_cost_panel(snap.execution_id)
 
+    # ── Receipts (fold-in #3 / DEC-13) ─────────────────────────────────
+    # Verified/claimed badges for the run's external effects — "receipts, not
+    # self-report". Renders only when the run produced a durable receipt.
+    if snap.execution_id:
+        _build_receipt_panel(snap.execution_id)
+
     # ── Blocked-on-tools panel (Wave 1.2) ──────────────────────────────
     # A task parked by the Stage-3.5 readiness gate sat invisible here —
     # the page showed "assigned/partial" with no why and no way forward.
@@ -307,6 +313,33 @@ def _build_cost_panel(execution_id: str) -> None:
             ui.label(view["total"]).classes("s-cell s-cell--bold")
         ui.label("Cost is an estimate from editable per-model prices (Settings). "
                  "It reflects spend, not success.").classes("s-muted")
+
+
+def _build_receipt_panel(execution_id: str) -> None:
+    """Render the verified/claimed RECEIPTS for a run's external effects (fold-in
+    #3 / DEC-13). Only when the run produced a receipt — an MCP/external mutation
+    the daemon INDEPENDENTLY read back. A 'Verified' badge means the effect was
+    machine-checked (receipts, not self-report); 'Claimed' means the tool reported
+    it but it was not independently verified. Design-token classes only. Like cost,
+    this is SEPARATE chrome from the status pill — it says the effect was verified,
+    never that the run succeeded."""
+    from systemu.runtime import receipts_store
+    badges = receipts_store.receipt_badges_for(execution_id)
+    if not badges:
+        return
+    ui.label("Receipts").classes("s-section-head q-mt-md")
+    with ui.card().classes("s-card w-full"):
+        for b in badges:
+            with ui.row().classes("w-full items-center justify-between q-gutter-sm"):
+                _cls = "s-pill s-pill--success" if b["verified"] else "s-pill s-pill--muted"
+                ui.label(b["label"]).classes(_cls).tooltip(b["tooltip"])
+                if b.get("method"):
+                    ui.label(b["method"]).classes("s-mono s-muted")
+                if b.get("detail"):
+                    ui.label(b["detail"]).classes("s-muted")
+        ui.label("A 'Verified' receipt means the effect was independently read back and "
+                 "machine-checked — receipts, not self-report. It reflects verification, "
+                 "not success.").classes("s-muted")
 
 
 def _link_row(icon: str, label: str, entity_id: str, route: str) -> None:
