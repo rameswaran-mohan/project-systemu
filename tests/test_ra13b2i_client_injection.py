@@ -66,12 +66,57 @@ def _make_runtime(tmp_path):
     return ShadowRuntime(cfg, vault)
 
 
-def test_off_mode_injects_no_client(tmp_path, monkeypatch):
-    """I2 — OFF injects NO client (no attr) ⇒ byte-identical + no outbound GET."""
+def test_off_mode_client_present_but_dormant_for_non_mcp(tmp_path, monkeypatch):
+    """R-A14a reframe of the old ``test_off_mode_injects_no_client``.
+
+    Its ORIGINAL intent was "no outbound GET / no credit-gate change when the net is
+    disarmed". R-A14a decoupled the MCP verification obligation from the stamp mode, so
+    the readback transport is now injected UNCONDITIONALLY (a non-money MCP mutation must
+    be verifiable net-OFF). The invariant is NO LONGER "client is None" — it is that the
+    client is PRESENT but **DORMANT for a NON-MCP effect in OFF**: it is never read, so
+    there is no outbound GET and the credit is byte-identical.
+
+    Asserts THAT directly: OFF injects a ProdReadbackClient, and driving a non-external,
+    non-MCP objective in OFF credits normally, writes NO ExternalEvidence, and issues
+    ZERO readbacks through the injected client's transport."""
     monkeypatch.setenv("SYSTEMU_S4_STAMP", "off")
-    rt = _make_runtime(tmp_path)
-    assert getattr(rt, "_external_api_client", None) is None, (
-        "OFF must inject no readback client (byte-identical / no outbound GET)")
+
+    # inject a REAL ProdReadbackClient whose httpx transport COUNTS reads (dormancy proof).
+    import httpx
+    import systemu.runtime.readback_client as rc
+    reads = {"n": 0}
+
+    def _handler(request):
+        reads["n"] += 1
+        return httpx.Response(200, headers={"content-type": "application/json"}, json={})
+
+    _real = rc.ProdReadbackClient
+    transport = httpx.MockTransport(_handler)
+
+    def _factory(*a, **k):
+        k.setdefault("transport", transport)
+        return _real(*a, **k)
+    monkeypatch.setattr(rc, "ProdReadbackClient", _factory)
+
+    # Drive a non-external, non-MCP objective in OFF. The runtime the harness builds
+    # gets the injected client (via the factory above); we assert it is PRESENT + DORMANT.
+    from systemu.core.models import Objective
+    from test_s3_credit_wiring import _drive_live_credit
+    obj = Objective(id=1, goal="write the local report file",
+                    success_criteria="file exists",
+                    requires_external_verification=False)
+    runtime, result, ctx = _drive_live_credit(
+        tmp_path, monkeypatch, objectives=[obj], claim_obj_id=1, tool_parsed={"ok": True})
+
+    # PRESENT: OFF now injects the client (a real ProdReadbackClient instance).
+    assert type(getattr(runtime, "_external_api_client", None)).__name__ == "ProdReadbackClient", (
+        "OFF must now inject a ProdReadbackClient (present)")
+    # DORMANT / byte-identical: credited unchanged, no ExternalEvidence, no outbound GET.
+    assert result.get("status") == "success", (
+        f"a non-external non-MCP OFF objective must credit unchanged; got {result.get('status')}")
+    assert not (getattr(ctx, "_external_evidence", {}) or {}), (
+        "a non-MCP OFF effect must write no ExternalEvidence")
+    assert reads["n"] == 0, "the injected client must be DORMANT for a non-MCP OFF effect"
 
 
 def test_shadow_mode_injects_prod_client(tmp_path, monkeypatch):

@@ -813,6 +813,93 @@ def _run_external_verification(runtime, *, objective, decision, tool, result,
         return ExternalEvidence(objective_id=oid, confirmed=False)
 
 
+# ── R-A14a — the MCP → S3/S4 verification LINKAGE (decoupled from S4_STAMP) ────
+#
+# An MCP mutation is INVISIBLE to the S3/S4 net today: MCP tools carry no effect_tags
+# and are NOT bound as capabilities, so the requirement binder never stamps
+# ``requires_external_verification`` → the hardened api_readback never runs → no
+# receipt. R-A14a fixes this WITHOUT the flag-gated binder stamp: the ``mcp``
+# ActuationModality carries its OWN per-actuation obligation. For a KNOWN-mutation MCP
+# call this hook drives the modality's ``capture_evidence`` (→ the EXISTING
+# money-move-safe ``_run_external_verification`` → verify() + hardened api_readback),
+# persists the ExternalEvidence, and signals that the credit must be GATED on the
+# confirmed bit — DECOUPLED from SYSTEMU_S4_STAMP (works OFF/SHADOW). The money-move
+# fail-closed invariant is PRESERVED BY REUSE (verify() demotes a money-move unless a
+# hardened independent api_readback confirms). Fully guarded — never raises.
+
+def _known_mutation_mcp_entry(decision):
+    """Resolve the v2 ToolEntry for a namespaced MCP mutation call, else None.
+
+    A namespaced MCP tool is registered as ``mcp__<slug>__<tool>`` with
+    ``is_action_tool = not readOnlyHint`` (registry_bridge). A read-only tool
+    (``is_action_tool`` False) is NOT a mutation ⇒ None (no obligation ⇒ today's
+    behavior). An MCP call dispatches via the v2 registry (not the ``tools`` list), so
+    the entry is resolved from the registry, not the run's tool list. Never raises."""
+    try:
+        name = decision.get("tool_name") if isinstance(decision, dict) else None
+        if not isinstance(name, str) or not name.startswith("mcp__"):
+            return None
+        from systemu.runtime.tool_registry_v2 import registry
+        entry = registry.get(name)
+        if entry is None or not bool(getattr(entry, "is_action_tool", False)):
+            return None
+        return entry
+    except Exception:
+        return None
+
+
+def _mcp_actuation_link(runtime, context, *, objective, decision, result) -> bool:
+    """Drive the ``mcp`` modality's per-actuation verification obligation at the credit
+    seam, PERSIST the resulting ExternalEvidence receipt (always, best-effort), and
+    return whether the credit must be GATED on it. Never raises.
+
+    Gating SEMANTICS (R-A14a regression fix):
+      * MONEY-MOVE MCP mutation → returns True (FAIL-CLOSED gate). The obligation gates
+        the credit: the reused ``verify()`` credits a money-move ONLY via a hardened
+        independent host-pinned+fresh api_readback (attestation / self-report / advisory /
+        inline tokens can NEVER credit one). A money-move ALWAYS gates — even if capture
+        produced no evidence, or errored. THE INVARIANT — never weakened here.
+      * NON-money MCP mutation → returns False (NON-GATING). The receipt is still
+        PERSISTED (confirmed=True ⇒ a "verified" provenance receipt, confirmed=False ⇒
+        "claimed") but it does NOT block the credit: the credit proceeds via the NORMAL
+        path (the local verifier verdict / result.success), exactly as before R-A14a. A
+        non-money MCP mutation therefore credits whether or not verification confirms —
+        no over-gating, no stall, no regression. The receipt is best-effort DEC-13
+        provenance only.
+
+    DECOUPLED from SYSTEMU_S4_STAMP (the obligation is per-actuation, declared by the
+    modality for a declared MCP mutation — NOT the flag-gated binder stamp, which is
+    never touched here)."""
+    entry = _known_mutation_mcp_entry(decision)
+    if entry is None:
+        return False
+    # money-move classification FIRST so a capture error still gates a money-move.
+    is_money = _is_money_move_seam(objective, decision, entry)
+    try:
+        from systemu.runtime.actuation.mcp_modality import McpActuationModality
+        from systemu.runtime.actuation.modality import Action, ActionResult
+        parsed = getattr(result, "parsed", None)
+        response = parsed.get("response") if isinstance(parsed, dict) else None
+        action = Action(
+            modality="mcp",
+            name=(decision.get("tool_name") if isinstance(decision, dict) else "") or "",
+            params=(decision.get("parameters") if isinstance(decision, dict) else {}) or {},
+            is_mutation=True, objective=objective, tool=entry)
+        aresult = ActionResult(
+            success=bool(getattr(result, "success", False)),
+            response=response, raw=parsed)
+        ev = McpActuationModality(runtime).capture_evidence(action, aresult)
+        # PERSIST the receipt regardless of gating (best-effort provenance for DEC-13).
+        if ev is not None:
+            _persist_external_evidence(context, ev)
+        # GATE only for a money-move (fail-closed). Non-money is a non-gating receipt.
+        return bool(is_money)
+    except Exception:
+        logger.debug("[Runtime R-A14a] mcp actuation link errored — money-move stays "
+                     "gated (fail-closed)", exc_info=True)
+        return bool(is_money)
+
+
 # ── R-A13b-1 — the SHADOW park-surface METER (record-only) ────────────────────
 #
 # Stage 2 of the 3-stage external-verification activation: a RECORD-ONLY branch at
@@ -2913,17 +3000,29 @@ class ShadowRuntime:
         # depth guard (harness_arbiter._arbitrate_subagent) and the v2 delegation
         # refusal (in _handle_tool_call) both see real nesting.
         self._subagent_depth = self._init_subagent_depth(config)
-        # R-A13b-2i: inject the PRODUCTION independent-https readback client so the
-        # hardened api_readback path (and the SHADOW park-surface meter) can perform a
-        # real, INDEPENDENT read-back — resolving _build_external_api_client's branch-1
-        # in a live run. GATED on the S4 stamp net being armed (mode != off): OFF sets
-        # NOTHING, so there is no client (byte-identical) and no outbound GET when the
-        # net is disarmed. Tests may override runtime._external_api_client with a mock.
+        # R-A13b-2i / R-A14a: inject the PRODUCTION independent-https readback client so
+        # the hardened api_readback path (and the SHADOW park-surface meter) can perform a
+        # real, INDEPENDENT read-back — resolving _build_external_api_client's branch-1 in
+        # a live run. Tests may override runtime._external_api_client with a mock.
+        #
+        # R-A14a: injected UNCONDITIONALLY — including OFF. R-A14a decoupled the MCP
+        # verification OBLIGATION from SYSTEMU_S4_STAMP (_mcp_actuation_link runs at the
+        # credit seam regardless of the stamp mode), so the readback TRANSPORT must be
+        # available net-OFF too, else a decoupled MCP obligation is UN-SATISFIABLE (a
+        # non-money MCP mutation could never verify → the OFF regression this closes).
+        #
+        # DORMANCY (why injecting in OFF stays byte-identical for non-MCP): the client is
+        # ONLY read by _build_external_api_client, which is ONLY reached from
+        # _run_external_verification. For a NON-MCP effect that hook runs ONLY when the
+        # binder stamped requires_external_verification (or the SHADOW meter fires) — which
+        # OFF never does — so the injected client is NEVER read for a non-MCP OFF effect
+        # (no outbound GET, byte-identical credit). It fires ONLY on an MCP obligation
+        # (via _mcp_actuation_link) — exactly the path R-A14a needs net-OFF. The client is
+        # ALSO a credential-less INDEPENDENT reader (no money-transport a non-MCP effect
+        # would use to self-confirm): the money-move fail-closed gate is unchanged.
         try:
-            from systemu.runtime.requirement_binder import _s4_stamp_mode
-            if _s4_stamp_mode() != "off":
-                from systemu.runtime.readback_client import ProdReadbackClient
-                self._external_api_client = ProdReadbackClient()
+            from systemu.runtime.readback_client import ProdReadbackClient
+            self._external_api_client = ProdReadbackClient()
         except Exception:
             logger.debug("[Runtime] prod readback client injection skipped", exc_info=True)
         # v0.9.1.1 fix: load user_profile once at init so _resolve_verifier_output_dir
@@ -7478,9 +7577,38 @@ class ShadowRuntime:
                                     finally:
                                         # one-shot: consume the pre-submit snapshot.
                                         self._presubmit_external_snapshot = None
+                                # ── R-A14a: decoupled per-actuation MCP obligation ──
+                                # For a KNOWN-mutation MCP call, drive the mcp modality's
+                                # capture_evidence (→ the EXISTING money-move-safe
+                                # verify() + hardened api_readback) and PERSIST the receipt
+                                # — regardless of SYSTEMU_S4_STAMP (the binder never stamps
+                                # MCP tools). The credit is GATED on it ONLY for a
+                                # MONEY-MOVE MCP mutation (fail-closed): a NON-money MCP
+                                # mutation's receipt is NON-GATING (best-effort provenance),
+                                # so it credits via the normal path whether or not
+                                # verification confirms — no over-gating / no regression.
+                                # Runs AFTER the binder hook above (guarded on the ORIGINAL
+                                # _needs_external so it never runs for pure-MCP) so the
+                                # modality's evidence is authoritative (no clobber). Fully
+                                # guarded — never raises.
+                                _mcp_money_gate = False
+                                try:
+                                    if _s4_obj is not None:
+                                        _mcp_money_gate = _mcp_actuation_link(
+                                            self, context, objective=_s4_obj,
+                                            decision=decision, result=result)
+                                except Exception:
+                                    logger.debug("[Runtime R-A14a] mcp actuation link "
+                                                 "guard errored — no-op", exc_info=True)
+                                    _mcp_money_gate = False
+                                # The effective obligation: the binder stamp OR the
+                                # MONEY-MOVE MCP obligation only. A NON-money MCP mutation
+                                # never sets this (its receipt is non-gating), and non-MCP +
+                                # non-mutation is byte-identical (_mcp_money_gate stays False).
+                                _needs_external_eff = _needs_external or _mcp_money_gate
                                 _external_ok = (
                                     _read_external_ok(context, completed_obj)
-                                    if _needs_external else False)
+                                    if _needs_external_eff else False)
                                 try:
                                     _obj_for_verify = next(
                                         (o for o in objectives if o.id == completed_obj), None)
@@ -7547,8 +7675,11 @@ class ShadowRuntime:
                                     # independent readback, a bad verifier) must NEVER
                                     # credit an unverified external effect. Fail CLOSED.
                                     # Non-external keeps the exact legacy except behavior
-                                    # (_do_credit stays True).
-                                    if _needs_external:
+                                    # (_do_credit stays True). R-A14a: a MONEY-MOVE MCP
+                                    # obligation (folded into _needs_external_eff) fails
+                                    # closed here too; a NON-money MCP mutation is non-gating
+                                    # (_needs_external_eff False) ⇒ legacy except behavior.
+                                    if _needs_external_eff:
                                         _do_credit = False
 
                                 # S4 (§5.8 — external evidence is AUTHORITATIVE): an
@@ -7568,8 +7699,11 @@ class ShadowRuntime:
                                 # CLOSED (_do_credit=False) for external. Any not-credited
                                 # external objective emits an UNVERIFIED_EXTERNAL steering
                                 # observation (mirrors the B9 credential-gate note). Guarded
-                                # on _needs_external → non-external is byte-identical.
-                                if _needs_external:
+                                # on _needs_external_eff → non-external + NON-money MCP + non-
+                                # mutation is byte-identical (R-A14a folds ONLY the MONEY-MOVE
+                                # MCP obligation into this authoritative-external-bit gate; a
+                                # non-money MCP receipt is non-gating and credits normally).
+                                if _needs_external_eff:
                                     _do_credit = _external_ok
                                     if not _do_credit:
                                         logger.warning(
@@ -7651,7 +7785,7 @@ class ShadowRuntime:
                                 try:
                                     from systemu.runtime.requirement_binder import (
                                         _s4_stamp_mode as _s4_mode)
-                                    if (not _needs_external and _s4_obj is not None
+                                    if (not _needs_external_eff and _s4_obj is not None
                                             and _s4_mode() == "shadow"
                                             and bool(getattr(_s4_obj, "_s4_stamp_shadow", False))):
                                         _meter_tool = next(
