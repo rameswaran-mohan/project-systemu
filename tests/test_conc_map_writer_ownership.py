@@ -91,6 +91,15 @@ WRITER_OWNERSHIP = {
                  "credit-seam meter branch (record-only, same single writer thread as incr()). "
                  "Any further writer needs a DEC-10 review + this allowlist update."),
     },
+    "Cost ledger (in-process — systemu.runtime.costing._LEDGER)": {
+        "call": "record_usage(",
+        "allowed": {"core/llm_router.py"},  # the router's token-capture hook, sole writer
+        "def": "runtime/costing.py",
+        "note": ("R-P3a cost accumulator: the SOLE writer is the LLM router's "
+                 "per-call token-capture hook (_record_usage_safe → record_usage), "
+                 "reading the ambient execution_id. In-process ledger (not a durable "
+                 "vault store). Any further writer needs a DEC-10 review + this update."),
+    },
     "R-P1 resolve audit (<root>/messaging/resolve_audit.jsonl)": {
         "call": "_audit(",
         "allowed": {"messaging/decision_bridge.py"},

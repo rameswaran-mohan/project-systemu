@@ -252,10 +252,18 @@ async def run_open_world_planner(
 
     # Off-loop LLM call (mirrors the main decision loop's run_in_executor idiom).
     loop = asyncio.get_event_loop()
+    # R-P3a: carry the ambient execution_id across the run_in_executor thread hop
+    # so the router's cost hook attributes THIS planner call to its owning run.
+    # run_in_executor does NOT copy contextvars — copy_context()+ctx.run does.
+    # (Same fix as the decision-loop hop in shadow_runtime; without it the planner
+    # call — a per-run tier-2/3 LLM call — orphans its entire cost.)
+    import contextvars as _cv
+    _llm_ctx = _cv.copy_context()
     try:
         raw = await loop.run_in_executor(
             None,
-            lambda: llm_call_json(
+            lambda: _llm_ctx.run(
+                llm_call_json,
                 tier=tier,
                 system=system,
                 user=prompt,

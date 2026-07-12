@@ -83,6 +83,13 @@ def work_row_model(snap: WorkflowSnapshot) -> Dict[str, Any]:
             "reached": reached,
             "link": _chip_link(stage, snap, reached),
         })
+    # R-P3a: per-run cost chip. Priced off the live ledger via the run's
+    # execution_id; a run with no LLM usage (or no execution_id yet) simply has
+    # no chip. Cost is SEPARATE chrome from the status pill — it never implies
+    # the run succeeded, only what it spent. An Unknown total renders tokens only
+    # (no fabricated money).
+    from systemu.runtime import costing
+    summary = costing.cost_of(snap.execution_id)
     return {
         "workflow_id": snap.workflow_id,
         "title": snap.title,
@@ -92,6 +99,9 @@ def work_row_model(snap: WorkflowSnapshot) -> Dict[str, Any]:
         "chips": chips,
         "detail_link": f"/workflow/{snap.workflow_id}",
         "needs_approval": snap.status == "pending_approval",
+        "cost": summary.model_dump(mode="json"),
+        "cost_chip": costing.chip_text(summary),
+        "has_cost": (summary.tokens_in + summary.tokens_out) > 0,
     }
 
 
@@ -308,6 +318,13 @@ def _render_row(row: Dict[str, Any], on_refresh=None) -> None:
             # Status pill (tracker status, tinted per status_class)
             pill = _PILL_CLASS.get(row["status_class"], "s-pill--muted")
             ui.label(row["status"]).classes(f"s-pill {pill}")
+
+            # R-P3a: cost chip (tokens + currency, or tokens-only when Unknown).
+            # Muted, neutral chrome — deliberately NOT a status tint, so cost
+            # never reads as success/failure.
+            if row.get("has_cost"):
+                ui.label(row["cost_chip"]).classes("s-pill s-pill--muted s-mono") \
+                    .tooltip("LLM usage this run (cost is an estimate; edit prices in Settings)")
 
             # Slice 2b: inspect-before-approve — open the unified gate card
             # (ensure_scroll_gate enqueues on demand; workflow_id == scroll_id).

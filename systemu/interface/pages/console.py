@@ -90,6 +90,28 @@ def home_recent_workflows(snapshots, *, limit: int = 5) -> List[Dict[str, Any]]:
     return rows
 
 
+def home_daily_cost_summary(runs=None) -> Dict[str, Any]:
+    """Today's LLM spend across BOTH lanes for the Home glance (pure, testable).
+
+    ``runs`` given → sum exactly those run refs/records (the reconciling path:
+    the daily total equals the sum of the per-run costs). ``runs`` None → sum
+    every ledger row stamped today (in-process; both quick_ and exec_ runs).
+    An Unknown total (some model unpriced) surfaces tokens only — never a
+    fabricated number.
+    """
+    from systemu.runtime import costing
+    summary = costing.daily_total(runs)
+    total_tok = summary.tokens_in + summary.tokens_out
+    return {
+        "chip": costing.chip_text(summary),
+        "total": costing.format_money(summary.total) if summary.total_known else "—",
+        "total_known": summary.total_known,
+        "tokens_total": total_tok,
+        "tokens_total_display": costing.format_tokens(total_tok),
+        "has_usage": total_tok > 0,
+    }
+
+
 def _pending_approvals_count(vault) -> int:
     """Count items awaiting operator approval — proposed tools + pending deps.
 
@@ -184,6 +206,9 @@ def build_home_page() -> None:
             _build_needs_you_card(vault)
         with ui.column().style("flex: 1; min-width: 320px;"):
             _build_whats_running_card()
+
+    # ── Today's spend (R-P3a) — both lanes, no caps, estimate only ──────
+    _build_daily_cost_banner()
 
     # ── Live activity panes (BUG-2 regression fix) ──────────────────────
     # The Phase-6 Home rebuild dropped the origin-filtered live panes — the
@@ -303,6 +328,27 @@ def _build_whats_running_card() -> None:
             ui.link("Open Work →", "/work").classes("s-muted").style("text-decoration: none;")
         # Compact pipeline: stage chips only (the active list is the Work page).
         build_workflow_pipeline(compact=True)
+
+
+def _build_daily_cost_banner() -> None:
+    """Today's LLM spend (both lanes) — a slim glance strip. Cost is an estimate
+    from editable prices; it never implies any run succeeded. No caps."""
+    from nicegui import ui
+    from systemu.interface.design.primitives import card
+
+    view = home_daily_cost_summary()
+    with card(classes="w-full q-mb-md"):
+        with ui.row().classes("w-full items-center justify-between"):
+            with ui.row().classes("items-center q-gutter-sm"):
+                ui.label("Today's spend").classes("s-cell s-cell--bold")
+                ui.label(view["chip"]).classes("s-pill s-pill--muted s-mono") \
+                    .tooltip("Sum of LLM token cost across quick + workflow runs today "
+                             "(estimate — edit per-model prices in Settings)")
+            if not view["total_known"] and view["has_usage"]:
+                ui.label("some models unpriced — showing tokens only") \
+                    .classes("s-muted").style("font-size: 11px;")
+            ui.link("Prices →", "/settings").classes("s-muted") \
+                .style("text-decoration: none;")
 
 
 def _build_recent_activity_card() -> None:

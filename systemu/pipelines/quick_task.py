@@ -54,6 +54,11 @@ class QuickResult:
     iterations: int = 0
     error: Optional[str] = None
     question: Optional[str] = None    # set when status == needs_input
+    # R-P3a (per-run cost visibility): the run's LLM usage rows
+    # ({model, tokens_in, tokens_out}) drained from costing._LEDGER at finish so
+    # the quick lane (the DEFAULT lane) shows tokens+cost like the workflow lane —
+    # AC1 "both lanes". costing.cost_of(result) prices this. NOT a caps mechanism.
+    cost: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _enabled_tool_records(vault) -> List[Any]:
@@ -361,6 +366,20 @@ def run_quick_task(
     import uuid as _uuid
     execution_id = f"quick_{_uuid.uuid4().hex[:12]}"
 
+    # R-P3a (AC1 "both lanes"): the quick lane is NOT a ShadowRuntime run, so it
+    # never set the ambient execution_id — every quick-lane LLM call would ORPHAN
+    # its cost (current_execution_id() == None → the router hook no-ops). Stamp it
+    # here (mirroring shadow_runtime.execute) so the router accumulator attributes
+    # calls to THIS run; _finish resets it on every terminal (all paths route
+    # through _finish/_terminate). Best-effort: never break the lane on a carrier
+    # import failure.
+    _eid_token = None
+    try:
+        from systemu.runtime.chat_submission_ctx import set_execution_id as _set_eid
+        _eid_token = _set_eid(execution_id)
+    except Exception:
+        logger.debug("[QuickTask] execution_id carrier unavailable", exc_info=True)
+
     history: List[Dict[str, Any]] = []
     files: List[str] = []
     tool_calls = 0
@@ -376,6 +395,19 @@ def run_quick_task(
     def _finish(result: QuickResult) -> QuickResult:
         result.files_produced = files
         result.tool_calls = tool_calls
+        # R-P3a: attach the run's cost rows (drained from the live ledger) and
+        # release the ambient execution_id. Every terminal routes through here,
+        # so this is the single reset point (no leak into the next same-thread run).
+        try:
+            from systemu.runtime import costing
+            result.cost = costing.usage_rows(execution_id)
+        except Exception:
+            logger.debug("[QuickTask] cost attach skipped", exc_info=True)
+        try:
+            from systemu.runtime.chat_submission_ctx import set_execution_id as _reset_eid
+            _reset_eid(None, reset_token=_eid_token)
+        except Exception:
+            logger.debug("[QuickTask] execution_id reset skipped", exc_info=True)
         # v0.9.32 (review FIX 4): an intentional operator interrupt publishes at
         # WARNING, not ERROR — matches the supervisor's cancelled publish level.
         level = {"success": "SUCCESS", "partial": "WARNING",

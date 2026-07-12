@@ -6016,10 +6016,20 @@ class ShadowRuntime:
                     loop_guard_nudge = None
                 _llm_user = json.dumps(_user_payload)
                 loop = asyncio.get_event_loop()
+                # R-P3a: carry this run's ambient execution_id (set at run top)
+                # across the run_in_executor thread hop so the router's cost hook
+                # attributes the decision call to THIS run instead of orphaning.
+                # run_in_executor does NOT copy contextvars — copy_context()+ctx.run
+                # does. (A sub-agent child runs its own execute() under its own eid,
+                # so its decision call attributes to the child, which rolls up to
+                # the run-tree root.)
+                import contextvars as _cv
+                _llm_ctx = _cv.copy_context()
                 try:
                     decision = await loop.run_in_executor(
                         None,
-                        lambda: llm_call_json(
+                        lambda: _llm_ctx.run(
+                            llm_call_json,
                             tier=2,
                             system=_llm_system,
                             user=_llm_user,

@@ -25,8 +25,12 @@ Guarantees:
   * short timeout + a response-size cap (mirrors ``web.fetch_core.fetch_url``).
   * NEVER raises into a run — ANY error returns ``{}`` (⇒ the verifier fails closed).
 
-Injected at ``ShadowRuntime.__init__`` as ``runtime._external_api_client`` ONLY when
-the S4 stamp net is armed (mode != off), so OFF issues no outbound GET at all.
+Injected UNCONDITIONALLY at ``ShadowRuntime.__init__`` as ``runtime._external_api_client``
+(since R-A14a): the tier-2 MCP actuation path drives an independent readback net-OFF, so the
+client must be present even when the S4 stamp net is off. It is DORMANT unless something
+actually drives verification — an OFF non-MCP run stamps no ``requires_external_verification``
+and issues no outbound GET; the GET fires only for a known-mutation MCP actuation (or an armed
+stamp net). ANY error still returns ``{}`` (⇒ the verifier fails closed).
 """
 from __future__ import annotations
 

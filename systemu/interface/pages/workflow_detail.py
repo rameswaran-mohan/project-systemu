@@ -115,6 +115,12 @@ def build_workflow_detail_page(workflow_id: str) -> None:
             # route since Phase 5; link the live tab directly.
             _link_row("settings", "Execution", snap.execution_id, "/chat?tab=live")
 
+    # ── Cost breakdown (R-P3a) ─────────────────────────────────────────
+    # Per-model token + currency breakdown for this run. Cost is SEPARATE from
+    # the verified/claimed badges — it never implies the run succeeded.
+    if snap.execution_id:
+        _build_cost_panel(snap.execution_id)
+
     # ── Blocked-on-tools panel (Wave 1.2) ──────────────────────────────
     # A task parked by the Stage-3.5 readiness gate sat invisible here —
     # the page showed "assigned/partial" with no why and no way forward.
@@ -249,6 +255,58 @@ def _timeline_row(stage: str, *, reached: bool, entered_at: str | None) -> None:
             ui.label("pending").style(
                 f"font-size: 11px; color: {THEME['text_muted']}; font-style: italic;"
             )
+
+
+def cost_detail_view(execution_id: str) -> dict:
+    """Pure render-data for the by-model cost breakdown (testable without NiceGUI).
+
+    An unknown model's line shows its tokens with a "unknown" cost cell (never a
+    fabricated number); if ANY line is unknown the total is "unknown" too (AC4).
+    """
+    from systemu.runtime import costing
+    summary = costing.cost_of(execution_id)
+    rows = []
+    for line in summary.by_model:
+        rows.append({
+            "model": line.model,
+            "tokens_in": line.tokens_in,
+            "tokens_out": line.tokens_out,
+            "tokens": costing.format_tokens(line.tokens_in + line.tokens_out),
+            "cost": costing.format_money(line.cost) if line.priced else "unknown",
+            "priced": line.priced,
+        })
+    total_tok = summary.tokens_in + summary.tokens_out
+    return {
+        "by_model": rows,
+        "total": costing.format_money(summary.total) if summary.total_known else "unknown",
+        "total_known": summary.total_known,
+        "tokens_total": total_tok,
+        "tokens_total_display": costing.format_tokens(total_tok),
+        "has_usage": total_tok > 0,
+    }
+
+
+def _build_cost_panel(execution_id: str) -> None:
+    """Render the by-model cost breakdown (only when the run used the LLM).
+
+    Design-token classes only (no inline f-string styles) — cost is muted,
+    neutral chrome that never reads as a success/failure signal."""
+    view = cost_detail_view(execution_id)
+    if not view["has_usage"]:
+        return
+    ui.label("Cost").classes("s-section-head q-mt-md")
+    with ui.card().classes("s-card w-full"):
+        for r in view["by_model"]:
+            with ui.row().classes("w-full items-center justify-between q-gutter-sm"):
+                ui.label(r["model"]).classes("s-mono")
+                ui.label(f"{r['tokens']} tok").classes("s-muted")
+                ui.label(r["cost"]).classes("s-cell s-cell--bold")
+        ui.separator()
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label(f"Total · {view['tokens_total_display']} tok").classes("s-muted")
+            ui.label(view["total"]).classes("s-cell s-cell--bold")
+        ui.label("Cost is an estimate from editable per-model prices (Settings). "
+                 "It reflects spend, not success.").classes("s-muted")
 
 
 def _link_row(icon: str, label: str, entity_id: str, route: str) -> None:

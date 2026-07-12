@@ -200,6 +200,14 @@ def build_settings_page() -> None:
         with ui.column().classes("s-card").style("gap: 14px; padding: 20px;"):
             gate_mode_card()
 
+        # ── Cost & Prices (R-P3a) ────────────────────────────────────────
+        # Per-model token prices used to estimate run cost. Editable in plain
+        # language; a change takes effect immediately (costing reads the override
+        # on every cost_of). There are NO caps here — this only shows spend.
+        _section_header("Cost & Prices")
+        with ui.column().classes("s-card").style("gap: 14px; padding: 20px;"):
+            price_editor_card()
+
         # ── Vault ──────────────────────────────────────────────────────────
         _section_header("Storage")
         with ui.column().style(
@@ -654,6 +662,102 @@ def _update_env_var(key: str, value: str) -> None:
     if not found:
         updated.append(f"{key}={value}\n")
     env_path.write_text("".join(updated), encoding="utf-8")
+
+
+def get_price_rows() -> list:
+    """R-P3a: the current effective per-model prices for the editor (pure).
+
+    Rows carry the shipped-or-overridden price as strings (so the inputs prefill
+    without float drift) plus ``overridden`` so the UI can flag a tuned model.
+    """
+    from systemu.runtime import costing
+    shipped = costing.shipped_prices()
+    effective = costing.current_prices()
+    rows = []
+    for model in sorted(effective):
+        p = effective[model]
+        base = shipped.get(model)
+        rows.append({
+            "model": model,
+            "in_per_1k": str(p["in_per_1k"]),
+            "out_per_1k": str(p["out_per_1k"]),
+            "currency": str(p["currency"]),
+            "shipped": model in shipped,
+            "overridden": (base is None) or (
+                p["in_per_1k"] != base["in_per_1k"]
+                or p["out_per_1k"] != base["out_per_1k"]
+                or p["currency"] != base["currency"]
+            ),
+        })
+    return rows
+
+
+def save_price_overrides(overrides: dict) -> None:
+    """R-P3a: validate + persist per-model price overrides to .env AND live
+    os.environ, so ``costing`` prices reflect them immediately (AC3 — no restart,
+    no cache). Values are stored as strings and parsed to Decimal by costing
+    (money is never a float). Raises ValueError on a non-numeric price."""
+    import json
+    import os
+    from decimal import Decimal, InvalidOperation
+
+    clean: dict = {}
+    for model, spec in (overrides or {}).items():
+        if not model or not isinstance(spec, dict):
+            continue
+        try:
+            _in = Decimal(str(spec["in_per_1k"]))
+            _out = Decimal(str(spec["out_per_1k"]))
+        except (KeyError, InvalidOperation, ValueError, TypeError):
+            raise ValueError(
+                f"Prices for {model} must be numbers (per 1,000 tokens).")
+        if _in < 0 or _out < 0:
+            raise ValueError(f"Prices for {model} cannot be negative.")
+        clean[str(model)] = {
+            "in_per_1k": str(spec["in_per_1k"]),
+            "out_per_1k": str(spec["out_per_1k"]),
+            "currency": str(spec.get("currency") or "USD").strip() or "USD",
+        }
+    from systemu.runtime import costing
+    blob = json.dumps(clean)
+    _update_env_var(costing.PRICE_OVERRIDE_ENV, blob)
+    os.environ[costing.PRICE_OVERRIDE_ENV] = blob
+
+
+def price_editor_card() -> None:
+    """Render the per-model price editor. Caller wraps it in a section column."""
+    rows = get_price_rows()
+    ui.label(
+        "Estimate run cost from per-model token prices (per 1,000 tokens). "
+        "These are editable defaults — a change applies immediately. No caps."
+    ).classes("s-muted")
+
+    inputs: dict = {}
+    for r in rows:
+        with ui.row().style("align-items: center; gap: 10px; flex-wrap: wrap;"):
+            ui.label(r["model"]).classes("s-mono").style("min-width: 240px;")
+            _in = ui.input("Input / 1k", value=r["in_per_1k"]).props("dense") \
+                .style("width: 120px;")
+            _out = ui.input("Output / 1k", value=r["out_per_1k"]).props("dense") \
+                .style("width: 120px;")
+            _cur = ui.input("Currency", value=r["currency"]).props("dense") \
+                .style("width: 90px;")
+            inputs[r["model"]] = (_in, _out, _cur)
+
+    def _save(_=None):
+        overrides = {
+            model: {"in_per_1k": (i.value or "").strip(),
+                    "out_per_1k": (o.value or "").strip(),
+                    "currency": (c.value or "").strip()}
+            for model, (i, o, c) in inputs.items()
+        }
+        try:
+            save_price_overrides(overrides)
+            ui.notify("Prices saved — applied immediately.", type="positive")
+        except Exception as exc:
+            ui.notify(f"Could not save prices: {exc}", type="negative")
+
+    ui.button("Save Prices", on_click=_save).classes("s-btn s-btn--primary")
 
 
 def get_adherence_settings() -> dict:

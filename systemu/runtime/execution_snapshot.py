@@ -112,6 +112,12 @@ class ExecutionSnapshot:
     # instead of dropping (or double-firing) an in-flight wait. Store-agnostic +
     # cycle-free (mirrors external_evidence). Default [] = no pending waits.
     pending_waits:            List[dict] = field(default_factory=list)
+    # R-P3a (per-run cost visibility): the run's LLM usage rows, a plain list of
+    # {model, tokens_in, tokens_out} dicts drained from costing._LEDGER at capture
+    # so the run's cost survives a suspend→resume and can be priced off the record
+    # itself (costing.cost_of(record)). Store-agnostic + cycle-free (mirrors
+    # pending_waits). Default [] = no recorded usage. NOT a caps mechanism.
+    cost:                     List[dict] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,6 +213,9 @@ def read_snapshot(
             # R-A12a: guard a poisoned/garbage store — a non-list pending_waits
             # degrades to [] (=> no phantom timers; never a crash).
             pending_waits=list(data.get("pending_waits") or []) if isinstance(data.get("pending_waits"), list) else [],
+            # R-P3a: guard a poisoned/garbage store — a non-list cost degrades to
+            # [] (=> the run shows zero usage; never a crash).
+            cost=list(data.get("cost") or []) if isinstance(data.get("cost"), list) else [],
         )
     except SnapshotRefused:
         # DEC-9: a newer-than-supported snapshot must refuse LOUDLY — never
@@ -263,6 +272,7 @@ def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
         "requirement_report":      snapshot.requirement_report,
         "external_evidence":       snapshot.external_evidence,
         "pending_waits":           snapshot.pending_waits,
+        "cost":                    snapshot.cost,
     }
 
 
@@ -345,7 +355,26 @@ def capture_from_context(
         requirement_report=getattr(context, "_requirement_report", None),
         external_evidence=dict(getattr(context, "_external_evidence", {}) or {}),
         pending_waits=list(getattr(context, "_pending_waits", []) or []),
+        cost=_usage_rows_for(execution_id, root_execution_id),
     )
+
+
+def _usage_rows_for(execution_id: str, root_execution_id: Optional[str]) -> List[dict]:
+    """R-P3a: the run's OWN LLM usage rows, drained from the live cost ledger, so
+    the snapshot carries this run's cost across a suspend→resume. Best-effort — a
+    costing import failure never breaks the snapshot.
+
+    Deliberately does NOT union the root-tree id's rows: a sub-agent snapshot must
+    carry ONLY the child's own cost. Copying the root run's rows into the child's
+    durable field would DOUBLE-COUNT the root at query time (its rows already live
+    in the root's own record; a tree total sums each record's own rows). Roll-up is
+    a query-time concern over ``root_execution_id``, never a duplication into the
+    durable field."""
+    try:
+        from systemu.runtime import costing
+        return list(costing.usage_rows(execution_id))
+    except Exception:
+        return []
 
 
 def apply_to_context(snapshot: ExecutionSnapshot, *, context) -> None:
@@ -363,6 +392,26 @@ def apply_to_context(snapshot: ExecutionSnapshot, *, context) -> None:
     try:
         for note in snapshot.sticky_notes:
             context.add_sticky_note(note)
+    except Exception:
+        pass
+
+    # R-P3a: re-seed the cost ledger so a resumed run's post-resume LLM calls
+    # ACCUMULATE on top of its pre-suspend cost. execute() mints a FRESH
+    # execution_id on resume, so the fresh-eid ledger is empty; without this, the
+    # next capture overwrites snapshot.cost with post-resume-only rows and the
+    # pre-suspend cost is LOST (and cost_of/daily_total undercount). Seed the fresh
+    # eid from the durable snapshot.cost, then DROP the stale original eid's ledger
+    # (snapshot.execution_id) so the daily-total ledger-scan holds exactly ONE
+    # entry per logical run — no double-count across the resume. Best-effort +
+    # idempotent; a costing hiccup never breaks the resume.
+    try:
+        from systemu.runtime import costing
+        from systemu.runtime.chat_submission_ctx import current_execution_id
+        cur_eid = current_execution_id()
+        old_eid = getattr(snapshot, "execution_id", None)
+        costing.seed_usage(cur_eid, getattr(snapshot, "cost", None) or [])
+        if old_eid and old_eid != cur_eid:
+            costing.drop_usage(old_eid)
     except Exception:
         pass
 

@@ -27,6 +27,24 @@ from sharing_on.config import Config
 
 logger = logging.getLogger(__name__)
 
+
+def _record_usage_safe(model: str, in_tok: int, out_tok: int) -> None:
+    """R-P3a — the cost accumulator hook. Called at each per-call token-capture
+    point (native + OpenRouter paths), INSIDE the router where the tokens are
+    known (``llm_call_json`` drops token metadata — a caller-side hook would
+    capture nothing). Reads the ambient ``execution_id`` to attribute the call
+    to its owning run with no signature changes.
+
+    Best-effort and lazy-imported: accounting must NEVER break an LLM call, and
+    the import must not risk a boot-time cycle (llm_router loads very early).
+    """
+    try:
+        from systemu.runtime.chat_submission_ctx import current_execution_id
+        from systemu.runtime import costing
+        costing.record_usage(current_execution_id(), model, in_tok, out_tok)
+    except Exception:
+        logger.debug("[LLM] cost accounting hook skipped", exc_info=True)
+
 # API call timeout in seconds.  120 s covers slow free-tier models while still
 # surfacing a clear TimeoutError instead of hanging silently forever.
 _API_TIMEOUT_SECONDS = 120.0
@@ -317,8 +335,15 @@ def _run_coroutine(coro):
             except Exception:
                 pass
 
+    # R-P3a: carry the CALLING thread's contextvars (notably the ambient
+    # execution_id set by the shadow/quick run) into the worker thread.
+    # concurrent.futures does NOT copy contextvars, so without this the router's
+    # cost-accounting hook — and any other contextvar consumer — would read the
+    # default (None) inside the worker and orphan every attributed call.
+    import contextvars
+    _ctx = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(_runner).result()
+        return pool.submit(_ctx.run, _runner).result()
 
 
 def _extract_json(raw_text: str, tier: int) -> Any:
@@ -466,6 +491,7 @@ async def _llm_call_via_provider(
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     logger.info("[LLM] done tier=%d model=%s in=%d out=%d latency=%dms (native)",
                 tier, model, in_tok, out_tok, elapsed_ms)
+    _record_usage_safe(model, in_tok, out_tok)
 
     content: Any = raw_text
     if response_format and response_format.get("type") == "json_object":
@@ -615,6 +641,7 @@ async def llm_call(
         "[LLM] done tier=%d model=%s in=%d out=%d latency=%dms",
         tier, model, in_tok, out_tok, elapsed_ms,
     )
+    _record_usage_safe(model, in_tok, out_tok)
 
     content: Any = raw_text
     if response_format and response_format.get("type") == "json_object":
