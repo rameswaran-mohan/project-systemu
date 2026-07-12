@@ -99,13 +99,18 @@ def resolve_reference(text: str, *, situation: dict, granted: Any,
                 path = fh.get("path")
                 if not path or not isinstance(path, str):
                     continue
-                # confinement re-gate (defense-in-depth; a revoked/moved root drops it)
-                if granted is not None:
-                    try:
-                        if not granted.is_within_granted(path):
-                            continue
-                    except Exception:
+                # confinement re-gate (defense-in-depth; a revoked/moved root drops
+                # it). FAIL-CLOSED: without a GrantedRoots authority we cannot confirm
+                # the candidate is confined, so DROP it rather than accept it — a
+                # missing granted-roots object must never widen file access (was a
+                # fail-open: `if granted is not None` skipped the gate when None).
+                if granted is None:
+                    continue
+                try:
+                    if not granted.is_within_granted(path):
                         continue
+                except Exception:
+                    continue
                 s = _score(fh, ref_tokens, want_exts, now=now)
                 if s > 0.0:
                     scored.append((s, path))

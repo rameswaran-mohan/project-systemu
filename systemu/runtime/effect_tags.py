@@ -120,6 +120,34 @@ _NET_WRITE_METHODS = {"post", "put", "patch", "delete", "request", "send"}
 # attr-only network mutators (receiver is not a bare module name, e.g. self.session.post)
 _ATTR_ONLY_NET_MUTATE = {"post", "put", "patch"}
 
+# R-A14a §15.1 hardening: stdlib egress modules whose IMPORT signals network egress
+# even when the CALL-site scan misses it (e.g. `http.client.HTTPSConnection(...)` has
+# an Attribute receiver, and `conn.request(...)` a bare `conn` receiver, so neither
+# trips _NET_CLIENTS). Keyed on the FULL dotted module so `http.client` is net but
+# `http.server` (inbound) is not. Tightens the forged-network hard-DENY: a forged
+# tool reaching the net via one of these is DENIED, not merely REQUIRE_APPROVAL.
+_NET_EGRESS_MODULES = {
+    "http.client": EffectTag.NET_MUTATE,   # HTTP client egress (request/send)
+    "ftplib": EffectTag.NET_MUTATE,        # FTP transfer egress
+    "telnetlib": EffectTag.NET_MUTATE,     # telnet session egress
+    "poplib": EffectTag.NET_READ,          # POP3 mail read
+    "imaplib": EffectTag.NET_READ,         # IMAP mail read
+    "nntplib": EffectTag.NET_READ,         # NNTP read
+}
+
+
+def _net_egress_for_module(module_name) -> "Optional[EffectTag]":
+    """The net-egress EffectTag for an imported stdlib module (exact or dotted-
+    prefix match on the FULL module name), else None. ``http.client`` → net;
+    ``http.server`` → None."""
+    if not isinstance(module_name, str) or not module_name:
+        return None
+    mod = module_name.strip()
+    for m, tag in _NET_EGRESS_MODULES.items():
+        if mod == m or mod.startswith(m + "."):
+            return tag
+    return None
+
 _SHELL_ATTRS = {("os", "system"), ("os", "popen"), ("os", "execv"),
                 ("os", "execve"), ("os", "execvp"), ("os", "execvpe")}
 _SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
@@ -152,14 +180,21 @@ class _EffectVisitor(ast.NodeVisitor):
             pass
 
     def visit_Import(self, node: ast.Import) -> None:  # noqa: N802 (ast API)
-        if self._sig is not None:
-            for alias in node.names:
+        for alias in node.names:
+            if self._sig is not None:
                 self._add_class(self._sig.class_for_import(alias.name))
+            _net = _net_egress_for_module(alias.name)
+            if _net is not None:
+                self.tags.add(_net)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
-        if self._sig is not None and node.module:
-            self._add_class(self._sig.class_for_import(node.module))
+        if node.module:
+            if self._sig is not None:
+                self._add_class(self._sig.class_for_import(node.module))
+            _net = _net_egress_for_module(node.module)
+            if _net is not None:
+                self.tags.add(_net)
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802

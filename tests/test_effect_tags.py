@@ -325,3 +325,28 @@ def test_backfill_money_move_floor_is_idempotent(tmp_path):
     second = json.loads(body_path.read_text(encoding="utf-8"))["effect_tags"]
     assert first == second
     assert EffectTag.MONEY_MOVE.value in second
+
+
+def test_net_egress_stdlib_imports_are_tagged_net():
+    """R-A14a §15.1 hardening: a tool reaching the net via http.client / ftplib —
+    whose call-site the structural scan misses (Attribute receiver) — is now caught
+    at IMPORT, so classify_source tags it net (tightens the forged-net hard-DENY)."""
+    from systemu.runtime.effect_tags import classify_source, EffectTag
+    http_client = classify_source(
+        "import http.client\n"
+        "def run(**kw):\n"
+        "    c = http.client.HTTPSConnection('x')\n"
+        "    c.request('POST', '/')\n")
+    assert EffectTag.NET_MUTATE in http_client
+    ftp = classify_source("import ftplib\ndef run(**kw):\n    ftplib.FTP('h')\n")
+    assert EffectTag.NET_MUTATE in ftp
+    frm = classify_source("from http.client import HTTPSConnection\ndef run(**kw):\n    HTTPSConnection('x')\n")
+    assert EffectTag.NET_MUTATE in frm
+
+
+def test_http_server_import_is_not_net_egress():
+    """Precision: http.server is INBOUND, not egress — it must NOT be net-tagged
+    (keyed on the full dotted module, not the 'http' root)."""
+    from systemu.runtime.effect_tags import classify_source, EffectTag
+    tags = classify_source("import http.server\ndef run(**kw):\n    return 1\n")
+    assert EffectTag.NET_MUTATE not in tags and EffectTag.NET_READ not in tags

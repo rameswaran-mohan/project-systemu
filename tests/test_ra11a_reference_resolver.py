@@ -54,3 +54,12 @@ def test_recency_breaks_a_name_tie_toward_newer():
 def test_fail_safe_on_garbage_situation():
     v = resolve_reference("x", situation={"roots": "not-a-list"}, granted=_Granted())
     assert isinstance(v, ReferenceVerdict) and v.state == "missing"   # never raises
+
+
+def test_granted_none_fails_closed_drops_all_refs():
+    """Security: without a GrantedRoots authority the confinement re-gate cannot
+    confirm confinement — it must FAIL CLOSED (drop every candidate), never
+    fail-open and accept an unconfined path."""
+    sit = _situation([("resume.pdf", 100)])
+    v = resolve_reference("my resume", situation=sit, granted=None)
+    assert v.state == "missing"
