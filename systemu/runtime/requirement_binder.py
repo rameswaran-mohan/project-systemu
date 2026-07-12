@@ -724,9 +724,13 @@ def build_requirement_report(objectives, capability, situation, ctx, provided_pa
             if not _needs_ask(r):
                 continue
             key = (_get(r, "schema_path"), _get(r, "kind"), _get(r, "state"),
-                   _get(r, "value_origin"))
+                   _get(r, "value_origin"), _get(r, "bound_value_ref"))
             if key in seen_keys:
                 continue                          # dedupe identical asks across objectives
+            # NOTE: bound_value_ref is IN the key — two objectives binding the same
+            # schema_path to DIFFERENT values (distinct bound_value_ref) are DISTINCT
+            # asks; deduping them (as the pre-fix key did) silently dropped the second
+            # binding from the operator's one-click bundle.
             seen_keys.add(key)
             ask.append(r)
     try:

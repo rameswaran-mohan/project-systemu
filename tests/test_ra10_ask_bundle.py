@@ -288,3 +288,46 @@ def test_producer_no_capability_is_noop():
     # either way no elicitation and no crash.
     report = getattr(ctx, "_requirement_report", None)
     assert report is None or report.get("ask_bundle") == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ask_bundle dedupe key — bound_value_ref (pruned-backlog fix, front-loaded)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _obj(n):
+    from types import SimpleNamespace
+    return SimpleNamespace(id=n)
+
+
+def test_ask_bundle_does_not_dedupe_distinct_bound_values():
+    """Two objectives binding the SAME schema_path to DIFFERENT values (distinct
+    bound_value_ref) are DISTINCT asks. bound_value_ref is IN the dedupe key, so the
+    second binding is NOT silently dropped from the operator's one-click bundle."""
+    from systemu.runtime.requirement_binder import build_requirement_report
+    r_a = _req(schema_path="repo", kind="decision", state="resolvable",
+               value_origin="operator", bound_value_ref="repo:project-a")
+    r_b = _req(schema_path="repo", kind="decision", state="resolvable",
+               value_origin="operator", bound_value_ref="repo:project-b")
+
+    def _cr(obj, *a, **k):
+        return [r_a] if obj.id == 1 else [r_b]
+
+    with patch("systemu.runtime.requirement_binder.compute_requirements", side_effect=_cr):
+        report = build_requirement_report([_obj(1), _obj(2)], object(), {}, None)
+
+    refs = {getattr(r, "bound_value_ref", None) for r in report.ask_bundle}
+    assert refs == {"repo:project-a", "repo:project-b"}, "both distinct bindings must surface"
+    assert len(report.ask_bundle) == 2
+
+
+def test_ask_bundle_still_dedupes_identical_asks():
+    """Regression: two objectives with an IDENTICAL ask (same key incl.
+    bound_value_ref) still dedupe to one."""
+    from systemu.runtime.requirement_binder import build_requirement_report
+    same = _req(schema_path="repo", kind="decision", state="resolvable",
+                value_origin="operator", bound_value_ref="repo:x")
+
+    with patch("systemu.runtime.requirement_binder.compute_requirements",
+               side_effect=lambda obj, *a, **k: [same]):
+        report = build_requirement_report([_obj(1), _obj(2)], object(), {}, None)
+    assert len(report.ask_bundle) == 1
