@@ -1192,6 +1192,7 @@ class Supervisor:
         attempt: int,
         max_attempts: int,
         now: float,
+        submission_id: Optional[str] = None,
     ) -> Optional[dict]:
         """R-A12a: arm a DURABLE retry wait on the run's ExecutionSnapshot.
 
@@ -1230,10 +1231,15 @@ class Supervisor:
         )
 
         # A missing execution_id (worker-thread exception path) still needs a durable
-        # home + a stable dedupe key. Derive one from activity + shadow_id + attempt:
-        # shadow_id makes the key RUN-UNIQUE (distinct runs → distinct keys) while
-        # staying stable within a run+attempt (so a re-arm is still idempotent).
-        eid = execution_id or f"retryarm-{activity_id}-{shadow_id}-{attempt}"
+        # home + a stable dedupe key. PREFER the per-submission ``submission_id``
+        # (``sub_<uuid>``, generated in submit()) — it is PROVABLY unique per run yet
+        # stable within a submission, so distinct runs get distinct keys (no cross-run
+        # collision silently deduping a later run's retry) while a re-arm of the same
+        # submission+attempt stays idempotent. Fall back to activity+shadow_id+attempt
+        # only when no submission_id reached this path (shadow_id is run-distinguishing
+        # but NOT provably unique — a shadow can be shared across runs).
+        _syn = submission_id or f"{activity_id}-{shadow_id}"
+        eid = execution_id or f"retryarm-{_syn}-{attempt}"
         rec = _pw.make_retry_wait(
             execution_id=eid,
             activity_id=activity_id,
@@ -1482,6 +1488,7 @@ class Supervisor:
                 attempt=retry_count,
                 max_attempts=MAX_RETRIES,
                 now=time.time(),
+                submission_id=payload.get("submission_id") or result.get("submission_id"),
             )
         else:
             # Dead letter

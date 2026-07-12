@@ -282,6 +282,13 @@ python install.py --mode docker-local     # or docker-enterprise
 
 ## How it works
 
+> **Capture & consent.** Recording captures your screen (screenshots), window
+> switches, file changes, clipboard, and process events **only while you have a
+> recording session running**, and it stays **on your machine** — it is processed
+> locally and written to the local vault, not uploaded anywhere by Systemu. Start
+> a recording only when you intend to; stop it (Ctrl+C) when you're done. Model
+> inference may send task text to your configured LLM provider — see Privacy.
+
 ```
 You perform a task on your computer
           │

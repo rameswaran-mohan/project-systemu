@@ -1,0 +1,112 @@
+# systemu — compliance control map (SEED / Phase C0)
+#
+# DEC-23 seed S-2: a control-family skeleton that BINDS NOW so the eventual
+# compliance program (systemu-COMPLIANCE-SPEC/-PLAN, picked up at a Track-F /
+# enterprise-pilot trigger) has an honest, versioned starting point — and so the
+# per-install /trust page + auditor pack can render real control status rather
+# than marketing.
+#
+# STATUS vocabulary (deliberately honest — no control is claimed done that isn't):
+#   enforced   — a code-level control is live in the default build + under test
+#   partial    — enforced for some paths / behind a default-off flag / seeded
+#   planned    — designed, not yet built (points at the owning milestone)
+#
+# This is a SEED, not the finished program. The full control catalogue, evidence
+# collection, and auditor pack are Track-F scope.
+
+version: 0
+generated_as: seed
+family_note: >
+  Each control maps a compliance intent to the ACTUAL systemu enforcement point
+  (file/mechanism) — grep-verifiable, not aspirational.
+
+controls:
+  - id: CTL-1
+    name: Least-privilege action governance
+    intent: Every effectful action passes one deterministic policy (ALLOW/DENY/REQUIRE_APPROVAL/MASK).
+    mechanism: runtime/action_governance.py::evaluate_action (S1)
+    status: enforced
+
+  - id: CTL-2
+    name: Untrusted-code network containment
+    intent: A self-forged tool that reaches the network is refused until an OS egress jail exists.
+    mechanism: runtime/action_governance.py::forged_network_denied (IMPL-13 hard-DENY) + tests/test_ra14a_hard_deny.py
+    status: enforced
+
+  - id: CTL-3
+    name: Fail-closed money-movement verification
+    intent: A money-moving effect is credited only via an independent, host-pinned, provably-fresh read-back.
+    mechanism: runtime/external_verifier.py::verify money-move gate + hardened api_readback
+    status: partial   # enforced for the effects it covers; MCP pre-submit probe pending; net-arm operator-gated
+
+  - id: CTL-4
+    name: Per-command operator approval
+    intent: A destructive, non-allowlisted command requires an explicit operator decision.
+    mechanism: runtime/tool_sandbox.py per-command gate + runtime/command_approvals.py
+    status: enforced
+
+  - id: CTL-5
+    name: Secrets at rest
+    intent: Tokens/credentials are encrypted at rest, never stored in plaintext.
+    mechanism: vault token store (DPAPI at-rest, S5)
+    status: enforced
+
+  - id: CTL-6
+    name: Filesystem confinement
+    intent: File access is confined to operator-granted roots, re-checked at use, fail-closed.
+    mechanism: runtime/reference_resolver.py confinement re-gate + granted-roots
+    status: enforced
+
+  - id: CTL-7
+    name: Independent effect verification (receipts)
+    intent: An external effect yields a machine-verified or explicitly-claimed receipt — not self-report.
+    mechanism: runtime/actuation/mcp_modality.py + runtime/receipts_store.py (display-only) + workflow_detail badge
+    status: enforced   # for tier-2 MCP actuation, net-off
+
+  - id: CTL-8
+    name: Action audit trail
+    intent: Effectful tool actions are recorded to a durable, queryable audit store.
+    mechanism: runtime/audit_log.py::append_action → vault.append_action_audit
+    status: enforced
+
+  - id: CTL-9
+    name: SSRF / egress target safety
+    intent: An outbound read-back resolves to a public host and is socket-IP-pinned against DNS rebind.
+    mechanism: runtime/readback_client.py::_resolve_pinned_ip + is_url_safe
+    status: enforced
+
+  - id: CTL-10
+    name: Prompt-injection containment
+    intent: Content the agent observes is fenced data, never instructions; values never silent-bind to effects.
+    mechanism: situational_inventory fence() + IMPL-5 value-provenance (content_derived taint)
+    status: enforced
+
+  - id: CTL-11
+    name: Cost visibility
+    intent: Per-run and daily model cost is shown; an unknown model is never assigned a fabricated number.
+    mechanism: runtime/costing.py + Work/Home/Settings surfaces
+    status: enforced
+
+  - id: CTL-12
+    name: Forge-time code isolation
+    intent: Generated tool code is not executed to inspect it (conformance is a static AST read).
+    mechanism: pipelines/tool_forge.py::check_run_conformance (AST-only)
+    status: enforced
+
+  - id: CTL-13
+    name: Dashboard authentication (non-loopback)
+    intent: A non-loopback dashboard binding must require a passphrase; loopback default stays frictionless.
+    mechanism: interface/ (R-SEC1)
+    status: planned   # R-SEC1 hotfix — precondition of any non-loopback / Docker-published deployment
+
+  - id: CTL-14
+    name: Tamper-evident ledger
+    intent: Sensitive ledger rows are hash-chained (digests in-chain, raw PII beside) for later attestation.
+    mechanism: R-P3b ledger (seed S-1; canonical-serialization + PII-out-of-chain rules reserved)
+    status: planned   # no ledger model exists yet — reserved, not built
+
+  - id: CTL-15
+    name: Capture consent
+    intent: Screen/action capture is disclosed and consented at first run.
+    mechanism: README + first-run disclosure (seed S-3)
+    status: partial   # disclosed in README; first-run gating is Track-F

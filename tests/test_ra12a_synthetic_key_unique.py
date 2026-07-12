@@ -106,3 +106,29 @@ def test_same_run_attempt_rearm_is_idempotent(tmp_path):
     snap = read_snapshot(rec1["execution_id"], data_dir=tmp_path)
     assert snap is not None
     assert len(snap.pending_waits) == 1   # deduped — one wait, not twins
+
+
+def test_submission_id_is_the_preferred_provably_unique_key(tmp_path):
+    """When a submission_id reaches the arm (the REAL result path threads
+    payload['submission_id']), it is preferred over shadow_id — so two runs sharing
+    activity+shadow+attempt but with DISTINCT sub_<uuid> submission_ids get DISTINCT
+    keys (shadow_id is run-distinguishing but not provably unique). Same submission
+    stays idempotent."""
+    sup = _bare_supervisor(tmp_path)
+
+    def _arm_sub(sub):
+        return sup._arm_durable_retry(
+            execution_id=None, activity_id="act", shadow_id="sh", root_execution_id=None,
+            scroll_id="scr", delay_s=5.0, attempt=0, max_attempts=5, now=1_000_000.0,
+            submission_id=sub)
+
+    r1 = _arm_sub("sub_aaaa")
+    r2 = _arm_sub("sub_bbbb")
+    assert r1["execution_id"] == "retryarm-sub_aaaa-0"          # submission_id, not shadow_id
+    assert r1["execution_id"] != r2["execution_id"]             # distinct submissions → distinct keys
+    assert r1["wait_id"] != r2["wait_id"]
+
+    r1b = _arm_sub("sub_aaaa")                                  # re-arm same submission → idempotent
+    assert r1b["wait_id"] == r1["wait_id"]
+    snap = read_snapshot(r1["execution_id"], data_dir=tmp_path)
+    assert snap is not None and len(snap.pending_waits) == 1
