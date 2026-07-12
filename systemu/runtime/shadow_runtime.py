@@ -8247,6 +8247,16 @@ class ShadowRuntime:
                 set_chat_submission_id(None, reset_token=self._chat_submission_token)
             except Exception:
                 pass
+            # fold-in: persist this run's cost DURABLY before the ambient eid is
+            # reset — so the per-run cost survives a daemon restart (the live ledger
+            # is in-process; the ExecutionSnapshot cost is deleted on completion).
+            # Best-effort; a no-op for a zero-LLM run.
+            try:
+                from systemu.runtime import costing as _costing
+                from systemu.runtime.chat_submission_ctx import current_execution_id
+                _costing.persist_run_cost(current_execution_id())
+            except Exception:
+                pass
             try:
                 from systemu.runtime.chat_submission_ctx import set_execution_id
                 set_execution_id(None, reset_token=getattr(self, "_execution_id_token", None))

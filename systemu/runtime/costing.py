@@ -214,6 +214,60 @@ def record_usage(run_ref: Optional[str], model: Optional[str],
         _LEDGER.setdefault(str(run_ref), []).append(row)
 
 
+import os as _os
+import re as _re
+_UNSAFE_EID = _re.compile(r"[^A-Za-z0-9_.-]")
+
+#: Base dir for durable cost files. Prod uses "data" (matching the snapshot store's
+#: default). Tests set this to a tmp dir to redirect the durable IO without touching
+#: real ./data (mirrors execution_snapshot's redirect pattern).
+_DEFAULT_DATA_DIR = None
+
+
+def _cost_path(execution_id: str, data_dir=None):
+    """``<data_dir>/audit/exec_<eid>/cost.json`` — a DURABLE per-run cost file
+    (co-located with the snapshot but NOT deleted on completion). The eid is
+    path-sanitized (it becomes a filename)."""
+    from pathlib import Path
+    base = data_dir if data_dir is not None else (_DEFAULT_DATA_DIR or "data")
+    eid = (_UNSAFE_EID.sub("_", str(execution_id)).replace("..", "_")) or "unknown"
+    return Path(base) / "audit" / f"exec_{eid}" / "cost.json"
+
+
+def persist_run_cost(execution_id: Optional[str], *, data_dir=None) -> None:
+    """Write a run's usage rows to its DURABLE cost file so the per-run cost display
+    survives a daemon restart (the in-process ledger is volatile; the
+    ExecutionSnapshot cost is deleted on completion). Best-effort + atomic; a falsy
+    eid or an empty ledger is a no-op (never an empty/orphan file)."""
+    if not execution_id:
+        return
+    rows = usage_rows(execution_id)
+    if not rows:
+        return
+    try:
+        target = _cost_path(execution_id, data_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+        _os.replace(tmp, target)
+    except Exception:
+        logger.debug("[costing] persist_run_cost failed (swallowed)", exc_info=True)
+
+
+def _read_durable_cost(execution_id: Optional[str], *, data_dir=None) -> List[Dict[str, Any]]:
+    """Read a run's durable cost rows, or [] when absent/corrupt. Never raises."""
+    if not execution_id:
+        return []
+    try:
+        target = _cost_path(execution_id, data_dir)
+        if not target.exists():
+            return []
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 def seed_usage(run_ref: Optional[str], rows: Optional[List[Dict[str, Any]]]) -> None:
     """R-P3a: re-seed a run's ledger with its DURABLE (persisted) usage rows on
     RESUME, so post-resume LLM calls ACCUMULATE on top of the pre-suspend cost.
@@ -296,7 +350,12 @@ def _rows_of(run: Any) -> List[Dict[str, Any]]:
     if isinstance(run, list):
         return run
     if isinstance(run, str):
-        return usage_rows(run)
+        # Live ledger first (freshest, in-process). If empty — a completed run in a
+        # FRESH process (daemon restarted → ledger cleared), or a run whose eid is
+        # off-process — fall back to the DURABLE per-run cost so the cost display
+        # survives a restart (the ExecutionSnapshot cost is deleted on completion).
+        rows = usage_rows(run)
+        return rows if rows else _read_durable_cost(run)
     # dict-like record
     if isinstance(run, dict):
         if isinstance(run.get("cost"), list):

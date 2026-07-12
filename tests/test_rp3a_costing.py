@@ -275,3 +275,40 @@ def test_cost_chip_for_helper():
     unknown_chip = costing.cost_chip_for(
         [{"model": "who/unknown", "tokens_in": 500, "tokens_out": 500}])
     assert unknown_chip is not None and unknown_chip.startswith("—")   # tokens shown, cost —
+
+
+def test_cost_survives_restart_via_durable_fallback(tmp_path, monkeypatch):
+    """After a daemon restart (the in-process ledger is wiped), cost_of(eid) still
+    shows the run's cost by falling back to the durable per-run cost file."""
+    monkeypatch.setattr(costing, "_DEFAULT_DATA_DIR", str(tmp_path))
+    known = next(iter(costing.shipped_prices()))
+    costing.reset_ledger()
+    costing.record_usage("exec-restart", known, 1000, 500)
+    costing.persist_run_cost("exec-restart")            # durable write
+
+    costing.reset_ledger()                              # simulate the restart
+    assert costing.usage_rows("exec-restart") == []     # ledger cleared
+
+    s = costing.cost_of("exec-restart")                 # falls back to the durable file
+    assert s.tokens_in == 1000 and s.tokens_out == 500
+    assert s.total_known is True                        # priced from the durable rows
+
+
+def test_persist_run_cost_is_a_noop_without_usage(tmp_path, monkeypatch):
+    monkeypatch.setattr(costing, "_DEFAULT_DATA_DIR", str(tmp_path))
+    costing.reset_ledger()
+    costing.persist_run_cost("exec-empty")              # no usage → no orphan file
+    assert costing._read_durable_cost("exec-empty") == []
+    costing.persist_run_cost(None)                      # no eid → no-op
+
+
+def test_live_ledger_preferred_over_durable(tmp_path, monkeypatch):
+    """A LIVE run reads the fresh ledger, not a stale durable file."""
+    monkeypatch.setattr(costing, "_DEFAULT_DATA_DIR", str(tmp_path))
+    known = next(iter(costing.shipped_prices()))
+    costing.reset_ledger()
+    costing.record_usage("exec-live", known, 100, 50)
+    costing.persist_run_cost("exec-live")               # durable = 100/50
+    costing.record_usage("exec-live", known, 900, 450)  # ledger now 1000/500 (fresher)
+    s = costing.cost_of("exec-live")
+    assert s.tokens_in == 1000 and s.tokens_out == 500  # live ledger wins
