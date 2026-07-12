@@ -59,7 +59,8 @@ async def _default_elicitation_callback(context, params):
 async def open_session(spec: Dict[str, Any], *,
                        elicitation_callback: Optional[ElicitCallback] = None,
                        sampling_callback: Optional[ElicitCallback] = None,
-                       init_timeout: float = 30.0):
+                       init_timeout: float = 30.0,
+                       classification_trusted: bool = True):
     """Yield a live, initialised ClientSession for ``spec``.
 
     Lazy-imports the SDK. Declares client capabilities and wires the
@@ -67,13 +68,29 @@ async def open_session(spec: Dict[str, Any], *,
 
     ``sampling_callback`` EXISTS from P2 (contract-pinned) but is left ``None``
     here — P4 fills the sampling injection without re-editing this constructor.
-    Both callback kwargs are part of the frozen signature:
-    ``open_session(spec, *, elicitation_callback=None, sampling_callback=None,
-    init_timeout=30.0)``.
+
+    R-A14a §15.1(c) / IMPL-13 / DEC-1 — ``classification_trusted`` gates the STDIO
+    launch. A stdio transport SPAWNS an MCP server subprocess; pre-S2 there is NO
+    OS-kernel egress jail, so a REGISTRY / untrusted stdio server would egress
+    unrestricted. The DEFAULT is ``True`` (an OPERATOR-CONNECTED server — the
+    operator vouched by adding it in Settings → Connectors — and every existing
+    caller). A future R-A11 registry/discovery caller passes
+    ``classification_trusted=False``; such a launch is REFUSED pre-jail (before
+    the SDK import + the transport constructor — never launched-then-denied) with
+    an ``egress_enforcer_unavailable``-class error until S2 ships. Remote
+    (http/sse) transports do not spawn a child and are unaffected here (their
+    SSRF/TLS guard lives in the ConnectionManager).
     """
     transport = str(spec.get("transport") or "").lower()
     if transport not in _VALID_TRANSPORTS:
         raise ValueError(f"unknown MCP transport: {transport!r}")
+
+    # §15.1(c): refuse a registry/untrusted stdio LAUNCH pre-jail (fail-closed).
+    if transport == "stdio" and not classification_trusted:
+        from systemu.runtime.action_governance import (
+            _egress_enforcer_available, EGRESS_ENFORCER_UNAVAILABLE_STDIO)
+        if not _egress_enforcer_available():
+            raise PermissionError(EGRESS_ENFORCER_UNAVAILABLE_STDIO)
 
     from mcp import ClientSession  # lazy
 

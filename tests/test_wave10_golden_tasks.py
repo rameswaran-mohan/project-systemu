@@ -123,7 +123,7 @@ def _load_tool_meta(impl: Path) -> dict:
     return dict(getattr(module, "TOOL_META", {}) or {})
 
 
-def _register_impl(vault: Vault, name: str, impl: Path) -> Tool:
+def _register_impl(vault: Vault, name: str, impl: Path, *, forged: bool = True) -> Tool:
     """Save a full Tool record for an implementation file already inside the
     temp vault. enabled + DEPLOYED so the quick lane's readiness gate admits
     it; forged_by_systemu so the W6 subprocess-isolation path is exercised.
@@ -134,6 +134,13 @@ def _register_impl(vault: Vault, name: str, impl: Path) -> Tool:
     time — mirror that here so these golden-task registrations are tagged
     the same way a real forged tool would be, instead of unrealistically
     shipping with no tags.
+
+    R-A14a §15.1(a) / IMPL-13: ``forged`` is False for a curated NETWORK tool
+    (e.g. ``fetch_html``). Such tools ship as BUILT-INS in production (never
+    ``forged_by_systemu``); registering one as forged would (correctly) trip the
+    forged-network hard-DENY and never run. Registering it faithfully as a
+    built-in is MORE production-accurate AND still exercises the W6 subprocess
+    path here (the quick lane attaches no registry → subprocess fallback).
     """
     from systemu.runtime.effect_tags import classify_source
 
@@ -148,7 +155,7 @@ def _register_impl(vault: Vault, name: str, impl: Path) -> Tool:
         status=ToolStatus.DEPLOYED,
         enabled=True,
         implementation_path=str(impl),
-        forged_by_systemu=True,
+        forged_by_systemu=forged,
         dependencies=list(meta.get("dependencies") or []),
         parameter_names=_PARAMETER_NAMES.get(name, []),
         effect_tags=effect_tags,
@@ -157,15 +164,18 @@ def _register_impl(vault: Vault, name: str, impl: Path) -> Tool:
     return tool
 
 
-def _register_real_tool(vault: Vault, name: str) -> Tool:
+def _register_real_tool(vault: Vault, name: str, *, forged: bool = True) -> Tool:
     """Copy the REAL implementation from the repo tool pack into the temp
     vault and register it. This is the load-bearing move: the golden tasks
-    must execute the shipped code, not a test stand-in."""
+    must execute the shipped code, not a test stand-in.
+
+    ``forged=False`` for a curated network tool (fetch_html) — see
+    ``_register_impl`` (R-A14a §15.1 forged-network DENY)."""
     src = _REAL_IMPLEMENTATIONS / f"{name}.py"
     assert src.is_file(), f"real implementation missing from repo: {src}"
     dst = Path(vault.root) / "tools" / "implementations" / f"{name}.py"
     shutil.copyfile(src, dst)
-    return _register_impl(vault, name, dst)
+    return _register_impl(vault, name, dst, forged=forged)
 
 
 def _register_inline_tool(vault: Vault, name: str, body: str) -> Tool:
@@ -352,7 +362,12 @@ class TestGoldenTasks:
         from systemu.runtime import dependency_installer as di
         from systemu.runtime.tool_sandbox import ToolSandbox
 
-        tool = _register_real_tool(vault, "fetch_html")
+        # fetch_html is a curated BUILT-IN network tool. It ships non-forged in
+        # production; registering it forged would trip the R-A14a §15.1(a)
+        # forged-network hard-DENY (IMPL-13) and never fetch. Register it
+        # faithfully as a built-in — the subprocess path is still exercised (the
+        # quick lane attaches no registry → subprocess fallback).
+        tool = _register_real_tool(vault, "fetch_html", forged=False)
         assert tool.dependencies == ["requests"]   # matches TOOL_META
         assert importlib.util.find_spec("requests") is not None, \
             "precondition: requests must be installed (it is a repo dep)"

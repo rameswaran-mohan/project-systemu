@@ -52,6 +52,133 @@ def requires_isolation(effect_tags: Iterable) -> bool:
     return any(coerce(t) in MUST_ISOLATE for t in (effect_tags or ()))
 
 
+# ── R-A14a §15.1(a) / IMPL-13 / DEC-1 — the forged-network HARD-DENY ──────────
+# The network egress effect classes. A forged/untrusted tool carrying ANY of
+# these EGRESSES; pre-S2 there is NO OS-kernel egress jail, so it would run with
+# UNRESTRICTED network access (the hole S2 closes). Broader than MUST_ISOLATE:
+# net_read is included — a forged tool that merely READS the network still
+# egresses (exfiltration), and there is no jail to bound it. IMPL-13: "no kernel
+# enforcer ⇒ forged-network DENY; the capability is absent, never silently
+# ungated."
+NET_EFFECTS = frozenset({
+    EffectTag.NET_READ.value,
+    EffectTag.NET_MUTATE.value,
+    EffectTag.SEND_MESSAGE.value,
+    EffectTag.MONEY_MOVE.value,
+    EffectTag.OAUTH_CALL.value,
+})
+
+
+def has_network_egress(effect_tags: Iterable) -> bool:
+    """True iff any effect tag is a network-egress class (NET_EFFECTS)."""
+    return any(coerce(t) in NET_EFFECTS for t in (effect_tags or ()))
+
+
+def _egress_enforcer_available() -> bool:
+    """The S2 seam. There is NO OS-kernel egress jail today ⇒ False.
+
+    When S2 (R-A8 Phase-2) lands the jailed spawn path in ``backend/local.py``,
+    this flips to probe the enforcer's real availability; until then a forged
+    network tool is DENIED (IMPL-13). The R-A8 Phase-1 spike already proved the
+    zero-capability AppContainer blocks egress at zero privilege, so this DENY is
+    the honest posture until that enforcer is wired — never a silent un-gate."""
+    return False
+
+
+# The honest, matchable BLOCKED reasons (an ``egress_enforcer_unavailable``-class
+# refusal, never a rubber-stampable approval card).
+EGRESS_ENFORCER_UNAVAILABLE = (
+    "egress_enforcer_unavailable: refusing to run a forged/untrusted network "
+    "tool — no OS-kernel egress jail (S2) exists yet, so it would run with "
+    "unrestricted network access. This capability is absent until S2 ships, "
+    "never silently ungated (IMPL-13 / DEC-1)."
+)
+EGRESS_ENFORCER_UNAVAILABLE_STDIO = (
+    "egress_enforcer_unavailable: refusing to LAUNCH a registry/untrusted stdio "
+    "MCP server — no OS-kernel egress jail (S2) exists yet, so its subprocess "
+    "would egress unrestricted. Only operator-connected servers may launch until "
+    "S2 ships (IMPL-13 / DEC-1)."
+)
+
+
+def _forged_source_has_network_egress(impl_path) -> bool:
+    """Structurally scan a forged tool's ON-DISK source for a network-egress
+    effect, INDEPENDENT of its (unreliable) stored/declared ``effect_tags``.
+
+    The forged ``effect_tags`` CANNOT be trusted for this gate: a runtime-forged
+    tool ships with ``effect_tags=[]`` (never stamped — the once-per-version boot
+    backfill already ran before it was forged), and even a backfilled forged tool
+    can DECLARE-AWAY its net tags via a self-authored ``TOOL_META`` (the backfill
+    prefers the declaration and only floors ``money_move``). Both let a
+    net-exfiltrating forged tool reach a rubber-stampable approval card instead of
+    the DENY. So the gate re-derives net-egress from the source the backend is
+    about to execute — mirroring ``tool_dry_run``'s empty-tag re-derivation — which
+    an attacker-authored declaration cannot suppress.
+
+    Returns True iff the source structurally egresses. A read/parse failure yields
+    False: the tag check already ran (no net there either), the codebase governs a
+    truly unclassifiable forged tool via REQUIRE_APPROVAL, and an unreadable /
+    unparseable source cannot execute — so this never SILENTLY ungates a *known*
+    net egress, and it never over-DENYs a legitimate local tool on a transient
+    read hiccup. (The residual — an egress via a sink ``classify_source`` does not
+    recognise — lands in REQUIRE_APPROVAL, the documented curation-bounded bound.)"""
+    if not impl_path:
+        return False
+    try:
+        from pathlib import Path
+        src = Path(impl_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    try:
+        from systemu.runtime.effect_tags import classify_source
+        return has_network_egress(classify_source(src))
+    except Exception:
+        return False
+
+
+def forged_network_denied(tool, *, impl_path=None) -> Optional[str]:
+    """§15.1(a) hard-DENY predicate. Returns the honest BLOCKED reason iff *tool*
+    is a forged/untrusted NETWORK actuator that must be refused pre-S2, else None.
+
+    Fires ONLY for a tool that is (i) ``forged_by_systemu`` AND (ii) has a
+    network-egress effect — established from its effect tags OR, because forged
+    tags are UNRELIABLE (empty for runtime-forged tools; declare-away-able via a
+    self-authored ``TOOL_META``), from a fresh STRUCTURAL scan of the source the
+    backend is about to run — AND (iii) has no egress enforcer available today.
+    ``impl_path`` (the resolved on-disk path the caller is about to execute) is
+    scanned when provided; otherwise the tool's own ``implementation_path`` is used.
+
+    Returns None for:
+      * a non-forged BUILT-IN net tool (vetted repo code — gated, not denied),
+        and by extension an operator-connected MCP tool (never ``forged``, and
+        actuated via ``call_mcp_tool``, never the forged spawn);
+      * a forged LOCAL-only tool (no network egress in tags OR source → unchanged
+        REQUIRE_APPROVAL).
+
+    Fail-closed: any error resolving the signals DENIES — a forged tool we cannot
+    clear is refused, never launched-then-denied."""
+    if tool is None:
+        return None  # no Tool context — the None-isolation default governs elsewhere
+    try:
+        if not bool(getattr(tool, "forged_by_systemu", False)):
+            return None  # built-in / operator-connected MCP → not this DENY
+        net = has_network_egress(getattr(tool, "effect_tags", None) or ())
+        if not net:
+            # Tags say local-only, but forged tags are untrustworthy — re-derive
+            # net-egress from the actual source (closes the empty-tag and the
+            # declare-away holes). Scan the exact path the caller will execute.
+            src_path = impl_path or getattr(tool, "implementation_path", None)
+            net = _forged_source_has_network_egress(src_path)
+        if not net:
+            return None  # forged but local-only (tags AND source) → REQUIRE_APPROVAL
+        if _egress_enforcer_available():
+            return None  # S2 jail present → the jailed spawn path governs (future)
+        return EGRESS_ENFORCER_UNAVAILABLE
+    except Exception:
+        # never let a classification hiccup weaken the DENY — fail toward refusal.
+        return EGRESS_ENFORCER_UNAVAILABLE
+
+
 class Verdict(str, Enum):
     ALLOW = "allow"
     DENY = "deny"

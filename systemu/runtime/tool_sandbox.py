@@ -658,6 +658,28 @@ class ToolSandbox:
         except Exception:
             logger.debug("[Sandbox] execute_tool output-path normalise failed", exc_info=True)
 
+        # ── R-A14a §15.1(a) / IMPL-13 / DEC-1: forged-network HARD-DENY ───
+        # A forged/untrusted tool carrying a network-egress effect tag CANNOT run
+        # safely pre-S2: there is no OS-kernel egress jail, so an approved forged
+        # network tool would egress with UNRESTRICTED network access. Until the
+        # enforcer exists we REFUSE the class OUTRIGHT — a hard DENY that fires
+        # BEFORE the approval gates (never a rubber-stampable card) and BEFORE any
+        # subprocess is launched (never launched-then-denied). Byte-identical to
+        # today for a non-net forged tool (still REQUIRE_APPROVAL, gated below) and
+        # for a non-forged built-in / operator-connected MCP tool (not forged).
+        from systemu.runtime.action_governance import forged_network_denied
+        _egress_deny = forged_network_denied(tool, impl_path=impl_path)
+        if _egress_deny is not None:
+            logger.warning("[Sandbox] forged-network HARD-DENY for %s: %s",
+                           tool_name, _egress_deny)
+            return ToolResult(
+                success=False,
+                error=_egress_deny,
+                parsed={"success": False, "error": _egress_deny,
+                        "error_type": "egress_enforcer_unavailable"},
+                exit_code=-1,
+            )
+
         # ── v0.9.32 (D.4): per-command operator approval gate ─────────────
         # The single chokepoint for both shell tools (run_command,
         # run_cli_command) and both lanes. A destructive, non-allowlisted
