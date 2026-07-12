@@ -152,13 +152,18 @@ def test_projection_respects_tombstones(tmp_path):
     assert any(it.name == "a" for it in items)            # the tool still projects
 
 
-def test_projection_preserves_pinned_across_reconcile(tmp_path):
+def test_projection_reflects_pins_from_sidecar(tmp_path):
+    # pinned is authoritative from the UI-owned pins.json sidecar — the reconciler
+    # never has to write items.json to record a pin (DEC-10 single-writer).
     v = _Vault(tmp_path, tools=[{"id": "t1", "name": "a", "enabled": True}])
     items = tr.project(v)
-    items[0].pinned = True
-    ts.save_items(v, items)
+    key = ts.ref_key(items[0].kind, items[0].ref)
+    ts.set_pin(v, key, True)
     reprojected = {it.id: it for it in tr.project(v)}
     assert reprojected[items[0].id].pinned is True        # operator curation survives
+    ts.set_pin(v, key, False)
+    reprojected = {it.id: it for it in tr.project(v)}
+    assert reprojected[items[0].id].pinned is False       # unpin round-trips too
 
 
 def test_reconcile_once_persists(tmp_path):
@@ -211,3 +216,91 @@ def test_summarize_counts():
     s = summarize(items)
     assert "2 tools" in s and "1 key" in s
     assert summarize([]) == "nothing yet"
+
+
+# --------------------------------------------------------------------------- #
+# T2a — curate what's already on the table: remove(+undo) · pin · search/filter
+# (spec UNIFIED-v2 §5.10.b/.c, §9 T2). Pure logic unit-tested here; the nicegui
+# card actions (★/×, undo snackbar, zone collapse) are operator-verifiable.
+# --------------------------------------------------------------------------- #
+
+def test_remove_tombstone_is_symmetric_undo(tmp_path):
+    """add_tombstone hides an item from the projection; remove_tombstone (undo)
+    brings it back — the projector re-adds the live-store object."""
+    v = _Vault(tmp_path, tools=[{"id": "t1", "name": "a", "enabled": True}])
+    _seed_mcp(v, "http://gh")
+    key = ts.ref_key("mcp_server", {"server": "http://gh"})
+
+    ts.add_tombstone(v, key)
+    assert not any(it.kind == "mcp_server" for it in tr.project(v))   # removed
+
+    ts.remove_tombstone(v, key)
+    assert key not in ts.load_tombstones(v)
+    assert any(it.kind == "mcp_server" for it in tr.project(v))       # undo re-adds
+
+
+def test_remove_tombstone_missing_key_is_a_noop(tmp_path):
+    v = _Vault(tmp_path)
+    ts.remove_tombstone(v, "never:there")            # must not raise on absent key
+    assert ts.load_tombstones(v) == set()
+
+
+def test_filter_items_matches_name_detail_kind_case_insensitively():
+    from systemu.interface.pages.table import filter_items
+    items = [
+        TableItem(id="a", kind="tool", name="Zipper", detail="zip files"),
+        TableItem(id="b", kind="mcp_server", name="github", detail="git host"),
+        TableItem(id="c", kind="credential_ref", name="openai_key", detail="stored"),
+    ]
+    assert {it.id for it in filter_items(items, "ZIP")} == {"a"}         # name+detail
+    assert {it.id for it in filter_items(items, "git")} == {"b"}         # detail
+    assert {it.id for it in filter_items(items, "credential")} == {"c"}  # kind
+    assert filter_items(items, "") == items                              # empty = all
+    assert filter_items(items, "   ") == items                           # blank = all
+    assert filter_items(items, "nomatch") == []
+
+
+def test_set_pin_targets_only_its_ref_key(tmp_path):
+    # pinning one item's ref-key must not pin another's (sidecar keyed by ref_key)
+    v = _Vault(tmp_path, tools=[
+        {"id": "t1", "name": "a", "enabled": True},
+        {"id": "t2", "name": "b", "enabled": True},
+    ])
+    items = tr.project(v)
+    a = next(it for it in items if it.name == "a")
+    b = next(it for it in items if it.name == "b")
+    ts.set_pin(v, ts.ref_key(a.kind, a.ref), True)
+    reproj = {it.id: it for it in tr.project(v)}
+    assert reproj[a.id].pinned is True
+    assert reproj[b.id].pinned is False                  # only the targeted ref-key
+
+
+def test_load_pins_defensive_on_broken_file(tmp_path):
+    v = _Vault(tmp_path)
+    (tmp_path / "table").mkdir(parents=True)
+    (tmp_path / "table" / "pins.json").write_text("not json {", encoding="utf-8")
+    assert ts.load_pins(v) == set()                      # never raises
+
+
+def test_sort_for_display_pins_first_then_name():
+    from systemu.interface.pages.table import sort_for_display
+    items = [
+        TableItem(id="a", kind="tool", name="banana"),
+        TableItem(id="b", kind="tool", name="apple", pinned=True),
+        TableItem(id="c", kind="tool", name="cherry"),
+        TableItem(id="d", kind="tool", name="date", pinned=True),
+    ]
+    order = [it.name for it in sort_for_display(items)]
+    # pinned first (apple, date — alpha within), then the rest alpha (banana, cherry)
+    assert order == ["apple", "date", "banana", "cherry"]
+
+
+def test_removal_notice_flags_still_active_for_operational_kinds():
+    from systemu.interface.pages.table import removal_notice
+    for kind in ("credential_ref", "mcp_server", "service"):
+        msg, still_active = removal_notice(kind, "thing")
+        assert still_active is True
+        assert "still" in msg.lower()          # honest: the real object persists
+    # a preference / declared intent has no live object behind it
+    msg, still_active = removal_notice("preference", "dark mode")
+    assert still_active is False

@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState
+from systemu.runtime import table_store as ts
 
 # zone label -> the item kinds it holds (ordered for display)
 _ZONE_ORDER: List[tuple] = [
@@ -86,13 +87,87 @@ def _project(vault) -> List[Any]:
         return []
 
 
-def _render_card(it: Any) -> None:
+# ── T2a curation: pure helpers (unit-tested; the nicegui actions call these) ──
+
+def filter_items(items: List[Any], query: str) -> List[Any]:
+    """Case-insensitive substring filter over name + detail + kind. A blank
+    query returns the list unchanged (identity, not a copy)."""
+    q = (query or "").strip().lower()
+    if not q:
+        return items
+    out = []
+    for it in items:
+        hay = " ".join([
+            str(getattr(it, "name", "") or ""),
+            str(getattr(it, "detail", "") or ""),
+            _kind(it),
+        ]).lower()
+        if q in hay:
+            out.append(it)
+    return out
+
+
+def sort_for_display(items: List[Any]) -> List[Any]:
+    """Pinned items first, then alphabetical by name (both groups). Stable +
+    case-insensitive so the board order is predictable after a pin."""
+    return sorted(
+        items,
+        key=lambda it: (
+            0 if getattr(it, "pinned", False) else 1,
+            str(getattr(it, "name", "") or "").lower(),
+        ),
+    )
+
+
+# kinds that reference a LIVE operational object — removing the table item is a
+# view change only; the real credential/server/service keeps existing (§5.10.b
+# "explicit still-ACTIVE notice"). Managing the real object is a deep-link (T2b).
+_STILL_ACTIVE_KINDS = {"credential_ref", "mcp_server", "service", "tool", "data_root"}
+_MANAGE_WHERE = {
+    "credential_ref": "Credentials", "mcp_server": "Connections",
+    "service": "Connections", "tool": "the Build page", "data_root": "Connections",
+}
+
+
+def removal_notice(kind: str, name: str) -> tuple:
+    """(message, still_active) for the post-remove snackbar. For a kind backed
+    by a live object the message says plainly that the real thing still exists
+    and where to manage it — the table is an intent layer, not the store."""
+    if kind in _STILL_ACTIVE_KINDS:
+        where = _MANAGE_WHERE.get(kind, "its own page")
+        return (
+            f"Removed “{name}” from your table. The actual {kind.replace('_', ' ')} "
+            f"is still active — manage it in {where}.",
+            True,
+        )
+    return (f"Removed “{name}” from your table.", False)
+
+
+def _render_card(it: Any, *, on_pin=None, on_remove=None) -> None:
     status = getattr(it, "status", "") or ""
     color = _STATUS_COLOR.get(status, "grey")
+    pinned = bool(getattr(it, "pinned", False))
     with ui.card().classes("s-card").style("min-width: 220px; max-width: 340px;"):
-        with ui.row().classes("items-center no-wrap").style("gap: 6px;"):
-            ui.icon("circle", size="xs").props(f"color={color}")
-            ui.label(getattr(it, "name", "") or "").classes("text-weight-medium ellipsis")
+        with ui.row().classes("items-center no-wrap w-full justify-between").style("gap: 6px;"):
+            with ui.row().classes("items-center no-wrap").style("gap: 6px;"):
+                ui.icon("circle", size="xs").props(f"color={color}")
+                ui.label(getattr(it, "name", "") or "").classes("text-weight-medium ellipsis")
+            # curation actions — pin (★) + remove (×). Handlers close over this item.
+            _k, _ref = _kind(it), getattr(it, "ref", {}) or {}
+            _nm = getattr(it, "name", "") or ""
+            with ui.row().classes("items-center no-wrap").style("gap: 0;"):
+                if on_pin is not None:
+                    ui.button(
+                        icon="star" if pinned else "star_border",
+                        on_click=lambda _e=None, k=_k, r=_ref, p=not pinned: on_pin(k, r, p),
+                    ).props(
+                        f"flat dense round size=sm {'color=amber' if pinned else 'color=grey'}"
+                    ).tooltip("Unpin" if pinned else "Pin")
+                if on_remove is not None:
+                    ui.button(
+                        icon="close",
+                        on_click=lambda _e=None, k=_k, r=_ref, n=_nm: on_remove(k, r, n),
+                    ).props("flat dense round size=sm color=grey").tooltip("Remove from table")
         detail = getattr(it, "detail", "") or ""
         if detail:
             ui.label(detail).classes("s-muted").style("font-size: 12px;")
@@ -108,31 +183,112 @@ def _render_card(it: Any) -> None:
 def build_table_page() -> None:
     state = AppState.get()
     vault = getattr(state, "vault", None)
-    items = _project(vault)
 
-    with ui.row().classes("w-full items-center justify-between q-mb-md"):
+    # per-page UI state: the live search query, a pending-undo (ref_key, name), and
+    # the set of zone labels the operator collapsed (persisted so a board refresh —
+    # from a search keystroke / pin / remove / undo-timer — doesn't re-expand them).
+    view: Dict[str, Any] = {"query": "", "undo": None, "seq": 0, "collapsed": set()}
+
+    def _clear_undo(seq: int) -> None:
+        if view["undo"] is not None and view["seq"] == seq:
+            view["undo"] = None
+            try:
+                _board.refresh()
+            except Exception:
+                pass
+
+    def _on_remove(kind: str, ref: Dict[str, Any], name: str) -> None:
+        try:
+            key = ts.ref_key(kind, ref or {})
+            ts.add_tombstone(vault, key)
+        except Exception:
+            ui.notify("Couldn't remove that item.", type="negative")
+            return
+        msg, still_active = removal_notice(kind, name)
+        ui.notify(msg, type="warning" if still_active else "info", multi_line=True)
+        view["seq"] += 1
+        view["undo"] = (key, name)
+        _board.refresh()
+        ui.timer(10.0, lambda s=view["seq"]: _clear_undo(s), once=True)
+
+    def _on_undo() -> None:
+        if view["undo"]:
+            key, _name = view["undo"]
+            try:
+                ts.remove_tombstone(vault, key)
+            except Exception:
+                pass
+            view["undo"] = None
+            _board.refresh()
+
+    def _on_pin(kind: str, ref: Dict[str, Any], pinned: bool) -> None:
+        # UI-owned sidecar write (pins.json) — never touches items.json, so pin
+        # curation can't race the reconciler (DEC-10 single-writer on items.json).
+        try:
+            ts.set_pin(vault, ts.ref_key(kind, ref or {}), pinned)
+        except Exception:
+            pass
+        _board.refresh()
+
+    def _on_search(e: Any) -> None:
+        view["query"] = getattr(e, "value", "") or ""
+        _board.refresh()
+
+    def _on_zone_toggle(label: str, expanded: bool) -> None:
+        # record the operator's collapse choice so the next board refresh honors it
+        # (no refresh here — the expansion already animated client-side).
+        if expanded:
+            view["collapsed"].discard(label)
+        else:
+            view["collapsed"].add(label)
+
+    with ui.row().classes("w-full items-center justify-between q-mb-sm"):
         with ui.column().classes("q-gutter-none"):
             ui.label("On the table").classes("text-h6")
             ui.label(
                 "Everything systemu can see it has — services, tools, files, keys. "
-                "Read-only for now."
+                "Pin what matters, remove what's noise."
             ).classes("s-muted")
-        ui.label(summarize(items)).classes("s-muted")
+        ui.input(placeholder="Search your table…", on_change=_on_search) \
+            .props("dense clearable outlined").classes("s-table-search").style("min-width: 220px;")
 
-    zones = group_into_zones(items)
-    if not zones:
-        with ui.card().classes("s-card"):
-            ui.label("Your table is empty.").classes("text-subtitle1")
-            ui.label(
-                "Connect a service or forge a tool and it'll appear here."
-            ).classes("s-muted")
-        return
+    @ui.refreshable
+    def _board() -> None:
+        items = _project(vault)
+        ui.label(summarize(items)).classes("s-muted q-mb-xs")
 
-    for label, _kinds in list(_ZONE_ORDER) + [(_OTHER, set())]:
-        zitems = zones.get(label)
-        if not zitems:
-            continue
-        ui.label(f"{label} ({len(zitems)})").classes("text-subtitle1 q-mt-md q-mb-xs")
-        with ui.row().classes("w-full wrap").style("gap: 8px;"):
-            for it in zitems:
-                _render_card(it)
+        if view["undo"] is not None:
+            with ui.row().classes("items-center s-card q-pa-sm q-mb-sm").style("gap: 10px;"):
+                ui.icon("undo", size="sm").props("color=grey")
+                ui.label(f"Removed “{view['undo'][1]}”.").classes("s-muted")
+                ui.button("Undo", on_click=_on_undo).props("flat dense size=sm color=primary")
+
+        shown = filter_items(items, view["query"])
+        zones = group_into_zones(shown)
+        if not zones:
+            with ui.card().classes("s-card"):
+                if items and view["query"].strip():
+                    ui.label("No matches.").classes("text-subtitle1")
+                    ui.label("Nothing on your table matches that search.").classes("s-muted")
+                else:
+                    ui.label("Your table is empty.").classes("text-subtitle1")
+                    ui.label(
+                        "Connect a service or forge a tool and it'll appear here."
+                    ).classes("s-muted")
+            return
+
+        for label, _kinds in list(_ZONE_ORDER) + [(_OTHER, set())]:
+            zitems = zones.get(label)
+            if not zitems:
+                continue
+            _exp = ui.expansion(
+                f"{label} ({len(zitems)})",
+                value=(label not in view["collapsed"]),
+            ).classes("w-full q-mt-sm").props("dense")
+            _exp.on_value_change(lambda e, L=label: _on_zone_toggle(L, bool(getattr(e, "value", True))))
+            with _exp:
+                with ui.row().classes("w-full wrap q-mt-xs").style("gap: 8px;"):
+                    for it in sort_for_display(zitems):
+                        _render_card(it, on_pin=_on_pin, on_remove=_on_remove)
+
+    _board()

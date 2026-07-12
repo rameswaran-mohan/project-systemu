@@ -132,6 +132,46 @@ def add_tombstone(vault, ref_key: str) -> None:
     _write_atomic(_tombstones_path(vault), json.dumps(sorted(tomb), indent=2))
 
 
+def remove_tombstone(vault, ref_key: str) -> None:
+    """Undo a removal: drop ``ref_key`` from the tombstone set so the projector
+    re-adds the live-store object. A no-op (never raises) if the key is absent."""
+    tomb = load_tombstones(vault)
+    tomb.discard(str(ref_key))
+    _write_atomic(_tombstones_path(vault), json.dumps(sorted(tomb), indent=2))
+
+
+# ── operator pins — a UI-owned curation sidecar (§5.10.c, DEC-10) ──────────────
+# `pins.json` is written ONLY by the /table page and READ by the reconciler's
+# projection. This keeps `items.json` a single-writer store (the reconciler): the
+# UI never writes items.json, so pin curation cannot race the 60s reconcile.
+
+def _pins_path(vault) -> Path:
+    return _dir(vault) / "pins.json"
+
+
+def load_pins(vault) -> set:
+    """The set of operator-pinned ref-keys. Defensive: broken/absent ⇒ empty."""
+    try:
+        path = _pins_path(vault)
+        if not path.exists():
+            return set()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {str(k) for k in (raw or []) if isinstance(k, str)}
+    except Exception:
+        return set()
+
+
+def set_pin(vault, ref_key: str, pinned: bool) -> None:
+    """Pin/unpin a ref-key. UI-only writer; the projector reads this back onto the
+    matching item's ``pinned`` flag. Atomic + never raises on a missing key."""
+    pins = load_pins(vault)
+    if pinned:
+        pins.add(str(ref_key))
+    else:
+        pins.discard(str(ref_key))
+    _write_atomic(_pins_path(vault), json.dumps(sorted(pins), indent=2))
+
+
 def ref_key(kind: str, ref: Dict[str, Any]) -> str:
     """Stable per-kind identity key for dedup / tombstone / heal (§5.10.a).
 

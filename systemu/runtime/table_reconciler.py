@@ -130,10 +130,12 @@ def _project_credentials(vault) -> List[TableItem]:
 def project(vault) -> List[TableItem]:
     """Compute the current TableItems from the live operational stores.
 
-    Deterministic + idempotent; tombstoned refs excluded; operator-set fields
-    (``pinned``, ``usage``) and ``created_at`` preserved from any existing item
-    with the same (stable) id."""
+    Deterministic + idempotent; tombstoned refs excluded. ``created_at`` and
+    ``usage`` are preserved from any existing item with the same (stable) id;
+    ``pinned`` is read from the UI-owned ``pins.json`` sidecar (`ts.load_pins`) so
+    operator pin curation never has to write ``items.json`` (DEC-10 single-writer)."""
     tombstones = ts.load_tombstones(vault)
+    pins = ts.load_pins(vault)
     existing = {it.id: it for it in ts.load_items(vault)}
 
     projected: Dict[str, TableItem] = {}
@@ -141,11 +143,11 @@ def project(vault) -> List[TableItem]:
         key = ts.ref_key(item.kind, item.ref)
         if key in tombstones:
             continue                       # operator removed it — never re-add
+        item.pinned = key in pins          # authoritative from the UI-owned sidecar
         prior = existing.get(item.id)
         if prior is not None:
-            # heal/preserve: keep the operator's curation + original creation time
+            # heal/preserve: keep the original creation time + curated usage
             item.created_at = prior.created_at
-            item.pinned = prior.pinned
             if prior.usage and not item.usage:
                 item.usage = prior.usage
         projected[item.id] = item          # dict keyed by stable id dedups
