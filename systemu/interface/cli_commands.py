@@ -1627,6 +1627,24 @@ def debug_s4_shadow_meter(ctx, min_runs: int):
     click.echo(arm_verdict_line(snapshot, min_runs=min_runs))
 
 
+@debug_group.command("avoidable-forge")
+@click.pass_context
+def debug_avoidable_forge(ctx):
+    """R-A13.5 · CAP-10 — the avoidable-forge rate over the vault's forged tools.
+
+    Deterministic post-hoc replay (never an LLM judge): for every forged tool,
+    re-runs the capability-slot query — does an EXISTING tool already occupy its
+    slot (would it have bound instead of forging a duplicate)? This is the CAP-10
+    tripwire that adjudicates the DEC-18 "no embeddings" question, reported beside
+    the §10 avoidable-ask rate. READ-ONLY — computes over the live capability index,
+    writes nothing.
+    """
+    from systemu.runtime.replay_metrics import avoidable_forge_report, format_avoidable_forge
+    _, vault = _get_vault_and_config(ctx)
+    for line in format_avoidable_forge(avoidable_forge_report(vault)):
+        click.echo(line)
+
+
 @debug_group.command("rejection-log")
 @click.option("--clear", is_flag=True, help="Wipe the rejection store after listing.")
 @click.option("--window-hours", default=None, type=int,
