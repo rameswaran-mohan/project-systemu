@@ -121,3 +121,45 @@ def _stub_situation_survey(request, monkeypatch):
 
     monkeypatch.setattr(_si, "survey_situation", _instant_empty_survey, raising=False)
     yield
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GATE-TIER (DEC-14) — auto-tag SOURCE-SENSITIVE tests so there is an EDIT-SAFE
+# subset. Many tests assert on a function/class body read via ``inspect.getsource``
+# (~90 files). Those compare against a source SNAPSHOT: if a subagent edits the
+# file under test WHILE the suite runs, getsource returns the new text and the
+# assertion fails spuriously — the long-standing "never run the full gate while
+# subagents edit the same file" constraint. Rather than rewrite ~90 files, we
+# auto-tag them ``source_sensitive`` by module content, so:
+#     pytest -m "not source_sensitive"
+# is a fast, EDIT-SAFE gate you CAN run concurrently with source edits.
+# ─────────────────────────────────────────────────────────────────────────────
+import functools as _functools
+
+
+def module_text_is_source_sensitive(text: str) -> bool:
+    """True if a test module reads source via ``inspect.getsource`` — pure +
+    trivially testable (the detection contract GATE-TIER's auto-tagger relies on)."""
+    return "getsource(" in (text or "")
+
+
+@_functools.lru_cache(maxsize=None)
+def _path_is_source_sensitive(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            return module_text_is_source_sensitive(fh.read())
+    except Exception:
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-apply the ``source_sensitive`` marker to every test whose module reads
+    source via getsource — no manual per-file marking. Defensive: a detection
+    hiccup on one item never breaks collection."""
+    for item in items:
+        try:
+            path = str(getattr(item, "path", None) or getattr(item, "fspath", "") or "")
+            if path and _path_is_source_sensitive(path):
+                item.add_marker(pytest.mark.source_sensitive)
+        except Exception:
+            continue

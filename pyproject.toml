@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.10.16"
+version = "0.10.17"
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 license = {text = "MIT"}
@@ -141,6 +141,7 @@ markers = [
     "slow: long-running tests",
     "real_survey: exercises the REAL R-A9 situational-inventory survey (opts out of the conftest survey stub)",
     "full_budget: opts out of any conftest budget/iteration cap (needs the real ladder)",
+    "source_sensitive: reads a function/class SOURCE via inspect.getsource — fragile if the file under test is edited mid-run; auto-applied by conftest. Run `pytest -m 'not source_sensitive'` for the EDIT-SAFE gate (GATE-TIER / DEC-14).",
 ]
 
 [tool.setuptools]
