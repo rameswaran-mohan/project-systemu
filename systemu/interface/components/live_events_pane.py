@@ -24,6 +24,24 @@ from systemu.interface.dashboard_state import THEME
 
 _MAX_EVENTS = 50
 
+# R-UX2 — a single event's detail block (a big tool_result / params / reasoning)
+# is rendered as ONE element; left unbounded it can bloat the DOM and push a
+# NiceGUI sync past the WebSocket message limit ("Connection lost — message too
+# long"). Cap each rendered block so no single event can do that; the full record
+# stays available on the run's own page.
+_MAX_DETAIL_CHARS = 8000
+
+
+def clip_detail(text: str, limit: int = _MAX_DETAIL_CHARS) -> str:
+    """Bound one rendered detail block. Long payloads get a truncation note
+    (deterministic; pure so it's unit-tested)."""
+    s = "" if text is None else str(text)
+    if len(s) <= limit:
+        return s
+    return (s[:limit]
+            + f"\n… ({len(s) - limit:,} more chars truncated — "
+              "open the full record on the run's page)")
+
 
 def _append_capped(buf: List[Dict[str, Any]], event: Dict[str, Any], max_len: int = _MAX_EVENTS) -> None:
     """Append event to a list, keeping only the most recent max_len entries.
@@ -128,7 +146,7 @@ def render_event_details_body(details: Dict[str, Any], *,
     summary = details.get("summary")
     if summary:
         ui.label("Outcome").classes("s-field-label")
-        ui.label(str(summary)).classes("s-cell").style("white-space: pre-wrap;")
+        ui.label(clip_detail(summary)).classes("s-cell").style("white-space: pre-wrap;")
     # W8.4: per-file artifacts when the run tracked them; the folder as
     # fallback context either way.
     files = details.get("files")
@@ -144,7 +162,7 @@ def render_event_details_body(details: Dict[str, Any], *,
         ui.label("Reasoning").style(
             f"color: {THEME['text_muted']}; font-size: 11px; font-weight: 700;"
         )
-        ui.label(str(reasoning)).style(
+        ui.label(clip_detail(reasoning)).style(
             f"color: {THEME['text']}; font-size: 12px; white-space: pre-wrap;"
         )
     tool_params = details.get("tool_params")
@@ -156,7 +174,7 @@ def render_event_details_body(details: Dict[str, Any], *,
             _pp = _json.dumps(tool_params, indent=2, default=str)
         except Exception:
             _pp = str(tool_params)
-        ui.code(_pp).style("font-size: 11px; width: 100%;")
+        ui.code(clip_detail(_pp)).style("font-size: 11px; width: 100%;")
     tool_result = details.get("tool_result")
     if tool_result is not None:
         ui.label("Tool result").style(
@@ -166,7 +184,7 @@ def render_event_details_body(details: Dict[str, Any], *,
             _rr = _json.dumps(tool_result, indent=2, default=str)
         except Exception:
             _rr = str(tool_result)
-        ui.code(_rr).style("font-size: 11px; width: 100%;")
+        ui.code(clip_detail(_rr)).style("font-size: 11px; width: 100%;")
 
     # v0.9.51 re-trigger affordance — when the event ties back to an activity,
     # offer an in-place re-run (the recovery path for a failed/cancelled/stuck task
