@@ -242,6 +242,53 @@ def build_table_page() -> None:
         else:
             view["collapsed"].add(label)
 
+    def _do_add(dlg: Any, kind: str, name: str, detail: str) -> None:
+        name = (name or "").strip()
+        if not name:
+            ui.notify("Give it a name.", type="warning")
+            return
+        try:
+            ts.add_operator_item(vault, ts.make_operator_item(kind, name, (detail or "").strip()))
+        except Exception:
+            ui.notify("Couldn't add that.", type="negative")
+            return
+        try:
+            dlg.close()
+        except Exception:
+            pass
+        ui.notify(f"Added “{name}” to your table.", type="positive")
+        _board.refresh()
+
+    def _open_add_palette() -> None:
+        # "+ Put on the table" (§5.10.c). The declare flows CREATE operator_added
+        # items directly (operator-typed = trusted); the deeper setup happens in the
+        # existing flows the links route to (no dual-write — §5.10.a).
+        with ui.dialog() as dlg, ui.card().classes("s-card").style("min-width: 360px;"):
+            ui.label("Put on the table").classes("text-h6")
+            ui.label(
+                "Declare something you have. systemu will use it, and heal it to the "
+                "real thing once you connect it."
+            ).classes("s-muted")
+            kind_sel = ui.select(
+                {"service": "A service or account", "data_root": "A folder",
+                 "credential_ref": "A credential (name only — never a secret)"},
+                value="service", label="What is it?",
+            ).props("outlined dense").classes("w-full q-mt-sm")
+            name_in = ui.input(label="Name").props("outlined dense").classes("w-full")
+            detail_in = ui.input(label="Note (optional)").props("outlined dense").classes("w-full")
+            with ui.row().classes("w-full justify-end q-mt-sm").style("gap: 8px;"):
+                ui.button("Cancel", on_click=dlg.close).props("flat color=grey")
+                ui.button(
+                    "Add",
+                    on_click=lambda: _do_add(dlg, kind_sel.value, name_in.value, detail_in.value),
+                ).props("color=primary")
+            ui.separator().classes("q-my-sm")
+            with ui.row().classes("items-center wrap").style("gap: 12px;"):
+                ui.label("Or set one up now:").classes("s-muted")
+                ui.link("Connect a server / credential →", "/settings").classes("s-muted")
+                ui.link("Forge a tool →", "/tools").classes("s-muted")
+        dlg.open()
+
     with ui.row().classes("w-full items-center justify-between q-mb-sm"):
         with ui.column().classes("q-gutter-none"):
             ui.label("On the table").classes("text-h6")
@@ -249,8 +296,11 @@ def build_table_page() -> None:
                 "Everything systemu can see it has — services, tools, files, keys. "
                 "Pin what matters, remove what's noise."
             ).classes("s-muted")
-        ui.input(placeholder="Search your table…", on_change=_on_search) \
-            .props("dense clearable outlined").classes("s-table-search").style("min-width: 220px;")
+        with ui.row().classes("items-center no-wrap").style("gap: 8px;"):
+            ui.input(placeholder="Search your table…", on_change=_on_search) \
+                .props("dense clearable outlined").classes("s-table-search").style("min-width: 200px;")
+            ui.button("Put on the table", icon="add", on_click=_open_add_palette) \
+                .props("dense color=primary")
 
     @ui.refreshable
     def _board() -> None:
@@ -273,8 +323,11 @@ def build_table_page() -> None:
                 else:
                     ui.label("Your table is empty.").classes("text-subtitle1")
                     ui.label(
-                        "Connect a service or forge a tool and it'll appear here."
+                        "Declare what you have, or connect a service / forge a tool "
+                        "and it'll appear here."
                     ).classes("s-muted")
+                    ui.button("Put on the table", icon="add", on_click=_open_add_palette) \
+                        .props("color=primary").classes("q-mt-sm")
             return
 
         for label, _kinds in list(_ZONE_ORDER) + [(_OTHER, set())]:

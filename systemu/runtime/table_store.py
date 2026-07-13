@@ -21,6 +21,7 @@ status, never origin (the §5.10.b taint rule).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -170,6 +171,99 @@ def set_pin(vault, ref_key: str, pinned: bool) -> None:
     else:
         pins.discard(str(ref_key))
     _write_atomic(_pins_path(vault), json.dumps(sorted(pins), indent=2))
+
+
+# ── operator_added declarations — a UI-owned curation sidecar (§5.10.a/.b) ─────
+# The "+ Put on the table" palette creates DECLARED intent items (a service the
+# operator says they use, a folder, a credential NAME) that have no live-store
+# object yet. They persist in `operator_items.json` (written ONLY by the /table UI
+# — §5.10.b#2 "operator_added settable ONLY by direct operator UI action") and are
+# MERGED by the projector. items.json stays a single-writer store (the reconciler);
+# a declared item whose live object later appears heals via a shared ref_key.
+
+def id_for_key(ref_key: str) -> str:
+    """Stable item id from a ref-key (the projector uses the same derivation, so a
+    declared item and its later migrated twin collapse to ONE card)."""
+    return "ti_" + hashlib.sha1(str(ref_key).encode("utf-8")).hexdigest()[:12]
+
+
+# per-kind ref shape for an operator declaration — chosen so ref_key() keys it the
+# SAME way the migrated projection would, enabling declared→ready heal on collision.
+def _operator_ref(kind: str, name: str) -> Dict[str, Any]:
+    if kind in ("service", "mcp_server"):
+        return {"server": name}
+    if kind == "data_root":
+        return {"root_path": name}
+    if kind == "credential_ref":
+        return {"credential_name": name}
+    if kind == "tool":
+        return {"name": name}
+    return {"name": name}
+
+
+def make_operator_item(kind: str, name: str, detail: str = "") -> "TableItem":
+    """Construct a DECLARED operator_added item. origin_class is forced to
+    ``operator`` (operator-typed = trusted, §5.10.b#7); no secret ever in ``ref``
+    (a credential declaration carries the NAME only, §5.10.b#6). A credential
+    declaration also carries NO free-text ``detail`` — so an operator can't
+    accidentally park a secret value in a note on a Keys-zone item (§5.10.b#6)."""
+    ref = _operator_ref(kind, name)
+    if kind == "credential_ref":
+        detail = ""
+    return TableItem(
+        id=id_for_key(ref_key(kind, ref)), kind=kind, name=name, detail=detail,
+        status="declared", provenance="operator_added", origin_class="operator", ref=ref)
+
+
+def _operator_items_path(vault) -> Path:
+    return _dir(vault) / "operator_items.json"
+
+
+def load_operator_items(vault) -> List[TableItem]:
+    """Persisted operator_added declarations. Defensive: broken/absent ⇒ []."""
+    try:
+        path = _operator_items_path(vault)
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        out: List[TableItem] = []
+        for entry in (raw or []):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                it = TableItem(**entry)
+                # harden the sidecar: nothing here can be anything but a direct
+                # operator declaration, regardless of what a hand-edited file claims.
+                it.provenance = "operator_added"
+                it.origin_class = "operator"
+                out.append(it)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def save_operator_items(vault, items: List[TableItem]) -> None:
+    payload = [it.model_dump(mode="json") for it in items]
+    _write_atomic(_operator_items_path(vault), json.dumps(payload, indent=2))
+
+
+def add_operator_item(vault, item: "TableItem") -> None:
+    """Append an operator declaration, deduped by ref_key (re-adding the same thing
+    is a no-op that keeps the first). UI-only writer.
+
+    An explicit "Put on the table" is a DIRECT operator action (§5.10.b#2), so it
+    OVERRIDES any prior removal tombstone for the same ref_key — re-declaring X
+    means the operator wants X back (mirroring the 10s undo). Without this, a stale
+    tombstone would silently swallow the re-declaration while the UI reported success."""
+    key = ref_key(item.kind, item.ref)
+    remove_tombstone(vault, key)              # declaring un-removes (overrides tombstone)
+    items = load_operator_items(vault)
+    if any(ref_key(it.kind, it.ref) == key for it in items):
+        return
+    items.append(item)
+    save_operator_items(vault, items)
 
 
 def ref_key(kind: str, ref: Dict[str, Any]) -> str:

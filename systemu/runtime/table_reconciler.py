@@ -139,10 +139,12 @@ def project(vault) -> List[TableItem]:
     existing = {it.id: it for it in ts.load_items(vault)}
 
     projected: Dict[str, TableItem] = {}
+    live_keys: set = set()
     for item in (_project_mcp(vault) + _project_tools(vault) + _project_credentials(vault)):
         key = ts.ref_key(item.kind, item.ref)
         if key in tombstones:
             continue                       # operator removed it — never re-add
+        live_keys.add(key)
         item.pinned = key in pins          # authoritative from the UI-owned sidecar
         prior = existing.get(item.id)
         if prior is not None:
@@ -151,6 +153,16 @@ def project(vault) -> List[TableItem]:
             if prior.usage and not item.usage:
                 item.usage = prior.usage
         projected[item.id] = item          # dict keyed by stable id dedups
+
+    # merge operator_added declarations (§5.10.a): a declared intent surfaces only
+    # while it has NO live object — once the real thing appears at the same ref_key
+    # the migrated item wins (declared→ready heal, AC2), so no duplicate card.
+    for item in ts.load_operator_items(vault):
+        key = ts.ref_key(item.kind, item.ref)
+        if key in tombstones or key in live_keys:
+            continue
+        item.pinned = key in pins
+        projected.setdefault(item.id, item)
     return list(projected.values())
 
 

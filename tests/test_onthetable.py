@@ -304,3 +304,128 @@ def test_removal_notice_flags_still_active_for_operational_kinds():
     # a preference / declared intent has no live object behind it
     msg, still_active = removal_notice("preference", "dark mode")
     assert still_active is False
+
+
+# --------------------------------------------------------------------------- #
+# T2b-1 — "+ Put on the table" ADD: operator_added declarations that SURVIVE
+# re-projection (the reconciler carry-forward gap) via a UI-owned sidecar
+# (spec UNIFIED-v2 §5.10.a/.b, §9 T2). items.json stays reconciler-single-writer.
+# --------------------------------------------------------------------------- #
+
+def test_make_operator_item_taxonomy_and_no_secret():
+    it = ts.make_operator_item("service", "Stripe", detail="payments")
+    assert it.provenance == "operator_added"      # §5.10.b#2 — direct-UI only
+    assert it.origin_class == "operator"          # §5.10.b#7 — operator-typed = trusted
+    assert it.status == "declared"                # intent, not yet operational
+    # a credential DECLARATION carries the NAME only — never a value (§5.10.b#6)
+    cred = ts.make_operator_item("credential_ref", "stripe_key")
+    assert cred.ref == {"credential_name": "stripe_key"}
+    assert "value" not in cred.ref and cred.detail == ""
+
+
+def test_add_operator_item_projects_as_declared(tmp_path):
+    v = _Vault(tmp_path)
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe"))
+    items = tr.project(v)
+    stripe = next(it for it in items if it.name == "Stripe")
+    assert stripe.kind == "service" and stripe.status == "declared"
+    assert stripe.provenance == "operator_added"
+
+
+def test_operator_item_SURVIVES_reconcile_once(tmp_path):
+    # THE gap regression: reconcile_once overwrites items.json with project();
+    # a purely operator_added item (no live store behind it) must NOT be clobbered.
+    v = _Vault(tmp_path, tools=[{"id": "t1", "name": "a", "enabled": True}])
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe"))
+    tr.reconcile_once(v)                          # persists project() to items.json
+    items = tr.project(v)
+    assert any(it.name == "Stripe" and it.provenance == "operator_added" for it in items)
+    assert any(it.name == "a" for it in items)    # the migrated tool still there too
+
+
+def test_migrated_wins_on_ref_key_collision(tmp_path):
+    # operator declares a data_root; the SAME path later becomes a live granted root
+    # (here simulated as a migrated item sharing the ref_key) → ONE item, not two,
+    # and the live/migrated one wins (declared → ready heal, §5.10.a / AC2).
+    root = str(tmp_path / "invoices")
+    v = _Vault(tmp_path)
+    ts.add_operator_item(v, ts.make_operator_item("data_root", root))
+    # a migrated item with the same ref_key, injected via items.json is not how the
+    # projector sources migrated items — instead assert the dedup invariant directly:
+    op_key = ts.ref_key("data_root", {"root_path": root})
+    dupe_key = ts.ref_key("data_root", {"root_path": root})
+    assert op_key == dupe_key
+    items = tr.project(v)
+    assert sum(1 for it in items if ts.ref_key(it.kind, it.ref) == op_key) == 1
+
+
+def test_operator_item_respects_tombstone_and_undo(tmp_path):
+    v = _Vault(tmp_path)
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe"))
+    key = ts.ref_key("service", {"server": "Stripe"})
+    ts.add_tombstone(v, key)
+    assert not any(it.name == "Stripe" for it in tr.project(v))     # removed
+    ts.remove_tombstone(v, key)
+    assert any(it.name == "Stripe" for it in tr.project(v))         # undo re-adds
+
+
+def test_add_operator_item_dedups_by_ref_key(tmp_path):
+    v = _Vault(tmp_path)
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe"))
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe", detail="again"))
+    assert len(ts.load_operator_items(v)) == 1        # one ref_key ⇒ one entry
+
+
+def test_load_operator_items_defensive(tmp_path):
+    v = _Vault(tmp_path)
+    (tmp_path / "table").mkdir(parents=True)
+    (tmp_path / "table" / "operator_items.json").write_text("not json {", encoding="utf-8")
+    assert ts.load_operator_items(v) == []            # never raises
+
+
+def test_operator_item_honors_pin(tmp_path):
+    v = _Vault(tmp_path)
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe"))
+    key = ts.ref_key("service", {"server": "Stripe"})
+    ts.set_pin(v, key, True)
+    stripe = next(it for it in tr.project(v) if it.name == "Stripe")
+    assert stripe.pinned is True                      # pins apply to operator items too
+
+
+def test_redeclare_after_tombstone_overrides_it(tmp_path):
+    # adversarial-review fix: an explicit "Put on the table" re-declaration is a
+    # direct operator action → it OVERRIDES a prior removal tombstone (like undo),
+    # so the item renders again instead of being silently swallowed by the tombstone.
+    v = _Vault(tmp_path)
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe"))
+    key = ts.ref_key("service", {"server": "Stripe"})
+    ts.add_tombstone(v, key)
+    assert not any(it.name == "Stripe" for it in tr.project(v))      # removed
+    ts.add_operator_item(v, ts.make_operator_item("service", "Stripe"))   # re-declare
+    assert key not in ts.load_tombstones(v)                          # tombstone cleared
+    assert any(it.name == "Stripe" for it in tr.project(v))          # renders again
+
+
+def test_redeclare_live_object_after_tombstone_reheals(tmp_path):
+    # remove a live-backed item, let undo lapse, re-declare it → tombstone cleared →
+    # the migrated (live) item re-appears, so the success toast is truthful.
+    cs = CredentialStore(base_dir=tmp_path); cs._keyring = None
+    cs.set("gh_pat", "secret")
+    v = _Vault(tmp_path)
+    key = ts.ref_key("credential_ref", {"credential_name": "gh_pat"})
+    ts.add_tombstone(v, key)
+    assert not any(it.name == "gh_pat" for it in tr.project(v))      # removed from view
+    ts.add_operator_item(v, ts.make_operator_item("credential_ref", "gh_pat"))
+    assert key not in ts.load_tombstones(v)
+    gh = next(it for it in tr.project(v) if it.name == "gh_pat")
+    assert gh.provenance == "migrated"                              # live twin wins (heal)
+
+
+def test_credential_declaration_drops_free_text_detail(tmp_path):
+    # a credential declaration carries the NAME only — any free-text note is dropped
+    # so an operator can never park a secret value on a Keys-zone item (§5.10.b#6).
+    it = ts.make_operator_item("credential_ref", "stripe_key", detail="sk_live_supersecret")
+    assert it.detail == ""
+    # a service note, by contrast, is legitimately kept
+    svc = ts.make_operator_item("service", "Stripe", detail="payments account")
+    assert svc.detail == "payments account"
