@@ -317,3 +317,32 @@ def test_order_records_preserves_order_when_no_relevance_signal():
     recs = [_rec("zebra_tool"), _rec("delete_thing"), _rec("apple_tool")]
     out = ci.order_records(recs, "no overlap here")
     assert [r["name"] for r in out] == ["zebra_tool", "delete_thing", "apple_tool"]
+
+
+# --------------------------------------------------------------------------- #
+# CAP-5/CAP-6 slice-4 — same-slot dedup advisory at the forge gate (non-blocking)
+# --------------------------------------------------------------------------- #
+
+def test_slot_collisions_finds_same_slot_tool(tmp_path):
+    v = _Vault(tmp_path, tools=[
+        _Tool("t1", "create_issue"), _Tool("t2", "read_file")])
+    cols = ci.slot_collisions(v, "open_issue")           # open→create, so create:issue
+    assert [c["tool_id"] for c in cols] == ["t1"]        # collides with create_issue
+    assert ci.slot_collisions(v, "delete_widget") == []  # free slot → no collision
+
+
+def test_slot_collisions_excludes_self(tmp_path):
+    v = _Vault(tmp_path, tools=[_Tool("t1", "create_issue")])
+    assert ci.slot_collisions(v, "create_issue", exclude_id="t1") == []
+
+
+def test_slot_collisions_no_slot_name_is_empty(tmp_path):
+    v = _Vault(tmp_path, tools=[_Tool("t1", "create_issue")])
+    assert ci.slot_collisions(v, "???") == []            # no derivable slot → no false hit
+
+
+def test_forge_dedup_advisory_wording():
+    adv = ci.forge_dedup_advisory("open_issue", [{"tool_id": "t1", "name": "create_issue",
+                                                  "slots": ["create:issue"]}])
+    assert "create_issue" in adv and "create:issue" in adv and "extend" in adv.lower()
+    assert ci.forge_dedup_advisory("x", []) == ""        # free slot → no advisory line

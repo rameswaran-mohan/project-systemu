@@ -422,6 +422,18 @@ def forge_tool(
     """
     logger.info("[Forge] Proposing tool '%s' for scroll '%s'", tool.name, scroll.name)
 
+    # R-CAP1 · CAP-6 — a same-slot dedup advisory: if an existing tool already
+    # occupies this proposed tool's capability slot, surface it so the operator can
+    # extend instead of forging a duplicate. INFORMS the gate, never blocks (and a
+    # failure to compute it never affects the forge) — CAP-6 "never blocks alone".
+    _dedup_line = ""
+    try:
+        from systemu.runtime import capability_index as _capidx
+        _dedup_line = _capidx.forge_dedup_advisory(
+            tool.name, _capidx.slot_collisions(vault, tool.name, exclude_id=tool.id))
+    except Exception:
+        _dedup_line = ""
+
     # ── User confirmation gate (CLI path) ─────────────────────────────────
     choice = notify_user(
         title="Forge New Tool?",
@@ -431,6 +443,7 @@ def forge_tool(
             f"Description: {tool.description}\n"
             f"Dependencies: {', '.join(tool.dependencies) or 'none'}\n\n"
             f"Context scroll: {scroll.name}"
+            + (f"\n\n⚠ {_dedup_line}" if _dedup_line else "")
         ),
         # v0.6.1-b: safe-default first (auto-skip in non-interactive mode)
         actions=["Skip", "Forge"],

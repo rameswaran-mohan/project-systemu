@@ -333,6 +333,43 @@ def order_records(records: List[Dict[str, Any]], query: str,
         return records
 
 
+def slot_collisions(vault, name: str, *, exclude_id: Optional[str] = None,
+                    live: bool = True) -> List[Dict[str, Any]]:
+    """CAP-6 — existing tools that occupy the SAME canonical slot(s) as a proposed
+    tool ``name`` (the pre-forge "prove absence before creation" signal, CAP-5).
+    Returns compact dicts (empty if the slot is free / the name has no slot). Reads
+    a fresh in-memory view by default (``live``), never writes, never raises —
+    ADVISORY only: it informs the forge gate, it never blocks (CAP-6)."""
+    try:
+        slots = {cs.slot_str(s) for s in cs.slots_from_name(name or "")}
+        if not slots:
+            return []
+        rows = derive_index(vault) if live else load_index(vault)
+        out = []
+        for r in rows:
+            if exclude_id and r.tool_id == exclude_id:
+                continue
+            if slots & set(r.slots):
+                out.append({"tool_id": r.tool_id, "name": r.name, "slots": list(r.slots)})
+        return out
+    except Exception:
+        return []
+
+
+def forge_dedup_advisory(name: str, collisions: List[Dict[str, Any]]) -> str:
+    """One plain heads-up line for the forge confirmation if ``name`` collides with
+    existing tools in its capability slot (CAP-6). Empty string if none — so the
+    caller adds nothing when the slot is free. Never a hard block."""
+    cols = [c for c in (collisions or []) if isinstance(c, dict)]
+    if not cols:
+        return ""
+    names = ", ".join(sorted({str(c.get("name", "")) for c in cols if c.get("name")})[:5])
+    slots = ", ".join(sorted({s for c in cols for s in (c.get("slots") or [])}))
+    return (f"Heads up: this shares the {slots or 'same'} capability with existing "
+            f"tool(s): {names}. Consider extending one of those instead of forging a "
+            f"duplicate.")
+
+
 def find_tools(vault, query: str, limit: Optional[int] = None,
                *, live: bool = False) -> List[Dict[str, Any]]:
     """CAP-4c — a deterministic index lookup (no LLM, burns no harness-request
