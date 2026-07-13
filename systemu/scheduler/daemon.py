@@ -576,6 +576,27 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         replace_existing=True,
     )
 
+    # R-CAP1 · CAP-2 — the capability index reconciler: derives
+    # capabilities/capability_index.json from {Tool catalog ∪ mcp enabled_tools}
+    # (usage read from capability_ledger). SOLE writer of that store (CAP-0.1) —
+    # derive-only + idempotent + never raises, so it's warmth not correctness
+    # (find_tools(live=True) reads fresh without writing).
+    from systemu.runtime import capability_index as _capidx
+    def _reconcile_capability_index_job():
+        try:
+            _capidx.reconcile_index(vault)          # SOLE writer of the index (CAP-0.1)
+        except Exception:
+            logger.exception("[Daemon] capability index reconciler job crashed")
+
+    scheduler.add_job(
+        _reconcile_capability_index_job,
+        trigger="interval",
+        seconds=60,
+        id="capability_reconciler",
+        name="Capability Slots Index Reconciler",
+        replace_existing=True,
+    )
+
     # Recovery scan-to-queue + stale-gate reconciler: recovery has no persisted
     # producer (diagnoses are on-demand scans), so this daemon job IS the
     # producer — it scans the vault, enqueues a recovery gate for every current

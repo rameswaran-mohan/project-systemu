@@ -77,6 +77,15 @@ WRITER_OWNERSHIP = {
         "def": "runtime/table_store.py",
         "note": "Clean single writer.",
     },
+    "CapabilitySlots index (<root>/capabilities/capability_index.json)": {
+        "call": "reconcile_index(",
+        "allowed": {"scheduler/daemon.py"},          # the sole 60s capability reconciler job
+        "def": "runtime/capability_index.py",
+        "note": ("R-CAP1 CAP-0.1: reconcile_index is DERIVE-ONLY (rebuilds the whole file "
+                 "from {Tool catalog ∪ mcp enabled_tools}; no RMW). The daemon job is the "
+                 "sole writer; read-only callers use find_tools(live=True) which derives in "
+                 "memory and never writes. Any further writer needs a DEC-10 review."),
+    },
     "Fatigue metrics (<root>/metrics/metrics.json) — resolution side": {
         "call": "record_resolution(",
         "allowed": {"approval/decision_queue.py", "interface/command/inbox.py"},

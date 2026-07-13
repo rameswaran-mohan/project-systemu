@@ -2220,3 +2220,24 @@ def skill_view(name):
     click.echo("")
     click.echo("=" * 60)
     click.echo(result.get("body", ""))
+
+
+def run_find_tools(vault, query: str, limit: int = 15) -> int:
+    """R-CAP1 · CAP-4c — print the deterministic capability search for ``query``.
+
+    Uses ``capability_index.find_tools(live=True)`` (derives in memory — NEVER
+    writes the index, so the daemon reconciler stays its sole writer, CAP-0.1).
+    Ranks the COMPLETE store, so every tool is listed (never-subtract). No LLM,
+    no harness-request budget. Returns a process exit code (always 0 — a search
+    with no matches is a valid, non-error result)."""
+    from systemu.runtime import capability_index as _ci
+    q = (query or "").strip()
+    rows = _ci.find_tools(vault, q, limit=(None if not limit else int(limit)), live=True)
+    if not rows:
+        click.echo("No tools on your table yet. Forge or connect one and it'll appear here.")
+        return 0
+    click.echo(f"Tools for {q!r} — ranked, {len(rows)} shown:")
+    for r in rows:
+        slot = ", ".join(r.get("slots") or []) or "-"
+        click.echo(f"  {str(r.get('name', '')):<28} [{slot}]  ({r.get('origin', '')})")
+    return 0

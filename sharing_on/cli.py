@@ -1274,6 +1274,34 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
     sys.exit(result.exit_code)
 
 
+@cli.command(name="find-tools")
+@click.argument("query", nargs=-1, required=True)
+@click.option("--limit", "limit", default=15, type=int,
+              help="Max results to show (0 = all). Ranked; the store is complete.")
+def find_tools_cmd(query, limit):
+    """Search your capability catalog for tools matching QUERY (R-CAP1 · CAP-4c).
+
+    Deterministic — no LLM, no model budget. Ranks the COMPLETE store, so every
+    tool stays reachable (never-subtract). Reads a fresh in-memory view without
+    writing the index.
+
+    \b
+    Examples:
+      sharing_on find-tools create an issue
+      sharing_on find-tools send email
+    """
+    import os
+    from systemu.storage.sqlite.vault import SqliteVault
+    from systemu.interface.cli_commands import run_find_tools
+
+    db_url = os.environ.get("SYSTEMU_DATABASE_URL")
+    if not db_url:
+        click.echo("ERROR: SYSTEMU_DATABASE_URL not set", err=True)
+        sys.exit(2)
+    vault = SqliteVault(database_url=db_url)
+    sys.exit(run_find_tools(vault, " ".join(query), limit))
+
+
 # ---------------------------------------------------------------------------
 # capture command group (v0.7.1)
 # ---------------------------------------------------------------------------

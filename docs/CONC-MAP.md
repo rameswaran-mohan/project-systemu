@@ -57,6 +57,7 @@ multi-writer × missing-serialization.
 | `dashboard_lockout.json` (R-SEC1) | concurrent NiceGUI login threads | `A`, **unlocked RMW** | multi | MED (security-relevant undercount) |
 | `schedules/*.json` + index | schedule job `mark_fired/missed` | `A`, unlocked RMW | APScheduler | LOW-MED |
 | **OnTheTable** `table/items.json` | **only** `table_reconciler.reconcile_once` (60s) | `A` | **single ✓** | LOW |
+| **CapabilitySlots index** `capabilities/capability_index.json` (R-CAP1) | **only** the daemon's `capability_reconciler` job (60s) → `capability_index.reconcile_index` | `A` (derive-only, no RMW) | **single ✓** (read-only callers use `find_tools(live=True)` — derives in memory, never writes) | LOW |
 | **OnTheTable curation sidecars** `table/tombstones.json` + `table/pins.json` (T2a) + `table/operator_items.json` (T2b) | **only** the `/table` page (`interface/pages/table.py` — `add/remove_tombstone`, `set_pin`, `add_operator_item`) | `A` | **single ✓** (UI-owned; the reconciler only READS them in `project()`) | LOW |
 | **R-P1 resolve audit** `messaging/resolve_audit.jsonl` | **only** `decision_bridge.resolve_from_channel` → telegram thread | `APPEND` | **single ✓** | LOW |
 | **R-P3a cost ledger** (in-process `costing._LEDGER`, keyed by execution_id) | **only** `llm_router._record_usage_safe` → the calling LLM-call thread (contextvar-propagated into the sync worker) | in-process `_LEDGER_LOCK` | **single ✓** (router token-capture hook) | LOW (in-memory, not durable; no cross-proc surface) |
