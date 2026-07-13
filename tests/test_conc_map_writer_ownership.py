@@ -77,6 +77,14 @@ WRITER_OWNERSHIP = {
         "def": "runtime/table_store.py",
         "note": "Clean single writer.",
     },
+    "R-A13.5 ask corpus (<root>/audit/ask_corpus.jsonl)": {
+        "call": "record_ask(",
+        "allowed": {"runtime/shadow_runtime.py"},    # the shadow exec loop, at the ask point
+        "def": "runtime/replay_metrics.py",
+        "note": ("APPEND-only deterministic ask corpus (observability; the §10 avoidable-ask "
+                 "signal). O_APPEND line-atomic (records << PIPE_BUF) so concurrent shadow "
+                 "runs interleave whole lines safely. Any further writer needs a DEC-10 review."),
+    },
     "CapabilitySlots index (<root>/capabilities/capability_index.json)": {
         "call": "reconcile_index(",
         "allowed": {"scheduler/daemon.py"},          # the sole 60s capability reconciler job

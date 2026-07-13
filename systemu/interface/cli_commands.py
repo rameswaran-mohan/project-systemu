@@ -1645,6 +1645,22 @@ def debug_avoidable_forge(ctx):
         click.echo(line)
 
 
+@debug_group.command("avoidable-ask")
+@click.pass_context
+def debug_avoidable_ask(ctx):
+    """R-A13.5 · §10 — the avoidable-ask signal over the accreted ask corpus.
+
+    Deterministic (never an LLM judge): counts harness asks made with no recorded
+    resolution attempt (zero tool-attempts + no blocking signal) — a §10 lower-bound
+    that decides DEC-7 (the quick-lane ask cap), reported beside the avoidable-forge
+    rate. The corpus accretes from real runs at the ask point. READ-ONLY.
+    """
+    from systemu.runtime.replay_metrics import avoidable_ask_report, format_avoidable_ask
+    _, vault = _get_vault_and_config(ctx)
+    for line in format_avoidable_ask(avoidable_ask_report(vault)):
+        click.echo(line)
+
+
 @debug_group.command("rejection-log")
 @click.option("--clear", is_flag=True, help="Wipe the rejection store after listing.")
 @click.option("--window-hours", default=None, type=int,

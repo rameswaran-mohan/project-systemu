@@ -117,3 +117,61 @@ def test_format_report_lines_are_plain_strings(tmp_path):
     lines = rm.format_avoidable_forge(rm.avoidable_forge_report(v))
     assert isinstance(lines, list) and all(isinstance(x, str) for x in lines)
     assert any("open_issue" in x for x in lines) and any("%" in x for x in lines)
+
+
+# --------------------------------------------------------------------------- #
+# R-A13.5 slice-2 — the avoidable-ASK corpus + report (§10, DEC-7 signal)
+# --------------------------------------------------------------------------- #
+
+def test_record_and_load_ask_corpus(tmp_path):
+    v = _Vault(tmp_path)
+    rm.record_ask(v, kind="credential", attempts_before=0, tool_attempts=0, blocked_signals=[])
+    rm.record_ask(v, kind="decision", attempts_before=3, tool_attempts=2,
+                  blocked_signals=["loop_guard"])
+    corpus = rm.load_ask_corpus(v)
+    assert len(corpus) == 2 and corpus[0]["kind"] == "credential"
+    # append-only jsonl under the vault audit dir
+    assert (tmp_path / "audit" / "ask_corpus.jsonl").exists()
+
+
+def test_avoidable_ask_counts_only_no_prior_attempt(tmp_path):
+    v = _Vault(tmp_path)
+    rm.record_ask(v, kind="a", attempts_before=0, tool_attempts=0, blocked_signals=[])  # no-attempt
+    rm.record_ask(v, kind="b", attempts_before=2, tool_attempts=1, blocked_signals=[])  # tried
+    rm.record_ask(v, kind="c", attempts_before=0, tool_attempts=0,
+                  blocked_signals=["loop_guard"])                                        # blocked (necessary)
+    rep = rm.avoidable_ask_report(v)
+    assert rep["total_asks"] == 3
+    assert rep["no_attempt_count"] == 1                 # only the truly zero-effort ask
+    assert abs(rep["rate"] - 1 / 3) < 1e-9
+
+
+def test_record_ask_never_raises_on_broken_vault():
+    class _Bad:
+        root = "\x00::/nonexistent-invalid"            # unwritable path
+    rm.record_ask(_Bad(), kind="x")                     # must not raise
+    assert rm.load_ask_corpus(_Bad()) == []
+
+
+def test_load_ask_corpus_skips_malformed_lines(tmp_path):
+    v = _Vault(tmp_path)
+    d = tmp_path / "audit"; d.mkdir(parents=True)
+    (d / "ask_corpus.jsonl").write_text('{"kind":"ok","attempts_before":0}\nnot json {\n\n',
+                                        encoding="utf-8")
+    corpus = rm.load_ask_corpus(v)
+    assert len(corpus) == 1 and corpus[0]["kind"] == "ok"
+
+
+def test_empty_ask_corpus_is_a_clean_zero(tmp_path):
+    rep = rm.avoidable_ask_report(_Vault(tmp_path))
+    assert rep["total_asks"] == 0 and rep["rate"] == 0.0
+
+
+def test_input_asks_excluded_from_the_metric(tmp_path):
+    # an off-protocol input-kind record must not count (operator-input is necessary
+    # by nature) — belt-and-suspenders beyond the structural else-branch exclusion.
+    v = _Vault(tmp_path)
+    rm.record_ask(v, kind="input", attempts_before=0, tool_attempts=0, blocked_signals=[])
+    rm.record_ask(v, kind="tool", attempts_before=0, tool_attempts=0, blocked_signals=[])
+    rep = rm.avoidable_ask_report(v)
+    assert rep["total_asks"] == 1 and rep["no_attempt_count"] == 1   # input excluded

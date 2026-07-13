@@ -6655,6 +6655,25 @@ class ShadowRuntime:
                                 attempts_before_request=_att,
                                 provenance=_prov,
                             )
+                            # R-A13.5 — accrete this harness ask into the deterministic
+                            # avoidable-ask corpus (observability-only, append-only; it
+                            # NEVER affects the run). INPUT asks (the if-branch above)
+                            # are operator-input by nature and excluded — only this
+                            # instrumented else-branch (tool/credential/decision asks,
+                            # where "did it try to resolve first" is a meaningful §10
+                            # question) is recorded.
+                            try:
+                                from systemu.runtime import replay_metrics as _rm
+                                _rm.record_ask(
+                                    self.vault,
+                                    kind=str(getattr(_hk, "value", _hk) or ""),
+                                    attempts_before=_att,
+                                    tool_attempts=len(_prov.get("tool_attempts") or []),
+                                    blocked_signals=_prov.get("blocked_signals") or [],
+                                    confidence=_conf,
+                                )
+                            except Exception:
+                                pass
                         _gov = governor or Governor(self.config)
                         _used_harness = True   # v0.10.0 Task 1.7(c): this run pulled the harness
                         # v0.9.33 Bug 2/3: thread real arbitration context. This

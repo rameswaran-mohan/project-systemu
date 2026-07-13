@@ -17,7 +17,105 @@ its fixture format is the plan's "FIRST STEP" and lands with the ask-replay.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Dict, List
+
+
+# ── avoidable-ASK corpus (§10, decides DEC-7) — slice-2 ────────────────────────
+# A deterministic directional signal accreted from real runs. The ask rail records
+# each harness ask with its resolution-attempt instrumentation (attempts_before,
+# tool_attempts, blocked_signals — the v0.10.0 pull instrumentation); the report
+# counts asks made with NO recorded resolution attempt — a §10 lower-bound. The
+# corpus is append-only, single-writer (the shadow exec thread) — CONC-MAP registered.
+
+def _ask_corpus_path(vault) -> Path:
+    return Path(vault.root) / "audit" / "ask_corpus.jsonl"
+
+
+def record_ask(vault, *, kind: str = "", attempts_before: int = 0,
+               blocked_signals: Any = None, tool_attempts: int = 0,
+               confidence: float = 0.5) -> None:
+    """Append one ask to the corpus (R-A13.5 / DEC-11 accretion). OBSERVABILITY-ONLY,
+    append-only, single-writer — NEVER raises (a recording hiccup must never affect
+    the run that made the ask)."""
+    try:
+        rec = {
+            "kind": str(kind or ""),
+            "attempts_before": int(attempts_before or 0),
+            "tool_attempts": int(tool_attempts or 0),
+            "blocked_signals": list(blocked_signals or []),
+            "confidence": float(confidence or 0.0),
+        }
+        p = _ask_corpus_path(vault)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def load_ask_corpus(vault) -> List[Dict[str, Any]]:
+    """All recorded asks. Defensive: a broken/absent file / malformed line ⇒ skipped."""
+    try:
+        p = _ask_corpus_path(vault)
+        if not p.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def avoidable_ask_report(vault) -> Dict[str, Any]:
+    """§10 — a DETERMINISTIC DIRECTIONAL signal for the avoidable-ask rate (a DEC-7
+    input). Counts asks made with NO recorded resolution attempt (zero tool-attempts
+    AND no blocking signal): by §10 ("try inventory + discovery + resolver + a safe
+    default BEFORE asking") those are avoidable-CANDIDATES. This is a NON-DEFINITIVE
+    PROXY / leading indicator, not a strict bound — its bias is two-sided (it can miss
+    an avoidable ask that logged a *failed* tool attempt, and can count a necessary
+    ACCESS/COMPUTE ask that legitimately did no tool attempt). The definitive rate
+    needs a resolver-replay over each ask's inventory snapshot (the documented
+    refinement). Operator-input (``kind=="input"``) asks are excluded — necessary by
+    nature. Reported beside the avoidable-forge rate. Never raises."""
+    corpus = [a for a in load_ask_corpus(vault)
+              if str(a.get("kind", "")).strip().lower() != "input"]
+    total = len(corpus)
+    no_attempt = [
+        a for a in corpus
+        if int(a.get("attempts_before") or 0) == 0
+        and int(a.get("tool_attempts") or 0) == 0
+        and not (a.get("blocked_signals") or [])
+    ]
+    return {
+        "total_asks": total,
+        "no_attempt_count": len(no_attempt),
+        "rate": (len(no_attempt) / total) if total else 0.0,
+    }
+
+
+def format_avoidable_ask(report: Dict[str, Any]) -> List[str]:
+    r = report or {}
+    total = int(r.get("total_asks", 0) or 0)
+    n = int(r.get("no_attempt_count", 0) or 0)
+    rate = float(r.get("rate", 0.0) or 0.0)
+    return [
+        f"No-prior-attempt asks: {n}/{total} = {rate * 100:.0f}%",
+        "  (asks made with no recorded tool-resolution attempt and no blocking signal —",
+        "   a deterministic DIRECTIONAL signal (non-definitive proxy) for the §10",
+        "   avoidable-ask rate; a DEC-7 input. The definitive rate needs a resolver-replay",
+        "   over each ask's inventory snapshot.)",
+    ]
 
 
 def avoidable_forge_report(vault) -> Dict[str, Any]:
