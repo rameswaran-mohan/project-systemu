@@ -344,6 +344,16 @@ def run_quick_task(
             "parameters_schema": dict(entry.get("schema") or {}),
         })
 
+    # R-CAP1 · CAP-4 — order the LLM-visible tool index most-relevant-first for
+    # THIS task (deterministic slot+lexical rank). NEVER-SUBTRACT: every tool
+    # keeps its full schema and stays in the list; only the order changes, so the
+    # model can still pick any tool. Defensive — a hiccup leaves the order as-is.
+    try:
+        from systemu.runtime import capability_index as _capidx
+        index = _capidx.order_records(index, prompt)
+    except Exception:
+        logger.debug("[QuickTask] capability ordering skipped", exc_info=True)
+
     # Deliverables contract: mirror the sandbox's output_dir derivation
     # (config.output_dir or <vault>/output), pre-normalize write paths with
     # the SAME function the sandbox uses (so artifact collection sees the

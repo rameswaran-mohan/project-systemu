@@ -301,6 +301,38 @@ def select_top_k(rows: List[IndexRow], query: str, k: int = 12) -> List[IndexRow
     return rank(rows, query)[:max(0, int(k))]
 
 
+def order_records(records: List[Dict[str, Any]], query: str,
+                  *, name_key: str = "name") -> List[Dict[str, Any]]:
+    """CAP-4 applied to a tool-consuming surface's OWN dict records (e.g. the
+    quick-lane ``_tool_index``): reorder most-relevant-first for ``query`` WITHOUT
+    dropping any record (never-subtract — the model still sees every tool, just
+    better-ordered). Deterministic (slot match → lexical name/slot overlap; the
+    tool-controlled description is never a signal). Equally-relevant records KEEP
+    their original relative order — the sort is stable and the key carries NO name
+    tiebreak, so a zero-signal query leaves the surface UNCHANGED (only a real
+    relevance difference reorders; no arbitrary alphabetical reshuffle that could
+    e.g. front-load verb-first names). Defensive: any error returns the input list
+    UNCHANGED, so a ranking hiccup can never shrink or reorder-destroy the surface."""
+    try:
+        qslots = set(_query_slots(query))
+        q_tokens = _tokens(query)
+
+        def _key(rec):
+            name = str((rec or {}).get(name_key, "") or "")
+            slots = [cs.slot_str(s) for s in cs.slots_from_name(name)]
+            slot_exact = 1 if (qslots & set(slots)) else 0
+            lex = len(q_tokens & _tokens(name, " ".join(slots)))
+            return (-slot_exact, -lex)          # stable sort preserves order on ties
+
+        ordered = sorted(records, key=_key)
+        # never-subtract guard: only accept the reorder if it preserved every record
+        if len(ordered) == len(records):
+            return ordered
+        return records
+    except Exception:
+        return records
+
+
 def find_tools(vault, query: str, limit: Optional[int] = None,
                *, live: bool = False) -> List[Dict[str, Any]]:
     """CAP-4c — a deterministic index lookup (no LLM, burns no harness-request

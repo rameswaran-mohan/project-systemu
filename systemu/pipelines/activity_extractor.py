@@ -94,6 +94,15 @@ def extract_and_process(
         _enrich_tool_for_catalog(t, vlt)
         for t in vlt.load_index("tools")
     ]
+    # R-CAP1 · CAP-4 — order the dedup catalog most-relevant-first for this scroll
+    # (the same never-subtract + defensive helper the quick lane uses; only the
+    # order changes, every tool + schema is kept).
+    try:
+        from systemu.runtime import capability_index as _capidx
+        existing_tools = _capidx.order_records(
+            existing_tools, getattr(scroll, "intent", "") or getattr(scroll, "name", "") or "")
+    except Exception:
+        logger.debug("[Extract] capability ordering skipped", exc_info=True)
 
     # ── Stage 3b: Tier 1 extraction call ──────────────────────────────────
     prompt = load_prompt("extract_skills_tools.md")

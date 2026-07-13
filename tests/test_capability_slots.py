@@ -271,3 +271,49 @@ def test_boolean_subschema_tool_still_indexed(tmp_path):
         _Tool("t1", "read_file", parameters_schema={"properties": {"flag": True}})])
     rows = ci.derive_index(v)
     assert any(r.tool_id == "t1" for r in rows)         # not silently dropped
+
+
+# --------------------------------------------------------------------------- #
+# CAP-4 slice-3a — order_records: reorder the LLM-visible index most-relevant-
+# first for a task, WITHOUT dropping any tool (never-subtract).
+# --------------------------------------------------------------------------- #
+
+def _rec(name, desc=""):
+    return {"name": name, "description": desc, "parameter_names": [], "parameters_schema": {}}
+
+
+def test_order_records_puts_the_match_first_and_keeps_all():
+    recs = [_rec("read_file"), _rec("send_email"), _rec("create_issue")]
+    out = ci.order_records(recs, "create an issue")
+    assert out[0]["name"] == "create_issue"            # slot match ranked first
+    assert {r["name"] for r in out} == {r["name"] for r in recs}   # never-subtract
+
+
+def test_order_records_ignores_tool_controlled_description():
+    # a tool stuffing the query into its description must NOT jump ahead of a real
+    # name/slot match (description is not a ranking signal).
+    recs = [
+        _rec("zzz_unrelated", "create an issue create an issue create an issue"),
+        _rec("create_issue"),
+    ]
+    out = ci.order_records(recs, "create an issue")
+    assert out[0]["name"] == "create_issue"
+
+
+def test_order_records_is_deterministic_and_defensive():
+    recs = [_rec("b_tool"), _rec("a_tool")]
+    assert [r["name"] for r in ci.order_records(recs, "x")] == \
+           [r["name"] for r in ci.order_records(recs, "x")]         # stable
+    # a malformed record (missing name) must not crash — order left intact
+    weird = [{"nope": 1}, _rec("create_issue")]
+    out = ci.order_records(weird, "create an issue")
+    assert len(out) == 2                                            # never-subtract
+    assert out[0]["name"] == "create_issue"
+
+
+def test_order_records_preserves_order_when_no_relevance_signal():
+    # a zero-signal query must NOT alphabetically reshuffle (which would front-load
+    # verb-first names like delete_* ahead of get_*) — original order is kept.
+    recs = [_rec("zebra_tool"), _rec("delete_thing"), _rec("apple_tool")]
+    out = ci.order_records(recs, "no overlap here")
+    assert [r["name"] for r in out] == ["zebra_tool", "delete_thing", "apple_tool"]
