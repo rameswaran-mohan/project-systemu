@@ -129,6 +129,28 @@ _MANAGE_WHERE = {
 }
 
 
+# broken/stale cards lead with a PRIMARY action that deep-links to the existing
+# management surface for the kind (§5.10.c) — navigation only, no new flow, no
+# dual-write (the repair happens in the surface the operator lands on).
+_REPAIR_ROUTE = {
+    "mcp_server": ("/settings", "Reconnect"), "service": ("/settings", "Reconnect"),
+    "credential_ref": ("/settings", "Re-add"), "data_root": ("/settings", "Re-grant"),
+    "tool": ("/tools", "Fix in Build"),
+}
+
+
+def repair_route(kind: str, status: str) -> tuple:
+    """(label, route) for a broken/stale card's primary Fix action, or ('', '')
+    when the status is healthy or the kind has no management surface."""
+    if status not in ("broken", "stale"):
+        return ("", "")
+    route_label = _REPAIR_ROUTE.get(kind)
+    if not route_label:
+        return ("", "")
+    route, label = route_label
+    return (label, route)
+
+
 def removal_notice(kind: str, name: str) -> tuple:
     """(message, still_active) for the post-remove snackbar. For a kind backed
     by a live object the message says plainly that the real thing still exists
@@ -178,6 +200,12 @@ def _render_card(it: Any, *, on_pin=None, on_remove=None) -> None:
             prov = getattr(it, "provenance", "") or ""
             if prov and prov != "migrated":
                 ui.badge(prov).props("outline color=blue")
+        # broken/stale cards lead with a PRIMARY action deep-linking to the repair
+        # surface (§5.10.c) — navigation only (the fix happens where it lands).
+        _rlabel, _rroute = repair_route(_kind(it), status)
+        if _rlabel:
+            ui.link(f"{_rlabel} →", _rroute).classes("s-pill").style(
+                "font-size: 12px; margin-top: 4px;")
 
 
 def build_table_page() -> None:

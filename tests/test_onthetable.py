@@ -429,3 +429,18 @@ def test_credential_declaration_drops_free_text_detail(tmp_path):
     # a service note, by contrast, is legitimately kept
     svc = ts.make_operator_item("service", "Stripe", detail="payments account")
     assert svc.detail == "payments account"
+
+
+# --------------------------------------------------------------------------- #
+# T2b-2a — broken/stale cards lead with a repair deep-link (§5.10.c)
+# --------------------------------------------------------------------------- #
+
+def test_repair_route_only_for_broken_or_stale():
+    from systemu.interface.pages.table import repair_route
+    label, route = repair_route("mcp_server", "broken")
+    assert route == "/settings" and label                 # broken server → Reconnect
+    assert repair_route("credential_ref", "stale")[1] == "/settings"
+    assert repair_route("tool", "broken")[1] == "/tools"
+    # a healthy card has no Fix action; an unknown kind has no surface
+    assert repair_route("mcp_server", "ready") == ("", "")
+    assert repair_route("preference", "broken") == ("", "")
