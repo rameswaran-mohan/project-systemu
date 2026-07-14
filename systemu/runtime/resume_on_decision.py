@@ -89,13 +89,16 @@ def _dispatch_resume(decision, *, vault, supervisor,
     if not execution_id:
         logger.info("[ResumeOnDecision] decision %s has no execution_id — skipping", decision.id)
         return False
+    choice = (decision.choice or "").strip().lower()
 
-    # A command/tool gate doesn't carry activity_id/shadow_id (the sandbox doesn't
-    # know them), so derive them from the parked run's snapshot. structured_question
-    # carries them directly in its context.
+    # v0.10.21: a tool/command gate that parked on the run's FIRST tool call now
+    # STAMPS activity_id/shadow_id into the context (chat_submission_ctx carriers), so
+    # prefer those. A structured_question carries them directly. Only fall back to the
+    # snapshot for an OLDER gate decision (or a mid-run park) that lacks context coords.
     activity_id = dctx.get("activity_id")
     shadow_id = dctx.get("shadow_id")
     snap = None
+    snapshot_refused = False
     try:
         from systemu.runtime.execution_snapshot import read_snapshot, write_snapshot
         from systemu.runtime.snapshot_migrations import SnapshotRefused
@@ -110,19 +113,52 @@ def _dispatch_resume(decision, *, vault, supervisor,
             logger.error("[ResumeOnDecision] snapshot refused for %s: %s",
                          execution_id, _refused)
             snap = None
+            snapshot_refused = True
     except Exception:
         snap = None
     if snap is not None:
         activity_id = activity_id or getattr(snap, "activity_id", None)
         shadow_id = shadow_id or getattr(snap, "shadow_id", None)
     if not (activity_id and shadow_id):
+        # v0.10.21: a GATE with no resume coords (an iteration-1 park whose decision
+        # predates the context-coord stamp, or any coords-less gate) can't be RESUMED,
+        # but we can still record the operator's approval so a manual re-run succeeds —
+        # and stamp resume_dispatched so the reconciler stops re-logging this every
+        # poll. A structured_question / attest genuinely needs the snapshot coords, so
+        # those keep skipping.
+        #
+        # DEC-9 GUARD: a REFUSED snapshot (newer schema — not merely absent) means the
+        # parked run may have done effectful work this build can't read. Do NOT record
+        # the approval or stamp dispatched in that case — fall through to the honest
+        # skip so nothing masks the refusal (mirrors the pre-v0.10.21 behaviour).
+        if is_gate and not snapshot_refused:
+            # Record ONLY a STANDING allow here ("Always allow" on a tool gate) — the
+            # choice meant to carry forward, idempotent and keyed to persist across runs.
+            # Deliberately DO NOT persist a SINGLE-USE bridge ("Approve once", or any
+            # command gate) in the coords-less path: with no run to resume, the one-shot
+            # would sit unconsumed and could later be spent by an UNRELATED call to the
+            # same (params-independent) tool signature. A manual re-run simply re-asks —
+            # the correct "approve once" semantics for a parked instance that no longer
+            # exists. (The normal coords-present path re-submits immediately, consuming
+            # the bridge within seconds, so it has no such window.)
+            if is_tool_gate and choice == "always allow":
+                _record_gate_approval(dctx, is_tool_gate=True, choice=choice)
+            _stamp_dispatched(decision, vault)
+            _handled.add(decision.id)
+            logger.info(
+                "[ResumeOnDecision] %s gate resolved (%s) for %s but no resume coords "
+                "— %s; task must be re-run (not auto-resumed)",
+                gate_type, choice or "deny", decision.id,
+                ("recorded standing allow" if (is_tool_gate and choice == "always allow")
+                 else "no standing approval recorded"),
+            )
+            return True
         logger.info(
             "[ResumeOnDecision] decision %s missing resume coords — skipping",
             decision.id,
         )
         return False
 
-    choice = (decision.choice or "").strip().lower()
     if is_gate:
         if choice in ("deny", ""):
             # Operator denied a REQUIRED command/tool → the task can't proceed; mark
@@ -142,38 +178,13 @@ def _dispatch_resume(decision, *, vault, supervisor,
             logger.info("[ResumeOnDecision] %s gate DENIED for activity %s — finalized",
                         gate_type, activity_id)
             return True
-        if is_tool_gate:
-            # S1b (Task 4): three-way split, SCOPED TO tool gates. The signature is
-            # the value STAMPED into the context by the gate (Task 3) — read it back,
-            # NEVER recompute (no tool object is in scope here). "Always allow" →
-            # STANDING allow-list (store.approve); "Approve once" → SINGLE-USE resume
-            # bridge honored exactly once (store.mark_resume_approved), then re-submit.
-            try:
-                from systemu.runtime.command_approvals import init_default_store
-                from pathlib import Path as _P
-                sig = dctx.get("tool_signature")
-                store = init_default_store(_P("data"))
-                if store is not None and sig:
-                    if choice == "always allow":
-                        store.approve(sig)
-                    else:
-                        store.mark_resume_approved(sig)
-            except Exception:
-                logger.debug("[ResumeOnDecision] could not record tool approval", exc_info=True)
-        else:
-            # Command gate (byte-for-byte unchanged from v0.9.52): Approve once /
-            # Always allow → mark a SINGLE-USE resume approval keyed by the command
-            # signature so the resumed run honors it exactly once (then re-asks for
-            # any later command), then re-submit the activity.
-            try:
-                from systemu.runtime.command_approvals import command_signature, init_default_store
-                from pathlib import Path as _P
-                sig = command_signature(dctx.get("command") or "", cwd=dctx.get("cwd") or "")
-                store = init_default_store(_P("data"))
-                if store is not None:
-                    store.mark_resume_approved(sig)
-            except Exception:
-                logger.debug("[ResumeOnDecision] could not mark resume approval", exc_info=True)
+        # S1b (Task 4) / v0.9.52: record the operator's approval to the
+        # CommandApprovalStore. Tool gate: "Always allow" → STANDING allow-list,
+        # anything else non-deny → SINGLE-USE resume bridge. Command gate: always a
+        # SINGLE-USE bridge (byte-for-byte the v0.9.52 behaviour). Extracted into
+        # _record_gate_approval so the missing-coords rescue above records the SAME
+        # approval — the ONLY place a tool-gate "Always allow" becomes a standing entry.
+        _record_gate_approval(dctx, is_tool_gate=is_tool_gate, choice=choice)
     elif is_attest:
         # R-A13 Stage-3a: stash the operator's attest CHOICE + the enqueue-time effect
         # classification (a JSON payload the resume-start applier peels) so the applier
@@ -224,6 +235,40 @@ def _dispatch_resume(decision, *, vault, supervisor,
         activity_id, execution_id, decision.id,
     )
     return True
+
+
+def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
+    """Persist a resolved tool/command gate approval to the CommandApprovalStore.
+
+    Tool gate: ``"always allow"`` → STANDING allow-list (``store.approve``); any other
+    non-deny choice → SINGLE-USE resume bridge (``store.mark_resume_approved``). Command
+    gate: always a SINGLE-USE bridge (byte-for-byte the v0.9.52 behaviour). The tool
+    signature is READ BACK from the context (stamped by the gate at park time), never
+    recomputed here (no tool object is in scope).
+
+    Decoupled from the resume DISPATCH so the approval is recorded even when the parked
+    run has no resume coords — without it a re-run would re-hit the same gate. The
+    caller guarantees ``choice`` is non-deny. Best-effort; never raises."""
+    try:
+        from pathlib import Path as _P
+        from systemu.runtime.command_approvals import init_default_store
+        store = init_default_store(_P("data"))
+        if store is None:
+            return
+        if is_tool_gate:
+            sig = dctx.get("tool_signature")
+            if not sig:
+                return
+            if choice == "always allow":
+                store.approve(sig)
+            else:
+                store.mark_resume_approved(sig)
+        else:
+            from systemu.runtime.command_approvals import command_signature
+            sig = command_signature(dctx.get("command") or "", cwd=dctx.get("cwd") or "")
+            store.mark_resume_approved(sig)
+    except Exception:
+        logger.debug("[ResumeOnDecision] could not record gate approval", exc_info=True)
 
 
 def _stamp_dispatched(decision, vault) -> None:

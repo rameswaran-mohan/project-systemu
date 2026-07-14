@@ -879,13 +879,22 @@ class ToolSandbox:
         }
         try:
             from systemu.runtime.chat_submission_ctx import (
-                current_chat_submission_id, current_execution_id)
+                current_activity_id, current_chat_submission_id,
+                current_execution_id, current_shadow_id)
             _exec_id = current_execution_id()
             _chat_sub = current_chat_submission_id()
             if _exec_id:
                 _resume_extras["execution_id"] = _exec_id
             if _chat_sub:
                 _resume_extras["chat_submission_id"] = _chat_sub
+            # v0.10.21: carry activity_id/shadow_id so a command parked on the run's
+            # FIRST tool call (no snapshot yet) is still resumable from the context.
+            _act_id = current_activity_id()
+            _sh_id = current_shadow_id()
+            if _act_id:
+                _resume_extras["activity_id"] = _act_id
+            if _sh_id:
+                _resume_extras["shadow_id"] = _sh_id
         except Exception:
             logger.debug("[Sandbox] could not read run coords for command gate", exc_info=True)
         dec_id = InboxQueue(self._vault).enqueue(
@@ -1032,13 +1041,25 @@ class ToolSandbox:
         }
         try:
             from systemu.runtime.chat_submission_ctx import (
-                current_chat_submission_id, current_execution_id)
+                current_activity_id, current_chat_submission_id,
+                current_execution_id, current_shadow_id)
             _exec_id = current_execution_id()
             _chat_sub = current_chat_submission_id()
             if _exec_id:
                 _resume_extras["execution_id"] = _exec_id
             if _chat_sub:
                 _resume_extras["chat_submission_id"] = _chat_sub
+            # v0.10.21: carry activity_id/shadow_id so a tool parked on the run's FIRST
+            # tool call (iteration 1, no snapshot yet) is resumable from the context.
+            # This is THE fix for the "stuck even after approval" report: web_search
+            # gated on the agent's first action never wrote a snapshot, so the resumer
+            # could not derive coords → "missing resume coords" forever.
+            _act_id = current_activity_id()
+            _sh_id = current_shadow_id()
+            if _act_id:
+                _resume_extras["activity_id"] = _act_id
+            if _sh_id:
+                _resume_extras["shadow_id"] = _sh_id
         except Exception:
             logger.debug("[Sandbox] could not read run coords for tool gate", exc_info=True)
         dec_id = InboxQueue(self._vault).enqueue(

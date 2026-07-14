@@ -4747,6 +4747,14 @@ class ShadowRuntime:
             # can stamp it into the decision context → the parked gate is resumable.
             from systemu.runtime.chat_submission_ctx import set_execution_id
             self._execution_id_token = set_execution_id(execution_id)
+            # v0.10.21: also carry activity_id + shadow_id so a tool/command gate that
+            # parks on the run's FIRST tool call (before any snapshot is written) can
+            # stamp the resume coords into the decision context — the resumer then
+            # needs no snapshot to derive them.
+            from systemu.runtime.chat_submission_ctx import (
+                set_activity_id, set_shadow_id)
+            self._activity_id_token = set_activity_id(getattr(activity, "id", "") or "")
+            self._shadow_id_token = set_shadow_id(getattr(shadow, "id", "") or "")
             exec_start   = __import__("time").time()
             tool_call_count = 0
             # v0.9.33 Bug 2/3: per-execution harness-request counter. Threaded
@@ -8313,6 +8321,16 @@ class ShadowRuntime:
             try:
                 from systemu.runtime.chat_submission_ctx import set_execution_id
                 set_execution_id(None, reset_token=getattr(self, "_execution_id_token", None))
+            except Exception:
+                pass
+            try:
+                # v0.10.21: reset the run-scoped activity_id/shadow_id carriers.
+                # getattr(..., None) so an early-exit path that never reached the
+                # set-point resets harmlessly (reset_token=None is the clear branch).
+                from systemu.runtime.chat_submission_ctx import (
+                    set_activity_id, set_shadow_id)
+                set_activity_id(None, reset_token=getattr(self, "_activity_id_token", None))
+                set_shadow_id(None, reset_token=getattr(self, "_shadow_id_token", None))
             except Exception:
                 pass
             try:

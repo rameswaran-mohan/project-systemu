@@ -48,3 +48,43 @@ def set_execution_id(value: Optional[str], *, reset_token: Any = None):
         _execution_id_var.reset(reset_token)
         return None
     return _execution_id_var.set(value)
+
+
+# v0.10.21: same carrier pattern for the run's activity_id + shadow_id, so a
+# tool/command gate that PARKS on the run's FIRST tool call — before any park-rail
+# inside ShadowRuntime.execute has written a resume snapshot — can stamp the resume
+# coords straight into the gate decision's context. resume_on_decision then reads
+# activity_id/shadow_id from the context (no snapshot dependency), so a chat task
+# parked on an iteration-1 approval actually resumes once the operator approves.
+_activity_id_var: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "activity_id", default=None
+)
+_shadow_id_var: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "shadow_id", default=None
+)
+
+
+def current_activity_id() -> Optional[str]:
+    """Return the active activity_id (or None if not inside a run)."""
+    return _activity_id_var.get()
+
+
+def set_activity_id(value: Optional[str], *, reset_token: Any = None):
+    """Set or reset the active activity_id. Returns a token usable to reset."""
+    if reset_token is not None:
+        _activity_id_var.reset(reset_token)
+        return None
+    return _activity_id_var.set(value)
+
+
+def current_shadow_id() -> Optional[str]:
+    """Return the active shadow_id (or None if not inside a run)."""
+    return _shadow_id_var.get()
+
+
+def set_shadow_id(value: Optional[str], *, reset_token: Any = None):
+    """Set or reset the active shadow_id. Returns a token usable to reset."""
+    if reset_token is not None:
+        _shadow_id_var.reset(reset_token)
+        return None
+    return _shadow_id_var.set(value)
