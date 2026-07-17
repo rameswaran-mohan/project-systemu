@@ -253,7 +253,7 @@ SPINE_OF = {
     "/shadows": "/shadows", "/memory": "/shadows", "/army": "/shadows",  # 6h: /army is the legacy alias, still lights Shadows
     "/tools": "/tools", "/skills": "/tools", "/evolutions": "/tools",
     "/insights": "/insights",
-    "/settings": "/settings",
+    "/settings": "/settings", "/privacy": "/settings",   # R-P3b privacy page lives under Settings
     # /inbox intentionally absent → no left-nav highlight (right rail owns it)
 }
 
@@ -1111,6 +1111,15 @@ def register_routes() -> None:
         from systemu.interface.pages.health import build_health_page
         with _build_layout("Health", "/health"):
             build_health_page()
+
+    @ui.page("/privacy")
+    def page_privacy():
+        if _redirect_to_welcome_if_needed():
+            return
+        # R-P3b — the honest "what leaves this machine" page (§15.7 interim rule).
+        from systemu.interface.pages.privacy import build_privacy_page
+        with _build_layout("Privacy", "/privacy"):
+            build_privacy_page()
 
     @ui.page("/memory/{shadow_id}")
     def page_shadow_memory(shadow_id: str):

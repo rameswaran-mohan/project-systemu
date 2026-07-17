@@ -551,7 +551,8 @@ def run_direct_task(
         # v0.9.45: a parked run (suspended_*) is AWAITING the operator, not failed —
         # surface it as WARNING so it stops looking broken (red) in the Live feed.
         _level = ("WARNING" if str(_status).startswith("suspended")
-                  else {"success": "SUCCESS", "partial": "WARNING"}.get(_status, "ERROR"))
+                  else {"success": "SUCCESS", "partial": "WARNING",
+                        "spend_cap_reached": "WARNING"}.get(_status, "ERROR"))
         # W8.4: same summary-key fix as the history write above.
         _summary = result.get("final_summary") or result.get("summary") or ""
         _log_event(

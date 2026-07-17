@@ -75,6 +75,11 @@ class BrowserPool:
         self._browser = self._pw.chromium.launch(headless=True)
 
     def render_html(self, url: str, timeout_ms: int = 20000) -> str:
+        # R-A11: IP-level SSRF gate (the domain allow/deny policy below has NO IP
+        # awareness, so it would let a local Chromium reach IMDS / loopback / RFC-1918).
+        from systemu.runtime import net_safety
+        if not net_safety.url_is_admissible(url, allowed_hosts=net_safety.allowed_outbound_hosts()):
+            raise PermissionError(f"URL blocked by SSRF guard: {url}")
         if not is_url_allowed(url):
             raise PermissionError(f"URL blocked by domain policy: {url}")
         with self._sem:

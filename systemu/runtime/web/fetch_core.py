@@ -85,15 +85,37 @@ def looks_like_spa(html: str, extracted_text: str) -> bool:
 
 
 def fetch_url(url: str, timeout: int = 20) -> FetchResult:
-    """httpx GET with realistic headers, size + content-type guards."""
+    """httpx GET with realistic headers, size + content-type guards.
+
+    R-A11: SSRF-gated like the v2 web_access seam — the initial URL AND every
+    redirect hop are re-checked against ``net_safety`` (redirects are followed
+    manually so a public URL cannot 302 to an internal/metadata host)."""
     import httpx
+
+    from systemu.runtime import net_safety
+    _allow = net_safety.allowed_outbound_hosts()
+    if not net_safety.url_is_admissible(url, allowed_hosts=_allow):
+        return FetchResult(ok=False, status=0,
+                           error="blocked: destination is not an allowed public address (SSRF guard)")
+
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; SystemuBot/1.0; +https://systemu.local)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as c:
+        # follow_redirects=False + a MANUAL, re-gated hop loop (httpx's own follow
+        # would chase a redirect to an internal host without re-checking).
+        with httpx.Client(follow_redirects=False, timeout=timeout, headers=headers) as c:
             r = c.get(url)
+            _hops = 0
+            while r.is_redirect and _hops < 5:
+                _loc = r.headers.get("location", "")
+                _nxt = str(r.url.join(_loc)) if _loc else ""
+                if not _nxt or not net_safety.url_is_admissible(_nxt, allowed_hosts=_allow):
+                    return FetchResult(ok=False, status=r.status_code,
+                                       error="blocked: redirect to a non-public address (SSRF guard)")
+                r = c.get(_nxt)
+                _hops += 1
             ctype = r.headers.get("content-type", "")
             if "html" not in ctype and "text" not in ctype and "json" not in ctype:
                 return FetchResult(ok=False, status=r.status_code,

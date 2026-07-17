@@ -2275,3 +2275,93 @@ def run_find_tools(vault, query: str, limit: int = 15) -> int:
         slot = ", ".join(r.get("slots") or []) or "-"
         click.echo(f"  {str(r.get('name', '')):<28} [{slot}]  ({r.get('origin', '')})")
     return 0
+
+
+# ── R-P3b · spend caps (view / set / clear) ──────────────────────────────────
+
+def _fmt_money(m) -> str:
+    if m is None:
+        return "(no cap)"
+    from systemu.runtime import costing
+    return f"{costing.currency_symbol(m.currency)}{m.amount}"
+
+
+def run_spend_caps_show(*, data_dir=None) -> int:
+    """R-P3b — print the configured per-task / per-day spend caps + today's spend.
+
+    Caps are OFF by default. A run that REACHES its cap halts honestly (no silent
+    overrun) — raise the cap and re-run to continue. Read-only; exit code 0."""
+    from systemu.runtime import costing, spend_caps
+    caps = spend_caps.load_caps(data_dir=data_dir)
+    day = costing.daily_total()
+    click.echo("Spend caps (a run that reaches its cap halts; raise + re-run to continue):")
+    click.echo(f"  per-task: {_fmt_money(caps.get('task'))}")
+    click.echo(f"  per-day:  {_fmt_money(caps.get('day'))}")
+    if getattr(day, "total_known", False) and day.total is not None:
+        click.echo(f"  today so far: {_fmt_money(day.total)}")
+    else:
+        click.echo("  today so far: (unknown — some models are unpriced)")
+    return 0
+
+
+def run_spend_caps_set(kind: str, amount, *, data_dir=None) -> int:
+    """Set the per-``kind`` ('task'|'day') cap to ``amount`` (in the default currency)."""
+    from systemu.runtime import spend_caps
+    try:
+        spend_caps.set_cap(kind, amount, data_dir=data_dir)
+    except ValueError as exc:
+        click.echo(f"ERROR: {exc}", err=True)
+        return 2
+    click.echo(f"Set {kind} spend cap to {amount}.")
+    return 0
+
+
+def run_spend_caps_clear(kind: str, *, data_dir=None) -> int:
+    """Remove the per-``kind`` ('task'|'day') cap."""
+    from systemu.runtime import spend_caps
+    try:
+        spend_caps.clear_cap(kind, data_dir=data_dir)
+    except ValueError as exc:
+        click.echo(f"ERROR: {exc}", err=True)
+        return 2
+    click.echo(f"Cleared {kind} spend cap.")
+    return 0
+
+
+def run_world(vault, query: str = "", limit: int = 30) -> int:
+    """R-W1 (W-A slice-1) — show what the world model believes (§5.11.a/.b).
+
+    READ-ONLY: reads the ``FactStore`` and never writes it (sole-writer discipline,
+    E5). With no ``query`` it summarises the store — facts grouped by kind + active
+    (unexpired) negative facts. With a ``query`` it runs ``world.query.about`` — the
+    never-subtract escape hatch. The store is empty until slice-2 populates it from
+    the live inventory, so today this is the operator's read surface + the API proof.
+    Always returns 0 (an empty world is a valid, non-error result)."""
+    from systemu.runtime import world_model as _wm
+    store = _wm.FactStore(vault)
+    q = (query or "").strip()
+    if q:
+        hits = _wm.about(store, q, limit=(None if not limit else int(limit)))
+        if not hits:
+            click.echo(f"Nothing known about {q!r} yet.")
+            return 0
+        click.echo(f"About {q!r} — {len(hits)} fact(s):")
+        for f in hits:
+            click.echo(f"  [{f.kind}] {f.value}  (origin={f.origin_class}, conf={f.confidence:.2f})")
+        return 0
+    facts = store.all_facts()
+    negatives = [n for n in store.all_negatives() if not n.is_expired()]
+    if not facts and not negatives:
+        click.echo("The world model is empty. It fills as systemu surveys your setup and works.")
+        return 0
+    by_kind = {}
+    for f in facts:
+        by_kind[f.kind] = by_kind.get(f.kind, 0) + 1
+    click.echo(f"World model — {len(facts)} fact(s) across {len(by_kind)} kind(s):")
+    for kind in sorted(by_kind):
+        click.echo(f"  {kind:<16} {by_kind[kind]}")
+    if negatives:
+        click.echo(f"Active 'searched, not found' notes — {len(negatives)}:")
+        for n in negatives:
+            click.echo(f"  {n.scope}  (probed: {', '.join(n.probes) or '-'})")
+    return 0

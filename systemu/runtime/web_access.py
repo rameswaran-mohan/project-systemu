@@ -19,9 +19,11 @@ Jina-on-DDG returns real keyless results; Overpass returns named local POIs.
 """
 from __future__ import annotations
 
+import http.client as _httplib
 import json
 import logging
 import re
+import socket as _socket
 import ssl
 import threading
 import time
@@ -102,25 +104,182 @@ _CACHE = _TTLCache(ttl=900.0)
 _BROWSER_SEM = threading.Semaphore(2)       # cap concurrent Chromium instances
 
 
+# ── R-A11 SSRF gate (the canonical fail-closed check; closes the live hole) ──
+from systemu.runtime import net_safety
+
+
+def _allowed_outbound_hosts() -> "set[str]":
+    """Operator escape hatch (delegates to the canonical net_safety source)."""
+    return net_safety.allowed_outbound_hosts()
+
+
+#: the refusal tuple — the SAME error shape callers already handle (status None,
+#: no body, an error string). NEVER a partial fetch.
+_SSRF_REFUSAL: "Tuple[Optional[int], str, str]" = (
+    None, "", "blocked: destination is not an allowed public address (SSRF guard)")
+
+
+def _ssrf_admissible(url: str) -> bool:
+    """True iff the URL may be fetched. Fail-CLOSED: any gate error refuses (a
+    broken security control must never open the egress hole)."""
+    try:
+        return net_safety.url_is_admissible(url, allowed_hosts=_allowed_outbound_hosts())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_BLOCKED_REDIRECT_REASON = "blocked redirect to a non-public address (SSRF guard)"
+
+
+class _SSRFGuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the SSRF gate on EVERY 30x redirect target. Without this, a public URL
+    that 302-redirects to an internal / metadata host would be followed unguarded —
+    the classic resolve-then-reject SSRF bypass (the gate only saw the ORIGINAL url)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _ssrf_admissible(newurl):
+            raise urllib.error.HTTPError(newurl, code, _BLOCKED_REDIRECT_REASON, headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# ── the socket-pin: dial the VETTED IP, closing the resolve-then-reconnect TOCTOU ─
+# ``url_is_admissible`` (and the redirect re-check) VET the host, but urllib would
+# then resolve it AGAIN at connect time — a rebinding DNS answer could swap in an
+# internal IP in that narrow window. We PIN: resolve ONCE to a vetted-public IP
+# literal and dial THAT, so the kernel connects to the exact address the gate
+# approved (a literal never re-resolves). TLS SNI + the Host header still use the
+# hostname — ``self.host`` is untouched, only the socket creator is swapped — so cert
+# validation is unchanged. This brings web_access up to the money-move readback path's
+# posture (which already pins via ``net_safety.resolve_pinned_ip``).
+_PIN_REFUSAL = "SSRF guard: host %r did not resolve to a public address"
+
+
+class _PinBlocked(OSError):
+    """Raised by the socket-pin when a host resolves to a non-public address at
+    CONNECT (the exact rebind TOCTOU the pin closes). A distinct type so ``_http_get``
+    can map it back to the canonical ``blocked: … (SSRF guard)`` refusal tuple."""
+
+
+def _proxy_hosts() -> "set[str]":
+    """Hosts of any configured HTTP(S) proxy. urllib routes the connection to the
+    PROXY (``self.host`` becomes the proxy), so the proxy hop must dial as-is: it is
+    operator-configured infra (like the allowlist) and MAY be internal — a corporate
+    10.x or a localhost debug proxy. The real TARGET host is still SSRF-pre-checked
+    upstream (``url_is_admissible`` on the original URL) and the proxy — not our
+    kernel — resolves the target, so pinning the proxy adds no protection, only
+    breakage. Never raises (a parse quirk must not disable egress).
+
+    Residual (LOW, operator-scoped, reviewed): the exemption is scheme-blind, so a
+    DIRECT fetch of ``https://<proxy-hostname>/`` when only an HTTP proxy is set would
+    dial that one host as-is (re-resolving) rather than pinned. NOT attacker-injectable
+    (only operator/system-configured hosts land here) and the precondition — attacker
+    DNS control over the operator's own proxy hostname — already MITMs all proxied
+    traffic, so incremental risk is negligible. Documented rather than closed: a
+    literal-IP-only exemption would break legitimate hostname proxies (the very
+    regression this exemption exists to fix)."""
+    hosts: "set[str]" = set()
+    try:
+        for key, spec in urllib.request.getproxies().items():
+            if key == "no":                       # no_proxy list, not a proxy endpoint
+                continue
+            h = urllib.parse.urlsplit(spec if "://" in spec else "//" + spec).hostname
+            if h:
+                hosts.add(h.lower())
+    except Exception:  # noqa: BLE001 — never let proxy parsing break egress
+        pass
+    return hosts
+
+
+def _pinned_connect(address, *args, **kwargs):
+    """Drop-in for ``HTTPConnection._create_connection`` that dials the VETTED IP
+    literal instead of re-resolving the hostname (closes the rebind TOCTOU). An
+    operator-allowlisted host OR a configured proxy dials as-is (either may be
+    internal by design — the pin must not re-vet it, since ``resolve_pinned_ip``
+    fail-closes on private); any other host that does not resolve entirely-public
+    RAISES ``_PinBlocked`` — it never dials."""
+    host, port = address[0], address[1]
+    h = str(host).lower()
+    if h in _allowed_outbound_hosts() or h in _proxy_hosts():
+        return _socket.create_connection((host, port), *args, **kwargs)
+    pinned = net_safety.resolve_pinned_ip(host)
+    if pinned is None:
+        raise _PinBlocked(_PIN_REFUSAL % host)
+    return _socket.create_connection((pinned, port), *args, **kwargs)
+
+
+class _PinnedHTTPConnection(_httplib.HTTPConnection):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._create_connection = _pinned_connect
+
+
+class _PinnedHTTPSConnection(_httplib.HTTPSConnection):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._create_connection = _pinned_connect
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PinnedHTTPConnection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        # mirror stdlib https_open (3.12: passes only context), swapping the pinned class.
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
+
+
+#: a guarded opener: redirect re-check + pinned http/https connections (dial the
+#: vetted IP) + the module SSL context. Passing pinned HTTP(S)Handler subclasses
+#: suppresses build_opener's default handlers, so EVERY hop goes through the pin.
+#: Callers go through ``_urlopen`` so redirects are re-gated; tests patch ``_urlopen``.
+_SSRF_OPENER = urllib.request.build_opener(
+    _SSRFGuardedRedirectHandler(),
+    _PinnedHTTPHandler(),
+    _PinnedHTTPSHandler(context=_CTX),
+)
+
+
+def _urlopen(req, *, timeout: int):
+    """The single egress call — a guarded opener that re-checks each redirect hop."""
+    return _SSRF_OPENER.open(req, timeout=timeout)
+
+
 # ── HTTP seams (monkeypatched in tests) ─────────────────────────────────────
 def _http_get(url: str, timeout: int = 30, headers: Optional[dict] = None) -> Tuple[Optional[int], str, str]:
+    if not _ssrf_admissible(url):
+        return _SSRF_REFUSAL
     req = urllib.request.Request(url, headers=headers or {"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+        with _urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode("utf-8", "replace"), ""
     except urllib.error.HTTPError as e:
+        if getattr(e, "reason", None) == _BLOCKED_REDIRECT_REASON:
+            return _SSRF_REFUSAL          # a redirect to a non-public host was refused
         return e.code, "", "HTTP %s" % e.code
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), _PinBlocked):
+            return _SSRF_REFUSAL          # a rebind caught at connect (the socket-pin)
+        return None, "", repr(e)[:120]
     except Exception as e:  # noqa: BLE001
         return None, "", repr(e)[:120]
 
 
 def _http_post(url: str, data: bytes, timeout: int = 40, headers: Optional[dict] = None) -> Tuple[Optional[int], str, str]:
+    if not _ssrf_admissible(url):
+        return _SSRF_REFUSAL
     req = urllib.request.Request(url, data=data, headers=headers or {"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+        with _urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode("utf-8", "replace"), ""
     except urllib.error.HTTPError as e:
+        if getattr(e, "reason", None) == _BLOCKED_REDIRECT_REASON:
+            return _SSRF_REFUSAL
         return e.code, "", "HTTP %s" % e.code
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), _PinBlocked):
+            return _SSRF_REFUSAL          # a rebind caught at connect (the socket-pin)
+        return None, "", repr(e)[:120]
     except Exception as e:  # noqa: BLE001
         return None, "", repr(e)[:120]
 
@@ -193,6 +352,12 @@ def read_url(url: str, *, render: bool = False, timeout: int = 45, config: Any =
 
 def _browser_render(url: str) -> Optional[str]:
     """Last-resort Chromium render via the existing BrowserPool, capped + fail-safe."""
+    # R-A11: the render path reaches the network through a local Chromium, NOT through
+    # _http_get — so it must be SSRF-gated in its own right, else render=True would
+    # bypass the guard and reach IMDS / loopback / internal hosts.
+    if not _ssrf_admissible(url):
+        logger.info("[web_access] browser render blocked — SSRF guard (%s)", _host(url))
+        return None
     if not _BROWSER_SEM.acquire(blocking=False):
         logger.info("[web_access] browser render skipped — concurrency cap reached")
         return None

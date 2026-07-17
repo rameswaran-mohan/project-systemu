@@ -1124,24 +1124,32 @@ class Supervisor:
             # We must STOP CLEANLY here — NOT fall into the generic `except`
             # below, which would mark status="failure" → retry-storm +
             # dead-letter + LLM post-mortem on something that is awaiting a
-            # human, not broken. Clean fail-closed deny (Option 1): the run
-            # did NOT execute the command; the operator re-runs the task after
-            # approving. (NOT a resume — that's a deferred follow-up.)
-            logger.info(
-                "[Supervisor] Shadow %s blocked on command-approval gate "
-                "(decision=%s, dedup=%s) — clean deny, no retry.",
-                shadow_id, getattr(pd, "decision_id", "?"),
-                getattr(pd, "dedup_key", "?"),
-            )
-            result = {
-                "status": "command_gate_blocked",
-                "error":  "command_gate",
-                "final_summary": (
-                    "Blocked: a shell command requires operator approval and "
-                    "was NOT run. Approve it (Always allow) in the inbox, then "
-                    "re-run the task."
-                ),
-            }
+            # human, not broken.
+            #
+            # v0.10.21 (fold-in): the raise is NOT always an approval gate. A
+            # 'Stuck on Objective N' structured question (request_choice with a
+            # 'stuck:' dedup) also raises PendingOperatorDecision here — that one
+            # is the run ASKING the operator for a hint, resumed by
+            # resume_on_decision when answered, NOT a shell-command approval and
+            # NOT a failure. _pending_decision_result classifies the two so a
+            # stuck question PARKS (non-terminal, accurate message) instead of
+            # being marked FAILED with the command-gate "approve a shell command
+            # / re-run" text. Approval gates keep the byte-for-byte clean deny.
+            result = self._pending_decision_result(pd)
+            if result["status"] == "suspended_operator_question":
+                logger.info(
+                    "[Supervisor] Shadow %s paused on operator question "
+                    "(decision=%s, dedup=%s) — suspended, awaiting answer.",
+                    shadow_id, getattr(pd, "decision_id", "?"),
+                    getattr(pd, "dedup_key", "?"),
+                )
+            else:
+                logger.info(
+                    "[Supervisor] Shadow %s blocked on command-approval gate "
+                    "(decision=%s, dedup=%s) — clean deny, no retry.",
+                    shadow_id, getattr(pd, "decision_id", "?"),
+                    getattr(pd, "dedup_key", "?"),
+                )
 
         except Exception as exc:
             logger.exception("[Supervisor] Shadow thread error: %s", exc)
@@ -1321,6 +1329,38 @@ class Supervisor:
                 "any surviving wait", execution_id, exc_info=True,
             )
 
+    @staticmethod
+    def _pending_decision_result(pd) -> Dict[str, Any]:
+        """Classify a PendingOperatorDecision that unwound to the Supervisor (v0.10.21).
+
+        A STUCK operator question (dedup ``stuck:...``, built by request_choice at the
+        stuck-loop escalation) is the run asking the operator for a hint / accept-partial
+        / cancel. It snapshotted itself and is AWAITING A HUMAN ANSWER — resumed by
+        ``resume_on_decision`` when the operator answers. It is NOT a failure and NOT a
+        shell-command approval, so it maps to ``suspended_operator_question`` (parked,
+        non-terminal, accurate message). Everything else is an approval gate
+        (command/tool/mcp) → ``command_gate_blocked`` (byte-for-byte the v0.9.32 clean
+        deny: the gated action did not run)."""
+        dedup = getattr(pd, "dedup_key", "") or ""
+        if dedup.startswith("stuck:"):
+            return {
+                "status": "suspended_operator_question",
+                "final_summary": (
+                    "Paused — waiting for your answer in the inbox "
+                    "(Provide hint / Accept partial / Cancel run). "
+                    "Answer it there to continue."
+                ),
+            }
+        return {
+            "status": "command_gate_blocked",
+            "error":  "command_gate",
+            "final_summary": (
+                "Blocked: a shell command requires operator approval and "
+                "was NOT run. Approve it (Always allow) in the inbox, then "
+                "re-run the task."
+            ),
+        }
+
     def _handle_result(self, payload: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Post-execution: log result, decide retry vs dead-letter, trigger LLM analysis."""
         activity_id = payload["activity_id"]
@@ -1412,6 +1452,61 @@ class Supervisor:
                 context={"activity_id": activity_id, "shadow_id": shadow_id},
                 origin=payload.get("origin"),   # v0.8.16
             )
+            return
+
+        # R-P3b: the run reached its spend cap and halted itself (shadow_runtime's
+        # spend-cap gate). Terminal, but NOT a bug to diagnose — mirror the
+        # command-gate clean stop: mark terminal, and SKIP retry + dead-letter + the
+        # LLM post-mortem. The whole point is to STOP spending; a Tier-1 _analyze_failure
+        # call here would spend MORE (uncapped, and unrecorded across the thread
+        # boundary). The operator raises the cap (`sharing-on spend-caps set …`) and
+        # re-runs. Terminal ⇒ sweep-immune (no orphan re-run).
+        if status == "spend_cap_reached":
+            summary = result.get("final_summary") or "Spend cap reached — run halted."
+            try:
+                from systemu.runtime.activity_completion import mark_activity_failed
+                mark_activity_failed(getattr(self, "vault", None), activity_id,
+                                     status="failed", summary=summary)
+            except Exception:
+                logger.warning("[Supervisor] mark_activity_failed(spend_cap_reached) "
+                               "failed for %s", activity_id, exc_info=True)
+            self._publish(
+                f"💰 Spend cap reached: {self._aname(activity_id)} — {summary}",
+                level="WARNING",
+                context={"activity_id": activity_id, "shadow_id": shadow_id},
+                origin=payload.get("origin"),
+            )
+            return
+
+        # v0.10.21 (fold-in): Paused on a 'Stuck on Objective N' operator QUESTION
+        # (request_choice with a 'stuck:' dedup raised PendingOperatorDecision). This
+        # is the run asking the operator for a hint / accept-partial / cancel — it
+        # snapshotted itself and is AWAITING AN ANSWER, resumed by resume_on_decision
+        # when the operator responds. PARK it (leave the activity ASSIGNED — no
+        # terminal mutation, no retry, no dead-letter) with an accurate "waiting for
+        # your input" message, NOT the command-gate FAILED text. Mirrors the
+        # suspended_harness_escalation branch below. Orphan-safe: the recovery sweep
+        # (jobs._resubmit_unexecuted_assigned) skips activities that have a pending
+        # operator decision, so this ASSIGNED-while-waiting activity is never re-run
+        # from scratch — it is resumed ONLY by resume_on_decision on the answer.
+        if status == "suspended_operator_question":
+            summary = result.get("final_summary") or (
+                "Paused — waiting for your answer in the inbox."
+            )
+            logger.info(
+                "[Supervisor] activity %s paused on operator question — awaiting "
+                "answer (resumed when the operator responds)", activity_id,
+            )
+            self._publish(
+                f"⏸️ Waiting for your input: {self._aname(activity_id)} — {summary}",
+                level="INFO",
+                context={"activity_id": activity_id, "shadow_id": shadow_id},
+                origin=payload.get("origin"),
+            )
+            # The activity is left non-terminal (ASSIGNED). It is NOT re-run from
+            # scratch by the recovery sweep: jobs._resubmit_unexecuted_assigned skips
+            # activities that have a pending operator decision (this one). It is resumed
+            # only by resume_on_decision when the operator answers.
             return
 
         # Parked on a blocking harness ESCALATE — the run snapshotted itself and

@@ -235,6 +235,8 @@ def build_settings_page() -> None:
             ui.label("API key is loaded from the .env file. Editing is not supported live for security — update the .env file and restart.").style(
                 f"font-size: 12px; color: {THEME['text_muted']};"
             )
+            # R-P3b: the honest "what leaves this machine" page.
+            ui.link("What leaves this machine →", "/privacy").classes("s-muted")
 
         # ── MCP servers (W9.3) ─────────────────────────────────────────────
         _section_header("MCP servers")

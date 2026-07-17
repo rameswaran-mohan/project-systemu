@@ -1399,6 +1399,25 @@ def _resubmit_unexecuted_assigned(vault) -> None:
     if not candidates:
         return
 
+    # v0.10.21 (fold-in): an activity parked on a PENDING operator decision — a
+    # 'Stuck on Objective N' question, a harness escalation, a command/tool gate — is
+    # NOT an orphaned un-executed activity. It is deliberately WAITING for the operator
+    # and is resumed by resume_on_decision when answered. It stays ASSIGNED with an
+    # empty first-run execution_log, so without this guard the sweep would re-submit it
+    # FROM SCRATCH (no resume_from) — resetting progress and re-executing effects every
+    # sweep, and racing the operator's answer-carrying resume. Skip any activity that
+    # has a pending decision referencing it. (Best-effort: if the decisions can't be
+    # read, fall through to the execution_log check — no worse than before.)
+    parked_activity_ids: set = set()
+    try:
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        for _dec in OperatorDecisionQueue(vault).list_pending():
+            _aid = (getattr(_dec, "context", None) or {}).get("activity_id")
+            if _aid:
+                parked_activity_ids.add(_aid)
+    except Exception:
+        logger.debug("[Job] could not read pending decisions for park-skip", exc_info=True)
+
     try:
         from systemu.runtime.supervisor import Supervisor
         supervisor = Supervisor.get()
@@ -1411,6 +1430,14 @@ def _resubmit_unexecuted_assigned(vault) -> None:
         try:
             activity = vault.get_activity(header["id"])
             if not activity.assigned_shadow_id:
+                continue
+            if activity.id in parked_activity_ids:
+                # Parked on a pending operator decision — resumed by resume_on_decision
+                # when the operator answers, NOT re-run from scratch here.
+                logger.debug(
+                    "[Job] Recovery: skipping %s — parked on a pending operator decision",
+                    activity.id,
+                )
                 continue
             shadow = vault.get_shadow(activity.assigned_shadow_id)
             if shadow.execution_log:

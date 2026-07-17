@@ -1302,6 +1302,70 @@ def find_tools_cmd(query, limit):
     sys.exit(run_find_tools(vault, " ".join(query), limit))
 
 
+@cli.group(name="spend-caps")
+def spend_caps_group():
+    """View or set per-task / per-day LLM spend caps (R-P3b).
+
+    Caps are OFF by default. When a run REACHES its cap it halts honestly (no
+    silent overrun); raise the cap and re-run to continue. An unknown/unpriced
+    cost never trips a cap. Stored in data/spend_caps.json (or the
+    SYSTEMU_SPEND_CAP_TASK / _DAY env vars, which take precedence).
+    """
+
+
+@spend_caps_group.command(name="show")
+def spend_caps_show_cmd():
+    """Show the configured caps and today's spend so far."""
+    from systemu.interface.cli_commands import run_spend_caps_show
+    sys.exit(run_spend_caps_show())
+
+
+@spend_caps_group.command(name="set")
+@click.argument("kind", type=click.Choice(["task", "day"]))
+@click.argument("amount")
+def spend_caps_set_cmd(kind, amount):
+    """Set the per-KIND cap to AMOUNT, e.g. `spend-caps set task 0.50`."""
+    from systemu.interface.cli_commands import run_spend_caps_set
+    sys.exit(run_spend_caps_set(kind, amount))
+
+
+@spend_caps_group.command(name="clear")
+@click.argument("kind", type=click.Choice(["task", "day"]))
+def spend_caps_clear_cmd(kind):
+    """Remove the per-KIND cap."""
+    from systemu.interface.cli_commands import run_spend_caps_clear
+    sys.exit(run_spend_caps_clear(kind))
+
+
+@cli.command(name="world")
+@click.argument("query", nargs=-1, required=False)
+@click.option("--limit", "limit", default=30, type=int,
+              help="Max results for a query (0 = all). Ranked; the store is complete.")
+def world_cmd(query, limit):
+    """Show what systemu's world model believes about your setup (R-W1 · §5.11).
+
+    READ-ONLY. With no QUERY, summarises the fact store (facts by kind + active
+    'searched, not found' notes). With a QUERY, shows everything known about that
+    host/app/account (the never-subtract escape hatch). Empty until systemu surveys
+    your setup and works — a smaller world, never a broken one.
+
+    \b
+    Examples:
+      sharing_on world
+      sharing_on world github
+    """
+    import os
+    from systemu.storage.sqlite.vault import SqliteVault
+    from systemu.interface.cli_commands import run_world
+
+    db_url = os.environ.get("SYSTEMU_DATABASE_URL")
+    if not db_url:
+        click.echo("ERROR: SYSTEMU_DATABASE_URL not set", err=True)
+        sys.exit(2)
+    vault = SqliteVault(database_url=db_url)
+    sys.exit(run_world(vault, " ".join(query or ()), limit))
+
+
 # ---------------------------------------------------------------------------
 # capture command group (v0.7.1)
 # ---------------------------------------------------------------------------

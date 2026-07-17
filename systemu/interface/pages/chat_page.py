@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 # Terminal chat statuses. Note both "failed" (extraction/decision crash, set by
 # direct_task) and "failure" (ShadowRuntime result status) occur in practice.
-_TERMINAL_STATUSES = {"success", "failure", "failed", "partial", "skipped_no_shadow", "cancelled"}
+_TERMINAL_STATUSES = {"success", "failure", "failed", "partial", "skipped_no_shadow",
+                      "cancelled", "spend_cap_reached"}
 
 
 def _make_chat_stop_handler(ts: str):
@@ -200,6 +201,8 @@ def build_chat_page(prefill: str = "") -> None:
             "pending_decision": THEME.get("warning", "#f59e0b"),
             # W8.3: quick lane asked the operator a question.
             "needs_input":      THEME["warning"],
+            # R-P3b: reached its spend cap — a budget stop, not a failure.
+            "spend_cap_reached": THEME["warning"],
         }.get(status, THEME.get("text_muted", "#94a3b8"))
 
         card_opacity = "opacity: 0.55; " if is_stale else ""
@@ -257,7 +260,7 @@ def build_chat_page(prefill: str = "") -> None:
                                 "flat dense round size=sm color=negative"
                             ).tooltip("Kill this job")
                         elif status in ("success", "partial", "failed", "cancelled",
-                                        "skipped_no_shadow"):
+                                        "skipped_no_shadow", "spend_cap_reached"):
                             def _restart(_=None, _p=entry.get("prompt", "")):
                                 try:
                                     prompt_input.set_value(_p)

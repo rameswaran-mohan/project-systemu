@@ -5904,6 +5904,12 @@ class ShadowRuntime:
                     config=self.config,
                 )
 
+            # R-P3b: per-task spend-cap baseline, captured lazily at the first gate
+            # check so the cap measures only THIS execution attempt (fresh run = 0;
+            # resume/retry = the seeded prior cost).
+            _spendcap_baseline = None
+            _spendcap_baseline_set = False
+
             while iteration < _iter_budget:
                 iteration += 1
 
@@ -5958,6 +5964,51 @@ class ShadowRuntime:
                         "status":        "cancelled",
                         "final_summary": f"Shadow cancelled by watchdog at iteration {iteration}.",
                         "error":         "WatchdogCancelled",
+                        "execution_id":  execution_id,
+                    }
+
+                # ── R-P3b: spend-cap gate — halt BEFORE the next LLM call if this run
+                # (or today) has reached its configured spend cap (RUL-6: gate, never
+                # silently overrun). OFF by default; an unknown/mixed-currency cost never
+                # trips (RUL-1). Fail OPEN on any check error (a broken budget meter must
+                # never halt a legitimate run — caps are a guard, not a correctness gate).
+                #
+                # The per-task cap is BASELINE-RELATIVE: the baseline (this run's cost at
+                # first check — 0 for a fresh run, the seeded prior cost for a resume) is
+                # subtracted, so a resume/retry proceeds past iteration 1 (no strand) yet
+                # is STILL bounded by its own post-baseline spend — instead of exempting
+                # resumes wholesale. The (cumulative, global) DAY cap is enforced on FRESH
+                # runs only (enforce_day) so already-authorized resumed work isn't
+                # day-halted; it stays bounded by its per-task cap.
+                #
+                # Returns a DEDICATED terminal status so the Supervisor skips retry /
+                # dead-letter / post-mortem: an UNCAPPED Tier-1 LLM post-mortem fired
+                # AFTER a spend cap would spend more, not less — defeating the cap.
+                _cap_msg = None
+                try:
+                    from systemu.runtime import spend_caps as _spend_caps
+                    if not _spendcap_baseline_set:
+                        _spendcap_baseline = _spend_caps.run_baseline(execution_id)
+                        _spendcap_baseline_set = True
+                    _cap_msg = _spend_caps.halt_if_capped(
+                        execution_id,
+                        task_baseline=_spendcap_baseline,
+                        enforce_day=not resume_from_execution_id,
+                    )
+                except Exception:
+                    logger.debug("[Runtime] spend-cap check failed — not halting", exc_info=True)
+                    _cap_msg = None
+                if _cap_msg:
+                    logger.info("[Runtime] spend cap reached at iter=%d (execution_id=%s)",
+                                iteration, execution_id)
+                    _record_terminal_telemetry(
+                        shadow=shadow, execution_id=execution_id, scroll=scroll,
+                        status="partial", iteration=iteration,
+                    )
+                    return {
+                        "status":        "spend_cap_reached",
+                        "final_summary": _augment_summary_with_committed_effects(_cap_msg, context),
+                        "error":         "SpendCapReached",
                         "execution_id":  execution_id,
                     }
 
