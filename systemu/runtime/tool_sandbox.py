@@ -988,24 +988,37 @@ class ToolSandbox:
                 store = init_default_store(Path("data"))
             except Exception:
                 store = None
-        if store is not None and store.is_approved(sig):
-            return  # "Always allow" on record → run
-        # One-shot resume-approval (park→resume bridge): honored exactly once.
-        if store is not None and store.consume_resume_approved(sig):
-            return
-        # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
-        # exact decision with a non-Deny choice; honor once without persisting.
-        dedup = f"tool:{sig}"
-        if resolved_dedup and resolved_dedup == dedup:
-            try:
-                from systemu.approval.decision_queue import OperatorDecisionQueue
-                choice = OperatorDecisionQueue(self._vault).consume_resolved_choice(dedup)
-                if choice is not None and (choice or "").strip().lower() != "deny":
-                    return
-            except Exception:
-                logger.debug("[Sandbox] tool-gate approve-once bypass check failed; "
-                             "falling through to re-gate (fail-closed)",
-                             exc_info=True)
+        # IMPL-1 — NO persisted approval of any kind may satisfy the DENY band.
+        #
+        # This check MUST precede every short-circuit below. The tool signature is
+        # params-INDEPENDENT (name + body hash + effect tags + host class), but the DENY
+        # verdict is params-DEPENDENT (is_destructive_param). So one tool yields
+        # REQUIRE_APPROVAL on benign params and DENY on destructive ones under the SAME
+        # signature: an "Always allow" granted legitimately on the benign call would
+        # otherwise short-circuit here and run the destructive call UNGATED, forever.
+        # That is the normal flow of the feature, not an abuse of it — which is why
+        # refusing to RECORD a standing allow on a DENY card is not sufficient on its
+        # own. Only the CONSUMPTION side can express "no stored approval covers this
+        # band". A DENY always posts.
+        if verdict != Verdict.DENY:
+            if store is not None and store.is_approved(sig):
+                return  # "Always allow" on record → run
+            # One-shot resume-approval (park→resume bridge): honored exactly once.
+            if store is not None and store.consume_resume_approved(sig):
+                return
+            # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
+            # exact decision with a non-Deny choice; honor once without persisting.
+            dedup = f"tool:{sig}"
+            if resolved_dedup and resolved_dedup == dedup:
+                try:
+                    from systemu.approval.decision_queue import OperatorDecisionQueue
+                    choice = OperatorDecisionQueue(self._vault).consume_resolved_choice(dedup)
+                    if choice is not None and (choice or "").strip().lower() != "deny":
+                        return
+                except Exception:
+                    logger.debug("[Sandbox] tool-gate approve-once bypass check failed; "
+                                 "falling through to re-gate (fail-closed)",
+                                 exc_info=True)
 
         # Not approved → post the gate and raise (mirror _maybe_gate_command).
         from systemu.approval.exceptions import PendingOperatorDecision

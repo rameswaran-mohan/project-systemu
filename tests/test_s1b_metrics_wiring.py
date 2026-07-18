@@ -89,13 +89,37 @@ def test_auto_allow_bypass_is_counted(tmp_path):
 
     descriptor = GateDescriptor.from_tool(
         tool_name="csv_summariser", sig="sig_xyz", verdict="allow")
-    policy = GateModePolicy(mode=GateMode.BYPASS)  # "tool" is not on the floor
+    policy = GateModePolicy(mode=GateMode.BYPASS)
 
-    inbox.enqueue(descriptor, gate_type="tool", policy=policy, vault=vault)
+    # "scroll" is NOT on the floor, so Bypass auto-grants it — that born-resolved row
+    # is what this test pins.
+    inbox.enqueue(descriptor, gate_type="scroll", policy=policy, vault=vault)
 
     snap = _snapshot(tmp_path)
     assert snap["always_allow_grants"] == 1
     assert snap["gate_cards_resolved"] == 1
+
+
+def test_a_tool_gate_is_never_auto_granted_by_bypass(tmp_path):
+    """A tool gate runs agent-authored code, so it belongs on the Bypass FLOOR: a
+    Bypass policy must never auto-grant it. Previously "tool" was missing from the
+    floor set, so Bypass minted a born-resolved row picking options[-1] ("Always
+    allow") with zero operator clicks — and the reconciler then turned that into a
+    standing approval."""
+    from systemu.interface.command.gate import GateDescriptor
+    from systemu.interface.command.gate_mode import GateMode, GateModePolicy
+    from systemu.interface.command.inbox import InboxQueue
+
+    vault = _make_vault(tmp_path)
+    inbox = InboxQueue(vault)
+    descriptor = GateDescriptor.from_tool(
+        tool_name="csv_summariser", sig="sig_xyz", verdict="require_approval")
+    inbox.enqueue(descriptor, gate_type="tool",
+                  policy=GateModePolicy(mode=GateMode.BYPASS), vault=vault)
+
+    snap = _snapshot(tmp_path)
+    assert snap.get("always_allow_grants", 0) == 0   # not auto-granted
+    assert snap.get("gate_cards_resolved", 0) == 0   # it stays pending for the operator
 
 
 # ── 4. structured_question decisions are tracked separately from gates ──────

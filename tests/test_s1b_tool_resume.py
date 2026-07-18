@@ -57,6 +57,9 @@ class _Sup:
 def _tool_dec(choice, sig=SIG):
     return _Dec({"kind": "gate", "gate_type": "tool", "tool_signature": sig,
                  "tool_name": "send_email",
+                 # production always stamps the verdict (a missing one now fails
+                 # CLOSED, so a standing allow requires the safety evidence)
+                 "verdict": "require_approval",
                  "execution_id": "exec_A", "chat_submission_id": "sub_1"}, choice)
 
 
@@ -191,6 +194,7 @@ def test_reconciler_dispatches_tool_gate(monkeypatch, tmp_path):
         context={
             "kind": "gate", "gate_type": "tool",
             "tool_signature": SIG, "tool_name": "send_email",
+            "verdict": "require_approval",   # production stamps it; absent ⇒ fails closed
             "chat_submission_id": "2026-07-05T10:00:00",
             "execution_id": "exec_T",
             # activity_id/shadow_id NOT in context — derived from the snapshot.

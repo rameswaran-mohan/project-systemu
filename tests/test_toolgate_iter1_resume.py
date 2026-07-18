@@ -188,6 +188,8 @@ def _bind_no_snapshot(monkeypatch, tmp_path):
 
 def _ctx(**extra):
     base = {"kind": "gate", "gate_type": "tool", "tool_signature": SIG,
+            # production stamps the verdict; absent ⇒ fails closed (single-use)
+            "verdict": "require_approval",
             "tool_name": "web_search", "execution_id": "exec_iter1",
             "chat_submission_id": "sub_iter1"}
     base.update(extra)

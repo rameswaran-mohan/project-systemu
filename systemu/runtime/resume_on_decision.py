@@ -141,7 +141,12 @@ def _dispatch_resume(decision, *, vault, supervisor,
             # the correct "approve once" semantics for a parked instance that no longer
             # exists. (The normal coords-present path re-submits immediately, consuming
             # the bridge within seconds, so it has no such window.)
-            if is_tool_gate and choice == "always allow":
+            # A DENY-band gate records NOTHING here. Routing it into the recorder would
+            # fall through to the single-use bridge — creating exactly the dangling,
+            # params-independent one-shot this branch refuses to create, and creating it
+            # only for the most dangerous band. A DENY simply re-asks on re-run.
+            _v = str(dctx.get("verdict") or "").strip().lower()
+            if is_tool_gate and choice == "always allow" and _v != "deny":
                 _record_gate_approval(dctx, is_tool_gate=True, choice=choice)
             _stamp_dispatched(decision, vault)
             _handled.add(decision.id)
@@ -259,7 +264,23 @@ def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
             sig = dctx.get("tool_signature")
             if not sig:
                 return
-            if choice == "always allow":
+            # IMPL-1: an "Always allow" can NEVER cover the DENY band. The gate stamps the
+            # verdict at park time; without this check a standing approval for a
+            # DENY-band tool would be consulted by ``tool_sandbox`` BEFORE any band check
+            # on the next call and run it UNGATED — a persistent bypass of the
+            # unknown-∩-high-severity floor. A DENY is downgraded to single-use, so the
+            # gate re-fires every time and the floor keeps being enforced.
+            # Normalise via ``.value`` first: ``Verdict`` is a str-Enum, and ``str()`` on
+            # the member yields "Verdict.DENY", which would NOT match and would silently
+            # re-open the hole for any caller that stamps the enum rather than its value.
+            raw = dctx.get("verdict")
+            verdict = str(getattr(raw, "value", raw) or "").strip().lower()
+            # ABSENCE of the verdict fails CLOSED (single-use), matching
+            # ``decision_bridge.classify_resolution``, which floors on a missing verdict
+            # for the same key. A gate parked before the verdict was carried is rare; the
+            # cost of closing it is one extra ask on a legacy card, and the cost of
+            # leaving it open is a standing allow on an unknown band.
+            if choice == "always allow" and verdict and verdict != "deny":
                 store.approve(sig)
             else:
                 store.mark_resume_approved(sig)

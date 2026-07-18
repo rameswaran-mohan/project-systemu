@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Tuple
 # render-only in the rail: the card shows ("Resolve in Inbox →"), but the operator
 # resolves the full choice via the /insights Inbox, which routes through
 # decision_dispatcher.dispatch -> command_gate_handler / mcp_call_gate_handler.
-_RAIL_RENDER_ONLY_DEDUP_PREFIXES = ("command:", "mcp:")
+_RAIL_RENDER_ONLY_DEDUP_PREFIXES = ("command:", "mcp:", "tool:")
 
 
 def _is_render_only_gate(dedup: str) -> bool:

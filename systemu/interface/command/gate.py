@@ -211,15 +211,24 @@ class GateDescriptor(BaseModel):
         into the decision's ``context_extras`` by the caller (Task 4 reads it on
         resume — never recomputed there).
 
-        ``verdict`` is the ``Verdict`` value (str) from ``evaluate_action`` — DENY
-        posts the SAME card (safe_default Deny); the DENY-specific typed-confirm is a
-        later follow-up (S1b.1). Risk is "high" for a DENY, "medium" otherwise."""
-        options = ["Deny", "Approve once", "Always allow"]
+        ``verdict`` is the ``Verdict`` value (str) from ``evaluate_action``. A DENY posts
+        the same card shape (safe_default Deny) but WITHOUT the standing "Always allow"
+        option: IMPL-1 says an always-allow can never cover the DENY band, so offering it
+        would either be a persistent bypass of the unknown-∩-high-severity floor or (once
+        the recorder refuses it) a silent no-op. ``_record_gate_approval`` enforces the
+        same rule independently — this is the UX half of a defence-in-depth pair. The
+        DENY-specific reclassify + typed-confirm flow (IMPL-2) is the follow-up that gives
+        a DENY a legitimate way forward; until then "Approve once" stays a single-use,
+        non-persisted decision. Risk is "high" for a DENY, "medium" otherwise."""
+        # normalise via .value: Verdict is a str-Enum and str(member) is
+        # "Verdict.DENY", which would not match and would re-offer the option.
+        is_deny = str(getattr(verdict, "value", verdict) or "").strip().lower() == "deny"
+        options = ["Deny", "Approve once"] if is_deny else ["Deny", "Approve once", "Always allow"]
         tags = ", ".join(sorted(str(t) for t in (effect_tags or []))) or "unclassified"
         inspect = f"tool: {tool_name}\neffects: {tags}\nverdict: {verdict}"
         if reason:
             inspect += f"\n\nReason: {reason}"
-        risk = "high" if str(verdict).lower() == "deny" else "medium"
+        risk = "high" if is_deny else "medium"
         return cls(
             title=f"Run tool: {tool_name}",
             risk=risk,
@@ -227,6 +236,10 @@ class GateDescriptor(BaseModel):
             options=options,
             safe_default=options[0],
             what_approve_does=(
+                f"Runs the {tool_name!r} tool ({tags}). This effect could not be "
+                "classified and carries a high-severity signal, so it cannot be "
+                "remembered — you will be asked again every time."
+                if is_deny else
                 f"Runs the {tool_name!r} tool ({tags}). 'Always allow' remembers "
                 "this exact tool body + effect set + host class."),
             dedup=f"tool:{sig}",
