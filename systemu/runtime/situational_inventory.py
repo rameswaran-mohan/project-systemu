@@ -122,6 +122,10 @@ class CapabilityRef(BaseModel):
 class RootSurvey(BaseModel):
     path: str
     salient: list[FileHandleLite] = []       # children carry their own content_derived
+    # True when this root's listing is INCOMPLETE — the per-root top-N cap dropped
+    # files, the traversal cap stopped the walk, or the root was unreadable. A consumer
+    # must not treat "absent from salient" as "gone" when this is set.
+    truncated: bool = False
     curated: bool = False
     table_item_id: Optional[str] = None
     # canonical IMMUTABLE taint axis — MUST match table_store.TableItem.origin_class (operator | systemu_authored | content_derived); content_derived values are never silent-bound (§5.10.b)
@@ -305,7 +309,7 @@ def build_capabilities(vault) -> list["CapabilityRef"]:
     return rows
 
 
-def _scan_root_bounded(root: str) -> list[tuple[str, float, int]]:
+def _scan_root_bounded(root: str, stats: Optional[dict] = None) -> list[tuple[str, float, int]]:
     """Walk `root` collecting (path, mtime, size) for REGULAR files, with a HARD
     traversal cap (`_MAX_SCAN_ENTRIES`) on entries examined.
 
@@ -345,7 +349,12 @@ def _scan_root_bounded(root: str) -> list[tuple[str, float, int]]:
             for entry in it:
                 examined += 1
                 if examined > _MAX_SCAN_ENTRIES:
-                    return found            # traversal cap reached: stop walking (truncated)
+                    # traversal cap reached: stop walking (truncated). Report it, so a
+                    # consumer can tell "this root has nothing more" from "we stopped
+                    # looking" — absence is only evidence when we actually looked.
+                    if stats is not None:
+                        stats["capped"] = True
+                    return found
                 try:
                     if entry.is_symlink():
                         continue             # never follow/collect symlinks (escape defense)
@@ -387,8 +396,13 @@ def build_roots(granted_roots) -> list["RootSurvey"]:
     surveys: list[RootSurvey] = []
     for root in roots or []:
         salient: list[FileHandleLite] = []
+        truncated = False
         try:
-            candidates = _scan_root_bounded(root)
+            scan_stats: dict = {}
+            candidates = _scan_root_bounded(root, scan_stats)
+            # the listing is incomplete if the walk was capped, or if more candidates
+            # exist than we emit (top-N) — either way "absent" is not "gone".
+            truncated = bool(scan_stats.get("capped")) or len(candidates) > _MAX_SALIENT_PER_ROOT
             # top-N most-recent first
             candidates.sort(key=lambda t: t[1], reverse=True)
             for path, mtime, size in candidates:
@@ -407,9 +421,12 @@ def build_roots(granted_roots) -> list["RootSurvey"]:
                 ))
         except Exception:
             # An unreadable/vanished root degrades to an empty salient list; the
-            # RootSurvey row is still emitted so the planner sees the grant.
+            # RootSurvey row is still emitted so the planner sees the grant. Mark it
+            # TRUNCATED — an empty listing here means "we could not look", which must
+            # never be read as "the root is empty".
             salient = []
-        surveys.append(RootSurvey(path=str(root), salient=salient))
+            truncated = True
+        surveys.append(RootSurvey(path=str(root), salient=salient, truncated=truncated))
     return surveys
 
 

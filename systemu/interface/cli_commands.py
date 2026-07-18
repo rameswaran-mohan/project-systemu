@@ -2339,6 +2339,11 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
     Always returns 0 (an empty world is a valid, non-error result)."""
     from systemu.runtime import world_model as _wm
     store = _wm.FactStore(vault)
+    survey = store.latest_survey()
+    #: how a derived staleness reads to an operator. "not surveyed" is deliberately NOT
+    #: called stale — the last survey did not cover that scope, so absence is not evidence.
+    _MARK = {"confirmed": "", "unconfirmed": "  ⚠ not re-confirmed by the last survey",
+             "not_surveyed": "  (scope not surveyed)", "unknown": ""}
     q = (query or "").strip()
     if q:
         hits = _wm.about(store, q, limit=(None if not limit else int(limit)))
@@ -2347,7 +2352,8 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
             return 0
         click.echo(f"About {q!r} — {len(hits)} fact(s):")
         for f in hits:
-            click.echo(f"  [{f.kind}] {f.value}  (origin={f.origin_class}, conf={f.confidence:.2f})")
+            mark = _MARK.get(_wm.staleness_of(f, survey), "")
+            click.echo(f"  [{f.kind}] {f.value}  (origin={f.origin_class}, conf={f.confidence:.2f}){mark}")
         return 0
     facts = store.all_facts()
     negatives = [n for n in store.all_negatives() if not n.is_expired()]
@@ -2360,6 +2366,15 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
     click.echo(f"World model — {len(facts)} fact(s) across {len(by_kind)} kind(s):")
     for kind in sorted(by_kind):
         click.echo(f"  {kind:<16} {by_kind[kind]}")
+    if survey is not None:
+        unconfirmed = [f for f in facts if _wm.staleness_of(f, survey) == "unconfirmed"]
+        click.echo(f"Last survey {survey.at} covered: "
+                   f"{', '.join(survey.kinds_surveyed) or '(nothing)'}"
+                   f"{' [file coverage truncated]' if survey.data_location_cap_hit else ''}")
+        if unconfirmed:
+            click.echo(f"Not re-confirmed by it — {len(unconfirmed)} (may be gone):")
+            for f in unconfirmed[:10]:
+                click.echo(f"  [{f.kind}] {f.value}")
     if negatives:
         click.echo(f"Active 'searched, not found' notes — {len(negatives)}:")
         for n in negatives:

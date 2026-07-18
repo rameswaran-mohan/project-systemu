@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, List
+from typing import Any, List, Optional
 
-from systemu.runtime.world_model import Fact, FactStore, ProvStep, fact_id_for
+from systemu.runtime.world_model import (
+    Fact, FactStore, ProvStep, SurveyWatermark, fact_id_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +43,16 @@ logger = logging.getLogger(__name__)
 _MAX_DATA_LOCATION_PER_RUN = 200
 
 
-def _facts_from_report(report: Any) -> List[Fact]:
+def _facts_from_report(report: Any, now: Optional[str] = None,
+                       stats: Optional[dict] = None) -> List[Fact]:
     """Map SituationReport entries → world-model Facts. Pure; per-entry defensive — a
     malformed entry (e.g. an out-of-vocab origin_class the Fact validator rejects) is
-    skipped, not raised. ``value``/``ref`` are ids/names/paths only, never secrets."""
-    now = datetime.now(timezone.utc).isoformat()
+    skipped, not raised. ``value``/``ref`` are ids/names/paths only, never secrets.
+
+    ``now`` is the shared survey instant — the facts and the watermark MUST carry the
+    same timestamp, or a fact confirmed microseconds before the watermark reads as older
+    than the survey that just confirmed it."""
+    now = now or datetime.now(timezone.utc).isoformat()
     facts: List[Fact] = []
 
     def _add(kind: str, value: Any, origin_class: Any, ref: Any) -> None:
@@ -74,6 +81,8 @@ def _facts_from_report(report: Any) -> List[Fact]:
     for root in getattr(report, "roots", None) or []:
         for fh in getattr(root, "salient", None) or []:
             if n_data >= _MAX_DATA_LOCATION_PER_RUN:
+                if stats is not None:
+                    stats["data_cap_hit"] = True
                 break
             _add("data_location", getattr(fh, "path", None),
                  getattr(fh, "origin_class", "content_derived"), getattr(fh, "path", None))
@@ -87,16 +96,62 @@ def _facts_from_report(report: Any) -> List[Fact]:
     return facts
 
 
+def _coverage(report: Any, facts: List[Fact], now: Optional[str] = None,
+              stats: Optional[dict] = None) -> SurveyWatermark:
+    """What this survey actually COVERED — so staleness can be derived read-side without
+    ever mutating a fact.
+
+    Everything here is deliberately CONSERVATIVE, because the only dangerous error is
+    claiming coverage we did not have (that turns a live fact into "may be gone"):
+
+      * a KIND counts as surveyed only if it produced ≥1 entry — an empty slice is
+        indistinguishable from one that timed out;
+      * a ROOT counts as covered only if it produced ≥1 entry — an unreadable or vanished
+        root still emits a row (so the planner sees the grant) with an empty listing, and
+        that must never read as "the root is empty";
+      * coverage is TRUNCATED if the surveyor says so for any root (its per-root top-N cap,
+        its traversal cap, or an unreadable root) or if our own per-run cap tripped.
+        Truncation is taken from the SURVEYOR rather than inferred from how many facts we
+        produced — the surveyor is the only thing that knows what it stopped walking.
+
+    The cost is that staleness is UNDER-reported. That is the safe direction: a fact is
+    never called stale on evidence we do not actually have."""
+    roots = []
+    root_truncated = False
+    for root in getattr(report, "roots", None) or []:
+        p = getattr(root, "path", None)
+        if getattr(root, "truncated", False):
+            root_truncated = True
+        if p and (getattr(root, "salient", None) or []):
+            roots.append(str(p))
+    return SurveyWatermark(
+        at=now or datetime.now(timezone.utc).isoformat(),
+        kinds_surveyed=sorted({f.kind for f in facts}),
+        roots_covered=roots,
+        data_location_cap_hit=root_truncated or bool((stats or {}).get("data_cap_hit")),
+    )
+
+
 def populate_from_situation(report: Any, vault: Any) -> int:
     """Project ``report`` into ``FactStore(vault)``. Returns the number of facts
     written. WRITE-ONLY + FAIL-SAFE — never raises (a failure returns 0)."""
     try:
-        facts = _facts_from_report(report)
+        now = datetime.now(timezone.utc).isoformat()   # ONE survey instant, shared
+        stats: dict = {}
+        facts = _facts_from_report(report, now, stats)
         if not facts:
             return 0
+        store = FactStore(vault)
         # BULK: one load + one save for the whole batch (O(N), not N whole-file
         # rewrites) — this is the per-run cost, so it must not be O(N²).
-        return FactStore(vault).put_facts(facts)
+        n = store.put_facts(facts)
+        # Record what this survey covered. This is a WRITE to a separate file; it never
+        # loads facts.json, so the populator stays a non-reader of the store.
+        try:
+            store.record_survey(_coverage(report, facts, now, stats))
+        except Exception:
+            logger.debug("[world-model] survey watermark skipped (non-fatal)", exc_info=True)
+        return n
     except Exception:
         logger.debug("[world-model] populate_from_situation skipped (non-fatal)", exc_info=True)
         return 0

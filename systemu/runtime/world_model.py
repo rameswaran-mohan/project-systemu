@@ -147,6 +147,88 @@ class NegativeFact(BaseModel):
             return True
 
 
+# ── survey watermark: what the last survey actually COVERED ──────────────────
+# Absence of re-confirmation is only evidence of staleness when the survey genuinely
+# looked. The survey is scope-varying (grant-scoped roots, a per-run file cap, per-source
+# timeouts), so "not re-seen" alone would mass-stale perfectly valid facts. Recording the
+# COVERAGE lets staleness be derived READ-SIDE — with no mutation of the facts themselves,
+# so the store stays append-only/confirm-in-place and belief revision (a later program)
+# is not pre-empted.
+
+#: keep the last N watermarks — enough to reason about recent coverage, bounded on disk.
+_MAX_SURVEYS = 20
+
+
+class SurveyWatermark(BaseModel):
+    """One survey's coverage record. Written by the populator; read only by the
+    operator-facing surfaces.
+
+    ``at`` is REQUIRED on purpose: defaulting it would make a malformed/older row
+    validate to read-time *now*, which is newer than every fact — turning the whole
+    store stale in one read. Required means such a row is skipped on load instead."""
+    at: str
+    kinds_surveyed: List[str] = Field(default_factory=list)   # fact kinds this survey produced
+    roots_covered: List[str] = Field(default_factory=list)    # granted roots that actually yielded entries
+    data_location_cap_hit: bool = False                       # the file listing was truncated
+
+
+def _as_dt(value: str) -> datetime:
+    """Parse an ISO timestamp, assuming UTC when naive. Raises on garbage."""
+    d = datetime.fromisoformat(str(value))
+    return d if d.tzinfo is not None else d.replace(tzinfo=timezone.utc)
+
+
+def _path_under(value: Any, root: Any) -> bool:
+    """Path-COMPONENT containment, not a raw string prefix — ``C:/Radiology/scan.pdf`` is
+    NOT under ``C:/R``. Mirrors the confinement layer's rule without touching the
+    filesystem; also normalises separators and a trailing slash."""
+    v = str(value or "").replace("\\", "/").rstrip("/").lower()
+    r = str(root or "").replace("\\", "/").rstrip("/").lower()
+    if not v or not r:
+        return False
+    return v == r or v.startswith(r + "/")
+
+
+def staleness_of(fact: Fact, survey: Optional[SurveyWatermark]) -> str:
+    """Derive a fact's staleness from its ``last_confirmed`` against what the latest
+    survey COVERED. Returns:
+
+      ``confirmed``    — re-seen by the latest survey;
+      ``unconfirmed``  — the survey covered this fact's scope and did NOT re-see it
+                         (the honest "this may be gone" signal — e.g. a disconnected
+                         service);
+      ``not_surveyed`` — the survey did not cover this kind/scope, so absence is NOT
+                         evidence (the case a naive "not re-seen ⇒ stale" rule gets
+                         wrong);
+      ``unknown``      — no survey recorded yet.
+
+    Pure; never raises."""
+    try:
+        if survey is None:
+            return "unknown"
+        last = getattr(fact, "last_confirmed", None)
+        if not last:
+            return "unknown"                   # never confirmed ≠ evidence it disappeared
+        try:
+            # REAL datetime comparison. A lexicographic string compare gets this wrong
+            # for a differing UTC offset or a naive stamp — and every such error points
+            # the dangerous way (a newer fact reading as stale).
+            if _as_dt(last) >= _as_dt(survey.at):
+                return "confirmed"
+        except Exception:
+            return "unknown"                   # unparseable ⇒ never claim stale
+        if fact.kind not in (survey.kinds_surveyed or ()):
+            return "not_surveyed"
+        if fact.kind == "data_location":
+            if survey.data_location_cap_hit:
+                return "not_surveyed"          # the listing was truncated — we stopped looking
+            if not any(_path_under(fact.value, r) for r in (survey.roots_covered or [])):
+                return "not_surveyed"          # outside the roots this survey actually walked
+        return "unconfirmed"
+    except Exception:
+        return "unknown"
+
+
 def fact_id_for(kind: str, value: Any) -> str:
     """A deterministic id for a ``(kind, value)`` — so re-observing the same fact
     confirms it IN PLACE rather than duplicating. Never uses wall-clock/randomness
@@ -344,6 +426,50 @@ class FactStore:
 
     def all_negatives(self) -> List[NegativeFact]:
         return list(self._load_negatives().values())
+
+    # ── survey watermarks (write: populator · read: operator surfaces) ───────
+    @property
+    def _surveys_path(self) -> Path:
+        return self._dir / "surveys.json"
+
+    def record_survey(self, survey: SurveyWatermark) -> None:
+        """Append a survey-coverage watermark. WRITE-ONLY w.r.t. the facts — it never
+        loads or touches ``facts.json``, so the populator can call it without becoming a
+        reader of the store."""
+        try:
+            existing = self.all_surveys()
+        except Exception:
+            existing = []
+        rows = (existing + [survey])[-_MAX_SURVEYS:]
+        payload = {"version": 1, "surveys": [s.model_dump(mode="json") for s in rows]}
+        _write_atomic(self._surveys_path, json.dumps(payload, indent=2))
+
+    def all_surveys(self) -> List[SurveyWatermark]:
+        try:
+            if not self._surveys_path.exists():
+                return []
+            data = json.loads(self._surveys_path.read_text(encoding="utf-8"))
+            rows = data.get("surveys") if isinstance(data, dict) else None
+            out: List[SurveyWatermark] = []
+            for r in (rows or []):
+                try:
+                    out.append(SurveyWatermark.model_validate(r))
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    def latest_survey(self) -> Optional[SurveyWatermark]:
+        """The most recent watermark BY TIMESTAMP, not by write order — two concurrent
+        runs can append out of order, and the newest is what staleness must compare to."""
+        rows = self.all_surveys()
+        if not rows:
+            return None
+        try:
+            return max(rows, key=lambda s: _as_dt(s.at))
+        except Exception:
+            return rows[-1]
 
 
 # ── WM-4: the world.query view family (deterministic; results are fenced data) ─
