@@ -5789,6 +5789,20 @@ class ShadowRuntime:
                 )
                 context._situation_report = _report.model_dump()
                 context._situation_stamps = _stamps
+                # R-W1 (W-A slice-2a): project the report into the world-model fact
+                # store — WRITE-ONLY + additive. It does NOT touch _report /
+                # context._situation_report (planner input byte-identical) and no bind
+                # source reads the store, so it cannot affect binding/planning today.
+                # OFF-LOOP + time-bounded, matching this stage's non-blocking contract:
+                # the populate is file I/O, so it runs in a thread under its own timeout.
+                try:
+                    from systemu.runtime.world_model_populator import populate_from_situation
+                    await _asyncio.wait_for(
+                        _asyncio.to_thread(populate_from_situation, _report, self.vault),
+                        timeout=5.0,
+                    )
+                except Exception:
+                    logger.debug("[Runtime] world-model populate skipped (non-fatal)", exc_info=True)
             except Exception:
                 logger.debug(
                     "[Runtime] situational inventory survey skipped (non-fatal)",

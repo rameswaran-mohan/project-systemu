@@ -76,6 +76,51 @@ def test_put_fact_updates_confidence_and_appends_source_chain(tmp_path):
     assert kinds == ["inventory", "probe"]                  # append-only: old step preserved
 
 
+def test_reobserving_the_same_source_does_not_grow_the_chain(tmp_path):
+    # F4 fix (now load-bearing with a per-run populator): re-confirming a fact from the
+    # SAME (source_kind, ref) — even at a different time — must NOT append a duplicate
+    # step. Recency is carried by last_confirmed, not by chain growth.
+    s = _store(tmp_path)
+    for at in ("2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00", "2026-03-01T00:00:00+00:00"):
+        s.put_fact(Fact(fact_id="service:gh", kind="service", value="github", origin_class="operator",
+                        source_chain=[ProvStep(source_kind="inventory", ref="mcp:gh", at=at)]))
+    assert len(s.get("service:gh").source_chain) == 1          # deduped, not grown
+    # a DISTINCT source is still appended (append-only for genuinely new provenance)
+    s.put_fact(Fact(fact_id="service:gh", kind="service", value="github", origin_class="operator",
+                    source_chain=[ProvStep(source_kind="probe", ref="whoami")]))
+    assert len(s.get("service:gh").source_chain) == 2
+
+
+def test_put_facts_bulk_writes_once_and_applies_the_same_rules(tmp_path):
+    # F1: the per-run populator must not rewrite the whole file once per fact (O(N²)).
+    # put_facts does ONE save for the batch, with identical immutability/dedup rules.
+    s = _store(tmp_path)
+    saves = {"n": 0}
+    orig = s._save_facts
+    def _counting(f):
+        saves["n"] += 1
+        return orig(f)
+    s._save_facts = _counting
+    n = s.put_facts([_fact(fact_id=f"service:{i}", value=f"svc{i}") for i in range(5)])
+    assert n == 5 and saves["n"] == 1                      # ONE save for the whole batch
+    assert len(s.query_facts()) == 5
+    # a batch member violating immutability is SKIPPED, not aborting the rest
+    s._save_facts = orig
+    stored = s.put_facts([
+        _fact(fact_id="service:0", value="svc0", origin_class="content_derived"),  # taint change
+        _fact(fact_id="service:new", value="fresh"),
+    ])
+    assert stored == 1                                      # only the valid one landed
+    assert s.get("service:0").origin_class == "operator"     # unchanged (refused)
+    assert s.get("service:new") is not None
+
+
+def test_put_facts_empty_batch_writes_nothing(tmp_path):
+    s = _store(tmp_path)
+    assert s.put_facts([]) == 0
+    assert not s._facts_path.exists()                       # no file created for a no-op
+
+
 def test_put_fact_rejects_a_kind_change_on_update(tmp_path):
     # F3: kind is identity-defining (fact_id_for folds it in). A hand-set fact_id
     # re-typed to a different kind is a caller error — refused, not silently re-typed.
@@ -184,19 +229,60 @@ def test_fact_id_for_is_deterministic_and_dedups():
 
 # ── risk-5: the substrate is inert — no run-loop module imports it (slice-1) ──
 
-def test_no_run_loop_module_imports_the_world_model_store():
-    # The §5.11.f risk-5 invariant: the agent behaves identically when this feature is
-    # absent/empty. Operationalised — the live run-loop stages must not yet import the
-    # store (that wiring is slice-2). If this fails, slice-1 stopped being inert.
+#: The ONLY modules — anywhere in the package — allowed to reference the world model,
+#: and the role each is allowed to play. Scanning the WHOLE tree (not just runtime/)
+#: matters: a runtime-only scan silently rests on "every decision path lives under
+#: systemu/runtime/", which is true today but unpinned.
+_WM_ALLOWED = {
+    # runtime — the decision zone. Write-side only.
+    "world_model.py": "defines the store + the read API",
+    "world_model_populator.py": "the WRITE-ONLY projector",
+    "shadow_runtime.py": "hosts the populator call (write seam)",
+    # outside runtime — operator-facing, never on a decision path.
+    "cli_commands.py": "read-only operator CLI surface",
+}
+
+#: The read surface. Checked only against the small write-only projector — a read API
+#: includes generic names (``get``) that cannot be grepped across a large module without
+#: false positives, which is exactly why the invariant below gates on MODULE REFERENCE
+#: rather than on a symbol blocklist.
+_WM_READ_SURFACE = ("find_services", "what_can", "find_data", "about(", "provenance(",
+                    "query_facts", "query_negative", "all_facts", "all_negatives")
+
+
+def test_only_the_allowed_modules_reference_the_world_model_anywhere():
+    # The load-bearing invariant: the store is WRITE-ONLY on every decision path today —
+    # reading it to influence a bind is the trust-critical, separately-gated slice-2c.
+    # Gate on REFERENCE, not on a symbol blocklist: a reader added anywhere trips this no
+    # matter which call it uses (including `about()`/`get()`, which a substring list would
+    # miss or false-positive on). Scan the WHOLE package, so the invariant does not quietly
+    # depend on where decision code happens to live.
     import pathlib
-    root = pathlib.Path(wm.__file__).parent
-    offenders = []
-    for name in ("shadow_runtime.py", "open_world_planner.py", "requirement_binder.py",
-                 "supervisor.py", "situational_inventory.py"):
-        p = root / name
-        if p.exists() and "world_model" in p.read_text(encoding="utf-8", errors="replace"):
-            offenders.append(name)
-    assert offenders == [], f"slice-1 must stay inert; imported by {offenders}"
+    systemu_root = pathlib.Path(wm.__file__).parent.parent          # systemu/
+    touching = {p.name for p in systemu_root.rglob("*.py")
+                if "world_model" in p.read_text(encoding="utf-8", errors="replace")}
+    unexpected = touching - set(_WM_ALLOWED)
+    assert unexpected == set(), f"these modules must not touch the world model: {unexpected}"
+
+
+def test_the_write_only_projector_never_reads_the_store():
+    import pathlib
+    text = (pathlib.Path(wm.__file__).parent / "world_model_populator.py").read_text(
+        encoding="utf-8", errors="replace")
+    hits = [s for s in _WM_READ_SURFACE if s in text]
+    assert hits == [], f"the populator is write-only; it must not read: {hits}"
+
+
+def test_the_write_host_reaches_the_store_only_through_the_populator():
+    # shadow_runtime drives the planner, so it is the likeliest place a future
+    # read-for-decision would land. Pin that it never opens the store itself.
+    import pathlib
+    text = (pathlib.Path(wm.__file__).parent / "shadow_runtime.py").read_text(
+        encoding="utf-8", errors="replace")
+    assert "world_model_populator" in text          # the write seam is present…
+    assert "FactStore(" not in text                 # …and it never opens the store itself
+    assert "from systemu.runtime.world_model import" not in text
+    assert "world_model.FactStore" not in text
 
 
 # ── E5: the `sharing-on world` CLI is READ-ONLY ───────────────────────────────

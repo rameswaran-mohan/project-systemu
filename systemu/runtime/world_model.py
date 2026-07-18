@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -41,6 +42,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 from systemu.runtime import capability_slots as _cs
 
@@ -217,38 +220,69 @@ class FactStore:
                    "facts": [f.model_dump(mode="json") for f in facts.values()]}
         _write_atomic(self._facts_path, json.dumps(payload, indent=2))
 
-    def put_fact(self, fact: Fact) -> Fact:
-        """Insert or CONFIRM a fact. On an existing ``fact_id``: ``origin_class`` is
-        IMMUTABLE (a change raises ``ImmutableProvenanceError`` — E1/§5.10.b#1);
-        ``value``/``confidence``/``last_confirmed`` update; ``source_chain`` is
-        APPEND-ONLY (existing steps are preserved, new ones appended — never
-        truncated). Returns the stored fact."""
-        facts = self._load_facts()
-        existing = facts.get(fact.fact_id)
-        if existing is not None and existing.origin_class != fact.origin_class:
+    @staticmethod
+    def _resolve_put(existing: Optional[Fact], fact: Fact) -> Fact:
+        """The fact to STORE for one put. ``origin_class`` is IMMUTABLE (a change
+        raises ``ImmutableProvenanceError`` — E1/§5.10.b#1) and so is ``kind``
+        (identity-defining); ``value``/``confidence``/``last_confirmed`` update;
+        ``source_chain`` is APPEND-ONLY but deduped by ``(source_kind, ref)`` — so
+        re-observing a fact from the SAME source never grows the chain (recency lives
+        in ``last_confirmed``), while a DISTINCT source is still appended. Pure."""
+        if existing is None:
+            return fact
+        if existing.origin_class != fact.origin_class:
             raise ImmutableProvenanceError(
                 f"origin_class is immutable for {fact.fact_id!r}: "
                 f"{existing.origin_class!r} → {fact.origin_class!r} refused")
-        if existing is not None and existing.kind != fact.kind:
+        if existing.kind != fact.kind:
             # kind is identity-defining (fact_id_for folds it in) — a re-typed re-put on
             # a hand-set id is a caller error, refused not silently re-typed (F3).
             raise ImmutableProvenanceError(
                 f"kind is immutable for {fact.fact_id!r}: "
                 f"{existing.kind!r} → {fact.kind!r} refused")
-        if existing is not None:
-            merged_chain = list(existing.source_chain)
-            for step in fact.source_chain:
-                if step not in merged_chain:
-                    merged_chain.append(step)
-            stored = fact.model_copy(update={
-                "origin_class": existing.origin_class,   # preserved regardless (belt-and-braces)
-                "source_chain": merged_chain,
-            })
-        else:
-            stored = fact
+        merged_chain = list(existing.source_chain)
+        seen = {(s.source_kind, s.ref) for s in existing.source_chain}
+        for step in fact.source_chain:
+            key = (step.source_kind, step.ref)
+            if key not in seen:
+                merged_chain.append(step)
+                seen.add(key)
+        return fact.model_copy(update={
+            "origin_class": existing.origin_class,   # preserved regardless (belt-and-braces)
+            "source_chain": merged_chain,
+        })
+
+    def put_fact(self, fact: Fact) -> Fact:
+        """Insert or CONFIRM one fact (see :meth:`_resolve_put` for the immutability +
+        append-only rules). Returns the stored fact."""
+        facts = self._load_facts()
+        stored = self._resolve_put(facts.get(fact.fact_id), fact)
         facts[stored.fact_id] = stored
         self._save_facts(facts)
         return stored
+
+    def put_facts(self, new_facts: "List[Fact]") -> int:
+        """BULK insert/confirm — ONE load + ONE save for the whole batch, so a
+        per-run populator costs O(N) instead of N whole-file rewrites (calling
+        ``put_fact`` in a loop is O(N²) disk work). Same per-fact immutability +
+        append-only rules; a fact that violates immutability is SKIPPED (logged)
+        rather than aborting the batch. Returns the number stored."""
+        if not new_facts:
+            return 0
+        facts = self._load_facts()
+        n = 0
+        for f in new_facts:
+            try:
+                stored = self._resolve_put(facts.get(f.fact_id), f)
+            except ImmutableProvenanceError:
+                logger.debug("[world-model] refused an immutable-provenance change for %s",
+                             getattr(f, "fact_id", "?"), exc_info=True)
+                continue
+            facts[stored.fact_id] = stored
+            n += 1
+        if n:
+            self._save_facts(facts)
+        return n
 
     def get(self, fact_id: str) -> Optional[Fact]:
         return self._load_facts().get(fact_id)
