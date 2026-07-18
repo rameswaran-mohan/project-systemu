@@ -466,6 +466,43 @@ def test_declared_intent_content_derived_binds_into_ask(tmp_path):
         "a content_derived declared-intent bind is never silent"
 
 
+# ── the clamp holds for a TRUSTED-LOOKING declared_intents TOOL entry ────────
+def test_declared_intent_tool_trusted_origin_is_clamped_to_content_derived(tmp_path):
+    """A DISABLED table tool falls through ``compose_table`` into ``declared_intents``
+    CARRYING its ``origin_class`` verbatim (``situational_inventory`` ~line 531). Since
+    the projector stamps every tool ``systemu_authored``, that trusted-looking label now
+    rides on an entry the binder matches by FUZZY NAME over surveyed data — and the only
+    thing stopping it from laundering into a trusted ``value_origin`` is the
+    unconditional ``return _CONTENT_DERIVED`` in ``_entry_origin`` (IMPL-5).
+
+    The existing declared_intents test feeds ``origin_class='content_derived'``, so it
+    passes EVEN IF the clamp is deleted and the stored origin is passed through
+    (content_derived → content_derived). This one feeds a TRUSTED value, so only a real
+    clamp keeps it untrusted — and an untrusted bind is forced into the ask_bundle
+    instead of being applied silently.
+    """
+    for forged_origin in ("systemu_authored", "operator"):
+        situation = _situation(declared_intents=[{
+            "id": "i-1", "kind": "tool", "name": "special_account", "detail": "",
+            "status": "declared", "origin_class": forged_origin,
+        }])
+        ctx = _FakeCtx(situation=situation, granted_roots=_FakeGrantedRoots([]))
+        cap = _tool("api", {"special_account": {"type": "string", "description": "an account"}})
+
+        reqs = compute_requirements(_obj(), cap, situation, ctx)
+        acct = [r for r in reqs if r.schema_path.endswith("special_account")]
+        assert acct, "the declared-intent-matched leaf should produce a Requirement"
+        assert acct[0].value_origin == "content_derived", (
+            f"a declared_intents TOOL entry claiming origin_class={forged_origin!r} must "
+            "CLAMP to content_derived — a fuzzy name match over surveyed data can never "
+            "carry a trusted taint (IMPL-5 fail-untrusted)")
+
+        report = build_requirement_report([_obj()], cap, situation, ctx)
+        assert any(a.schema_path.endswith("special_account") for a in report.ask_bundle), (
+            f"the clamped bind (claimed {forged_origin!r}) must route to the ask_bundle "
+            "— never silent")
+
+
 # ── additionalProperties + $ref-cycle parity (inherited from _walk) ──────────
 def test_additional_properties_and_ref_cycle_diff_without_crash():
     """A schema using ``additionalProperties`` and a ``$ref`` cycle must diff without

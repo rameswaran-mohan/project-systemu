@@ -89,12 +89,20 @@ def _project_tools(vault) -> List[TableItem]:
                 status = "broken"
             else:
                 status = "declared"
-            forged = bool(t.get("forged_by_systemu"))
             out.append(TableItem(
                 id=_id_for(key), kind="tool", name=str(name),
                 detail=str(t.get("description") or "")[:200],
                 status=status, provenance="migrated",
-                origin_class="systemu_authored" if forged else "operator",
+                # The TAINT axis (§5.10.b "who vouches for this content"), NOT an
+                # authorship record — so it is UNCONDITIONAL. It was derived from
+                # ``forged_by_systemu`` ("an LLM authored this tool body"), which
+                # stamped every non-forged tool ``operator`` — this code asserting
+                # THE OPERATOR DECLARED IT about shipped seed tools the operator
+                # never touched. Authorship lives truthfully in
+                # ``capability_index.origin`` (builtin|forged|mcp); this now agrees
+                # with ``situational_inventory``'s CapabilityRef default for the
+                # same objects.
+                origin_class="systemu_authored",
                 ref={"tool_id": tid, "name": name},
                 # effect_tags (populated once G0 lands) ride in usage metadata for
                 # the page + later gate context; empty on the plain v0.9.52 base.

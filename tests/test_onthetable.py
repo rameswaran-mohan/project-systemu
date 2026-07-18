@@ -132,7 +132,83 @@ def test_projection_populates_from_live_stores(tmp_path):
     assert by_name["zipper"].origin_class == "systemu_authored"
     assert by_name["zipper"].usage.get("effect_tags") == ["local_write"]
     assert by_name["poster"].status == "broken"           # dry_run failed
+    # a NOT-forged tool is still systemu_authored on the TAINT axis (see the
+    # dedicated pin below) — asserted here too so the sibling fixture can't drift.
+    assert by_name["poster"].origin_class == "systemu_authored"
     assert by_name["gh_pat"].kind == "credential_ref" and by_name["gh_pat"].status == "ready"
+
+
+def test_projected_tool_origin_class_is_systemu_authored_regardless_of_forged(tmp_path):
+    """``origin_class`` is the §5.10.b TAINT axis ("who vouches for this content"),
+    NOT an authorship record — and NOTHING on the operator's table is vouched for by
+    the operator merely because systemu did not FORGE its body.
+
+    ``forged_by_systemu`` means "an LLM authored this tool body". Deriving the taint
+    label from it stamped every non-forged tool ``operator`` — the repo's own code
+    asserting THE OPERATOR DECLARED IT, which is false for a shipped seed tool the
+    operator never touched. (39 shipped seeds carry forged=False; two of them,
+    ``extract_records`` and ``web_extract``, were mislabelled ``operator`` in a stock
+    install.) Authorship already lives truthfully in ``capability_index.origin``
+    (builtin|forged|mcp); the taint axis must not double as a provenance record.
+
+    This also makes the two shipped derivations agree: ``situational_inventory``'s
+    ``CapabilityRef.origin_class`` already defaults to ``systemu_authored`` for the
+    same objects.
+    """
+    v = _Vault(tmp_path, tools=[
+        {"id": "t1", "name": "forged_tool", "enabled": True, "forged_by_systemu": True},
+        {"id": "t2", "name": "seed_tool", "enabled": True, "forged_by_systemu": False},
+        {"id": "t3", "name": "no_key_tool", "enabled": True},          # key ABSENT
+        {"id": "t4", "name": "null_key_tool", "enabled": True, "forged_by_systemu": None},
+    ])
+    by_name = {it.name: it for it in tr.project(v) if it.kind == "tool"}
+    assert set(by_name) == {"forged_tool", "seed_tool", "no_key_tool", "null_key_tool"}
+    for name, item in by_name.items():
+        assert item.origin_class == "systemu_authored", (
+            f"{name!r} projected origin_class={item.origin_class!r} — a tool on the "
+            "table is NEVER 'operator' on the taint axis; the operator did not "
+            "declare a catalog tool by not-forging it")
+
+
+def test_projection_recomputes_origin_class_each_tick(tmp_path):
+    """``project()`` RE-DERIVES ``origin_class`` from the live stores on every tick — it
+    is NOT inherited from the persisted item. Only ``created_at``/``usage`` (and
+    ``pinned``, from the sidecar) survive re-projection.
+
+    ``table_store``'s "IMMUTABLE" note is about the CURATION lifecycle (accepting a
+    suggestion changes ``status``, never ``origin`` — §5.10.b), NOT about the projector,
+    which is the store's sole writer and rewrites items.json wholesale. This distinction
+    matters: if re-projection inherited the stored label, every install that already
+    persisted the old wrong ``operator`` stamp would keep it FOREVER, and this fix would
+    be a no-op on exactly the machines it is meant to correct.
+    """
+    # (a) a persisted item carrying a STALE/wrong origin_class is re-derived, not kept.
+    v = _Vault(tmp_path, tools=[{"id": "t1", "name": "a", "enabled": True}])
+    first = tr.project(v)
+    tool = next(it for it in first if it.kind == "tool")
+    ts.save_items(v, [tool.model_copy(update={"origin_class": "operator",
+                                              "created_at": "2020-01-01T00:00:00+00:00"})])
+
+    reprojected = {it.id: it for it in tr.project(v)}
+    again = reprojected[tool.id]
+    assert again.origin_class == "systemu_authored", (
+        "origin_class must be RECOMPUTED from the live store each tick — a persisted "
+        "stale 'operator' must not be inherited, or the mislabel is permanent")
+    assert again.created_at == "2020-01-01T00:00:00+00:00", \
+        "created_at IS preserved across ticks (the documented carry-forward)"
+
+    # (b) flipping forged_by_systemu across ticks never moves the taint axis.
+    v2 = _Vault(tmp_path / "v2", tools=[{"id": "t1", "name": "a", "enabled": True,
+                                         "forged_by_systemu": True}])
+    (tmp_path / "v2").mkdir()
+    tick1 = next(it for it in tr.project(v2) if it.kind == "tool")
+    tr.reconcile_once(v2)
+    v2._tools = [{"id": "t1", "name": "a", "enabled": True, "forged_by_systemu": False}]
+    tick2 = next(it for it in tr.project(v2) if it.kind == "tool")
+    assert tick1.id == tick2.id, "same ref_key ⇒ same stable id across ticks"
+    assert tick1.origin_class == tick2.origin_class == "systemu_authored", (
+        "a forged→not-forged flip must NOT move origin_class — the taint axis is not "
+        "derived from the authorship bit")
 
 
 def test_projection_is_idempotent_stable_ids(tmp_path):

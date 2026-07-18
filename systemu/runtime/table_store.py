@@ -16,8 +16,16 @@ exception, so the page shell can't die on it) — but with **atomic writes**
 
 `TableItem`s REFERENCE the operational stores (MCP connections, the tool catalog,
 the credential-name registry); they never duplicate a secret value. `origin_class`
-is IMMUTABLE through every status transition — accepting a suggestion changes
+is IMMUTABLE through every status TRANSITION — accepting a suggestion changes
 status, never origin (the §5.10.b taint rule).
+
+That immutability is a rule about the CURATION lifecycle, **not** about the
+projector. ``table_reconciler.project()`` is this store's sole writer and RE-DERIVES
+``origin_class`` from the live stores on every tick (only ``created_at``/``usage``
+carry forward, and ``pinned`` comes from the sidecar) — a derived label has to track
+its derivation, or a stamp we later find to be wrong would be frozen into every
+install that already persisted it. Pinned by
+``test_projection_recomputes_origin_class_each_tick``.
 """
 from __future__ import annotations
 
@@ -53,7 +61,9 @@ class TableItem(BaseModel):
     detail: str = ""
     status: str = "declared"
     provenance: str = "migrated"          # consulted | operator_added | learned | migrated
-    origin_class: str = "operator"        # operator | systemu_authored | content_derived — IMMUTABLE
+    # operator | systemu_authored | content_derived. IMMUTABLE across status
+    # transitions; RE-DERIVED by the projector each tick (see the module docstring).
+    origin_class: str = "operator"
     ref: Dict[str, Any] = Field(default_factory=dict)
     parent_id: Optional[str] = None       # grouping: a service anchors its sub-items
     usage: Dict[str, Any] = Field(default_factory=dict)
