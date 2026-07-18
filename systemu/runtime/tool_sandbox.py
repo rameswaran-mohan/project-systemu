@@ -1021,6 +1021,32 @@ class ToolSandbox:
         wired incrementally). ``resolved_dedup`` is the quick-lane one-shot
         resume/approve-once token: on the re-call the resume-approved signature
         is consumed here (mirrors ``_maybe_gate_command``).
+
+        ── SIBLING: the dry-run auto-skip ───────────────────────────────────
+        ``systemu.pipelines.tool_dry_run._gate_skip_reason`` MIRRORS the scoring
+        below (the ``ActionContext`` built at :1073-1081, plus the
+        ``forged_network_denied`` pre-check at :764 that precedes this call).
+        The dry-run pipeline calls ``execute_tool`` WITHOUT ``tool=`` on purpose
+        — a card parked from there would be ORPHANED (a forge dry-run has no
+        activity for the resume machinery to resume) and the raise would be
+        swallowed into a "failed" dry-run that triggers a re-forge loop — so it
+        re-scores the call itself and REFUSES to execute instead of gating.
+
+        The mirror is EXACT only on the DECLARED-TAG path. For an UNTAGGED tool
+        — every freshly-forged one, since ``tool_forge`` never stamps
+        ``effect_tags`` and the backfill is a boot pass — ``_gate_skip_reason``
+        substitutes an ADVISORY ``classify_source`` scan where this gate would
+        score empty tags as UNKNOWN. That scan is name-matching and can
+        under-tag, so the dry-run can ALLOW a body this gate would card. That is
+        a deliberate divergence (without it every forge dry-run would skip), but
+        it is a real residual gap, not a wash — see ``_gate_skip_reason``'s
+        docstring and the strict-xfail ratchet
+        ``TestKnownGap_UntaggedSourceScanIsNameMatching``.
+
+        If you change the inputs to the ``ActionContext`` below, change
+        ``_gate_skip_reason`` too. ``tests/test_dryrun_gate_skip.py``
+        (``TestParityWithLiveGate``, t5) pins the two together for declared-tag
+        inputs and fails on drift there; it does not cover the untagged path.
         """
         if tool is None:
             return  # no Tool to gate — legacy/registry-less path unchanged

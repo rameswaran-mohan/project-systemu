@@ -22,8 +22,18 @@ Safety:
   don't declare ``dry_run=True`` support get ``status="skipped"`` and
   evidence noting the reason; operator must approve manually.
 * **Tmp-path sandbox** — when the test-param generator produces path-like
-  arguments, they're rewritten to ``/tmp/dry_run_<uuid>/`` so even tools
-  that don't honour ``dry_run=True`` can't trample real outputs.
+  arguments, those PARAMETERS are rewritten to ``/tmp/dry_run_<uuid>/``.
+  This constrains only what the tool receives: :func:`_sandbox_paths`
+  rewrites param VALUES, so a body that constructs its own absolute path
+  (or derives one from a constant) is untouched and can still write
+  outside the tmp dir. Treat it as a nudge, not a containment boundary.
+* **Action-gate auto-skip** (:func:`_gate_skip_reason`) — re-scores the call
+  the way the live gate would and refuses to execute on any non-ALLOW
+  verdict. LIMIT: the scoring is only as good as its inputs. For a tool with
+  DECLARED ``effect_tags`` it mirrors the live gate; for an UNTAGGED tool
+  (every freshly-forged one) it falls back to an advisory ``classify_source``
+  scan that is NAME-MATCHING and can under-tag — see that function's
+  docstring and ``tests/test_dryrun_gate_skip.py``'s KNOWN GAP section.
 * **Replay mode** (v0.5.0-d) — when ``replay_params`` is supplied, the
   pipeline skips test-param generation and instead runs the tool against
   each historical params set.  ANY failure → backward-compat regression.
@@ -97,6 +107,11 @@ class DryRunResult:
     # representative input for a file format (e.g. a real .docx) — the operator
     # owns correctness, so the tool is STILL enable-able (unlike a hard "failed").
     operator_verify: bool          = False
+    # S1b: the live-action-gate verdict that caused an auto-skip ("deny" /
+    # "require_approval"), or None when the gate was not what stopped the run.
+    # Recorded so the operator can see WHY the body was not executed instead of
+    # inferring it from prose. See _gate_skip_reason.
+    gate_verdict:   Optional[str]   = None
 
     def to_evidence(self) -> Dict[str, Any]:
         """Compact evidence dict for persistence into ``Tool.dry_run_evidence``."""
@@ -122,6 +137,9 @@ class DryRunResult:
             ),
             "replayed_count": self.replayed_count,
             "operator_verify": self.operator_verify,
+            # Evidence is schemaless JSON, so this is purely additive — older
+            # records simply lack the key.
+            "gate_verdict": self.gate_verdict,
         }
 
 
@@ -228,6 +246,16 @@ def dry_run_tool(
             elapsed_ms=_elapsed_ms(t0),
         )
 
+    # S1b: auto-skip anything the LIVE action gate would card. Scored on the
+    # SYNTHESIZED params — the exact dict _execute is about to pass to the body,
+    # so is_destructive_param reflects the real call. See _gate_skip_reason.
+    gate_skip = _gate_skip_reason(tool, params, config)
+    if gate_skip:
+        verdict, reason = gate_skip
+        logger.info("[ToolDryRun] '%s' auto-skipped: action gate scores this "
+                    "call %s (%s)", tool.name, verdict.upper(), reason)
+        return _gate_skip_result(verdict, reason, params=params, t0=t0)
+
     # Execute via the existing sandbox.
     result = _execute(tool, params, vault=vault, config=config)
     elapsed = _elapsed_ms(t0)
@@ -313,6 +341,38 @@ def replay_against_history(
             skip_reason=net_skip,
             elapsed_ms=_elapsed_ms(t0),
         )
+
+    # S1b: same auto-skip as dry_run_tool — replay runs UNATTENDED off recorded
+    # params (the v0.5.0-d recalibrator's bump path), so it needs the same gate.
+    #
+    # Scored ONCE, pre-loop, over the UNION of the history: replay is
+    # all-or-nothing by contract (any failure rejects the bump), so a single
+    # destructive entry must gate the whole replay rather than letting the loop
+    # execute the benign entries first. The tag context does not vary per entry.
+    # is_destructive_call is evaluated on the SANDBOXED params because those are
+    # what _execute actually receives below.
+    try:
+        from systemu.runtime.tool_sandbox import ToolSandbox
+        _replay_destructive = any(
+            ToolSandbox.is_destructive_call(tool.name, _sandbox_paths(dict(p)))
+            for p in history
+        )
+    except Exception:
+        # Fail closed: an unscoreable history is treated as destructive.
+        logger.debug("[ToolDryRun] replay destructive-scan failed — assuming "
+                     "destructive (fail-closed)", exc_info=True)
+        _replay_destructive = True
+
+    gate_skip = _gate_skip_reason(tool, {}, config,
+                                  is_destructive_param=_replay_destructive)
+    if gate_skip:
+        verdict, reason = gate_skip
+        logger.info("[ToolDryRun] replay of '%s' auto-skipped: action gate "
+                    "scores this call %s (%s)", tool.name, verdict.upper(), reason)
+        # replayed_count=0 → success=False → the recalibrator rejects the bump
+        # and falls back to forking, identical to the existing net-skip path.
+        return _gate_skip_result(verdict, reason, params={}, t0=t0,
+                                 replayed_count=0)
 
     for idx, params in enumerate(history):
         sandboxed = _sandbox_paths(dict(params))
@@ -624,6 +684,26 @@ def _execute(
             install_mode=install_mode,
             approvals=approvals,
         )
+        # S1b — ``tool=`` is DELIBERATELY NOT threaded here. Read this before
+        # "fixing" it: passing it looks like the obvious way to gate the dry-run,
+        # and it is the wrong one.
+        #
+        # Threading it makes ``_maybe_gate_tool`` post a card and raise
+        # PendingOperatorDecision. The bare ``except Exception`` below would
+        # swallow that into a "sandbox crash" → dry_run_status="failed" → the
+        # tool is auto-disabled → the Governor's self-heal re-forges it → a
+        # re-forge loop, from a gate that was working correctly.
+        #
+        # Worse, the card would be structurally ORPHANED: the resume machinery
+        # resumes ACTIVITIES via run coords, and a forge-pipeline dry-run has no
+        # activity, so the card resolves nothing even with an operator sitting in
+        # front of it.
+        #
+        # ``_gate_skip_reason`` (called by both public entry points, before we
+        # ever get here) closes the same hole with zero new prompts, zero stall
+        # risk, and zero approval-state side effects — a dry-run that never
+        # enters ``_maybe_gate_tool`` can never spend an IMPL-2 reclassification
+        # or a one-shot approval meant for a real call.
         coro = sandbox.execute_tool(
             tool.implementation_path,
             params,
@@ -673,6 +753,220 @@ def _resolve_impl_path(tool: "Tool", config: "Config") -> Optional[Path]:
     return impl_path
 
 
+def _scan_source_effect_tags(tool: "Tool", config: Optional["Config"]) -> set:
+    """Deterministic ``classify_source`` scan of the tool's on-disk body.
+
+    The single derivation shared by :func:`_net_egress_skip_reason` and
+    :func:`_gate_skip_reason` so the two guards can never drift apart on what
+    "the source says this tool does" means. Returns an EMPTY set when the source
+    is missing / unreadable / unparseable — every caller treats empty as
+    UNDETERMINABLE and fails closed, so an empty return never silently ungates.
+    """
+    if config is None:
+        return set()
+    try:
+        from systemu.runtime.effect_tags import classify_source
+        impl_path = _resolve_impl_path(tool, config)
+        if impl_path is None or not impl_path.exists():
+            return set()
+        source = impl_path.read_text(encoding="utf-8", errors="replace")
+        return {t.value if hasattr(t, "value") else str(t)
+                for t in classify_source(source)}
+    except Exception:
+        logger.debug("[ToolDryRun] classify_source fallback failed", exc_info=True)
+        return set()
+
+
+def _gate_skip_reason(
+    tool: "Tool",
+    params: Dict[str, Any],
+    config: Optional["Config"] = None,
+    *,
+    is_destructive_param: Optional[bool] = None,
+) -> Optional[tuple]:
+    """S1b — auto-skip what the LIVE action gate would card, as scored from
+    DECLARED effect tags, or — for an UNTAGGED tool — from an ADVISORY source
+    scan that can UNDER-tag.
+
+    Not "anything the live gate would card": the untagged path deliberately
+    DIVERGES from the live gate (see below), and the source scan it substitutes
+    is name-matching, so a body reaching a sink through a non-literal receiver
+    scans clean and PROCEEDS.
+
+    Returns ``(verdict_str, reason)`` to SKIP, or ``None`` to proceed.
+
+    ── Why this exists ──────────────────────────────────────────────────────
+    ``_execute`` calls ``ToolSandbox.execute_tool`` WITHOUT ``tool=``, so the
+    live per-tool gate (``ToolSandbox._maybe_gate_tool``) short-circuits on its
+    ``if tool is None: return`` and the forged body runs UNGATED. Dry-runs fire
+    UNATTENDED (end-of-forge ``tool_forge.py:222``, the ``scheduler/jobs.py``
+    startup sweep, the tool reconciler, the tool recalibrator), so nothing else
+    is watching. This function re-scores the call the same way and refuses to
+    execute rather than gating — see the comment at the sandbox call in
+    ``_execute`` for why threading ``tool=`` is NOT the fix.
+
+    ── The two checks, in the LIVE order ────────────────────────────────────
+    ``ToolSandbox.execute_tool`` runs ``forged_network_denied`` (~:764) and THEN
+    ``_maybe_gate_tool`` (~:794). This mirrors that composite, in that order.
+
+    1. ``forged_network_denied`` — a STRUCTURAL re-scan of the source. This is
+       what closes the DECLARED-TAGS SPOOF: ``_net_egress_skip_reason`` trusts a
+       non-empty self-declared ``effect_tags`` and never scans when tags are
+       present (``vault_migrator`` PREFERS the declaration over the scan), so a
+       forged body declaring ``["local_read"]`` while importing ``urllib``
+       otherwise egresses during "dry run". The scan re-derives egress precisely
+       BECAUSE a declaration is declare-away-able.
+    2. ``evaluate_action`` over the SAME ``ActionContext`` ``_maybe_gate_tool``
+       builds (tool_sandbox.py:1073-1081). Any non-ALLOW verdict skips.
+       ``tests/test_dryrun_gate_skip.py`` (``TestParityWithLiveGate``) pins the
+       WIRING for DECLARED-tag inputs: it drives a NON-forged tool with NO
+       implementation file on disk over explicit tag sets, so scorer drift on
+       that path fails the test. What it does NOT cover: the untagged
+       source-fallback path below. With no impl file the fallback returns an
+       empty set, so the parametrised ``set()`` case scores UNKNOWN on both
+       sides and the scan is never exercised. Parity is pinned exactly where
+       the two agree; it is silent exactly where they diverge — which is also
+       where the residual gap lives.
+
+    ── NO approval state is consulted, in either direction ──────────────────
+    Deliberately no ``command_approvals`` / reclassification lookup. Auto-skip
+    means the dry-run never ENTERS ``_maybe_gate_tool``, so it can never spend an
+    IMPL-2 reclassification or a one-shot "Approve once" that the operator
+    granted for a real call. A dry-run must have zero approval-state side
+    effects. That also means a standing "Always allow" does NOT let a dry-run
+    execute — correct: an allow is authorisation for the operator's call, not a
+    licence for an unattended validation run.
+
+    ── The one deliberate divergence from ``_maybe_gate_tool`` ──────────────
+    When ``effect_tags`` is EMPTY we fall back to the ``classify_source`` scan,
+    whereas the live gate would score empty as UNKNOWN. This is required, not
+    cosmetic: ``tool_forge`` never stamps ``effect_tags`` (the vault_migrator
+    backfill is a once-per-version BOOT pass), and the forge dry-runs the tool
+    immediately at ``tool_forge.py:222`` — so EVERY freshly-forged tool has empty
+    tags at exactly this moment. Scoring those as UNKNOWN would skip every forge
+    dry-run, turning the whole validation gate into a no-op while leaving the
+    tools enable-able (``operator_verify=True``) — a validation loss whose
+    gating gain is CONDITIONAL, not free (see the caveat below).
+
+    ── What that fallback is, and is NOT ────────────────────────────────────
+    The fallback is an ADVISORY, NAME-MATCHING ``classify_source`` scan. It is
+    better-INFORMED than a bare UNKNOWN but strictly LESS SAFE, because the two
+    fail in opposite directions: UNKNOWN always SKIPS, whereas a scan that comes
+    back purely-local EXECUTES. For an untagged tool, a body whose only
+    RECOGNISED sinks are local WILL EXECUTE unattended — including when that
+    same body also reaches subprocess / os / the network through a receiver the
+    scan does not recognise by name. ``classify_source`` matches literal
+    receivers (``subprocess.run``, ``os.system``, ``requests.get``), so
+    ``import subprocess as sp; sp.run(...)`` — and the ordinary idiomatic
+    ``from subprocess import check_output`` / ``from os import system`` — scan
+    as purely-local and proceed.
+
+    ``_net_egress_skip_reason`` running first does NOT bound this. It bounds the
+    reachable VERDICTS (to ALLOW / REQUIRE_APPROVAL), not the reachable RISK: it
+    consumes the SAME under-tagging scan, so a body it reads as purely-local is
+    exactly the body that gets here and executes. The "bound" is vacuous for the
+    dominant case — a freshly-forged untagged tool. See
+    ``TestKnownGap_UntaggedSourceScanIsNameMatching`` in
+    ``tests/test_dryrun_gate_skip.py``, the strict-xfail ratchet that will
+    xpass — and force this docstring to be rewritten — when the classifier
+    learns alias resolution.
+
+    When declared tags ARE present the scan is never consulted and the context
+    is byte-identical to the live gate's.
+
+    ── Caveat on "the live gate cards it at first live call anyway" ─────────
+    That holds only while the tool's tags stay honest. ``vault_migrator``'s
+    once-per-version boot backfill PREFERS a self-authored
+    ``TOOL_META["effect_tags"]`` over the structural scan (vault_migrator.py
+    :231), flooring only ``money_move``. So after that backfill, a forged tool
+    that declared ``["local_read"]`` scores ALLOW at ``_maybe_gate_tool`` and is
+    NEVER carded. "The live gate catches it later" is a claim about tools whose
+    stamped tags reflect their body — not a guarantee that survives a
+    self-declaration.
+
+    ``is_destructive_param`` may be supplied by ``replay_against_history``, which
+    scores the union over its whole history rather than one params set.
+    """
+    try:
+        from systemu.runtime.action_governance import (
+            ActionContext, Verdict, evaluate_action, forged_network_denied)
+        from systemu.runtime.tool_sandbox import ToolSandbox
+
+        tool_name = getattr(tool, "name", "") or ""
+
+        # (1) The forged-network HARD-DENY, scanning the exact path _execute
+        #     would run — mirrors ToolSandbox.execute_tool:764.
+        denied = forged_network_denied(
+            tool, impl_path=_resolve_impl_path(tool, config) if config else None)
+        if denied:
+            return (Verdict.DENY.value, denied)
+
+        # (2) The action-governance ladder — mirrors _maybe_gate_tool:1073-1081.
+        declared = {str(t) for t in (getattr(tool, "effect_tags", None) or [])}
+        effect_tags = declared or _scan_source_effect_tags(tool, config)
+
+        if is_destructive_param is None:
+            is_destructive_param = ToolSandbox.is_destructive_call(
+                tool_name, params or {})
+
+        ctx = ActionContext(
+            tool=tool_name,
+            effect_tags=effect_tags,
+            is_destructive_param=bool(is_destructive_param),
+            target=None,
+            target_is_network=False,
+            classification_trusted=True,
+        )
+        verdict, reason = evaluate_action(ctx)
+        if verdict != Verdict.ALLOW:
+            return (verdict.value, reason)
+        return None
+    except Exception:
+        # FAIL CLOSED. An ambiguous path must skip, never execute: this runs
+        # unattended, so "we could not score it" is a reason to refuse, not a
+        # reason to proceed.
+        logger.debug("[ToolDryRun] gate scoring failed — skipping (fail-closed)",
+                     exc_info=True)
+        return ("deny", "action-gate scoring failed — refusing to execute an "
+                        "unscored body during an unattended dry-run (fail-closed)")
+
+
+def _gate_skip_result(
+    verdict: str, reason: str, *, params: Dict[str, Any], t0: float,
+    replayed_count: int = 0,
+) -> DryRunResult:
+    """The single skip shape shared by ``dry_run_tool`` and
+    ``replay_against_history`` so the two can never disagree.
+
+    ``operator_verify=True`` is DELIBERATE. It lets
+    ``tool_reconciler._complete_deferred_enables`` (:381) complete an operator's
+    already-approved "Enable & run" instead of parking the task forever: a
+    skipped tool is never "unsatisfiable", so without this the activity hangs —
+    the recurring stuck-task class.
+
+    The safety argument is ENABLEMENT IS NOT EXECUTION APPROVAL: S1b cards the
+    first live effectful call. That holds CONDITIONALLY, not unconditionally —
+    it depends on the tool's stamped ``effect_tags`` reflecting its body.
+    ``vault_migrator``'s once-per-version boot backfill PREFERS a self-authored
+    ``TOOL_META["effect_tags"]`` over the structural scan (vault_migrator.py
+    :231) and floors only ``money_move``, so a forged tool that declares
+    ``["local_read"]`` scores ALLOW at ``_maybe_gate_tool`` and is never carded.
+    Enabling such a tool is not backstopped by a later gate.
+    """
+    return DryRunResult(
+        success=False, status="skipped", operator_verify=True,
+        gate_verdict=verdict,
+        params_used=params,
+        skip_reason=(
+            f"live action gate would score this call {verdict.upper()} "
+            f"({reason}) — body not executed during unattended dry-run; "
+            f"validation happens at the first live call, which the gate cards"
+        ),
+        replayed_count=replayed_count,
+        elapsed_ms=_elapsed_ms(t0),
+    )
+
+
 def _net_egress_skip_reason(tool: "Tool", config: Optional["Config"] = None) -> Optional[str]:
     """Fail-closed egress guard: return a skip reason UNLESS the tool can be
     affirmatively proven non-egress, in which case return ``None`` (proceed).
@@ -683,25 +977,25 @@ def _net_egress_skip_reason(tool: "Tool", config: Optional["Config"] = None) -> 
     ONLY when that set is non-empty AND a subset of :data:`_SAFE_LOCAL_TAGS`
     (local_read/write/delete). Any other outcome — net verbs, ``shell_exec``,
     ``unknown``, or an EMPTY/undeterminable set (unreadable/unparseable source,
-    or an aliased import the AST scan misses) — SKIPS, so no unreviewed body can
-    egress under the "dry run" label. This mirrors the live S1 gate's
-    "empty ⇒ UNKNOWN ⇒ don't trust" stance.
+    or a source the AST scan reads as having NO recognised sink at all) — SKIPS.
+    This mirrors the live S1 gate's "empty ⇒ UNKNOWN ⇒ don't trust" stance.
+
+    LIMIT — this is fail-closed on what the scan SEES, not on what the body
+    DOES. An aliased or from-imported egress sink does NOT produce an empty set
+    and therefore does NOT skip: the scan simply does not tag it, so the body's
+    OTHER recognised sinks decide the verdict. ``import requests as r`` plus a
+    local ``Path(...).write_text(...)`` scans exactly ``{local_write}`` — purely
+    local, so it PROCEEDS and executes. The guard is a floor under DECLARED
+    tags and under obviously-net bodies; it is not a proof of non-egress. See
+    ``_gate_skip_reason``'s "What that fallback is, and is NOT" block.
     """
     try:
         tags = {str(t).strip().lower() for t in (tool.effect_tags or [])}
     except Exception:
         tags = set()
 
-    if not tags and config is not None:
-        try:
-            from systemu.runtime.effect_tags import classify_source
-            impl_path = _resolve_impl_path(tool, config)
-            if impl_path is not None and impl_path.exists():
-                source = impl_path.read_text(encoding="utf-8", errors="replace")
-                tags = {t.value if hasattr(t, "value") else str(t)
-                        for t in classify_source(source)}
-        except Exception:
-            logger.debug("[ToolDryRun] classify_source fallback failed", exc_info=True)
+    if not tags:
+        tags = _scan_source_effect_tags(tool, config)
 
     # PROCEED only when we can PROVE non-egress: non-empty and purely local.
     if tags and tags <= _SAFE_LOCAL_TAGS:

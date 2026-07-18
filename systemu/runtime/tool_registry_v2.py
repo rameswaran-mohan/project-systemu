@@ -90,6 +90,38 @@ class ToolRegistry:
         timeout_seconds: Optional[int] = None,
         dynamic_schema_overrides: Optional[Callable[[], Dict[str, Any]]] = None,
     ) -> None:
+        """Register one code-side tool entry.
+
+        ── The registration contract (a SECURITY boundary, not a convention) ──
+        Entries come from exactly two places, both of them curated:
+
+        * **Repo code at import time** — a module under ``systemu/runtime/tools/``
+          with a TOP-LEVEL ``registry.register(...)`` call, imported by
+          :meth:`discover_modules`' AST scan. There is no plugin path, no
+          config-driven registration, and no way for a FORGED tool to land here:
+          forged tools live in the v1 vault registry and are dispatched through
+          ``ToolSandbox.execute_tool``, which gates them via ``_maybe_gate_tool``.
+        * **The MCP bridge** — ``runtime/mcp/sdk/registry_bridge`` registers an
+          operator-connected server's tools under a namespaced prefix, with a
+          ``check_fn`` that fails closed when the tool is disabled or its lease
+          is revoked. Its handler funnels through the ``call_mcp_tool`` P0
+          chokepoint.
+
+        ``tests/test_v2_registry_boundary.py`` ENFORCES this rather than assuming
+        it: every registered handler must resolve to a ``systemu.`` module.
+
+        ── Gating obligation for effectful handlers ─────────────────────────
+        The v2 fast path in ``ToolSandbox.execute()`` (~:601-656) calls the
+        handler DIRECTLY — it does not route through ``execute_tool``, so
+        ``_maybe_gate_command`` / ``_maybe_gate_tool`` never see the call. Any v2
+        handler with effectful semantics (network mutation, message send, money
+        move, oauth, destructive local writes) MUST therefore gate INSIDE the
+        handler by raising ``PendingOperatorDecision`` — the chokepoint that
+        ``ToolSandbox.execute``'s ``except PendingOperatorDecision`` clause
+        (~:624-663) explicitly anticipates and re-raises so the worker/supervisor
+        park+resume machinery receives it. Swallowing it into a failure dict
+        would orphan the Inbox decision and silently continue with a denied tool.
+        """
         with self._lock:
             self._tools[name] = ToolEntry(
                 name=name, toolset=toolset, schema=schema, handler=handler,
