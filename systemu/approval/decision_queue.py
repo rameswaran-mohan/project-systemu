@@ -360,23 +360,7 @@ class OperatorDecisionQueue:
             decision_id, choice, decision.dedup_key,
         )
         self._record_resolution(decision)
-        # v0.8.22 (C): emit EventBus event so the chat UI hides the inline card.
-        # W5.3: self-describing (ts/level/message) — see post() note.
-        try:
-            from systemu.interface.event_bus import EventBus
-            EventBus.get().publish({
-                "ts": decision.resolved_at.isoformat(),
-                "level": "INFO",
-                "message": f"Resolved: {decision.title}",
-                "category": "operator_decision_resolved",
-                "context": {
-                    "decision_id": decision.id,
-                    "choice": choice,
-                    "chat_submission_id": (decision.context or {}).get("chat_submission_id"),
-                },
-            })
-        except Exception:
-            pass
+        self._publish_resolved(decision)
         return decision
 
     def resolve_with_context_patch(self, decision_id: str, *, choice: str,
@@ -411,6 +395,15 @@ class OperatorDecisionQueue:
         logger.info("[DecisionQueue] resolved+patched %s -> %r (keys=%s)",
                     decision_id, choice, sorted((context_patch or {}).keys()))
         self._record_resolution(decision)
+        # IMPL-2 (LOW): publish the SAME event ``resolve`` does. This path resolves a
+        # decision every bit as much as its sibling, but published nothing — so the
+        # in-process EventBus fast path (resume_on_decision's subscriber) never fired
+        # for it and every reclassify waited on the ~15s reconciler poll instead. Safe
+        # for the other caller (amend-then-approve): ``_dispatch_resume`` returns False
+        # for anything that is not a tool/command gate, an operator-attest card or a
+        # structured_question, and ``event_pusher`` drops this category outright, so no
+        # subscriber gains a new side effect.
+        self._publish_resolved(decision)
         return decision
 
     def consume_resolved_choice(self, dedup_key: str) -> Optional[str]:
@@ -428,6 +421,35 @@ class OperatorDecisionQueue:
         Returns the consumed choice string, or None if there was no resolved
         decision to consume. "Always allow" never reaches here — it persists in
         the CommandApprovalStore and is checked before the one-shot bypass.
+
+        IMPL-2: this is the CHOICE-ONLY view of :meth:`consume_resolved_decision`.
+        A caller that must establish WHICH CARD the choice came from — the tool gate,
+        while an operator reclassification is pending — cannot do it from a label and
+        calls the sibling instead. Kept as its own method so the callers that only ever
+        needed the label (MCP dispatch, the sampling gate, the command gate) are
+        byte-for-byte unchanged.
+        """
+        decision = self.consume_resolved_decision(dedup_key)
+        return decision.choice if decision is not None else None
+
+    def consume_resolved_decision(self, dedup_key: str) -> Optional[OperatorDecision]:
+        """Atomically read AND retire the newest RESOLVED decision for a dedup_key,
+        returning the DECISION — choice *and* context — rather than just the label.
+
+        IMPL-2 (adversarial review, CRITICAL). A gate dedup key is
+        params-INDEPENDENT (``tool:<sig>`` covers every call to one tool body), and a
+        resolved decision row is never retired by the ordinary approve→resume flow:
+        the dispatcher mints a ``resume_pending`` bridge, the run resumes through the
+        BRIDGE, and the row sits at ``status="resolved"`` indefinitely. So "the newest
+        non-deny choice on this dedup key" is NOT evidence that the operator approved
+        the call in front of the gate — it may be a leftover from an unrelated benign
+        call on the same signature. Deciding that needs the card's CONTEXT
+        (``reclassified`` / ``assigned_class`` / ``args_fingerprint``), which the
+        string return could not express.
+
+        Consumption semantics are identical to :meth:`consume_resolved_choice` (it is
+        implemented in terms of this method): single-use, fail-CLOSED if the retiring
+        save fails, newest-first by ``created_at``.
         """
         if not dedup_key:
             return None
@@ -474,7 +496,7 @@ class OperatorDecisionQueue:
                     "(dedup_key=%r) — re-gating to stay fail-closed.",
                     decision.id, dedup_key, exc_info=True)
                 return None
-            return choice
+            return decision
         return None
 
     def expire_by_dedup_key(self, dedup_key: str) -> bool:
@@ -514,6 +536,31 @@ class OperatorDecisionQueue:
         return True
 
     # ── Private helpers ──────────────────────────────────────────────
+
+    def _publish_resolved(self, decision: "OperatorDecision") -> None:
+        """v0.8.22 (C): emit the EventBus event so the chat UI hides the inline card and
+        the daemon's resume subscriber can re-dispatch a parked run without waiting for
+        the reconciler poll. W5.3: self-describing (ts/level/message) — see post().
+
+        ONE publisher for BOTH resolving paths (``resolve`` and
+        ``resolve_with_context_patch``), so a subscriber never has to care which one ran.
+        Best-effort: EventBus is optional and must never block a vault-saved resolution.
+        """
+        try:
+            from systemu.interface.event_bus import EventBus
+            EventBus.get().publish({
+                "ts": decision.resolved_at.isoformat() if decision.resolved_at else "",
+                "level": "INFO",
+                "message": f"Resolved: {decision.title}",
+                "category": "operator_decision_resolved",
+                "context": {
+                    "decision_id": decision.id,
+                    "choice": decision.choice,
+                    "chat_submission_id": (decision.context or {}).get("chat_submission_id"),
+                },
+            })
+        except Exception:
+            pass
 
     def _record_resolution(self, decision: "OperatorDecision") -> None:
         """S1b (PLAN-11): record a resolution against the approval-fatigue

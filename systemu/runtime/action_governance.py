@@ -209,7 +209,9 @@ class ActionContext(BaseModel):
 
     # A mistyped field name on a SECURITY context must be a loud error, not a silent
     # no-op that scores the call as though the signal were never supplied.
-    model_config = {"extra": "forbid"}
+    # ``validate_assignment`` because the gate SETS ``operator_assigned_class`` after
+    # construction — without it a wrong-typed value would reach the scorer unchecked.
+    model_config = {"extra": "forbid", "validate_assignment": True}
     args_preview: Dict[str, Any] = Field(default_factory=dict)
 
 

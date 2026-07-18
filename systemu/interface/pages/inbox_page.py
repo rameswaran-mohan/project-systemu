@@ -30,6 +30,57 @@ logger = logging.getLogger(__name__)
 _DESTRUCTIVE_RISKS = frozenset({"high"})
 
 
+# ─── IMPL-2: the reclassify panel (pure helpers) ──────────────────────────────
+#
+# A DENY card is a refusal, not a prompt — "Approve once" on it is a no-op by
+# design (no stored approval may satisfy the DENY band). The operator's real exit
+# is to assign the effect class the gate could not determine, under TYPED
+# confirmation, after which the gate re-arbitrates and posts a fresh card.
+#
+# The validation lives in these UI-free helpers so it is unit-testable without a
+# NiceGUI runtime (mirroring _inbox_card_model).
+
+def _reclassify_choices() -> List[str]:
+    """The effect classes an operator may assign, as the REAL tag values the store
+    and the governor accept — not display labels.
+
+    ``unknown`` is excluded: it is precisely the conjunct the DENY band keys on, so
+    "reclassify as unknown" would classify nothing. The store refuses it on write
+    too; this keeps it off the menu in the first place.
+    """
+    from systemu.runtime.effect_tags import EffectTag
+    return [t.value for t in EffectTag if t is not EffectTag.UNKNOWN]
+
+
+def _validate_reclassify(selected: str, typed: str):
+    """Pure: return ``(effect_class, "")`` when the operator may proceed, else
+    ``(None, reason)``.
+
+    The typed value must match the SELECTED class EXACTLY — no case-folding, no
+    whitespace forgiveness on the comparison. The point of a typed confirmation is
+    that the operator transcribes the specific thing they are asserting; accepting a
+    near-miss would turn it back into the second click it is meant not to be.
+    """
+    cls = (selected or "").strip()
+    if not cls:
+        return None, "Select an effect class first."
+    if cls not in _reclassify_choices():
+        return None, f"{cls!r} is not a known effect class."
+    if not typed:
+        return None, f"Type {cls} exactly to confirm."
+    if typed != cls:
+        return None, f"Typed value does not match — type {cls} exactly."
+    return cls, ""
+
+
+def _wants_reclassify_panel(dedup: str, options) -> bool:
+    """True iff this card should render the inline reclassify panel: a TOOL gate
+    (the effect vocabulary is the tool's; command/MCP gates are out of scope) whose
+    options actually carry the remedy."""
+    from systemu.interface.command.gate import RECLASSIFY_OPTION
+    return bool(dedup) and dedup.startswith("tool:") and RECLASSIFY_OPTION in (options or [])
+
+
 def _inbox_card_model(descriptor) -> Dict[str, Any]:
     """Pure model for one unified Inbox card (spec §4.3).
 
@@ -37,11 +88,26 @@ def _inbox_card_model(descriptor) -> Dict[str, Any]:
     what-Approve-does text and the highlighted safe-default. Kept UI-free so it
     is unit-testable without a NiceGUI runtime.
     """
+    from systemu.interface.command.gate import RECLASSIFY_OPTION
     options = list(getattr(descriptor, "options", []) or [])
     safe_default = getattr(descriptor, "safe_default", "") or (
         options[0] if options else "")
     # The affirmative (Approve-equivalent) option is the LAST option.
-    affirmative = options[-1] if options else ""
+    #
+    # IMPL-2: except that "Reclassify effect…" is not an affirmative — it runs nothing,
+    # it opens the assign-a-class panel, and the renderer draws it as a ghost. On a
+    # DENY card (["Deny", "Reclassify effect…"]) the naive options[-1] therefore named
+    # an option the renderer had already special-cased, leaving the card with NO
+    # primary/danger button and the styling decided in two places. A DENY card really
+    # has no affirmative action; say so rather than nominate one.
+    #
+    # The carve-out is deliberately confined to cards that carry the reclassify
+    # option, so no ordinary gate's affirmative can shift.
+    _candidates = [o for o in options if o != RECLASSIFY_OPTION]
+    if RECLASSIFY_OPTION in options and _candidates == [safe_default]:
+        affirmative = ""
+    else:
+        affirmative = _candidates[-1] if _candidates else ""
     risk = getattr(descriptor, "risk", "low")
     return {
         "title": getattr(descriptor, "title", ""),
@@ -228,16 +294,140 @@ def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None
                 button("Review & Forge", variant="primary", on_click=_open_review)
             return
 
+        # IMPL-2: a DENY tool card carries the reclassify remedy. It must NOT resolve
+        # on click like the other options — it opens an inline typed-confirm panel
+        # (rendered below the buttons) and resolves from there with the assigned class.
+        from systemu.interface.command.gate import RECLASSIFY_OPTION
+        show_reclassify = _wants_reclassify_panel(dedup, model["options"])
+        _panel_ref: Dict[str, Any] = {}
+
+        def _open_reclassify(_=None) -> None:
+            panel = _panel_ref.get("panel")
+            if panel is not None:
+                panel.set_visibility(True)
+
         # Action buttons: the affirmative (destructive→danger) + the safe-default
         # / Deny rendered as a ghost so the destructive choice is visually
         # distinct from the safe one.
         with ui.row().style("gap: 8px;"):
             for opt in model["options"]:
+                if show_reclassify and opt == RECLASSIFY_OPTION:
+                    # ghost: it runs nothing by itself, so it must not read as the
+                    # affirmative action even though it is the last option.
+                    button(opt, variant="ghost", on_click=_open_reclassify)
+                    continue
                 if opt == model["affirmative"]:
                     variant = "danger" if model["destructive"] else "primary"
                 else:
                     variant = "ghost"
                 button(opt, variant=variant, on_click=_resolve_with(opt))
+
+        if show_reclassify:
+            _panel_ref["panel"] = _render_reclassify_panel(
+                dec_id, vault=vault, on_resolved=on_resolved)
+
+
+def _reclassify_outcome_notice(dctx, cls: str):
+    """Pure: the (message, notify-type) the panel shows after a reclassify resolves.
+
+    The affirmative copy is only earned when the assignment will actually be RECORDED.
+    ``resume_on_decision._dispatch_resume`` returns False for a decision with no
+    ``chat_submission_id``, so outside the chat lane a reclassify writes nothing to the
+    approval store — yet the panel reported "Reclassified as <class>. …The task will
+    re-check this call on that classification and ask you to approve it" in green. The
+    operator was told a remedy had been applied when none had, and the suggested
+    recovery ("re-run the task") could not help either: there is no record to apply.
+
+    Pure + exported so the honest-reporting rule is unit-testable without a NiceGUI
+    runtime, like ``_validate_reclassify`` and ``_inbox_card_model``.
+    """
+    from systemu.runtime.resume_on_decision import reclassification_can_be_recorded
+    if reclassification_can_be_recorded(dctx):
+        return (
+            f"Reclassified as {cls}. Nothing has run. The task will re-check this "
+            "call on that classification and ask you to approve it — if it does "
+            "not resume on its own, re-run the task.",
+            "positive",
+        )
+    return (
+        f"Recorded your answer ({cls}) on this card, but NOTHING was applied: this "
+        "decision has no resumable run attached, so the assignment was not saved and "
+        "the call is still refused. Nothing has run. Re-run the task to be asked "
+        "again.",
+        "warning",
+    )
+
+
+def _render_reclassify_panel(dec_id: str, *, vault, on_resolved):
+    """The inline "assign the real effect class" panel (IMPL-2), hidden until the
+    operator opens it. Returns the panel element so the caller can reveal it.
+
+    Resolving goes through ``resolve_with_context_patch`` — NOT the generic
+    ``_resolve_and_execute_gate`` chain — because the patch (the assigned class) and
+    the resolution must land in ONE reload+save, and because a reclassify executes
+    nothing: it records a classification the gate re-arbitrates on, and the run then
+    posts a fresh approval card.
+    """
+    from systemu.interface.design.primitives import button
+    from systemu.interface.command.gate import RECLASSIFY_OPTION
+
+    choices = _reclassify_choices()
+    with ui.column().classes("s-card").style(
+        "margin-top: 8px; gap: 8px;"
+    ) as panel:
+        ui.label("ASSIGN THE REAL EFFECT CLASS").classes("s-field-label")
+        ui.label(
+            "systemu could not classify this effect and a high-severity signal "
+            "fired, so it refused to run it. Assign the class you know this call "
+            "really has. This runs nothing: the call is re-checked on the class you "
+            "assign and you are asked to approve it. The assignment is single-use, "
+            "applies only to this exact call, and expires if left unused."
+        ).classes("s-cell").style("white-space: pre-wrap; font-size: 13px;")
+        selector = ui.select(choices, value=choices[0] if choices else None,
+                             label="Effect class").classes("s-input")
+        confirm_input = ui.input(
+            label="Type the class value exactly to confirm").classes("s-input")
+
+        def _confirm(_=None) -> None:
+            cls, err = _validate_reclassify(
+                (selector.value or ""), (confirm_input.value or ""))
+            if cls is None:
+                ui.notify(err, type="warning")
+                return
+            try:
+                from systemu.approval.decision_queue import OperatorDecisionQueue
+                decision = OperatorDecisionQueue(vault).resolve_with_context_patch(
+                    dec_id, choice=RECLASSIFY_OPTION,
+                    context_patch={"assigned_class": cls, "typed_confirmed": True},
+                )
+            except Exception as exc:
+                logger.exception("[Inbox] reclassify failed for %s", dec_id)
+                ui.notify(f"Reclassify failed: {exc}", type="negative")
+                return
+            # Say only what is true. A card is posted automatically ONLY when the
+            # parked run had resume coords; the coords-less rescue records the
+            # assignment, stamps the decision dispatched, and deliberately resumes
+            # nothing (there is no run left to resume). Promising a card outright left
+            # the operator waiting for something that was never coming — and when the
+            # dispatcher cannot process this decision at all, the assignment is never
+            # even recorded, which _reclassify_outcome_notice reports honestly rather
+            # than dressing a no-op in a green toast.
+            message, kind = _reclassify_outcome_notice(
+                getattr(decision, "context", None), cls)
+            if kind != "positive":
+                logger.warning(
+                    "[Inbox] reclassify on %s resolved the card but the dispatcher "
+                    "cannot record it (no resumable run attached) — the operator was "
+                    "told so.", dec_id)
+            ui.notify(message, type=kind)
+            on_resolved()
+
+        with ui.row().style("gap: 8px;"):
+            button("Confirm reclassification", variant="primary", on_click=_confirm)
+            button("Cancel", variant="ghost",
+                   on_click=lambda _=None: panel.set_visibility(False))
+    panel.set_visibility(False)
+    return panel
 
 
 def _render_history_card(row: Dict[str, Any]) -> None:

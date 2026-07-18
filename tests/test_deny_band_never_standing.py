@@ -11,8 +11,23 @@ the verdict at park time, but the approval recorder read only the operator's CHO
 running the DENY-band tool UNGATED, permanently. Nothing pinned the negative.
 
 Defence in depth, both halves pinned here:
-  * the recorder refuses to persist a standing allow for a DENY verdict;
+  * the recorder refuses to persist ANY approval for a DENY verdict;
   * the card does not offer the option in the first place.
+
+IMPL-2 STRENGTHENED THE RECORDER RULE (adversarial review, CRITICAL). It used to
+DEGRADE a DENY-band approval to a single-use resume bridge, on the reasoning that the
+bridge is harmless because every bypass in ``tool_sandbox._maybe_gate_tool`` sits under
+``if verdict != Verdict.DENY``. That held only for as long as nothing could lift a DENY.
+IMPL-2's operator reclassification lifts exactly those params to REQUIRE_APPROVAL — at
+which point the degraded bridge becomes REDEEMABLE, and it is the one bypass left live
+under a pending reclassification. So "Approve once" on a DENY card, a documented no-op
+that an operator would naturally try first, silently minted a token that a later
+legitimate use of the remedy would cash: the destructive call ran with no card ever
+shown for the assigned classification.
+
+A DENY-band gate now records NOTHING — the rule the coords-less rescue already carried.
+The assertions below were tightened accordingly (``single_use == []``, not
+``== ["sig-1"]``); nothing here was relaxed.
 """
 from __future__ import annotations
 
@@ -30,7 +45,10 @@ class _Store:
     def approve(self, sig):
         self.standing.append(sig)
 
-    def mark_resume_approved(self, sig):
+    def mark_resume_approved(self, sig, *, for_reclassification=None):
+        # IMPL-2 added the scope kwarg (which reclassified card minted this bridge);
+        # the double has to carry it or a real call raises TypeError into the
+        # recorder's best-effort except and this file silently tests nothing.
         self.single_use.append(sig)
 
 
@@ -46,10 +64,13 @@ def _record(monkeypatch, *, verdict, choice):
 
 # ── the recorder half ────────────────────────────────────────────────────────
 
-def test_always_allow_on_a_deny_never_becomes_standing(monkeypatch):
+def test_always_allow_on_a_deny_records_nothing_at_all(monkeypatch):
     store = _record(monkeypatch, verdict="deny", choice="always allow")
     assert store.standing == [], "a DENY-band tool must never get a standing allow"
-    assert store.single_use == ["sig-1"], "it degrades to single-use, so the gate re-fires"
+    assert store.single_use == [], (
+        "nor a single-use bridge — IMPL-2's reclassification can LIFT a DENY on these "
+        "params, and the bridge is the one bypass live under a pending "
+        "reclassification, so a degraded one-shot is redeemable later")
 
 
 def test_always_allow_on_a_non_deny_is_still_standing(monkeypatch):
@@ -73,16 +94,33 @@ def test_deny_verdict_is_matched_case_insensitively(monkeypatch):
         assert store.standing == [], f"{v!r} must not persist"
 
 
-def test_approve_once_on_a_deny_is_single_use_not_standing(monkeypatch):
+def test_approve_once_on_a_deny_records_nothing(monkeypatch):
+    """THE REGRESSION PIN for the IMPL-2 adversarial finding. "Approve once" is the
+    natural first click on a refusal card and does nothing at the gate — but minting a
+    bridge for it left a token that a later reclassification could cash. The DENY card
+    no longer OFFERS the option (see ``test_a_deny_card_offers_no_approval_at_all``);
+    this is the recorder half, so no other surface can supply the choice and get one."""
     store = _record(monkeypatch, verdict="deny", choice="approve once")
-    assert store.standing == [] and store.single_use == ["sig-1"]
+    assert store.standing == [] and store.single_use == []
+
+
+def test_no_choice_whatsoever_persists_on_a_deny(monkeypatch):
+    for choice in ("approve", "approve once", "always allow", "trust for session", "yes"):
+        store = _record(monkeypatch, verdict="deny", choice=choice)
+        assert store.standing == [] and store.single_use == [], choice
 
 
 # ── the card half ────────────────────────────────────────────────────────────
 
-def test_a_deny_card_does_not_offer_always_allow():
+def test_a_deny_card_offers_no_approval_at_all():
+    """IMPL-2: neither a standing allow NOR "Approve once". Both are no-ops at the
+    gate, and offering the latter is what minted the stale, later-redeemable bridge.
+    What the card does offer is the reclassify remedy."""
+    from systemu.interface.command.gate import RECLASSIFY_OPTION
     d = GateDescriptor.from_tool(tool_name="t", sig="s", verdict="deny")
     assert "Always allow" not in d.options
+    assert "Approve once" not in d.options
+    assert d.options == ["Deny", RECLASSIFY_OPTION]
     assert d.options[0] == "Deny" and d.safe_default == "Deny"   # fail-closed default kept
     assert d.risk == "high"
 

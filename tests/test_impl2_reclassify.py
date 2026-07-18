@@ -221,3 +221,23 @@ def test_an_explicit_policy_denial_is_not_reclassifiable():
     # A policy denial is not an "we couldn't tell" problem, so the remedy must not apply.
     v, why = evaluate_action(_ctx(denied_by_policy=True, operator_assigned_class="local_read"))
     assert v == Verdict.DENY and "policy" in why
+
+
+def test_a_mask_verdict_would_not_run_ungated():
+    """MASK has no producer today, but it was listed in the gate's frictionless
+    early-return — the one branch there that RUNS a call. Listing an unreachable verdict
+    in a fail-open position is a latent hazard: the day it becomes producible, it runs
+    ungated. The gate now returns early only for ALLOW."""
+    import inspect
+    from systemu.runtime import tool_sandbox
+    src = inspect.getsource(tool_sandbox.ToolSandbox._maybe_gate_tool)
+    assert "Verdict.MASK)" not in src and "Verdict.MASK," not in src
+
+
+def test_the_security_context_validates_post_construction_assignment():
+    """The gate SETS operator_assigned_class after building the context, so assignment
+    must be validated too — extra="forbid" alone only covers construction."""
+    import pytest
+    ctx = ActionContext(tool="t", effect_tags=set())
+    with pytest.raises(Exception):
+        ctx.operator_assigned_class = 123        # not a str-or-None

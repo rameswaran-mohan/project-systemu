@@ -1855,12 +1855,36 @@ def decisions_mode(ctx, set_mode):
             + "). Most actions will run unattended.")
 
 
+def _reclassify_needs_the_inbox(choice: str) -> bool:
+    """True iff this choice is IMPL-2's "Reclassify effect…" remedy, which this CLI
+    cannot deliver.
+
+    Reclassifying is not a plain option pick: it assigns an effect class under a TYPED
+    confirmation and resolves through ``resolve_with_context_patch`` so the class rides
+    along in the decision context. ``decisions resolve`` has neither — it would resolve
+    the card with a bare label, the recorder would find no ``assigned_class`` and no
+    ``typed_confirmed`` and store nothing, and the re-run would re-DENY. Net effect: the
+    operator spends their one card and stays exactly where they were, which is the dead
+    end IMPL-2 removes. Refuse and point at the Inbox instead.
+    """
+    return str(choice or "").strip().lower().startswith("reclassify")
+
+
 @decisions_group.command("resolve")
 @click.argument("decision_id")
 @click.option("--choice", "-c", required=True, help="One of the decision's options.")
 @click.pass_context
 def decisions_resolve(ctx, decision_id: str, choice: str):
     """Resolve a pending decision with the operator's chosen option."""
+    if _reclassify_needs_the_inbox(choice):
+        console.print(
+            "[red]Not available here.[/red] Reclassifying an effect requires a typed "
+            "confirmation of the class you are assigning, which this command cannot "
+            "collect — resolving it here would record nothing and re-refuse the "
+            "action.\nOpen the dashboard [bold]Inbox[/bold] and use "
+            "'Reclassify effect…' on the card.")
+        ctx.exit(2)
+        return
     _, vault = _get_vault_and_config(ctx)
     from systemu.approval.decision_queue import OperatorDecisionQueue
     queue = OperatorDecisionQueue(vault)

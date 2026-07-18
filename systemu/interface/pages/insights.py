@@ -200,6 +200,32 @@ def sanitize_card_payload(card: dict) -> dict:
     return _json_safe(card)
 
 
+def _renderable_options(options):
+    """IMPL-2: drop options this renderer cannot actually deliver.
+
+    Returns ``(kept, suppressed)``.
+
+    ``render_decision_card`` draws every option as a plain button wired to
+    ``queue.resolve(id, choice=label)``. That is the wrong shape for
+    "Reclassify effect…": the remedy needs a panel (pick a class, transcribe it to
+    confirm) and resolves through ``resolve_with_context_patch`` with the assigned
+    class attached. Rendered here it would resolve the card, record NOTHING, and
+    re-DENY — the operator would see the remedy, use it, and land back in exactly the
+    dead end IMPL-2 exists to remove, on a surface that looks identical to the Inbox.
+
+    Suppressing it is the conservative half of the fix: the option simply is not
+    offered where it cannot work, and the card's own body already points at the Inbox.
+    Never returns an empty list — a decision card with no buttons is unresolvable.
+    """
+    from systemu.interface.command.gate import RECLASSIFY_OPTION
+    original = list(options or [])
+    kept = [o for o in original if o != RECLASSIFY_OPTION]
+    suppressed = len(kept) != len(original)
+    if not kept:
+        kept = ["Deny"]
+    return kept, suppressed
+
+
 def render_decision_card(card: dict, queue, on_resolved) -> None:
     """Render one OperatorDecision card with working resolve+dispatch buttons.
 
@@ -493,8 +519,20 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                 ui.button("Edit", on_click=lambda: _panel.set_visibility(True))
             return  # capability-gate branch handled — skip the flat-options loop
 
+        # IMPL-2: this renderer has no reclassify panel, so it must not offer the
+        # option — a click here would resolve (and burn) the card while recording
+        # nothing. Point the operator at the surface that can actually do it.
+        _opts, _suppressed = _renderable_options(card["options"])
+        if _suppressed:
+            # Token classes, not an inline f-string style — this file already carries
+            # 17 baselined inline-style violations and must not grow another.
+            ui.label(
+                "This action was refused because its effect could not be classified. "
+                "To assign the real effect class, open the Inbox — the reclassify "
+                "step needs a typed confirmation that this view cannot collect."
+            ).classes("s-muted s-cell")
         with ui.row().style("gap: 8px;"):
-            for opt in card["options"]:
+            for opt in _opts:
                 ui.button(
                     opt,
                     on_click=_make_handler(card["id"], card["dedup_key"], opt, queue),

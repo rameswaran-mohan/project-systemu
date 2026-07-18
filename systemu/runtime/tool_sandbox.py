@@ -94,6 +94,99 @@ def _inject_sandbox_kwargs(handler, params: Dict[str, Any], output_dir: str) -> 
 _FORCE_FLAG_RE = re.compile(r"--force(?![-\w])")
 
 
+def args_fingerprint(parameters: Any) -> str:
+    """A stable fingerprint of a tool call's PARAMETERS. Empty when it cannot be
+    computed (fail-closed — an empty fingerprint matches no stored record).
+
+    IMPL-2 (adversarial review, HIGH). ``tool_signature`` is params-INDEPENDENT (name
+    + body hash + effect tags + host class) while the DENY verdict is
+    params-DEPENDENT (``is_destructive_param``). An operator reclassification keyed on
+    the signature alone therefore applies to EVERY call to that tool body: reclassify
+    after a DENY on ``{"path": "/data/quarterly_report"}`` and the agent's next call
+    on ``{"path": "/etc/production_secrets"}`` is lifted too — and the card that posts
+    for it is byte-identical, because ``GateDescriptor.from_tool`` never receives
+    parameters. This fingerprint is what binds the record to the ONE call the
+    operator actually classified.
+
+    Deliberately hashed over the FULL parameters, not ``_small_args_preview``: the
+    preview truncates to 8 keys and 80 characters per value, so two calls differing
+    only past those bounds would share a fingerprint. ``sort_keys`` makes it
+    insensitive to dict ordering (an LLM re-emitting the same call with the keys in a
+    different order is the same call), and ``default=str`` keeps an exotic value from
+    raising.
+    """
+    import hashlib
+    import json as _json
+    try:
+        canon = _json.dumps(parameters, sort_keys=True, default=str)
+    except Exception:
+        logger.debug("[Sandbox] could not fingerprint call parameters", exc_info=True)
+        return ""
+    return hashlib.sha1(canon.encode("utf-8", "replace")).hexdigest()
+
+
+def _resolved_decision_is_the_follow_up(decision, *, pending_class: Optional[str],
+                                        fingerprint: str) -> bool:
+    """IMPL-2 SCOPE (adversarial review, CRITICAL): may this resolved decision satisfy
+    the gate for the call currently being scored?
+
+    With NO reclassification pending this is the historical, unscoped channel and the
+    answer is unconditionally yes — the caller has already established the choice is
+    non-deny, and the decision was consumed from THIS call's dedup key.
+
+    While a reclassification IS pending, the invariant is that the only thing which may
+    bypass the gate is evidence tied to the FOLLOW-UP CARD for THAT class and THOSE
+    parameters. The dedup key cannot supply that evidence: ``tool:<sig>`` is
+    params-INDEPENDENT, so every card this tool body ever posted shares it — and a
+    resolved row is never retired by the ordinary approve→resume flow (the dispatcher
+    mints a ``resume_pending`` bridge, the run resumes through the BRIDGE, and the row
+    stays ``resolved`` forever). ``quick_task._poll_command_choice`` then reads that
+    stale row with the NON-consuming ``get_resolved_choice``, returns instantly, and the
+    lane auto-retries with ``resolved_dedup`` set — so an "Approve once" granted for an
+    unrelated benign call arrives here as an approval for a DENY-band one, cashes the
+    operator's reclassification and runs it, with the follow-up card still pending.
+
+    Three conditions, each fail-closed, mirroring ``consume_resume_approved``'s scope
+    match and ``_reclassification_applies``' params binding:
+
+    * ``reclassified is True`` — the card was posted UNDER a classification at all;
+    * ``assigned_class`` equals the class this call is being scored under. A decision
+      about ``net_mutate`` is not a decision about ``local_write``;
+    * ``args_fingerprint`` equals this call's. An ABSENT fingerprint on either side
+      matches NOTHING — there is deliberately no "both empty, therefore equal" case,
+      because ``GateDescriptor.from_tool`` never receives parameters and two different
+      calls on one signature render byte-identical cards.
+
+    HONEST NOTE on the fingerprint terms' coverage. The load-bearing case is BOTH sides
+    empty (``"" == ""`` would otherwise be a match), and it is pinned — remove the
+    emptiness test and ``test_the_predicate_refuses_an_empty_fingerprint_on_either_side``
+    fails. The two ``bool(...)`` calls are individually REDUNDANT, though: dropping
+    either one alone is behaviour-equivalent, because a non-empty value never equals an
+    empty one. No test can distinguish those two mutations (checked), so they are not
+    claimed as pinned. The symmetric form is kept deliberately to mirror
+    ``CommandApprovalStore._reclassification_applies``, which expresses the same params
+    binding the same way — a reader comparing the two scope checks should see one shape,
+    not two.
+
+    Reachability, stated plainly: the gate can never actually reach this function with
+    an empty ``fingerprint``, because ``pending_class`` is only set when
+    ``peek_reclassified`` matched, which itself requires a non-empty fingerprint on both
+    sides. That is why the emptiness test is pinned at this function's own boundary
+    rather than through the gate — an integration test asserting it would be passing for
+    a reason unrelated to the guard.
+    """
+    if not pending_class:
+        return True
+    ctx = getattr(decision, "context", None) or {}
+    if ctx.get("reclassified") is not True:
+        return False
+    if str(ctx.get("assigned_class") or "").strip() != pending_class:
+        return False
+    stored_fp = str(ctx.get("args_fingerprint") or "")
+    want_fp = str(fingerprint or "")
+    return bool(stored_fp) and bool(want_fp) and stored_fp == want_fp
+
+
 def _small_args_preview(parameters: Any, *, max_keys: int = 8, max_len: int = 80) -> Dict[str, Any]:
     """A small, bounded args preview for the ActionContext (S1b tool gate).
 
@@ -966,6 +1059,17 @@ class ToolSandbox:
         sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
                              effect_tags, host_class=host_class)
 
+        # Resolve the approval store (fail-closed: no store → still gate). Resolved
+        # BEFORE scoring because IMPL-2's operator reclassification is an INPUT to
+        # evaluate_action, not a post-hoc bypass of it.
+        from systemu.runtime.command_approvals import init_default_store
+        store = self._command_approvals
+        if store is None:
+            try:
+                store = init_default_store(Path("data"))
+            except Exception:
+                store = None
+
         ctx = ActionContext(
             tool=getattr(tool, "name", tool_name),
             effect_tags=effect_tags,
@@ -975,19 +1079,55 @@ class ToolSandbox:
             classification_trusted=True,
             args_preview=_small_args_preview(parameters),
         )
+
+        # IMPL-2: a pending operator reclassification (assigned under typed confirm on
+        # the DENY card, recorded single-use by resume_on_decision) re-enters the
+        # scoring ladder here. It is ADDITIVE and defeats only the UNKNOWN conjunct —
+        # see action_governance._effective_tags — so a DENY becomes an approvable card
+        # rather than a dead end, and can never become an ALLOW.
+        #
+        # The record is scoped to the CALL, not just the tool signature: ``fingerprint``
+        # binds it to the exact parameters the operator classified, so a substituted
+        # call on the same signature falls back to a fresh DENY (see args_fingerprint).
+        fingerprint = args_fingerprint(parameters)
+        pending_class = None
+        if store is not None:
+            try:
+                pending_class = store.peek_reclassified(
+                    sig, args_fingerprint=fingerprint)
+            except Exception:
+                logger.debug("[Sandbox] could not read reclassification; scoring "
+                             "without it (fail-closed)", exc_info=True)
+                pending_class = None
+        if pending_class:
+            ctx.operator_assigned_class = pending_class
+            logger.info("[Sandbox] tool %s scored under operator reclassification %s",
+                        getattr(tool, "name", tool_name), pending_class)
+
         verdict, reason = evaluate_action(ctx)
 
-        if verdict in (Verdict.ALLOW, Verdict.MASK):
-            return  # frictionless majority — run unchanged
+        def _spend_reclassification() -> None:
+            """Single-use: a reclassification is spent by the call it authorised, so
+            the very next identical call is scored from scratch (and DENYs again).
+            Called on EVERY path that lets the call RUN while one is pending."""
+            if pending_class and store is not None:
+                try:
+                    store.consume_reclassified(sig, args_fingerprint=fingerprint)
+                except Exception:
+                    logger.debug("[Sandbox] could not consume reclassification",
+                                 exc_info=True)
 
-        # Resolve the approval store (fail-closed: no store → still gate).
-        from systemu.runtime.command_approvals import init_default_store
-        store = self._command_approvals
-        if store is None:
-            try:
-                store = init_default_store(Path("data"))
-            except Exception:
-                store = None
+        # MASK is deliberately NOT in this tuple. ``evaluate_action`` has no MASK
+        # producer today, so listing it changed nothing — but it is the one branch here
+        # that would run a call ungated, so if MASK ever became producible it would fail
+        # OPEN. Omitted, a MASK verdict falls through to the gate below and cards.
+        if verdict == Verdict.ALLOW:
+            # Defensive: the IMPL-2 floor makes ALLOW unreachable while a
+            # reclassification is pending (action_governance floors it to
+            # REQUIRE_APPROVAL). If a future scoring change ever reopens this path,
+            # the one-shot is still spent rather than left standing.
+            _spend_reclassification()
+            return  # frictionless majority — run unchanged
         # IMPL-1 — NO persisted approval of any kind may satisfy the DENY band.
         #
         # This check MUST precede every short-circuit below. The tool signature is
@@ -1001,19 +1141,73 @@ class ToolSandbox:
         # own. Only the CONSUMPTION side can express "no stored approval covers this
         # band". A DENY always posts.
         if verdict != Verdict.DENY:
-            if store is not None and store.is_approved(sig):
+            # IMPL-2 — while a reclassification is PENDING, a STANDING allow does not
+            # apply. The allow was granted in the benign era of this params-independent
+            # signature; the call in front of us is one the gate just DENY-floored and
+            # the operator has just assigned a class to. Honouring the old allow would
+            # run it with the operator never having seen a card on the NEW
+            # classification — the remedy would silently become a bypass. The honest
+            # follow-up card must post at least once. (The standing allow is left
+            # intact; it resumes covering ordinary calls once the one-shot is spent.)
+            if store is not None and not pending_class and store.is_approved(sig):
                 return  # "Always allow" on record → run
             # One-shot resume-approval (park→resume bridge): honored exactly once.
-            if store is not None and store.consume_resume_approved(sig):
+            # This is the WORKFLOW-lane bypass under a pending reclassification — and it
+            # applies ONLY when the bridge is the follow-up card's own "Approve once",
+            # i.e. the operator's decision on THIS classification. (The chat lane has its
+            # own channel, the resolved-dedup decision below, scope-bound the same way.
+            # An earlier revision of this comment claimed the bridge was the ONE
+            # surviving bypass; that belief is exactly why the sibling below shipped
+            # unscoped. Two lanes, two channels, one scope rule.)
+            #
+            # ``for_reclassification`` is what makes that true (adversarial review,
+            # CRITICAL). The bridge is keyed on the params-independent signature, so
+            # before scoping, ANY unconsumed bridge satisfied this check — including one
+            # minted by an "Approve once" click on the DENY card itself (a documented
+            # no-op at the gate that the recorder nonetheless honoured), or one left
+            # behind by a run that crashed before re-entry. Either would have cashed the
+            # reclassification and run the call with no card ever shown for the assigned
+            # classification. The scope check refuses those, in both directions: an
+            # unscoped bridge cannot redeem a reclassified call, and a scoped bridge
+            # cannot redeem an ordinary one.
+            if store is not None and store.consume_resume_approved(
+                    sig, for_reclassification=pending_class):
+                _spend_reclassification()
                 return
             # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
             # exact decision with a non-Deny choice; honor once without persisting.
+            #
+            # This is the SECOND bypass that survives a pending reclassification, and —
+            # unlike the bridge above — it is the one the CHAT LANE actually travels:
+            # ``quick_task._execute_tool`` polls for the card's resolution and re-calls
+            # with ``resolved_dedup`` set. The scoped bridge is minted by a different
+            # actor (the resume dispatcher) and a lane with no resumable run never mints
+            # one at all, so this channel cannot simply be closed while a
+            # reclassification is pending — it has to be SCOPED, exactly like the bridge.
             dedup = f"tool:{sig}"
             if resolved_dedup and resolved_dedup == dedup:
                 try:
                     from systemu.approval.decision_queue import OperatorDecisionQueue
-                    choice = OperatorDecisionQueue(self._vault).consume_resolved_choice(dedup)
-                    if choice is not None and (choice or "").strip().lower() != "deny":
+                    # The DECISION, not just its label: "the newest non-deny choice on
+                    # this dedup key" is not evidence about THIS call (see
+                    # _resolved_decision_is_the_follow_up), and a label cannot say which
+                    # card it came from.
+                    decision = OperatorDecisionQueue(
+                        self._vault).consume_resolved_decision(dedup)
+                    choice = getattr(decision, "choice", None)
+                    norm = (choice or "").strip().lower()
+                    # IMPL-2 — a RECLASSIFY resolution is not an approval. It shares this
+                    # dedup key with the approval choices, so reading it as "not Deny,
+                    # therefore approved" would let the reclassify click itself run the
+                    # call and no follow-up card would ever post. Fall through to
+                    # re-gate. The choice is still CONSUMED above, which is what retires
+                    # the stale decision so the fresh card can be posted.
+                    if (choice is not None and norm != "deny"
+                            and not norm.startswith("reclassify")
+                            and _resolved_decision_is_the_follow_up(
+                                decision, pending_class=pending_class,
+                                fingerprint=fingerprint)):
+                        _spend_reclassification()
                         return
                 except Exception:
                     logger.debug("[Sandbox] tool-gate approve-once bypass check failed; "
@@ -1031,6 +1225,16 @@ class ToolSandbox:
             verdict=getattr(verdict, "value", str(verdict)),
             reason=reason,
             effect_tags=effect_tags,
+            # IMPL-2: the FOLLOW-UP card — offers Deny / Approve once only (no standing
+            # allow under a one-shot classification, no second reclassify).
+            reclassified=bool(pending_class),
+            assigned_class=pending_class or "",
+            # IMPL-2 (adversarial review, HIGH): the card must disclose WHICH call it
+            # is. Two different calls share one tool signature, so without the args a
+            # substituted call renders a card byte-identical to the one the operator
+            # expects — nothing on the surface would let them notice the swap. Bounded
+            # by _small_args_preview (8 keys / 80 chars) and secret-masked upstream.
+            args_preview=ctx.args_preview,
         )
         # D3: stamp the signature (+ tool name) so the resume path reads it back;
         # carry the run's resume coords so a PARKED tool gate is resumable.
@@ -1048,10 +1252,29 @@ class ToolSandbox:
             "tool_signature": sig,
             "tool_name": getattr(tool, "name", tool_name),
             "tool_id": getattr(tool, "id", "") or "",
+            # NOTE: the verdict stamped here is the verdict AS SCORED — i.e. the NEW
+            # one when a reclassification was applied. That is what the recorder and
+            # the remote classifier must reason about, not the original DENY.
             "verdict": getattr(verdict, "value", str(verdict)),
             "effect_tags": sorted(effect_tags),
             "destructive": ctx.is_destructive_param,
         }
+        # IMPL-2: the fingerprint of the CALL this card is about. ``_record_reclassify``
+        # reads it back and scopes the record to it, so the operator's assignment binds
+        # to the parameters they were shown and cannot be spent by a substituted call
+        # on the same (params-independent) signature.
+        if fingerprint:
+            _resume_extras["args_fingerprint"] = fingerprint
+        if pending_class:
+            # IMPL-2 follow-up card. ``reclassified`` makes _record_gate_approval refuse
+            # a standing allow (defence in depth — the card does not offer one) and
+            # SCOPE the single-use bridge it mints to this classification, and
+            # ``requires_typed_confirm`` makes decision_bridge.classify_resolution FLOOR
+            # this card: an effect that was once DENY-floored must never become a
+            # one-tap remote approval, and the remote lane has no reclassify surface.
+            _resume_extras["reclassified"] = True
+            _resume_extras["assigned_class"] = pending_class
+            _resume_extras["requires_typed_confirm"] = True
         try:
             from systemu.runtime.chat_submission_ctx import (
                 current_activity_id, current_chat_submission_id,
@@ -1085,9 +1308,13 @@ class ToolSandbox:
             decision_id=dec_id,
             dedup_key=descriptor.dedup,
             options=descriptor.options,
-            message=(f"Operator approval required to run tool `{getattr(tool, 'name', tool_name)}`. "
-                     "Open the dashboard Inbox and choose Deny / Approve once "
-                     "/ Always allow."),
+            # Name the options this card ACTUALLY offers. The hardcoded
+            # "Deny / Approve once / Always allow" was already wrong for a DENY card
+            # (no standing allow) and is now wrong twice over: a DENY card offers no
+            # "Approve once" either, and it does offer the reclassify remedy.
+            message=(f"Operator approval required to run tool "
+                     f"`{getattr(tool, 'name', tool_name)}`. Open the dashboard Inbox "
+                     f"and choose {' / '.join(descriptor.options)}."),
         )
 
     def _tool_body_hash(self, tool) -> str:

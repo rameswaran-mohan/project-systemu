@@ -104,10 +104,16 @@ _FLOOR_EFFECT_TAGS = frozenset({
 # is applied automatically (no operator choice).
 _REMOTE_VERDICTS = frozenset({"grant", "require_approval", "allow"})
 
-# Keys a caller MAY set to force a typed-confirmation floor. No caller sets one
-# today (the DENY typed-confirm is unbuilt and the amend band-increase confirm
-# is derived live at dashboard resolve time — see the module tests), but we
-# honor them defensively so a future persisted marker fails closed.
+# Keys a caller MAY set to force a typed-confirmation floor.
+#
+# IMPL-2: ``tool_sandbox._maybe_gate_tool`` now sets ``requires_typed_confirm`` on every
+# operator-RECLASSIFIED follow-up card, so this is live, not merely defensive. (It was
+# accurate when written — the DENY typed-confirm was unbuilt then, and the amend
+# band-increase confirm is still derived live at dashboard resolve time rather than
+# persisted.) The floor it produces is the point: an effect the governor once
+# DENY-floored must never become a one-tap remote approval, and the remote lane has no
+# reclassify surface to offer instead. The remaining keys stay honored defensively so a
+# future persisted marker fails closed.
 _TYPED_CONFIRM_KEYS = ("requires_typed_confirm", "typed_confirm",
                        "require_typed_confirm")
 

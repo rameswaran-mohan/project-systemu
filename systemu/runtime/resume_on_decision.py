@@ -145,8 +145,24 @@ def _dispatch_resume(decision, *, vault, supervisor,
             # fall through to the single-use bridge — creating exactly the dangling,
             # params-independent one-shot this branch refuses to create, and creating it
             # only for the most dangerous band. A DENY simply re-asks on re-run.
+            # IMPL-2: a RECLASSIFY records nothing here either, for the same reason —
+            # a reclassification is a params-INDEPENDENT single-use record, so with no
+            # run to consume it within seconds it would sit in the store until some
+            # LATER, unrelated call to this tool signature spent it. That call would be
+            # re-arbitrated on a class the operator assigned to a different set of
+            # parameters. A manual re-run simply re-asks, which is the correct
+            # semantics for a parked instance that no longer exists.
             _v = str(dctx.get("verdict") or "").strip().lower()
-            if is_tool_gate and choice == "always allow" and _v != "deny":
+            _is_reclass = is_tool_gate and choice.startswith("reclassify")
+            _standing = (is_tool_gate and choice == "always allow" and _v != "deny")
+            # The reclassify exclusion is UNREACHABLE by construction today, and is kept
+            # deliberately: a reclassify is never "always allow", and only ever arrives
+            # from a DENY card, so either condition above already refuses it. No test
+            # can drive this term (mutation-checked — the coords-less test passes
+            # without it), so it is documentation, not a pinned guard: it exists so that
+            # loosening the standing-allow rule later cannot silently start minting
+            # dangling reclassification records here.
+            if _standing and not _is_reclass:
                 _record_gate_approval(dctx, is_tool_gate=True, choice=choice)
             _stamp_dispatched(decision, vault)
             _handled.add(decision.id)
@@ -164,6 +180,11 @@ def _dispatch_resume(decision, *, vault, supervisor,
         )
         return False
 
+    # IMPL-2: "Reclassify effect…" is neither an approval nor a denial. It assigns an
+    # effect class the gate re-arbitrates on, so it takes its own branch below — and
+    # is EXCLUDED from the ordinary non-deny path, which would mint an approval bridge.
+    is_reclassify = is_tool_gate and choice.startswith("reclassify")
+
     if is_gate:
         if choice in ("deny", ""):
             # Operator denied a REQUIRED command/tool → the task can't proceed; mark
@@ -179,17 +200,36 @@ def _dispatch_resume(decision, *, vault, supervisor,
                     vault.save_activity(act)
             except Exception:
                 logger.debug("[ResumeOnDecision] gate-deny finalize failed", exc_info=True)
+            # IMPL-2: a DENIED follow-up card must leave NO dangling reclassification.
+            # The record is single-use but not self-expiring, so without this the class
+            # the operator just refused to approve would still be sitting in the store,
+            # ready to re-arbitrate the NEXT call to this signature — one the operator
+            # never saw. Unconditional (not just on a reclassified card): a plain deny
+            # of a signature that happens to carry a stale record clears it too.
+            _clear_reclassification(dctx)
             _stamp_dispatched(decision, vault)
             logger.info("[ResumeOnDecision] %s gate DENIED for activity %s — finalized",
                         gate_type, activity_id)
             return True
-        # S1b (Task 4) / v0.9.52: record the operator's approval to the
-        # CommandApprovalStore. Tool gate: "Always allow" → STANDING allow-list,
-        # anything else non-deny → SINGLE-USE resume bridge. Command gate: always a
-        # SINGLE-USE bridge (byte-for-byte the v0.9.52 behaviour). Extracted into
-        # _record_gate_approval so the missing-coords rescue above records the SAME
-        # approval — the ONLY place a tool-gate "Always allow" becomes a standing entry.
-        _record_gate_approval(dctx, is_tool_gate=is_tool_gate, choice=choice)
+        if is_reclassify:
+            # Record the single-use class assignment and fall through to the resume
+            # submit. Deliberately NO _record_gate_approval: a reclassify must never
+            # mint an approval bridge of any kind. A standing allow would cover the
+            # params-independent signature forever; a single-use bridge would let the
+            # re-run BYPASS the gate, so the operator would have assigned a class and
+            # run the call without ever seeing what that class scores to. The remedy's
+            # whole point is that the re-run posts an HONEST card on the new
+            # classification — the operator approves THAT, or denies it.
+            _record_reclassification(dctx)
+        else:
+            # S1b (Task 4) / v0.9.52: record the operator's approval to the
+            # CommandApprovalStore. Tool gate: "Always allow" → STANDING allow-list,
+            # anything else non-deny → SINGLE-USE resume bridge. Command gate: always a
+            # SINGLE-USE bridge (byte-for-byte the v0.9.52 behaviour). Extracted into
+            # _record_gate_approval so the missing-coords rescue above records the SAME
+            # approval — the ONLY place a tool-gate "Always allow" becomes a standing
+            # entry.
+            _record_gate_approval(dctx, is_tool_gate=is_tool_gate, choice=choice)
     elif is_attest:
         # R-A13 Stage-3a: stash the operator's attest CHOICE + the enqueue-time effect
         # classification (a JSON payload the resume-start applier peels) so the applier
@@ -242,6 +282,140 @@ def _dispatch_resume(decision, *, vault, supervisor,
     return True
 
 
+def reclassification_can_be_recorded(dctx) -> bool:
+    """Will ``_dispatch_resume`` be able to reach ``_record_reclassification`` for a
+    decision carrying this context?
+
+    The Inbox panel asks BEFORE claiming the remedy worked. ``_dispatch_resume`` returns
+    False for a decision with no ``chat_submission_id`` — the resume machinery is
+    single-lane — so outside the chat lane a reclassify records NOTHING, and the panel
+    nonetheless notified "Reclassified as <class>. The task will re-check this call…" in
+    green. Nothing had been written; re-running did not help, because there was no
+    record to apply. The single-lane limitation is pre-existing and out of scope; the
+    affirmative claim about it was the defect.
+
+    This mirrors the early-return ladder in ``_dispatch_resume`` and is deliberately
+    NARROW: it reports only the STATICALLY decidable refusals. A True answer is "nothing
+    known will stop this", not a guarantee — the coords-less rescue can still decline to
+    record (it refuses a reclassify by design, since a dangling params-independent
+    one-shot could later be spent by an unrelated call), and that depends on a snapshot
+    this function cannot see. False, however, is certain: the dispatcher will not record.
+    """
+    d = dctx or {}
+    if d.get("kind") != "gate" or d.get("gate_type") != "tool":
+        return False        # reclassification is a TOOL-gate remedy
+    if not d.get("chat_submission_id"):
+        return False        # THE reported case: the dispatcher returns False here
+    if d.get("resume_dispatched"):
+        return False        # already handled; this decision will not be processed again
+    if not d.get("execution_id"):
+        return False        # no run to resume, and the reclassify branch is never reached
+    return True
+
+
+def _reclassify_store():
+    """The CommandApprovalStore the reclassification records live in, or None.
+    Best-effort; never raises (mirrors _record_gate_approval)."""
+    try:
+        from pathlib import Path as _P
+        from systemu.runtime.command_approvals import init_default_store
+        return init_default_store(_P("data"))
+    except Exception:
+        logger.debug("[ResumeOnDecision] could not open the approval store",
+                     exc_info=True)
+        return None
+
+
+def _record_reclassification(dctx) -> Optional[str]:
+    """IMPL-2: persist the operator's SINGLE-USE effect-class assignment for a tool
+    signature. Returns the recorded class, or None when nothing was recorded.
+
+    Four preconditions, each fail-closed (recording nothing means the resumed run
+    re-DENYs and posts a fresh card — never that something runs):
+
+    * a tool signature, READ BACK from the context (stamped by the gate at park
+      time), never recomputed here;
+    * the TYPED CONFIRMATION gesture. ``inbox_page`` stamps ``typed_confirmed`` when
+      the operator transcribes the class they are asserting, but until this check it
+      was written and never read: the validation lived only in the UI, while
+      ``resolve_with_context_patch`` is a public API with no notion of caller. The
+      gesture the whole remedy is predicated on has to be enforced where the record
+      is made, not where the button is drawn;
+    * an ARGS FINGERPRINT of the call the operator was looking at. The signature is
+      params-INDEPENDENT and the DENY verdict is params-DEPENDENT, so an unscoped
+      record would re-arbitrate any call on the tool body;
+    * a class that validates through ``effect_tags.coerce``. An unrecognised value
+      classifies NOTHING, so storing it would hold a "reclassification" that strips
+      the UNKNOWN conjunct and puts nothing in its place.
+
+    Recording also CLEARS any outstanding one-shot resume bridge on the signature.
+    The gate's arbitration is about to change; no bridge minted before that change
+    can be a decision about the call the change produces, so leaving one standing
+    would let it be cashed by the lifted verdict. Belt and braces with the DENY-band
+    rule in ``_record_gate_approval`` (which is why no such bridge should exist) and
+    the bridge SCOPE check in ``consume_resume_approved``.
+
+    Best-effort; never raises."""
+    try:
+        sig = dctx.get("tool_signature")
+        if not sig:
+            logger.info("[ResumeOnDecision] reclassify with no tool_signature "
+                        "— recording nothing")
+            return None
+        if not dctx.get("typed_confirmed"):
+            logger.warning(
+                "[ResumeOnDecision] reclassify for %s arrived without the typed "
+                "confirmation — recording nothing; the run will re-gate. (A "
+                "reclassification is only meaningful when the operator transcribed "
+                "the class they are asserting.)", sig)
+            return None
+        fingerprint = str(dctx.get("args_fingerprint") or "").strip()
+        if not fingerprint:
+            logger.warning(
+                "[ResumeOnDecision] reclassify for %s carried no args fingerprint "
+                "— recording nothing. An unscoped record would re-arbitrate every "
+                "call to this tool body, not the one the operator classified.", sig)
+            return None
+        from systemu.runtime.effect_tags import EffectTag, coerce
+        cls = coerce(dctx.get("assigned_class"))
+        if cls == EffectTag.UNKNOWN.value:
+            logger.warning(
+                "[ResumeOnDecision] reclassify for %s carried no usable effect class "
+                "(%r) — recording nothing; the run will re-gate",
+                sig, dctx.get("assigned_class"))
+            return None
+        store = _reclassify_store()
+        if store is None:
+            return None
+        if store.clear_resume_approved(sig):
+            logger.warning(
+                "[ResumeOnDecision] cleared a stale resume bridge on %s before "
+                "recording a reclassification — it was minted under a different "
+                "arbitration and must not be redeemable by the lifted verdict", sig)
+        return (cls if store.mark_reclassified(sig, cls,
+                                               args_fingerprint=fingerprint)
+                else None)
+    except Exception:
+        logger.debug("[ResumeOnDecision] could not record reclassification",
+                     exc_info=True)
+        return None
+
+
+def _clear_reclassification(dctx) -> None:
+    """Drop any pending reclassification for this gate's tool signature (the operator
+    denied the follow-up card). Best-effort; never raises."""
+    try:
+        sig = dctx.get("tool_signature")
+        if not sig:
+            return
+        store = _reclassify_store()
+        if store is not None:
+            store.clear_reclassified(sig)
+    except Exception:
+        logger.debug("[ResumeOnDecision] could not clear reclassification",
+                     exc_info=True)
+
+
 def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
     """Persist a resolved tool/command gate approval to the CommandApprovalStore.
 
@@ -275,15 +449,68 @@ def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
             # re-open the hole for any caller that stamps the enum rather than its value.
             raw = dctx.get("verdict")
             verdict = str(getattr(raw, "value", raw) or "").strip().lower()
+            # IMPL-2 ROOT-CAUSE FIX (adversarial review, CRITICAL): a DENY-band gate
+            # records NOTHING here — not a standing allow, and not a single-use bridge.
+            #
+            # "Approve once" on a DENY card is a no-op AT THE GATE: every bypass in
+            # ``tool_sandbox._maybe_gate_tool`` sits under ``if verdict != Verdict.DENY``.
+            # But this recorder was not band-aware — it fell through to the else-branch
+            # and minted ``resume_pending[sig]`` anyway. That was inert only for as long
+            # as DENY skipped every bypass. IMPL-2 lifts those same params to
+            # REQUIRE_APPROVAL, at which point the stale bridge becomes REDEEMABLE — and
+            # the bridge is the one bypass deliberately left live under a pending
+            # reclassification. The result was: DENY card → "Approve once" (a natural
+            # first move, documented as doing nothing) → reclassify → the re-run cashes
+            # the bridge from step two, spends the reclassification, and executes the
+            # destructive call with NO card ever shown for the assigned classification.
+            #
+            # The coords-less rescue above already carries exactly this rule; this is it
+            # on the ordinary path. It also stops littering the store with one-shots that
+            # are, by contract, unusable.
+            #
+            # Normalise via ``.value`` first: ``Verdict`` is a str-Enum, and ``str()`` on
+            # the member yields "Verdict.DENY", which would NOT match and would silently
+            # re-open the hole for any caller that stamps the enum rather than its value.
+            if verdict == "deny":
+                logger.info(
+                    "[ResumeOnDecision] DENY-band tool gate %s resolved %r — recording "
+                    "NOTHING (no stored approval may satisfy the DENY band; the remedy "
+                    "is to reclassify the effect)", sig, choice)
+                return
             # ABSENCE of the verdict fails CLOSED (single-use), matching
             # ``decision_bridge.classify_resolution``, which floors on a missing verdict
             # for the same key. A gate parked before the verdict was carried is rare; the
             # cost of closing it is one extra ask on a legacy card, and the cost of
             # leaving it open is a standing allow on an unknown band.
-            if choice == "always allow" and verdict and verdict != "deny":
+            # IMPL-2 (defence in depth): a card posted under an operator
+            # RECLASSIFICATION may never mint a STANDING allow. The classification is
+            # single-use and params-scoped by intent, so a standing allow granted on it
+            # would outlive the one call it was reasoned about and cover the
+            # params-independent signature forever. The follow-up card does not OFFER
+            # "Always allow" — this is the recorder half of that pair, so no other
+            # surface can supply the choice and get a standing entry.
+            reclassified = bool(dctx.get("reclassified"))
+            # IMPL-2 SCOPE (adversarial review, defence in depth #3): stamp WHICH card
+            # minted this bridge. A bridge is the operator's decision about one specific
+            # card; without the stamp, any unconsumed bridge on the (params-independent)
+            # signature satisfies any call — which is what made the attack above
+            # redeemable in the first place. The gate honours a bridge only when its
+            # scope equals the class the current call is being scored under.
+            scope = None
+            if reclassified:
+                scope = str(dctx.get("assigned_class") or "").strip()
+                if not scope:
+                    # No coherent scope to mint under, and an UNSCOPED bridge on a
+                    # reclassified card is precisely what the gate refuses to honour.
+                    # Record nothing rather than a one-shot that can never be spent.
+                    logger.warning(
+                        "[ResumeOnDecision] reclassified card for %s carried no "
+                        "assigned_class — recording nothing; the run will re-gate", sig)
+                    return
+            if choice == "always allow" and verdict and not reclassified:
                 store.approve(sig)
             else:
-                store.mark_resume_approved(sig)
+                store.mark_resume_approved(sig, for_reclassification=scope)
         else:
             from systemu.runtime.command_approvals import command_signature
             sig = command_signature(dctx.get("command") or "", cwd=dctx.get("cwd") or "")

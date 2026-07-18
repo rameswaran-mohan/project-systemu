@@ -25,6 +25,13 @@ _SEVERITY_TO_RISK = {"blocker": "high", "warning": "medium", "info": "low"}
 # Mirrors harness_review._HARNESS_OPTIONS verbatim (index 0 is the safe default).
 _HARNESS_OPTIONS: List[str] = ["Deny", "Approve"]
 
+# IMPL-2: the exact option label a DENY tool card offers as the remedy, AND the exact
+# choice string the Inbox panel resolves with. ``decision_queue.resolve`` validates
+# choice-in-options, so a one-character drift between the two would raise instead of
+# resolving — hence ONE constant, imported by both surfaces. The trailing character is
+# a real ellipsis (U+2026), not three periods.
+RECLASSIFY_OPTION = "Reclassify effect…"
+
 
 class GateDescriptor(BaseModel):
     title:             str
@@ -202,7 +209,10 @@ class GateDescriptor(BaseModel):
 
     @classmethod
     def from_tool(cls, *, tool_name: str, sig: str, verdict: str = "require_approval",
-                  reason: str = "", effect_tags=None) -> "GateDescriptor":
+                  reason: str = "", effect_tags=None,
+                  reclassified: bool = False,
+                  assigned_class: str = "",
+                  args_preview=None) -> "GateDescriptor":
         """Build a GateDescriptor for a gated forged/registry tool call (S1b, THE
         CRUX). Mirrors ``from_command``: safe_default "Deny" (index 0, fail-closed),
         dedup keyed on the EXACT tool signature (``tool:<sig>``) so re-attempts and
@@ -216,32 +226,76 @@ class GateDescriptor(BaseModel):
         option: IMPL-1 says an always-allow can never cover the DENY band, so offering it
         would either be a persistent bypass of the unknown-∩-high-severity floor or (once
         the recorder refuses it) a silent no-op. ``_record_gate_approval`` enforces the
-        same rule independently — this is the UX half of a defence-in-depth pair. The
-        DENY-specific reclassify + typed-confirm flow (IMPL-2) is the follow-up that gives
-        a DENY a legitimate way forward; until then "Approve once" stays a single-use,
-        non-persisted decision. Risk is "high" for a DENY, "medium" otherwise."""
+        same rule independently — this is the UX half of a defence-in-depth pair.
+
+        IMPL-2: a DENY card additionally offers ``RECLASSIFY_OPTION`` — the ONLY exit
+        from the refusal band that is not "fail the task". It runs nothing by itself: the
+        operator assigns the real effect class under typed confirmation, and the gate
+        re-arbitrates and posts a FRESH card on that classification.
+
+        ``reclassified`` marks that follow-up card. Its option set is exactly
+        ["Deny", "Approve once"] — no standing allow may be minted under a ONE-SHOT
+        classification (it would outlive the single call it was reasoned about, on a
+        params-independent signature), and no second reclassify, because the operator
+        has already classified this call. Risk stays "high": an effect that was refused
+        once does not become routine because it now has a label.
+        """
         # normalise via .value: Verdict is a str-Enum and str(member) is
         # "Verdict.DENY", which would not match and would re-offer the option.
         is_deny = str(getattr(verdict, "value", verdict) or "").strip().lower() == "deny"
-        options = ["Deny", "Approve once"] if is_deny else ["Deny", "Approve once", "Always allow"]
+        if reclassified:
+            options = ["Deny", "Approve once"]
+        elif is_deny:
+            # NO "Approve once" (adversarial review, CRITICAL). It does NOTHING at the
+            # gate by contract — every bypass in ``tool_sandbox._maybe_gate_tool`` sits
+            # under ``if verdict != Verdict.DENY``. Offering an option that cannot act
+            # is bad enough on a safety surface; worse, clicking it drove the recorder
+            # to mint a single-use resume bridge, which became REDEEMABLE the moment a
+            # reclassification lifted the verdict on those same params. The remedy is
+            # the reclassify option; the approval belongs on the follow-up card, where
+            # the operator can see what they are approving.
+            options = ["Deny", RECLASSIFY_OPTION]
+        else:
+            options = ["Deny", "Approve once", "Always allow"]
         tags = ", ".join(sorted(str(t) for t in (effect_tags or []))) or "unclassified"
         inspect = f"tool: {tool_name}\neffects: {tags}\nverdict: {verdict}"
+        if args_preview:
+            # WHICH call this is. The tool signature is params-INDEPENDENT, so without
+            # the arguments two entirely different calls render an identical card — and
+            # a reclassification the operator made for one of them would look like it
+            # was made for the other. Already bounded + secret-masked by the caller.
+            _args = ", ".join(f"{k}={v!r}" for k, v in sorted(args_preview.items()))
+            inspect += f"\nargs: {_args}"
+        if reclassified:
+            inspect += f"\noperator-reclassified as {assigned_class or 'unspecified'}"
         if reason:
             inspect += f"\n\nReason: {reason}"
-        risk = "high" if is_deny else "medium"
+        risk = "high" if (is_deny or reclassified) else "medium"
+        if reclassified:
+            what = (
+                f"Runs the {tool_name!r} tool once, scored as the effect class you "
+                f"assigned ({assigned_class or 'unspecified'}). That classification is "
+                "single-use and cannot be remembered — the next identical call is "
+                "gated again from scratch.")
+        elif is_deny:
+            what = (
+                f"Runs the {tool_name!r} tool ({tags}). This effect could not be "
+                "classified and carries a high-severity signal, so it cannot be "
+                "remembered — you will be asked again every time. "
+                f"'{RECLASSIFY_OPTION}' never runs anything by itself: you assign the "
+                "real effect class under typed confirmation, and a fresh approval card "
+                "is posted on that classification.")
+        else:
+            what = (
+                f"Runs the {tool_name!r} tool ({tags}). 'Always allow' remembers "
+                "this exact tool body + effect set + host class.")
         return cls(
             title=f"Run tool: {tool_name}",
             risk=risk,
             inspect=inspect,
             options=options,
             safe_default=options[0],
-            what_approve_does=(
-                f"Runs the {tool_name!r} tool ({tags}). This effect could not be "
-                "classified and carries a high-severity signal, so it cannot be "
-                "remembered — you will be asked again every time."
-                if is_deny else
-                f"Runs the {tool_name!r} tool ({tags}). 'Always allow' remembers "
-                "this exact tool body + effect set + host class."),
+            what_approve_does=what,
             dedup=f"tool:{sig}",
         )
 

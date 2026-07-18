@@ -858,9 +858,19 @@ def _execute_tool(sandbox, tool, params: Dict[str, Any]):
             try:
                 return _call(resolved_dedup=pend.dedup_key)
             except PendingOperatorDecision:
-                # Re-gated (e.g. the bypass didn't apply) → fail-closed.
-                return _denied("Command approved once but re-gated; not run. "
-                               "Choose 'Always allow' to permit repeat runs.")
+                # Re-gated (the approval on record did not cover THIS call) → fail-closed.
+                #
+                # IMPL-2: this branch is now the ordinary outcome of the resolved-dedup
+                # SCOPE refusal — the poll found a resolved choice belonging to a
+                # different card on the same params-independent dedup key, and the gate
+                # declined it. The old copy told the operator to "Choose 'Always allow'",
+                # which is both unavailable on a reclassified follow-up card and exactly
+                # the grant that must never be minted under a one-shot classification.
+                # Point them at the card for THIS call instead.
+                return _denied("Approved once, but the gate asked again — nothing ran. "
+                               "The approval on record did not cover this exact call. "
+                               "Open the Inbox and approve the card that names these "
+                               "arguments.")
             except Exception:
                 # v0.9.32 (D.4 review FIX-5): any unexpected error on the
                 # re-attempt must fail-closed too, never crash the lane.
@@ -868,6 +878,21 @@ def _execute_tool(sandbox, tool, params: Dict[str, Any]):
                                  "— fail-closed denial")
                 return _denied("Command approval re-attempt failed — denied "
                                "(fail-closed).")
+        # IMPL-2: a reclassify is neither an approval nor a denial — the operator
+        # supplied the effect class and the gate must now re-score on it. It authorizes
+        # NOTHING by itself (a fresh card is posted on the new classification), so this
+        # stays fail-closed for THIS attempt. It gets its own message because the
+        # timeout copy below would be simply untrue: nothing timed out, and the operator
+        # did act.
+        if norm.startswith("reclassify"):
+            # State only what is TRUE of this attempt. The earlier copy promised "the
+            # follow-up card" — but this attempt is ABANDONED here, and whether a card
+            # ever appears depends on the ReAct loop choosing to retry, which this lane
+            # does not control. Telling the operator to go approve a card that may not
+            # exist sends them to wait on nothing.
+            return _denied("Effect reclassification recorded. This attempt did not "
+                           "run; re-running the task re-checks this call on the new "
+                           "classification and asks you to approve it.")
         # Deny or timeout → fail-closed.
         msg = ("Command denied by operator." if norm == "deny"
                else "Command approval timed out — denied (fail-closed).")
