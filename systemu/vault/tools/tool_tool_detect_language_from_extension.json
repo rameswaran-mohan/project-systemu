@@ -19,7 +19,7 @@
   "implementation_path": "vault/tools/implementations/detect_language_from_extension.py",
   "tool_md_path": "systemu\\vault\\tools\\tool_tool_detect_language_from_extension\\TOOL.md",
   "status": "deployed",
-  "forged_by_systemu": true,
+  "forged_by_systemu": false,
   "enabled": true,
   "version": 1,
   "created_at": "2026-05-04T00:00:00",

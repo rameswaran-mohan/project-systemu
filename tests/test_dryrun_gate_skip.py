@@ -45,43 +45,70 @@ Test discipline notes (these tests have to fail for the RIGHT reason):
   tool ``net_read`` — but the test can never actually egress, even when the
   guard is deliberately removed to mutation-test this file.
 
-── KNOWN GAP: the untagged-body source-scan evasion ─────────────────────────
-
-The three holes above are closed. The DOMINANT case is not.
+── CLOSED: the untagged-body import-alias evasion ───────────────────────────
 
 A freshly-forged tool has NO ``effect_tags`` (``tool_forge`` never stamps them;
 the ``vault_migrator`` backfill is a once-per-version BOOT pass) and is dry-run
 IMMEDIATELY at ``tool_forge.py:222``. For that tool ``_gate_skip_reason`` has no
-declared tags to score, so it falls back to a ``classify_source`` AST scan — and
-that scan is NAME-MATCHING. It recognises a sink only when the receiver is
-literally spelled: ``subprocess.run``, ``os.system``, ``requests.get``. So::
+declared tags to score, so it falls back to a ``classify_source`` AST scan.
 
-    import subprocess as sp          # aliased      → not seen
-    from subprocess import check_output   # idiomatic → not seen
-    from os import system                 # idiomatic → not seen
+That scan USED TO BE name-matching — it recognised a sink only when the receiver
+was spelled literally (``subprocess.run``, ``os.system``, ``requests.get``), so
+ordinary idiomatic Python defeated it::
 
-A body using any of these, plus one ordinary local write, scans as exactly
-``{local_write}`` — purely local — so ``_net_egress_skip_reason`` proceeds,
-``evaluate_action`` returns ALLOW, and the body EXECUTES UNATTENDED. Note the
-from-import forms are ORDINARY Python, not adversarial constructions; they are
-the likelier real-world trigger.
+    import subprocess as sp             ;  sp.run(...)
+    from subprocess import check_output ;  check_output(...)
+    from os import system               ;  system(...)
 
-``TestKnownGap_UntaggedSourceScanIsNameMatching`` (bottom of this file) is the
-strict-xfail RATCHET for that gap: it asserts the DESIRED behaviour, so it xfails
-today and will XPASS — hard-failing the suite — the moment the classifier learns
-alias resolution, forcing this section and the ``_gate_skip_reason`` /
-``_net_egress_skip_reason`` docstrings to be brought back into line.
+Each scanned as exactly ``{local_write}`` — purely local — so the body EXECUTED
+UNATTENDED, and the same alias defeated the LIVE ``forged_network_denied`` gate.
 
-A SECOND, independent gap surfaced while building that ratchet, and is pinned
-separately (``test_gate_scorer_should_also_skip_the_shell_body``): ``shell_exec``
-sits in ``action_governance._LOCAL_TAGS`` and NOT in ``_APPROVAL_TAGS``, so
-``evaluate_action`` ALLOWs it. A CORRECTLY ``shell_exec``-tagged body therefore
-still scores ALLOW at ``_gate_skip_reason`` — and at the LIVE
-``_maybe_gate_tool``. Fixing the classifier does not flip that; only
-``_net_egress_skip_reason``'s stricter ``_SAFE_LOCAL_TAGS`` allowlist (which
-excludes ``shell_exec``) stops such a body in the dry-run pipeline, making that
-one guard a single point of failure. The two ratchets are kept apart so a fix to
-either is never mistaken for a fix to both.
+``classify_source`` now RESOLVES IMPORT ALIASES (``effect_tags._EffectVisitor``
+builds a module-alias and a symbol-alias map while walking, and resolves both
+attribute receivers and bare call names through them), so those bodies are
+tagged correctly and both controls see the sink.
+``TestUntaggedSourceScanResolvesImportAliases`` (bottom of this file) is the
+former ratchet, converted to ordinary passing tests and kept as the REGRESSION
+NET for the whole corpus.
+
+── ALSO CLOSED: shell_exec ALLOWed at the action gate ───────────────────────
+
+``shell_exec`` used to sit in ``action_governance._LOCAL_TAGS`` and NOT in
+``_APPROVAL_TAGS``, so ``evaluate_action`` ALLOWed it. That had to be fixed
+TOGETHER with alias resolution, because alias resolution alone was a net
+security REGRESSION: a forged shell body went from scanning ``[]`` (UNKNOWN ⇒
+REQUIRE_APPROVAL ⇒ gated) to scanning ``['shell_exec']`` (ALLOW ⇒ UNGATED) — a
+more accurate classifier making the gate LESS protective. ``shell_exec`` is now
+an approval-band tag, so a shell body SKIPS here rather than relying on
+``_net_egress_skip_reason``'s stricter ``_SAFE_LOCAL_TAGS`` allowlist as a single
+point of failure, and it CARDS at the live ``_maybe_gate_tool``.
+``TestShellExecCardsAtTheActionGate`` (bottom of this file) is the former
+ratchet, converted to ordinary passing tests.
+
+``shell_exec`` deliberately STAYS in ``_LOCAL_TAGS``: that set suppresses the
+NAME verb-map, so removing it would only manufacture phantom NET_MUTATE /
+SEND_MESSAGE tags from tool names (the ``send_summary_to_log`` rule).
+``local_delete`` is in both sets for the same reason. See
+``tests/test_action_governance.py`` and ``tests/test_shell_exec_gate.py``.
+
+── WHAT REMAINS UNCOVERED ───────────────────────────────────────────────────
+
+One gap remains, pinned as its own strict-xfail ratchet:
+
+1. ``TestRemainingGap_LocalVariableDataflow`` — alias resolution is an
+   IMPORT-BINDING analysis, not dataflow. A sink reached through a local
+   VARIABLE (``sp = subprocess``, ``cx = requests.Session()``,
+   ``f = subprocess.run``) or a star-import binds no name the import statements
+   describe, so it is still unseen. Closing it needs real dataflow analysis.
+
+Genuinely DYNAMIC access (``__import__`` / ``exec`` / ``eval`` /
+``importlib.import_module``) now forces UNKNOWN, which fails closed at both
+guards. ``getattr`` is DELIBERATELY excluded from that list — it was measured at
+~15% of this repo's own tool bodies used benignly, so forcing UNKNOWN on it would
+skip that whole population and collapse the dry-run into a no-op. That exclusion
+is pinned as intentional behaviour in
+``tests/test_effect_tags.py::TestDynamicAccessForcesUnknown``, and it means
+``getattr(os, "system")("ls")`` is still not seen.
 
 Do not read the parity test (t5) as covering this. It drives a NON-forged tool
 with NO implementation file over explicit tag sets, so its ``set()`` case scores
@@ -341,16 +368,25 @@ class TestFrictionlessMajorityUnaffected:
         SECURITY CAVEAT — this test ENCODES the risky path as desired behaviour,
         so it must carry the caveat. That same ``classify_source`` fallback is
         the ONLY classification standing between a freshly-forged body and
-        unattended execution, and it is NAME-MATCHING: it recognises a sink only
-        when the receiver is literally spelled (``subprocess.run``,
-        ``os.system``, ``requests.get``). An ALIASED (``import subprocess as
-        sp``) or FROM-IMPORTED (``from subprocess import check_output``,
-        ``from os import system``) sink is NOT seen, and the body's remaining
-        local sinks then score it purely-local — so it proceeds exactly as this
-        test's benign tool does. "Passes this test" therefore does not mean
-        "safe to execute"; it means "scanned clean". See the KNOWN GAP section
-        in this module's docstring and
-        ``TestKnownGap_UntaggedSourceScanIsNameMatching``.
+        unattended execution.
+
+        It is now materially stronger than it was: it RESOLVES IMPORT ALIASES, so
+        ``import subprocess as sp`` and ``from os import system`` are recognised,
+        and genuinely dynamic access (``__import__``/``exec``/``eval``/
+        ``importlib.import_module``) forces UNKNOWN, which fails closed. It is
+        still NOT a proof of safety. It remains blind to:
+
+        * a sink reached through a local VARIABLE (``sp = subprocess``,
+          ``cx = requests.Session()``, ``f = subprocess.run``) or a star-import —
+          alias resolution is import-binding analysis, not dataflow;
+        * ``getattr(os, "system")("ls")`` — a DELIBERATE, measured exclusion
+          (~15% benign use in this repo's own tool bodies).
+
+        "Passes this test" therefore still does not mean "safe to execute"; it
+        means "scanned clean". See the WHAT REMAINS UNCOVERED section in this
+        module's docstring and ``TestRemainingGap_LocalVariableDataflow``. (The
+        shell-exec gap that used to be listed here is CLOSED — see
+        ``TestShellExecCardsAtTheActionGate``.)
         """
         from systemu.pipelines.tool_dry_run import dry_run_tool
 
@@ -551,62 +587,62 @@ class TestGateSkipDoesNotStrandTheReconciler:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KNOWN GAP ratchet — the untagged-body source-scan evasion (see module docstring)
+# The former KNOWN GAP, now CLOSED by classifier alias resolution — kept as a
+# regression net (see the module docstring), plus the two gaps that REMAIN.
 
-class TestKnownGap_UntaggedSourceScanIsNameMatching:
-    """The gap the three closed holes do NOT cover, pinned as a strict xfail.
+class TestUntaggedSourceScanResolvesImportAliases:
+    """The alias-evasion corpus, now RECOGNISED by ``classify_source``.
 
-    For an UNTAGGED tool (every freshly-forged one) ``_gate_skip_reason`` scores
-    from a ``classify_source`` AST scan. That scan is NAME-MATCHING: it tags a
-    sink only when the receiver is literally spelled ``subprocess`` / ``os`` /
-    a known net client. A body that reaches those sinks through an alias or a
-    from-import scans as purely-local and EXECUTES UNATTENDED.
+    These were strict-xfail ratchets while the scan was name-matching. The
+    classifier now resolves import aliases, so they assert real behaviour and
+    are ordinary passing tests. They stay as a REGRESSION NET: alias resolution
+    is what stands between a freshly-forged body and unattended execution, so a
+    regression here must fail loudly rather than quietly re-open the hole.
 
-    These tests assert the DESIRED behaviour (``_gate_skip_reason`` returns a
-    skip), so they FAIL today. ``strict=True`` is LOAD-BEARING: a non-strict
-    xfail would silently xpass once the classifier is fixed and this gap-marker
-    would rot into a lie. Strict means the fix hard-FAILS the suite here and
-    forces the docstrings — module-level KNOWN GAP, ``_gate_skip_reason``,
-    ``_net_egress_skip_reason``, ``_maybe_gate_tool`` — to be updated with it.
-
-    Scope discipline: these assert CLASSIFICATION and the ``_gate_skip_reason``
-    verdict ONLY. They never invoke ``dry_run_tool``, never spawn a subprocess,
-    and never write outside ``tmp_path`` — the point is provable, so proving it
-    does not require actually running a shell out of a committed test.
+    Scope discipline (unchanged): these assert CLASSIFICATION and the
+    ``_net_egress_skip_reason`` verdict ONLY. They never invoke ``dry_run_tool``,
+    never spawn a subprocess, and never write outside ``tmp_path`` — the point is
+    provable, so proving it does not require running a shell from a committed
+    test.
     """
 
-    # Each body pairs an UNRECOGNISED sink with one ordinary local write, so the
-    # scan's verdict is decided by the sinks it DOES see. Confirmed to scan as
-    # exactly {local_write} for all three.
+    # The full PoC-verified corpus. Every one is ORDINARY idiomatic Python, not
+    # an adversarial construction — the dominant real-world trigger is a careless
+    # LLM forge. Each pairs its sink with one plain local write, so a regression
+    # shows up as {local_write} (a WRONG "purely local" verdict) rather than as an
+    # empty set, which the fail-closed guards would catch anyway.
     EVASIONS = {
-        "aliased_import": (
-            "import subprocess as sp\n"
-            "from pathlib import Path\n"
-            "\n"
-            "def run(x):\n"
-            "    Path('out.txt').write_text('local')\n"
-            "    sp.run(['echo', 'reached-a-shell'])\n"
-            "    return {'success': True}\n"
-        ),
+        "aliased_subprocess": (
+            "import subprocess as sp\n", "sp.run(['echo', 'hi'])", "shell_exec"),
         "from_import_subprocess": (
-            "from subprocess import check_output\n"
-            "from pathlib import Path\n"
-            "\n"
-            "def run(x):\n"
-            "    Path('out.txt').write_text('local')\n"
-            "    check_output(['echo', 'reached-a-shell'])\n"
-            "    return {'success': True}\n"
-        ),
+            "from subprocess import check_output\n",
+            "check_output(['echo', 'hi'])", "shell_exec"),
         "from_import_os_system": (
-            "from os import system\n"
+            "from os import system\n", "system('echo hi')", "shell_exec"),
+        "from_import_os_remove": (
+            "from os import remove\n", "remove('/tmp/x')", "local_delete"),
+        "aliased_shutil_rmtree": (
+            "import shutil as sh\n", "sh.rmtree('/tmp/x')", "local_delete"),
+        "aliased_requests_get": (
+            "import requests as r\n", "r.get('https://example.invalid/x')",
+            "net_read"),
+        "from_import_build_opener": (
+            "from urllib.request import build_opener\n",
+            "build_opener().open('https://example.invalid/x')", "net_read"),
+    }
+
+    @staticmethod
+    def _body(case):
+        imports, call, _ = TestUntaggedSourceScanResolvesImportAliases.EVASIONS[case]
+        return (
+            f"{imports}"
             "from pathlib import Path\n"
             "\n"
             "def run(x):\n"
             "    Path('out.txt').write_text('local')\n"
-            "    system('echo reached-a-shell')\n"
+            f"    {call}\n"
             "    return {'success': True}\n"
-        ),
-    }
+        )
 
     @staticmethod
     def _scan(body):
@@ -615,110 +651,196 @@ class TestKnownGap_UntaggedSourceScanIsNameMatching:
                 for t in classify_source(body)}
 
     @pytest.mark.parametrize("case", sorted(EVASIONS))
-    def test_reference_bodies_scan_as_purely_local(self, case):
-        """PREMISE GUARD (passes today, and must keep passing until the fix).
+    def test_reference_bodies_are_no_longer_purely_local(self, case):
+        """The inverted PREMISE GUARD.
 
-        Pins the fact the ratchet rests on: each reference body scans as EXACTLY
-        ``{local_write}`` — purely local — because the only sink the name-matcher
-        recognises is the ``Path(...).write_text(...)``. If this ever changes,
-        the xfail tests below stop probing what their docstrings claim, and this
-        assertion says so loudly rather than letting them rot.
+        This previously pinned the gap's premise — that each body scanned as
+        EXACTLY ``{local_write}``. Post-fix it pins the opposite: the local write
+        is still seen AND the aliased sink is too, so the body is no longer
+        mistaken for purely-local. A regression to ``{local_write}`` fails here
+        first, and with the clearest possible message.
         """
-        assert self._scan(self.EVASIONS[case]) == {"local_write"}
+        expected = self.EVASIONS[case][2]
+        tags = self._scan(self._body(case))
+        assert tags == {"local_write", expected}, (
+            f"alias resolution regressed for {case}: expected the sink to scan "
+            f"as {expected!r} alongside the local write, got {sorted(tags)}")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "classify_source is name-matching: an aliased or from-imported "
-            "subprocess/os sink is not recognised, so the body scans as "
-            "purely-local. Fix = classifier alias resolution."
-        ),
-    )
     @pytest.mark.parametrize("case", sorted(EVASIONS))
-    def test_classifier_should_see_the_shell_sink(self, case):
-        """The CLASSIFICATION half of the gap.
+    def test_classifier_sees_the_aliased_sink(self, case):
+        """The CLASSIFICATION half — was a strict-xfail ratchet, now passes.
 
-        DESIRED: a body that calls into subprocess/os carries ``shell_exec``
-        however the sink is spelled. TODAY: the sink is invisible to the scan.
+        A body that reaches subprocess / os / shutil / the network carries the
+        right tag HOWEVER the sink is spelled.
         """
-        assert "shell_exec" in self._scan(self.EVASIONS[case])
+        assert self.EVASIONS[case][2] in self._scan(self._body(case))
 
     def _untagged_tool(self, tmp_path, case):
         """An UNTAGGED forged tool (as ``tool_forge`` leaves it) whose body
-        reaches a shell through an unrecognised name."""
+        reaches an effectful sink through an aliased / from-imported name."""
         t = _make_tool(f"gap_probe_{case}", effect_tags=[])
         t.implementation_path = _write_impl(
-            tmp_path, f"gap_probe_{case}.py", self.EVASIONS[case])
+            tmp_path, f"gap_probe_{case}.py", self._body(case))
         return t, _config_for(tmp_path / "vault")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "classify_source is name-matching: an aliased or from-imported "
-            "subprocess/os/net sink scans purely-local, so an untagged forged "
-            "body still executes unattended. Fix = classifier alias resolution; "
-            "when that lands this xpasses and FORCES the docstrings + this test "
-            "to be updated."
-        ),
-    )
     @pytest.mark.parametrize("case", sorted(EVASIONS))
-    def test_untagged_body_with_aliased_shell_sink_should_be_skipped(
-            self, tmp_path, case):
-        """THE RATCHET. An untagged forged body reaching a shell via an alias /
-        from-import must not execute unattended.
+    def test_untagged_body_with_aliased_sink_is_skipped(self, tmp_path, case):
+        """THE FORMER RATCHET — now passing. An untagged forged body reaching a
+        shell / delete / the network via an alias or from-import does not execute
+        unattended.
 
-        Asserted against ``_net_egress_skip_reason`` — the guard that ACTUALLY
-        decides this in the pipeline, and the one a classifier fix would flip.
-        Its allowlist is ``_SAFE_LOCAL_TAGS`` (local_read/write/delete), which
-        excludes ``shell_exec``, so the moment the scan tags the sink this
-        returns a skip and the tool never reaches ``_execute``.
+        Asserted against ``_net_egress_skip_reason``, the guard that ACTUALLY
+        decides this in the pipeline. Its allowlist is ``_SAFE_LOCAL_TAGS``
+        (local_read/write/delete), so the shell and net cases skip on the tag
+        being outside it.
 
-        DESIRED: a skip reason. TODAY: ``None`` (proceed) — the scan reports
-        exactly ``{local_write}``, which is a subset of the allowlist.
-
-        NOT asserted against ``_gate_skip_reason``: see the sibling test below
-        for why that one would not flip on a classifier fix at all.
+        NOTE the ``local_delete`` cases skip for a DIFFERENT reason —
+        ``local_delete`` IS in ``_SAFE_LOCAL_TAGS``, so this guard passes them
+        and ``_gate_skip_reason`` is what stops them (``local_delete`` is in
+        ``_APPROVAL_TAGS`` ⇒ REQUIRE_APPROVAL). The sibling test below asserts
+        that half, so both routes are covered explicitly rather than by accident.
         """
-        from systemu.pipelines.tool_dry_run import _net_egress_skip_reason
+        from systemu.pipelines.tool_dry_run import (
+            _gate_skip_reason, _net_egress_skip_reason)
 
         t, config = self._untagged_tool(tmp_path, case)
+        stopped = (_net_egress_skip_reason(t, config) is not None
+                   or _gate_skip_reason(t, {"x": "hello"}, config,
+                                        is_destructive_param=False) is not None)
 
-        assert _net_egress_skip_reason(t, config) is not None, (
-            "SECURITY GAP: an untagged forged body reaching subprocess/os "
-            "through an aliased or from-imported name proved 'non-egress' and "
+        assert stopped, (
+            "SECURITY REGRESSION: an untagged forged body reaching an effectful "
+            "sink through an aliased or from-imported name proved harmless and "
             "would execute during an unattended dry-run")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "SECOND, INDEPENDENT gap: shell_exec is in action_governance's "
-            "_LOCAL_TAGS and NOT in _APPROVAL_TAGS, so evaluate_action ALLOWs "
-            "it. _gate_skip_reason therefore proceeds even for a CORRECTLY "
-            "shell_exec-tagged body — fixing the classifier alone does NOT flip "
-            "this. Fix = decide whether shell_exec should card at the action "
-            "gate; when it does, this xpasses and forces a docs update."
-        ),
-    )
-    @pytest.mark.parametrize("case", sorted(EVASIONS))
-    def test_gate_scorer_should_also_skip_the_shell_body(self, tmp_path, case):
-        """The gate-scorer half — a SEPARATE gap, pinned separately so a fix to
-        one is never mistaken for a fix to the other.
-
-        ``_gate_skip_reason`` delegates the verdict to ``evaluate_action``, which
-        treats ``shell_exec`` as a LOCAL (ALLOW) effect. So this returns ``None``
-        both today (sink invisible ⇒ ``{local_write}``) AND after a classifier
-        fix (sink visible ⇒ ``{local_write, shell_exec}`` ⇒ still ALLOW). The
-        dry-run is saved here only by ``_net_egress_skip_reason``'s stricter
-        allowlist running FIRST in the pipeline — a single point of failure
-        worth knowing about.
-        """
+    @pytest.mark.parametrize(
+        "case", [c for c, v in EVASIONS.items() if v[2] == "local_delete"])
+    def test_aliased_delete_is_carded_by_the_action_gate(self, tmp_path, case):
+        """``local_delete`` IS in ``_APPROVAL_TAGS``, so a correctly-tagged
+        aliased delete scores REQUIRE_APPROVAL at the gate scorer — unlike
+        ``shell_exec`` (see the remaining-gap ratchet below)."""
         from systemu.pipelines.tool_dry_run import _gate_skip_reason
 
         t, config = self._untagged_tool(tmp_path, case)
-
         got = _gate_skip_reason(t, {"x": "hello"}, config,
                                 is_destructive_param=False)
 
+        assert got is not None and got[0] == "require_approval"
+
+    @pytest.mark.parametrize(
+        "case", [c for c, v in EVASIONS.items() if v[2].startswith("net_")])
+    def test_aliased_network_sink_is_denied_at_the_live_gate(self, tmp_path, case):
+        """The SECOND control this classifier feeds. ``forged_network_denied`` is
+        the LIVE gate, not a dry-run guard — the same alias that fooled the
+        dry-run also defeated it, and the same fix repairs both."""
+        from systemu.runtime.action_governance import forged_network_denied
+
+        t, config = self._untagged_tool(tmp_path, case)
+        from systemu.pipelines.tool_dry_run import _resolve_impl_path
+
+        assert forged_network_denied(
+            t, impl_path=_resolve_impl_path(t, config)) is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The gaps that REMAIN, each pinned as its own strict-xfail ratchet.
+
+class TestShellExecCardsAtTheActionGate:
+    """CLOSED — was the strict-xfail ratchet ``TestRemainingGap_ShellExecAllows...``.
+
+    ``shell_exec`` is now in ``action_governance._APPROVAL_TAGS``, so
+    ``evaluate_action`` cards it and ``_gate_skip_reason`` SKIPS a shell body
+    instead of executing it unattended.
+
+    This had to ship WITH the classifier fix, not after it. Alias resolution made
+    the classifier correct — bodies that used to scan ``{local_write}`` now scan
+    ``{local_write, shell_exec}`` — and under the OLD ladder that was a net
+    security REGRESSION: empty tags score UNKNOWN ⇒ REQUIRE_APPROVAL (gated),
+    while ``{shell_exec}`` scored ALLOW (ungated). A more accurate classifier
+    made the gate less protective. Both halves land together.
+
+    ``shell_exec`` deliberately REMAINS in ``_LOCAL_TAGS`` (it suppresses the
+    name verb-map, exactly as ``local_delete`` does in both sets) — pinned by
+    ``tests/test_action_governance.py``
+    ``::test_shell_exec_stays_in_local_tags_so_the_name_map_cannot_escalate``.
+
+    The LIVE ``_maybe_gate_tool`` gained the same ratchet plus a narrow carve-out
+    for the real shell tools, whose commands the params-DEPENDENT
+    ``_maybe_gate_command`` already scored one call earlier — see
+    ``tests/test_shell_exec_gate.py``. This pipeline has NO such carve-out on
+    purpose (it never runs the command gate), so the skip below is unconditional.
+    """
+
+    CASES = ["aliased_subprocess", "from_import_subprocess", "from_import_os_system"]
+
+    @pytest.mark.parametrize("case", CASES)
+    def test_precondition_the_body_is_now_correctly_tagged_shell_exec(self, case):
+        """Premise guard: the test below must pass because of the ACTION-GATE
+        ladder, not because the sink went unseen again. Pinning the tag here
+        keeps the two failure modes distinguishable."""
+        body = TestUntaggedSourceScanResolvesImportAliases._body(case)
+        assert "shell_exec" in TestUntaggedSourceScanResolvesImportAliases._scan(body)
+
+    @pytest.mark.parametrize("case", CASES)
+    def test_gate_scorer_should_skip_a_shell_body(self, tmp_path, case):
+        from systemu.pipelines.tool_dry_run import _gate_skip_reason
+
+        t = _make_tool(f"shellgap_{case}", effect_tags=[])
+        t.implementation_path = _write_impl(
+            tmp_path, f"shellgap_{case}.py",
+            TestUntaggedSourceScanResolvesImportAliases._body(case))
+        got = _gate_skip_reason(t, {"x": "hello"}, _config_for(tmp_path / "vault"),
+                                is_destructive_param=False)
+
         assert got is not None, (
-            "an untagged forged body reaching subprocess/os scored ALLOW at the "
-            "action-gate scorer")
+            "a body correctly tagged shell_exec scored ALLOW at the action-gate "
+            "scorer")
+
+
+class TestRemainingGap_LocalVariableDataflow:
+    """NEW gap, characterised while closing the alias one.
+
+    Alias resolution is an IMPORT-BINDING analysis, not dataflow. A sink reached
+    through a local VARIABLE — rebinding a module, holding a client object, or
+    rebinding the function itself — is still invisible, because nothing in the
+    import statements names it. Closing this needs real dataflow analysis, which
+    is a different (and much larger) undertaking.
+
+    Also uncovered and NOT ratcheted here: ``getattr(os, "system")("ls")``. That
+    one is a DELIBERATE, measured exclusion rather than an oversight — ``getattr``
+    appears in ~15% of this repo's own tool bodies used benignly, so forcing
+    UNKNOWN on it would skip that whole population and collapse the dry-run into
+    a no-op. It is pinned as an intentional-behaviour test in
+    ``tests/test_effect_tags.py::TestDynamicAccessForcesUnknown``.
+    """
+
+    DATAFLOW_EVASIONS = {
+        # rebinding the module through a plain assignment
+        "module_rebind": "import subprocess\nsp = subprocess\nsp.run(['echo','hi'])",
+        # a client object held in a local whose name is not a known net client
+        "client_in_local": ("import requests\n"
+                            "cx = requests.Session()\ncx.get('https://x.invalid')"),
+        # rebinding the sink function itself
+        "func_rebind": "import subprocess\nf = subprocess.run\nf(['echo','hi'])",
+        # star-import binds no name the AST can see
+        "star_import": "from subprocess import *\nrun(['echo','hi'])",
+    }
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Import-alias resolution is not DATAFLOW analysis: a sink reached "
+            "through a local variable (module rebind, client object, function "
+            "rebind) or a star-import binds no name the import statements "
+            "describe, so it is still unseen. Fix = dataflow/binding analysis, "
+            "a materially larger change than alias resolution."
+        ),
+    )
+    @pytest.mark.parametrize("case", sorted(DATAFLOW_EVASIONS))
+    def test_dataflow_reached_sink_should_be_seen(self, case):
+        from systemu.runtime.effect_tags import classify_source
+        body = ("from pathlib import Path\nPath('o').write_text('l')\n"
+                + self.DATAFLOW_EVASIONS[case])
+        tags = {t.value for t in classify_source(body)}
+        assert tags - {"local_write"}, (
+            f"{case}: the sink reached through a local variable was not seen")

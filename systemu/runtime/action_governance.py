@@ -18,6 +18,19 @@ Load-bearing rules (all under test in ``tests/test_action_governance.py``):
     rubber-stampable card. This bounds *blast radius*, not *world breadth*.
   * **No false positive.** The name verb-map does not escalate a tool whose
     tool-side tags say it is local-only (so `send_summary_to_log` stays ALLOW).
+  * **`shell_exec` is an APPROVAL-band effect, and STAYS in `_LOCAL_TAGS`.**
+    Those are not in tension — the two sets answer different questions.
+    `_APPROVAL_TAGS` asks "must the operator see this?": yes, because a shell can
+    run ANYTHING. "Local" describes a shell's EGRESS class (it does not itself
+    reach the network), not its BLAST RADIUS (it can `curl`, `rm`, or install).
+    `_LOCAL_TAGS` asks "may the NAME verb-map escalate this tool?": no, because
+    the tool-side tags already classify it, so a shell tool called
+    `run_deploy_script` must not silently acquire NET_MUTATE from the token
+    "deploy" (the same no-false-positive rule that protects
+    `send_summary_to_log`). `local_delete` is in BOTH sets for exactly this
+    reason and is the precedent being mirrored. Removing `shell_exec` from
+    `_LOCAL_TAGS` would not tighten anything — it would only manufacture phantom
+    network/message tags from tool names.
 
 This is the evaluator only. Wiring the live gates (`_maybe_gate_command`,
 `_gate_mcp_call`, the forged execute path) to delegate through it — and closing
@@ -227,8 +240,9 @@ _DELETE_VERBS = {"delete", "remove", "drop", "truncate", "wipe", "purge",
 _LOCAL_TAGS = {EffectTag.LOCAL_READ.value, EffectTag.LOCAL_WRITE.value,
                EffectTag.LOCAL_DELETE.value, EffectTag.SHELL_EXEC.value}
 _APPROVAL_TAGS = {EffectTag.NET_MUTATE.value, EffectTag.SEND_MESSAGE.value,
-                  EffectTag.MONEY_MOVE.value, EffectTag.MONEY_MOVE.value,
-                  EffectTag.LOCAL_DELETE.value, EffectTag.OAUTH_CALL.value}
+                  EffectTag.MONEY_MOVE.value,
+                  EffectTag.LOCAL_DELETE.value, EffectTag.OAUTH_CALL.value,
+                  EffectTag.SHELL_EXEC.value}
 
 
 def _tokens(name: str) -> Set[str]:
@@ -272,7 +286,7 @@ def _score_known(ctx: ActionContext, tags: Set[str]) -> Tuple["Verdict", str]:
         return Verdict.REQUIRE_APPROVAL, "irreversible action"
     if tags & _APPROVAL_TAGS:
         return (Verdict.REQUIRE_APPROVAL,
-                "external mutation / delete / money / message effect")
+                "external mutation / delete / money / message / shell-exec effect")
     if not ctx.classification_trusted:
         # a discovered/registry/first-use tool making any effectful call is gated
         # regardless of a self-declared read-only hint

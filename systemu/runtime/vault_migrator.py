@@ -2,8 +2,10 @@
 package's version. Auto-runs on daemon start. Idempotent via .seed_version.
 Identity is by NAME (not by `forged_by_systemu` flag) — POC finding: user
 vaults mis-flag all seed tools as forged, so a flag-based filter would
-prevent legitimate seed updates from ever reaching the vault. Never raises;
-wrapped by daemon try/except so a migration failure can't break boot.
+prevent legitimate seed updates from ever reaching the vault. That same
+mis-flag is REPAIRED (sha-guarded) by `normalize_seed_forged_flags`, which
+runs on every boot ahead of the fast path. Never raises; wrapped by daemon
+try/except so a migration failure can't break boot.
 """
 from __future__ import annotations
 
@@ -257,6 +259,260 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
         return {"error": str(exc)}
 
 
+_FORGED_FIELD = "forged_by_systemu"
+_IMPL_PATH_FIELD = "implementation_path"
+
+
+def _path_under(candidate: Path, root: Path) -> bool:
+    """Path-COMPONENT containment — ``…/implementations_evil/x.py`` is NOT under
+    ``…/implementations``.
+
+    The same containment rule the confinement layer applies to path facts, kept
+    LOCAL: this runs on the boot path, and the module that already implements it
+    is under a test-enforced no-reference invariant. It additionally RESOLVES
+    both sides first, so a symlinked implementation cannot sit inside the
+    directory while pointing outside it. A raw ``startswith`` would accept a
+    prefix-named sibling — this repo has already shipped that bug once
+    (``C:/Radiology/x`` counted as inside ``C:/R``). Never raises; an
+    unresolvable path is simply not contained.
+    """
+    try:
+        c = candidate.resolve()
+        r = root.resolve()
+        return c == r or r in c.parents
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_vault_impl(vault_dir: Path, impl_dir: Path, name: str,
+                        declared: Any) -> Path | None:
+    """Which file does this vault tool ACTUALLY execute? Returns None to REFUSE.
+
+    ``implementation_path`` is the field the runtime loads
+    (``ToolSandbox.execute_tool``), and a relative value is anchored at the vault
+    root's PARENT — not at the implementations dir. That is how the value is
+    written (``tool_forge``: ``impl_path.relative_to(vault_dir.parent)``) and how
+    it is read back (``tool_dry_run._resolve_impl_path``), which is why every
+    shipped seed body carries ``vault/tools/implementations/<name>.py``. Anchoring
+    that string at ``impl_dir`` instead would resolve to a path that does not
+    exist and silently skip every seed.
+
+    REFUSES (returns None) when the declared value is present but not a string,
+    or when it resolves outside the vault's implementations dir — including via
+    ``..`` segments, a symlink, or an absolute path. Falls back to ``{name}.py``
+    only when the field is absent or blank; that is the same fallback
+    ``backfill_effect_tags`` uses, and an absent field is not evidence of
+    tampering. Never raises — a malformed body is a refusal, not a boot failure.
+    """
+    try:
+        if declared is None or (isinstance(declared, str) and not declared.strip()):
+            candidate = impl_dir / f"{name}.py"
+        elif isinstance(declared, str):
+            p = Path(declared)
+            candidate = p if p.is_absolute() else (vault_dir.parent / p)
+        else:
+            return None      # non-string ⇒ malformed body; prove nothing about it
+        if not _path_under(candidate, impl_dir):
+            return None
+        return candidate.resolve()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def normalize_seed_forged_flags(vault_dir, *, logger_=None) -> Dict[str, Any]:
+    """Re-label a vault's SEED tools with the package's ``forged_by_systemu``
+    value — but ONLY where the vault's implementation is byte-identical to the
+    shipped one.
+
+    ``forged_by_systemu`` means "an LLM authored this body". Vaults seeded from
+    the original prototype export carry ``true`` on 39 shipped seed tools that
+    are in fact repo code. Two controls key on the flag and both misfire on that
+    mis-flag: ``action_governance.forged_network_denied`` HARD-DENIES the seeded
+    network tools (``fetch_html``/``fetch_json``/``api_call_get``/
+    ``download_file``) as un-jailed forged egress, and
+    ``tool_sandbox._command_gate_already_scored`` refuses ``run_command`` the
+    command-gate carve-out. Both consumers' own docstrings state the intended
+    posture for a built-in: gated, not denied.
+
+    WHY A SHA GUARD, NOT A BLANKET FLIP: this RELAXES a deny, so "vetted" has to
+    be VERIFIED rather than asserted. A name match alone proves nothing — a forge
+    picks its own ``name`` and its own impl filename. The only evidence that a
+    vault tool IS the repo's tool is that its bytes are the repo's bytes. So the
+    flag moves only on ``sha256(vault impl) == sha256(package impl)``; an
+    operator-edited or forge-substituted body keeps ``forged=true`` and stays
+    denied/gated. Fail closed: anything we cannot positively clear is left alone.
+
+    A sha guard only holds if it hashes the RIGHT FILE and writes to the RIGHT
+    RECORD, so identity is resolved before any hashing:
+
+      * AMBIGUOUS NAMES ARE REFUSED. ``vault._update_index`` upserts on ``id``,
+        so two index entries may share a ``name`` — ``governor._materialise_forge``
+        builds a Tool straight from the LLM-supplied ``spec["name"]`` with a
+        fresh id and no existing-name check. A last-wins ``{name: entry}`` dict
+        picked one of them, hashed ``implementations/{name}.py``, then wrote the
+        flag to the SELECTED entry's body: "vetted" onto a record never hashed.
+        Where more than one entry carries the name we now skip it entirely and
+        count ``skipped_ambiguous`` — there is no evidence identifying the seed,
+        and picking a winner IS the bug.
+
+      * THE HASHED FILE IS THE ONE THAT EXECUTES. ``tool.implementation_path``
+        is what ``ToolSandbox.execute_tool`` loads, so a body declaring
+        ``payload.py`` while a pristine ``{name}.py`` sits beside it must not be
+        cleared. The declared path is resolved the way the runtime resolves it
+        (relative ⇒ anchored at the vault root's PARENT) and must land INSIDE
+        ``vault/tools/implementations/`` by path-component containment after
+        symlink resolution; anything else counts ``skipped_impl_path``.
+
+    Runs on EVERY boot, BEFORE ``run``'s ``installed == vault_seed`` fast path —
+    this fix ships without a version bump, so an existing vault's
+    ``.seed_version`` already matches and anything behind that return would never
+    execute in a real operator's vault. Mirrors ``backfill_effect_tags``'s
+    fast-path-independent invocation. Idempotent: once converged every tool is a
+    pair of sha compares (~41 per boot) and no write. NEVER raises — a
+    normalization failure must not break boot.
+    """
+    log = logger_ or logger
+    vault_dir = Path(vault_dir)
+    errors: list = []
+
+    try:
+        try:
+            pkg_vault = _package_vault_root()
+            pkg_idx = json.loads(
+                (pkg_vault / "tools" / "index.json").read_text(encoding="utf-8")) or []
+        except Exception as exc:  # noqa: BLE001
+            return {"skipped": True, "reason": f"package index unreadable: {exc}"}
+
+        vault_idx_path = vault_dir / "tools" / "index.json"
+        if not vault_idx_path.exists():
+            return {"skipped": True, "reason": "no vault tool index"}
+        try:
+            vault_idx = json.loads(vault_idx_path.read_text(encoding="utf-8")) or []
+        except Exception as exc:  # noqa: BLE001
+            return {"skipped": True, "reason": f"vault index unreadable: {exc}"}
+
+        # Identity by NAME — the migrator's own rule (see module docstring) — but
+        # a name is NOT a key. `vault._update_index` upserts on `id`, so a vault
+        # index can legitimately hold TWO entries under one name, and a last-wins
+        # `{name: entry}` dict would silently pick one of them. Collect every
+        # match instead and refuse the ambiguous ones below.
+        vault_by_name: Dict[str, list] = {}
+        for _e in vault_idx:
+            _n = _e.get("name")
+            if _n:
+                vault_by_name.setdefault(_n, []).append(_e)
+        pkg_impl_dir = pkg_vault / "tools" / "implementations"
+        vault_impl_dir = vault_dir / "tools" / "implementations"
+
+        normalized = 0
+        index_normalized = 0
+        skipped_modified = 0
+        skipped_ambiguous = 0
+        skipped_impl_path = 0
+
+        for pkg_entry in pkg_idx:
+            name = pkg_entry.get("name")
+            pkg_tid = pkg_entry.get("id")
+            if not name or not pkg_tid:
+                continue
+            matches = vault_by_name.get(name) or []
+            if not matches:
+                continue  # not installed here, or a user tool the package never shipped
+            if len(matches) > 1:
+                # AMBIGUOUS. Two records claim this name and nothing here is
+                # evidence of which one is the seed — so there is no "right" one
+                # to pick, only a guess. Guessing is precisely the defect: the
+                # guard hashed `{name}.py` but wrote the flag to the SELECTED
+                # entry's body, which let a forge that named itself after a seed
+                # collect a "vetted" label for a body that was never hashed.
+                # Refuse the whole name; fail closed (see this docstring's rule).
+                skipped_ambiguous += 1
+                continue
+            vault_entry = matches[0]
+            try:
+                # The BODY comes first now: it declares which file EXECUTES, and
+                # that is the file whose bytes have to match the package's. The
+                # vault may hold this seed under its OWN id (identity is by name),
+                # so resolve the body through the vault's index entry.
+                vault_tid = vault_entry.get("id") or pkg_tid
+                vault_body_path = vault_dir / "tools" / f"tool_{vault_tid}.json"
+                if not vault_body_path.exists():
+                    continue  # no body ⇒ nothing to verify and nothing to write
+                vault_body = json.loads(vault_body_path.read_text(encoding="utf-8"))
+
+                # Hash what RUNS, not what the name implies. Only the vault side
+                # is attacker-influenced; the package index ships with the code,
+                # so the package impl stays `{name}.py`.
+                vault_impl = _resolve_vault_impl(
+                    vault_dir, vault_impl_dir, name, vault_body.get(_IMPL_PATH_FIELD))
+                if vault_impl is None:
+                    skipped_impl_path += 1
+                    continue
+
+                pkg_impl = pkg_impl_dir / f"{name}.py"
+                # is_file(), not exists(): a declared path may name the impl
+                # DIRECTORY itself, which is inside the dir and so passes
+                # containment — hashing it would just raise into the per-tool
+                # handler. Not a file ⇒ no provenance to prove.
+                if not (pkg_impl.is_file() and vault_impl.is_file()):
+                    continue  # cannot prove provenance ⇒ leave the flag as-is
+                if _file_sha256(vault_impl) != _file_sha256(pkg_impl):
+                    # Operator- or forge-modified body: NOT the repo's code.
+                    skipped_modified += 1
+                    continue
+
+                pkg_body_path = pkg_vault / "tools" / f"tool_{pkg_tid}.json"
+                if not pkg_body_path.exists():
+                    continue
+                pkg_flag = bool(
+                    json.loads(pkg_body_path.read_text(encoding="utf-8")).get(
+                        _FORGED_FIELD, False))
+
+                if bool(vault_body.get(_FORGED_FIELD, False)) != pkg_flag:
+                    vault_body[_FORGED_FIELD] = pkg_flag  # ONLY this field
+                    _write_text_atomic(
+                        vault_body_path, json.dumps(vault_body, indent=2) + "\n")
+                    normalized += 1
+
+                # The index header is DERIVED from the body (vault._tool_header);
+                # keep the two in agreement or the dashboard/table facets read a
+                # stale label off the header.
+                if bool(vault_entry.get(_FORGED_FIELD, False)) != pkg_flag:
+                    vault_entry[_FORGED_FIELD] = pkg_flag
+                    index_normalized += 1
+            except Exception as exc:  # noqa: BLE001 — never raise per file
+                errors.append(f"normalize {name}: {exc}")
+
+        if index_normalized:
+            try:
+                _write_text_atomic(vault_idx_path, json.dumps(vault_idx, indent=2) + "\n")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"vault_index_write: {exc}")
+                index_normalized = 0
+
+        # Log the REFUSALS too: a seed left denied because its name is ambiguous
+        # or its declared impl path points outside the vault is a state the
+        # operator has to be able to see, or they just get an unexplained deny.
+        if (normalized or index_normalized or skipped_ambiguous
+                or skipped_impl_path or errors):
+            log.info(
+                "[SeedForgedNormalize] bodies=%d index=%d skipped_modified=%d "
+                "skipped_ambiguous=%d skipped_impl_path=%d errors=%d",
+                normalized, index_normalized, skipped_modified,
+                skipped_ambiguous, skipped_impl_path, len(errors))
+        return {
+            "normalized": normalized,
+            "index_normalized": index_normalized,
+            "skipped_modified": skipped_modified,
+            "skipped_ambiguous": skipped_ambiguous,
+            "skipped_impl_path": skipped_impl_path,
+            "errors": errors,
+        }
+    except Exception as exc:  # noqa: BLE001 — never break boot
+        log.error("[SeedForgedNormalize] unexpected failure (non-fatal): %s", exc)
+        return {"error": str(exc)}
+
+
 def _maybe_log_profile_notice(vault_dir) -> None:
     """v0.9.0 (Layer 1): if vault has no user_profile.json, log a one-line
     nudge so operators discover the wizard."""
@@ -286,11 +542,19 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     # version marker; never raises.
     backfill_effect_tags(vault_dir, version=installed, logger_=log)
 
+    # Re-label mis-flagged SEED tools (repo code wrongly marked LLM-forged), sha-
+    # guarded so only a byte-identical-to-package body is cleared. Like the G0
+    # backfill this runs INDEPENDENTLY of the seed-tool fast path below — this
+    # fix ships without a version bump, so an existing vault's .seed_version
+    # already equals `installed` and anything behind that return would never run.
+    forged_norm = normalize_seed_forged_flags(vault_dir, logger_=log)
+
     vault_seed = _read_seed_version(vault_dir)
 
     # Fast path
     if installed == vault_seed:
-        return {"fast_path": True, "seed_version": installed}
+        return {"fast_path": True, "seed_version": installed,
+                "forged_normalized": forged_norm.get("normalized", 0)}
 
     errors: list = []
 
@@ -397,6 +661,7 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
         "skipped_forged": skipped_forged,
         "skipped_identical": skipped_identical,
         "wild_card_added": wild_card_added,
+        "forged_normalized": forged_norm.get("normalized", 0),
         "errors": errors,
     }
     log.info("[VaultMigrator] %s → %s: added=%d updated=%d skipped=%d wild_card_added=%d errors=%d",

@@ -15,6 +15,25 @@ properties are load-bearing:
     the absence of a tag is NEVER "no effect" (unparseable source ⇒ UNKNOWN), and
     the real network boundary is the OS-kernel egress jail (S2), not this scan.
 
+    The scan RESOLVES IMPORT ALIASES. It once matched receivers by literal name,
+    which ordinary idiomatic Python defeated — ``import subprocess as sp``,
+    ``from os import system``, ``import requests as r`` all scanned as
+    "purely local", which silently ungated BOTH consumers of this classifier
+    (``tool_dry_run._gate_skip_reason``, which decides whether a freshly-forged
+    body executes unattended, and ``action_governance.forged_network_denied``,
+    the live network gate). ``_EffectVisitor`` now builds a module-alias and a
+    symbol-alias map while walking and resolves attribute receivers AND bare call
+    names through them. Resolution is ADDITIVE — the literal receiver is scored
+    too — so it can only ever ADD a tag, never remove one the old scan produced.
+
+    KNOWN LIMITS, by construction: this is import-BINDING analysis, not dataflow.
+    A sink reached through a local variable (``sp = subprocess``,
+    ``cx = requests.Session()``, ``f = subprocess.run``) or a star-import is not
+    seen. Genuinely dynamic access (``__import__``/``exec``/``eval``/
+    ``importlib.import_module``) forces UNKNOWN rather than guessing; ``getattr``
+    is DELIBERATELY excluded from that list on measured evidence (see
+    ``_DYNAMIC_UNKNOWN_NAMES``).
+
 Nothing here imports :mod:`systemu.core.models` — the vocabulary is foundational
 and must stay import-cycle-free (``core.models`` stores ``effect_tags`` as plain
 strings and never imports this module).
@@ -133,6 +152,13 @@ _NET_EGRESS_MODULES = {
     "poplib": EffectTag.NET_READ,          # POP3 mail read
     "imaplib": EffectTag.NET_READ,         # IMAP mail read
     "nntplib": EffectTag.NET_READ,         # NNTP read
+    # `from urllib.request import build_opener` / `Request` / `urlretrieve`: the
+    # opener's `.open()` has no receiver the call-site scan can key on, so the
+    # IMPORT is the only reliable signal. NET_READ is the conservative floor —
+    # the call-site `_urlopen_effect` still upgrades a data= urlopen to NET_MUTATE.
+    # Keyed on the FULL dotted module, so the very common (and inert)
+    # `urllib.parse` is NOT matched.
+    "urllib.request": EffectTag.NET_READ,
 }
 
 
@@ -161,6 +187,19 @@ _WRITE_METHODS = {"write_text", "write_bytes"}
 _READ_METHODS = {"read_text", "read_bytes"}
 _WRITE_MODE_CHARS = ("w", "a", "x", "+")
 
+# Genuinely DYNAMIC module/attribute access — the target is a runtime string, so
+# no static resolution is possible and the honest answer is UNKNOWN (gated, never
+# refused). Kept DELIBERATELY SMALL.
+#
+# ``getattr`` is EXCLUDED on measured evidence: it appears in ~15% of this repo's
+# own tool bodies used entirely benignly (``getattr(obj, "name", None)``), so
+# forcing UNKNOWN on it would skip that whole population and collapse the forge
+# dry-run into a no-op — a large validation loss for a small gating gain. The
+# advisory ``code_risk`` scan already surfaces getattr-based indirection to the
+# operator at Gate-2, which is the right surface for it.
+_DYNAMIC_UNKNOWN_NAMES = {"__import__", "exec", "eval"}
+_DYNAMIC_UNKNOWN_ATTRS = {("importlib", "import_module")}
+
 
 class _EffectVisitor(ast.NodeVisitor):
     def __init__(self, sig=None) -> None:
@@ -168,6 +207,19 @@ class _EffectVisitor(ast.NodeVisitor):
         # the curated effect_signals module (lazily injected by classify_source);
         # None ⇒ semantic classification degrades to the structural scan (defensive).
         self._sig = sig
+        # ── import-alias resolution ──────────────────────────────────────────
+        # Without these the scan is NAME-MATCHING: it sees a sink only when the
+        # receiver is spelled literally, so ordinary idiomatic Python
+        # (`import subprocess as sp`, `from os import system`) reads as
+        # purely-local. That defeated BOTH controls this classifier feeds — the
+        # unattended forge dry-run and the live `forged_network_denied` gate.
+        #
+        # local name -> module (`import subprocess as sp`  ⇒ sp -> "subprocess")
+        self._module_alias: "dict[str, str]" = {}
+        # local name -> (module, symbol)
+        # (`from subprocess import check_output as co` ⇒ co -> ("subprocess",
+        #  "check_output")), so a BARE call resolves to a qualified pair.
+        self._symbol_alias: "dict[str, tuple[str, str]]" = {}
 
     def _add_class(self, cls) -> None:
         """Add the EffectTag for a curated class VALUE (e.g. "money_move"); no-op on
@@ -186,6 +238,16 @@ class _EffectVisitor(ast.NodeVisitor):
             _net = _net_egress_for_module(alias.name)
             if _net is not None:
                 self.tags.add(_net)
+            # `import os.path as p` binds `p` to the FULL dotted module, whereas a
+            # plain `import os.path` binds only the ROOT name `os`. Recording the
+            # full dotted name for the aliased form is what keeps `p.remove(...)`
+            # from being mis-resolved to `os.remove` (a false positive) while
+            # `import os.path; os.remove(...)` still resolves correctly.
+            if alias.asname:
+                self._module_alias[alias.asname] = alias.name
+            else:
+                root = alias.name.split(".")[0]
+                self._module_alias[root] = root
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
@@ -195,6 +257,15 @@ class _EffectVisitor(ast.NodeVisitor):
             _net = _net_egress_for_module(node.module)
             if _net is not None:
                 self.tags.add(_net)
+            # RELATIVE imports (`from .os import system`, level > 0) name a LOCAL
+            # module, not the stdlib one — resolving those against the stdlib
+            # tables would invent effects that are not there.
+            if not node.level:
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue   # star-import: nothing to bind a name to
+                    self._symbol_alias[alias.asname or alias.name] = (
+                        node.module, alias.name)
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802
@@ -202,6 +273,29 @@ class _EffectVisitor(ast.NodeVisitor):
         if self._sig is not None and isinstance(node.value, str):
             self._add_class(self._sig.class_for_host(node.value))
         self.generic_visit(node)
+
+    def _classify_module_attr(self, mod: str, attr: str, node: ast.Call) -> None:
+        """Score a resolved ``module.attr`` sink. Shared by the attribute-receiver
+        path and the BARE-name path (a from-imported symbol is the same sink, just
+        spelled without its module)."""
+        pair = (mod, attr)
+        if pair in _DELETE_ATTRS:
+            self.tags.add(EffectTag.LOCAL_DELETE)
+        elif pair in _WRITE_ATTRS:
+            self.tags.add(EffectTag.LOCAL_WRITE)
+        elif pair in _SHELL_ATTRS:
+            self.tags.add(EffectTag.SHELL_EXEC)
+        elif pair in _DYNAMIC_UNKNOWN_ATTRS:
+            self.tags.add(EffectTag.UNKNOWN)
+        elif mod == "subprocess" and attr in _SUBPROCESS_FUNCS:
+            self.tags.add(EffectTag.SHELL_EXEC)
+        elif mod == "socket" and attr in {"socket", "create_connection"}:
+            self.tags.add(EffectTag.NET_MUTATE)
+        elif mod in _NET_CLIENTS:
+            if attr in _NET_READ_METHODS:
+                self.tags.add(EffectTag.NET_READ)
+            elif attr in _NET_WRITE_METHODS:
+                self.tags.add(EffectTag.NET_MUTATE)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 (ast API)
         func = node.func
@@ -211,28 +305,30 @@ class _EffectVisitor(ast.NodeVisitor):
                 self.tags.add(self._open_effect(node))
             elif func.id == "urlopen":
                 self.tags.add(self._urlopen_effect(node))
+            elif func.id in _DYNAMIC_UNKNOWN_NAMES:
+                # a runtime-string target — no static resolution is possible
+                self.tags.add(EffectTag.UNKNOWN)
+            # A BARE call of a from-imported symbol is the SAME sink as the
+            # qualified form: `from subprocess import check_output` +
+            # `check_output(...)` ⇒ ("subprocess", "check_output").
+            _sym = self._symbol_alias.get(func.id)
+            if _sym is not None:
+                self._classify_module_attr(_sym[0], _sym[1], node)
 
         elif isinstance(func, ast.Attribute):
             attr = func.attr
             # module.attr where module is a bare Name
             if isinstance(func.value, ast.Name):
-                mod = func.value.id
-                pair = (mod, attr)
-                if pair in _DELETE_ATTRS:
-                    self.tags.add(EffectTag.LOCAL_DELETE)
-                elif pair in _WRITE_ATTRS:
-                    self.tags.add(EffectTag.LOCAL_WRITE)
-                elif pair in _SHELL_ATTRS:
-                    self.tags.add(EffectTag.SHELL_EXEC)
-                elif mod == "subprocess" and attr in _SUBPROCESS_FUNCS:
-                    self.tags.add(EffectTag.SHELL_EXEC)
-                elif mod == "socket" and attr in {"socket", "create_connection"}:
-                    self.tags.add(EffectTag.NET_MUTATE)
-                elif mod in _NET_CLIENTS:
-                    if attr in _NET_READ_METHODS:
-                        self.tags.add(EffectTag.NET_READ)
-                    elif attr in _NET_WRITE_METHODS:
-                        self.tags.add(EffectTag.NET_MUTATE)
+                # Score the LITERAL receiver AND its import-alias resolution.
+                # The union is deliberate: it is strictly ADDITIVE, so no
+                # classification the pre-alias scan produced can be lost (a bare
+                # `session.post(...)` on an un-imported local keeps working), while
+                # `import subprocess as sp; sp.run(...)` now also resolves.
+                literal = func.value.id
+                resolved = self._module_alias.get(literal)
+                self._classify_module_attr(literal, attr, node)
+                if resolved is not None and resolved != literal:
+                    self._classify_module_attr(resolved, attr, node)
             # attr-only signals (any receiver) — conservative, high-value only
             if attr == "urlopen":
                 self.tags.add(self._urlopen_effect(node))

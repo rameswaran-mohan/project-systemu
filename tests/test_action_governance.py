@@ -65,6 +65,70 @@ def test_send_message_requires_approval():
 
 
 # --------------------------------------------------------------------------- #
+# shell_exec is an APPROVAL-band effect (coupled with the classifier's import-
+# alias resolution). "local" describes a shell's EGRESS class, not its blast
+# radius: a shell can run anything, so the gate must card it.
+#
+# Before this ratchet `shell_exec` was in `_LOCAL_TAGS` and ABSENT from
+# `_APPROVAL_TAGS`, so `{shell_exec}` scored ALLOW. Once `classify_source`
+# learned to resolve import aliases, forged shell bodies stopped scanning EMPTY
+# (UNKNOWN ⇒ gated) and started scanning `{shell_exec}` (ALLOW ⇒ UNGATED) — a
+# more accurate classifier made the gate LESS protective. These pin the fix.
+# --------------------------------------------------------------------------- #
+
+def test_shell_exec_requires_approval():
+    assert _v(tool="exec_body", effect_tags={EffectTag.SHELL_EXEC.value}) == Verdict.REQUIRE_APPROVAL
+
+
+def test_shell_exec_with_local_write_requires_approval():
+    # the common forged shape: writes a file AND shells out. The benign local
+    # companion tag must not dilute the shell escalation.
+    assert _v(tool="exec_body", effect_tags={EffectTag.LOCAL_WRITE.value,
+                                             EffectTag.SHELL_EXEC.value}) == Verdict.REQUIRE_APPROVAL
+
+
+def test_shell_exec_with_net_read_requires_approval():
+    # net_read alone is the frictionless majority (ALLOW); adding shell_exec
+    # must still card.
+    assert _v(tool="exec_body", effect_tags={EffectTag.NET_READ.value,
+                                             EffectTag.SHELL_EXEC.value}) == Verdict.REQUIRE_APPROVAL
+
+
+def test_shell_exec_stays_in_local_tags_so_the_name_map_cannot_escalate():
+    """REGRESSION PIN: `shell_exec` must REMAIN in `_LOCAL_TAGS`.
+
+    `_LOCAL_TAGS` is not "the safe tags" — it is the set `_effective_tags` uses
+    to compute `local_only`, which SUPPRESSES the NAME verb-map. That
+    suppression is the `send_summary_to_log` no-false-positive rule, and
+    `local_delete` is already in BOTH sets for exactly this reason. Drop
+    `shell_exec` from `_LOCAL_TAGS` and a shell tool named `run_deploy_script`
+    or `send_report_via_shell` silently acquires NET_MUTATE / SEND_MESSAGE it
+    never had.
+
+    This asserts on the TAG SET, not on the verdict. The verdict is
+    REQUIRE_APPROVAL either way now that `shell_exec` is an approval tag, so a
+    verdict assertion here would pass for the wrong reason and prove nothing.
+    """
+    from systemu.runtime.action_governance import _effective_tags
+
+    tags = _effective_tags(ActionContext(
+        tool="send_report_and_update_index",   # "send" + "update" both in the verb map
+        effect_tags={EffectTag.SHELL_EXEC.value, EffectTag.LOCAL_WRITE.value},
+    ))
+
+    assert EffectTag.SEND_MESSAGE.value not in tags, (
+        "the name verb-map escalated a tool-side-local shell tool to SEND_MESSAGE "
+        "— shell_exec was dropped from _LOCAL_TAGS")
+    assert EffectTag.NET_MUTATE.value not in tags, (
+        "the name verb-map escalated a tool-side-local shell tool to NET_MUTATE "
+        "— shell_exec was dropped from _LOCAL_TAGS")
+    # and it still cards, on the shell tag itself rather than on a phantom one
+    assert _v(tool="send_report_and_update_index",
+              effect_tags={EffectTag.SHELL_EXEC.value,
+                           EffectTag.LOCAL_WRITE.value}) == Verdict.REQUIRE_APPROVAL
+
+
+# --------------------------------------------------------------------------- #
 # the two-band UNKNOWN rule (BLOCKER-1)
 # --------------------------------------------------------------------------- #
 

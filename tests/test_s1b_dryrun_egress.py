@@ -201,32 +201,18 @@ class TestFailClosedOnUndeterminableTags:
         assert executed == [], "shell-egress tool must not reach _execute"
         assert result.status == "skipped"
 
-    def test_aliased_net_import_with_empty_tags_is_skipped(self, tmp_path, vault, monkeypatch):
-        """An aliased net import (`import requests as r; r.get(...)`) is a known
-        blind spot of the AST classifier → it yields NO tags → effective tag set
-        is empty/undeterminable → fail-closed SKIP. The old code executed it."""
+    def _assert_untagged_body_is_skipped(self, body, filename, tmp_path, vault,
+                                         monkeypatch):
+        """Drive an UNTAGGED tool with ``body`` through the pipeline and assert it
+        never reaches ``_execute``."""
         from systemu.pipelines.tool_dry_run import dry_run_tool
-        from systemu.runtime.effect_tags import classify_source
-
-        body = (
-            "import requests as r\n"
-            "\n"
-            "def run(x):\n"
-            "    return r.get('https://example.com')\n"
-        )
-        # Precondition: this really is a classifier blind spot (no tags), so the
-        # test proves the EMPTY/undeterminable branch, not a positive net match.
-        assert classify_source(body) == set()
 
         impl_dir = tmp_path / "vault" / "tools" / "implementations"
         impl_dir.mkdir(parents=True, exist_ok=True)
-        impl_file = impl_dir / "aliased_net.py"
-        impl_file.write_text(body)
+        (impl_dir / filename).write_text(body)
 
         t = _make_tool(name="fetch_data")  # no effect_tags
-        t.implementation_path = "vault/tools/implementations/aliased_net.py"
-
-        config = _config_for(tmp_path / "vault")
+        t.implementation_path = f"vault/tools/implementations/{filename}"
 
         executed = []
         monkeypatch.setattr(
@@ -234,10 +220,63 @@ class TestFailClosedOnUndeterminableTags:
             lambda tool, params, vault, config: executed.append(True) or {"success": True},
         )
 
-        result = dry_run_tool(t, vault=vault, config=config)
+        result = dry_run_tool(t, vault=vault, config=_config_for(tmp_path / "vault"))
 
-        assert executed == [], "aliased-net tool must not reach _execute"
+        assert executed == [], "net-reaching tool must not reach _execute"
         assert result.status == "skipped"
+
+    def test_dataflow_net_body_with_empty_tags_is_skipped(self, tmp_path, vault,
+                                                          monkeypatch):
+        """The EMPTY/undeterminable branch: a body whose net sink the classifier
+        cannot bind yields NO tags → fail-closed SKIP. The old code executed it.
+
+        This test used to use ``import requests as r; r.get(...)`` as its
+        blind-spot example. That is no longer a blind spot — ``classify_source``
+        now resolves import aliases — so the example was re-anchored on one that
+        genuinely remains: a client object held in a LOCAL VARIABLE, which needs
+        dataflow analysis rather than import-binding resolution. Re-anchoring
+        keeps this test proving the empty-tags branch instead of silently
+        becoming a duplicate of the positive-match case below.
+        """
+        from systemu.runtime.effect_tags import classify_source
+
+        body = (
+            "import requests\n"
+            "\n"
+            "def run(x):\n"
+            "    cx = requests.Session()\n"
+            "    return cx.get('https://example.com')\n"
+        )
+        # Precondition: this really is a classifier blind spot (no tags), so the
+        # test proves the EMPTY/undeterminable branch, not a positive net match.
+        assert classify_source(body) == set()
+
+        self._assert_untagged_body_is_skipped(
+            body, "dataflow_net.py", tmp_path, vault, monkeypatch)
+
+    def test_aliased_net_import_is_positively_classified_and_skipped(
+            self, tmp_path, vault, monkeypatch):
+        """The POSITIVE-match counterpart. ``import requests as r; r.get(...)``
+        was a classifier blind spot that scanned as NO tags and reached
+        ``_execute``; alias resolution now tags it ``net_read``, so it is skipped
+        on a positive net classification rather than on undeterminability.
+
+        Both routes are asserted so the fail-closed guard cannot regress into
+        depending on only one of them.
+        """
+        from systemu.runtime.effect_tags import EffectTag, classify_source
+
+        body = (
+            "import requests as r\n"
+            "\n"
+            "def run(x):\n"
+            "    return r.get('https://example.com')\n"
+        )
+        # Precondition: a POSITIVE net classification (not the empty branch).
+        assert EffectTag.NET_READ in classify_source(body)
+
+        self._assert_untagged_body_is_skipped(
+            body, "aliased_net.py", tmp_path, vault, monkeypatch)
 
     def test_completely_empty_tags_no_source_is_skipped(self, tmp_path, vault, monkeypatch):
         """No declared tags AND no resolvable source (missing impl file) →

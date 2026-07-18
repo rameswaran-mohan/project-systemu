@@ -32,8 +32,11 @@ Safety:
   verdict. LIMIT: the scoring is only as good as its inputs. For a tool with
   DECLARED ``effect_tags`` it mirrors the live gate; for an UNTAGGED tool
   (every freshly-forged one) it falls back to an advisory ``classify_source``
-  scan that is NAME-MATCHING and can under-tag — see that function's
-  docstring and ``tests/test_dryrun_gate_skip.py``'s KNOWN GAP section.
+  scan. That scan RESOLVES IMPORT ALIASES (``import subprocess as sp``,
+  ``from os import system``) and forces UNKNOWN on dynamic access, but it is
+  import-binding analysis, NOT dataflow — a sink reached through a local
+  variable is still unseen and can under-tag. See that function's docstring
+  and ``tests/test_dryrun_gate_skip.py``'s WHAT REMAINS UNCOVERED section.
 * **Replay mode** (v0.5.0-d) — when ``replay_params`` is supplied, the
   pipeline skips test-param generation and instead runs the tool against
   each historical params set.  ANY failure → backward-compat regression.
@@ -725,10 +728,12 @@ def _execute(
 #     — obvious egress; net_read is included DELIBERATELY (a dry-run must not
 #     phone home even for a read: it leaks presence, burns a rate-limited quota).
 #   * shell_exec — a shell can `curl` out, so it is egress-capable.
-#   * unknown — classify_source couldn't resolve the source (unparseable).
+#   * unknown — classify_source couldn't resolve the source (unparseable, or a
+#     dynamic __import__/exec/eval/importlib.import_module it refuses to guess at).
 #   * EMPTY / undeterminable — no declared tags AND the source scan yielded
-#     nothing (unreadable file, or an aliased import like `import requests as r`
-#     that the AST classifier doesn't recognize).
+#     nothing (unreadable file, or a body whose sinks the scan cannot bind — it
+#     resolves import aliases but NOT local-variable dataflow, so
+#     `sp = subprocess; sp.run(...)` still yields no tag).
 # This guard FAILS CLOSED: it proceeds ONLY when it can prove non-egress, i.e.
 # the effective tags are non-empty and a subset of SAFE_LOCAL. This matches the
 # live S1 gate's "empty ⇒ UNKNOWN ⇒ don't trust" principle — the dry-run must be
@@ -790,8 +795,8 @@ def _gate_skip_reason(
 
     Not "anything the live gate would card": the untagged path deliberately
     DIVERGES from the live gate (see below), and the source scan it substitutes
-    is name-matching, so a body reaching a sink through a non-literal receiver
-    scans clean and PROCEEDS.
+    resolves import bindings but not dataflow, so a body reaching a sink through
+    a local VARIABLE still scans clean and PROCEEDS.
 
     Returns ``(verdict_str, reason)`` to SKIP, or ``None`` to proceed.
 
@@ -849,27 +854,31 @@ def _gate_skip_reason(
     gating gain is CONDITIONAL, not free (see the caveat below).
 
     ── What that fallback is, and is NOT ────────────────────────────────────
-    The fallback is an ADVISORY, NAME-MATCHING ``classify_source`` scan. It is
-    better-INFORMED than a bare UNKNOWN but strictly LESS SAFE, because the two
-    fail in opposite directions: UNKNOWN always SKIPS, whereas a scan that comes
-    back purely-local EXECUTES. For an untagged tool, a body whose only
-    RECOGNISED sinks are local WILL EXECUTE unattended — including when that
-    same body also reaches subprocess / os / the network through a receiver the
-    scan does not recognise by name. ``classify_source`` matches literal
-    receivers (``subprocess.run``, ``os.system``, ``requests.get``), so
-    ``import subprocess as sp; sp.run(...)`` — and the ordinary idiomatic
-    ``from subprocess import check_output`` / ``from os import system`` — scan
-    as purely-local and proceed.
+    The fallback is an ADVISORY ``classify_source`` scan. It is better-INFORMED
+    than a bare UNKNOWN but strictly LESS SAFE, because the two fail in opposite
+    directions: UNKNOWN always SKIPS, whereas a scan that comes back purely-local
+    EXECUTES. For an untagged tool, a body whose only RECOGNISED sinks are local
+    WILL EXECUTE unattended — including when that same body also reaches
+    subprocess / os / the network through a receiver the scan cannot resolve.
 
-    ``_net_egress_skip_reason`` running first does NOT bound this. It bounds the
-    reachable VERDICTS (to ALLOW / REQUIRE_APPROVAL), not the reachable RISK: it
-    consumes the SAME under-tagging scan, so a body it reads as purely-local is
-    exactly the body that gets here and executes. The "bound" is vacuous for the
-    dominant case — a freshly-forged untagged tool. See
-    ``TestKnownGap_UntaggedSourceScanIsNameMatching`` in
-    ``tests/test_dryrun_gate_skip.py``, the strict-xfail ratchet that will
-    xpass — and force this docstring to be rewritten — when the classifier
-    learns alias resolution.
+    The scan RESOLVES IMPORT ALIASES, so the ordinary idiomatic forms that used
+    to defeat it — ``import subprocess as sp; sp.run(...)``,
+    ``from subprocess import check_output``, ``from os import system``,
+    ``import requests as r`` — are now tagged correctly, and dynamic access
+    (``__import__``/``exec``/``eval``/``importlib.import_module``) forces UNKNOWN
+    (which SKIPS). What it still misses is DATAFLOW: ``sp = subprocess``,
+    ``cx = requests.Session()``, ``f = subprocess.run``, ``from subprocess import
+    *``, and the deliberately-excluded ``getattr(os, "system")``. Those still
+    scan purely-local and proceed.
+
+    ``_net_egress_skip_reason`` running first does NOT bound that residue. It
+    bounds the reachable VERDICTS (to ALLOW / REQUIRE_APPROVAL), not the
+    reachable RISK: it consumes the SAME scan, so a body it reads as purely-local
+    is exactly the body that gets here and executes. See
+    ``TestRemainingGap_LocalVariableDataflow`` in
+    ``tests/test_dryrun_gate_skip.py``, the strict-xfail ratchet that will xpass —
+    and force this docstring to be rewritten — if the classifier ever learns
+    dataflow analysis.
 
     When declared tags ARE present the scan is never consulted and the context
     is byte-identical to the live gate's.
@@ -901,7 +910,21 @@ def _gate_skip_reason(
         if denied:
             return (Verdict.DENY.value, denied)
 
-        # (2) The action-governance ladder — mirrors _maybe_gate_tool:1073-1081.
+        # (2) The action-governance ladder — mirrors _maybe_gate_tool:1182-1189.
+        #
+        #     DELIBERATE ASYMMETRY: the live gate carries a shell-tool carve-out
+        #     (``tool_sandbox._command_gate_already_scored``) that skips carding
+        #     `run_command` / `run_cli_command` when `shell_exec` is the sole
+        #     approval-band tag, because `_maybe_gate_command` — which is
+        #     params-DEPENDENT and therefore strictly stronger — already scored
+        #     that exact command one call earlier. This pipeline NEVER runs
+        #     `_maybe_gate_command` (it calls `execute_tool` without `tool=`, and
+        #     the command gate is not part of the path it re-implements), so it
+        #     has NO command-gate decision to delegate to. It keeps the strict
+        #     scorer: a `shell_exec` body SKIPS here. That is the fail-closed
+        #     direction and it is the point — a dry-run fires UNATTENDED, so
+        #     "some other gate already looked at this" must be a fact, never an
+        #     assumption. Do NOT add the carve-out here.
         declared = {str(t) for t in (getattr(tool, "effect_tags", None) or [])}
         effect_tags = declared or _scan_source_effect_tags(tool, config)
 
@@ -981,13 +1004,19 @@ def _net_egress_skip_reason(tool: "Tool", config: Optional["Config"] = None) -> 
     This mirrors the live S1 gate's "empty ⇒ UNKNOWN ⇒ don't trust" stance.
 
     LIMIT — this is fail-closed on what the scan SEES, not on what the body
-    DOES. An aliased or from-imported egress sink does NOT produce an empty set
-    and therefore does NOT skip: the scan simply does not tag it, so the body's
-    OTHER recognised sinks decide the verdict. ``import requests as r`` plus a
-    local ``Path(...).write_text(...)`` scans exactly ``{local_write}`` — purely
-    local, so it PROCEEDS and executes. The guard is a floor under DECLARED
-    tags and under obviously-net bodies; it is not a proof of non-egress. See
-    ``_gate_skip_reason``'s "What that fallback is, and is NOT" block.
+    DOES. A sink the scan cannot resolve does NOT produce an empty set and
+    therefore does NOT skip: the scan simply does not tag it, so the body's OTHER
+    recognised sinks decide the verdict, and a body whose remaining sinks are
+    local PROCEEDS and executes.
+
+    Import ALIASES no longer fall in that hole — ``import requests as r; r.get()``
+    and ``from os import system`` now tag correctly, so bodies like those skip
+    here. What still does: a sink reached through a local VARIABLE
+    (``sp = subprocess``, ``cx = requests.Session()``, ``f = subprocess.run``), a
+    star-import, and the deliberately-excluded ``getattr(os, "system")``. The
+    guard is a floor under DECLARED tags and under bodies whose sinks the scan
+    can bind; it is not a proof of non-egress. See ``_gate_skip_reason``'s "What
+    that fallback is, and is NOT" block.
     """
     try:
         tags = {str(t).strip().lower() for t in (tool.effect_tags or [])}

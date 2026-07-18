@@ -350,3 +350,256 @@ def test_http_server_import_is_not_net_egress():
     from systemu.runtime.effect_tags import classify_source, EffectTag
     tags = classify_source("import http.server\ndef run(**kw):\n    return 1\n")
     assert EffectTag.NET_MUTATE not in tags and EffectTag.NET_READ not in tags
+
+
+# --------------------------------------------------------------------------- #
+# IMPORT-ALIAS RESOLUTION — the classifier must not be defeated by ordinary
+# Python spelling.
+#
+# Before this, the scan was NAME-MATCHING: it recognised a sink only when the
+# receiver was spelled literally (``subprocess.run``, ``os.system``,
+# ``requests.get``). Every body below is idiomatic, non-adversarial Python that
+# scanned as exactly ``{local_write}`` — "purely local" — and so was executed
+# unattended by the forge dry-run AND passed ``forged_network_denied`` at the
+# LIVE gate. The dominant real-world trigger is a careless LLM forge, not an
+# attacker.
+#
+# Each body pairs the aliased sink with one ordinary local write, so a scan that
+# still misses the sink comes back ``{local_write}`` rather than empty — i.e.
+# these tests fail LOUDLY on a regression instead of degrading to "no sinks".
+# --------------------------------------------------------------------------- #
+
+def _local_write_plus(imports: str, call: str) -> str:
+    """A body whose ONLY other sink is a plain local write."""
+    return (
+        f"{imports}"
+        "from pathlib import Path\n"
+        "\n"
+        "def run(x):\n"
+        "    Path('out.txt').write_text('local')\n"
+        f"    {call}\n"
+        "    return {'success': True}\n"
+    )
+
+
+def _bare(imports: str, call: str) -> str:
+    """The same body with NO local write, for assertions that must not be
+    satisfied by a confounding sink (e.g. proving ``shutil.move`` itself is what
+    produced ``local_write``)."""
+    return f"{imports}\ndef run(x):\n    {call}\n    return {{'success': True}}\n"
+
+
+class TestAliasedImportsAreResolved:
+    """``import X as Y`` — the receiver is resolved through the import alias map."""
+
+    def test_aliased_subprocess_is_shell_exec(self):
+        tags = _tags(_local_write_plus(
+            "import subprocess as sp\n", "sp.run(['echo', 'hi'])"))
+        assert EffectTag.SHELL_EXEC.value in tags
+
+    def test_aliased_shutil_rmtree_is_local_delete(self):
+        tags = _tags(_local_write_plus(
+            "import shutil as sh\n", "sh.rmtree('/tmp/x')"))
+        assert EffectTag.LOCAL_DELETE.value in tags
+
+    def test_aliased_requests_get_is_net_read(self):
+        tags = _tags(_local_write_plus(
+            "import requests as r\n", "r.get('https://example.com/x')"))
+        assert EffectTag.NET_READ.value in tags
+
+    def test_aliased_requests_delete_is_net_mutate(self):
+        """``delete`` — deliberately NOT ``post``/``put``/``patch``, which the
+        pre-existing ``_ATTR_ONLY_NET_MUTATE`` rule catches on ANY receiver and
+        which would therefore pass without any alias resolution at all."""
+        tags = _tags(_bare("import requests as r\n", "r.delete('https://example.com/x')"))
+        assert EffectTag.NET_MUTATE.value in tags
+
+    def test_aliased_os_system_is_shell_exec(self):
+        tags = _tags(_local_write_plus("import os as o\n", "o.system('ls')"))
+        assert EffectTag.SHELL_EXEC.value in tags
+
+    def test_dotted_alias_resolves_to_the_full_module_not_its_root(self):
+        """``import os.path as p`` binds ``p`` to ``os.path``, NOT to ``os``.
+
+        The call here is deliberately ``p.remove(...)``: ``remove`` is in
+        ``_DELETE_ATTRS`` as ``("os", "remove")`` and is NOT one of the
+        attr-only rules, so resolving the alias to the ROOT would invent a
+        ``local_delete`` that is not there. Resolving to the FULL dotted module
+        yields ``("os.path", "remove")``, which matches nothing.
+
+        (A ``p.exists(...)`` probe would NOT discriminate — it collides with no
+        table under either resolution, so it passes even when the resolution is
+        wrong. Confirmed by mutation-testing this rule.)
+        """
+        tags = _tags(_local_write_plus("import os.path as p\n", "p.remove('/tmp/x')"))
+        assert tags == {EffectTag.LOCAL_WRITE.value}
+
+    def test_plain_dotted_import_still_binds_its_root(self):
+        """``import os.path`` (no asname) binds the name ``os`` — so ``os.remove``
+        in the same body must still resolve."""
+        tags = _tags(_local_write_plus("import os.path\n", "os.remove('/tmp/x')"))
+        assert EffectTag.LOCAL_DELETE.value in tags
+
+
+class TestFromImportsAreResolved:
+    """``from X import Y`` — a BARE call name is resolved to its (module, symbol)."""
+
+    def test_from_import_subprocess_check_output_is_shell_exec(self):
+        tags = _tags(_local_write_plus(
+            "from subprocess import check_output\n", "check_output(['echo', 'hi'])"))
+        assert EffectTag.SHELL_EXEC.value in tags
+
+    def test_from_import_os_system_is_shell_exec(self):
+        tags = _tags(_local_write_plus(
+            "from os import system\n", "system('echo hi')"))
+        assert EffectTag.SHELL_EXEC.value in tags
+
+    def test_from_import_os_remove_is_local_delete(self):
+        tags = _tags(_local_write_plus(
+            "from os import remove\n", "remove('/tmp/x')"))
+        assert EffectTag.LOCAL_DELETE.value in tags
+
+    def test_from_import_shutil_rmtree_is_local_delete(self):
+        tags = _tags(_local_write_plus(
+            "from shutil import rmtree\n", "rmtree('/tmp/x')"))
+        assert EffectTag.LOCAL_DELETE.value in tags
+
+    def test_from_import_with_asname_is_resolved(self):
+        """``from subprocess import check_output as co`` — the alias, not the
+        symbol, is what appears at the call site."""
+        tags = _tags(_local_write_plus(
+            "from subprocess import check_output as co\n", "co(['echo', 'hi'])"))
+        assert EffectTag.SHELL_EXEC.value in tags
+
+    def test_from_import_shutil_move_is_local_write(self):
+        """No confounding ``Path.write_text`` here — ``move`` itself must be what
+        produces the tag, otherwise this would pass unchanged."""
+        tags = _tags(_bare("from shutil import move\n", "move('/tmp/a', '/tmp/b')"))
+        assert tags == {EffectTag.LOCAL_WRITE.value}
+
+    def test_urllib_request_build_opener_is_net(self):
+        """``from urllib.request import build_opener`` — the opener's ``.open()``
+        has no recognisable receiver, so the IMPORT is what must carry the net
+        signal (``urllib.request`` is unambiguously egress; ``urllib.parse`` is
+        not — see the precision test below)."""
+        from systemu.runtime.action_governance import has_network_egress
+        tags = _tags(_local_write_plus(
+            "from urllib.request import build_opener\n",
+            "build_opener().open('https://example.com/x')"))
+        assert has_network_egress(tags)
+
+    def test_plain_urllib_request_import_is_net(self):
+        from systemu.runtime.action_governance import has_network_egress
+        assert has_network_egress(_tags("import urllib.request\ndef run(x):\n    return 1\n"))
+
+    def test_relative_from_import_is_not_resolved_against_stdlib(self):
+        """PRECISION: ``from .os import system`` imports a LOCAL module named
+        ``os``, not the stdlib one. Resolving a relative import against the
+        stdlib tables would be a false positive."""
+        tags = _tags(_local_write_plus("from .os import system\n", "system('x')"))
+        assert EffectTag.SHELL_EXEC.value not in tags
+
+
+class TestNoFalsePositivesFromAliasResolution:
+    """Precision guards — the resolution must not invent effects."""
+
+    def test_urllib_parse_is_not_net(self):
+        from systemu.runtime.action_governance import has_network_egress
+        assert not has_network_egress(
+            _tags("from urllib.parse import urlencode\ndef run(x):\n    return urlencode(x)\n"))
+
+    def test_unrelated_alias_is_inert(self):
+        tags = _tags(_local_write_plus(
+            "import json as j\n", "j.dumps({'a': 1})"))
+        assert tags == {EffectTag.LOCAL_WRITE.value}
+
+    def test_from_import_of_a_benign_symbol_is_inert(self):
+        tags = _tags(_local_write_plus(
+            "from os import getcwd\n", "getcwd()"))
+        assert tags == {EffectTag.LOCAL_WRITE.value}
+
+    def test_local_variable_shadowing_a_module_name_still_classifies(self):
+        """Pre-existing behaviour must be preserved: a receiver that is NOT in
+        the alias map falls back to its literal name, so ``session.post(...)``
+        and an unimported ``os.system(...)`` keep classifying as they did."""
+        assert EffectTag.NET_MUTATE.value in _tags("session.post('https://x/y')")
+        assert EffectTag.SHELL_EXEC.value in _tags("os.system('ls')")
+
+
+class TestDynamicAccessForcesUnknown:
+    """Genuinely DYNAMIC module/attribute access cannot be resolved statically,
+    so it forces UNKNOWN (gated, never refused).
+
+    Deliberately EXCLUDES ``getattr``: it was measured at ~15% of this repo's own
+    tool bodies used benignly, so forcing UNKNOWN on it would make every such body
+    skip and collapse the dry-run into a no-op.
+    """
+
+    @pytest.mark.parametrize("call", [
+        "__import__('subprocess').run(['ls'])",
+        "exec('import os; os.system(\"ls\")')",
+        "eval('__import__(\"os\").system(\"ls\")')",
+    ])
+    def test_dynamic_builtin_forces_unknown(self, call):
+        assert EffectTag.UNKNOWN.value in _tags(_local_write_plus("", call))
+
+    def test_importlib_import_module_forces_unknown(self):
+        tags = _tags(_local_write_plus(
+            "import importlib\n", "importlib.import_module('subprocess').run(['ls'])"))
+        assert EffectTag.UNKNOWN.value in tags
+
+    def test_from_importlib_import_module_forces_unknown(self):
+        tags = _tags(_local_write_plus(
+            "from importlib import import_module\n", "import_module('subprocess')"))
+        assert EffectTag.UNKNOWN.value in tags
+
+    def test_getattr_is_deliberately_not_unknown_forcing(self):
+        """The measured-cost exclusion, pinned so it is not "tightened" by
+        accident: ~15% of real tool bodies use getattr benignly."""
+        tags = _tags(_local_write_plus("", "getattr(obj, 'name', None)"))
+        assert EffectTag.UNKNOWN.value not in tags
+
+
+class TestAliasResolutionReachesBothSafetyControls:
+    """The classifier is load-bearing for TWO controls. Both must see the sink.
+
+    1. ``tool_dry_run._net_egress_skip_reason`` — whose ``_SAFE_LOCAL_TAGS``
+       allowlist excludes ``shell_exec``, so a resolved shell sink now skips.
+    2. ``action_governance.forged_network_denied`` — the LIVE gate, which
+       re-scans the source precisely because declared tags are untrustworthy.
+    """
+
+    def test_live_gate_sees_an_aliased_network_sink(self, tmp_path):
+        from systemu.runtime.action_governance import forged_network_denied
+
+        # ``get`` — NOT post/put/patch, which the pre-existing attr-only rule
+        # already catches on any receiver; this must fail without alias resolution.
+        impl = tmp_path / "aliased_net.py"
+        impl.write_text(_local_write_plus(
+            "import requests as r\n", "r.get('https://example.invalid/x')"),
+            encoding="utf-8")
+
+        class _T:
+            forged_by_systemu = True
+            effect_tags = []          # exactly as tool_forge leaves it
+            implementation_path = str(impl)
+
+        assert forged_network_denied(_T()) is not None, (
+            "SECURITY: the LIVE forged-network gate did not see an aliased "
+            "requests sink in a forged tool's source")
+
+    def test_live_gate_still_clears_a_purely_local_forged_tool(self, tmp_path):
+        """The no-false-positive half: a genuinely local forged tool must still
+        pass the live gate, or every forge is denied."""
+        from systemu.runtime.action_governance import forged_network_denied
+
+        impl = tmp_path / "purely_local.py"
+        impl.write_text(_local_write_plus("import json as j\n", "j.dumps({'a': 1})"),
+                        encoding="utf-8")
+
+        class _T:
+            forged_by_systemu = True
+            effect_tags = []
+            implementation_path = str(impl)
+
+        assert forged_network_denied(_T()) is None

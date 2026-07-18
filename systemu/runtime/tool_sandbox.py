@@ -53,6 +53,69 @@ _WRITE_NAME_TOKENS = (
 # carry, not by their name (see ToolSandbox.is_destructive_call).
 _SHELL_TOOL_NAMES = {"run_command", "run_cli_command"}
 
+# The tag subset the command gate's decision can stand in for. ``shell_exec``
+# must be the SOLE approval-band reason to card: everything else here is
+# ALLOW-band on its own, so their presence adds no un-delegated risk.
+# ``local_delete`` is DELIBERATELY absent — it is approval-band in its own right
+# and the command gate has nothing to say about a delete the command string does
+# not express.
+_COMMAND_GATE_DELEGABLE_TAGS = {"shell_exec", "local_read", "local_write"}
+
+
+def _command_gate_already_scored(tool, tool_name: str, effect_tags: set) -> bool:
+    """True iff ``_maybe_gate_command`` has ALREADY governed this exact call, so
+    the per-tool gate would only re-ask a question that was just answered.
+
+    Context: ``shell_exec`` is an APPROVAL-band effect at the action governor
+    (a shell can run anything). Without this pre-check, adding it to
+    ``_APPROVAL_TAGS`` would re-open W12 / audit-F5 — a provably read-only ``ver``
+    auto-denied — because ``run_command`` carries ``shell_exec`` on EVERY call,
+    including the read-only ones the command gate deliberately lets through.
+
+    Why the delegation is TOTAL and safe: ``_maybe_gate_command`` runs
+    immediately before ``_maybe_gate_tool`` in ``execute_tool`` and covers all
+    three outcomes. A destructive command already RAISED (we never reach here).
+    An approved one means the operator explicitly approved THIS command. A
+    provably read-only one needs no gate. And the command gate keys on
+    ``command_signature(command, cwd)`` — params-DEPENDENT — which strictly
+    DOMINATES this gate's params-INDEPENDENT ``tool_signature``: it discriminates
+    between calls that the tool gate cannot tell apart at all.
+
+    Each clause below exists for a distinct reason; the order is load-bearing.
+
+    (a) ``forged_by_systemu`` → NEVER exempt. A forge picks its own ``name`` AND
+        its own impl filename, so a name-only exemption would let a forged tool
+        call itself ``run_command``, pass the command gate with a benign
+        ``{"command": "dir"}``, and then run whatever its BODY actually does —
+        the command gate scores the command STRING, never the body.
+        ``forged_by_systemu`` is system-set (``systemu/core/models.py:386``,
+        stamped by the forge pipelines, defaulting False) and is the only
+        forge-proof key available at this seam. It is checked FIRST so no
+        attacker-controlled value can be consulted before it.
+    (b) ``tool_name`` (derived from the impl FILENAME, ``impl_path.stem``) must be
+        one of ``_SHELL_TOOL_NAMES`` — that is the exact set
+        ``_maybe_gate_command`` covers. For anything else the command gate
+        returned immediately without scoring, so there is no decision to delegate
+        to.
+    (c) the Tool's OWN ``name`` must be a shell tool too. The two names can
+        disagree, and ``Tool.name`` is what the ActionContext is scored under and
+        what ``tool_signature`` is keyed on. A tool presenting itself as
+        something other than a shell tool does not inherit a shell tool's
+        exemption.
+    (d) the effect tags must be a SUBSET of ``_COMMAND_GATE_DELEGABLE_TAGS``, so
+        the exemption holds only while ``shell_exec`` is the SOLE approval-band
+        reason to card. A future re-tag that adds e.g. ``net_mutate`` is then
+        NOT silently exempted — it cards, because the command gate scored a
+        command and has nothing to say about a network mutation.
+    """
+    if bool(getattr(tool, "forged_by_systemu", False)):
+        return False
+    if tool_name not in _SHELL_TOOL_NAMES:
+        return False
+    if getattr(tool, "name", tool_name) not in _SHELL_TOOL_NAMES:
+        return False
+    return set(effect_tags) <= _COMMAND_GATE_DELEGABLE_TAGS
+
 
 def _inject_sandbox_kwargs(handler, params: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
     """v0.9.33 (A): add _root / output_dir to a v2 handler's kwargs so file
@@ -1024,8 +1087,19 @@ class ToolSandbox:
 
         ── SIBLING: the dry-run auto-skip ───────────────────────────────────
         ``systemu.pipelines.tool_dry_run._gate_skip_reason`` MIRRORS the scoring
-        below (the ``ActionContext`` built at :1073-1081, plus the
-        ``forged_network_denied`` pre-check at :764 that precedes this call).
+        below (the ``ActionContext`` built at :1182-1189, plus the
+        ``forged_network_denied`` pre-check at :827 that precedes this call).
+
+        That "mirrors" promise survives the shell-tool carve-out
+        (``_command_gate_already_scored``, applied just below) because the
+        carve-out is a PRE-CHECK, NOT an ``ActionContext`` input: it returns
+        before scoring, and changes nothing the scorer reads. The two therefore
+        still score IDENTICAL contexts. The dry-run deliberately does NOT carry
+        the carve-out — it never runs ``_maybe_gate_command``, so it has no
+        command-gate decision to delegate to and keeps the strict scorer. That
+        asymmetry is recorded at ``_gate_skip_reason`` too, and it fails in the
+        SAFE direction (the dry-run skips a shell body this gate would let a real
+        shell tool run).
         The dry-run pipeline calls ``execute_tool`` WITHOUT ``tool=`` on purpose
         — a card parked from there would be ORPHANED (a forge dry-run has no
         activity for the resume machinery to resume) and the raise would be
@@ -1036,12 +1110,14 @@ class ToolSandbox:
         — every freshly-forged one, since ``tool_forge`` never stamps
         ``effect_tags`` and the backfill is a boot pass — ``_gate_skip_reason``
         substitutes an ADVISORY ``classify_source`` scan where this gate would
-        score empty tags as UNKNOWN. That scan is name-matching and can
-        under-tag, so the dry-run can ALLOW a body this gate would card. That is
-        a deliberate divergence (without it every forge dry-run would skip), but
-        it is a real residual gap, not a wash — see ``_gate_skip_reason``'s
+        score empty tags as UNKNOWN. That scan RESOLVES IMPORT ALIASES and forces
+        UNKNOWN on dynamic access, but it is import-BINDING analysis, not
+        dataflow, so a sink reached through a local variable can still under-tag
+        and the dry-run can ALLOW a body this gate would card. That is a
+        deliberate divergence (without it every forge dry-run would skip), but it
+        is a real residual gap, not a wash — see ``_gate_skip_reason``'s
         docstring and the strict-xfail ratchet
-        ``TestKnownGap_UntaggedSourceScanIsNameMatching``.
+        ``TestRemainingGap_LocalVariableDataflow``.
 
         If you change the inputs to the ``ActionContext`` below, change
         ``_gate_skip_reason`` too. ``tests/test_dryrun_gate_skip.py``
@@ -1055,6 +1131,26 @@ class ToolSandbox:
             ActionContext, Verdict, evaluate_action)
 
         effect_tags = {str(t) for t in (getattr(tool, "effect_tags", None) or [])}
+
+        # ── shell-tool carve-out: delegate to the gate that ALREADY ran ──────
+        # ``shell_exec`` is APPROVAL-band at the governor, so without this a real
+        # shell tool would card on EVERY call — including the provably read-only
+        # ones ``_maybe_gate_command`` (which runs immediately before this call)
+        # deliberately lets through. That is verbatim the W12 / audit-F5 bug a
+        # past audit already paid to fix.
+        #
+        # The delegation is TOTAL and safe because the command gate covers all
+        # three outcomes: a destructive command already RAISED (we never reach
+        # here); an approved one means the operator explicitly approved THIS
+        # command; a provably read-only one needs no gate. And it keys on
+        # ``command_signature(command, cwd)`` — params-DEPENDENT — which strictly
+        # DOMINATES this gate's params-INDEPENDENT ``tool_signature``.
+        #
+        # It is a PRE-CHECK, not an input to the ActionContext below, so the
+        # scoring this function shares with ``tool_dry_run._gate_skip_reason``
+        # stays byte-identical (see the SIBLING note in the docstring).
+        if _command_gate_already_scored(tool, tool_name, effect_tags):
+            return
 
         # D1 host/target — DEFERRED until a real host resolver lands (a later
         # task). `target_is_network` means "an actually-RESOLVED untrusted host"
