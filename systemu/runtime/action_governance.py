@@ -201,6 +201,15 @@ class ActionContext(BaseModel):
     classification_trusted: bool = True                   # False ⇒ discovered/registry/first-use MCP
     operator_confirmed_read_only: bool = False            # the ONLY thing that clears a network target
     denied_by_policy: bool = False                        # explicit denylist / policy violation
+    # IMPL-2: an effect class the OPERATOR assigned to a DENY-floored action via
+    # typed-confirm (provenance `operator`, logged at the call site). Defeats ONLY the
+    # UNKNOWN conjunct — never clears an independently-computed escalator, and never
+    # makes the action frictionless. Absent on every ordinary call.
+    operator_assigned_class: Optional[str] = None
+
+    # A mistyped field name on a SECURITY context must be a loud error, not a silent
+    # no-op that scores the call as though the signal were never supplied.
+    model_config = {"extra": "forbid"}
     args_preview: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -236,6 +245,38 @@ def _name_categories(name: str) -> Set[str]:
     if toks & _DELETE_VERBS:
         cats.add("delete")
     return cats
+
+
+def _assigned_class(ctx: ActionContext) -> Optional[str]:
+    """The operator's assigned effect class, or None if there isn't a usable one.
+
+    A value that does not coerce to a REAL tag classifies nothing, so it is not a
+    reclassification at all — it must not defeat the UNKNOWN conjunct. Without this,
+    ``coerce("garbage")`` returns ``unknown``, which would be added and then discarded:
+    net effect, UNKNOWN silently stripped and nothing put in its place. Whitespace is
+    normalised so a blank submission reads the same as no submission."""
+    raw = (ctx.operator_assigned_class or "").strip()
+    if not raw:
+        return None
+    assigned = coerce(raw)
+    return None if assigned == EffectTag.UNKNOWN.value else assigned
+
+
+def _score_known(ctx: ActionContext, tags: Set[str]) -> Tuple["Verdict", str]:
+    """The known-effects ladder: what the gate does once the effect IS classified."""
+    if ctx.is_destructive_param:
+        return Verdict.REQUIRE_APPROVAL, "destructive parameter signal"
+    if ctx.irreversible:
+        return Verdict.REQUIRE_APPROVAL, "irreversible action"
+    if tags & _APPROVAL_TAGS:
+        return (Verdict.REQUIRE_APPROVAL,
+                "external mutation / delete / money / message effect")
+    if not ctx.classification_trusted:
+        # a discovered/registry/first-use tool making any effectful call is gated
+        # regardless of a self-declared read-only hint
+        return (Verdict.REQUIRE_APPROVAL,
+                "unconfirmed discovered/registry tool — gated on first effectful use")
+    return Verdict.ALLOW, "reversible/local or read-only effect"
 
 
 def _effective_tags(ctx: ActionContext) -> Set[str]:
@@ -275,6 +316,16 @@ def _effective_tags(ctx: ActionContext) -> Set[str]:
             # the name gave us a positive classification ⇒ no longer UNKNOWN
             tags.discard(EffectTag.UNKNOWN.value)
 
+    # IMPL-2: an operator-assigned effect class is a POSITIVE classification, so it
+    # defeats the UNKNOWN conjunct. It is strictly ADDITIVE, never subtractive —
+    # independently-derived tags (the name verb map, a network target) still stand.
+    # That is what stops "reclassify a wire_funds tool as local_read" from stripping its
+    # money escalator: the operator's class is never the SOLE severity input.
+    assigned = _assigned_class(ctx)
+    if assigned:
+        tags.add(assigned)
+        tags.discard(EffectTag.UNKNOWN.value)
+
     return tags
 
 
@@ -305,22 +356,23 @@ def evaluate_action(ctx: ActionContext) -> Tuple[Verdict, str]:
         return (Verdict.REQUIRE_APPROVAL,
                 "unclassifiable effect — gated (dangerous-until-proven)")
 
-    # known effects
-    if ctx.is_destructive_param:
-        return Verdict.REQUIRE_APPROVAL, "destructive parameter signal"
-    if ctx.irreversible:
-        return Verdict.REQUIRE_APPROVAL, "irreversible action"
-    if tags & _APPROVAL_TAGS:
-        return (Verdict.REQUIRE_APPROVAL,
-                "external mutation / delete / money / message effect")
-    if not ctx.classification_trusted:
-        # a discovered/registry/first-use tool making any effectful call is gated
-        # regardless of a self-declared read-only hint
-        return (Verdict.REQUIRE_APPROVAL,
-                "unconfirmed discovered/registry tool — gated on first effectful use")
+    # known effects — either natively classified, or classified BY THE OPERATOR (IMPL-2).
+    verdict, why = _score_known(ctx, tags)
 
-    # reversible local read/write or a plain net-read ⇒ frictionless majority
-    return Verdict.ALLOW, "reversible/local or read-only effect"
+    # IMPL-2 re-arbitration. A DENY is operator-remediable but never rubber-stampable:
+    # the operator assigns the real effect class (typed-confirm, logged), and the gate
+    # re-runs this SAME ladder over the reclassified tags plus the UNTOUCHED raw signals.
+    # So the remedy genuinely works — a refusal becomes an honest approval card — while
+    # the operator's label can never erase an independently-computed signal: destructive
+    # parameters and irreversibility are facts about the CALL, and a name-derived money
+    # or network escalation survives because the assigned class is additive, not a
+    # replacement. The one thing reclassification may never buy is silence: an action
+    # that was refused once does not become frictionless, so ALLOW is floored to an
+    # approval card (spec AC-d: never ALLOW).
+    if _assigned_class(ctx) and verdict is Verdict.ALLOW:
+        return (Verdict.REQUIRE_APPROVAL,
+                "operator-reclassified effect — approvable on the new classification")
+    return verdict, why
 
 
 def should_mask(ctx: ActionContext) -> bool:
