@@ -117,9 +117,11 @@ class _BindCtx:
     # R-A12c: the tool-call's already-supplied params (decision.parameters). A dict or
     # None; source #0 (_bind_provided_params) binds a required leaf whose key is present.
     provided_params: Optional[dict] = None
-    # R-A16 §5.9: the vault, threaded EXPLICITLY from the call site — the only thing
-    # it feeds is _value_digest's keying. It is deliberately NOT read off ``ctx``:
-    # the real ExecutionContext carries no vault (and must not — it is serialized and
+    # R-A16 §5.9: the vault, threaded EXPLICITLY from the call site. It feeds TWO
+    # things: _value_digest's keying, and (via _granted_store) the GrantedRootsStore
+    # that source #1's confinement re-gate needs — without it ``granted`` is None and
+    # source #1 is DORMANT. It is deliberately NOT read off ``ctx``: the real
+    # ExecutionContext carries no vault (and must not — it is serialized and
     # snapshotted, so a live handle on it is a snapshot-shape hazard).
     vault: Any = None
 
@@ -933,8 +935,12 @@ def compute_requirements(objective, capability, situation, ctx, provided_params=
     ``requires_external_verification`` on ``objective`` from the EffectTag (AC4/§5.8).
     ``provided_params`` (R-A12c) are the CURRENT tool-call's already-supplied params —
     a required leaf present there binds (source #0) instead of generating a spurious ask.
-    ``vault`` (R-A16 §5.9, optional) keys the per-bind ``bound_value_digest``; omit it
-    and binds carry no digest (observability degrades, the diff is unchanged).
+    ``vault`` (R-A16 §5.9) does TWO jobs and is NOT optional in practice: it keys the
+    per-bind ``bound_value_digest``, AND it builds the GrantedRootsStore that source #1
+    (granted-root FileHandle) re-gates through. Omit it and binds carry no digest AND
+    source #1 cannot fire at all — the resolver fail-closes on a None store, so a
+    required path leaf degrades to a ``missing`` gap. The ``ctx`` carries neither, so
+    the thread from the call site is the ONLY route.
     Defensive: a broken schema / missing situation yields [] or a best-effort list,
     never raises."""
     try:
@@ -967,11 +973,12 @@ def compute_requirements(objective, capability, situation, ctx, provided_params=
         if not root:
             return []
 
-        # resolve the granted-roots store (source #1 re-gate). Prefer one already on
-        # ctx; else construct from the vault; else None (source #1 no-ops).
+        # resolve the granted-roots store (source #1 re-gate). Prefer one injected on
+        # ctx (a TEST-ONLY seam — nothing in systemu/ ever assigns it); else build one
+        # from the EXPLICITLY THREADED vault; else None (source #1 no-ops).
         granted = getattr(ctx, "_granted_roots", None)
         if granted is None:
-            granted = _granted_from_ctx(ctx)
+            granted = _granted_store(vault, ctx)
 
         tool_name = str(_get(capability, "name") or "")
         sit = situation if isinstance(situation, dict) else {}
@@ -988,14 +995,28 @@ def compute_requirements(objective, capability, situation, ctx, provided_params=
         return []
 
 
-def _granted_from_ctx(ctx):
-    """Best-effort GrantedRootsStore from the ctx's vault; None on any miss."""
-    vault = getattr(ctx, "vault", None)
-    if vault is None:
+def _granted_store(vault, ctx=None):
+    """Best-effort GrantedRootsStore for source #1's confinement re-gate; None on any miss.
+
+    THE VAULT MUST BE THREADED FROM THE CALL SITE. This was previously
+    ``_granted_from_ctx(ctx)``, reading ``ctx.vault`` — an attribute the real
+    ``ExecutionContext`` has never had — so it returned ``None`` on EVERY production
+    bind. ``reference_resolver`` FAIL-CLOSES on a ``None`` store (it drops every
+    candidate rather than skipping the confinement gate), which meant source #1 never
+    once fired in a real run: a required path leaf fell through to a bare ``missing``
+    gap and the operator was asked to hand-type a path to a file sitting in a root they
+    had already granted. Identical root cause, and identical repair, to ``_value_digest``.
+
+    Adding ``vault`` to ``ExecutionContext`` is NOT the fix — that object is serialized
+    and snapshotted, so a live handle on it is a snapshot-shape hazard. The ``ctx``
+    fallback below is kept only as an explicit injection seam (it is ``None`` in
+    production, and ``tests/test_ra11a_source1_liveness.py`` pins that)."""
+    v = vault if vault is not None else getattr(ctx, "vault", None)
+    if v is None:
         return None
     try:
         from systemu.runtime.granted_roots import GrantedRootsStore
-        return GrantedRootsStore(base_dir=vault.root)
+        return GrantedRootsStore(base_dir=v.root)
     except Exception:
         return None
 
@@ -1019,8 +1040,10 @@ def build_requirement_report(objectives, capability, situation, ctx,
     per-objective core is ``compute_requirements``; this is the §5.6 pull/scope-card
     feed. ``provided_params`` (R-A12c) threads the tool-call's already-supplied params
     through to the per-objective diff. ``vault`` (R-A16 §5.9) keys each bind's
-    ``bound_value_digest`` — it MUST be threaded from the call site, because the
-    ``ExecutionContext`` passed as ``ctx`` carries no vault of its own.
+    ``bound_value_digest`` AND supplies source #1's GrantedRootsStore — it MUST be
+    threaded from the call site, because the ``ExecutionContext`` passed as ``ctx``
+    carries neither a vault nor a granted-roots store of its own. Omitting it leaves
+    source #1 dormant, not merely un-digested.
     Defensive: never raises."""
     from systemu.core.models import RequirementReport
 
