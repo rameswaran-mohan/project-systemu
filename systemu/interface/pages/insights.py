@@ -70,14 +70,60 @@ def build_structured_answer(questions: list, values: dict) -> str:
     return json.dumps({q["id"]: values.get(q["id"]) for q in (questions or [])})
 
 
-def build_elicitation_answer(schema: dict, values: dict) -> str:
+def build_elicitation_answer(schema: dict, values: dict, picked=None) -> str:
     """v0.9.35 (P1) — serialize an elicitation form's per-field values to the
     JSON stored as the decision choice. Only fields declared in the schema's
     properties are emitted (secret fields never enter this dict). The reconciler
-    type-coerces these strings via elicitation.param_answers_from_choice."""
+    type-coerces these strings via elicitation.param_answers_from_choice.
+
+    R-B4/F3: ``picked`` is the set of field names for which the operator
+    explicitly chose the offered suggestion rather than typing their own value.
+    It rides alongside the values under ``PICK_MARKER_KEY`` — the one place in
+    the system that KNOWS the answer's provenance instead of inferring it from a
+    digest comparison. Intersected with the declared properties so the marker can
+    only ever name a real field, and omitted entirely when nothing was picked (so
+    an untouched card serializes exactly as before).
+    """
     import json
+    from systemu.runtime.elicitation import PICK_MARKER_KEY
     props = (schema or {}).get("properties") or {}
-    return json.dumps({name: (values or {}).get(name) for name in props})
+    out = {name: (values or {}).get(name) for name in props}
+    chosen = sorted(set(picked or []) & set(props))
+    if chosen:
+        out[PICK_MARKER_KEY] = chosen
+    return json.dumps(out)
+
+
+def answer_ack_model(vault, request_id: str) -> dict:
+    """The §5.6 "on your table ✓" acknowledgement for one ask.
+
+    Returns ``{"visible": bool, "rows": [{"key","name","kind"}], "text": str}``.
+
+    Pure read of the receipt `ask_promotion` wrote when the answer materialized a
+    learned TableItem — this NEVER re-derives what a card would have been, so the
+    chip can only ever claim something that was actually written.
+
+    ``visible`` is False on any failure, and on an empty receipt. The failure
+    direction matters: a missing acknowledgement is a chip the operator does not
+    see, while a fabricated one is systemu telling them it did something it did
+    not. An ACKNOWLEDGEMENT, never a gate (§5.6) — nothing here blocks the answer.
+    """
+    try:
+        if vault is None or not request_id:
+            return {"visible": False, "rows": [], "text": ""}
+        from systemu.runtime.table_store import load_answer_receipts
+        rows = load_answer_receipts(vault).get(str(request_id), [])
+    except Exception:
+        return {"visible": False, "rows": [], "text": ""}
+    if not rows:
+        return {"visible": False, "rows": [], "text": ""}
+    names = ", ".join(r["name"] for r in rows if r.get("name"))
+    return {
+        "visible": True,
+        "rows": rows,
+        "text": (f"On your table: {names}" if names
+                 else f"{len(rows)} item(s) added to your table"),
+    }
 
 
 def build_insights_page(default_tab: str = "memory") -> None:
@@ -313,12 +359,52 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
         # defaults pre-filled, client-side validation, secret fields → URL mode.
         # Keyed on a non-empty requested_schema so non-INPUT gates are untouched.
         _ctx = card.get("context") or {}
+
+        # ── §5.6 "on your table ✓" acknowledgement + undo chip ─────────────────
+        # Rendered whenever a receipt exists for this ask. NOTE the timing this
+        # cannot escape: promotion runs in the harness-grant reconciler AFTER the
+        # decision resolves, so the chip appears on a card RE-RENDERED after that
+        # tick (a resumed/re-opened ask, or a later visit), not instantly on
+        # submit. It is an acknowledgement, never a gate, so appearing late is a
+        # weaker version of the feature rather than a broken one — and claiming
+        # "added to your table" before the write had happened would be the
+        # dishonest alternative.
+        _ack_vault = None
+        try:
+            from systemu.interface.dashboard_state import AppState
+            _ack_vault = getattr(AppState.get(), "vault", None)
+        except Exception:
+            _ack_vault = None
+        _ack = answer_ack_model(_ack_vault, _ctx.get("request_id") or "")
+        if _ack["visible"]:
+            def _undo_ack(_e=None, rid=_ctx.get("request_id") or "", v=_ack_vault):
+                try:
+                    from systemu.runtime.table_store import undo_answer_receipt
+                    removed = undo_answer_receipt(v, rid)
+                except Exception:
+                    ui.notify("Couldn't undo that.", type="negative")
+                    return
+                ui.notify(
+                    f"Removed {len(removed)} item(s) from your table. "
+                    "Your answer still stands.",
+                    type="info", multi_line=True)
+                on_resolved()
+
+            with ui.row().classes("items-center s-card q-pa-sm").style("gap: 8px;"):
+                ui.icon("check_circle", size="sm").props("color=positive")
+                ui.label(_ack["text"]).classes("s-muted")
+                ui.button("Undo", on_click=_undo_ack) \
+                    .props("flat dense size=sm color=primary")
+
         _req_schema = _ctx.get("requested_schema") or {}
         if isinstance(_req_schema, dict) and (_req_schema.get("properties")):
             from systemu.runtime.elicitation import is_secret_field
             _props = _req_schema.get("properties") or {}
             _required = _req_schema.get("required") or []
             _widgets: dict = {}
+            # field name -> (pick radio, the suggested value) for fields that got
+            # the R-B4/F3 explicit-pick control
+            _picks: dict = {}
             ui.label(card.get("title") or "Input needed").style(
                 f"font-weight: 700; color: {THEME['text']}; margin-bottom: 6px;"
             )
@@ -350,13 +436,37 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                     _w = ui.radio(["Yes", "No"],
                                   value=("Yes" if _default else "No")
                                   if _default is not None else None).props("inline")
+                elif _default not in (None, ""):
+                    # ── R-B4/F3: a REAL pick ─────────────────────────────────
+                    # A candidate used to arrive only as a pre-filled input, which
+                    # made "did they take the suggestion?" unanswerable except by
+                    # comparing digests after the fact — and that comparison is
+                    # dead for path-shaped values, failing toward TRUSTED. Offering
+                    # the candidate as an explicit choice means the answer carries
+                    # its own provenance and nothing has to be inferred.
+                    #
+                    # The free-text box stays live either way: this is a pick, not
+                    # a closed enum. Making it an enum would be the wrong fix — it
+                    # would stop the operator answering anything the binder had not
+                    # already guessed.
+                    _pick_w = ui.radio(
+                        ["Use this suggestion", "Enter my own"],
+                        value="Use this suggestion",
+                    ).props("inline")
+                    ui.label(f"suggested: {_default}").classes("s-muted").style(
+                        "font-size: 12px;")
+                    _w = ui.input(_name, value=str(_default)).style("min-width: 220px;")
+                    _picks[_name] = (_pick_w, str(_default))
+                    _widgets[_name] = (_ftype, _w)
+                    continue
                 else:
                     _w = ui.input(_name, value=("" if _default is None else str(_default))
                                   ).style("min-width: 220px;")
                 _widgets[_name] = (_ftype, _w)
 
             def _submit_form(_e=None, did=card["id"], the_queue=queue,
-                             schema=_req_schema, widgets=_widgets, required=_required):
+                             schema=_req_schema, widgets=_widgets, required=_required,
+                             picks=_picks):
                 try:
                     vals: dict = {}
                     for _n, (_t, _wg) in widgets.items():
@@ -364,6 +474,17 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                         if _t == "boolean":
                             _v = (_v == "Yes") if _v in ("Yes", "No") else None
                         vals[_n] = _v
+                    # R-B4/F3 — a field counts as PICKED only when the operator left
+                    # the radio on "use this suggestion" AND the box still holds that
+                    # exact value. Editing the text after picking is an override, and
+                    # the stricter of the two signals is the honest one: this must not
+                    # stamp "the operator confirmed our candidate" on a value they
+                    # then changed.
+                    picked = [
+                        _n for _n, (_pw, _sv) in picks.items()
+                        if getattr(_pw, "value", None) == "Use this suggestion"
+                        and str(vals.get(_n)) == _sv
+                    ]
                     # Client-side required check (secrets excluded from widgets).
                     _missing = [r for r in required
                                 if r in widgets and (vals.get(r) in (None, ""))]
@@ -371,7 +492,8 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                         ui.notify("Fill all required fields: " + ", ".join(_missing),
                                   type="warning")
                         return
-                    the_queue.resolve(did, choice=build_elicitation_answer(schema, vals))
+                    the_queue.resolve(
+                        did, choice=build_elicitation_answer(schema, vals, picked))
                     ui.notify("Submitted", type="positive")
                     on_resolved()
                 except Exception as exc:

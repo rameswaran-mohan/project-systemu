@@ -63,15 +63,58 @@ def pending_ask_rows(vault) -> List[Dict[str, Any]]:
     return rows
 
 
-def needs_you_total(vault) -> int:
-    """Gates + non-gate asks — the complete pending-attention count."""
+def table_suggestion_count(vault) -> int:
+    """R-B4 — how many `suggested` table items are waiting in the tray (§5.10.c).
+
+    Reads the PROJECTED snapshot (`items.json`) rather than re-projecting: the
+    reconciler is that file's sole writer (DEC-10) and this is a badge poll running
+    every 2s on every page, so re-deriving here would both duplicate the projection
+    and race it. The cost is that a suggestion is visible in the count within one
+    reconcile tick (≤60s) rather than instantly — the same freshness the /table
+    board itself has.
+
+    Defensive: any failure ⇒ 0. A badge must never break the shell, and 0 is the
+    non-alarming direction for a count whose only job is to point at a page the
+    operator can also reach directly.
+    """
+    try:
+        from systemu.runtime.table_store import load_items
+        return sum(1 for it in load_items(vault)
+                   if (getattr(it, "status", "") or "") == "suggested")
+    except Exception:
+        logger.debug("[Attention] could not count table suggestions", exc_info=True)
+        return 0
+
+
+def needs_you_breakdown(vault) -> Dict[str, Any]:
+    """The complete pending-attention accounting, BY SURFACE.
+
+    A single total was enough while everything waiting lived on /inbox. R-B4 adds a
+    second place work can wait — the /table tray — and a badge that counts it but
+    always links to /inbox would send the operator to an empty page and tell them
+    nothing needs them. So the breakdown carries the target: /inbox while anything
+    is queued there, /table when the tray is the ONLY thing waiting.
+    """
     gates = 0
     try:
         from systemu.interface.command.inbox import InboxQueue
         gates = len(InboxQueue(vault).list_descriptors())
     except Exception:
         gates = 0
-    return gates + len(pending_ask_rows(vault))
+    asks = len(pending_ask_rows(vault))
+    suggestions = table_suggestion_count(vault)
+    return {
+        "gates": gates,
+        "asks": asks,
+        "table_suggestions": suggestions,
+        "total": gates + asks + suggestions,
+        "target": "/inbox" if (gates + asks) else ("/table" if suggestions else "/inbox"),
+    }
+
+
+def needs_you_total(vault) -> int:
+    """Gates + non-gate asks + tray suggestions — the complete pending count."""
+    return needs_you_breakdown(vault)["total"]
 
 
 def make_answer_host():

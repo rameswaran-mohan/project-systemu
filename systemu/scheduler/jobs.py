@@ -415,6 +415,7 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
             # R-A16 §5.9 — the coerced answers, stashed for the avoidable-ask record
             # that fires only AFTER a successful dispatch (see below).
             _ask_answers = None
+            _ask_picked = []
 
             if choice in {"deny", "reject", "skip"}:
                 grant_payload = {
@@ -447,6 +448,14 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
                         _raw = {}
                     _coerced = param_answers_from_choice(_req_schema, _raw)
                     _ask_answers = _coerced
+                    # R-B4/F3 — carry the explicit pick marker to the promoter. It
+                    # is read off the RAW choice because `param_answers_from_choice`
+                    # deliberately strips it (it is provenance metadata, never a tool
+                    # parameter), so this is the last frame where it exists.
+                    from systemu.runtime.elicitation import PICK_MARKER_KEY
+                    _ask_picked = _raw.get(PICK_MARKER_KEY)
+                    if not isinstance(_ask_picked, list):
+                        _ask_picked = []
                     if _pending:
                         # missing-param: merge the typed answers + re-dispatch the
                         # original tool call (which re-validates).
@@ -553,7 +562,8 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
             try:
                 from systemu.runtime.ask_promotion import promote_answered_asks
                 promote_answered_asks(vault, dctx, _ask_answers,
-                                      budget=_promotion_budget)
+                                      budget=_promotion_budget,
+                                      picked=_ask_picked)
             except Exception:
                 logger.debug("[HarnessGrantReconciler] §5.9 ask promotion skipped",
                              exc_info=True)

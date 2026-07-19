@@ -802,19 +802,23 @@ def needs_you_badge_model(vault) -> dict:
     invisible: a stuck chat task showed badge 0 / "nothing needs you".
 
     The Phase-4 right rail hides below 1100px and the sidebar collapses at
-    768px, so this header badge is the narrow-viewport path to parked work —
-    it always targets ``/inbox`` (demoted from the left nav in Slice 1).
+    768px, so this header badge is the narrow-viewport path to parked work.
 
     Defensive: ANY failure (no vault, unreadable decision store, …) yields
     ``count 0 / hidden`` — the badge must never break the page shell.
+
+    R-B4: the count now also includes the /table tray's `suggested` items, so the
+    target is no longer a constant — it follows the breakdown (``/table`` when the
+    tray is the ONLY thing waiting, ``/inbox`` otherwise). A badge that counted the
+    tray but always linked to /inbox would land the operator on an empty Inbox.
     """
-    count = 0
     try:
-        from systemu.interface.components.attention import needs_you_total
-        count = needs_you_total(vault)
+        from systemu.interface.components.attention import needs_you_breakdown
+        b = needs_you_breakdown(vault)
+        count, target = b["total"], b["target"]
     except Exception:
-        count = 0
-    return {"count": count, "visible": count > 0, "target": "/inbox"}
+        count, target = 0, "/inbox"
+    return {"count": count, "visible": count > 0, "target": target}
 
 
 # ── Dashboard Global Job Management Buttons ──

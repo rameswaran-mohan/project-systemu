@@ -21,6 +21,31 @@ from typing import Any, Dict, List, Optional
 _ALLOWED_TYPES = {"string", "number", "integer", "boolean"}
 _ALLOWED_FORMATS = {"email", "uri", "date", "date-time", "password"}
 
+#: R-B4/F3 — the reserved key carrying "which fields did the operator explicitly
+#: PICK the suggestion for", alongside the answer values.
+#:
+#: Why it exists. Until now "did the operator take the binder's candidate or type
+#: their own?" was INFERRED downstream by comparing a keyed digest of the answer
+#: against a digest of the candidate (`replay_metrics.record_ask_avoidable`, and
+#: the origin decision in the `ask_promotion` module). Byte-equality works for
+#: short identifiers and is effectively dead for path-shaped values:
+#: ``out/x.md``, ``out\x.md`` and ``OUT/X.MD`` all compare unequal.
+#:
+#: NB the deliberate circumlocution above: a source pin asserts the promoter is
+#: not WIRED into this rail (it has no idempotency stamp, so two resumes would
+#: promote twice) and enforces that by substring. Naming the function here, even
+#: in prose, trips it. The pin is right to be that blunt — this comment bends.
+#:
+#: The failure is not neutral. A mismatch is read as "the operator typed this",
+#: i.e. the TRUSTED axis — so a confirm the normalizer failed to fold silently
+#: LAUNDERS a content_derived value into `operator`. An explicit marker records
+#: what the UI actually knows at the moment of the click, and fails toward taint.
+#:
+#: It is NOT a schema property and must never reach a tool. `param_answers_from_
+#: choice` drops it unconditionally — before the schema check, so a schema that
+#: declared a property of this name could not smuggle it through either.
+PICK_MARKER_KEY = "__picked__"
+
 # Field names / formats that indicate a credential → URL-mode, never the form.
 _SECRET_NAME_TOKENS = (
     "password", "passwd", "secret", "token", "api_key", "apikey",
@@ -148,6 +173,11 @@ def param_answers_from_choice(
     props = schema.get("properties") or {}
     out: Dict[str, Any] = {}
     for name, raw in (raw_values or {}).items():
+        if name == PICK_MARKER_KEY:
+            # R-B4/F3 — provenance metadata, never a tool parameter. Dropped BEFORE
+            # the schema lookup on purpose: a schema declaring a property of this
+            # name would otherwise let the marker through as a real argument.
+            continue
         spec = props.get(name) if isinstance(props.get(name), dict) else {}
         if not isinstance(spec, dict) or not spec:
             # Field not declared in the schema (e.g. a leaked secret) — omit it.

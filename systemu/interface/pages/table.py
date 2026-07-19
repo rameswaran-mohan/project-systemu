@@ -25,6 +25,15 @@ from nicegui import ui
 from systemu.interface.dashboard_state import AppState
 from systemu.runtime import table_consult as tc
 from systemu.runtime import table_store as ts
+from systemu.runtime.table_provenance import provenance_banner
+
+#: R-B4 — the banner tone → the token class that renders it. Token classes only
+#: (the `.style()` linter rejects a raw colour where a class exists).
+_TONE_BANNER = {
+    "ok": "s-banner", "warn": "s-banner s-banner--warn",
+    "danger": "s-banner s-banner--danger",
+}
+_TONE_BADGE = {"ok": "grey", "warn": "orange", "danger": "red"}
 
 # zone label -> the item kinds it holds (ordered for display)
 _ZONE_ORDER: List[tuple] = [
@@ -189,6 +198,36 @@ def removal_notice(kind: str, name: str) -> tuple:
     return (f"Removed “{name}” from your table.", False)
 
 
+def tray_items(items: List[Any]) -> List[Any]:
+    """The "New on your table" tray (§5.10.c) — every `suggested` item.
+
+    Pure + order-stable so the tray can be asserted without a nicegui runtime.
+    These are §5.9 learned cards and R-B3 task proposals awaiting the operator;
+    they are NOT part of the inventory yet, which is why `_board` renders them
+    here INSTEAD of in their kind zone. A suggestion sitting in "Services &
+    Accounts" alongside configured services reads as inventory, and reading as
+    inventory is precisely the misattribution §5.10.b#2's residual warns about.
+    """
+    return [it for it in (items or [])
+            if (getattr(it, "status", "") or "") == "suggested"]
+
+
+def board_items(items: List[Any]) -> List[Any]:
+    """The complement of :func:`tray_items` — what the zones render."""
+    return [it for it in (items or [])
+            if (getattr(it, "status", "") or "") != "suggested"]
+
+
+def _render_provenance_badge(it: Any) -> None:
+    """The §5.10.b#4 provenance badge. Reads the banner rather than printing the
+    raw `provenance` string, so an unrecognised value renders as "Source unknown"
+    instead of as a plausible-looking label the operator would read as a fact."""
+    banner = provenance_banner(it)
+    ui.badge(banner["headline"]).props(
+        f"outline color={_TONE_BADGE.get(banner['tone'], 'grey')}"
+    ).tooltip(banner["detail"])
+
+
 def _render_card(it: Any, *, on_pin=None, on_remove=None) -> None:
     status = getattr(it, "status", "") or ""
     color = _STATUS_COLOR.get(status, "grey")
@@ -221,9 +260,17 @@ def _render_card(it: Any, *, on_pin=None, on_remove=None) -> None:
             if status:
                 ui.badge(status).props("outline")
             ui.badge(_kind(it) or "item").props("outline color=grey")
-            prov = getattr(it, "provenance", "") or ""
-            if prov and prov != "migrated":
-                ui.badge(prov).props("outline color=blue")
+            # §5.10.b#4 — provenance made visible. The ONE case with no badge is a
+            # determined, trusted, already-configured row (`migrated`+`operator`):
+            # "this install already had it" is the uninteresting default and a badge
+            # on every card would train the operator to stop reading them. Every
+            # other case — including an UNDETERMINED one — gets a badge, so the
+            # absence of a badge can only ever mean the reassuring case was actually
+            # established.
+            _b = provenance_banner(it)
+            if not (_b["determined"] and _b["trusted"]
+                    and (getattr(it, "provenance", "") or "") == "migrated"):
+                _render_provenance_badge(it)
         # broken/stale cards lead with a PRIMARY action deep-linking to the repair
         # surface (§5.10.c) — navigation only (the fix happens where it lands).
         _rlabel, _rroute = repair_route(_kind(it), status)
@@ -272,6 +319,64 @@ def build_table_page() -> None:
                 pass
             view["undo"] = None
             _board.refresh()
+
+    def _do_accept(dlg, kind: str, ref: Dict[str, Any], name: str) -> None:
+        """Commit an acceptance. The ONLY writer of `accepted.json` — reached only
+        from the dialog below, which always renders the provenance banner first, so
+        the §5.10.b#4 banner is structurally unskippable rather than merely present.
+        Status only: nothing here touches provenance or origin_class."""
+        try:
+            ts.add_accepted(vault, ts.ref_key(kind, ref or {}))
+        except Exception:
+            ui.notify("Couldn't accept that item.", type="negative")
+            return
+        dlg.close()
+        ui.notify(
+            f"“{name}” is on your table. It still carries where it came from — "
+            "systemu will confirm with you before using its value.",
+            type="positive", multi_line=True)
+        _board.refresh()
+
+    # The accept dialog uses the STABLE-SLOT host pattern (`attention.
+    # make_answer_host`): pre-created HERE, in the page's own slot, and repopulated
+    # per click. Creating it inside the click handler would put it in whatever slot
+    # was current at that moment — and `_board` is refreshed by the 10s undo timer,
+    # so dismissing one suggestion and then accepting another within that window
+    # would land the dialog in a slot the timer then disposes. NiceGUI raises
+    # "parent slot of the element has been deleted", the W3.1 log filter drops it,
+    # and the dialog silently never opens.
+    with ui.dialog() as _accept_dlg:
+        _accept_body = ui.card().classes("s-card").style("min-width: 380px;")
+
+    def _open_accept_dialog(kind: str, ref: Dict[str, Any], name: str,
+                            item: Any) -> None:
+        # §5.10.b#4 accept→config: the provenance banner NAMING THE SOURCE plus a
+        # verify warning, shown BEFORE the accept lands. Rendering it here (rather
+        # than only on the later config screen) is what makes it load-bearing: the
+        # operator cannot move a content-derived suggestion into `declared_intents`
+        # without having been told a task or a page put it there.
+        banner = provenance_banner(item)
+        _accept_body.clear()
+        with _accept_body:
+            ui.label(f"Accept “{name}”?").classes("text-h6")
+            with ui.column().classes(
+                    _TONE_BANNER.get(banner["tone"], "s-banner")).style("gap: 4px;"):
+                ui.label(banner["headline"]).classes("text-weight-medium")
+                ui.label(banner["detail"]).style("font-size: 13px;")
+                if banner["warning"]:
+                    ui.label(banner["warning"]).classes("s-text-warn").style(
+                        "font-size: 12px;")
+            ui.label(
+                "Accepting puts it on your table so systemu can see it. It does "
+                "NOT grant access, and it does not let systemu use the value "
+                "without asking you."
+            ).classes("s-muted").style("font-size: 12px;")
+            with ui.row().classes("w-full justify-end q-mt-sm").style("gap: 8px;"):
+                ui.button("Cancel", on_click=_accept_dlg.close).props("flat color=grey")
+                ui.button("Accept",
+                          on_click=lambda: _do_accept(_accept_dlg, kind, ref, name)) \
+                    .props("color=primary")
+        _accept_dlg.open()
 
     def _on_pin(kind: str, ref: Dict[str, Any], pinned: bool) -> None:
         # UI-owned sidecar write (pins.json) — never touches items.json, so pin
@@ -497,7 +602,11 @@ def build_table_page() -> None:
     @ui.refreshable
     def _board() -> None:
         items = _project(vault)
-        ui.label(summarize(items)).classes("s-muted q-mb-xs")
+        # Summarize what is actually ON the table. Counting suggestions here would
+        # say "3 services" while the tray beneath says two of them are not in use
+        # yet — the summary line is the one place an operator reads a total, and it
+        # should not be inflated by things they have not accepted.
+        ui.label(summarize(board_items(items))).classes("s-muted q-mb-xs")
 
         if view["undo"] is not None:
             with ui.row().classes("items-center s-card q-pa-sm q-mb-sm").style("gap: 10px;"):
@@ -505,9 +614,42 @@ def build_table_page() -> None:
                 ui.label(f"Removed “{view['undo'][1]}”.").classes("s-muted")
                 ui.button("Undo", on_click=_on_undo).props("flat dense size=sm color=primary")
 
-        shown = filter_items(items, view["query"])
+        # ── the "New on your table" tray (§5.10.c): above the zones, when non-empty
+        _tray = tray_items(filter_items(items, view["query"]))
+        if _tray:
+            with ui.column().classes("s-card q-pa-sm q-mb-sm w-full").style("gap: 6px;"):
+                ui.label(f"New on your table ({len(_tray)})").classes("s-section-head")
+                ui.label(
+                    "systemu found these while working. Nothing here is in use yet "
+                    "— accept what's right, dismiss the rest."
+                ).classes("s-muted").style("font-size: 12px;")
+                for _it in sort_for_display(_tray):
+                    _tk, _tref = _kind(_it), getattr(_it, "ref", {}) or {}
+                    _tn = getattr(_it, "name", "") or ""
+                    with ui.row().classes(
+                            "items-center no-wrap w-full justify-between").style("gap: 8px;"):
+                        with ui.row().classes("items-center no-wrap").style("gap: 6px;"):
+                            ui.label(_tn).classes("text-weight-medium ellipsis")
+                            ui.badge(_tk or "item").props("outline color=grey")
+                            _render_provenance_badge(_it)
+                        with ui.row().classes("items-center no-wrap").style("gap: 4px;"):
+                            ui.button(
+                                "Accept",
+                                on_click=lambda _e=None, k=_tk, r=_tref, n=_tn, i=_it:
+                                    _open_accept_dialog(k, r, n, i),
+                            ).props("flat dense size=sm color=primary")
+                            ui.button(
+                                "Dismiss",
+                                on_click=lambda _e=None, k=_tk, r=_tref, n=_tn:
+                                    _on_remove(k, r, n),
+                            ).props("flat dense size=sm color=grey")
+
+        shown = board_items(filter_items(items, view["query"]))
         zones = group_into_zones(shown)
-        if not zones:
+        # `and not _tray`: a table holding ONLY suggestions is not empty — the tray
+        # above is already showing them, and "Your table is empty" underneath it
+        # would be flatly untrue.
+        if not zones and not _tray:
             with ui.card().classes("s-card"):
                 if items and view["query"].strip():
                     ui.label("No matches.").classes("text-subtitle1")

@@ -59,6 +59,28 @@ def _provider_text(provider: dict) -> str:
     return "configured"
 
 
+def _needs_you_section():
+    """The R-B4 "Needs you" breakdown for /health, or ``None`` when it cannot be
+    determined.
+
+    ``None`` (⇒ the section is not rendered) is deliberately distinct from a zero
+    breakdown (⇒ "Nothing is waiting on you"). With no vault, or an unreadable
+    decision store, we do not KNOW that nothing is waiting — and /health is
+    reachable precisely when the install is broken, which is exactly when a
+    confident "nothing needs you" would be both wrong and reassuring. This page
+    has already shipped that failure class once; it does not get to ship it again.
+    """
+    try:
+        from systemu.interface.dashboard_state import AppState
+        vault = getattr(AppState.get(), "vault", None)
+        if vault is None:
+            return None
+        from systemu.interface.components.attention import needs_you_breakdown
+        return needs_you_breakdown(vault)
+    except Exception:
+        return None
+
+
 def build_health_page() -> None:
     """Render /health. Token classes only — no inline f-string styles / raw hex."""
     from nicegui import ui
@@ -86,6 +108,35 @@ def build_health_page() -> None:
                     ui.label(p["message"]).classes(f"s-banner {variant} w-full")
                     if p.get("cta"):
                         ui.label(p["cta"]).classes("s-muted")
+
+            # ── R-B4: "Needs you" — what is WAITING, by surface ────────────
+            # §5.10's honest-risks list names "Needs-you surfacing" as one of the
+            # three load-bearing defences against a stale table: a suggestion
+            # nobody is told about is wallpaper. /health is the "why is nothing
+            # happening?" page, and "three things are waiting on you" is one of
+            # the true answers to that question.
+            #
+            # It reads AppState rather than health_view() so health_view stays
+            # hermetic + vault-free (it is unit-tested with injected overrides).
+            # No vault ⇒ the section is omitted entirely rather than rendered as
+            # a reassuring "nothing waiting" we cannot actually vouch for.
+            _needs = _needs_you_section()
+            if _needs is not None:
+                ui.label("Needs you").classes("s-section-head")
+                if _needs["total"] == 0:
+                    ui.label("Nothing is waiting on you.").classes("s-muted")
+                else:
+                    for _lbl, _n, _href in (
+                        ("Approvals in your Inbox", _needs["gates"], "/inbox"),
+                        ("Questions waiting for an answer", _needs["asks"], "/inbox"),
+                        ("Suggestions on your table",
+                         _needs["table_suggestions"], "/table"),
+                    ):
+                        if not _n:
+                            continue
+                        with ui.row().classes("w-full items-center").style("gap: 12px;"):
+                            ui.label(f"{_lbl}: {_n}")
+                            ui.link("open →", _href).classes("s-muted")
 
             # ── live status ───────────────────────────────────────────────
             ui.label("Status").classes("s-section-head")

@@ -426,8 +426,17 @@ def _supersede_all(vault, facts, new_id: str) -> None:
                          exc_info=True)
 
 
-def _materialize_learned_card(vault, *, leaf: str, answer: str, origin_class: str) -> bool:
-    """Best-effort learned TableItem. Returns True when a card was written.
+def _materialize_learned_card(vault, *, leaf: str, answer: str,
+                              origin_class: str) -> Optional[Tuple[str, str, str]]:
+    """Best-effort learned TableItem. Returns ``(ref_key, name, kind)`` when a card
+    was written, else ``None``.
+
+    It returns the KEY rather than a bool because the §5.6 ✓/undo chip has to name
+    what it put on the table and has to be able to undo it, and the only honest
+    source for that is the write that actually happened. A UI that re-derived the
+    key would need its own copy of the leaf→kind mapping and the ref shape — the
+    second-source-of-truth failure this module's own comments already call out as
+    how a learned card and an operator removal stop meeting.
 
     The card is NAMED AND KEYED BY THE LEAF, and carries the answer in ``usage``.
     ``name`` is what the /table surface renders, so the raw answer there published every
@@ -441,7 +450,7 @@ def _materialize_learned_card(vault, *, leaf: str, answer: str, origin_class: st
     card is the visible half."""
     kind = _card_kind_for(leaf)
     if kind is None:
-        return False
+        return None
     try:
         from systemu.runtime import table_store as ts
 
@@ -453,13 +462,15 @@ def _materialize_learned_card(vault, *, leaf: str, answer: str, origin_class: st
         # fails — which is the failure mode `test_the_key_id_parser_does_not_silently_
         # duplicate_guard_3` already exists to prevent elsewhere in this codebase.
         written = ts.add_learned_item(vault, item)
+        key = ts.ref_key(item.kind, item.ref)
         if not written:
             logger.info("[S3] learned card withheld (removed by the operator, or "
-                        "already present): %s", ts.ref_key(item.kind, item.ref))
-        return written
+                        "already present): %s", key)
+            return None
+        return (key, item.name, item.kind)
     except Exception:
         logger.debug("[S3] learned card materialization skipped", exc_info=True)
-        return False
+        return None
 
 
 def _drop_stale_learned_card(vault, *, leaf: str) -> None:
@@ -486,7 +497,8 @@ def _drop_stale_learned_card(vault, *, leaf: str) -> None:
 
 # ── the public entry ─────────────────────────────────────────────────────────
 def promote_answered_asks(vault, dctx, answers,
-                          budget: Optional[PromotionBudget] = None) -> int:
+                          budget: Optional[PromotionBudget] = None,
+                          picked=None) -> int:
     """Promote the accepted answers on ONE bundled scope card. Returns the number of
     promotions written. Never raises.
 
@@ -515,6 +527,12 @@ def promote_answered_asks(vault, dctx, answers,
         from systemu.runtime import replay_metrics as rm
 
         ask_id = str((dctx or {}).get("request_id", "") or "")
+        # R-B4/F3 — the explicit "operator picked the suggestion" marker. Keyed the
+        # SAME way `answers` is (the UI intersects it with the schema properties,
+        # which are the keys `param_answers_from_choice` emits), so the lookup below
+        # cannot drift from the answer lookup. Non-str entries are dropped: this is
+        # attacker-shaped input, having ridden a persisted decision across a suspend.
+        picked_fields = {p for p in (picked or []) if isinstance(p, str)}
 
         by_path: Dict[str, List[dict]] = {}
         for snap in snaps:
@@ -575,6 +593,21 @@ def promote_answered_asks(vault, dctx, answers,
                 capped.append(f"{path} (no comparable candidate digest)")
                 continue
             matched = [origin for ref, origin in cands if ref == ans_ref]
+            if not matched and path in picked_fields:
+                # R-B4/F3 — the operator EXPLICITLY picked the offered suggestion,
+                # but the digests did not compare equal. The digest comparison is
+                # the weaker witness here: `normalize_value` folds case and path
+                # separators, yet an answer that round-tripped through a widget can
+                # still differ from the candidate the binder digested, and any such
+                # difference reads as "the operator typed this" ⇒ `_OPERATOR`, the
+                # TRUSTED axis. That is a laundering path for a scraped value.
+                #
+                # An explicit pick is direct evidence about the SAME question, so it
+                # is honoured — and only ever in the tainting direction: it can make
+                # the origin more tainted, never less. `_most_tainted` over every
+                # comparable candidate is the conservative reading when we know a
+                # candidate was taken but not which one.
+                matched = [origin for _ref, origin in cands]
             origin = _most_tainted(matched) if matched else _OPERATOR
 
             # ── bounds: per-call, per-class, and the shared per-TICK budget ──
@@ -617,8 +650,18 @@ def promote_answered_asks(vault, dctx, answers,
                 # fresh one below replaces it rather than sitting alongside it
                 _drop_stale_learned_card(vault, leaf=leaf)
 
-            _materialize_learned_card(vault, leaf=leaf, answer=str(answer),
-                                      origin_class=origin)
+            _card = _materialize_learned_card(vault, leaf=leaf, answer=str(answer),
+                                              origin_class=origin)
+            if _card is not None and ask_id:
+                # R-B4/§5.6 — record WHAT this answer put on the table so the answer
+                # card can acknowledge it and offer a one-click undo. Best-effort by
+                # construction (`record_answer_receipt` swallows): the promotion has
+                # already succeeded at this point, and an un-acknowledged promotion is
+                # a missing chip, not a wrong one.
+                from systemu.runtime import table_store as _ts
+                _key, _name, _kind = _card
+                _ts.record_answer_receipt(vault, ask_id, ref_key_=_key,
+                                          name=_name, kind=_kind)
             promoted += 1
             per_class[klass] = per_class.get(klass, 0) + 1
             logger.debug("[S3] promoted %s (origin=%s, ask=%s)", path, origin, ask_id)

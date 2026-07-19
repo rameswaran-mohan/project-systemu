@@ -222,6 +222,30 @@ def project(vault) -> List[TableItem]:
             continue
         item.pinned = key in pins
         projected.setdefault(item.id, item)
+
+    # ── R-B4: apply the operator's ACCEPTANCES (§5.10.b#1 / AC5) ───────────────
+    # Runs LAST, over the finished projection, and is deliberately the only place
+    # a `suggested` item ever changes status. Three properties make it safe:
+    #
+    #   1. STATUS ONLY. `provenance` and `origin_class` are not touched — the taint
+    #      rule is "accepting changes status, never origin". An accepted proposal
+    #      keeps `provenance="proposed"`/`origin_class="content_derived"` and so
+    #      keeps its badge, its fence, and its no-silent-bind treatment.
+    #   2. It promotes ONLY `suggested`. It cannot resurrect a `broken` item into
+    #      `ready` or otherwise launder a health state, and a stale acceptance for
+    #      a key that later became a live `ready` object is inert rather than a
+    #      downgrade.
+    #   3. The source is an operator-only sidecar (`accepted.json`). Nothing in the
+    #      runtime writes it, so no code path auto-promotes.
+    #
+    # Tombstoned keys never reach here — every loop above skips them — so an
+    # accepted-then-removed item stays removed.
+    accepted = ts.load_accepted(vault)
+    if accepted:
+        for item in projected.values():
+            if item.status == "suggested" \
+                    and ts.ref_key(item.kind, item.ref) in accepted:
+                item.status = "declared"
     return list(projected.values())
 
 

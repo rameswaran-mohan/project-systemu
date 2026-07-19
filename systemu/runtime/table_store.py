@@ -46,6 +46,14 @@ from pydantic import BaseModel, Field
 ITEM_KINDS = {"service", "mcp_server", "tool", "data_root", "credential_ref",
               "preference", "device"}
 ITEM_STATUSES = {"declared", "configuring", "ready", "stale", "broken", "suggested"}
+#: The five legal `provenance` values (R-B4). Previously documented ONLY in the
+#: field comment on `TableItem.provenance`, which meant nothing could ASK whether a
+#: value was known — and a renderer that cannot tell "unknown" from "known" has to
+#: guess, which is how a badge ends up flattering an unrecognised row. The
+#: §5.10.b#4 provenance banner reads this set to decide whether it may name a
+#: source at all; anything outside it is reported as undetermined, never as
+#: operator-declared.
+ITEM_PROVENANCES = {"consulted", "operator_added", "learned", "migrated", "proposed"}
 
 
 def _now() -> str:
@@ -150,6 +158,180 @@ def remove_tombstone(vault, ref_key: str) -> None:
     tomb = load_tombstones(vault)
     tomb.discard(str(ref_key))
     _write_atomic(_tombstones_path(vault), json.dumps(sorted(tomb), indent=2))
+
+
+# ── accepted suggestions — a UI-owned curation sidecar (R-B4, §5.10.b#1) ──────
+# `accepted.json` is the exact mirror of `tombstones.json`: a set of ref-keys the
+# operator ACCEPTED from the tray, written ONLY by direct operator UI action and
+# read back by the projector.
+#
+# It is an OVERLAY rather than an in-place status edit, and that is the whole
+# design. `load_proposed_items` clamps `status="suggested"` unconditionally on
+# every load — that clamp IS the trust boundary (§5.10.b#2b), so a persisted
+# acceptance must never be expressed by writing `declared` into a task-writable
+# sidecar, where the clamp would either erase it or have to be weakened to honour
+# it. Keeping acceptance in a separate operator-only file lets the clamp stay
+# absolute while a real acceptance still sticks.
+#
+# It carries STATUS ONLY. `provenance` and `origin_class` are untouched by
+# acceptance — §5.10.b#1: "accepting a `suggested` item changes *status*
+# (→`declared`), never origin." An accepted content_derived item is still
+# content_derived, still fenced, still never silent-bound.
+#
+# A tombstone BEATS an acceptance: every merge loop in `project()` skips a
+# tombstoned key before the overlay is ever consulted, so accept-then-remove
+# removes. The reverse order is also safe — acceptance of a tombstoned key
+# projects nothing.
+
+def _accepted_path(vault) -> Path:
+    return _dir(vault) / "accepted.json"
+
+
+def load_accepted(vault) -> set:
+    """The set of ref-keys the operator accepted from the tray. Defensive: a
+    broken/absent file ⇒ empty (fail-closed: an unreadable file means nothing is
+    accepted, never that everything is)."""
+    try:
+        path = _accepted_path(vault)
+        if not path.exists():
+            return set()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {str(k) for k in (raw or []) if isinstance(k, str)}
+    except Exception:
+        return set()
+
+
+def add_accepted(vault, ref_key: str) -> None:
+    """Record an operator acceptance. Direct-UI-action only — nothing in the
+    runtime may call this, or `suggested` would auto-promote (the §5.10.b#1 hard
+    invariant). Pinned by ``test_nothing_in_the_runtime_accepts_a_suggestion``."""
+    acc = load_accepted(vault)
+    acc.add(str(ref_key))
+    _write_atomic(_accepted_path(vault), json.dumps(sorted(acc), indent=2))
+
+
+def remove_accepted(vault, ref_key: str) -> None:
+    """Undo an acceptance — the item falls back to `suggested`. No-op if absent."""
+    acc = load_accepted(vault)
+    acc.discard(str(ref_key))
+    _write_atomic(_accepted_path(vault), json.dumps(sorted(acc), indent=2))
+
+
+# ── answer receipts — what answering ONE ask put on the table (R-B4, §5.6) ────
+# §5.6: "Answer cards carry an 'on your table ✓' acknowledgement + undo chip when
+# the answer auto-materializes a TableItem — an acknowledgement, never a gate."
+#
+# The card needs to name WHAT it put there, and it is rendered by the UI long
+# after (and in a different process from) the reconciler tick that promoted the
+# answer. Re-deriving it in the UI would mean re-running the leaf→kind mapping and
+# the ref-shape construction — a second copy of the mapping whose drift from
+# `ask_promotion`'s copy is exactly how a learned card and an operator removal stop
+# meeting. So the promoter WRITES what it actually did, and the card reads it.
+#
+# Keyed by ask_id. Bounded: `MAX_ANSWER_RECEIPTS` asks, oldest evicted — an
+# acknowledgement is worthless once the card is gone, so this must not grow
+# without limit on a long-lived vault.
+
+MAX_ANSWER_RECEIPTS = 50
+
+
+def _receipts_path(vault) -> Path:
+    return _dir(vault) / "answer_receipts.json"
+
+
+def load_answer_receipts(vault) -> Dict[str, List[Dict[str, str]]]:
+    """ask_id → the rows that answering it materialized. Defensive: broken ⇒ {}."""
+    try:
+        path = _receipts_path(vault)
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, List[Dict[str, str]]] = {}
+        for ask_id, rows in raw.items():
+            if not isinstance(ask_id, str) or not isinstance(rows, list):
+                continue
+            clean = [
+                {"key": str(r.get("key", "")), "name": str(r.get("name", "")),
+                 "kind": str(r.get("kind", ""))}
+                for r in rows
+                if isinstance(r, dict) and isinstance(r.get("key"), str) and r.get("key")
+            ]
+            if clean:
+                out[ask_id] = clean
+        return out
+    except Exception:
+        return {}
+
+
+def record_answer_receipt(vault, ask_id: str, *, ref_key_: str, name: str,
+                          kind: str) -> None:
+    """Note that answering ``ask_id`` put ``ref_key_`` on the table.
+
+    Best-effort and NEVER raises: §5.9 already treats the card as the visible half
+    and the profile fact as the durable half, so a receipt failure must not fail a
+    promotion that already succeeded. Deduped by key within one ask, so a re-answer
+    that heals the same card in place does not stack acknowledgements.
+    """
+    try:
+        if not ask_id or not ref_key_:
+            return
+        data = load_answer_receipts(vault)
+        rows = data.get(ask_id, [])
+        if any(r["key"] == str(ref_key_) for r in rows):
+            return
+        rows.append({"key": str(ref_key_), "name": str(name), "kind": str(kind)})
+        data[ask_id] = rows
+        if len(data) > MAX_ANSWER_RECEIPTS:
+            # dicts preserve insertion order, so the oldest ask_ids are first
+            for stale in list(data.keys())[: len(data) - MAX_ANSWER_RECEIPTS]:
+                data.pop(stale, None)
+        _write_atomic(_receipts_path(vault), json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def clear_answer_receipt(vault, ask_id: str) -> None:
+    """Drop one ask's receipt (the operator used the undo chip). Never raises."""
+    try:
+        data = load_answer_receipts(vault)
+        if data.pop(str(ask_id), None) is not None:
+            _write_atomic(_receipts_path(vault), json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def undo_answer_receipt(vault, ask_id: str) -> List[str]:
+    """The §5.6 undo chip: take back everything answering ``ask_id`` put on the
+    table. Returns the ref-keys removed.
+
+    TOMBSTONES rather than deleting the sidecar row, because deletion would not
+    stick: the promotion's profile fact survives the undo (it is the durable half
+    of §5.9 and undoing a table card is not a retraction of the answer), so the very
+    next promotion for the same leaf would cheerfully re-add the card. A tombstone
+    is the one removal `add_learned_item` actually honours.
+
+    The receipt is cleared last so a failure part-way leaves the chip visible and
+    the undo retryable, rather than clearing the acknowledgement for a removal that
+    did not happen.
+    """
+    removed: List[str] = []
+    try:
+        for row in load_answer_receipts(vault).get(str(ask_id), []):
+            key = row.get("key") or ""
+            if not key:
+                continue
+            try:
+                add_tombstone(vault, key)
+                removed.append(key)
+            except Exception:
+                continue
+    except Exception:
+        return removed
+    if removed:
+        clear_answer_receipt(vault, ask_id)
+    return removed
 
 
 # ── operator pins — a UI-owned curation sidecar (§5.10.c, DEC-10) ──────────────
