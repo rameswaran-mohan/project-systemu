@@ -19,18 +19,28 @@ Two distinct harms, both pinned here:
     ``success=True`` with ``run()`` never called and no effect produced.
 
 These tests emulate the container rather than requiring a Docker daemon: the
-fake ``docker run`` reads the backend's OWN ``-v host:container`` mount
-arguments to build the container filesystem view, then executes the exact
-``sh -c`` command the backend composed. A container path referenced by the
-command but never mounted is therefore a test failure, not a silent pass.
+fake ``docker run`` builds the container filesystem view from the backend's
+OWN ``-v`` mounts AND from the tar payload it streams on stdin, then executes
+the exact command the backend composed. A container path referenced by the
+command but never delivered by either route is therefore a test failure, not
+a silent pass.
+
+W6.7 moved the tool and the runner from bind mounts to a streamed payload,
+because a bind SOURCE is resolved by the daemon and systemu can be
+containerised (see ``test_docker_backend_deployment_portability``). The
+emulator follows: it now unpacks the payload as the container would. The
+honesty property is unchanged — delivery is checked, not assumed.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import re
 import shlex
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -41,12 +51,46 @@ from systemu.runtime.backend.local import LocalBackend
 
 # ── container emulator ───────────────────────────────────────────────────────
 
-class _FakeProc:
-    def __init__(self, out: bytes, err: bytes, rc: int) -> None:
-        self._out, self._err, self.returncode = out, err, rc
+def _payload_guard(shell_cmd: str, croot: Path):
+    """Evaluate the backend's ``[ -f X ] && [ -f Y ] || { echo …; exit N; }``
+    payload-arrival guard against the real container filesystem.
 
-    async def communicate(self):
-        return self._out, self._err
+    Returns what the shell would produce if the guard trips, else ``None``.
+    Parses the CONDITION rather than the ``echo``, so a deleted guard stops
+    protecting anything.
+    """
+    g = re.search(
+        r"\{\s*((?:\[\s*-f\s+\S+\s*\]\s*(?:&&)?\s*)+);\s*\}\s*\|\|\s*"
+        r"\{\s*echo\s+'(\S+)[^']*'\s*>&2;\s*exit\s+(\d+);\s*\}",
+        shell_cmd)
+    if g is None:
+        return None
+    guarded = [p.strip("'\"") for p in re.findall(r"\[\s*-f\s+(\S+?)\s*\]", g.group(1))]
+    if all((croot / p.lstrip("/")).is_file() for p in guarded):
+        return None
+    return b"", f"{g.group(2)} payload check failed".encode(), int(g.group(3))
+
+
+class _FakeProc:
+    """The container. Its work happens in ``communicate`` because that is
+    where the streamed payload actually arrives — on stdin, exactly as the
+    real container receives it."""
+
+    def __init__(self, run) -> None:
+        self._run, self.returncode = run, None
+
+    async def communicate(self, input=None):  # noqa: A002 - matches asyncio API
+        out, err, self.returncode = self._run(input)
+        return out, err
+
+
+def _static(out: bytes, err: bytes, rc: int) -> _FakeProc:
+    return _FakeProc(lambda _input: (out, err, rc))
+
+
+# tarfile's extraction ``filter`` landed after this project's 3.10 floor; use
+# it where available so the emulator does not emit a DeprecationWarning.
+_EXTRACT_KW = {"filter": "data"} if sys.version_info >= (3, 12) else {}
 
 
 def _parse_mount(spec: str) -> tuple[str, str]:
@@ -57,60 +101,94 @@ def _parse_mount(spec: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def _install_fake_docker(monkeypatch) -> dict:
+def _install_fake_docker(monkeypatch, croot: Path, *,
+                         deliver_payload: bool = True) -> dict:
     """Patch asyncio.create_subprocess_exec to emulate `docker run`.
 
+    ``croot`` is the container's root directory: everything the container can
+    see must have been put there by a mount or by the streamed payload.
+    ``deliver_payload=False`` emulates a delivery that silently produced
+    nothing, so the tests can prove the check is not vacuous.
     Returns a recorder dict populated on each call.
     """
     rec: dict = {}
 
-    async def _fake(*cmd, stdout=None, stderr=None, **kwargs):
+    async def _fake(*cmd, stdin=None, stdout=None, stderr=None, **kwargs):
         rec["argv"] = list(cmd)
         assert cmd[0] == "docker", f"expected a docker invocation, got {cmd[0]!r}"
+        croot.mkdir(parents=True, exist_ok=True)
 
         mounts: dict[str, str] = {}
         for i, arg in enumerate(cmd):
             if arg == "-v" and i + 1 < len(cmd):
                 host, container = _parse_mount(cmd[i + 1])
                 mounts[container] = host
+                src = Path(host)
+                if src.is_file():
+                    dest = croot / container.lstrip("/")
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(src.read_bytes())
         rec["mounts"] = mounts
 
         shell_cmd = cmd[-1]
         rec["shell_cmd"] = shell_cmd
-        # Only the final segment actually runs the tool (`pip install ... && python ...`)
-        tool_cmd = shell_cmd.split("&&")[-1].strip()
-        argv = shlex.split(tool_cmd, posix=True)
-        rec["container_argv"] = list(argv)
 
-        # Map container paths -> host paths using the backend's OWN mounts.
-        unmounted: list[str] = []
-        mapped: list[str] = []
-        for arg in argv:
-            if arg in mounts:
-                mapped.append(mounts[arg])
-            elif arg.startswith("/app/"):
-                # referenced inside the container but never mounted in
-                unmounted.append(arg)
-                mapped.append(arg)
-            else:
-                mapped.append(arg)
-        rec["unmounted_refs"] = unmounted
-        if unmounted:
-            # Exactly what the real container would do: python can't open it.
-            msg = f"python: can't open file {unmounted[0]!r}: No such file or directory"
-            return _FakeProc(b"", msg.encode(), 2)
+        def _run(payload: bytes | None):
+            # The streamed payload arrives on stdin; the container unpacks it
+            # before running anything.
+            rec["payload_bytes"] = len(payload or b"")
+            m = re.search(r"tar\s+-xf\s+-\s+-C\s+([^\s;]+)", shell_cmd)
+            rec["extract_dir"] = m.group(1) if m else None
+            rec["payload_names"] = []
+            if m and payload and deliver_payload:
+                dest = croot / m.group(1).lstrip("/")
+                dest.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(fileobj=io.BytesIO(payload), mode="r") as tar:
+                    rec["payload_names"] = tar.getnames()
+                    tar.extractall(dest, **_EXTRACT_KW)  # noqa: S202 - our own archive
 
-        if mapped and mapped[0] == "python":
-            mapped[0] = sys.executable
-        completed = subprocess.run(mapped, capture_output=True)
-        return _FakeProc(completed.stdout, completed.stderr, completed.returncode)
+            # The final segment runs the tool; `exec` is a shell builtin, not argv.
+            pm = re.search(
+                r"(?:exec\s+)?(python)\s+(/\S+)\s+(/\S+)\s+--params\s+(.*)$",
+                shell_cmd)
+            assert pm, f"no python invocation found in the command: {shell_cmd!r}"
+            argv = [pm.group(1), pm.group(2), pm.group(3),
+                    "--params", shlex.split(pm.group(4), posix=True)[0]]
+            rec["container_argv"] = list(argv)
+
+            # Anything the command names must actually BE in the container —
+            # whether a mount or the payload put it there.
+            undelivered = [a for a in (pm.group(2), pm.group(3))
+                           if not (croot / a.lstrip("/")).is_file()]
+            rec["unmounted_refs"] = undelivered
+
+            # The backend's payload-arrival guard runs BEFORE python. Evaluate
+            # the actual `[ -f X ]` condition, not the mere presence of an
+            # `echo` — otherwise deleting the guard still looks guarded.
+            guard = _payload_guard(shell_cmd, croot)
+            if guard is not None:
+                return guard
+            if undelivered:
+                msg = (f"python: can't open file {undelivered[0]!r}: "
+                       f"No such file or directory")
+                return b"", msg.encode(), 2
+
+            mapped = [sys.executable,
+                      str(croot / pm.group(2).lstrip("/")),
+                      str(croot / pm.group(3).lstrip("/")),
+                      "--params", argv[4]]
+            completed = subprocess.run(mapped, capture_output=True)
+            return completed.stdout, completed.stderr, completed.returncode
+
+        return _FakeProc(_run)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake)
     return rec
 
 
 def _run_docker(impl: Path, params: dict, monkeypatch, *, vault_root: Path):
-    rec = _install_fake_docker(monkeypatch)
+    croot = Path(vault_root) / "_container_root"
+    rec = _install_fake_docker(monkeypatch, croot)
     backend = DockerBackend(vault_root=vault_root)
     result = asyncio.run(backend.execute(impl, json.dumps(params), timeout=60))
     return result, rec
@@ -364,20 +442,34 @@ class TestEmulatorIsHonest:
         assert res.success, res.error
         assert res.parsed.get("echo") == "argv"
 
-    def test_unmounted_container_path_is_caught_by_the_emulator(self, tmp_path, monkeypatch):
-        """Meta-test: the emulator fails a command referencing an unmounted path.
+    def test_undelivered_container_path_is_caught_by_the_emulator(self, tmp_path, monkeypatch):
+        """Meta-test: the emulator fails a command referencing a path that
+        never arrived in the container.
 
-        Without this, a backend that forgot to mount the runner would appear
+        Without this, a backend that forgot to ship the runner would appear
         to pass because the emulator silently resolved the path on the host.
         """
-        rec = _install_fake_docker(monkeypatch)
         impl = _write(tmp_path, "t.py", "def run(**k):\n    return {'success': True}\n")
-        asyncio.run(DockerBackend(vault_root=tmp_path).execute(
-            impl, "{}", timeout=10))
+        _, rec = _run_docker(impl, {}, monkeypatch, vault_root=tmp_path)
         assert rec["unmounted_refs"] == [], (
-            "the backend's command references container paths it never mounted: "
-            f"{rec['unmounted_refs']}"
+            "the backend's command references container paths it never "
+            f"delivered: {rec['unmounted_refs']}"
         )
+
+    def test_the_emulator_really_would_catch_a_lost_payload(self, tmp_path, monkeypatch):
+        """Positive control FOR the meta-test above: suppress delivery and the
+        emulator must notice. An always-empty ``unmounted_refs`` would make
+        the previous assertion vacuous."""
+        impl = _write(tmp_path, "t.py", "def run(**k):\n    return {'success': True}\n")
+        croot = tmp_path / "_container_root"
+        rec = _install_fake_docker(monkeypatch, croot, deliver_payload=False)
+        res = asyncio.run(DockerBackend(vault_root=tmp_path).execute(
+            impl, "{}", timeout=10))
+        assert rec["unmounted_refs"], (
+            "the emulator did not notice a completely undelivered payload — "
+            "its delivery check is vacuous"
+        )
+        assert res.success is False
 
 
 # ── the shared contract: backends must not drift apart again ────────────────
@@ -394,29 +486,50 @@ class TestBackendsShareTheRunnerContract:
             f"directly; container argv was {argv!r}"
         )
         # the impl is an ARGUMENT to the runner, never argv[1]
-        assert "/app/tool.py" in argv[2:], f"impl not passed to the runner: {argv!r}"
+        assert argv[2].endswith("/t.py"), f"impl not passed to the runner: {argv!r}"
 
-    def test_runner_is_mounted_into_the_container(self, tmp_path, monkeypatch):
-        impl = _write(tmp_path, "t.py", "def run(**k):\n    return {'success': True}\n")
+    def test_the_tool_keeps_its_real_name_inside_the_container(self, tmp_path, monkeypatch):
+        """The runner names failures after ``basename(impl_path)``.
+
+        Delivering every tool as a fixed ``tool.py`` made every in-container
+        diagnostic say "tool.py" and never name the tool that actually broke.
+        The previous emulator hid this: it mapped the container path back to
+        the host file, so the runner saw the real name in tests and a generic
+        one in production.
+        """
+        impl = _write(tmp_path, "weather_lookup.py",
+                      "def run(**k):\n    return {'success': True}\n")
         _, rec = _run_docker(impl, {}, monkeypatch, vault_root=tmp_path)
 
-        runner_mounts = [c for c in rec["mounts"] if "tool_runner" in c]
-        assert runner_mounts, f"runner not mounted; mounts={rec['mounts']!r}"
-        host = Path(rec["mounts"][runner_mounts[0]])
-        assert host.name == "tool_runner_script.py" and host.exists(), (
-            f"runner mount does not point at the real runner: {host}"
+        assert rec["container_argv"][2].endswith("/weather_lookup.py"), (
+            "the tool lost its identity on the way into the container: "
+            f"{rec['container_argv']!r}"
         )
 
-    def test_runner_is_mounted_read_only(self, tmp_path, monkeypatch):
+    def test_the_runner_reaches_the_container(self, tmp_path, monkeypatch):
+        """The shared runner must ARRIVE, by whatever mechanism.
+
+        Was ``test_runner_is_mounted_into_the_container``: it pinned the
+        bind mount specifically, which is the thing W6.7 had to remove (a
+        bind source is resolved by the daemon, and systemu can be
+        containerised). The requirement is unchanged — the runner must be
+        in the container, and it must be the real shared one. Payload-level
+        detail (identity, read-only mode) is pinned in
+        ``test_docker_backend_deployment_portability``.
+        """
         impl = _write(tmp_path, "t.py", "def run(**k):\n    return {'success': True}\n")
         _, rec = _run_docker(impl, {}, monkeypatch, vault_root=tmp_path)
-        argv = rec["argv"]
-        # only the value that FOLLOWS a -v is a mount spec (the shell command
-        # also mentions the runner, and it is not a mount)
-        specs = [argv[i + 1] for i, a in enumerate(argv)
-                 if a == "-v" and i + 1 < len(argv) and "tool_runner" in argv[i + 1]]
-        assert specs and all(s.endswith(":ro") for s in specs), (
-            f"runner must be mounted read-only, got {specs!r}"
+
+        assert "tool_runner.py" in rec["payload_names"], (
+            f"runner never reached the container; delivered={rec['payload_names']!r}"
+        )
+        assert rec["unmounted_refs"] == [], (
+            f"the command names a path that never arrived: {rec['unmounted_refs']!r}"
+        )
+        landed = tmp_path / "_container_root" / "app" / "tool_runner.py"
+        from systemu.runtime.backend.docker import _RUNNER_SRC
+        assert landed.read_bytes() == _RUNNER_SRC.read_bytes(), (
+            "what arrived is not the real shared tool_runner_script.py"
         )
 
     # NOTE: the source-level DRIFT PIN lives in

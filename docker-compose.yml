@@ -299,6 +299,17 @@ services:
   # ──────────────────────────────────────────────────────────────────────────
   # docker-sandbox profile — tool execution isolated in ephemeral containers
   # (orthogonal to the storage/queue choice; can layer on top of either mode)
+  #
+  # W6.7 — systemu runs HERE, in a container, but the tool containers it spawns
+  # are created by the HOST daemon through the socket mounted below. The two do
+  # NOT share a filesystem, so nothing in this container can be used as a bind
+  # SOURCE for a tool container: the daemon resolves bind sources on the host,
+  # where /data/vault (a named volume) and /app (baked into the image) do not
+  # exist. `-v` does not reject a missing source — it creates it as an empty
+  # directory — so the profile silently could not execute any tool.
+  # DockerBackend therefore STREAMS the tool and the runner into each tool
+  # container over the Docker API and mounts nothing but a NAMED volume. Do not
+  # "fix" a tool-container mount by adding a host path here; there isn't one.
   # ──────────────────────────────────────────────────────────────────────────
 
   systemu-docker:
