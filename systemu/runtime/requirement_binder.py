@@ -8,6 +8,10 @@ open-world reframe: the planner reasons over a concrete gap list, not a hunch.
 The 5 bind sources, tried IN ORDER (first hit wins) — §5.3:
   1. FileHandle       — a granted-root salient file (re-gated through
                         GrantedRootsStore.is_within_granted). Origin content_derived.
+                        Consulted ONLY for a leaf the path oracle typed as a path
+                        (``_PATH_ONLY_SOURCES``): it scores the objective's GOAL TEXT,
+                        so ungated it pre-filled a path into every leaf in the schema —
+                        ``password``, ``query``, ``count``. See that constant.
   2. run-context      — a prior objective's produced file / run state (best-effort
                         from ctx.files_produced; a typed objective_outputs store is
                         deferred to R-A11). Origin content_derived.
@@ -629,6 +633,38 @@ def _bind_schema_default(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[s
 _SOURCES = (_bind_provided_params, _bind_filehandle, _bind_run_context,
             _bind_inventory_entry, _bind_profile, _bind_schema_default)
 
+# Sources that can only ever produce a FILE PATH, and are therefore consulted ONLY for
+# a leaf the path oracle typed as a path (``_bind_one_leaf``'s ``is_path``).
+#
+# WHY. ``_bind_filehandle`` scores the OBJECTIVE'S GOAL TEXT (``bc.reference_text``),
+# not the leaf key — and ``reference_resolver`` folds the key in with a UNION
+# (``_tokens(text) | _tokens(key or "")``), so the key can only WIDEN a match, never
+# constrain one. Ungated, one goal naming a granted-root file resolved for EVERY leaf
+# in the schema: measured over the repo's harvested tool schemas, 83/142 requirements
+# came back pre-filled with a path and 50 of those (35.2%, 30 distinct keys) were on
+# leaves that cannot hold one — ``password``, ``query``, ``count``, ``verbose``,
+# ``process_id``. The operator saw a confident wrong default in a box that wanted a
+# secret. This was inert until source #1 was threaded its vault and went live, so the
+# exposure is as new as that fix, not a legacy shape.
+#
+# NOT the resolver's scoring. Requiring a path-SHAPED value there was investigated and
+# rejected: the file genuinely matches the goal text, so the match is not the error —
+# consulting a file source for a non-path leaf is.
+#
+# COST. Pre-fill now rides on the oracle's recall. That is affordable because
+# ``looks_like_path`` is deliberately high-recall (it unions ``format``,
+# ``contentMediaType``, key patterns AND the description), and the only leaf it never
+# sees is one with NO ``type`` — a union like ``["string", "null"]`` still resolves
+# through ``_first_type``. Such a leaf degrades to an honest ``missing`` ask, which
+# beats a confidently wrong pre-fill.
+#
+# ``_bind_run_context`` is DELIBERATELY ABSENT. It is ungated in the same way (with one
+# produced file it binds every leaf at 0.5, non-path ones included), but G-LEARN S3
+# promotion uses it as its ``content_derived`` channel on non-path leaves, so gating it
+# would delete a shipped feature's substrate rather than close a defect. Tracked as
+# separate debt — see ``tests/test_ra11a_prefill_gate.py``.
+_PATH_ONLY_SOURCES = frozenset({_bind_filehandle})
+
 
 # ── small tolerant readers (TableItem-or-dict, list-or-missing) ──────────────
 def _get(obj, field):
@@ -730,6 +766,9 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
         # Otherwise try the 5 sources in order (first hit wins).
         bound = None
         for src in _SOURCES:
+            # a file-valued source may only fill a leaf the oracle typed as a path
+            if src in _PATH_ONLY_SOURCES and not is_path:
+                continue
             try:
                 if src is _bind_provided_params:
                     bound = src(bc, key, spec, path)
