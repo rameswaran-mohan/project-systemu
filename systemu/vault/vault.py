@@ -99,6 +99,10 @@ def _tool_header(t: Tool) -> Dict[str, Any]:
         # for every tool just to read schemas.
         "parameters_schema_summary": _summarise_schema(t.parameters_schema),
         "return_schema_summary":    _summarise_schema(t.return_schema),
+        # R-CAP1: capability_index._ready() gates on implementation_path. The
+        # header never carried it, so that gate rejected EVERY catalog tool and
+        # the capability index derived empty on every real vault.
+        "implementation_path": t.implementation_path or "",
         "created_at": t.created_at.isoformat(),
     }
 

@@ -1403,6 +1403,11 @@ class ToolSandbox:
             "verdict": getattr(verdict, "value", str(verdict)),
             "effect_tags": sorted(effect_tags),
             "destructive": ctx.is_destructive_param,
+            # R-UX3 / UX-14: persist the evaluate_action REASON structurally so
+            # the "why?" panel can render it without re-scoring the call (the
+            # read-only hard rule) and without parsing it back out of the
+            # free-text ``inspect`` blob. Deterministic string, no secrets.
+            "gate_reason": reason,
         }
         # IMPL-2: the fingerprint of the CALL this card is about. ``_record_reclassify``
         # reads it back and scopes the record to it, so the operator's assignment binds

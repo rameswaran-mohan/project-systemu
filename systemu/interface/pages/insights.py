@@ -261,6 +261,15 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                 f"font-family: monospace; margin-bottom: 8px;"
             )
 
+        # R-UX3 / UX-14: the "why?" expansion. This is the ONE shared card
+        # renderer, so attaching here gives every gate/ask card the affordance.
+        # Read-only: it renders the persisted record and re-scores nothing.
+        try:
+            from systemu.interface.components.why_panel import build_why_panel
+            build_why_panel(card)
+        except Exception:
+            pass  # an explanation failing must never break the decision card
+
         def _make_handler(did, dedup_key, label, the_queue):
             def _click(_e=None):
                 try:

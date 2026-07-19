@@ -451,6 +451,18 @@ def _build_layout(page_title: str, current_path: str):
                 except Exception:
                     pass  # never let banner failure break the dashboard
 
+            # R-UX3 / UX-13: the Ctrl+K palette, mounted once per page from the
+            # shared layout so it exists on EVERY route. Navigate/prefill only —
+            # it can never run anything (see command_palette's safety line).
+            try:
+                from systemu.interface.components.command_palette import (
+                    build_command_palette)
+                from systemu.interface.dashboard_state import AppState as _CpState
+                _cp_state = _CpState.get()
+                build_command_palette(getattr(_cp_state, "vault", None))
+            except Exception:
+                pass  # never let the palette break the page
+
             from systemu.interface.jobs import JobManager, JobStatus
             jm = JobManager.get()
             

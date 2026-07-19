@@ -241,6 +241,20 @@ def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None
         if model["dedup"]:
             ui.label(f"dedup: {model['dedup']}").classes("s-mono")
 
+        # R-UX3 / UX-14: "why?" renders from the PERSISTED decision record, not
+        # from the descriptor — the descriptor (extra=forbid) carries no
+        # verdict, effect tags or signature, so building the explanation from it
+        # would mean inventing the very fields that matter. If the record cannot
+        # be read, the affordance is omitted rather than shown half-true.
+        try:
+            from systemu.interface.components.why_panel import build_why_panel
+            _dec = vault.get_decision(dec_id)
+            if _dec is not None:
+                build_why_panel(
+                    _dec.to_dict() if hasattr(_dec, "to_dict") else _dec)
+        except Exception:
+            pass  # an explanation failing must never break the gate card
+
         def _resolve_with(choice: str):
             # W7.1: async handler + to_thread — the resolve chain executes the
             # approved action (LLM/pip/dry-run) and must never run on the UI

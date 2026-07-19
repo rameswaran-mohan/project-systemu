@@ -100,24 +100,69 @@ def _usage_for(vault, name: str) -> Dict[str, Any]:
 # CAP-2 — derive + persist (reconciler-sole-writer)
 # --------------------------------------------------------------------------- #
 
+# Mirrors vault._summarise_schema's cap so the full-schema and summary sources
+# truncate identically and therefore hash identically.
+_SHAPE_FIELD_CAP = 20
+
+
+def _shape_map(schema: Any) -> Dict[str, str]:
+    """Normalize ANY of the three shapes a tool's parameters actually arrive in
+    into one ``{name: type}`` map:
+
+      * a wrapped JSON Schema  ``{"type": "object", "properties": {n: {"type": t}}}``
+      * the BARE-PROPS form    ``{n: {"type": t}}``  — what every shipped seed
+        tool stores in ``parameters_schema`` (verified by reading the real vault)
+      * the header SUMMARY     ``{n: "t"}``          — ``parameters_schema_summary``,
+        the only schema form ``_tool_header`` carries
+
+    Reading only the wrapped form (the pre-fix behaviour) meant every real tool
+    fell through to an empty ``properties`` and hashed to the SAME empty-shape
+    digest, so ``io_shape_hash`` could not tell any two tools apart. The
+    branch/cap here deliberately mirrors ``vault._summarise_schema`` so a tool
+    hashes the same whichever source it was derived from."""
+    if not isinstance(schema, dict):
+        return {}
+    props = schema.get("properties") if "properties" in schema else schema
+    if not isinstance(props, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in list(props.items())[:_SHAPE_FIELD_CAP]:
+        if isinstance(v, dict):
+            out[str(k)] = str(v.get("type") or v.get("$type") or "any")[:30]
+        elif isinstance(v, str):
+            out[str(k)] = v[:30]                     # already-summarised header form
+        else:
+            out[str(k)] = "any"                      # boolean subschema &c — never raise
+    return out
+
+
 def io_shape_hash(schema: Dict[str, Any]) -> str:
     """A stable hash of a tool's input SHAPE (sorted param name:type), so two
     tools with the same interface collide regardless of description wording. A
     non-dict property value (a legal JSON-Schema boolean subschema) contributes
-    type '?' rather than raising (which would silently drop the whole tool)."""
-    props = (schema or {}).get("properties") or {}
-    if not isinstance(props, dict):
-        return hashlib.sha1(b"").hexdigest()[:16]
-    shape = sorted(
-        f"{k}:{v.get('type', '?') if isinstance(v, dict) else '?'}"
-        for k, v in props.items())
+    type 'any' rather than raising (which would silently drop the whole tool)."""
+    shape = sorted(f"{k}:{v}" for k, v in _shape_map(schema).items())
     return hashlib.sha1("|".join(shape).encode("utf-8")).hexdigest()[:16]
+
+
+_ABSENT = object()
 
 
 def _ready(tool: Any) -> bool:
     if not bool(_field(tool, "enabled", False)):
         return False
-    if not _field(tool, "implementation_path", ""):
+    # ``implementation_path`` DISQUALIFIES only when the producer actually
+    # emitted it and it is empty (a genuinely bodiless tool). A header that does
+    # not carry the key at all is UNKNOWN, not bodiless.
+    #
+    # Treating ABSENT as bodiless is what emptied the index in production: no
+    # `_tool_header` emitted this key, so EVERY catalog tool failed this gate and
+    # the entire vault catalog vanished from the index — a SqliteVault with 41
+    # enabled seeded builtins indexed 0 rows. Both headers now emit it, but
+    # existing on-disk ``tools/index.json`` files were written before they did,
+    # and those must still index.
+    impl = _field(tool, "implementation_path", _ABSENT)
+    if impl is not _ABSENT and not impl:
         return False
     return True
 
@@ -145,7 +190,12 @@ def derive_index(vault) -> List[IndexRow]:
                 detail=str(_field(t, "description", "") or "")[:300],
                 slots=slots,
                 effect_tags=list(_field(t, "effect_tags", []) or []),
-                io_shape_hash=io_shape_hash(_field(t, "parameters_schema", {}) or {}),
+                # the full schema when the source carries it (a Tool object), else
+                # the header's summary — `_tool_header` only ever emits the summary,
+                # and `_shape_map` normalizes both to the same digest.
+                io_shape_hash=io_shape_hash(
+                    _field(t, "parameters_schema", None)
+                    or _field(t, "parameters_schema_summary", {}) or {}),
                 usage=_usage_for(vault, name),
                 status=str(_field(t, "status", "ready") or "ready"),
                 origin=_origin_for(t),

@@ -231,6 +231,9 @@ def _tool_header(r: ToolRow) -> Dict[str, Any]:
         # v0.6.1-d: schema summaries inline in the header — see vault.py
         "parameters_schema_summary": _summarise_schema(r.parameters_schema or {}),
         "return_schema_summary":    _summarise_schema(r.return_schema or {}),
+        # R-CAP1: see vault._tool_header — capability_index._ready() gates on this,
+        # and its absence derived an EMPTY capability index on every real vault.
+        "implementation_path": r.implementation_path or "",
         "created_at": r.created_at.isoformat() if r.created_at else "",
     }
 

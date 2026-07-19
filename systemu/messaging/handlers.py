@@ -50,6 +50,7 @@ def handle_help(_: InboundCommand) -> str:
         "/approve <scroll_id>  — approve a pending scroll\n"
         "/reject  <scroll_id>  — reject a pending scroll\n"
         "/answer <tag> <a1-a4> — resolve a parked decision (or tap its button)\n"
+        "/why <tag>            — why a parked decision is asking (read-only)\n"
         "/help                 — this message\n"
         "\nPlain text without a leading / is treated as /chat."
     )
@@ -242,6 +243,58 @@ def handle_answer(cmd: InboundCommand) -> str:
         return f"Sorry — /answer failed: {exc}"
 
 
+_WHY_USAGE = (
+    "Usage: /why <tag>\n"
+    "The <tag> is the short code on the decision message. /why only reads the "
+    "stored record - it never re-scores or resolves anything."
+)
+
+
+def _why_lookup(tag: str):
+    """Find the decision for ``tag`` and return its dict, or None.
+
+    Rides R-P1's tag machinery (``_match_open_decision``) so /why and /answer
+    address decisions identically -- including the 8-char disambiguation for
+    colliding tags. READ-ONLY: it lists and matches, it never resolves.
+    """
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    from .decision_bridge import _match_open_decision
+
+    state = _state()
+    vault = getattr(state, "vault", None)
+    if vault is None:
+        return None
+    decision = _match_open_decision(OperatorDecisionQueue(vault), tag)
+    if decision is None:
+        return None
+    try:
+        return decision.to_dict()
+    except Exception:
+        logger.debug("[Handler] /why could not serialize decision", exc_info=True)
+        return None
+
+
+def handle_why(cmd: InboundCommand) -> str:
+    """Explain a parked decision: ``/why <tag>`` (UX-14 Telegram parity).
+
+    Returns byte-identical text to the dashboard's why panel -- one explanation
+    builder, two surfaces (PAR-2). Strictly read-only.
+    """
+    tag = (cmd.args or "").split()[0] if (cmd.args or "").strip() else ""
+    if not tag:
+        return _WHY_USAGE
+    try:
+        decision = _why_lookup(tag)
+    except Exception:
+        logger.exception("[Handler] /why lookup failed")
+        return f"Sorry - /why could not read the decision for tag {tag}."
+    if not decision:
+        return (f"No decision matches tag {tag}. Tags are shown on the "
+                f"decision message; use /status to see what is waiting.")
+    from systemu.interface.components.why_panel import explain
+    return explain(decision).as_text()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Default handler bundle
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,4 +311,5 @@ def default_handlers() -> Dict[str, Callable[[InboundCommand], str]]:
         "approve":    handle_approve,
         "reject":     handle_reject,
         "answer":     handle_answer,
+        "why":        handle_why,
     }

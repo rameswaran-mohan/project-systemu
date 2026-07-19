@@ -218,17 +218,29 @@ def test_run_find_tools_empty_catalog_is_a_clean_zero(tmp_path, capsys):
 def test_derive_index_reads_DICT_tool_headers(tmp_path):
     # HIGH: vault.list_tools() returns DICTS (not objects) — the derive must read
     # dict headers or the whole vault catalog vanishes from the index.
+    #
+    # The header is built by the REAL producer rather than hand-authored: the
+    # original hand-written fixture supplied implementation_path / effect_tags /
+    # parameters_schema, three keys `_tool_header` did not emit, so this test
+    # passed while the live index was empty. Building it from `_tool_header`
+    # means this can only pass against a shape production really produces.
+    from systemu.core.models import Tool
+    from systemu.vault.vault import _tool_header
+
+    header = _tool_header(Tool(
+        id="t1", name="create_issue", description="open an issue",
+        tool_type="python", implementation_path="vault/x.py",
+        forged_by_systemu=True, enabled=True, status="deployed"))
+    assert isinstance(header, dict)
+
     class _DictVault:
         def __init__(self, root): self.root = str(root)
         def list_tools(self, status=None):
-            return [{"id": "t1", "name": "create_issue", "enabled": True,
-                     "implementation_path": "vault/x.py", "effect_tags": ["net_call"],
-                     "forged_by_systemu": True, "description": "open an issue",
-                     "parameters_schema": {}, "status": "deployed"}]
+            return [dict(header)]
     rows = ci.derive_index(_DictVault(tmp_path))
     assert len(rows) == 1
     assert rows[0].tool_id == "t1" and rows[0].origin == "forged"
-    assert "create:issue" in rows[0].slots and rows[0].effect_tags == ["net_call"]
+    assert "create:issue" in rows[0].slots
 
 
 def test_effectful_query_ranks_trusted_origin_above_keyword_stuffed_mcp(tmp_path):
@@ -346,3 +358,146 @@ def test_forge_dedup_advisory_wording():
                                                   "slots": ["create:issue"]}])
     assert "create_issue" in adv and "create:issue" in adv and "extend" in adv.lower()
     assert ci.forge_dedup_advisory("x", []) == ""        # free slot → no advisory line
+
+
+# --------------------------------------------------------------------------- #
+# PRODUCER-GROUNDED pins — the "empty index on a real vault" regression
+#
+# ``test_derive_index_reads_DICT_tool_headers`` above was added by the R-CAP1
+# adversarial review to prove "the whole vault catalog doesn't vanish from the
+# index". It hand-authored its header dict, and THREE of the keys it supplies
+# (implementation_path / effect_tags / parameters_schema) were keys the real
+# producer — ``vault._tool_header`` — did not emit. So it passed green while
+# ``derive_index`` returned ZERO rows for every real vault: a SqliteVault with 41
+# enabled seeded builtins (read_file, web_search, …) indexed nothing, and
+# ``sharing-on find-tools "read a file"`` answered "No tools on your table yet."
+#
+# These pins never hand-author a header. They RUN the producer and assert on
+# whatever it actually emits.
+# --------------------------------------------------------------------------- #
+
+def _real_file_vault(tmp_path):
+    """A REAL Vault with a REAL Tool saved through the REAL save path, so every
+    header under test is produced by ``vault._tool_header``, not by hand."""
+    from systemu.core.models import Tool
+    from systemu.vault.vault import Vault
+    v = Vault(vault_dir=tmp_path / "realvault")
+    impl = Path(v.root) / "tools" / "implementations" / "create_github_issue.py"
+    impl.parent.mkdir(parents=True, exist_ok=True)
+    impl.write_text("def run(**kw):\n    return {}\n", encoding="utf-8")
+    v.save_tool(Tool(
+        id="tool-gh", name="create_github_issue",
+        description="open an issue on github", tool_type="python",
+        implementation_path=str(impl),
+        # bare-props form — the shape every shipped seed tool actually stores
+        parameters_schema={"title": {"type": "string"}},
+        enabled=True, status="deployed",
+    ))
+    return v
+
+
+def test_derive_index_is_NONEMPTY_for_a_real_vault_catalog(tmp_path):
+    v = _real_file_vault(tmp_path)
+    assert v.list_tools(), "producer precondition: the vault must list the saved tool"
+    rows = ci.derive_index(v)
+    assert rows, ("derive_index returned NOTHING for a real enabled+deployed tool — "
+                  "the entire vault catalog is missing from the capability index")
+    assert rows[0].name == "create_github_issue"
+    assert "create:issue" in rows[0].slots
+
+
+@pytest.mark.parametrize("backend", ["file", "sqlite"])
+def test_tool_header_emits_every_field_derive_index_gates_on(tmp_path, backend):
+    """FIXTURE-REALISM pin: fails if derive_index gates on a key the real producer
+    never emits. This is the guard the hand-authored dict fixture could not be.
+
+    Covers BOTH producers — there are exactly two ``_tool_header``
+    implementations (systemu/vault/vault.py and systemu/storage/sqlite/vault.py)
+    and they must not drift apart, since either can back a live index."""
+    if backend == "file":
+        header = _real_file_vault(tmp_path).list_tools()[0]
+    else:
+        from systemu.storage.sqlite.vault import SqliteVault
+        header = SqliteVault(f"sqlite:///{tmp_path / 'v.db'}").list_tools()[0]
+    for key in ("id", "name", "enabled", "implementation_path"):
+        assert key in header, (
+            f"the {backend} _tool_header() does not emit {key!r} but "
+            f"capability_index gates on it — any fixture supplying {key!r} asserts "
+            f"a shape production never produces")
+
+
+def test_sqlite_seeded_catalog_produces_a_nonempty_index(tmp_path):
+    """The production backend, over its real seeded builtin tools."""
+    from systemu.storage.sqlite.vault import SqliteVault
+    v = SqliteVault(f"sqlite:///{tmp_path / 'v.db'}")
+    seeded = [h for h in v.list_tools() if h.get("enabled")]
+    assert len(seeded) > 5, "precondition: the sqlite vault seeds enabled builtin tools"
+    rows = ci.derive_index(v)
+    assert len(rows) >= len(seeded), (
+        f"{len(seeded)} enabled seeded tools produced only {len(rows)} index rows")
+    indexed = {r.name for r in rows}
+    # named seeds, so a silently-shrinking catalog is caught as well as an empty one
+    assert {"file_read", "web_search", "file_write"} <= indexed
+
+
+def test_sqlite_seeded_catalog_yields_DISTINCT_io_shapes(tmp_path):
+    """io_shape_hash must actually discriminate: reading only the wrapped-schema
+    form hashed all 41 seeded tools to ONE digest (they store bare props), which
+    would make every tool look interface-identical to same-slot forge dedup."""
+    from systemu.storage.sqlite.vault import SqliteVault
+    v = SqliteVault(f"sqlite:///{tmp_path / 'v.db'}")
+    rows = ci.derive_index(v)
+    assert len(rows) > 20, "precondition: the seeded catalog is indexed"
+    assert len({r.io_shape_hash for r in rows}) > len(rows) // 2
+
+
+def test_forge_dedup_sees_an_existing_real_vault_tool(tmp_path):
+    """CAP-6: with an empty index the dedup advisory was silently always blank, so
+    the forge could never warn it was about to duplicate a shipped tool."""
+    v = _real_file_vault(tmp_path)
+    cols = ci.slot_collisions(v, "create_issue")
+    assert cols, "slot_collisions found nothing though create_github_issue holds create:issue"
+    assert ci.forge_dedup_advisory("create_issue", cols)
+
+
+def test_ready_tolerates_a_LEGACY_header_without_implementation_path(tmp_path):
+    """An on-disk tools/index.json written before the field was added carries no
+    implementation_path key. ABSENT means unknown, not bodiless — gating on absence
+    is what emptied the index for every existing vault."""
+    class _LegacyVault:
+        def __init__(self, root): self.root = str(root)
+        def list_tools(self, status=None):
+            return [{"id": "old1", "name": "read_file", "enabled": True,
+                     "description": "read a file", "status": "deployed"}]
+    assert len(ci.derive_index(_LegacyVault(tmp_path))) == 1
+
+
+def test_a_present_but_EMPTY_implementation_path_is_still_skipped(tmp_path):
+    """The gate keeps its teeth where the producer actually reports a bodiless tool."""
+    class _BodilessVault:
+        def __init__(self, root): self.root = str(root)
+        def list_tools(self, status=None):
+            return [{"id": "b1", "name": "read_file", "enabled": True,
+                     "implementation_path": "", "status": "proposed"}]
+    assert ci.derive_index(_BodilessVault(tmp_path)) == []
+
+
+def test_io_shape_hash_reads_the_BARE_PROPS_schema_production_stores():
+    """The shipped seed tools store parameters_schema as bare {name: {"type": …}},
+    NOT wrapped in {"properties": …}. Hashing only the wrapped form collapsed all
+    41 real tools onto the empty-schema digest, so io_shape could not tell any two
+    tools' interfaces apart."""
+    a = ci.io_shape_hash({"query": {"type": "string"}})
+    b = ci.io_shape_hash({"path": {"type": "string"}, "mode": {"type": "string"}})
+    assert a != b
+    assert a != ci.io_shape_hash({})
+
+
+def test_io_shape_hash_agrees_across_full_schema_and_header_summary():
+    """A tool must hash to the same shape whether derived from the full schema or
+    from the header's parameters_schema_summary — `_tool_header` carries only the
+    summary, so mismatched sources would collide inconsistently."""
+    summary = ci.io_shape_hash({"query": "string"})
+    assert ci.io_shape_hash({"query": {"type": "string"}}) == summary
+    assert ci.io_shape_hash({"type": "object",
+                             "properties": {"query": {"type": "string"}}}) == summary
