@@ -460,6 +460,27 @@ def _fact_origin(fact) -> str:
 #   * THE QUICK LANE — ``quick_task`` builds its own prompt (via
 #     ``user_context.profile_context_block``) and dispatches through ``ToolSandbox``
 #     WITHOUT ever calling the binder, so no IMPL-5 gate runs there at all.
+#
+#     BUT THE EXPOSURE IS BOUNDED, and the bound matters for any arming decision made
+#     off this note. The quick lane is not ungoverned: ``quick_task._execute_tool``
+#     threads ``tool=`` into ``ToolSandbox.execute_tool``, so ``_maybe_gate_tool`` — the
+#     EFFECT-CLASS gate — runs on every quick-lane call. Measured end to end: every
+#     ``action_governance._APPROVAL_TAGS`` effect (net_mutate / send_message /
+#     money_move / oauth_call / local_delete / shell_exec) AND the UNKNOWN empty-tags
+#     floor confirm-card, with the ACTUAL parameter values on the card via
+#     ``args_preview``. Only the ALLOW band (net_read / local_read) executes unattended.
+#     So the residual is "a tainted value can reach a READ unattended", NOT "a tainted
+#     value can move money unattended" — IMPL-5's protective purpose is met for every
+#     dangerous effect by effect-class gating, and it is IMPL-5's taint-based LETTER
+#     that is unmet, on the read band only.
+#
+#     That bound rests entirely on that one ``tool=`` keyword and had no dedicated pin;
+#     ``tests/test_quick_lane_action_gate_wiring.py`` now pins it in BOTH directions
+#     (dangerous bands card / read band stays frictionless) and characterizes the
+#     read-band residual so closing it is a visible edit. Note the arming consequence:
+#     the quick lane is not a ShadowRuntime run, so it never writes the ``s4_shadow``
+#     meter — ``s4_activation.s4_shadow_arm_verdict`` reads READY off full-lane evidence
+#     alone and is blind to the DEFAULT lane.
 #   * Values shorter than ``_MIN_TAINT_MATCH_LEN`` (see below).
 
 #: Minimum length for a provided value to be matched against the tainted corpus. A
