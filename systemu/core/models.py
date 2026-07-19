@@ -44,6 +44,14 @@ from systemu.core.utils import utcnow as _now
 
 ORIGINS = {"chat", "capture", "manual", "scheduled", "system"}
 
+# The CLOSED taint axis (§5.10.b / IMPL-5) — where a stored VALUE came from, as opposed
+# to `ORIGINS` above (which is the trigger origin of an event; the two are unrelated).
+# `content_derived` is the untrusted axis and is never silent-bound by the §5.3 binder.
+# Declared in the base layer so taint-carrying models can validate against it without
+# importing a runtime module; peer copies in the runtime are pinned equal by
+# tests/test_ra16_slice1_taint_carriage.py.
+ORIGIN_CLASSES = {"operator", "systemu_authored", "content_derived"}
+
 _REASON_TO_ORIGIN = {
     "chat": "chat", "ui-submit": "chat",
     "manual": "manual",
@@ -857,8 +865,35 @@ class UserFact(BaseModel):
     source_ref: Optional[str] = None
     confidence: float = 1.0
     superseded_by: Optional[str] = None
+    # R-A16 slice-1 (IMPL-5 taint carriage). The CLOSED taint axis this fact's VALUE
+    # came from — operator | systemu_authored | content_derived. ABSENT (None) on every
+    # fact written before this slice, and on every current operator-surface writer;
+    # `requirement_binder._bind_profile` grandfathers absent ⇒ operator, so legacy
+    # behavior is byte-identical. A §5.9 promotion MUST stamp the answer's ORIGINAL
+    # origin here — that is what stops a content_derived value laundering to trusted
+    # by way of the profile slot.
+    origin_class: Optional[str] = None
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("origin_class")
+    @classmethod
+    def _origin_class_in_vocab(cls, v: Optional[str]) -> Optional[str]:
+        """CLOSED vocabulary (same discipline the runtime's taint-carrying models use):
+        a typo'd/unknown taint fails LOUD at construction rather than being written to
+        user_facts.jsonl as if it were taint-clear. ``None`` = absent (legacy), allowed.
+
+        The vocabulary is declared HERE, in the base layer, and never imported from a
+        runtime module: ``core.models`` is imported by essentially everything, so a
+        runtime import would both risk a cycle AND breach the runtime fence that keeps
+        the taint substrate off the decision path. Cross-module agreement is pinned by
+        ``tests/test_ra16_slice1_taint_carriage.py`` instead of by an import."""
+        if v is None:
+            return v
+        if v not in ORIGIN_CLASSES:
+            raise ValueError(
+                f"origin_class must be one of {sorted(ORIGIN_CLASSES)}, got {v!r}")
+        return v
 
 
 # ─────────────────────────────────────────────────────────────────────────────

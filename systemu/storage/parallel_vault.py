@@ -328,6 +328,12 @@ class ParallelVault:
         return self._p.load_user_facts(**kwargs)
 
     def append_user_fact(self, **kwargs):
+        # The generic passthrough is LOAD-BEARING for R-A16 taint carriage: it carries
+        # ``origin_class`` (IMPL-5) to BOTH legs. ``_write_secondary`` swallows every
+        # exception, so a stamp dropped on the secondary leg would be silent — during a
+        # file→SQLite migration the secondary would accumulate taint-CLEARED copies and
+        # the cutover would launder them. Do not narrow this to an explicit parameter
+        # list without forwarding that keyword to both calls.
         result = self._p.append_user_fact(**kwargs)
         self._write_secondary("append_user_fact", **kwargs)
         return result

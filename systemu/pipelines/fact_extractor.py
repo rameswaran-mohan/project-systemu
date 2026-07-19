@@ -104,6 +104,21 @@ def extract_from_chat(
                     tags=[str(t) for t in tags][:3],
                     source_ref=source_ref,
                     confidence=max(0.0, min(1.0, conf)),
+                    # R-A16 (IMPL-5): the fact's VALUE is an LLM extraction from
+                    # ``chat_entry["prompt"]`` — operator-DELIVERED text, not
+                    # operator-AUTHORED. An operator who pastes an email, a log or a
+                    # scraped page authored none of it; the EXTRACTOR picks which
+                    # sentences become durable facts and the operator never reviews
+                    # the output. Extraction INPUT is content by definition, so this
+                    # is ``content_derived`` and not ``systemu_authored`` — the
+                    # latter is a TRUSTED axis (``_bind_provided_params``: "systemu's
+                    # own reasoning, non-content") and would still silent-bind.
+                    #
+                    # Absent this stamp the fact inherits the ``_fact_origin``
+                    # grandfather (absent ⇒ operator) and, at the >= 0.9 confidence
+                    # the extraction prompt asks for, binds SILENTLY. Stamped, it is
+                    # forced into the ask_bundle as a one-click operator confirm.
+                    origin_class="content_derived",
                 )
                 n += 1
             except Exception:

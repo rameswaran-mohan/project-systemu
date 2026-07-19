@@ -1107,11 +1107,21 @@ class Vault:
         return get_facts(self, tags=tags, include_superseded=include_superseded, recent=recent)
 
     def append_user_fact(self, *, fact: str, source: str, tags=None,
-                           source_ref=None, confidence: float = 1.0):
-        """v0.9.0: append a new fact, return the created UserFact."""
+                           source_ref=None, confidence: float = 1.0,
+                           origin_class: Optional[str] = None):
+        """v0.9.0: append a new fact, return the created UserFact.
+
+        ``origin_class`` (R-A16 slice-1, IMPL-5) is pure TRANSPORT here — the
+        canonical taint axis of the fact's VALUE, validated by ``UserFact`` and
+        clamped fail-untrusted by ``requirement_binder._fact_origin``. This wrapper
+        is the SANCTIONED write path (``user_profile`` docstring), so dropping the
+        parameter here made the whole taint mechanism unreachable in production.
+        Defaults to ABSENT, which grandfathers to ``operator`` at bind.
+        """
         from systemu.runtime.user_profile import add_fact
         return add_fact(self, fact, source=source, tags=tags,
-                         source_ref=source_ref, confidence=confidence)
+                         source_ref=source_ref, confidence=confidence,
+                         origin_class=origin_class)
 
     # Plan 0 Build 3 (Task 3.2 — paper fleet): per-child execution namespace.
     def create_child_execution_namespace(self, parent_id: str, child_id: str) -> Path:

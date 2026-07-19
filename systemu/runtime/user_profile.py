@@ -74,8 +74,18 @@ def add_fact(
     tags: Optional[List[str]] = None,
     source_ref: Optional[str] = None,
     confidence: float = 1.0,
+    origin_class: Optional[str] = None,
 ) -> UserFact:
-    """Append a new fact to user_facts.jsonl. Returns the created UserFact."""
+    """Append a new fact to user_facts.jsonl. Returns the created UserFact.
+
+    ``origin_class`` (R-A16 slice-1, IMPL-5) is the CLOSED taint axis the fact's VALUE
+    came from — ``operator | systemu_authored | content_derived``. It defaults to
+    ABSENT, which ``requirement_binder._bind_profile`` grandfathers to ``operator``:
+    every writer that exists today is an operator surface, so omitting it preserves
+    current behavior exactly. A §5.9 promotion of an answered ask MUST pass the
+    answer's ORIGINAL origin, so a ``content_derived`` value stays confirm-gated at
+    bind instead of laundering to trusted through the profile.
+    """
     uf = UserFact(
         id=_new_fact_id(),
         ts=_now_iso(),
@@ -84,6 +94,7 @@ def add_fact(
         source=source,
         source_ref=source_ref,
         confidence=confidence,
+        origin_class=origin_class,
     )
     path = _facts_path(vault)
     path.parent.mkdir(parents=True, exist_ok=True)

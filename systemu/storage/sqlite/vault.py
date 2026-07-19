@@ -1054,10 +1054,16 @@ class SqliteVault:
                          include_superseded=include_superseded, recent=recent)
 
     def append_user_fact(self, *, fact: str, source: str, tags=None,
-                         source_ref=None, confidence: float = 1.0):
+                         source_ref=None, confidence: float = 1.0,
+                         origin_class: Optional[str] = None):
+        # R-A16 slice-1 (IMPL-5): ``origin_class`` is pure TRANSPORT — validation
+        # lives in ``UserFact`` and the binder's fail-untrusted clamp. Profile
+        # storage delegates to the same file-side ``add_fact`` (``self.root`` is
+        # the memory dir), so this must forward exactly as the file Vault does.
         from systemu.runtime.user_profile import add_fact
         return add_fact(self, fact, source=source, tags=tags,
-                        source_ref=source_ref, confidence=confidence)
+                        source_ref=source_ref, confidence=confidence,
+                        origin_class=origin_class)
 
     # ── v0.6.8-a: recovery-engine duck-typed finders ─────────────────────────
     # The RecoveryEngine (systemu/recovery/engine.py) needs lightweight

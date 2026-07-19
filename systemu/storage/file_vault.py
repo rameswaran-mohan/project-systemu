@@ -248,4 +248,7 @@ class FileVault:
         return self._v.load_user_facts(**kwargs)
 
     def append_user_fact(self, **kwargs):
+        # The generic passthrough is LOAD-BEARING for R-A16 taint carriage: it is what
+        # carries ``origin_class`` (IMPL-5) to the writer. Do not narrow it to an
+        # explicit parameter list without forwarding that keyword.
         return self._v.append_user_fact(**kwargs)

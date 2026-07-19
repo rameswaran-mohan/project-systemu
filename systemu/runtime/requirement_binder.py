@@ -29,9 +29,19 @@ into the ``ask_bundle`` (one-click operator confirm). This is the load-bearing s
 invariant — an untrusted inventory value can close a gap for the PLANNER's view but
 can never become an unattended input.
 
-The T_high gate (net-new here — §5.3 leaves the threshold to the binder):
+The T_high gate (net-new here — §5.3 leaves the threshold to the binder). NOTE the
+two axes are SEPARATE: ``state`` is governed by confidence alone, and taint is
+enforced by ``_needs_ask``, NOT by demoting ``state``. A content_derived bind at
+confidence >= T_HIGH really is ``state="have"`` — it is kept out of a silent bind
+because ``_needs_ask`` surfaces it anyway. Do not "fix" this by forcing the state;
+``test_ac1_silent_bind_invariant`` pins the split on purpose ("state='have' alone
+can never make it silent"), and a stale earlier version of this very docstring —
+which claimed content_derived → state="resolvable" — has already misled a reader
+into specifying the wrong invariant.
   * bound, confidence >= T_HIGH, and NOT content_derived  → state="have"   (silent)
-  * bound, below T_HIGH, OR content_derived               → state="resolvable" + ask_bundle
+  * bound, below T_HIGH                                    → state="resolvable" + ask_bundle
+  * bound, content_derived (ANY confidence)                → state per confidence,
+        ALWAYS in the ask_bundle via ``_needs_ask`` (one-click confirm, never silent)
   * required + no source bound it                          → state="missing"  + ask_bundle,
         kind = "input" (a path leaf), else "capability" (no candidate path can do it),
         else "decision" (an operator choice — which repo / which identity)
@@ -315,8 +325,68 @@ def _bind_profile(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, str
                 conf = _get(fact, "confidence")
                 conf = float(conf) if isinstance(conf, (int, float)) else 1.0
                 fid = _get(fact, "id") or "fact"
-                return (f"profile_fact:{fid}", "operator_profile", _OPERATOR, conf)
+                return (f"profile_fact:{fid}", "operator_profile",
+                        _fact_origin(fact), conf)
     return None
+
+
+def _fact_origin(fact) -> str:
+    """The taint for a ``user_facts`` bind (R-A16 slice-1, IMPL-5 "taint travels").
+
+    Unlike ``_entry_origin`` — which DERIVES taint from the source kind because a
+    surveyed inventory entry's self-declared ``origin_class`` is forgeable — a profile
+    fact's stamp IS authoritative: the profile is written only through operator
+    surfaces and the §5.9 promoter, never rehydrated from scanned content. So the
+    stamp is READ, then CLAMPED:
+
+      * ABSENT + ``source="auto_extract"`` ⇒ ``content_derived``. See below — the
+        grandfather is WRONG for this one source.
+      * ABSENT  ⇒ ``operator``. Grandfathers every fact written before this slice and
+        every other current writer (all verified operator surfaces), so legacy
+        behavior is unchanged — the compatibility claim of the slice.
+      * PRESENT ⇒ ``_coerce_origin``: canonical values pass through; anything else
+        (a hand-edited JSONL, a poisoned stamp) fails UNTRUSTED to ``content_derived``.
+
+    THE ``auto_extract`` CARVE-OUT (R-A16). ``fact_extractor.extract_from_chat`` now
+    stamps ``content_derived`` at the write, but every such fact ALREADY persisted in
+    an operator vault carries an ABSENT stamp and would keep the grandfather. This
+    reader-side clamp closes that legacy corpus with no migration, and it is
+    DETERMINISTIC rather than a heuristic:
+
+      * ``UserFact.source`` is a REQUIRED field (no default) validated on read, so an
+        ``auto_extract`` row is unambiguously identifiable;
+      * ``fact_extractor`` is the SOLE writer of that source string in the tree.
+
+    Those facts are LLM extractions from ``chat_entry["prompt"]`` — operator-DELIVERED
+    text, not operator-AUTHORED. Paste an email or a scraped page into chat and the
+    extractor, not the operator, decides which of its sentences become durable facts;
+    nobody reviews the result. Slice 1 allowlisted that caller as an operator surface;
+    that claim is retracted here.
+
+    The clamp is keyed to that ONE source deliberately: ``onboarding`` (welcome/tour)
+    and ``explicit_user`` (``user remember``) are operator-authored and MUST keep
+    binding silently, or the profile stops paying off and re-asks the operator for
+    what they typed themselves.
+
+    A ``content_derived`` result can never silent-bind: ``_needs_ask`` forces it into
+    the ask_bundle regardless of confidence. That is what stops a §5.9 promotion from
+    laundering page-derived content into the trusted axis on the NEXT run.
+    """
+    raw = _get(fact, "origin_class")
+    if raw is None:
+        if _get(fact, "source") == "auto_extract":
+            return _CONTENT_DERIVED
+        return _OPERATOR
+    if not isinstance(raw, str):
+        # A profile dict is rehydrated from JSON, so this field can be ANY type. A
+        # non-str stamp is meaningless ⇒ fail UNTRUSTED. Also sidesteps a latent
+        # TypeError: ``_coerce_origin`` does ``origin in <frozenset>``, which RAISES
+        # on an unhashable value (a list/dict from a malformed or poisoned profile).
+        # That raise is currently absorbed by the per-leaf fail-safe and degrades the
+        # leaf to a "missing" gap; clamping here makes the taint decision explicit
+        # instead of relying on the broad except.
+        return _CONTENT_DERIVED
+    return _coerce_origin(raw)
 
 
 def _key_token_overlap(kl: str, other: str) -> bool:
