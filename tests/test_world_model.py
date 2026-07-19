@@ -289,6 +289,17 @@ _WM_ALLOWED = {
     "world_model.py": "defines the store + the read API",
     "world_model_populator.py": "the WRITE-ONLY projector",
     "shadow_runtime.py": "hosts the populator call (write seam)",
+    # ── slice-2c widened this allowlist by exactly TWO modules, each named here with
+    # the role it is allowed to play. Both are additions the store stops being inert
+    # for, so each is pinned separately below.
+    "world_model_discovery.py": (
+        "the WM-2 discovery negative-fact loop — WRITES 'searched and not found' at the "
+        "discovery seam and reads it back for the OPERATOR surfaces only. It never adds "
+        "to _req.spec or any prompt, and it never skips the deterministic pass."),
+    "world_query.py": (
+        "the FENCED read surface (WM-4/WM-15) — renders view results as untrusted data "
+        "with a RE-DERIVED bind-taint. Not wired into the planner prompt this slice; the "
+        "SituationReport-as-view inversion is sequenced last."),
     # outside runtime — operator-facing, never on a decision path.
     "cli_commands.py": "read-only operator CLI surface",
 }

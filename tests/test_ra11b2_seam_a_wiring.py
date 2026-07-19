@@ -41,6 +41,40 @@ def test_seam_a_stashes_discovery_and_writes_miss_audit():
     assert "_gov._ledger_append(" in src
 
 
+def test_seam_a_records_the_world_model_discovery_note_both_ways():
+    """R-W1 slice-2c — the WM-2 negative-fact loop hangs off this seam: a MISS persists
+    'searched and did not find', a HIT invalidates any stale note (CAP-5)."""
+    src = _execute_src()
+    assert "world_model_discovery" in src
+    assert "record_discovery_miss(" in src
+    assert "clear_discovery_miss(" in src
+    # the write must sit INSIDE the kind=tool discovery block, after the pass ran
+    i_disc = src.find("deployed_enabled_catalog(")
+    i_note = src.find("record_discovery_miss(")
+    assert 0 < i_disc < i_note
+
+
+def test_the_world_model_note_cannot_break_the_reuse_decision():
+    """It hangs off the forge path, so it carries its OWN try/except — a store problem
+    must never change whether a tool is reused."""
+    src = _execute_src()
+    i_note = src.find("world_model_discovery")
+    assert i_note > 0
+    # a `try:` opens between the reuse decision and the note, and the note's guard
+    # precedes the arbitrate that consumes the decision
+    assert "try:" in src[src.find("reuse_score"):i_note]
+    assert i_note < src.find("_verdict = _gov.arbitrate(_req, context=_arb_ctx)")
+
+
+def test_seam_a_does_not_feed_the_world_model_note_into_the_request_spec():
+    """STORE-WRITE-ONLY: the note must not be stashed on _req.spec, which flows on into
+    forge/approval surfaces. Planner input stays byte-identical this slice."""
+    src = _execute_src()
+    for leak in ("_req.spec[\"prior_miss\"]", "_req.spec['prior_miss']",
+                 "_req.spec[\"negative\"]", "_req.spec['negative']"):
+        assert leak not in src
+
+
 def test_param_input_sites_are_not_touched():
     """The two INPUT arbitrate sites (:4886 scroll-params, :6210 missing-required)
     must NOT gain a discovery pass — reuse is a kind=tool-only concern."""

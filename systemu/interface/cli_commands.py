@@ -2379,8 +2379,20 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
     q = (query or "").strip()
     if q:
         hits = _wm.about(store, q, limit=(None if not limit else int(limit)))
+        # R-W1 slice-2c: cite any unexpired "searched and did not find" note for this
+        # query FIRST (§5.11 AC2 — a precise "I looked, here is what I probed and when"
+        # beats both silence and a bare "nothing known"). Read-only; never raises.
+        try:
+            from systemu.runtime import world_model_discovery as _wmd
+            _miss = _wmd.recent_discovery_miss(vault, q)
+        except Exception:
+            _miss = None
+        if _miss is not None:
+            click.echo(f"Searched for {q!r} on {_miss.recorded_at} and found nothing.")
+            click.echo(f"  probed: {', '.join(_miss.probes) or '-'}")
         if not hits:
-            click.echo(f"Nothing known about {q!r} yet.")
+            if _miss is None:
+                click.echo(f"Nothing known about {q!r} yet.")
             return 0
         click.echo(f"About {q!r} — {len(hits)} fact(s):")
         for f in hits:

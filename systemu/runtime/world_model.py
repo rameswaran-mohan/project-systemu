@@ -51,6 +51,20 @@ from systemu.runtime import capability_slots as _cs
 # and SituationReport). Only ``content_derived`` rides the untrusted-content fence.
 ORIGIN_CLASSES = {"operator", "systemu_authored", "content_derived"}
 
+#: The taint axis for a NEGATIVE fact — deliberately NARROWER than ``ORIGIN_CLASSES``.
+#: A negative fact is an ASSERTION OF ABSENCE that SUPPRESSES a search for its whole TTL,
+#: so letting untrusted content assert it is denial-of-discovery: a poisoned page or file
+#: that can say "there is nothing here" would stop systemu looking for the real thing.
+#: ``content_derived`` is therefore REFUSED at construction (F1 fail-closed), not merely
+#: down-ranked — only systemu's own surveyor, or the operator, may record an absence.
+#:
+#: Note this fails closed in the OPPOSITE direction from the positive-fact read path
+#: (``world_query.bind_taint_of``, which clamps every stored fact DOWN to
+#: ``content_derived``). The asymmetry is deliberate and both directions are the safe
+#: one: presence read from the store must never be trusted enough to silent-bind, while
+#: absence must never be assertable by content at all.
+NEGATIVE_ORIGIN_CLASSES = {"operator", "systemu_authored"}
+
 #: WM-2 — absence expires FASTER than presence. In slice-1 there is no positive-fact
 #: decay horizon yet (WM-13 gardener is W-D), so this is a short ABSOLUTE default;
 #: the relative "faster than presence" comparison goes live with W-D decay.
@@ -130,6 +144,25 @@ class NegativeFact(BaseModel):
     probes: List[str] = Field(default_factory=list)
     recorded_at: str = Field(default_factory=_now)
     ttl_seconds: int = DEFAULT_NEGATIVE_TTL_SECONDS
+    #: WHO asserted this absence. Defaults to ``systemu_authored`` so rows written by
+    #: earlier slices (which had no such field) load unchanged; ``content_derived`` can
+    #: never be set — see :data:`NEGATIVE_ORIGIN_CLASSES`.
+    origin_class: str = "systemu_authored"
+
+    @field_validator("origin_class")
+    @classmethod
+    def _absence_is_never_content_derived(cls, v: str) -> str:
+        """Refuse any origin outside :data:`NEGATIVE_ORIGIN_CLASSES` — above all
+        ``content_derived``. Because ``FactStore._load_negatives`` skips rows that fail
+        validation, a ``content_derived`` negative that somehow reached disk is DROPPED
+        on read rather than honoured: the suppression disappears and the caller
+        re-searches. Fail-closed means failing towards *looking*, not towards silence."""
+        if v not in NEGATIVE_ORIGIN_CLASSES:
+            raise ValueError(
+                f"a negative fact's origin_class must be one of "
+                f"{sorted(NEGATIVE_ORIGIN_CLASSES)}, got {v!r} — untrusted content may "
+                f"never assert absence (denial-of-discovery)")
+        return v
 
     def is_expired(self, now: Optional[str] = None) -> bool:
         """True once ``ttl_seconds`` have elapsed since ``recorded_at``. Fail-OPEN on
@@ -157,6 +190,12 @@ class NegativeFact(BaseModel):
 
 #: keep the last N watermarks — enough to reason about recent coverage, bounded on disk.
 _MAX_SURVEYS = 20
+
+#: Bound on the negative store (slice-2c gave it its first production writer). Generous
+#: enough that a realistic run never evicts a LIVE note — eviction is a correctness-safe
+#: last resort (it costs a repeated search, never a missed one), not the primary
+#: mechanism. Expiry + invalidation-on-write are what actually keep this small.
+_MAX_NEGATIVES = 500
 
 
 class SurveyWatermark(BaseModel):
@@ -438,10 +477,54 @@ class FactStore:
 
     def put_negative(self, neg: NegativeFact) -> None:
         """Record (or refresh) a negative fact for ``neg.scope`` (one per scope — a
-        re-search overwrites the prior record with a fresh timestamp)."""
+        re-search overwrites the prior record with a fresh timestamp).
+
+        BOUNDED on write, like every other side-store here (cf. ``_MAX_SURVEYS`` and the
+        populator's per-run data_location cap). Until slice-2c this store had no
+        production writer, so growth was unreachable; now that a discovery miss writes a
+        note per distinct target, it needs the same discipline the rest of the T1 stores
+        already have — the WM-13 gardener that would otherwise expire these is W-D.
+
+        Two stages, both safe:
+          * EXPIRED notes are dropped. They are already invisible to
+            :meth:`query_negative`, so removing them changes no behaviour — it only stops
+            the file accreting rows that can never be read again.
+          * if still over :data:`_MAX_NEGATIVES`, the OLDEST notes go first. Evicting a
+            negative fact is always the safe direction: the cost is re-paying a search,
+            never a missed one (an absent note simply means "look again")."""
         negs = self._load_negatives()
         negs[neg.scope] = neg
+        if len(negs) > _MAX_NEGATIVES:
+            live = {k: v for k, v in negs.items() if not v.is_expired()}
+            live[neg.scope] = neg              # never evict the note just written
+            if len(live) > _MAX_NEGATIVES:
+                # oldest-first by recorded_at; an unparseable stamp sorts oldest, which
+                # is the safe direction (it is already fail-open/expired on read).
+                def _age(item):
+                    try:
+                        return _as_dt(item[1].recorded_at)
+                    except Exception:
+                        return datetime.min.replace(tzinfo=timezone.utc)
+                keep = sorted(live.items(), key=_age, reverse=True)[:_MAX_NEGATIVES]
+                live = dict(keep)
+                live[neg.scope] = neg          # belt-and-braces
+            negs = live
         self._save_negatives(negs)
+
+    def drop_negative(self, scope: str) -> bool:
+        """Invalidate the negative fact for ``scope`` ON WRITE (CAP-5 / WM-2): once the
+        thing we searched for actually EXISTS, "searched and not found" is no longer
+        true and must not wait out its TTL. Returns True if a record was removed.
+
+        This is the only removal on the store, and it is safe precisely because it
+        deletes a SUPPRESSION rather than a belief — the failure mode of dropping one
+        too eagerly is a redundant search, never a missed one."""
+        negs = self._load_negatives()
+        if scope not in negs:
+            return False
+        negs.pop(scope, None)
+        self._save_negatives(negs)
+        return True
 
     def query_negative(self, scope: str, now: Optional[str] = None) -> Optional[NegativeFact]:
         """The negative fact for ``scope`` IFF present and not yet expired (AC2). An

@@ -6826,6 +6826,26 @@ class ShadowRuntime:
                                         (_req.spec or {}).get("name", "")]
                                     _req.spec["reuse_tool_id"] = _disc.reuse_tool_id
                                     _req.spec["reuse_score"] = _disc.best_score
+                                # ── R-W1 slice-2c: the WM-2 discovery negative-fact
+                                # loop. A miss persists "searched and did not find"
+                                # (with a TTL) so a futile search is not forgotten and a
+                                # handoff can cite what was probed and when (AC2); a hit
+                                # INVALIDATES any prior note, because a capability that
+                                # now exists must not stay marked absent until its TTL
+                                # runs out (CAP-5). STORE-WRITE-ONLY: nothing is added to
+                                # _req.spec or any prompt, so planner input is unchanged.
+                                # Its own try/except — a store problem must never affect
+                                # the reuse decision computed above.
+                                try:
+                                    from systemu.runtime import world_model_discovery as _wmd
+                                    _nm = (_req.spec or {}).get("name", "")
+                                    if _disc.reuse_tool_id:
+                                        _wmd.clear_discovery_miss(self.vault, _nm)
+                                    else:
+                                        _wmd.record_discovery_miss(self.vault, _nm, _disc)
+                                except Exception:
+                                    logger.debug("[Runtime] world-model discovery note "
+                                                 "skipped (non-fatal)", exc_info=True)
                             except Exception:
                                 logger.debug("[Runtime] discovery pass failed — "
                                              "falling through to forge", exc_info=True)
