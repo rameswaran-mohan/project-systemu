@@ -300,6 +300,102 @@ class GateDescriptor(BaseModel):
         )
 
     @classmethod
+    def from_first_gate_bulk(cls, partition, *, version: str) -> "GateDescriptor":
+        """IMPL-4: the one-time bulk FIRST-GATE review card for backfilled tools.
+
+        The card PARTITIONS BY BAND, and the partition is the safety property — not a
+        presentation choice. Only ``REQUIRE_APPROVAL``-band tools are offered for the
+        batch Always-allow; DENY-band tools (UNKNOWN ∩ high-severity) are LISTED, named,
+        and pointed at the IMPL-2 reclassify remedy, but they are never part of the
+        affirmative action.
+
+        When NOTHING is eligible the affirmative option is not rendered at all. An
+        offered-but-inert option is precisely the shape of the IMPL-2 adversarial
+        finding ("Approve once" on a DENY card did nothing at the gate, yet clicking it
+        minted a token a later reclassification could cash) — and it matters doubly here
+        because the rail's one-click quick-approve resolves ``options[-1]``.
+
+        safe_default is "Leave gated" at index 0: fail-closed, mirroring every other
+        descriptor here. Risk stays "high" — one click can bless an entire inventory.
+        """
+        from systemu.runtime.first_gate_review import (
+            BULK_DEDUP_PREFIX, MAX_LISTED_PER_BAND, OPT_BULK_ALLOW, OPT_LEAVE_GATED)
+
+        eligible = list(getattr(partition, "eligible", ()) or ())
+        excluded = list(getattr(partition, "excluded", ()) or ())
+
+        # TWO options, both of which DO something. There is deliberately no third
+        # "review individually" choice: leaving the card alone already means every tool
+        # gates on first use, so it would be a second label for the safe default — and an
+        # option that cannot act is the shape of the IMPL-2 defect cited above.
+        #
+        # The spec's "batch classify" is also deliberately NOT offered. Assigning effect
+        # classes across a batch is a FRICTION-DECREASING bulk action, which §10 forbids,
+        # and for the DENY band it is exactly the sweep IMPL-4 exists to prevent: an
+        # effect class is what defeats the UNKNOWN conjunct, so bulk-assigning one would
+        # launder the whole excluded set into approvability without the operator seeing
+        # any individual call. Classification stays per-tool, under IMPL-2's typed
+        # confirm, where the operator sees the arguments they are classifying.
+        options = [OPT_LEAVE_GATED]
+        if eligible:
+            options.append(OPT_BULK_ALLOW)
+
+        def _line(e) -> str:
+            tags = ", ".join(e.effect_tags) or "unclassified"
+            return f"  {e.name} — {tags}"
+
+        def _listing(entries) -> list:
+            """Name up to MAX_LISTED_PER_BAND tools, then DISCLOSE the remainder.
+
+            Display-only: the counts above and below stay exact, and nothing about the
+            partition or the recorded allow-set depends on this. Truncation is never
+            silent — an operator who cannot see that the list was clipped would read a
+            short list as the whole inventory.
+            """
+            out = [_line(e) for e in entries[:MAX_LISTED_PER_BAND]]
+            rest = len(entries) - MAX_LISTED_PER_BAND
+            if rest > 0:
+                out.append(f"  …and {rest} more (open the Inbox to review the full list)")
+            return out
+
+        lines = [f"{len(eligible)} tool(s) can be approved as a batch:"]
+        lines += _listing(eligible) or ["  (none)"]
+        if excluded:
+            lines += [
+                "",
+                f"{len(excluded)} tool(s) are EXCLUDED from the batch — their effect "
+                "could not be classified and they carry a high-severity signal:",
+            ]
+            lines += _listing(excluded)
+            lines += [
+                "",
+                "These cannot be bulk-approved. Each one is resolved individually the "
+                "first time it runs, by reclassifying its effect under typed "
+                "confirmation.",
+            ]
+
+        what = (
+            f"'{OPT_BULK_ALLOW}' remembers {len(eligible)} tool(s) so they stop "
+            f"prompting mid-task. It does NOT cover the {len(excluded)} excluded "
+            "tool(s): an unclassifiable high-severity effect can never be batch-"
+            "approved, and each still needs an individual reclassification. "
+            "Approval binds to each tool's exact body + effect set, so re-forging one "
+            "re-gates it — and a remembered tool is still gated on any call whose "
+            "arguments score higher than what was reviewed here."
+        )
+
+        return cls(
+            title=f"Review {len(eligible) + len(excluded)} tool(s) before the "
+                  f"action gate turns on",
+            risk="high",
+            inspect="\n".join(lines),
+            options=options,
+            safe_default=options[0],
+            what_approve_does=what,
+            dedup=f"{BULK_DEDUP_PREFIX}{version}",
+        )
+
+    @classmethod
     def from_mcp_call(cls, *, server: str, tool: str, params: dict,
                       destructive: bool = True) -> "GateDescriptor":
         """Build a GateDescriptor for an MCP tool call (v0.9.34 P0, §3.3 L3).

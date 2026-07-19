@@ -245,6 +245,20 @@ def _v0822_run_vault_migrator(vault, *, logger_=None) -> None:
     except Exception:
         log.exception("[Daemon] v0.8.22 vault migrator crashed — continuing boot")
 
+    # IMPL-4: the migration MOMENT. The backfill above has just stamped an effect
+    # classification onto every legacy tool; without this the first post-ship session is
+    # an ambush of mid-run gate modals, one per tool. Post the one-time bulk review card
+    # so the operator reviews the inventory up front instead. Own version marker, so it
+    # is a cheap no-op on every boot after. Never raises.
+    try:
+        from systemu.runtime.first_gate_review import maybe_post_first_gate_review
+        from systemu.runtime.vault_migrator import _installed_version
+        from pathlib import Path
+        maybe_post_first_gate_review(vault=vault, vault_dir=Path(vault.root),
+                                     version=_installed_version())
+    except Exception:
+        log.exception("[Daemon] first-gate review card failed — continuing boot")
+
 
 def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     """Main daemon loop — runs APScheduler jobs."""

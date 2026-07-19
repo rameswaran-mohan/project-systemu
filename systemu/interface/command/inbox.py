@@ -10,6 +10,9 @@ from typing import List, Tuple
 
 from systemu.interface.command.gate import GateDescriptor
 from systemu.interface.command.result import CommandResult, CommandStatus
+# IMPL-4. Safe at module scope: ``first_gate_review`` has no top-level ``systemu``
+# imports (it reaches back into this module lazily, inside post_bulk_review_card).
+from systemu.runtime.first_gate_review import BULK_GATE_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,40 @@ def _handle_forge_rejection(decision, vault) -> CommandResult:
                          summary=f"Declined forging '{name}'.")
 
 
+def _handle_bulk_first_gate_review(decision) -> CommandResult:
+    """IMPL-4: apply a resolved bulk first-gate review.
+
+    The batch Always-allow records a STANDING allow for the REQUIRE_APPROVAL-band tools
+    only. Every entry is re-scored inside ``apply_bulk_decision`` from its raw signals —
+    the verdict stamped in the decision context is untrusted by the time it comes back
+    out of the store — so a DENY-band tool can never be swept in, whatever the stored
+    row says. Best-effort; never raises."""
+    from systemu.runtime.first_gate_review import (apply_bulk_decision,
+                                                   entries_from_context)
+    ctx = decision.context or {}
+    entries = entries_from_context(ctx)
+    try:
+        from systemu.runtime.command_approvals import init_default_store
+        from pathlib import Path as _P
+        store = init_default_store(_P("data"))
+    except Exception:
+        logger.debug("[Inbox] bulk first-gate review: no approval store", exc_info=True)
+        store = None
+
+    written = apply_bulk_decision(entries, choice=decision.choice, store=store)
+    if not written:
+        return CommandResult(
+            status=CommandStatus.NOOP,
+            summary=(f"First-gate review recorded ({decision.choice}); no tools were "
+                     f"batch-approved."))
+    excluded = len(entries) - len(written)
+    return CommandResult(
+        status=CommandStatus.OK,
+        summary=(f"Remembered {len(written)} tool(s) from the first-gate review; "
+                 f"{excluded} still gated (an unclassifiable high-severity effect "
+                 f"cannot be batch-approved)."))
+
+
 def resolve_gate(decision, *, vault) -> CommandResult:
     """Execute the action a resolved gate authorizes (Approve EXECUTES).
 
@@ -91,6 +128,15 @@ def resolve_gate(decision, *, vault) -> CommandResult:
     # Detect it BEFORE the generic non-approve early-exit below.
     if gate_type == "forge" and choice not in _APPROVE_LABELS:
         return _handle_forge_rejection(decision, vault)
+
+    # IMPL-4: the one-time bulk first-gate review card owns its OWN option labels
+    # ("Leave gated" / "Review individually" / the batch allow), none of which are in
+    # _APPROVE_LABELS — so it is dispatched BEFORE the generic early-exit below, which
+    # would otherwise NOOP every resolution and leave the card inert. The executor
+    # matches its affirmative label exactly and re-scores every entry, so a non-approve
+    # choice (and any label drift) records nothing.
+    if gate_type == BULK_GATE_TYPE:
+        return _handle_bulk_first_gate_review(decision)
 
     if choice not in _APPROVE_LABELS:
         return CommandResult(

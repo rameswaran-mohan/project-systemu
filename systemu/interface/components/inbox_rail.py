@@ -27,7 +27,12 @@ from typing import Any, Dict, List, Tuple
 # render-only in the rail: the card shows ("Resolve in Inbox →"), but the operator
 # resolves the full choice via the /insights Inbox, which routes through
 # decision_dispatcher.dispatch -> command_gate_handler / mcp_call_gate_handler.
-_RAIL_RENDER_ONLY_DEDUP_PREFIXES = ("command:", "mcp:", "tool:")
+# IMPL-4: ``tool_bulk:`` is listed SEPARATELY and deliberately — it does NOT match the
+# ``tool:`` prefix above (``"tool_bulk:x".startswith("tool:")`` is False), so it would
+# otherwise be one-click quick-approvable. Its options[-1] is the batch Always-allow,
+# which blesses an entire backfilled inventory at once; that must be resolved from the
+# full Inbox card, where the band partition (and the DENY-band exclusions) is visible.
+_RAIL_RENDER_ONLY_DEDUP_PREFIXES = ("command:", "mcp:", "tool:", "tool_bulk:")
 
 
 def _is_render_only_gate(dedup: str) -> bool:

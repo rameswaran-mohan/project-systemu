@@ -17,7 +17,13 @@ class GateMode(str, Enum):
     APPROVE_ONLY = "approve_only"  # always ask
 
 
-FLOOR_GATE_TYPES = frozenset({"dep", "recovery", "command", "mcp", "mcp_call", "sampling", "tool"})
+FLOOR_GATE_TYPES = frozenset({"dep", "recovery", "command", "mcp", "mcp_call", "sampling", "tool",
+                              # IMPL-4: the one-time bulk first-gate review card. One
+                              # resolution can bless an ENTIRE tool inventory, so it is
+                              # the last card that may ever be auto-granted by a Bypass
+                              # policy (which has born-resolved a gate with zero clicks
+                              # in this codebase before).
+                              "tool_bulk"})
 FLOOR_CAPABILITIES = frozenset({
     "network-egress", "fs-write", "pkg-install",
     "destructive-recovery", "credential-access",
