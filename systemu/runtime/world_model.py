@@ -347,21 +347,48 @@ class FactStore:
         """BULK insert/confirm — ONE load + ONE save for the whole batch, so a
         per-run populator costs O(N) instead of N whole-file rewrites (calling
         ``put_fact`` in a loop is O(N²) disk work). Same per-fact immutability +
-        append-only rules; a fact that violates immutability is SKIPPED (logged)
-        rather than aborting the batch. Returns the number stored."""
+        append-only rules; a fact that violates immutability is SKIPPED rather than
+        aborting the batch. Returns the number stored.
+
+        A skip discards the WHOLE fact, not just the provenance change: ``confidence``,
+        ``last_confirmed`` and ``source_chain`` stop updating for it too, and because
+        the store is durable, every later run re-drops it. (``value`` is NOT among the
+        losses on any id derived by :func:`fact_id_for`, which folds ``(kind, value)`` —
+        a changed value is a different ``fact_id``, so it lands as a new fact instead of
+        conflicting.) Discarding the rest is deliberate: partially applying an update
+        whose provenance is contested would be worse, and losing ``last_confirmed`` is
+        what makes the read side degrade a frozen fact to ``unconfirmed``
+        (see :func:`staleness_of`) rather than present it as freshly re-confirmed.
+
+        It is REPORTED at WARNING because the realistic way to reach it is a release
+        that RELABELS a kind: facts written under the old label can never be
+        re-confirmed under the new one, so every pre-existing fact of that kind freezes
+        and needs a migration — a silent skip would just leave the store quietly
+        rotting."""
         if not new_facts:
             return 0
         facts = self._load_facts()
         n = 0
+        dropped: List[str] = []
         for f in new_facts:
             try:
                 stored = self._resolve_put(facts.get(f.fact_id), f)
-            except ImmutableProvenanceError:
-                logger.debug("[world-model] refused an immutable-provenance change for %s",
-                             getattr(f, "fact_id", "?"), exc_info=True)
+            except ImmutableProvenanceError as exc:
+                # Collected, not logged per-fact: a relabelled kind can conflict on
+                # EVERY fact of that kind, on every run — one bounded warning per batch
+                # says the same thing without flooding the log.
+                dropped.append(str(exc))
                 continue
             facts[stored.fact_id] = stored
             n += 1
+        if dropped:
+            logger.warning(
+                "[world-model] dropped %d fact update(s) this batch — each is frozen at "
+                "its stored provenance, so its value/confidence/last_confirmed stop "
+                "updating too. A relabelled kind needs a migration, not a silent skip. "
+                "First: %s", len(dropped), dropped[0])
+            for extra in dropped[1:]:
+                logger.debug("[world-model] also dropped: %s", extra)
         if n:
             self._save_facts(facts)
         return n

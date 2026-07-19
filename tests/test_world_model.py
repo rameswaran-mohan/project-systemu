@@ -7,6 +7,7 @@ TTL, WM-4 never-subtract + the query views, durability, and the risk-5 "absent/e
 """
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -119,6 +120,56 @@ def test_put_facts_empty_batch_writes_nothing(tmp_path):
     s = _store(tmp_path)
     assert s.put_facts([]) == 0
     assert not s._facts_path.exists()                       # no file created for a no-op
+
+
+# ── a dropped update must be VISIBLE (the silent-freeze trap) ─────────────────
+
+def test_put_facts_warns_when_it_drops_a_fact_so_a_freeze_is_not_silent(tmp_path, caplog):
+    """A bulk drop is not just a refused provenance change — ``put_facts`` skips the
+    WHOLE fact, so ``confidence``/``last_confirmed``/``source_chain`` stop updating too,
+    for that fact, FOREVER (the store is durable; every later run re-drops it).
+
+    The one sequence that reaches this in practice is a RELEASE THAT RELABELS A KIND:
+    facts written under the old label can never be re-confirmed under the new one.
+    That has precedent — ``51296e5e`` changed a tool's origin_class derivation from
+    ``"systemu_authored" if forged else "operator"`` to a constant. At ``debug`` the
+    freeze is invisible in production, so it must be logged at WARNING, naming the
+    fact and BOTH origin classes — that is the only thing that tells an operator a
+    re-label needs a migration rather than leaving a quietly-rotting store."""
+    s = _store(tmp_path)
+    s.put_facts([_fact(fact_id="service:0", value="svc0", origin_class="operator")])
+    with caplog.at_level(logging.WARNING, logger="systemu.runtime.world_model"):
+        stored = s.put_facts([_fact(fact_id="service:0", value="svc0",
+                                    origin_class="content_derived")])
+    assert stored == 0
+    hits = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert hits, "a dropped fact update must be visible at WARNING, not debug"
+    msg = hits[0].getMessage()
+    assert "service:0" in msg                              # WHICH fact froze
+    assert "operator" in msg and "content_derived" in msg  # what the conflict was
+    # the guard itself is untouched: the refusal still stands (laundering defence).
+    assert s.get("service:0").origin_class == "operator"
+
+
+def test_a_dropped_fact_never_reads_confirmed_and_fresh(tmp_path):
+    """Why the drop is tolerable at all: a skipped fact keeps its OLD
+    ``last_confirmed``, so the read side degrades it to ``unconfirmed`` rather than
+    presenting stale content as freshly re-confirmed. This is the property that makes
+    "log it and leave the semantics alone" the honest fix — if a dropped fact could
+    read as confirmed-and-fresh, the drop would be a correctness defect instead."""
+    s = _store(tmp_path)
+    old, new = "2026-07-19T10:00:00+00:00", "2026-07-19T13:00:00+00:00"
+    s.put_facts([Fact(fact_id="service:abc", kind="service", value="github",
+                      origin_class="operator", confidence=1.0, last_confirmed=old)])
+    s.record_survey(wm.SurveyWatermark(at=old, kinds_surveyed=["service"]))
+    # a later run re-observes the same (kind, value) under a different origin → dropped
+    assert s.put_facts([Fact(fact_id="service:abc", kind="service", value="github",
+                             origin_class="content_derived", confidence=0.2,
+                             last_confirmed=new)]) == 0
+    s.record_survey(wm.SurveyWatermark(at=new, kinds_surveyed=["service"]))
+    got = s.get("service:abc")
+    assert got.last_confirmed == old                       # the drop took the whole fact
+    assert wm.staleness_of(got, s.latest_survey()) == "unconfirmed"   # NOT "confirmed"
 
 
 def test_put_fact_rejects_a_kind_change_on_update(tmp_path):

@@ -51,7 +51,17 @@ def _facts_from_report(report: Any, now: Optional[str] = None,
 
     ``now`` is the shared survey instant — the facts and the watermark MUST carry the
     same timestamp, or a fact confirmed microseconds before the watermark reads as older
-    than the survey that just confirmed it."""
+    than the survey that just confirmed it.
+
+    CHANGING A KIND'S ``origin_class`` BELOW IS A MIGRATION, NOT AN EDIT. ``fact_id_for``
+    folds only ``(kind, value)``, so a relabelled kind collides with the facts already on
+    disk under the old label, and ``FactStore.put_facts`` refuses each one (origin_class
+    is immutable — §5.10.b#1). Those facts then freeze: they keep the old label and stop
+    refreshing ``last_confirmed`` forever, so they read ``unconfirmed`` from then on.
+    Today every mapping here is a CONSTANT per kind, which is what keeps the conflict
+    unreachable in production — a per-entry/variable origin_class (as ``declared_intents``
+    already carries) would make it reachable on ordinary runs. ``put_facts`` logs any drop
+    at WARNING; if you see that, the store needs a migration."""
     now = now or datetime.now(timezone.utc).isoformat()
     facts: List[Fact] = []
 

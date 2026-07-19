@@ -186,7 +186,7 @@ class LocalBackend:
             return ToolResult(success=False, error=str(exc))
 
         success, parsed, parse_error = _parse_execution_stdout(
-            stdout, exit_code, impl_path.name,
+            stdout, exit_code, impl_path.name, stderr,
         )
         return ToolResult(
             success=success, stdout=stdout, stderr=stderr, parsed=parsed,

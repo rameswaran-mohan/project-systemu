@@ -435,8 +435,13 @@ class ToolResult:
             "exit_code": self.exit_code,
         }
 
-def _parse_execution_stdout(stdout: str, exit_code: int, impl_name: str) -> (bool, Dict, Optional[str]):
-    """Helper to parse stdout JSON from a tool execution."""
+def _parse_execution_stdout(stdout: str, exit_code: int, impl_name: str,
+                            stderr: str = "") -> (bool, Dict, Optional[str]):
+    """Helper to parse stdout JSON from a tool execution.
+
+    ``stderr`` is optional and used only to explain a failure that produced
+    no parseable result — see the W6.6 branch below.
+    """
     parsed: Dict[str, Any] = {}
     parse_error: Optional[str] = None
     if stdout.strip():
@@ -459,6 +464,24 @@ def _parse_execution_stdout(stdout: str, exit_code: int, impl_name: str) -> (boo
         logger.warning("[Sandbox] %s: %s", impl_name, parse_error)
 
     success = (exit_code == 0) and parse_error is None and parsed.get("success", True)
+
+    # W6.6: a non-zero exit with nothing parseable on stdout used to yield
+    # success=False AND error=None — a failure the operator was given no
+    # reason for (the detail was sitting unread on stderr). That shape is
+    # exactly how a crashed interpreter, a missing runner mount, or a
+    # container that never started surfaced. Explain it.
+    # ``not parsed`` is the load-bearing part: a tool that DID return a
+    # payload (even a bare {"success": false}) has spoken for itself and
+    # must not be overwritten with a synthesised message.
+    if not success and parse_error is None and not parsed:
+        detail = (stderr or "").strip()
+        parse_error = (
+            f"{impl_name} exited {exit_code} without returning a result"
+            + (f" — stderr: {detail[-500:]}" if detail else
+               " and wrote nothing to stderr")
+        )
+        logger.warning("[Sandbox] %s: %s", impl_name, parse_error)
+
     return success, parsed, parse_error
 
 

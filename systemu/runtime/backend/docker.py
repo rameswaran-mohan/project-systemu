@@ -9,6 +9,16 @@ Why ``--network host`` is omitted: it's a no-op on Docker Desktop
 (containers run inside a VM, not on the host network) and creates a
 false security impression.  Docker's default bridge network works on
 every platform.
+
+W6.1 parity (see ``tool_runner_script``): this backend executes the tool
+through the SHARED runner, exactly like LocalBackend, rather than running
+the implementation file as a script.  It previously ran
+``python /app/tool.py`` directly — but every curated vault tool is
+module-style (``TOOL_META`` + ``run()``, no ``__main__`` block), so the
+container defined the functions and exited: exit 0, no effect, and any
+module-level output was parsed as the tool's "result".  The runner is
+mounted read-only alongside the tool; it is stdlib-only by design, so it
+needs nothing installed in the image.
 """
 
 from __future__ import annotations
@@ -20,6 +30,15 @@ from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+
+# The shared out-of-process entrypoint, mounted into the container.  Same file
+# LocalBackend invokes — the two backends MUST NOT drift apart (a divergence
+# here is how module-style tools became silent no-ops under docker).
+_RUNNER_SRC = Path(__file__).parent / "tool_runner_script.py"
+
+# Container-side paths.
+_C_TOOL   = "/app/tool.py"
+_C_RUNNER = "/app/tool_runner.py"
 
 
 class DockerBackend:
@@ -57,11 +76,17 @@ class DockerBackend:
         else:
             pip_step = ""
 
-        shell_cmd = f"{pip_step}python /app/tool.py --params {quoted_params}"
+        # W6.1: invoke the RUNNER with the tool as its argument — never the
+        # tool file directly.  The runner imports the module and calls
+        # run(**params); script-style tools keep the old contract.
+        shell_cmd = (
+            f"{pip_step}python {_C_RUNNER} {_C_TOOL} --params {quoted_params}"
+        )
 
         cmd = [
             "docker", "run", "--rm",
-            "-v", f"{impl_path.absolute()}:/app/tool.py:ro",
+            "-v", f"{impl_path.absolute()}:{_C_TOOL}:ro",
+            "-v", f"{_RUNNER_SRC.absolute()}:{_C_RUNNER}:ro",
             "-v", f"{self.pip_cache_volume}:/root/.cache/pip",
             self.image,
             "sh", "-c", shell_cmd,
@@ -106,7 +131,7 @@ class DockerBackend:
             return ToolResult(success=False, error=str(exc))
 
         success, parsed, parse_error = _parse_execution_stdout(
-            stdout, exit_code, impl_path.name,
+            stdout, exit_code, impl_path.name, stderr,
         )
         return ToolResult(
             success=success, stdout=stdout, stderr=stderr, parsed=parsed,
