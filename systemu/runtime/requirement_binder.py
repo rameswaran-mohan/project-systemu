@@ -200,7 +200,7 @@ def _bind_filehandle(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, 
     from systemu.runtime.reference_resolver import resolve_reference
     try:
         verdict = resolve_reference(bc.reference_text, situation=bc.situation,
-                                    granted=bc.granted, key=key)
+                                    granted=bc.granted, key=key, vault=bc.vault)
     except Exception:
         logger.debug("[binder] reference_resolver raised; leaf falls through", exc_info=True)
         return None

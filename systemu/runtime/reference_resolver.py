@@ -73,13 +73,29 @@ def _score(fh: dict, ref_tokens: set[str], want_exts: frozenset[str], *, now: fl
 
 
 def resolve_reference(text: str, *, situation: dict, granted: Any,
-                      key: Optional[str] = None) -> ReferenceVerdict:
+                      key: Optional[str] = None, vault: Any = None) -> ReferenceVerdict:
+    """``vault`` (R-A16 §5.9 slice 4, optional) enables the LEARNED synonym overlay.
+
+    Threaded from the call site (``requirement_binder._bind_filehandle`` passes
+    ``bc.vault``), never read off a ctx. Omit it and the static map is used verbatim —
+    a caller that threads no vault is byte-for-byte unaffected by the overlay. The
+    overlay can only WIDEN the candidate set; the resolved file is still clamped to
+    ``content_derived`` by the binder, so this can never enable a silent bind.
+    """
     import time
     try:
         ref_tokens = _tokens(text) | _tokens(key or "")
         want_exts: frozenset[str] = frozenset()
-        for tok in list(ref_tokens):
-            want_exts |= synonym_exts(tok)
+        if vault is None:
+            for tok in list(ref_tokens):
+                want_exts |= synonym_exts(tok)
+        else:
+            # imported lazily: the pure/static path must not pay for the overlay, and
+            # the overlay module imports THIS module's tokenizer (single source of
+            # truth for what a lookupable key is). The BATCH accessor reads the store
+            # ONCE — this runs per path leaf, so a per-token read would multiply.
+            from systemu.runtime.reference_synonyms_learned import merged_exts_for_tokens
+            want_exts |= merged_exts_for_tokens(ref_tokens, vault)
         if not ref_tokens and not want_exts:
             return ReferenceVerdict("missing", None, 0.0, 0, "no reference tokens")
 

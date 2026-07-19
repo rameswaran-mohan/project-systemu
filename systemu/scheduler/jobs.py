@@ -265,6 +265,7 @@ def record_bundled_ask_outcomes(vault, dctx, answers) -> None:
         if not isinstance(answers, dict) or not answers:
             return
         from systemu.runtime import replay_metrics as _rm
+        from systemu.runtime import reference_synonyms_learned as _rsl
         ask_id = str((dctx or {}).get("request_id", "") or "")
         by_path: dict = {}                # insertion-ordered: file order is preserved
         for snap in snaps:
@@ -279,6 +280,25 @@ def record_bundled_ask_outcomes(vault, dctx, answers) -> None:
             if answer is None or str(answer) == "":
                 continue          # unanswered slot — the signal is answer-linked
             _rm.record_ask_avoidable(vault, ask_id=ask_id, snapshot=group, answer=answer)
+            # R-A16 §5.9 slice 4 — the LEARNED synonym overlay, fed from the same
+            # answer-time join. Deterministic (no LLM judge), capped and secret-fenced.
+            # It can only WIDEN the resolver's candidate set — the resolved file is
+            # still clamped to content_derived, so no silent bind follows.
+            #
+            # PER-ITERATION guard, not the outer one: `learn_from_answer` is
+            # never-raising internally, but if that ever regressed, the OUTER except
+            # would abandon the whole loop and cost every REMAINING path its
+            # slice-2 observation — a shipped metric silently losing rows because a
+            # tuning path failed. The tuning half must never be able to take the
+            # measurement half down with it.
+            try:
+                _rsl.learn_from_answer(
+                    vault, schema_path=path,
+                    klass=str((group[0] or {}).get("class", "") or ""),
+                    answer=answer)
+            except Exception:
+                logger.debug("[HarnessGrantReconciler] §5.9 synonym learn skipped",
+                             exc_info=True)
     except Exception:
         logger.debug("[HarnessGrantReconciler] R-A16 ask-outcome record skipped",
                      exc_info=True)

@@ -652,7 +652,89 @@ def answer_linked_ask_report(vault) -> Dict[str, Any]:
             "second_half_definitive_rate": second_rate,
             "delta": second_rate - first_rate,
         },
+        # R-A16 §5.9 slice 4 — the LEARNED synonym overlay, surfaced here because an
+        # invisible learned map is a debugging trap: a resolver verdict that depends
+        # on accreted state nobody can see is unexplainable.
+        "learned_synonyms": _learned_synonym_summary(vault),
+        # slice 4 — the evidence a per-class THRESHOLD delta would need before it
+        # could be justified. See `_threshold_sensitive_counts` for why the delta
+        # itself was NOT built.
+        "threshold_sensitive": _threshold_sensitive_counts(recs),
     }
+
+
+def _learned_synonym_summary(vault) -> Dict[str, Any]:
+    """The learned-synonym overlay, summarised. Never raises (report path)."""
+    try:
+        from systemu.runtime.reference_synonyms_learned import learned_synonym_report
+        return learned_synonym_report(vault)
+    except Exception:
+        return {"tokens": 0, "cap": 0, "entries": {}}
+
+
+def _threshold_sensitive_counts(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per class, how many DEFINITIVE confirms were actually CONFIDENCE-gated.
+
+    §5.9's Update clause also asks to "lower that class's confirm threshold". That
+    delta was deliberately NOT built, and this counter is the honest substitute: it
+    measures the trigger evidence such a delta would need, so the decision stays
+    auditable instead of being a silent omission.
+
+    THE GROUNDING (verified by running the producers, not by reading the spec).
+    An ask is threshold-movable only if it was gated by CONFIDENCE — i.e. the matched
+    candidate is NOT ``content_derived`` (a content_derived bind is surfaced by
+    ``requirement_binder._needs_ask`` at ANY confidence, so no threshold can silence
+    it — that is the load-bearing IMPL-5 safety invariant) AND its score is below the
+    STATIC ``T_HIGH``. Every production ``UserFact`` writer emits either confidence
+    1.0 (already at/above T_HIGH) or ``content_derived``:
+
+      * ``explicit_user`` / ``onboarding`` — ``add_fact``'s default confidence 1.0;
+      * ``ask_promotion`` — hard-coded confidence 1.0;
+      * ``auto_extract`` — the only sub-1.0 writer, and hard-stamped
+        ``content_derived`` (plus a reader-side clamp for its legacy absent stamps).
+
+    So this count is expected to be ZERO, and a learned threshold delta would be dead
+    machinery — one that adds vault state to a hot, must-never-raise bind path and
+    entrenches the false model that asks are confidence-gated when they are
+    taint-gated. If this counter is ever non-zero on real runs, that is the signal
+    that the delta has become worth building; until then it is not.
+
+    Deliberately reads the STATIC ``T_HIGH``, never an effective/tuned one: an
+    eligibility test that referenced a lowered threshold would shrink its own input
+    set and oscillate.
+    """
+    out: Dict[str, Any] = {"eligible_total": 0, "by_class": {}, "t_high": 0.80}
+    try:
+        from systemu.runtime.requirement_binder import T_HIGH
+        out["t_high"] = float(T_HIGH)
+    except Exception:
+        pass
+    try:
+        for r in recs or []:
+            if str(r.get("resolution", "") or "") != "resolvable_confirmed":
+                continue                     # only the DEFINITIVE sub-case may count
+            matched = r.get("matched_candidate")
+            cands = r.get("candidates")
+            if not matched or not isinstance(cands, list):
+                continue
+            for c in cands:
+                if not isinstance(c, dict) or c.get("ref") != matched:
+                    continue
+                if str(c.get("value_origin", "") or "") == "content_derived":
+                    break                    # taint-gated, not threshold-gated
+                try:
+                    score = float(c.get("score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    break
+                if score >= out["t_high"]:
+                    break                    # was never below the line
+                cls = str(r.get("class", "") or "?")
+                out["by_class"][cls] = out["by_class"].get(cls, 0) + 1
+                out["eligible_total"] += 1
+                break
+    except Exception:
+        pass
+    return out
 
 
 def avoidable_ask_report(vault) -> Dict[str, Any]:
@@ -750,6 +832,44 @@ def format_answer_linked_ask(report: Dict[str, Any]) -> List[str]:
         b = by_class[cls] or {}
         lines.append(f"      [{cls}] {int(b.get('definitive_avoidable', 0) or 0)}"
                      f"/{int(b.get('total', 0) or 0)} definitive-avoidable")
+    lines.extend(_format_learned_synonyms(r.get("learned_synonyms")))
+    lines.extend(_format_threshold_sensitive(r.get("threshold_sensitive")))
+    return lines
+
+
+def _format_learned_synonyms(ls: Any) -> List[str]:
+    """The §5.9 slice-4 learned overlay. Rendered ALWAYS (even at zero) so its
+    absence is a fact the reader can see, not an ambiguity."""
+    ls = ls if isinstance(ls, dict) else {}
+    n = int(ls.get("tokens", 0) or 0)
+    cap = int(ls.get("cap", 0) or 0)
+    lines = [f"  · learned synonyms (§5.9 slice 4): {n}/{cap} token(s) "
+             f"— extend the static reference_synonyms map, union-only"]
+    entries = ls.get("entries") if isinstance(ls.get("entries"), dict) else {}
+    for tok in sorted(entries):
+        exts = entries.get(tok) or []
+        lines.append(f"      {tok} -> {', '.join(str(e) for e in exts)}")
+    if not entries:
+        lines.append("      (none learned yet — needs an answered file-reference ask)")
+    return lines
+
+
+def _format_threshold_sensitive(ts: Any) -> List[str]:
+    """The threshold-delta trigger evidence. See ``_threshold_sensitive_counts``:
+    the delta itself is deliberately NOT built, and this is what would justify it."""
+    ts = ts if isinstance(ts, dict) else {}
+    n = int(ts.get("eligible_total", 0) or 0)
+    t_high = float(ts.get("t_high", 0.80) or 0.80)
+    lines = [f"  · confidence-gated confirms (would a learned T_high delta help?): "
+             f"{n}  [T_high={t_high:.2f}, static]"]
+    by_class = ts.get("by_class") if isinstance(ts.get("by_class"), dict) else {}
+    for cls in sorted(by_class):
+        lines.append(f"      [{cls}] {int(by_class[cls] or 0)}")
+    if not n:
+        lines.append("      0 = no ask here was gated by CONFIDENCE; every one was")
+        lines.append("      gated by content_derived TAINT, which no threshold may")
+        lines.append("      silence (IMPL-5). A per-class threshold delta would be")
+        lines.append("      dead machinery today — see _threshold_sensitive_counts.")
     return lines
 
 
