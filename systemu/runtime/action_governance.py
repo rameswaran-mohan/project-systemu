@@ -345,6 +345,25 @@ def _effective_tags(ctx: ActionContext) -> Set[str]:
     return tags
 
 
+def effective_tags(ctx: ActionContext) -> Set[str]:
+    """PUBLIC: the tag set ``evaluate_action`` ACTUALLY scored for *ctx*.
+
+    Callers that need to disclose or re-check a verdict's effect basis must use
+    THIS, never ``ctx.effect_tags`` (the raw DECLARED tags). The two differ
+    whenever the scorer escalated: an untagged ``wire_funds`` declares nothing
+    but scores ``money_move`` off the name verb map, and a tool declaring only
+    ``net_read`` scores ``{net_read, money_move}``. A consumer that reads the
+    declared set therefore sees a benign classification for a call the governor
+    judged dangerous — which is exactly how a money-move gate reached one-tap
+    remote approval (``messaging.decision_bridge.classify_resolution``).
+
+    Deliberately NOT the tool signature's input: ``command_approvals.tool_signature``
+    keys on the DECLARED tags, and re-keying it on the effective set would
+    invalidate every stored approval.
+    """
+    return _effective_tags(ctx)
+
+
 def _high_severity_signal(ctx: ActionContext, tags: Set[str]) -> bool:
     """The escalators that make an UNKNOWN effect fail closed to DENY."""
     return (

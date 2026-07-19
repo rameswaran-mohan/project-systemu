@@ -107,13 +107,33 @@ def test_real_benign_tool_gate_stays_remote():
     assert ctx["resolution_class"] == "remotely_resolvable"
 
 
-def test_real_benign_command_gate_stays_remote():
+def test_real_command_gate_floors_on_unclassified_effects():
+    """TIGHTENED (was ``test_real_benign_command_gate_stays_remote``, expecting
+    ``remotely_resolvable``).
+
+    Two independent reasons this must floor, and BOTH are load-bearing:
+
+    1. The shape asserted here is one the real producer never emits. A command
+       gate only posts for a DESTRUCTIVE, non-approved command (the
+       ``is_destructive_call`` early return skips provably read-only ones), so
+       ``_maybe_gate_command`` hard-codes ``destructive: True`` in its
+       context_extras — see tool_sandbox.py. Every real command gate was already
+       floored by step 4; this test's ``destructive``-less extras were fiction.
+    2. ``effect_tags: []`` — which the command producer DOES stamp verbatim,
+       because shell commands are not effect-tag classified at that seam — is the
+       ABSENCE of a classification, not a finding of "no effect", and now floors
+       on its own (classify_resolution step 3).
+
+    So no command gate is remotely resolvable today, by construction. The
+    remote lane belongs to positively-classified benign TOOL gates —
+    ``test_real_benign_tool_gate_stays_remote`` below is the shape that survives.
+    """
     d = GateDescriptor.from_command(tool_name="run_command", command="ls -la")
     ctx = _enqueue_and_get_ctx(
         d, gate_type="command",
         context_extras={"verdict": "require_approval", "effect_tags": [],
                         "command": "ls -la", "cwd": ""})
-    assert ctx["resolution_class"] == "remotely_resolvable"
+    assert ctx["resolution_class"] == "floor"
 
 
 # ── Part B: MISSING evidence → floor (the real bug: extras omit them) ──────────

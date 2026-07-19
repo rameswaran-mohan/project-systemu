@@ -87,12 +87,33 @@ _FLOOR_GATE_TYPES = frozenset({
 })
 
 # effect_tags that floor a gate regardless of gate_type: money movement and any
-# explicitly-irreversible effect. Kept small and POSITIVE (an unknown tag does
-# not by itself floor a recognized safe gate_type — but an unrecognized
-# gate_type already floors, so the allowlist stays the backstop).
+# explicitly-irreversible effect. This is a DENYLIST of known-dangerous classes,
+# and it answers only "is this classified effect dangerous?".
+#
+# It deliberately does NOT contain "unknown", and adding it would close nothing:
+# the check is a set INTERSECTION, and the unclassified cases that matter are an
+# EMPTY list (intersects nothing) — not a list carrying the literal "unknown".
+# The separate, prior question — "is there a classification AT ALL?" — is asked
+# in step 3 of classify_resolution, which floors an empty / unknown-only list.
+#
+# (Historical note: the "an unknown tag does not by itself floor a recognized
+# safe gate_type — the gate_type allowlist stays the backstop" rationale that
+# used to sit here was written in c4bfae0e, when this predicate was
+# exclusion-style and the allowlist held six gate types. 28119ca9 inverted the
+# design to positive-proof and narrowed the allowlist to {tool, command} — i.e.
+# to exactly the two types an unclassified gate rides in on — so the allowlist
+# is no longer a backstop for this case. The rationale was never updated to
+# match; it is not evidence that unclassified effects were meant to stay
+# remotely approvable.)
 _FLOOR_EFFECT_TAGS = frozenset({
     "money_move", "irreversible", "money_spend", "payment", "funds_move",
 })
+
+# The scorer's "nothing was classified" sentinel. Mirrors
+# ``runtime.effect_tags.EffectTag.UNKNOWN.value``; kept as a literal so this
+# module stays import-light (decision_queue imports it LAZILY to dodge an
+# approval<->messaging import cycle).
+_UNKNOWN_EFFECT_TAG = "unknown"
 
 # The ONLY verdict values that permit a remote (tap-to-approve) resolution. The
 # governor's HarnessDecision enum uses ``grant``/``deny``/``escalate``; the
@@ -205,14 +226,47 @@ def classify_resolution(context: Any) -> str:
         if verdict not in _REMOTE_VERDICTS:
             return RESOLUTION_FLOOR
 
-        # 3. effect_tags KEY must be PRESENT, be a list, and be DISJOINT from the
-        #    money/irreversible floor set. Absent effect_tags → floor.
+        # 3. effect_tags KEY must be PRESENT, be a list, carry a POSITIVE
+        #    classification, and be DISJOINT from the money/irreversible floor
+        #    set. Absent effect_tags → floor.
+        #
+        #    The POSITIVE-classification requirement is load-bearing. An EMPTY
+        #    list is the ABSENCE of a classification, not a finding of "no
+        #    effect" — but it is "present", "a list", and disjoint from every
+        #    denylist, so it used to satisfy all three tests and go REMOTE. That
+        #    inverted the whole point of the card: the governor raises a
+        #    REQUIRE_APPROVAL on an untagged tool precisely BECAUSE it could not
+        #    classify the effect ("unclassifiable effect — gated
+        #    (dangerous-until-proven)", action_governance.evaluate_action), and
+        #    that card then became one-tap approvable from a phone. Worse, the
+        #    name-verb escalator means an untagged `wire_funds` scores
+        #    MONEY_MOVE — so the very cards the money floor exists for were the
+        #    ones sailing past it.
+        #
+        #    Three siblings already read empty as UNKNOWN and fail closed on it;
+        #    this was the one consumer that did not:
+        #      * action_governance._effective_tags  — empty ⇒ {UNKNOWN}
+        #      * financial_signal._is_unknown_effect — empty OR unknown-only ⇒
+        #        UNKNOWN, feeding the fail-closed money-move net
+        #      * tool_dry_run._gate_skip_reason      — "empty ⇒ UNKNOWN ⇒ don't
+        #        trust"
+        #
+        #    Cost check ("does this make remote approval useless?"): no. The
+        #    population R-P1 Part C was built to keep on the phone is a BENIGN,
+        #    POSITIVELY-classified tool gate — its worked example is a
+        #    `net_mutate` tool — and every such gate still passes. What loses
+        #    the phone lane is exactly the set of actions the system cannot
+        #    describe, which fall back to the dashboard (SURFACE_DASHBOARD_ONLY),
+        #    the designed route. Friction lands on the least-understood actions.
         if "effect_tags" not in context:
             return RESOLUTION_FLOOR
         effect_tags = context.get("effect_tags")
         if not isinstance(effect_tags, list):
             return RESOLUTION_FLOOR
-        tags = {str(t).lower() for t in effect_tags}
+        tags = {str(t).strip().lower() for t in effect_tags}
+        tags.discard("")            # a blank entry classifies nothing
+        if not tags or _UNKNOWN_EFFECT_TAG in tags:
+            return RESOLUTION_FLOOR
         if tags & _FLOOR_EFFECT_TAGS:
             return RESOLUTION_FLOOR
 

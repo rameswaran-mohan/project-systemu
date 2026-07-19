@@ -1151,7 +1151,7 @@ class ToolSandbox:
             return  # no Tool to gate — legacy/registry-less path unchanged
 
         from systemu.runtime.action_governance import (
-            ActionContext, Verdict, evaluate_action)
+            ActionContext, Verdict, effective_tags, evaluate_action)
 
         effect_tags = {str(t) for t in (getattr(tool, "effect_tags", None) or [])}
 
@@ -1389,10 +1389,23 @@ class ToolSandbox:
         # keys the fail-closed classifier floors EVERY tool gate (verdict/
         # effect_tags absent → floor), making R-P1 inert. ``verdict`` is the
         # evaluate_action Verdict value (require_approval / deny); ``effect_tags``
-        # is the tool's declared effect set (a list — the money/irreversible floor
+        # is the EFFECTIVE effect set (a list — the money/irreversible floor
         # reads it). ``destructive`` is the destructive-param signal, stamped for
         # defense in depth (a destructive tool call floors even with a clean
         # verdict + empty effect_tags).
+        #
+        # ``effect_tags`` MUST be the tags the governor actually SCORED
+        # (``action_governance.effective_tags``), not the raw DECLARED
+        # ``effect_tags`` above. The two diverge exactly where it is most
+        # dangerous: an untagged ``wire_funds`` declares NOTHING but scores
+        # ``money_move`` off the name verb map, and one declaring ``net_read``
+        # scores ``{net_read, money_move}``. Stamping the declared set published
+        # a benign classification for a call the governor judged a money move —
+        # so ``classify_resolution``'s money floor never saw it and the card
+        # became a one-tap phone approval. It also made the "why?" panel
+        # (interface/components/why_panel.py) under-report the effect. The
+        # SIGNATURE is deliberately still keyed on the DECLARED tags (``sig``
+        # above): re-keying it here would invalidate every stored approval.
         _resume_extras = {
             "tool_signature": sig,
             "tool_name": getattr(tool, "name", tool_name),
@@ -1401,7 +1414,7 @@ class ToolSandbox:
             # one when a reclassification was applied. That is what the recorder and
             # the remote classifier must reason about, not the original DENY.
             "verdict": getattr(verdict, "value", str(verdict)),
-            "effect_tags": sorted(effect_tags),
+            "effect_tags": sorted(effective_tags(ctx)),
             "destructive": ctx.is_destructive_param,
             # R-UX3 / UX-14: persist the evaluate_action REASON structurally so
             # the "why?" panel can render it without re-scoring the call (the

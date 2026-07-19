@@ -804,12 +804,20 @@ def test_the_follow_up_card_floors_remote_resolution():
 def test_the_typed_confirm_key_is_what_floors_it():
     """Pin the MECHANISM, not just the outcome: strip the typed-confirm marker and
     the same context becomes remote. Without this the test could pass because of the
-    destructive flag alone and silently stop covering the marker."""
+    destructive flag alone and silently stop covering the marker.
+
+    ``effect_tags`` must carry a REAL positive classification for that isolation to
+    work. It used to be ``[]``, which was incidental to this test but is now itself a
+    floor trigger (an empty list is the ABSENCE of a classification, not "no effect"
+    — see classify_resolution step 3), which would have made the second assertion
+    floor for the wrong reason and silently stopped covering the marker again.
+    ``local_write`` is also what the real producer now stamps here: the operator
+    assigned that class, so it is in the tag set ``evaluate_action`` scored."""
     from systemu.messaging.decision_bridge import classify_resolution
     d = GateDescriptor.from_tool(tool_name="t", sig="s", verdict="require_approval",
                                  reclassified=True, assigned_class="local_write")
     base = _ctx(d, {"tool_signature": "s", "verdict": "require_approval",
-                    "effect_tags": [], "destructive": False,
+                    "effect_tags": ["local_write"], "destructive": False,
                     "reclassified": True, "assigned_class": "local_write"})
     assert classify_resolution({**base, "requires_typed_confirm": True}) == "floor"
     assert classify_resolution(base) == "remotely_resolvable"

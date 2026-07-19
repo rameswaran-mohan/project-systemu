@@ -126,11 +126,24 @@ def test_destructive_flag_floors_clean_gate():
 
 
 def test_both_present_clean_is_remote():
-    # The one remote shape: command/tool + affirmative verdict + clean list.
-    assert rc({"kind": "gate", "gate_type": "tool", "verdict": "grant",
-               "effect_tags": []}) == "remotely_resolvable"
+    # The one remote shape: command/tool + affirmative verdict + a list carrying a
+    # POSITIVE classification that is disjoint from the money/irreversible floor.
     assert rc({"kind": "gate", "gate_type": "tool", "verdict": "allow",
                "effect_tags": ["net_mutate"]}) == "remotely_resolvable"
+    assert rc({"kind": "gate", "gate_type": "tool", "verdict": "grant",
+               "effect_tags": ["local_write"]}) == "remotely_resolvable"
+
+
+def test_empty_effect_tags_is_not_a_clean_list():
+    # TIGHTENED: this case used to assert "remotely_resolvable" — it encoded the
+    # fail-open reality that an EMPTY list satisfies "present + a list + disjoint
+    # from the floor set". Empty is the ABSENCE of a classification, not a finding
+    # of "no effect", so it now floors. See classify_resolution step 3 and
+    # tests/test_empty_effect_tags_floor.py for the real-path coverage.
+    assert rc({"kind": "gate", "gate_type": "tool", "verdict": "grant",
+               "effect_tags": []}) == "floor"
+    assert rc({"kind": "gate", "gate_type": "tool", "verdict": "grant",
+               "effect_tags": ["unknown"]}) == "floor"
 
 
 def test_typed_confirm_floor():
