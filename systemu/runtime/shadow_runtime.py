@@ -1497,7 +1497,11 @@ def _populate_requirement_report(context, *, objectives, capability, situation,
     # contract, but we guard anyway so a producer-side surprise can't crash the run.
     try:
         from systemu.runtime.requirement_binder import build_requirement_report
-        report = build_requirement_report(objectives, capability, situation, context)
+        # vault= is threaded EXPLICITLY (R-A16 §5.9): it keys each bind's
+        # bound_value_digest. `context` carries no vault, so omitting this silently
+        # drops the digest and every bound ask degrades to "missing_answered".
+        report = build_requirement_report(objectives, capability, situation, context,
+                                          vault=vault)
         report_dict = report.model_dump()
     except PendingChoiceRequest:
         raise                                    # never here, but keep the rail honest
@@ -7078,11 +7082,15 @@ class ShadowRuntime:
                                     and getattr(_b_tool, "parameters_schema", None)):
                                 from systemu.runtime.requirement_binder import (
                                     build_requirement_report)
+                                # vault= threaded explicitly (R-A16 §5.9) — see the
+                                # note at the pre-loop producer: context has no vault,
+                                # and without the key no bind carries a value digest.
                                 _b_report = build_requirement_report(
                                     [_b_obj], _b_tool,
                                     getattr(context, "_situation_report", None) or {},
                                     context,
-                                    provided_params=decision.get("parameters") or {})
+                                    provided_params=decision.get("parameters") or {},
+                                    vault=self.vault)
                             _b_ask = list(getattr(_b_report, "ask_bundle", None) or []) \
                                 if _b_report is not None else []
                         except Exception:

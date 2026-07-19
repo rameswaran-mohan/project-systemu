@@ -50,6 +50,46 @@ def test_the_key_id_parser_does_not_silently_duplicate_guard_3():
         "guard 3 must be exactly one check on the untrusted candidate_ref")
 
 
+def test_every_production_binder_call_site_threads_the_vault():
+    """The digest is only as real as its WIRING.
+
+    ``_value_digest`` needs a vault, and the ``ExecutionContext`` it is handed does not
+    carry one — so a call site that omits ``vault=`` silently produces requirements with
+    no digest, and every ask from it degrades to ``missing_answered``. That is exactly
+    how the field shipped inert: the code was correct in isolation and unwired in
+    production, and no behavioural test could see it because the fixtures supplied a
+    ctx that DID have a vault.
+
+    This scans the real production module rather than the two known line numbers, so a
+    THIRD call site added later fails here until it is wired too."""
+    from systemu.runtime import shadow_runtime
+
+    src = inspect.getsource(shadow_runtime)
+    # every invocation (not the import lines, which have no open paren)
+    calls = [m.start() for m in re.finditer(r"build_requirement_report\(", src)]
+    assert len(calls) >= 2, (
+        "expected at least the two known production call sites — the scan has gone "
+        "blind and this pin no longer protects the wiring")
+    for pos in calls:
+        # the argument list runs to the matching close paren; a nested paren depth
+        # counter is overkill here — take the call's own balanced span
+        depth, i = 0, pos + len("build_requirement_report")
+        while i < len(src):
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        args = src[pos:i]
+        assert "vault=" in args, (
+            f"a build_requirement_report call site does not thread the vault:\n{args}\n"
+            f"Without vault= the bind's value digest is never stamped (the "
+            f"ExecutionContext carries no vault), so resolvable_confirmed can never "
+            f"fire and every bound ask records as missing_answered.")
+
+
 def test_binder_ref_prefix_allowlist_covers_every_bind_return_site():
     """The OTHER half of the fixture-realism guard (F1's meta-lesson).
 

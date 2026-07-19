@@ -117,6 +117,11 @@ class _BindCtx:
     # R-A12c: the tool-call's already-supplied params (decision.parameters). A dict or
     # None; source #0 (_bind_provided_params) binds a required leaf whose key is present.
     provided_params: Optional[dict] = None
+    # R-A16 §5.9: the vault, threaded EXPLICITLY from the call site — the only thing
+    # it feeds is _value_digest's keying. It is deliberately NOT read off ``ctx``:
+    # the real ExecutionContext carries no vault (and must not — it is serialized and
+    # snapshotted, so a live handle on it is a snapshot-shape hazard).
+    vault: Any = None
 
 
 def _descend_provided(container, segs):
@@ -630,6 +635,15 @@ def _value_digest(bc: _BindCtx, *, kind, schema_path, value) -> Optional[str]:
     delegates to ``elicitation.is_secret_field``) rather than a bespoke rule. So no
     secret-derived datum is even computed here, let alone carried.
 
+    THE VAULT COMES FROM THE CALL SITE, NOT FROM ``ctx``. It was originally read as
+    ``ctx.vault`` — an attribute the real ``ExecutionContext`` has never had — so the
+    digest evaluated to ``None`` on every production bind and this field shipped inert:
+    ``resolvable_confirmed`` could not fire, and every bound ask recorded as
+    ``missing_answered`` ("the binder had nothing"), which was false. The ctx fallback
+    below is retained only for callers that pass a ctx-shaped stand-in; production
+    threads ``vault=`` explicitly. Adding ``vault`` to ``ExecutionContext`` is NOT the
+    repair — that object is serialized and snapshotted.
+
     Observability-only and TOTALLY defensive: an unavailable vault, an unkeyable
     value, any failure at all ⇒ ``None`` (the §5.9 row degrades to candidate-only).
     A metric must never be able to perturb a bind."""
@@ -641,7 +655,8 @@ def _value_digest(bc: _BindCtx, *, kind, schema_path, value) -> Optional[str]:
             return None
         if _rm._is_secret_path(str(schema_path or ""), str(kind or "")):
             return None
-        vault = getattr(getattr(bc, "ctx", None), "vault", None)
+        vault = getattr(bc, "vault", None) or getattr(getattr(bc, "ctx", None),
+                                                      "vault", None)
         if vault is None:
             return None
         return _rm.value_ref(value, vault)
@@ -750,7 +765,8 @@ def _normalized_root(schema: dict) -> dict:
 
 
 # ── the public entry (§5.3) ──────────────────────────────────────────────────
-def compute_requirements(objective, capability, situation, ctx, provided_params=None) -> List[Any]:
+def compute_requirements(objective, capability, situation, ctx, provided_params=None,
+                         vault=None) -> List[Any]:
     """Compute the per-objective ``list[Requirement]`` by BIND-mode schema-diff.
 
     Reads ``capability``'s schema, diffs every REQUIRED leaf against the ordered sources,
@@ -758,6 +774,8 @@ def compute_requirements(objective, capability, situation, ctx, provided_params=
     ``requires_external_verification`` on ``objective`` from the EffectTag (AC4/§5.8).
     ``provided_params`` (R-A12c) are the CURRENT tool-call's already-supplied params —
     a required leaf present there binds (source #0) instead of generating a spurious ask.
+    ``vault`` (R-A16 §5.9, optional) keys the per-bind ``bound_value_digest``; omit it
+    and binds carry no digest (observability degrades, the diff is unchanged).
     Defensive: a broken schema / missing situation yields [] or a best-effort list,
     never raises."""
     try:
@@ -803,7 +821,7 @@ def compute_requirements(objective, capability, situation, ctx, provided_params=
         pp = provided_params if isinstance(provided_params, dict) else None
         bc = _BindCtx(situation=sit, ctx=ctx, granted=granted, tool_name=tool_name,
                       reference_text=(_goal + " " + _crit).strip(),
-                      provided_params=pp)
+                      provided_params=pp, vault=vault)
         _diff_schema(bc, root)
         return bc.reqs
     except Exception:
@@ -835,12 +853,16 @@ def _needs_ask(req) -> bool:
     return _get(req, "value_origin") == _CONTENT_DERIVED
 
 
-def build_requirement_report(objectives, capability, situation, ctx, provided_params=None):
+def build_requirement_report(objectives, capability, situation, ctx,
+                             provided_params=None, vault=None):
     """Aggregate ``compute_requirements`` across objectives into a RequirementReport:
     ``per_objective`` + a DEDUPED ``ask_bundle`` (every non-'have' requirement). The
     per-objective core is ``compute_requirements``; this is the §5.6 pull/scope-card
     feed. ``provided_params`` (R-A12c) threads the tool-call's already-supplied params
-    through to the per-objective diff. Defensive: never raises."""
+    through to the per-objective diff. ``vault`` (R-A16 §5.9) keys each bind's
+    ``bound_value_digest`` — it MUST be threaded from the call site, because the
+    ``ExecutionContext`` passed as ``ctx`` carries no vault of its own.
+    Defensive: never raises."""
     from systemu.core.models import RequirementReport
 
     per: Dict[int, List[Any]] = {}
@@ -849,7 +871,7 @@ def build_requirement_report(objectives, capability, situation, ctx, provided_pa
     for obj in objectives or []:
         try:
             reqs = compute_requirements(obj, capability, situation, ctx,
-                                        provided_params=provided_params)
+                                        provided_params=provided_params, vault=vault)
         except Exception:
             reqs = []
         oid = _get(obj, "id")

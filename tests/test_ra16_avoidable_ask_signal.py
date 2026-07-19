@@ -956,12 +956,24 @@ def test_real_binder_output_records_an_override_when_the_operator_changes_it(tmp
 
 
 def test_the_binder_value_digest_gate_refuses_credentials_and_secret_paths(tmp_path):
-    """The two producer-side digest guards, pinned DIRECTLY.
+    """The producer-side digest guards, pinned DIRECTLY — the OUTCOME, not independence.
 
-    End-to-end the credential source also returns no resolved value, so the KIND guard
-    is masked by that and survives deletion invisibly. Driving the gate itself keeps
-    both guards independently load-bearing — they are the reason no secret-derived
-    datum is ever even COMPUTED, let alone carried across the suspend."""
+    Read this before trusting it: it does NOT establish that both guards are
+    independently load-bearing. `_is_secret_path` stamps `format="password"` for any
+    `kind == "credential"` regardless of schema_path, so assertion (a) below passes via
+    the NAME guard alone; deleting the KIND guard leaves every test green. The KIND
+    guard is a redundant short-circuit under every current path, not dead code — it
+    executes and returns first — and the credential bind source additionally returns no
+    resolved value at all, so end-to-end there are THREE protections and this test can
+    kill none of them individually.
+
+    What it does pin: for a credential kind and for a secret-NAMED leaf, no digest is
+    ever computed — so no secret-derived datum is carried across the suspend. That
+    guarantee is what matters; which guard delivers it is not pinned here.
+
+    (An earlier version of this docstring claimed the opposite. It was false, and in
+    this codebase a docstring asserting a property its test does not establish has
+    already propagated into a wrong fix.)"""
     from systemu.runtime import requirement_binder as rb
     bc = rb._BindCtx(situation={}, ctx=_Ctx(_Vault(tmp_path), []), granted=None)
     # a non-secret leaf DOES get a digest — without this the pin could not fail
@@ -999,6 +1011,162 @@ def test_the_binder_never_stamps_a_value_digest_on_a_secret_named_leaf(tmp_path)
     ctx = _Ctx(v, ["some/produced.txt"])
     cap = _Cap({"password": {"type": "string"}, "client_secret": {"type": "string"}})
     reqs = compute_requirements(_Obj(), cap, {}, ctx)
+    assert reqs, "expected the binder to emit requirements"
+    for r in reqs:
+        assert r.kind != "credential", "this pin must exercise the NAME guard, not kind"
+        assert r.bound_value_ref, "expected a real bind (else the pin proves nothing)"
+        assert r.bound_value_digest is None, (r.schema_path, r.bound_value_ref)
+        assert rm.requirement_snapshot(r) is None
+
+
+def _real_execution_context(produced):
+    """A REAL ``ExecutionContext``, built with the exact keyword set production uses at
+    ``shadow_runtime.py:4862`` — not a stand-in. ``_Ctx`` above carries a ``.vault`` the
+    real object does not have, which is precisely the shape difference this section
+    exists to pin."""
+    from systemu.runtime.context_builder import ExecutionContext
+    ctx = ExecutionContext(
+        execution_id="exec-ra16",
+        system_prompt="sp",
+        scroll_json=[],
+        tool_index=[],
+        skill_index=[],
+        recalled_memory="",
+        use_objectives=True,
+        scroll_intent="write the report",
+    )
+    ctx.files_produced = list(produced)
+    return ctx
+
+
+def test_a_real_execution_context_has_no_vault_so_it_must_be_threaded(tmp_path):
+    """THE CTX-SHAPE FIXTURE-REALISM PIN — the same defect class as F1, one layer up.
+
+    F1's lesson was applied to the ``bound_value_ref`` SHAPE but not to the ``ctx``
+    shape. ``_Ctx`` above carries a ``.vault``; the real ``ExecutionContext`` does not
+    and never did, so ``_value_digest``'s ``getattr(ctx, "vault", None)`` lookup
+    returned ``None`` on EVERY production bind and the digest was never once stamped in
+    a real run — while every test here passed, because they all handed the binder a
+    fixture that happened to have the attribute.
+
+    Two assertions, and BOTH are load-bearing:
+      (a) a real ``ExecutionContext`` has no ``vault``. This fails the day someone
+          "fixes" the threading by hanging a live vault handle on the context instead —
+          which is exactly the wrong repair (the context is serialized and snapshotted).
+      (b) with the vault threaded EXPLICITLY, the digest is populated."""
+    from systemu.runtime.requirement_binder import build_requirement_report
+
+    v = _Vault(tmp_path)
+    ctx = _real_execution_context(["out/prior_report.md"])
+
+    # (a) the shape fact the whole commit rests on
+    assert not hasattr(ctx, "vault"), (
+        "a real ExecutionContext must NOT carry a vault — it is serialized and "
+        "snapshotted, and attaching a live handle invites a snapshot-shape "
+        "regression. Thread the vault through build_requirement_report instead.")
+
+    cap = _Cap({"out_path": {"type": "string", "description": "where to write"}})
+
+    # without the thread there is no key ⇒ no digest (the production behaviour that
+    # made resolvable_confirmed structurally unreachable)
+    unthreaded = build_requirement_report([_Obj()], cap, {}, ctx).ask_bundle[0]
+    assert unthreaded.bound_value_ref == "run_context:out/prior_report.md", (
+        "the binder must genuinely BIND here, else this pin proves nothing")
+    assert unthreaded.bound_value_digest is None
+
+    # (b) threaded explicitly ⇒ the digest IS stamped
+    req = build_requirement_report([_Obj()], cap, {}, ctx, vault=v).ask_bundle[0]
+    assert req.bound_value_ref == "run_context:out/prior_report.md"
+    assert req.bound_value_digest == rm.value_ref("out/prior_report.md", v)
+
+
+def test_compute_requirements_threads_the_vault_too(tmp_path):
+    """The per-objective core is a public §5.3 entry in its own right; the kwarg must
+    reach ``_BindCtx`` by that path as well, not only through the aggregator."""
+    from systemu.runtime.requirement_binder import compute_requirements
+
+    v = _Vault(tmp_path)
+    ctx = _real_execution_context(["out/prior_report.md"])
+    cap = _Cap({"out_path": {"type": "string"}})
+    reqs = compute_requirements(_Obj(), cap, {}, ctx, vault=v)
+    assert reqs and reqs[0].bound_value_digest == rm.value_ref("out/prior_report.md", v)
+
+
+def test_a_confirm_over_a_real_context_is_definitive_end_to_end(tmp_path):
+    """END-TO-END over the REAL producer chain with the REAL context object:
+    ExecutionContext → binder → ``requirement_snapshot`` → ``record_ask_avoidable``.
+
+    ``requirement_snapshot()`` is called for real rather than hand-building a snapshot
+    dict — a hand-built snapshot silently supplies the very ``candidate_ref`` whose
+    absence IS the defect, which produces a false pass."""
+    from systemu.runtime.requirement_binder import build_requirement_report
+
+    v = _Vault(tmp_path)
+    ctx = _real_execution_context(["out/prior_report.md"])
+    cap = _Cap({"out_path": {"type": "string"}})
+    req = build_requirement_report([_Obj()], cap, {}, ctx, vault=v).ask_bundle[0]
+
+    snap = rm.requirement_snapshot(req)          # the REAL producer, never a literal
+    assert snap and snap["candidate_ref"], "no candidate_ref ⇒ the join cannot fire"
+
+    rm.record_ask_avoidable(v, ask_id="hreq_real", snapshot=snap,
+                            answer="out/prior_report.md")
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "resolvable_confirmed", rec
+    assert rec["matched_candidate"] == snap["candidate_ref"]
+    assert "out/prior_report.md" not in _raw(tmp_path)
+
+
+def test_an_override_over_a_real_context_is_recorded_as_necessary(tmp_path):
+    """The other half: the binder held a value and the operator answered something
+    else ⇒ ``resolvable_overridden`` (the ask was NECESSARY). Pre-fix BOTH this and the
+    confirm above degraded to ``missing_answered`` — "the binder had nothing" — which
+    was false; it had a value."""
+    from systemu.runtime.requirement_binder import build_requirement_report
+
+    v = _Vault(tmp_path)
+    ctx = _real_execution_context(["out/prior_report.md"])
+    cap = _Cap({"out_path": {"type": "string"}})
+    req = build_requirement_report([_Obj()], cap, {}, ctx, vault=v).ask_bundle[0]
+
+    rm.record_ask_avoidable(v, ask_id="hreq_real", snapshot=rm.requirement_snapshot(req),
+                            answer="out/something_else.md")
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "resolvable_overridden", rec
+    assert rec["matched_candidate"] is None
+
+
+def test_a_credential_leaf_stamps_no_digest_even_with_the_vault_threaded(tmp_path):
+    """SECRET REGRESSION. Threading a real vault makes the digest computable for the
+    first time in production, so the producer-side secret boundary is now genuinely
+    load-bearing rather than masked by an always-``None`` vault. A credential-kind bind
+    must still stamp NO digest and still produce NO row."""
+    from systemu.runtime.requirement_binder import compute_requirements
+
+    v = _Vault(tmp_path)
+    ctx = _real_execution_context([])            # no run-context bind: force the cred source
+    cap = _Cap({"openai_account": {"type": "string"}})
+    reqs = compute_requirements(_Obj(), cap, {"credentials": ["openai"]}, ctx, vault=v)
+
+    assert [r.kind for r in reqs] == ["credential"], [(r.kind, r.bound_value_ref)
+                                                      for r in reqs]
+    assert reqs[0].bound_value_ref == "credential:openai"
+    assert reqs[0].bound_value_digest is None
+    assert rm.requirement_snapshot(reqs[0]) is None
+
+    rm.record_ask_avoidable(v, ask_id="hreq_cred",
+                            snapshot=rm.requirement_snapshot(reqs[0]), answer="openai")
+    assert _lines(tmp_path) == [], "a credential ask must never reach the corpus"
+
+
+def test_a_secret_named_leaf_stamps_no_digest_even_with_the_vault_threaded(tmp_path):
+    """The NAME half of the boundary, likewise re-pinned under a threaded vault."""
+    from systemu.runtime.requirement_binder import compute_requirements
+
+    v = _Vault(tmp_path)
+    ctx = _real_execution_context(["some/produced.txt"])
+    cap = _Cap({"password": {"type": "string"}, "client_secret": {"type": "string"}})
+    reqs = compute_requirements(_Obj(), cap, {}, ctx, vault=v)
     assert reqs, "expected the binder to emit requirements"
     for r in reqs:
         assert r.kind != "credential", "this pin must exercise the NAME guard, not kind"
