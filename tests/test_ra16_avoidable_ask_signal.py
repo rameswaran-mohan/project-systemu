@@ -1015,9 +1015,15 @@ def test_the_binder_never_stamps_a_value_digest_on_a_secret_named_leaf(tmp_path)
     using the canonical ``is_secret_field`` marker, not a bespoke rule."""
     from systemu.runtime.requirement_binder import compute_requirements
     v = _Vault(tmp_path)
-    ctx = _Ctx(v, ["some/produced.txt"])
+    ctx = _Ctx(v, [])
     cap = _Cap({"password": {"type": "string"}, "client_secret": {"type": "string"}})
-    reqs = compute_requirements(_Obj(), cap, {}, ctx)
+    # The positive control — "a real bind whose digest is absent" — comes from source #0.
+    # It used to come from ``files_produced``, but source #2 is now PATH-ONLY and these
+    # are not path leaves; that channel also bound a FILE PATH into ``password``, which
+    # is the exact wrong pre-fill the gate exists to stop.
+    reqs = compute_requirements(_Obj(), cap, {}, ctx,
+                                provided_params={"password": "hunter2xyz",
+                                                 "client_secret": "sekrit-abc"})
     assert reqs, "expected the binder to emit requirements"
     for r in reqs:
         assert r.kind != "credential", "this pin must exercise the NAME guard, not kind"
@@ -1171,9 +1177,13 @@ def test_a_secret_named_leaf_stamps_no_digest_even_with_the_vault_threaded(tmp_p
     from systemu.runtime.requirement_binder import compute_requirements
 
     v = _Vault(tmp_path)
-    ctx = _real_execution_context(["some/produced.txt"])
+    ctx = _real_execution_context([])
     cap = _Cap({"password": {"type": "string"}, "client_secret": {"type": "string"}})
-    reqs = compute_requirements(_Obj(), cap, {}, ctx, vault=v)
+    # source #0 supplies the positive-control bind (see the sibling pin above): source
+    # #2 is PATH-ONLY now and would not fire on these leaves.
+    reqs = compute_requirements(_Obj(), cap, {}, ctx, vault=v,
+                                provided_params={"password": "hunter2xyz",
+                                                 "client_secret": "sekrit-abc"})
     assert reqs, "expected the binder to emit requirements"
     for r in reqs:
         assert r.kind != "credential", "this pin must exercise the NAME guard, not kind"

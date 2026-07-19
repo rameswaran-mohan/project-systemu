@@ -14,7 +14,11 @@ The 5 bind sources, tried IN ORDER (first hit wins) — §5.3:
                         ``password``, ``query``, ``count``. See that constant.
   2. run-context      — a prior objective's produced file / run state (best-effort
                         from ctx.files_produced; a typed objective_outputs store is
-                        deferred to R-A11). Origin content_derived.
+                        deferred to R-A11). Origin content_derived. Like source #1 it
+                        binds a FILE PATH with no key test, so it too is consulted ONLY
+                        for a path leaf (``_PATH_ONLY_SOURCES``) — ungated it pre-filled
+                        a path into every leaf AND, running before the profile, masked
+                        the silent operator-profile bind. See that constant.
   3. inventory ENTRY  — a SituationReport hit (services / capabilities / roots /
                         credentials / declared_intents), prefer curated=True. Origin is
                         DERIVED from the source kind (scanned/surveyed content clamps to
@@ -70,8 +74,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
@@ -441,8 +447,10 @@ def _fact_origin(fact) -> str:
 #
 # THE CHANNEL. ``content_derived`` user_facts are injected verbatim into planning
 # prompts (``scroll_refiner``'s tier-1 elder_intake payload, recent 20; the planner's
-# fenced SituationReport, which carries the whole profile). Nothing stops the model
-# from copying such a value into a tool call's params — and source #0 then stamped it
+# fenced SituationReport; ``shadow_runtime``'s profile block, recent 5). Every one of
+# those is now capped to a most-recent window — the SituationReport was NOT, and capping
+# it is what makes ``_PROMPT_FACT_WINDOW`` sound; see that constant. Nothing stops the
+# model from copying such a value into a tool call's params — and source #0 then stamped it
 # ``systemu_authored`` at confidence 1.0, a TRUSTED axis, so it bound SILENTLY. The
 # taint laundered through the MODEL rather than through the store: the same value that
 # source #4 confirm-gates as ``content_derived`` came back clean.
@@ -486,6 +494,21 @@ def _fact_origin(fact) -> str:
 #     meter — ``s4_activation.s4_shadow_arm_verdict`` reads READY off full-lane evidence
 #     alone and is blind to the DEFAULT lane.
 #   * Values shorter than ``_MIN_TAINT_MATCH_LEN`` (see below).
+#   * A value SPLIT ACROSS TWO FACTS — "the prefix is acct-99", "the suffix is attacker"
+#     — which the model can rejoin into a value neither fact contains. Closing it means
+#     matching against CONCATENATIONS of the corpus, and that is not a smaller version of
+#     what ``_canonical_taint_form`` does: joining two facts manufactures adjacencies that
+#     never existed in either, so every join seam becomes a new false-match site, and the
+#     candidate set grows quadratically in a corpus this clamp just paid to bound. The
+#     honest statement is that a determined author who controls TWO stored facts can still
+#     launder one value past this gate. What that buys is bounded by the same
+#     effect-class gating described for the quick lane below: the dangerous bands still
+#     card. Deliberately left open, with the reasoning recorded rather than the gap
+#     merely noted.
+#   * A ``+``-encoded space (``a+b`` for ``a b``). ``unquote`` does not decode ``+`` —
+#     only ``unquote_plus`` does — and applying the plus rule unconditionally would fold
+#     genuine ``+`` characters (a version string, an email tag address) into separators.
+#     Narrow, and the safe direction.
 
 #: Minimum length for a provided value to be matched against the tainted corpus. A
 #: short value ("is", "id", "on") is a token of almost any sentence, so matching it
@@ -494,9 +517,160 @@ def _fact_origin(fact) -> str:
 #: in scope. Values below it bind unchanged — a documented residual, not an oversight.
 _MIN_TAINT_MATCH_LEN = 4
 
+#: How many of the most-recent user_facts the taint corpus may draw from — the BOUND
+#: on the clamp's over-ask cost, and the other half of the canonicalisation below.
+#:
+#: THE PRINCIPLE. This clamp exists for exactly one channel: a value that reached the
+#: MODEL through a prompt and came back as a trusted parameter. A value the model was
+#: never shown cannot have travelled that channel, so matching against it buys no
+#: security — only over-asks. The sound corpus is therefore the PROMPT-RENDERED fact
+#: set, not the whole vault.
+#:
+#: WHY 20. It is the WIDEST cap any prompt renderer applies, enumerated against every
+#: fact-rendering prompt path in the tree rather than assumed:
+#:   * ``scroll_refiner`` tier-1 elder_intake  — ``load_user_facts(recent=20)``
+#:   * ``shadow_runtime`` profile block        — ``load_user_facts(recent=5)``
+#:   * the planner's fenced SituationReport    — ``render_situation_for_prompt``, which
+#:     json-dumps ``build_profile``'s UNCAPPED list. That renderer is capped to THIS
+#:     constant in ``situational_inventory``; without that edit this bound would be a
+#:     real security regression, not a cost fix, because fact #21 IS shown to the
+#:     planner. The two constants are pinned equal by
+#:     ``test_ra16_taint_corpus_bound.test_render_cap_matches_binder_window``.
+#:   * ``user_context.profile_context_block`` — UNCAPPED, but filtered to the
+#:     ``office_context`` tag, and its ONLY caller is ``quick_task``. The quick lane
+#:     never calls the binder (see the residual note above), so no bind decision is ever
+#:     made against what that prompt rendered and it cannot widen the channel this clamp
+#:     closes. Named here because "the corpus is what the prompts carried" is the whole
+#:     argument, and an unlisted renderer would silently weaken it — if the quick lane
+#:     ever gains a bind path, this entry is the one that has to be revisited.
+#: Taking the widest is the fail-safe direction: a fact any renderer showed is in scope.
+#:
+#: ORDERING. ``build_profile`` -> ``get_facts`` returns facts NEWEST-LAST and
+#: ``recent=N`` means "the last N after filtering", so the last-N slice here selects
+#: the same rows the renderers carry. Both read the same non-superseded view.
+#:
+#: WHAT THIS GIVES UP. A fact that has since aged out of every prompt window but whose
+#: value the model lifted in an EARLIER run and is only now replaying through provided
+#: params. That requires the value to survive across runs in the model's output without
+#: any prompt carrying it — the plan text itself would have to be the carrier, which is
+#: the "in-context content with no stored taint record" residual already documented
+#: above, not a new one.
+_PROMPT_FACT_WINDOW = 20
+
+#: Zero-width and BOM code points. Invisible in every operator-facing surface, so a
+#: value carrying one is indistinguishable from the clean value to the human who would
+#: review the confirm — which is exactly why it must not change the match decision.
+_ZERO_WIDTH = dict.fromkeys(
+    map(ord, "​‌‍⁠﻿"), None)
+
+#: Matched pairs only — a lone leading quote is not a wrapper and must not be eaten.
+#: Kept byte-identical to ``replay_metrics._QUOTE_PAIRS`` (R-A16 F2) so the two
+#: canonicalisers stay unifiable; see ``_canonical_taint_form``.
+_QUOTE_PAIRS = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+                ("«", "»"), ("`", "`"))
+
+#: TRAILING only, never interior — stripping interior punctuation would fold ``a.b.c``
+#: into ``abc``, a substring-style collapse that manufactures over-asks.
+_TRAILING_PUNCT = ".,;:!?)]}>"
+
+#: The SEPARATOR CLASS. ``-``, ``_`` and whitespace are interchangeable FORM for the
+#: same identifier, and which one is stored is chosen by whoever authored the content —
+#: so a separator swap is an attacker-reachable reshape, not a benign difference.
+#: Folded to a single space, which is non-alphanumeric and therefore still a TOKEN
+#: DELIMITER for ``_appears_as_token`` — the fold loosens which forms match, never the
+#: boundary rule that keeps this from being a substring test.
+#:
+#: ``/`` is deliberately NOT in the class: ``out/report.md`` and ``out report.md`` are
+#: different values, and folding path structure into the separator class is the one
+#: step that would start manufacturing false matches.
+_SEP_RUN = re.compile(r"[-_\s]+")
+_DUP_SLASH = re.compile(r"/{2,}")
+
+
+def _strip_wrappers(s: str) -> str:
+    """Peel matched surrounding quotes and trailing punctuation until stable.
+
+    Bounded (never unbounded), and never strips to empty — a value that is ENTIRELY
+    punctuation keeps its own form rather than collapsing to ``""``, which would match
+    inside every fact in the corpus. Mirrors ``replay_metrics._strip_wrappers``."""
+    for _ in range(4):
+        before = s
+        for lo, hi in _QUOTE_PAIRS:
+            if len(s) >= 2 and s.startswith(lo) and s.endswith(hi):
+                s = s[1:-1].strip()
+                break
+        trimmed = s.rstrip(_TRAILING_PUNCT)
+        if trimmed:
+            s = trimmed
+        if s == before:
+            break
+    return s
+
+
+def _canonical_taint_form(value) -> str:
+    """The FORM-INSENSITIVE canonical string used on BOTH sides of the taint match.
+
+    The clamp compared RAW text, so it caught only case and surrounding whitespace.
+    Measured end-to-end, every other reshape LAUNDERED: separator swapped (``-``→``_``,
+    ``-``→space), a trailing period, a quote pair, URL-encoding, an interposed
+    zero-width space. Those are not exotic — quoting, punctuation and URL-encoding a URL
+    parameter are ordinary MODEL behaviour, so the clamp failed open on benign output;
+    and because whoever authors the content picks the STORED form, each one is also
+    attacker-reachable by construction.
+
+    THE LINE THIS MUST NOT CROSS. Every step is a total rewrite to a canonical string,
+    and the match over the result stays TOKEN-DELIMITED (:func:`_appears_as_token`), not
+    a raw ``in``. No step deletes a structural character, so ``acct99attacker`` must
+    never canonicalise onto ``acct-99-attacker`` and ``acct-98-attacker`` must never
+    reach ``acct-99-attacker``. Separator-DELETED and sibling-value forms therefore stay
+    UNMATCHED — pinned negatively by
+    ``test_ra16_taint_corpus_bound.test_canonicalisation_does_not_become_a_substring_match``.
+
+    ORDER MATTERS, and follows ``replay_metrics.canonical_compare_form`` (R-A16 F2) so
+    the two stay unifiable once both land: strip zero-width first (one can sit between
+    a quote and the value), unwrap (a quoted value may hide the ``%``), URL-decode (a
+    decode can REVEAL a separator: ``acct%2D99`` → ``acct-99``), then fold separators,
+    then casefold.
+
+    That sibling is NOT imported: it lives on an unmerged branch, and ``value_ref`` /
+    ``normalize_value`` may not be widened because every already-stamped on-disk digest
+    depends on their exact output. This is a separate, comparison-only helper that
+    persists nothing.
+
+    Never raises — an unstringable value yields ``""``, which callers treat as no-match."""
+    try:
+        s = str(value)
+    except Exception:
+        return ""
+    s = s.translate(_ZERO_WIDTH).strip()
+    if not s:
+        return ""
+    s = _strip_wrappers(s)
+    if "%" in s:
+        # errors="strict" so a mangled escape RAISES rather than silently mojibaking two
+        # distinct values onto one form. `unquote` leaves a non-escape '%' alone, so
+        # "100% cotton" and "%APPDATA%/x" pass through untouched.
+        try:
+            decoded = unquote(s, errors="strict")
+            if decoded and decoded != s:
+                s = _strip_wrappers(decoded.translate(_ZERO_WIDTH).strip())
+        except Exception:
+            pass
+    if "/" in s or "\\" in s:
+        s = s.replace("\\", "/")
+        scheme, sep, rest = s.partition("://")
+        if sep:
+            s = scheme + sep + _DUP_SLASH.sub("/", rest)
+        else:
+            lead = "//" if s.startswith("//") else ""
+            s = lead + _DUP_SLASH.sub("/", s[len(lead):])
+    s = _SEP_RUN.sub(" ", s).strip()
+    return s.casefold()
+
 
 def _tainted_fact_texts(bc) -> List[str]:
-    """The casefolded TEXT of every ``content_derived`` user_fact in this bind context.
+    """The CANONICAL text of each ``content_derived`` user_fact the PROMPTS could have
+    shown the model — the most-recent :data:`_PROMPT_FACT_WINDOW`, not the whole vault.
 
     Read from ``bc.situation["profile"]["user_facts"]``, which
     ``situational_inventory.build_profile`` already threads — so this needs no new
@@ -504,10 +678,22 @@ def _tainted_fact_texts(bc) -> List[str]:
     reader source #4 uses, so the legacy unstamped ``auto_extract`` corpus is covered by
     that function's clamp here too (one taint definition, not two).
 
-    NOTE the corpus here is a SUPERSET of what any single prompt showed the model
-    (``build_profile`` carries every fact; the prompts cap at 5/20 most-recent). That
-    asymmetry is deliberate and fail-safe — matching against more tainted values can
-    only add confirms, never remove one.
+    THE WINDOW IS THE COST BOUND, and it replaces a claim this docstring used to make.
+    It previously described the whole-profile superset as "deliberate and fail-safe —
+    matching against more tainted values can only add confirms, never remove one". True
+    of the SECURITY direction and silent on cost, which is where the defect was: the
+    corpus grew without limit, and measured on a 40-value panel of ordinary parameter
+    values against ordinary English facts, the clamp rate ran 0% / 7.5% / 22.5% / 35% /
+    55% at 0 / 1 / 5 / 10 / 20 facts. Because ``_UNTRUSTED_ABSENT_SOURCES`` includes
+    ``auto_extract``, that corpus is non-empty in any install where extraction ever ran,
+    and the growth was SELF-AMPLIFYING: over-clamp → more asks → §5.9 promotes more
+    answers as ``content_derived`` → bigger corpus → more over-clamp. The window breaks
+    that loop — the cost is now bounded by a constant, not by vault age.
+
+    The WINDOW is applied BEFORE the taint filter, not after: the renderers cap the
+    most-recent N of ALL non-superseded facts and only some of those are tainted, so
+    slicing first reproduces exactly what a prompt carried. Taking the last N TAINTED
+    facts instead would silently re-widen the corpus past the prompt.
 
     Defensive: a rehydrated profile can hold anything, so every step is guarded and any
     failure yields ``[]`` (⇒ no clamp ⇒ prior behavior), never an exception that would
@@ -520,13 +706,15 @@ def _tainted_fact_texts(bc) -> List[str]:
         facts = profile.get("user_facts")
         if not isinstance(facts, list):
             return out
-        for fact in facts:
+        for fact in facts[-_PROMPT_FACT_WINDOW:]:
             try:
                 if _fact_origin(fact) != _CONTENT_DERIVED:
                     continue
                 txt = _get(fact, "fact")
                 if isinstance(txt, str) and txt:
-                    out.append(txt.casefold())
+                    canon = _canonical_taint_form(txt)
+                    if canon:
+                        out.append(canon)
             except Exception:
                 continue                          # one bad row never voids the corpus
     except Exception:
@@ -567,6 +755,11 @@ def _provided_value_is_content_seeded(bc, val) -> bool:
     the model emits the extracted VALUE ("acct-42"). An equality test would miss the
     realistic shape entirely.
 
+    Both sides go through :func:`_canonical_taint_form` first, so a value the model
+    reshaped — requoted, re-separated, URL-encoded, punctuated, zero-width-padded — still
+    matches the stored form. The match itself stays TOKEN-DELIMITED; canonicalisation
+    changes which FORMS compare equal, never the boundary rule.
+
     ON "FALSE POSITIVES". A value that the operator really did supply, which also happens
     to appear as a token inside a tainted fact, clamps to an extra one-click confirm.
     That is the correct reading, not a bug: the value DID occur in untrusted content, and
@@ -574,20 +767,50 @@ def _provided_value_is_content_seeded(bc, val) -> bool:
     are byte-identical by the time they reach ``provided_params``. Erring toward the
     confirm is the IMPL-5 fail-untrusted direction.
 
-    Cost is bounded and usually zero: the corpus is empty in every run with no
-    ``content_derived`` facts, which is the overwhelmingly common case, so this returns
-    False on the first line and behavior is byte-identical to before the clamp."""
-    try:
-        s = str(val).strip()
-    except Exception:
-        return False                              # unstringable ⇒ no match, no raise
+    THE COST, MEASURED — this paragraph previously claimed "cost is bounded and usually
+    zero ... behavior is byte-identical to before the clamp", which was the opposite of
+    what the code did. The zero case is real but narrow: it holds only when NO
+    ``content_derived`` fact is in the window, and since ``_UNTRUSTED_ABSENT_SOURCES``
+    clamps the legacy unstamped ``auto_extract`` corpus, that is false in any install
+    where fact extraction ever ran. On the ordinary 40-value panel described in
+    :func:`_tainted_fact_texts` the clamp rate reached 55% at 20 facts and kept climbing
+    with vault age. It is bounded NOW, by :data:`_PROMPT_FACT_WINDOW` — the cost is a
+    function of the window, not of how long the vault has existed. The realized count is
+    recorded (:func:`replay_metrics.record_taint_clamp`) and surfaced in the avoidable-ask
+    report, so what remains is visible rather than silent.
+
+    A NOTE ON FRAGMENTS. A hyphen/underscore is a token delimiter, so a PREFIX or SUFFIX
+    of a stored compound value ("acct-99" against a stored "acct-99-attacker") matches.
+    That is intended and pre-dates this change: a fragment the model lifted out of
+    tainted content is itself content-derived. It is a genuine cost contributor, which is
+    why it is named here rather than left to be rediscovered."""
+    s = _canonical_taint_form(val)
     if len(s) < _MIN_TAINT_MATCH_LEN:
         return False
-    s = s.casefold()
-    for txt in _tainted_fact_texts(bc):
+    corpus = _tainted_fact_texts(bc)
+    for txt in corpus:
         if _appears_as_token(txt, s):
+            _record_clamp(bc, len(corpus))
             return True
     return False
+
+
+def _record_clamp(bc, corpus_size: int) -> None:
+    """Record one realized clamp for the ask report (observability only).
+
+    Wrapped and fully swallowed: this is a measurement side-effect on a SAFETY path, and
+    a recording failure must never change the bind decision or raise into the per-leaf
+    handler (which would degrade the leaf to a spurious gap — turning a metrics hiccup
+    into a behavior change). Records no value; see ``replay_metrics.record_taint_clamp``."""
+    try:
+        vault = getattr(bc, "vault", None)
+        if vault is None:
+            return
+        from systemu.runtime.replay_metrics import record_taint_clamp
+        record_taint_clamp(vault, corpus_size=corpus_size,
+                           tool_name=str(getattr(bc, "tool_name", "") or ""))
+    except Exception:
+        pass
 
 
 def _key_token_overlap(kl: str, other: str) -> bool:
@@ -658,12 +881,32 @@ _SOURCES = (_bind_provided_params, _bind_filehandle, _bind_run_context,
 # through ``_first_type``. Such a leaf degrades to an honest ``missing`` ask, which
 # beats a confidently wrong pre-fill.
 #
-# ``_bind_run_context`` is DELIBERATELY ABSENT. It is ungated in the same way (with one
-# produced file it binds every leaf at 0.5, non-path ones included), but G-LEARN S3
-# promotion uses it as its ``content_derived`` channel on non-path leaves, so gating it
-# would delete a shipped feature's substrate rather than close a defect. Tracked as
-# separate debt — see ``tests/test_ra11a_prefill_gate.py``.
-_PATH_ONLY_SOURCES = frozenset({_bind_filehandle})
+# ``_bind_run_context`` (source #2) IS GATED TOO, and the argument is stronger than
+# symmetry with source #1.
+#
+# THE SHAPE. It binds the first entry of ``ctx.files_produced`` — a FILE PATH — into
+# whatever leaf it is asked about, at 0.5, with no key test whatsoever. So any run that
+# produced one file pre-filled EVERY leaf. Measured over the same harvested-tool corpus
+# used for source #1: 29 of 104 requirements (27.9%) came back pre-filled by this source
+# and 29 of those 29 — 100% — were on leaves the oracle does not type as a path
+# (``password``, ``verbose``, ``query``, ``command``, ``pid``, ``lat``, ``lon``, ``url``,
+# ``message``, ``date_str`` …, 15 distinct keys). Source #1 runs FIRST and wins the
+# genuine path leaves, so before this gate source #2's entire contribution to that corpus
+# was wrong pre-fills. After the gate: 0.
+#
+# WHY IT IS WORSE THAN A COSMETIC WRONG DEFAULT. ``_SOURCES`` orders this source BEFORE
+# inventory (#3), profile (#4) and schema-default (#5). A junk 0.5 ``content_derived``
+# path bind therefore MASKS the source-#4 profile bind that would otherwise have fired —
+# and because ``content_derived`` never silent-binds, a G-LEARN-promoted ``operator``
+# fact stops paying off: the operator is re-asked, with a wrong path pre-filled in the
+# box. That structurally defeats the promotion payoff. It also stuffs the R-A13.5
+# avoidable-ask corpus with guaranteed-mismatch candidates recorded as "the binder was
+# wrong", poisoning the very signal G-LEARN learns from.
+#
+# THE TAINT CLAMP IS UNCHANGED. The bind this gate still lets through (a path leaf) is
+# ``content_derived`` exactly as before — ``tests/test_ra11a_source1_liveness.py`` pins
+# both IMPL-5 directions and must stay green.
+_PATH_ONLY_SOURCES = frozenset({_bind_filehandle, _bind_run_context})
 
 
 # ── small tolerant readers (TableItem-or-dict, list-or-missing) ──────────────

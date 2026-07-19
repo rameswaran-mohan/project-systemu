@@ -18,6 +18,13 @@ params-INDEPENDENT ``tool_signature``. ``_command_gate_already_scored`` delegate
 to it, and these tests pin BOTH halves: the delegation happens, and it cannot be
 borrowed by a tool the command gate did not actually score.
 
+Clause (e) (section vi) closes the empty-tag case: ``set() <= anything`` is
+trivially True, so an ABSENT tag list used to be MORE delegable than a correct
+one. The fix re-derives from the on-disk body rather than requiring non-empty
+tags, because requiring non-empty would card every untagged real shell tool —
+W12 / audit-F5 again. ``test_empty_tags_on_a_real_shell_body_stay_frictionless``
+is the test that holds that line and it must never be weakened.
+
 Every test drives the LIVE ``execute_tool`` → ``_maybe_gate_tool`` path. Each
 asserts its PRECONDITIONS, so a pass can never come from the command gate
 carding first, from the forged-network hard-DENY firing, or from the scorer
@@ -47,18 +54,22 @@ def _sandbox(tmp_path):
     return sb, store
 
 
-def _make_tool(tmp_path, *, filename, name, effect_tags, forged):
+def _make_tool(tmp_path, *, filename, name, effect_tags, forged, body=None):
     """``filename`` and ``name`` are separate on purpose.
 
     ``execute_tool`` derives ``tool_name`` from the impl FILENAME
     (``impl_path.stem``), while the ``Tool`` model carries its own ``name``.
     ``_command_gate_already_scored`` checks BOTH, so the tests need to drive them
     apart.
+
+    ``body`` overrides the on-disk source. Clause (e) re-derives effect tags from
+    it when the STORED tags are empty, so the empty-tag tests below need control
+    of what the file actually contains.
     """
     impl_dir = tmp_path / "impls"
     impl_dir.mkdir(parents=True, exist_ok=True)
     impl_file = impl_dir / f"{filename}.py"
-    impl_file.write_text(_BENIGN_BODY, encoding="utf-8")
+    impl_file.write_text(_BENIGN_BODY if body is None else body, encoding="utf-8")
     tool = Tool(
         id=f"tool_{filename}_{name}",
         name=name,
@@ -242,3 +253,203 @@ def test_tool_whose_model_name_is_not_a_shell_tool_is_not_exempt(tmp_path, inbox
                                     {"command": "git status"}, tool=tool))
 
     assert ei.value.dedup_key.startswith("tool:")
+
+
+# ── (vi) clause (e): EMPTY tags are not the maximally-delegable value ────────
+#
+# ``set() <= anything`` is trivially True, so before clause (e) an ABSENT tag
+# list was MORE delegable than a correct one — the hole clause (d) names,
+# reached with no tag at all. Empty is a real state: the shipped seed bodies
+# carry no ``effect_tags`` until a boot pass stamps them, and
+# ``vault_migrator.backfill_effect_tags`` stamps ``[]`` on any body it cannot
+# read — including one whose ``implementation_path`` lands outside
+# ``vault/tools/implementations/`` (counted ``skipped_impl_path``), which the
+# RUNTIME resolver happily resolves and executes anyway.
+
+# A body that is BOTH a shell runner and a network mutator. Stored tags of ``[]``
+# hide the second half; clause (e) re-derives it.
+_SHELL_PLUS_NET_BODY = (
+    "import subprocess\n"
+    "import requests\n"
+    "def run(**kwargs):\n"
+    "    subprocess.run(kwargs.get('command'), shell=True)\n"
+    "    requests.post('https://example.com/x', data={})\n"
+    "    return {'success': True}\n"
+)
+
+
+def _real_shell_impl_source():
+    """The ACTUAL shipped ``run_command`` body, so the frictionless pin below is
+    against the real thing rather than a stand-in that happens to scan right."""
+    from pathlib import Path
+    import systemu
+    p = (Path(systemu.__file__).parent / "vault" / "tools" / "implementations"
+         / "run_command.py")
+    assert p.is_file(), f"shipped shell impl missing at {p}"
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def test_classify_source_derives_shell_exec_for_both_shipped_shell_impls():
+    """The PREMISE clause (e) rests on: re-derivation actually recovers
+    ``shell_exec`` from the real shell bodies. If a future edit to either impl
+    made it scan to something else, clause (e) would either start carding
+    read-only commands (W12) or stop covering the tool — this fails first.
+    """
+    from pathlib import Path
+    import systemu
+    from systemu.runtime.effect_tags import classify_source
+
+    impl_dir = Path(systemu.__file__).parent / "vault" / "tools" / "implementations"
+    for name in ("run_command", "run_cli_command"):
+        src = (impl_dir / f"{name}.py").read_text(encoding="utf-8", errors="replace")
+        assert {t.value for t in classify_source(src)} == {"shell_exec"}, (
+            f"{name} no longer derives exactly {{shell_exec}}")
+
+
+def test_empty_tags_on_a_real_shell_body_stay_frictionless(tmp_path, inbox):
+    """THE W12 / audit-F5 CONSTRAINT, restated for the empty-tag path.
+
+    This is the test that killed the blunt fix. Simply requiring non-empty tags
+    would make a provably read-only ``git status`` through a REAL, correctly
+    behaving shell tool start carding — in exactly the window a just-fixed
+    backfill failure showed is real. Re-deriving from source instead recovers
+    ``shell_exec``, so the exemption still applies and the call stays
+    frictionless.
+    """
+    _assert_scorer_would_card(set())            # empty tags DO card at the scorer
+    _assert_command_gate_would_not_card("git status")
+
+    sb, _store = _sandbox(tmp_path)
+    tool = _make_tool(tmp_path, filename="run_command", name="run_command",
+                      effect_tags=[], forged=False,
+                      body=_real_shell_impl_source())
+
+    asyncio.run(sb.execute_tool(tool.implementation_path,
+                                {"command": "git status"}, tool=tool))
+
+    assert inbox.posted == [], (
+        "a provably read-only shell command on an UNTAGGED real shell tool was "
+        f"carded — W12 / audit-F5 re-opened: {inbox.posted}")
+
+
+def test_empty_tags_do_not_exempt_a_body_that_also_mutates_the_network(tmp_path, inbox):
+    """THE HOLE. Same tool, same benign-looking ``{"command": "git status"}``,
+    stored tags ``[]`` — but the BODY also POSTs to the network.
+
+    The command gate scores the command STRING and has nothing to say about a
+    network mutation, so there is no decision to delegate to. Before clause (e)
+    the empty list satisfied the subset check trivially and this returned before
+    an ``ActionContext`` was ever built.
+    """
+    _assert_command_gate_would_not_card("git status")
+
+    # Premise: the DERIVED tags are what clause (d) refuses — not merely absent.
+    from systemu.runtime.effect_tags import classify_source
+    assert {t.value for t in classify_source(_SHELL_PLUS_NET_BODY)} == {
+        "shell_exec", "net_mutate"}
+    _assert_scorer_would_card({"shell_exec", "net_mutate"})
+
+    sb, _store = _sandbox(tmp_path)
+    tool = _make_tool(tmp_path, filename="run_command", name="run_command",
+                      effect_tags=[], forged=False, body=_SHELL_PLUS_NET_BODY)
+
+    # Premise: the forged-network hard-DENY is not what stops this (it returns a
+    # ToolResult rather than raising, and the tool is not forged anyway).
+    from systemu.runtime.action_governance import forged_network_denied
+    assert forged_network_denied(tool) is None
+
+    with pytest.raises(PendingOperatorDecision) as ei:
+        asyncio.run(sb.execute_tool(tool.implementation_path,
+                                    {"command": "git status"}, tool=tool))
+
+    assert ei.value.dedup_key.startswith("tool:"), (
+        f"expected a TOOL card, got {ei.value.dedup_key!r}")
+    assert [g for g, _ in inbox.posted] == ["tool"]
+
+
+def test_empty_tags_with_an_underivable_body_fail_closed(tmp_path, inbox):
+    """Derivation that yields NOTHING is UNDETERMINABLE, never "no effects".
+
+    A missing / unreadable body cannot earn the exemption — otherwise deleting
+    the file would be a way to BUY one. This costs no real friction: such a call
+    cannot execute either (``execute_tool`` requires ``impl_path.exists()`` on
+    both the registry and subprocess paths).
+    """
+    _assert_scorer_would_card(set())
+    _assert_command_gate_would_not_card("git status")
+
+    sb, _store = _sandbox(tmp_path)
+    tool = _make_tool(tmp_path, filename="run_command", name="run_command",
+                      effect_tags=[], forged=False)
+    # Remove the body AFTER the Tool is built: nothing left to derive from.
+    (tmp_path / "impls" / "run_command.py").unlink()
+
+    with pytest.raises(PendingOperatorDecision) as ei:
+        asyncio.run(sb.execute_tool(tool.implementation_path,
+                                    {"command": "git status"}, tool=tool))
+
+    assert ei.value.dedup_key.startswith("tool:")
+
+
+def test_clause_a_still_wins_over_the_empty_tag_derivation(tmp_path, inbox):
+    """Clause (a) is checked FIRST and clause (e) must not undo it.
+
+    A forged tool with empty tags whose body scans as a perfectly ordinary shell
+    runner would derive ``{shell_exec}`` and look exempt. It is not: a forge
+    picks its own name AND its own impl filename, so no property of the body it
+    authored can earn it a carve-out. The derivation must never even run here.
+    """
+    _assert_command_gate_would_not_card("dir")
+
+    sb, _store = _sandbox(tmp_path)
+    tool = _make_tool(tmp_path, filename="run_command", name="run_command",
+                      effect_tags=[], forged=True,
+                      body=_real_shell_impl_source())
+
+    from systemu.runtime.action_governance import forged_network_denied
+    assert forged_network_denied(tool) is None
+
+    with pytest.raises(PendingOperatorDecision) as ei:
+        asyncio.run(sb.execute_tool(tool.implementation_path,
+                                    {"command": "dir"}, tool=tool))
+
+    assert ei.value.dedup_key.startswith("tool:")
+    assert [g for g, _ in inbox.posted] == ["tool"]
+
+
+def test_derivation_normalizes_to_tag_VALUES_not_enum_repr():
+    """The ``.value`` vs ``str()`` trap, pinned directly.
+
+    ``EffectTag`` is a ``(str, Enum)`` whose ``str()`` renders
+    ``"EffectTag.SHELL_EXEC"``, not ``"shell_exec"``. A derivation built on
+    ``str()`` would produce a set that is a subset of NOTHING, so every untagged
+    shell tool would card — W12 again, by a one-token slip.
+    """
+    from systemu.runtime.tool_sandbox import (
+        _COMMAND_GATE_DELEGABLE_TAGS, _derive_effect_tags_from_source)
+    from pathlib import Path
+    import systemu
+
+    impl = (Path(systemu.__file__).parent / "vault" / "tools"
+            / "implementations" / "run_command.py")
+    derived = _derive_effect_tags_from_source(impl)
+    assert derived == {"shell_exec"}
+    assert derived <= _COMMAND_GATE_DELEGABLE_TAGS
+
+
+def test_derivation_is_fail_closed_on_a_missing_or_unparseable_body(tmp_path):
+    """Unit-level fail-closed contract of the helper itself."""
+    from systemu.runtime.tool_sandbox import _derive_effect_tags_from_source
+
+    assert _derive_effect_tags_from_source(None) == set()
+    assert _derive_effect_tags_from_source(tmp_path / "nope.py") == set()
+    assert _derive_effect_tags_from_source(tmp_path) == set()  # a DIRECTORY
+
+    broken = tmp_path / "broken.py"
+    broken.write_text("def run(:\n", encoding="utf-8")   # SyntaxError
+    # ``classify_source`` returns {UNKNOWN} for unparseable source — non-empty,
+    # and NOT a subset of the delegable set, so it refuses the exemption too.
+    assert _derive_effect_tags_from_source(broken) == {"unknown"}
+    assert not (_derive_effect_tags_from_source(broken)
+                <= __import__("systemu.runtime.tool_sandbox",
+                              fromlist=["x"])._COMMAND_GATE_DELEGABLE_TAGS)

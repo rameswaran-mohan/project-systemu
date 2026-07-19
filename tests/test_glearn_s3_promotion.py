@@ -48,12 +48,18 @@ class _Vault:
 
 
 class _Ctx:
-    """A run context carrying ``files_produced`` — the real ``_bind_run_context``
-    source, which is what supplies a ``content_derived`` candidate WITH a resolved
-    value (and therefore a real ``bound_value_digest``)."""
+    """The run context. Carries an EMPTY ``files_produced``.
 
-    def __init__(self, files_produced=None):
-        self.files_produced = list(files_produced or [])
+    It used to carry a produced file, because ``_bind_run_context`` (source #2) was
+    this module's ``content_derived`` channel on non-path leaves. That source is now
+    PATH-ONLY (``requirement_binder._PATH_ONLY_SOURCES``): ungated it bound the first
+    produced file into every leaf at 0.5, which measured 100% wrong on the harvested
+    corpus and — because source #2 is ordered BEFORE the profile — masked exactly the
+    silent operator-profile bind this slice exists to deliver. See ``_real_snaps`` for
+    the channel that replaced it."""
+
+    def __init__(self):
+        self.files_produced = []
 
 
 class _Obj:
@@ -92,10 +98,93 @@ def _assert_realistic(snaps):
     return snaps
 
 
-def _real_snaps(vault, schema, *, situation=None, files_produced=None):
-    """Run the REAL binder + REAL snapshot producer. Never hand-builds a snapshot."""
+#: The ``UserFact.source`` of the fixture SEED fact (see ``_real_snaps``). This is a
+#: REAL production source string — ``fact_extractor.extract_from_chat`` is its sole
+#: writer — chosen because ``requirement_binder._fact_origin`` carves it out
+#: DETERMINISTICALLY to ``content_derived``. Nothing here hand-stamps a taint.
+_SEED_SOURCE = "auto_extract"
+
+
+def _seed_text(value) -> str:
+    """The seed fact's SENTENCE. Deliberately contains the VALUE and no leaf-key token.
+
+    ``_bind_profile`` matches a user_fact by ``tags`` OR by ``key in fact_text`` and
+    returns the FIRST match, while ``get_facts`` is newest-LAST. A seed naming the leaf
+    would therefore SHADOW the promotion under test at every ``_rebind`` — the
+    promoted fact would never be reached and the re-bind pins would assert against the
+    fixture instead of against the slice. Untagged + leaf-free keeps the seed inert to
+    source #4 while still populating the ``content_derived`` corpus source #0 reads."""
+    return f"observed {value} in fetched content"
+
+
+def _promoted(vault, **kw):
+    """The facts THIS SLICE wrote, i.e. excluding the fixture seed.
+
+    ``_real_snaps`` writes one ``auto_extract`` seed fact per call to manufacture the
+    binder's ``content_derived`` candidate, so a bare ``get_facts`` now counts fixture
+    material alongside promotions. Filtering on the promoter's OWN source keeps every
+    accounting pin measuring exactly what it measured before the re-channel — this is
+    fixture bookkeeping, not a weakened assertion."""
+    return [f for f in up.get_facts(vault, **kw) if f.source == ap.PROMOTION_SOURCE]
+
+
+def _inventory_snaps(vault, leaf, value):
+    """The SECOND real ``content_derived`` channel: a scanned inventory SERVICE entry.
+
+    ``_bind_inventory_entry`` (source #3) binds an account/identity/service-named leaf
+    from a live-token service entry and derives the taint with ``_entry_origin``, which
+    clamps a scanned entry to ``content_derived`` — with a resolved value, so a real
+    digest. Used where the seed fact of the source-#0 channel would itself perturb what
+    the pin measures: this path writes NOTHING to the vault, so ``get_facts`` pins keep
+    their exact original form."""
     rep = rb.build_requirement_report(
-        [_Obj()], schema, situation or {}, _Ctx(files_produced), vault=vault)
+        [_Obj()], {leaf: {"type": "string"}},
+        {"services": [{"name": "crm", "account": value, "has_live_token": True}]},
+        _Ctx(), vault=vault)
+    return [s for r in rep.ask_bundle if (s := rm.requirement_snapshot(r))]
+
+
+def _real_snaps(vault, schema, *, situation=None, candidate_value=None):
+    """Run the REAL binder + REAL snapshot producer. Never hand-builds a snapshot.
+
+    THE CANDIDATE CHANNEL. ``candidate_value`` makes the binder hold ``value`` as a
+    ``content_derived`` candidate for every leaf of ``schema``. It does that through
+    source #0's content-seeded provided-params clamp
+    (``requirement_binder._provided_value_is_content_seeded``): a ``content_derived``
+    user_fact whose sentence CONTAINS the value, plus the same value arriving in
+    ``provided_params``, is read as "the model lifted this out of tainted content we
+    put in front of it" and clamps to ``content_derived`` at confidence 1.0 — with a
+    resolved value, hence a real ``candidate_ref``.
+
+    WHY NOT ``ctx.files_produced`` (source #2), which this module used to use. That
+    source is now PATH-ONLY. It was also never production-realistic for these leaves:
+    the only production writers of ``files_produced`` go through
+    ``collect_artifact_paths``, which emits resolved ABSOLUTE paths of files that exist
+    on disk — so ``["acme-crm"]`` and bare relative paths were shapes production can
+    never emit, binding leaves like ``recipient`` and ``service`` with a file path.
+
+    THIS channel is production-realistic on both halves: ``build_requirement_report``
+    is called with ``provided_params=decision.get("parameters")`` at the real tool-call
+    seam (``shadow_runtime``), and ``auto_extract`` facts are what ``fact_extractor``
+    really writes."""
+    if candidate_value is not None:
+        # The seed must be VISIBLE to the binder, and it is read off
+        # ``situation["profile"]`` — not off the vault. A caller supplying its own
+        # situation would therefore seed a fact the clamp never sees, and the candidate
+        # would quietly bind ``systemu_authored`` instead of ``content_derived``: every
+        # pin here would still "pass" while testing nothing. Refuse loudly instead.
+        assert situation is None, (
+            "pass either `situation` or `candidate_value`, not both — a caller-supplied "
+            "situation hides the seed fact from the content_derived clamp and silently "
+            "degrades every pin that depends on it")
+        up.add_fact(vault, _seed_text(candidate_value), source=_SEED_SOURCE)
+        situation = {"profile": si.build_profile(vault)}
+        provided = {leaf: candidate_value for leaf in schema}
+    else:
+        provided = None
+    rep = rb.build_requirement_report(
+        [_Obj()], schema, situation or {}, _Ctx(), vault=vault,
+        provided_params=provided)
     out = []
     for r in rep.ask_bundle:
         snap = rm.requirement_snapshot(r)
@@ -131,7 +220,7 @@ def test_content_derived_answer_promotes_tainted_and_rebinds_confirm_gated(tmp_p
     re-binds ``content_derived`` and stays in the ask_bundle (one-click confirm) —
     never a silent trusted bind. This is IMPL-5 "taint travels" across the promotion."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     # positive control: the binder really did hold a content_derived candidate
     assert snaps[0]["value_origin"] == "content_derived"
     assert snaps[0]["candidate_ref"] is not None
@@ -140,7 +229,7 @@ def test_content_derived_answer_promotes_tainted_and_rebinds_confirm_gated(tmp_p
     n = ap.promote_answered_asks(v, _dctx(snaps), {"recipient": "out/draft.md"})
     assert n == 1, "the confirmed answer was not promoted"
 
-    facts = up.get_facts(v)
+    facts = _promoted(v)
     assert len(facts) == 1
     assert facts[0].origin_class == "content_derived", (
         "LAUNDERING: a content_derived value was promoted as trusted")
@@ -168,14 +257,14 @@ def test_freshly_typed_operator_answer_promotes_trusted_and_rebinds_SILENTLY(tmp
     for a value THEY typed. A freshly-typed answer is operator-origin and MUST
     silent-bind on the next run."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     assert snaps[0]["value_origin"] == "content_derived"
 
     # the operator OVERRIDES the candidate with their own typed value
     n = ap.promote_answered_asks(v, _dctx(snaps), {"recipient": "ops@acme.com"})
     assert n == 1
 
-    facts = up.get_facts(v)
+    facts = _promoted(v)
     assert facts[0].origin_class == "operator", (
         "OVER-TAINT: the operator's own typed value was recorded as untrusted — "
         "the next run would re-ask for something they just typed")
@@ -222,7 +311,7 @@ def test_unkeyable_vault_promotes_NOTHING(tmp_path, monkeypatch):
     secret) rather than stubbing ``value_ref`` itself, and asserts the negative control
     is genuine before relying on it."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     assert snaps[0]["candidate_ref"] is not None
 
     import systemu.runtime.dashboard_auth as da
@@ -235,7 +324,7 @@ def test_unkeyable_vault_promotes_NOTHING(tmp_path, monkeypatch):
 
     assert ap.promote_answered_asks(v, _dctx(snaps),
                                     {"recipient": "out/draft.md"}) == 0
-    assert not up.get_facts(v), "promoted despite an undigestable answer"
+    assert not _promoted(v), "promoted despite an undigestable answer"
 
 
 def test_most_tainted_candidate_wins_a_multi_match(tmp_path):
@@ -249,7 +338,7 @@ def test_most_tainted_candidate_wins_a_multi_match(tmp_path):
     assert ref is not None
     # a real two-candidate group: same path + same digest, different origins. Built by
     # running the producer twice under different situations, so both entries are real.
-    a = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))[0]
+    a = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))[0]
     b = dict(a)
     b["value_origin"] = "operator"
     group = [b, a]                      # trusted first — order must not decide
@@ -257,7 +346,7 @@ def test_most_tainted_candidate_wins_a_multi_match(tmp_path):
 
     n = ap.promote_answered_asks(v, _dctx(group), {"recipient": "out/draft.md"})
     assert n == 1
-    assert up.get_facts(v)[0].origin_class == "content_derived", (
+    assert _promoted(v)[0].origin_class == "content_derived", (
         "a multi-candidate match must resolve to the MOST-TAINTED origin")
 
 
@@ -271,16 +360,16 @@ def test_a_POISONED_value_origin_in_the_stamp_fails_UNTRUSTED(tmp_path):
     modelling TAMPERING is the point. Its key SET is still the producer's, so it is a
     real persisted shape carrying a hostile value — not an invented shape."""
     v = _Vault(tmp_path)
-    real = _real_snaps(v, SCHEMA, files_produced=["out/draft.md"])[0]
+    real = _real_snaps(v, SCHEMA, candidate_value="out/draft.md")[0]
     assert set(real) == SNAPSHOT_KEYS                      # still the producer's shape
 
     for poison in ("trusted", "OPERATOR", "", None, "operator ", 7, ["operator"]):
         vv = _Vault(tmp_path / f"p{abs(hash(str(poison)))}")
-        snap = {**_real_snaps(vv, SCHEMA, files_produced=["out/draft.md"])[0],
+        snap = {**_real_snaps(vv, SCHEMA, candidate_value="out/draft.md")[0],
                 "value_origin": poison}
         n = ap.promote_answered_asks(vv, _dctx([snap]), {"recipient": "out/draft.md"})
         assert n == 1, f"the poisoned-origin case did not run for {poison!r}"
-        got = up.get_facts(vv)[0].origin_class
+        got = _promoted(vv)[0].origin_class
         assert got == "content_derived", (
             f"a poisoned value_origin {poison!r} was promoted as {got!r} — an unknown "
             f"origin must fail UNTRUSTED")
@@ -292,7 +381,7 @@ def test_the_secret_and_spine_guards_FAIL_CLOSED_when_their_import_breaks(tmp_pa
     "refuse" if that import fails. Nothing else exercises that branch, so without this
     pin either could be flipped to fail-OPEN and every other test would stay green."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
 
     monkeypatch.delattr(rm, "_is_secret_path")
     assert ap._is_secret("recipient", "input") is True, (
@@ -311,7 +400,7 @@ def test_the_secret_and_spine_guards_FAIL_CLOSED_when_their_import_breaks(tmp_pa
 
     assert ap.promote_answered_asks(v, _dctx(snaps),
                                     {"recipient": "out/draft.md"}) == 0
-    assert not up.get_facts(v)
+    assert not _promoted(v)
 
 
 def test_an_empty_leaf_is_refused(tmp_path):
@@ -329,7 +418,7 @@ def test_learned_card_survives_a_reconcile_tick(tmp_path):
     a future refactor drops the merge."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     assert ap.promote_answered_asks(v, _dctx(snaps), {"service": "acme-crm"}) == 1
 
     learned = ts.load_learned_items(v)
@@ -356,7 +445,7 @@ def test_tombstoned_ref_is_never_re_promoted(tmp_path):
     ts.add_tombstone(v, key)
 
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     ap.promote_answered_asks(v, _dctx(snaps), {"service": "acme-crm"})
 
     assert not ts.load_learned_items(v), "a tombstoned ref was re-promoted as a card"
@@ -372,7 +461,7 @@ def test_removing_a_learned_card_survives_the_next_tick(tmp_path):
     only defence and a removed card comes straight back."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     assert ap.promote_answered_asks(v, _dctx(snaps), {"service": "acme-crm"}) == 1
     key = ts.ref_key("service", {"server": "service"})       # leaf-keyed (F2/F5)
     tr.reconcile_once(v)
@@ -395,7 +484,7 @@ def test_learned_card_never_overrides_an_operator_declaration(tmp_path):
     # which is the collision this pin exists to exercise.
     ts.add_operator_item(v, ts.make_operator_item("service", "service"))
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     ap.promote_answered_asks(v, _dctx(snaps), {"service": "acme-crm"})
 
     items = tr.project(v)
@@ -422,7 +511,7 @@ def test_learned_card_defers_to_an_operator_item_whose_id_is_STALE(tmp_path):
     ts.save_operator_items(v, [stale])
 
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     ap.promote_answered_asks(v, _dctx(snaps), {"service": "acme-crm"})
 
     key = ts.ref_key("service", {"server": "service"})
@@ -477,13 +566,13 @@ def test_spine_colliding_leaf_is_never_promoted(tmp_path, leaf):
     up.save_profile(v, UserProfile(name="R", location_text="Chennai",
                                    timezone="Asia/Kolkata", default_output_dir="D:/out"))
     schema = {leaf: {"type": "string"}}
-    snaps = _real_snaps(v, schema, files_produced=["D:/tainted"])
+    snaps = _real_snaps(v, schema, candidate_value="D:/tainted")
     if not snaps:                       # the spine already bound it silently — fine
         return
     _assert_realistic(snaps)
-    before = len(up.get_facts(v))
+    before = len(_promoted(v))
     ap.promote_answered_asks(v, _dctx(snaps), {leaf: "D:/tainted"})
-    assert len(up.get_facts(v)) == before, (
+    assert len(_promoted(v)) == before, (
         f"promoted into a spine-colliding leaf {leaf!r} — the spine bind shadows the "
         f"fact and hard-codes `operator`, laundering the value")
 
@@ -505,11 +594,11 @@ def test_secret_and_credential_asks_are_never_promoted(tmp_path):
             f"{path}/{klass} produced a snapshot — the secret fence moved")
 
     # and a snapshot that somehow carried a secret path is refused at promote time
-    real = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))[0]
+    real = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))[0]
     smuggled = {**real, "schema_path": "auth/api_key"}
     assert ap.promote_answered_asks(v, _dctx([smuggled]),
                                     {"auth/api_key": "out/draft.md"}) == 0
-    assert not up.get_facts(v), "a secret-mode field was promoted into the profile"
+    assert not _promoted(v), "a secret-mode field was promoted into the profile"
 
 
 @pytest.mark.parametrize("leaf,expect_card", [
@@ -531,10 +620,10 @@ def test_learned_card_kinds_are_restricted(tmp_path, leaf, expect_card):
     forever. The FACT still promotes — only the card is withheld."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(
-        _real_snaps(v, {leaf: {"type": "string"}}, files_produced=["acme-thing"]))
+        _real_snaps(v, {leaf: {"type": "string"}}, candidate_value="acme-thing"))
     ap.promote_answered_asks(v, _dctx(snaps), {leaf: "acme-thing"})
     assert bool(ts.load_learned_items(v)) is expect_card
-    assert up.get_facts(v), "the FACT must promote regardless of the card decision"
+    assert _promoted(v), "the FACT must promote regardless of the card decision"
 
 
 # ══ dedupe, supersede, caps ══════════════════════════════════════════════════
@@ -544,22 +633,22 @@ def test_dedupe_is_keyed_on_schema_path_and_supersedes_on_change(tmp_path):
     prompt re-promotes). Dedupe on ``schema_path``; a CHANGED answer supersedes the
     prior promotion rather than accumulating a contradictory second fact."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
 
     assert ap.promote_answered_asks(v, _dctx(snaps, "hreq_aaaa1111"),
                                     {"recipient": "ops@acme.com"}) == 1
     # SAME answer, a DIFFERENT ask_id → no second row
     assert ap.promote_answered_asks(v, _dctx(snaps, "hreq_bbbb2222"),
                                     {"recipient": "ops@acme.com"}) == 0
-    assert len(up.get_facts(v)) == 1, "re-promoted the same value under a new ask_id"
+    assert len(_promoted(v)) == 1, "re-promoted the same value under a new ask_id"
 
     # a CHANGED answer supersedes the prior promotion
     assert ap.promote_answered_asks(v, _dctx(snaps, "hreq_cccc3333"),
                                     {"recipient": "sre@acme.com"}) == 1
-    live = up.get_facts(v)
+    live = _promoted(v)
     assert len(live) == 1, "the superseded fact is still live"
     assert "sre@acme.com" in live[0].fact
-    allf = up.get_facts(v, include_superseded=True)
+    allf = _promoted(v, include_superseded=True)
     assert len(allf) == 2 and any(f.superseded_by for f in allf), (
         "the prior promotion must be marked superseded, not deleted (audit trail)")
 
@@ -567,7 +656,7 @@ def test_dedupe_is_keyed_on_schema_path_and_supersedes_on_change(tmp_path):
 def _many(v, n):
     """``n`` real, distinct, promotable snapshots + their answers."""
     schema = {f"field_{i}": {"type": "string"} for i in range(n)}
-    snaps = _assert_realistic(_real_snaps(v, schema, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, schema, candidate_value="out/draft.md"))
     assert len(snaps) == n, "the producer did not surface every leaf"
     return snaps, {s["schema_path"]: f"value-{i}" for i, s in enumerate(snaps)}
 
@@ -589,7 +678,7 @@ def test_the_batch_cap_is_enforced_and_what_it_drops_is_logged(tmp_path, caplog,
     with caplog.at_level("INFO"):
         n = ap.promote_answered_asks(v, _dctx(snaps), answers)
     assert n == 3, f"the batch cap was not enforced (promoted {n} of 7)"
-    assert len(up.get_facts(v)) == 3
+    assert len(_promoted(v)) == 3
     assert any("cap" in r.message.lower() for r in caplog.records), (
         "a capped promotion must be logged, not silently dropped")
 
@@ -604,7 +693,7 @@ def test_the_per_class_cap_is_enforced(tmp_path, monkeypatch):
     assert len({s["class"] for s in snaps}) == 1
 
     assert ap.promote_answered_asks(v, _dctx(snaps), answers) == 2
-    assert len(up.get_facts(v)) == 2
+    assert len(_promoted(v)) == 2
 
 
 def test_the_shipped_caps_are_actually_small(tmp_path):
@@ -620,7 +709,7 @@ def test_suggested_is_never_auto_confirmed(tmp_path):
     promote it to a configured/ready state."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     ap.promote_answered_asks(v, _dctx(snaps), {"service": "acme-crm"})
     assert all(i.status == "suggested" for i in ts.load_learned_items(v))
 
@@ -677,12 +766,12 @@ def test_unanswered_and_blank_slots_promote_nothing_AND_are_not_logged_as_refusa
     the digest step, so the early skip is what keeps them OUT of the log — that
     distinction is the only observable difference, and it is what this pins.)"""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     with caplog.at_level("INFO"):
         assert ap.promote_answered_asks(v, _dctx(snaps), {"recipient": ""}) == 0
         assert ap.promote_answered_asks(v, _dctx(snaps), {"recipient": None}) == 0
         assert ap.promote_answered_asks(v, _dctx(snaps), {"other/path": "x"}) == 0
-    assert not up.get_facts(v)
+    assert not _promoted(v)
     assert not [r for r in caplog.records if "capped/refused" in r.getMessage()], (
         "an unanswered/blank slot was logged as a refusal — that is a non-event, and "
         "logging it drowns the real refusals in the audit signal")
@@ -695,7 +784,7 @@ def test_fixture_realism_guard_tracks_the_live_producer(tmp_path):
     halves are pinned here — this is the guard that would have caught the two defects
     that shipped today from fixtures production never emits."""
     v = _Vault(tmp_path)
-    live = _real_snaps(v, SCHEMA, files_produced=["out/draft.md"])
+    live = _real_snaps(v, SCHEMA, candidate_value="out/draft.md")
     assert live and set(live[0]) == SNAPSHOT_KEYS, (
         f"requirement_snapshot now emits {sorted(set(live[0]))}; update SNAPSHOT_KEYS "
         f"and re-check every pin in this module against the new shape")
@@ -753,7 +842,7 @@ def test_an_incomparable_candidate_ref_promotes_NOTHING(tmp_path, label, mutate)
     through to ``operator``: one flipped hex character silently upgrades a
     ``content_derived`` value to the trusted axis, and it then SILENT-BINDS forever."""
     v = _Vault(tmp_path / label)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     # POSITIVE CONTROL: the un-mutated path really is tainted and really has a digest
     assert snaps[0]["value_origin"] == "content_derived"
     assert snaps[0]["candidate_ref"] is not None
@@ -762,7 +851,7 @@ def test_an_incomparable_candidate_ref_promotes_NOTHING(tmp_path, label, mutate)
     n = ap.promote_answered_asks(v, _dctx([poisoned]), {"recipient": "out/draft.md"})
     assert n == 0, (
         "an incomparable candidate_ref (%s) was promoted — it must fail closed" % label)
-    assert not up.get_facts(v), (
+    assert not _promoted(v), (
         "LAUNDERING: %s produced a fact; an unusable digest cannot be evidence that "
         "the operator TYPED the answer, so `operator` must never be inferred" % label)
 
@@ -786,7 +875,7 @@ def test_a_WELL_FORMED_same_key_NON_MATCH_is_an_override_by_construction(tmp_pat
     arise WITHOUT vault write access: a non-conforming producer, and a vault-key
     rotation, which needs no attacker at all."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     flipped = {**snaps[0], "candidate_ref": _flip_last_hex(snaps[0]["candidate_ref"])}
     # the mutation really did leave a comparable ref — that is the whole point
     assert rm._is_value_ref(flipped["candidate_ref"])
@@ -795,7 +884,7 @@ def test_a_WELL_FORMED_same_key_NON_MATCH_is_an_override_by_construction(tmp_pat
 
     assert ap.promote_answered_asks(v, _dctx([flipped]),
                                     {"recipient": "out/draft.md"}) == 1
-    assert up.get_facts(v)[0].origin_class == "operator", (
+    assert _promoted(v)[0].origin_class == "operator", (
         "a comparable, non-matching candidate must read as an override — clamping it "
         "to content_derived would re-ask the operator forever for values they typed")
 
@@ -805,9 +894,9 @@ def test_the_incomparable_ref_control_promotes_when_UNMUTATED(tmp_path):
     answer and vault DO promote when ``candidate_ref`` is left alone. Without this the
     seven pins above would all pass against a promoter that promotes nothing at all."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     assert ap.promote_answered_asks(v, _dctx(snaps), {"recipient": "out/draft.md"}) == 1
-    assert up.get_facts(v)[0].origin_class == "content_derived"
+    assert _promoted(v)[0].origin_class == "content_derived"
 
 
 def test_a_vault_key_ROTATION_promotes_nothing_rather_than_trusted(tmp_path):
@@ -823,7 +912,7 @@ def test_a_vault_key_ROTATION_promotes_nothing_rather_than_trusted(tmp_path):
     Modelled the honest way: two real vaults with genuinely different derived keys."""
     a = _Vault(tmp_path / "before_rotation")
     b = _Vault(tmp_path / "after_rotation")
-    snaps = _assert_realistic(_real_snaps(a, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(a, SCHEMA, candidate_value="out/draft.md"))
 
     # POSITIVE CONTROL: both refs are WELL-FORMED, and differ only by the signing key.
     ref_old = snaps[0]["candidate_ref"]
@@ -834,7 +923,7 @@ def test_a_vault_key_ROTATION_promotes_nothing_rather_than_trusted(tmp_path):
 
     n = ap.promote_answered_asks(b, _dctx(snaps), {"recipient": "out/draft.md"})
     assert n == 0, "a key rotation promoted anyway"
-    assert not up.get_facts(b), (
+    assert not _promoted(b), (
         "a digest signed under a DIFFERENT vault key was treated as proof the operator "
         "typed the answer — a routine key rotation launders the whole card")
 
@@ -864,8 +953,10 @@ def test_a_secret_VALUE_under_a_NON_secret_leaf_is_never_promoted(tmp_path, secr
     the profile, because the profile is read verbatim into a system prompt and into a
     tier-1 LLM payload on later, unrelated runs."""
     v = _Vault(tmp_path / str(abs(hash(secret))))
-    snaps = _assert_realistic(
-        _real_snaps(v, {"service_endpoint": {"type": "string"}}, files_produced=[secret]))
+    # the INVENTORY channel deliberately: the source-#0 channel seeds a user_fact
+    # CONTAINING the candidate, which would put the secret into user_facts.jsonl as
+    # fixture material and make the pin below assert against its own setup.
+    snaps = _assert_realistic(_inventory_snaps(v, "service_endpoint", secret))
     # POSITIVE CONTROL: the name-only fence really does PASS this leaf, so this pin is
     # exercising the value-level path it exists for and not the old name fence.
     assert ap._is_secret("service_endpoint", snaps[0]["class"]) is False, (
@@ -887,9 +978,9 @@ def test_the_secret_VALUE_fence_leaves_ORDINARY_answers_alone(tmp_path):
     for i, benign in enumerate(["out/draft.md", "ops@acme.com", "acme-crm",
                                 "https://api.acme.com/v1/reports", "Asia/Kolkata"]):
         v = _Vault(tmp_path / ("benign%d" % i))
-        snaps = _assert_realistic(
-            _real_snaps(v, {"service_endpoint": {"type": "string"}},
-                        files_produced=[benign]))
+        # same channel as the secret parametrization above — a control that took a
+        # different route through the binder would not be controlling for anything.
+        snaps = _assert_realistic(_inventory_snaps(v, "service_endpoint", benign))
         assert ap.promote_answered_asks(
             v, _dctx(snaps), {"service_endpoint": benign}) == 1, (
             "the value fence refused an ordinary answer %r" % benign)
@@ -902,7 +993,7 @@ def test_the_learned_card_never_carries_the_raw_ANSWER_in_its_name(tmp_path):
     a non-rendered field."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     assert ap.promote_answered_asks(v, _dctx(snaps), {"service": "acme-crm"}) == 1
 
     card = ts.load_learned_items(v)[0]
@@ -923,11 +1014,11 @@ def test_three_answers_to_ONE_path_leave_ONE_learned_card_holding_the_LATEST(tmp
     three were projected forever, removable only one-by-one."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     for i, answer in enumerate(["acme-crm", "acme-two", "acme-three"]):
         ap.promote_answered_asks(v, _dctx(snaps, "hreq_%d" % i), {"service": answer})
 
-    assert len(up.get_facts(v)) == 1, "the fact side did not supersede (control)"
+    assert len(_promoted(v)) == 1, "the fact side did not supersede (control)"
     cards = ts.load_learned_items(v)
     assert len(cards) == 1, (
         "%d learned cards for one schema_path — a superseded fact must not leave its "
@@ -945,7 +1036,7 @@ def test_superseding_a_card_does_not_resurrect_an_operator_REMOVAL(tmp_path):
     answer must not bring it back (the "no re-add flapping" rule)."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(
-        _real_snaps(v, {"service": {"type": "string"}}, files_produced=["acme-crm"]))
+        _real_snaps(v, {"service": {"type": "string"}}, candidate_value="acme-crm"))
     assert ap.promote_answered_asks(v, _dctx(snaps, "h1"), {"service": "acme-crm"}) == 1
     key = ts.ref_key("service", {"server": "service"})
     assert ts.load_learned_items(v), "control: the card exists"
@@ -972,13 +1063,13 @@ def test_the_per_TICK_budget_bounds_promotions_ACROSS_cards(tmp_path, monkeypatc
         for card in range(4):
             schema = {("c%d_f%d" % (card, i)): {"type": "string"} for i in range(3)}
             snaps = _assert_realistic(_real_snaps(v, schema,
-                                                  files_produced=["out/draft.md"]))
+                                                  candidate_value="out/draft.md"))
             answers = {s["schema_path"]: "v%d-%d" % (card, i)
                        for i, s in enumerate(snaps)}
             total += ap.promote_answered_asks(v, _dctx(snaps, "hreq_%d" % card), answers,
                                               budget=budget)
     assert total == 5, "the per-tick budget was not enforced (promoted %d of 12)" % total
-    assert len(up.get_facts(v)) == 5
+    assert len(_promoted(v)) == 5
     assert any("tick budget" in r.getMessage().lower() for r in caplog.records), (
         "a promotion dropped by the tick budget must be logged, not silently dropped")
 
@@ -1012,7 +1103,7 @@ def test_ALL_live_promotions_for_a_path_are_superseded_not_just_one(tmp_path,
     Superseding EVERY live promotion for the path — not just the one ``prior`` id —
     makes the next promotion repair the damage instead of compounding it."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     assert ap.promote_answered_asks(v, _dctx(snaps, "h1"),
                                     {"recipient": "old@a.com"}) == 1
 
@@ -1021,7 +1112,7 @@ def test_ALL_live_promotions_for_a_path_are_superseded_not_just_one(tmp_path,
     monkeypatch.setattr(_up, "forget_fact", lambda *a, **k: False)
     assert ap.promote_answered_asks(v, _dctx(snaps, "h2"),
                                     {"recipient": "mid@a.com"}) == 1
-    live = up.get_facts(v)
+    live = _promoted(v)
     assert len(live) == 2, "control: the failed supersede really did leave two live rows"
     assert "old@a.com" in live[0].fact, (
         "control: the STALE row is the one _bind_profile would bind (first match)")
@@ -1029,7 +1120,7 @@ def test_ALL_live_promotions_for_a_path_are_superseded_not_just_one(tmp_path,
     monkeypatch.undo()                              # the lock clears
     assert ap.promote_answered_asks(v, _dctx(snaps, "h3"),
                                     {"recipient": "new@a.com"}) == 1
-    live = up.get_facts(v)
+    live = _promoted(v)
     assert len(live) == 1 and "new@a.com" in live[0].fact, (
         "the stale rows were not healed — still live: %s" % [f.fact for f in live])
 
@@ -1040,16 +1131,16 @@ def test_an_UNCHANGED_answer_also_heals_stale_duplicate_rows(tmp_path, monkeypat
     would survive every subsequent tick that re-confirmed the same value — which is the
     common case, since the operator keeps answering the same thing."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     ap.promote_answered_asks(v, _dctx(snaps, "h1"), {"recipient": "old@a.com"})
     import systemu.runtime.user_profile as _up
     monkeypatch.setattr(_up, "forget_fact", lambda *a, **k: False)
     ap.promote_answered_asks(v, _dctx(snaps, "h2"), {"recipient": "same@a.com"})
-    assert len(up.get_facts(v)) == 2                # control
+    assert len(_promoted(v)) == 2                # control
 
     monkeypatch.undo()
     ap.promote_answered_asks(v, _dctx(snaps, "h3"), {"recipient": "same@a.com"})
-    live = up.get_facts(v)
+    live = _promoted(v)
     assert len(live) == 1 and "same@a.com" in live[0].fact, (
         "re-confirming the same value did not heal the duplicate: %s"
         % [f.fact for f in live])
@@ -1064,7 +1155,7 @@ def _stack_up_live_rows(v, snaps, values, monkeypatch):
     for i, val in enumerate(values[1:], start=1):
         ap.promote_answered_asks(v, _dctx(snaps, "h%d" % i), {"recipient": val})
     monkeypatch.undo()
-    assert len(up.get_facts(v)) == len(values), "control: the degraded state was not built"
+    assert len(_promoted(v)) == len(values), "control: the degraded state was not built"
 
 
 def test_one_RAISING_supersede_does_not_abandon_the_remaining_rows(tmp_path,
@@ -1077,11 +1168,11 @@ def test_one_RAISING_supersede_does_not_abandon_the_remaining_rows(tmp_path,
     The other F8 pins stub ``forget_fact`` to return False, which never enters the
     except branch — so this failure mode was invisible to them (it survived mutation)."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     _stack_up_live_rows(v, snaps, ["a@x.com", "b@x.com", "c@x.com"], monkeypatch)
 
     import systemu.runtime.user_profile as _up
-    doomed = up.get_facts(v)[0].id                 # the OLDEST — attempted first
+    doomed = _promoted(v)[0].id                 # the OLDEST — attempted first
     real_forget = _up.forget_fact
 
     def flaky(vault, fact_id, *, reason="forgotten"):
@@ -1093,7 +1184,7 @@ def test_one_RAISING_supersede_does_not_abandon_the_remaining_rows(tmp_path,
     assert ap.promote_answered_asks(v, _dctx(snaps, "h9"),
                                     {"recipient": "d@x.com"}) == 1
 
-    live = up.get_facts(v)
+    live = _promoted(v)
     assert {f.id for f in live} == {doomed, live[-1].id}, (
         "the healing loop abandoned the rows after the one that raised — still live: "
         "%s" % [f.fact for f in live])
@@ -1112,12 +1203,12 @@ def test_the_dedupe_compares_the_NEWEST_live_promotion_not_the_oldest(tmp_path,
     the OLDEST sees a match, takes the no-op path, and leaves MID live — a value the
     operator did not give, now pinned as the profile's answer."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     _stack_up_live_rows(v, snaps, ["old@x.com", "mid@x.com"], monkeypatch)
 
     n = ap.promote_answered_asks(v, _dctx(snaps, "h9"), {"recipient": "old@x.com"})
     assert n == 1, "re-answering a value that is live but STALE must promote it afresh"
-    live = up.get_facts(v)
+    live = _promoted(v)
     assert len(live) == 1 and "old@x.com" in live[0].fact, (
         "the operator's answer is not what is live — got %s"
         % [f.fact for f in live])
@@ -1152,11 +1243,11 @@ def test_a_separator_variant_answer_still_reads_as_a_CONFIRM(tmp_path):
     the SAME file with a backslash. That is a confirm, and must promote the candidate's
     ``content_derived`` origin — not ``operator``."""
     v = _Vault(tmp_path)
-    snaps = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
     assert snaps[0]["value_origin"] == "content_derived"
     assert ap.promote_answered_asks(v, _dctx(snaps),
                                     {"recipient": "out\\draft.md"}) == 1
-    assert up.get_facts(v)[0].origin_class == "content_derived", (
+    assert _promoted(v)[0].origin_class == "content_derived", (
         "a separator variant of the SAME file read as a fresh operator override and "
         "was promoted TRUSTED")
 
@@ -1184,7 +1275,7 @@ def test_secret_and_spine_refusals_are_LOGGED_not_silently_dropped(tmp_path, cap
     used to log at DEBUG and never entered ``capped``, so at the daemon's default level
     they were invisible — the module's own observability claim was false."""
     v = _Vault(tmp_path)
-    real = _assert_realistic(_real_snaps(v, SCHEMA, files_produced=["out/draft.md"]))[0]
+    real = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))[0]
 
     with caplog.at_level("INFO"):
         assert ap.promote_answered_asks(

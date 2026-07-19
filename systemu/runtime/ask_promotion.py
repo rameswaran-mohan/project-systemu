@@ -7,9 +7,39 @@ grew. This module is that promoter.
 
 WHY THIS MODULE IS WRITTEN DEFENSIVELY
 --------------------------------------
-This is the hop that would INTRODUCE the laundering bug. The consumer half (bind-side
-taint carriage, IMPL-5) is finished and correct; there were ZERO promotion writers
-before this slice. Every default along the path points at laundering:
+This is the hop that would INTRODUCE the laundering bug. There were ZERO promotion
+writers before this slice.
+
+The consumer half (bind-side taint carriage, IMPL-5) is BUILT, but "finished and
+correct" — as this docstring said until the prompt-channel hole was found and closed
+in ``_bind_provided_params`` — was an over-claim, and re-stating it here would stop
+the next reader looking. What actually holds is narrower: a value the binder reads
+from the STORE carries its taint, and ``_needs_ask`` refuses to silent-bind a
+``content_derived`` one.
+
+Carriage gaps are open. Do NOT treat the list at the ``requirement_binder`` clamp as
+exhaustive — an adversarial review has since found more, and a fix packet is filed:
+
+  * IN-CONTEXT content with no stored taint record (a tool result, a fetched page) —
+    nothing to match against.
+  * A RESHAPED value launders. The match normalizes case and whitespace only, so a
+    separator swap, a trailing period, quoting, or URL-encoding all evade it
+    (executed: ``acct-42-prod`` matches, ``acct_42_prod`` does not). This is NOT one
+    of the three residuals that commit documented.
+  * OVER-clamp in the other direction: the tainted corpus is every ``content_derived``
+    fact ever, with no recency cap, while the prompts that could have seeded the model
+    show 5/20 most-recent. Measured over-clamp on ordinary values: 5 facts ⇒ 15%,
+    20 ⇒ 62%.
+  * Values shorter than ``_MIN_TAINT_MATCH_LEN`` (4).
+  * The QUICK LANE never calls the binder, so no IMPL-5 TAINT gate runs there. Note
+    the narrower true statement: the lane is NOT ungated — the effect-class gate does
+    run, so money-move / send-message / delete / shell all card, and only reads
+    execute unattended.
+
+So the defences below are what keeps a promotion honest — they are not a second layer
+over a consumer half that is already airtight.
+
+Every default along the path points at laundering:
 
   * ``user_profile.add_fact``'s ``origin_class`` parameter defaults to ABSENT, and
   * ABSENT grandfathers to ``operator`` in ``requirement_binder._fact_origin``,
@@ -29,18 +59,31 @@ silently-bound one on the very next run. Four independent defences, in depth:
      ``content_derived`` over-taints the operator's own typing and destroys the payoff.
   4. Anything non-canonical clamps to ``content_derived`` (fail-untrusted).
 
-THE ORIGIN DECISION (§5.9's "picked vs typed", by VALUE-EQUALITY)
------------------------------------------------------------------
-§5.9 words the rule as "picked from a candidate list vs freshly typed", but no
-requirement-ask producer ever sets ``enum``: every slot renders as one free-text input
-and the answer envelope carries no provenance marker, so there is no "picked" signal to
-read. The equivalent observable is VALUE EQUALITY against the binder's own candidate,
-which already crosses the suspend as a keyed digest (``candidate_ref``):
+THE ORIGIN DECISION (§5.9's "picked vs typed": VALUE-EQUALITY + an explicit pick)
+---------------------------------------------------------------------------------
+§5.9 words the rule as "picked from a candidate list vs freshly typed". No
+requirement-ask producer sets ``enum`` — every slot renders as one free-text input — so
+the PRIMARY observable is VALUE EQUALITY against the binder's own candidate, which
+crosses the suspend as a keyed digest (``candidate_ref``). R-B4/F3 later added an
+EXPLICIT pick marker (the ``picked`` argument), so there are now two witnesses, and the
+digest is the weaker one:
 
     answer digest == a candidate digest  ⇒ the operator ACCEPTED that candidate
                                            ⇒ promote with THAT candidate's origin
-    answer digest != every candidate     ⇒ the operator TYPED something new
+    digest matches nothing, but the
+    field was explicitly PICKED          ⇒ the operator took a suggestion whose digest
+                                           merely failed to compare (a widget
+                                           round-trip can reshape the value past
+                                           ``normalize_value``)
+                                           ⇒ ``_most_tainted`` over EVERY comparable
+                                           candidate — we know one was taken, not which
+    digest matches nothing and the
+    field was NOT picked                 ⇒ the operator TYPED something new
                                            ⇒ promote as ``operator``
+
+The pick marker is honoured ONLY in the tainting direction: it can make an origin more
+tainted, never less. It is also attacker-shaped input (it rides a persisted decision
+across a suspend), which is why non-``str`` entries are dropped at the read.
 
 A multi-candidate match resolves to the MOST-TAINTED origin. Deliberately NOT the
 highest-confidence collapse ``replay_metrics`` uses for its own metric: confidence is
@@ -51,11 +94,18 @@ A candidate only participates in that comparison if it is a well-formed ``value_
 signed by THIS vault's key (see the guards at the decision site). Anything else is not
 evidence in either direction and reaches the fail-closed branch.
 
-DOCUMENTED RESIDUAL. A candidate whose MAC is altered but whose shape and key-id are
-intact reads as "the operator typed something new" ⇒ ``operator``. That is not closable:
-it is byte-for-byte the same signal as a genuine override, and the promoter holds
-digests, never values. Nor is it an escalation — producing it needs write access to the
-persisted card spec, and anyone holding that can author an ``operator``-stamped fact in
+DOCUMENTED RESIDUAL — now CONDITIONAL, not absolute. A candidate whose MAC is altered
+but whose shape and key-id are intact reads as "the operator typed something new" ⇒
+``operator`` — but ONLY when the field was not explicitly picked. Executed both ways on
+one flipped hex character: ``picked=None`` ⇒ ``operator``; ``picked=[<field>]`` ⇒
+``content_derived``. So R-B4's marker narrowed this residual to the case where no pick
+signal reached the promoter (a producer that does not thread ``picked``, or an answer
+genuinely typed).
+
+In that remaining case it is not closable: a well-formed same-key non-match is
+byte-for-byte the same signal as a genuine override, and the promoter holds digests,
+never values. Nor is it an escalation — producing it needs write access to the persisted
+card spec, and anyone holding that can author an ``operator``-stamped fact in
 ``user_facts.jsonl`` directly. The guards exist for the shapes that arise WITHOUT vault
 write access: a non-conforming producer, and a vault-key rotation (which needs no
 attacker at all and otherwise launders an entire card at once).
@@ -95,14 +145,29 @@ SCOPE LIMITS (each one closes a proven hole — see the pins)
     value; and keying on the value minted a NEW card per answer, so one leaf answered
     three times left three cards, all projected forever and removable only one by one.
     The value rides ``usage`` (carried by the projector, rendered by nothing).
-  * **No secrets, ever** — at BOTH levels. The field NAME goes through the codebase's
-    canonical marker (``replay_metrics`` → ``elicitation.is_secret_field``). The
-    VALUE goes through ``messaging.gateway.mask_outbound``, the shipped outbound
-    secret chokepoint, plus the two shapes it provably does not cover (see
-    :func:`_value_is_secret`). A name-only fence is not enough: the promoted fact is
-    read VERBATIM into a system prompt (``shadow_runtime._build_user_context_block``,
-    5 most-recent facts) and into a tier-1 LLM payload (``scroll_refiner``, recent 20)
-    on later, unrelated runs — so a credential parked under a neutral leaf egresses.
+  * **Secrets of a RECOGNIZED name or shape are refused, at BOTH levels — this is
+    NOT a general secret detector.** The field NAME goes through the codebase's
+    canonical marker (``replay_metrics`` → ``elicitation.is_secret_field``): a
+    matching name token, or an explicit ``format="password"`` marker — nothing about
+    the value itself. The VALUE goes through ``messaging.gateway.mask_outbound``, the
+    shipped outbound secret chokepoint (kv pairs, ``Bearer``/``Basic``,
+    ``sk-``/``AKIA``/``ghp_``/JWT/Slack prefixes, 40+-char hex), plus the two shapes
+    verified NOT to reach it — URI userinfo and a space-separated
+    ``--token``/``--password`` flag (see :func:`_value_is_secret`). A name-only fence
+    is not enough on its own: the promoted fact is read VERBATIM into a system prompt
+    (``shadow_runtime._build_user_context_block``, 5 most-recent facts) and into a
+    tier-1 LLM payload (``scroll_refiner``, recent 20) on later, unrelated runs — so
+    a credential parked under a neutral leaf egresses.
+
+    WHAT THIS DOES NOT CATCH. A secret with NEITHER a secret-marked field name NOR
+    one of the value shapes above — a bare password or passphrase typed as an
+    ordinary-looking string (``hunter2``, ``correcthorsebatterystaple``), or an
+    opaque token shorter than the 40-character hex floor — is indistinguishable from
+    ordinary prose to both fences (verified: ``_value_is_secret`` returns ``False``
+    on all of these) and WILL be promoted, persisted to ``user_facts.jsonl``, and
+    later egress verbatim through the same two paths above. Closing that gap needs a
+    different tool than "reuse the outbound mask chokepoint" — e.g. entropy scoring
+    or a broader unstructured-secret classifier — and is out of scope here.
 
 OBSERVABILITY + SAFETY CONTRACT. Bounded and never-raises: this runs inside a daemon
 reconciler tick AFTER a real resume has already been dispatched, so it must never take
@@ -282,8 +347,9 @@ _CRED_FLAG_RE = re.compile(
     r"credential|access[-_]?key)[\s=:]+\S+")
 
 
-def _value_is_secret(value: Any) -> bool:
-    """True when the ANSWER ITSELF looks like a credential, whatever the field is named.
+def _value_is_secret(value: Any, vault: Any = None) -> bool:
+    """True when the ANSWER ITSELF is or looks like a credential, whatever the field
+    is named.
 
     The name-level fence (:func:`_is_secret`) inspects field NAMES only, so a secret
     parked under a neutral leaf (``service_endpoint is postgres://admin:pw@db/prod``)
@@ -302,13 +368,39 @@ def _value_is_secret(value: Any) -> bool:
     timezones) — a blanket refusal here would silently disable the whole slice, so the
     negative control is pinned as hard as the positive ones.
 
-    Import failure ⇒ treat as secret (fail-closed), matching the other two guards."""
+    THE SHAPELESS CASE. Everything above is a SHAPE rule, and a shape rule cannot see
+    a secret that has no shape: ``hunter2``, ``correcthorsebatterystaple`` and a bare
+    32-char hex run were measured passing ALL of them. Lowering the long-hex threshold
+    and adding an entropy backstop were both tried and both REJECTED on measured
+    false-positive grounds (see ``runtime.credentials.known_values``). ``vault`` closes
+    it structurally instead: an answer equal to one of the operator's stored credential
+    values is refused by IDENTITY, which has no false positives to trade against.
+
+    Why this fence needs it even though the outbound mask has it too — they guard
+    different egress paths and neither subsumes the other. A refusal here stops a
+    DURABLE capture: a promoted fact is read verbatim into a system prompt and a
+    tier-1 LLM payload on every later, unrelated run, so a secret promoted but never
+    pushed still leaks, repeatedly. A secret pushed but never promoted leaks at the
+    gateway. One helper, two call sites.
+
+    ``vault`` is optional so the shape half stays callable (and pinned) standalone;
+    when it is absent the known-value half simply does not run.
+
+    Import failure ⇒ treat as secret (fail-closed), matching the other two guards. The
+    known-value check fails closed here too — unlike at the outbound mask, where a
+    failure must not break a push. The asymmetry is deliberate: the cost of a false
+    refusal here is one un-promoted fact (an over-ask), and the cost of a false pass is
+    a credential persisted to disk and replayed into future prompts."""
     try:
         s = str(value)
         if not s:
             return False
         if _URI_USERINFO_RE.search(s) or _CRED_FLAG_RE.search(s):
             return True
+        if vault is not None:
+            from systemu.runtime.credentials.known_values import contains_known_secret
+            if contains_known_secret(s, vault):
+                return True
         from systemu.messaging.gateway import mask_outbound
         return mask_outbound(s) != s
     except Exception:
@@ -563,8 +655,11 @@ def promote_answered_asks(vault, dctx, answers,
             if _collides_with_profile_spine(leaf):
                 capped.append(f"{path} (collides with the UserProfile spine)")
                 continue
-            if _value_is_secret(answer):
+            if _value_is_secret(answer, vault):
                 # NB: the path only — never the value, and never a hint of its shape.
+                # Deliberately does NOT distinguish a shape hit from a known-value hit:
+                # "this exact string is the operator's stored credential" is itself a
+                # fact about the value, and this list is logged at INFO.
                 capped.append(f"{path} (answer looks like a credential)")
                 continue
 

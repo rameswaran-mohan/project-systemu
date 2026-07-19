@@ -69,13 +69,65 @@ def fence(payload: object) -> str:
     return f"{header}{body}{footer}"
 
 
+#: The prompt's user_fact budget — the most-recent N facts this renderer may carry.
+#:
+#: WHY THIS EXISTS. ``build_profile`` returns EVERY non-superseded fact and this
+#: renderer json-dumps the report whole, so the planner prompt carried an unbounded
+#: fact list while the other two renderers already capped theirs (``scroll_refiner``
+#: recent-20, ``shadow_runtime`` recent-5). That made this the WIDEST prompt window in
+#: the tree, and it is what ``requirement_binder._PROMPT_FACT_WINDOW`` — the bound on
+#: the IMPL-5 taint corpus — has to be sound against: that clamp may only skip a fact
+#: the model was never shown, so an uncapped renderer here would turn its cost bound
+#: into a laundering hole. Capping the render is what makes "the corpus is what the
+#: prompts carried" TRUE rather than assumed.
+#:
+#: The two constants are pinned EQUAL by
+#: ``test_ra16_taint_corpus_bound.test_render_cap_matches_binder_window``; raising
+#: either alone re-opens the gap, and the pin fails if they drift.
+#:
+#: ``build_profile`` -> ``get_facts`` returns facts NEWEST-LAST, so the last-N slice is
+#: the most-recent N — the same rows ``load_user_facts(recent=N)`` yields.
+_PROMPT_FACT_BUDGET = 20
+
+
+def _cap_profile_facts(report):
+    """Return ``report`` with ``profile.user_facts`` capped to the most-recent N.
+
+    Copies only the two levels it rewrites — the caller's report (and the cached
+    SituationReport the snapshot stores) MUST NOT be mutated, or the binder's source #4
+    would start binding from a truncated profile and silently stop resolving older
+    facts. Only the PROMPT view is narrowed; the bind view stays whole.
+
+    Defensive: any unexpected shape returns the report untouched (⇒ prior behavior)."""
+    try:
+        if not isinstance(report, dict):
+            return report
+        profile = report.get("profile")
+        if not isinstance(profile, dict):
+            return report
+        facts = profile.get("user_facts")
+        if not isinstance(facts, list) or len(facts) <= _PROMPT_FACT_BUDGET:
+            return report
+        capped = dict(report)
+        capped_profile = dict(profile)
+        capped_profile["user_facts"] = facts[-_PROMPT_FACT_BUDGET:]
+        capped["profile"] = capped_profile
+        return capped
+    except Exception:
+        return report
+
+
 def render_situation_for_prompt(report) -> str:
     """Render a SituationReport dict as a FENCED, deterministic JSON block for the
     planner prompt (BLOCKER-2). The content is UNTRUSTED DATA describing what
-    exists — fence() ensures the LLM cannot treat it as instructions."""
+    exists — fence() ensures the LLM cannot treat it as instructions.
+
+    The profile's ``user_facts`` are capped to :data:`_PROMPT_FACT_BUDGET` most-recent
+    (see that constant — it is load-bearing for the IMPL-5 taint bound, not just a token
+    budget). The report object itself is never mutated."""
     import json as _json
     try:
-        body = _json.dumps(report, sort_keys=True, default=str)
+        body = _json.dumps(_cap_profile_facts(report), sort_keys=True, default=str)
     except Exception:
         body = _json.dumps({}, sort_keys=True)
     return fence(body)

@@ -2,7 +2,9 @@
 
 A ``content_derived`` user_fact is injected verbatim into planning prompts
 (``scroll_refiner``'s tier-1 elder_intake payload, recent 20; the planner's fenced
-SituationReport, which carries the whole profile). Nothing stopped the model from
+SituationReport, capped to the most-recent ``_PROMPT_FACT_BUDGET`` — it carried the
+WHOLE profile until the corpus bound in ``test_ra16_taint_corpus_bound`` required
+otherwise). Nothing stopped the model from
 copying such a value into a tool call's params, and bind source #0
 (``_bind_provided_params``) then stamped it ``systemu_authored`` at confidence 1.0 — a
 TRUSTED axis — so it bound SILENTLY. The taint laundered through the MODEL rather than

@@ -62,7 +62,47 @@ _SHELL_TOOL_NAMES = {"run_command", "run_cli_command"}
 _COMMAND_GATE_DELEGABLE_TAGS = {"shell_exec", "local_read", "local_write"}
 
 
-def _command_gate_already_scored(tool, tool_name: str, effect_tags: set) -> bool:
+def _derive_effect_tags_from_source(impl_path) -> set:
+    """Re-derive a tool's effect tags from its ON-DISK body.
+
+    Used ONLY when the stored ``effect_tags`` are EMPTY. Empty is not evidence of
+    "no effects": ``vault_migrator.backfill_effect_tags`` stamps ``[]`` whenever
+    it cannot READ a body (a declared ``implementation_path`` that lands outside
+    ``vault/tools/implementations/`` is refused and counted as
+    ``skipped_impl_path``), and the shipped seed bodies carry no ``effect_tags``
+    field at all until a boot pass stamps them. The runtime resolver applies no
+    such containment check, so a tool the backfill refused to classify still
+    RESOLVES AND EXECUTES here — with empty tags.
+
+    Mirrors ``tool_dry_run._scan_source_effect_tags``: same classifier, same
+    normalization, same fail-closed contract. Returns an EMPTY set when the
+    source is missing / unreadable / classifies to nothing, and the caller treats
+    that as UNDETERMINABLE, so an empty return can never silently exempt.
+
+    ``.value``, NOT ``str()``. ``EffectTag`` is a ``(str, Enum)`` whose ``str()``
+    renders ``"EffectTag.SHELL_EXEC"``, not ``"shell_exec"``. Comparing that form
+    against ``_COMMAND_GATE_DELEGABLE_TAGS`` fails for EVERY tag, which would
+    card every provably read-only shell command — verbatim the W12 / audit-F5
+    regression this carve-out exists to prevent.
+    """
+    try:
+        if impl_path is None:
+            return set()
+        p = Path(impl_path)
+        if not p.is_file():
+            return set()
+        from systemu.runtime.effect_tags import classify_source
+        source = p.read_text(encoding="utf-8", errors="replace")
+        return {t.value if hasattr(t, "value") else str(t)
+                for t in classify_source(source)}
+    except Exception:  # noqa: BLE001 — a scan failure must never ungate
+        logger.debug("[Sandbox] effect-tag re-derivation failed for %s",
+                     impl_path, exc_info=True)
+        return set()
+
+
+def _command_gate_already_scored(tool, tool_name: str, effect_tags: set,
+                                 *, impl_path=None) -> bool:
     """True iff ``_maybe_gate_command`` has ALREADY governed this exact call, so
     the per-tool gate would only re-ask a question that was just answered.
 
@@ -107,6 +147,37 @@ def _command_gate_already_scored(tool, tool_name: str, effect_tags: set) -> bool
         reason to card. A future re-tag that adds e.g. ``net_mutate`` is then
         NOT silently exempted — it cards, because the command gate scored a
         command and has nothing to say about a network mutation.
+    (e) EMPTY tags do not satisfy (d) by default. ``set() <= anything`` is
+        trivially True, so an absent tag list was the MAXIMALLY delegable value —
+        the same hole clause (d) names, reached with no tag at all. Empty is a
+        real state, not a hypothetical: the shipped seed bodies carry no
+        ``effect_tags`` until a boot pass stamps them, and
+        ``backfill_effect_tags`` stamps ``[]`` on any body it cannot read —
+        including one whose ``implementation_path`` points outside
+        ``vault/tools/implementations/``, which the backfill refuses to classify
+        but this runtime still resolves and EXECUTES.
+
+        Empty is also whatever a STORAGE BACKEND makes it. A backend that does
+        not persist ``effect_tags`` hands every tool back untagged, which makes
+        empty the NORMAL case there rather than an edge case — so this clause
+        must hold the line for ALL calls, not just rare ones. That is also
+        exactly why the fix re-derives instead of simply REQUIRING non-empty:
+        on such a backend, requiring non-empty would card every shell command
+        the operator runs.
+
+        So when the stored tags are empty we RE-DERIVE from the body actually on
+        disk and subset-check THAT. A genuine shell runner derives ``shell_exec``
+        and stays exempt (no new friction — the W12 / audit-F5 constraint holds);
+        a body that also mutates the network derives ``net_mutate`` and cards, as
+        (d) intends. Derivation that yields NOTHING is UNDETERMINABLE, never
+        "no effects", and fails closed — a missing or unreadable body cannot
+        earn the exemption. (Such a call cannot execute anyway: ``execute_tool``
+        requires ``impl_path.exists()`` on both the registry and subprocess
+        paths, so failing closed here adds no friction to any command that
+        would have run.)
+
+        Order matters: this runs LAST, so no source is ever read for a forged
+        tool (a) or for a tool the command gate never scored (b)/(c).
     """
     if bool(getattr(tool, "forged_by_systemu", False)):
         return False
@@ -114,7 +185,12 @@ def _command_gate_already_scored(tool, tool_name: str, effect_tags: set) -> bool
         return False
     if getattr(tool, "name", tool_name) not in _SHELL_TOOL_NAMES:
         return False
-    return set(effect_tags) <= _COMMAND_GATE_DELEGABLE_TAGS
+    tags = set(effect_tags)
+    if not tags:
+        tags = _derive_effect_tags_from_source(impl_path)
+        if not tags:
+            return False  # UNDETERMINABLE ⇒ fail closed, never exempt
+    return tags <= _COMMAND_GATE_DELEGABLE_TAGS
 
 
 def _inject_sandbox_kwargs(handler, params: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
@@ -878,7 +954,8 @@ class ToolSandbox:
         # benign local (ALLOW) tool falls through and runs. No-op when the Tool
         # is out of scope (tool=None) — legacy/registry-less path unchanged.
         self._maybe_gate_tool(tool, tool_name, parameters,
-                              resolved_dedup=_command_gate_resolved)
+                              resolved_dedup=_command_gate_resolved,
+                              impl_path=impl_path)
 
         # ── Fast path: ToolRegistry (direct Python function call) ─────────
         # Browser/Playwright tools MUST go through the subprocess path — their
@@ -1092,7 +1169,8 @@ class ToolSandbox:
         )
 
     def _maybe_gate_tool(self, tool, tool_name: str, parameters: Dict[str, Any],
-                         *, resolved_dedup: Optional[str] = None) -> None:
+                         *, resolved_dedup: Optional[str] = None,
+                         impl_path=None) -> None:
         """S1b (THE CRUX): the live per-tool action gate (IMPL-1).
 
         Builds an ``ActionContext`` from the Tool's EffectTags + target-network
@@ -1117,7 +1195,12 @@ class ToolSandbox:
         (``_command_gate_already_scored``, applied just below) because the
         carve-out is a PRE-CHECK, NOT an ``ActionContext`` input: it returns
         before scoring, and changes nothing the scorer reads. The two therefore
-        still score IDENTICAL contexts. The dry-run deliberately does NOT carry
+        still score IDENTICAL contexts. That holds for clause (e)'s empty-tag
+        re-derivation too — it decides only whether to RETURN EARLY, and the
+        derived tags are deliberately NOT written back into ``effect_tags``, so
+        the ``ActionContext`` built below is byte-identical either way.
+
+        The dry-run deliberately does NOT carry
         the carve-out — it never runs ``_maybe_gate_command``, so it has no
         command-gate decision to delegate to and keeps the strict scorer. That
         asymmetry is recorded at ``_gate_skip_reason`` too, and it fails in the
@@ -1172,7 +1255,11 @@ class ToolSandbox:
         # It is a PRE-CHECK, not an input to the ActionContext below, so the
         # scoring this function shares with ``tool_dry_run._gate_skip_reason``
         # stays byte-identical (see the SIBLING note in the docstring).
-        if _command_gate_already_scored(tool, tool_name, effect_tags):
+        # ``impl_path`` is the ALREADY-RESOLVED path ``execute_tool`` will run, so
+        # clause (e)'s re-derivation reads the SAME bytes that execute — not a
+        # path re-resolved here that could drift from it.
+        if _command_gate_already_scored(tool, tool_name, effect_tags,
+                                        impl_path=impl_path):
             return
 
         # D1 host/target — DEFERRED until a real host resolver lands (a later

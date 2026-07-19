@@ -31,18 +31,22 @@ from pydantic import BaseModel, Field
 
 from systemu.runtime import capability_slots as cs
 
-# ── effect classes that make a slot "effectful" (CAP-3 trust weighting) ────────
-_EFFECTFUL_TAGS = {
-    "net_call", "network", "send_message", "money_move", "oauth_call",
-    "external_write", "delete", "irreversible",
-}
-
 
 class IndexRow(BaseModel):
     tool_id: str
     name: str
     detail: str = ""                       # description, for lexical match only
     slots: List[str] = Field(default_factory=list)     # canonical "verb:target"
+    # Row data per the CAP-2 schema (spec §5.5.1) / the CapabilityRow interface
+    # stub -- populated from the G0 AST-derived backfill, persisted, and
+    # round-tripped through load_index(). NOT currently a ranking input: CAP-3's
+    # untrusted-origin trust weighting (score_key's `effectful` branch) keys off
+    # the QUERY's verb (_EFFECTFUL_VERBS below), not a row's own declared tags --
+    # deliberately, since an mcp/forged row's self-declared effect_tags are
+    # exactly the untrusted content CAP-3 exists to discount, so trusting them to
+    # set the row's OWN trust weight would let a tool suppress its own severity.
+    # This field stays as groundwork for the deferred CAP-6b near-dupe net and
+    # CAP-9 world-model convergence, both of which read effect_tags per spec.
     effect_tags: List[str] = Field(default_factory=list)
     io_shape_hash: str = ""
     usage: Dict[str, Any] = Field(default_factory=dict)  # last_used_at, invocations, verified_done_count

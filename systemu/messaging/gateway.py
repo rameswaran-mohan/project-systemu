@@ -172,13 +172,31 @@ _TOKEN_SHAPE_RES = (
 )
 
 
-def mask_outbound(text: str) -> str:
+def mask_outbound(text: str, vault: Any = None) -> str:
     """Redact secret-looking spans in an outbound push string.
 
     Conservative: redacts header/kv secret values, bearer/basic schemes, and
     token shapes (``sk-…``, ``AKIA…``, JWT, ``ghp_…``, Slack, long hex) to
     ``***``; leaves ordinary prose untouched. Never raises (returns the input
     unchanged on any error).
+
+    ``vault`` (optional) additionally enables the KNOWN-VALUE fence: any whole
+    token equal to one of the operator's STORED credential values is redacted,
+    whatever it looks like. Every rule above is a SHAPE rule, and no shape rule
+    can recognise a shapeless secret — ``hunter2`` and
+    ``correcthorsebatterystaple`` pass all of them (measured). Widening the
+    shapes was tried and rejected on false-positive grounds; see
+    ``runtime.credentials.known_values`` for the numbers. Identity closes what
+    resemblance cannot.
+
+    The known-value pass is OPT-IN by argument rather than always-on, because
+    it reads the credential store: a caller with no vault handle (and the whole
+    installed base of existing call sites) keeps exactly the shipped pure,
+    stateless, no-IO behaviour. It fails OPEN — no corpus means shape rules
+    only, i.e. the status quo — which is the correct direction HERE only
+    because this function's standing contract is that masking must never break
+    a push. The promotion fence, whose failure is a persisted secret rather
+    than a dropped notification, fails CLOSED instead.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -187,6 +205,9 @@ def mask_outbound(text: str) -> str:
         out = _BEARER_RE.sub(_MASK, out)
         for rx in _TOKEN_SHAPE_RES:
             out = rx.sub(_MASK, out)
+        if vault is not None:
+            from systemu.runtime.credentials.known_values import redact_known_secrets
+            out = redact_known_secrets(out, vault, _MASK)
         return out
     except Exception:  # pragma: no cover - masking must never break a push
         return text

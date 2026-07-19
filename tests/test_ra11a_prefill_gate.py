@@ -34,13 +34,27 @@ exactly ONE of which is path-named. Such a leaf now degrades to an honest ``miss
 ask instead of a confidently wrong pre-fill, which is the correct direction: an empty
 box the operator fills beats a filled box the operator must notice is wrong.
 
-SCOPE. The gate covers source #1 only. ``_bind_run_context`` (source #2) is ungated in
-exactly the same way — verified: with one produced file it binds 6/6 leaves at 0.5,
-5 of them non-path, including ``password`` and ``verbose``. It is deliberately NOT in
-this gate: ``test_glearn_s3_promotion.py`` uses it as its ``content_derived`` channel on
-non-path leaves (``{"service": {"type": "string"}}``), so gating it removes a shipped
-feature's substrate rather than fixing a defect. That is tracked as separate debt and is
-NOT repaired here by editing those tests to pass.
+SCOPE. The gate now covers source #1 AND ``_bind_run_context`` (source #2), which was
+ungated in exactly the same way — with one produced file it bound 6/6 leaves at 0.5,
+5 of them non-path, including ``password`` and ``verbose``.
+
+SOURCE #2's ARGUMENT IS STRONGER THAN SYMMETRY. Measured over the same harvested-tool
+corpus: 29 of 104 requirements pre-filled by source #2 and 29/29 — 100% — landed on
+non-path leaves (15 distinct keys: ``pid``, ``lat``, ``lon``, ``query``, ``command``,
+``url``, ``message`` …). Source #1 runs first and takes the genuine path leaves, so
+source #2's entire contribution to that corpus was wrong pre-fills. After the gate: 0.
+
+And it was not merely cosmetic. ``_SOURCES`` orders source #2 BEFORE inventory, profile
+and schema-default, so a junk 0.5 ``content_derived`` bind MASKED the source-#4 profile
+bind — and ``content_derived`` never silent-binds. A G-LEARN-promoted ``operator`` fact
+therefore stopped paying off the moment a run produced any file: the operator was
+re-asked, with a wrong path pre-filled. ``test_a_produced_file_no_longer_masks_a_silent_
+profile_bind`` below is that regression, and it is the pin that matters most here.
+
+The G-LEARN S3 suite used source #2 as its ``content_derived`` channel on non-path
+leaves. It was RE-CHANNELLED (not weakened) onto source #0's content-seeded
+provided-params clamp and, where a vault write would perturb the pin, onto the inventory
+entry source — both production-realistic. See ``tests/test_glearn_s3_promotion.py``.
 
 Both IMPL-5 taint directions stay pinned in ``test_ra11a_source1_liveness.py``; this
 module must not disturb either, so the path leaf below is asserted to still bind,
@@ -224,6 +238,103 @@ def test_an_untyped_leaf_degrades_to_an_honest_missing_ask(tmp_path):
         f"an untyped leaf was pre-filled with a path: {r.bound_value_ref!r}")
     assert r.state == "missing"
     assert r.bound_value_ref is None
+
+
+# ── source #2 (_bind_run_context): the same gate, a stronger argument ───────
+def _ctx_with_produced(produced, intent: str = "summarize my resume.pdf"):
+    ctx = _real_ctx(intent)
+    ctx.files_produced = list(produced)
+    return ctx
+
+
+def test_a_non_path_leaf_is_never_prefilled_from_the_RUN_CONTEXT(tmp_path):
+    """THE PIN for source #2. One produced file must not pre-fill ``password``,
+    ``verbose``, ``count``, ``query`` or ``process_id`` with a FILE PATH."""
+    vault, situation = _granted_world(tmp_path)
+    ctx = _ctx_with_produced([str(tmp_path / "work" / "resume.pdf")])
+    reqs = rb.compute_requirements(_Obj(), _Cap(), situation, ctx, vault=vault)
+    offenders = {
+        k: r.bound_value_ref
+        for k in _NON_PATH
+        if (r := _by_path(reqs, k)) is not None
+        and str(r.bound_value_ref or "").startswith("run_context:")
+    }
+    assert not offenders, (
+        "the run-context source pre-filled leaves that cannot hold a path: %s"
+        % offenders)
+
+
+def test_the_run_context_source_still_fills_a_genuine_PATH_leaf(tmp_path):
+    """The gate narrows source #2, it does not switch it off. With NO granted roots
+    source #1 cannot resolve, so a path leaf falls through to source #2 — and must
+    still be pre-filled from the produced file. Without this the pin above would be
+    satisfied by deleting the source outright."""
+    vault = Vault(root=tmp_path / "vault")
+    produced = str(tmp_path / "out" / "report.csv")
+    ctx = _ctx_with_produced([produced])
+    reqs = rb.compute_requirements(_Obj(), _Cap(), {}, ctx, vault=vault)
+    r = _by_path(reqs, "input_path")
+    assert r is not None
+    assert str(r.bound_value_ref or "") == f"run_context:{produced}", (
+        "source #2 stopped firing on a genuine path leaf: %r (state=%s) — the gate "
+        "over-reached" % (r.bound_value_ref, r.state))
+
+
+def test_the_surviving_run_context_bind_is_still_clamped_to_content_derived(tmp_path):
+    """IMPL-5 direction A for source #2: the bind the gate LETS THROUGH keeps its
+    ``content_derived`` clamp and still reaches the operator's confirm bundle. The gate
+    must not become a laundering path."""
+    vault = Vault(root=tmp_path / "vault")
+    ctx = _ctx_with_produced([str(tmp_path / "out" / "report.csv")])
+    rep = rb.build_requirement_report([_Obj()], _Cap(), {}, ctx, vault=vault)
+    r = _by_path(rep.per_objective[1], "input_path")
+    assert str(r.bound_value_ref or "").startswith("run_context:")
+    assert r.value_origin == "content_derived", (
+        "the gate laundered source #2's taint clamp, got %r" % r.value_origin)
+    assert rb._needs_ask(r) is True
+    assert any(x.schema_path == "input_path" for x in rep.ask_bundle)
+
+
+def test_a_produced_file_no_longer_masks_a_silent_profile_bind(tmp_path):
+    """THE REASON THE GATE IS WORTH ITS BLAST RADIUS — the G-LEARN payoff regression.
+
+    ``_SOURCES`` runs source #2 BEFORE the profile. So an operator-origin profile fact,
+    which is supposed to SILENT-BIND its leaf on the next identical goal, was masked by
+    a 0.5 ``content_derived`` path bind on any run that had produced a file — and
+    ``content_derived`` never silent-binds. The operator was re-asked for a value they
+    had already confirmed, with a wrong PATH pre-filled in the box.
+
+    The negative control is explicit: the SAME report, same produced file, asserts the
+    profile bind wins. If someone reverts the gate this fails on the mask."""
+    from systemu.runtime import situational_inventory as si
+    from systemu.runtime import user_profile as up
+
+    vault = Vault(root=tmp_path / "vault")
+    up.add_fact(vault, "the recipient is ops@acme.com", source="explicit_user",
+                tags=["recipient"])
+
+    class _RecipientCap:
+        name = "send_tool"
+        parameters_schema = {
+            "type": "object",
+            "properties": {"recipient": {"type": "string",
+                                         "description": "who to send it to"}},
+            "required": ["recipient"],
+        }
+
+    situation = {"profile": si.build_profile(vault)}
+    ctx = _ctx_with_produced([str(tmp_path / "out" / "report.csv")])
+    rep = rb.build_requirement_report([_Obj()], _RecipientCap(), situation, ctx,
+                                      vault=vault)
+    r = _by_path(rep.per_objective[1], "recipient")
+    assert r is not None
+    assert str(r.bound_value_ref or "").startswith("profile_fact:"), (
+        "a produced file MASKED the operator profile bind: bound %r via %r — the "
+        "G-LEARN promotion payoff is destroyed" % (r.bound_value_ref, r.source))
+    assert r.value_origin == "operator"
+    assert rb._needs_ask(r) is False, (
+        "the promoted operator fact must SILENT-bind; it is being re-asked")
+    assert not any(x.schema_path == "recipient" for x in rep.ask_bundle)
 
 
 def test_a_union_typed_string_leaf_still_reaches_the_oracle(tmp_path):

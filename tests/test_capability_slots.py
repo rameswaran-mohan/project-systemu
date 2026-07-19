@@ -255,6 +255,72 @@ def test_effectful_query_ranks_trusted_origin_above_keyword_stuffed_mcp(tmp_path
     assert top[0].tool_id == "b"                       # builtin outranks stuffed mcp
 
 
+# --------------------------------------------------------------------------- #
+# CAP-3 — the effectful-slot trust weighting ranks on the QUERY VERB.
+#
+# `capability_index` used to also carry a module-level `_EFFECTFUL_TAGS` set of
+# effect classes, commented as the CAP-3 trust weighting. It had ZERO readers (an
+# AST sweep over the repo found only its own assignment) — the shipped mechanism
+# is `_EFFECTFUL_VERBS`, keyed off the QUERY, per the §5.5.1 BUILD STATUS line
+# ("effectful-query → origin-trust > lexical"). It was deleted as misleading dead
+# code, and these two pins are the evidence for that deletion: #1 proves the live
+# query-verb path is reached and materially decides the ranking WITHOUT the
+# deleted constant, and #2 proves a row's OWN effect_tags must never drive it.
+#
+# The pin directly above cannot carry that weight: `_tokens()` returns a SET, so
+# its repeated-word "stuffed" name tokenizes to the same {create, issue} as the
+# builtin's. Lexical score TIES, and `trust` then decides in BOTH tuple branches —
+# so that test passes whether or not the effectful branch exists. Verified: forcing
+# `effectful = False` in `score_key` leaves it green. The fixtures below give the
+# untrusted row STRICTLY BETTER lexical overlap, so the two orderings diverge.
+# --------------------------------------------------------------------------- #
+
+def test_effectful_query_trust_outranks_a_STRICTLY_BETTER_lexical_match():
+    """#1 — the live `_EFFECTFUL_VERBS` (query-verb) path, mutation-detectable.
+
+    The mcp row wins on lexical overlap outright (3 tokens vs 2). Only the
+    effectful branch — which sorts `trust` AHEAD of `-lex` — can keep the builtin
+    on top. Disabling that branch flips the winner to the untrusted row, so this
+    fails if CAP-3's weighting regresses."""
+    builtin = ci.IndexRow(tool_id="b", name="account_manager",
+                          slots=["delete:account"], origin="builtin")
+    stuffed = ci.IndexRow(tool_id="m", name="delete_account_widget",
+                          slots=["delete:account"], origin="mcp:evil")
+    q = "delete account widget"
+
+    # precondition: the untrusted row really does have the BETTER lexical score,
+    # so a pass cannot be an artifact of a tie (the flaw in the pin above).
+    lex = lambda r: len(ci._tokens(q) & ci._tokens(r.name, " ".join(r.slots)))
+    assert lex(stuffed) > lex(builtin), "fixture must not tie on lexical overlap"
+
+    assert ci.rank([stuffed, builtin], q)[0].tool_id == "b"
+
+
+def test_a_rows_OWN_effect_tags_never_trigger_the_trust_weighting():
+    """#2 — the remove-not-wire decision, locked in.
+
+    Wiring the deleted `_EFFECTFUL_TAGS` would have meant a row's self-declared
+    effect_tags decide whether it gets trust protection — letting an untrusted
+    tool influence its own trust weight with the very content CAP-3 exists to
+    discount. Here the mcp row carries money_move/delete/send_message (members of
+    the deleted set) on a NON-effectful query and still wins on lexical merit; it
+    must NOT be promoted by its own tags."""
+    builtin = ci.IndexRow(tool_id="b", name="account_info",
+                          slots=["read:account"], origin="builtin")
+    tagged = ci.IndexRow(tool_id="m", name="widget_account_widget",
+                         slots=["read:account"], origin="mcp:evil",
+                         effect_tags=["money_move", "delete", "send_message"])
+    assert ci.rank([tagged, builtin], "account widget")[0].tool_id == "m"
+
+    # and effect_tags are inert in the key itself: two otherwise-identical rows
+    # differing ONLY in effect_tags score identically.
+    plain = ci.IndexRow(tool_id="same", name="send_email",
+                        slots=["send:email"], origin="builtin")
+    heavy = ci.IndexRow(tool_id="same", name="send_email", slots=["send:email"],
+                        origin="builtin", effect_tags=["money_move", "irreversible"])
+    assert ci.score_key(plain, "send an email") == ci.score_key(heavy, "send an email")
+
+
 def test_description_is_not_a_ranking_signal(tmp_path):
     # a tool whose only overlap is in its (tool-controlled) description must not
     # outrank one matching on name/slot.

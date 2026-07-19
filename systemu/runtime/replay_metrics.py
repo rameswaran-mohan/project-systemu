@@ -164,6 +164,119 @@ def load_ask_corpus(vault) -> List[Dict[str, Any]]:
         return []
 
 
+# ── R-A16 / IMPL-5: the realized TAINT-CLAMP count ────────────────────────────
+#
+# WHY THIS IS RECORDED AT ALL. The prompt-channel clamp
+# (``requirement_binder._provided_value_is_content_seeded``) converts a would-be silent
+# bind into an operator confirm. Every such conversion is a real friction cost paid by
+# the operator, and until now it was INVISIBLE: nothing counted it, so the only way to
+# discover that the clamp had begun firing on ordinary values was for an operator to
+# notice systemu had got noticeably more annoying. The cost was measured at up to 92.5%
+# of an ordinary 40-value panel on an aged vault before it was bounded — a number that
+# should never have been discoverable only by adversarial review.
+#
+# It is bounded now (``_PROMPT_FACT_WINDOW``), but the input to that bound is operator
+# content, so the rate still MOVES with what the operator's recent facts happen to say.
+# Counting it is what makes a future regression show up as a number instead of as an
+# unexplained rise in asks — and it is the same reason the avoidable-ask corpus exists.
+#
+# OBSERVABILITY-ONLY, append-only, never raises, and deliberately records NO VALUE — a
+# clamped value is by definition content-derived and may hold anything, including a
+# secret; only the fact of a clamp and the corpus size that produced it are kept.
+
+def _taint_clamp_corpus_path(vault) -> Path:
+    return Path(vault.root) / "audit" / "taint_clamp_corpus.jsonl"
+
+
+def record_taint_clamp(vault, *, corpus_size: int = 0, tool_name: str = "") -> None:
+    """Append one realized IMPL-5 taint clamp. NEVER raises and never records the
+    value — see the note above. ``corpus_size`` is the number of tainted facts in the
+    window that produced the match, so a rising clamp rate can be read against a rising
+    corpus rather than guessed at."""
+    try:
+        if vault is None:
+            return
+        _append_line(_taint_clamp_corpus_path(vault),
+                     {"corpus_size": int(corpus_size or 0),
+                      "tool_name": str(tool_name or "")})
+    except Exception:
+        pass
+
+
+def load_taint_clamp_corpus(vault) -> List[Dict[str, Any]]:
+    """All recorded taint clamps. Defensive: absent/broken file ⇒ []."""
+    try:
+        p = _taint_clamp_corpus_path(vault)
+        if not p.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def taint_clamp_report(vault) -> Dict[str, Any]:
+    """The realized prompt-channel clamp count — the friction the IMPL-5 clamp actually
+    charged the operator. Never raises.
+
+    Every row is coerced INDIVIDUALLY and defensively. ``record_taint_clamp`` writes
+    ints, but this reads a file on disk that can be truncated, hand-edited or corrupted
+    like any other corpus here, and a bare ``int(r["corpus_size"])`` over a non-numeric
+    row raises ValueError — which would propagate through ``avoidable_ask_report`` and
+    take down a SHIPPED DEC-7 metric on account of one bad line in an
+    observability-only sidecar. One unreadable row must cost its own count, nothing
+    more."""
+    sizes: List[int] = []
+    try:
+        rows = load_taint_clamp_corpus(vault)
+        for r in rows:
+            try:
+                sizes.append(int(r.get("corpus_size") or 0))
+            except Exception:
+                continue
+        return {
+            "clamp_count": len(rows),
+            "max_corpus_size": max(sizes) if sizes else 0,
+            "window": _prompt_fact_window(),
+        }
+    except Exception:
+        return {"clamp_count": 0, "max_corpus_size": 0, "window": 0}
+
+
+def _prompt_fact_window() -> int:
+    """The binder's corpus bound, read from its owner so the report can never quote a
+    stale constant. Defensive: an import failure yields 0 (⇒ "unknown"), never raises."""
+    try:
+        from systemu.runtime.requirement_binder import _PROMPT_FACT_WINDOW
+        return int(_PROMPT_FACT_WINDOW)
+    except Exception:
+        return 0
+
+
+def format_taint_clamp(report: Dict[str, Any]) -> List[str]:
+    r = report or {}
+    n = int(r.get("clamp_count", 0) or 0)
+    win = int(r.get("window", 0) or 0)
+    return [
+        f"Prompt-channel taint clamps: {n}"
+        + (f"  (corpus window: most-recent {win} facts)" if win else ""),
+        "  (provided tool-call params converted from a silent bind to an operator",
+        "   confirm because the value appeared in a content_derived user_fact the",
+        "   prompts carried. Each one is real operator friction; the count is bounded",
+        "   by the window but still moves with what the recent facts say.)",
+    ]
+
+
 # ── R-A16 / G-LEARN slice-2: the ANSWER-LINKED avoidable-ask signal (§5.9) ────
 #
 # §5.9: "When the operator answers an input/decision/capability ask with something
@@ -1026,6 +1139,14 @@ def avoidable_ask_report(vault) -> Dict[str, Any]:
         # the proxy above but never blended into it: one is directional, the
         # resolvable-confirmed sub-case of the other is definitive.
         "answer_linked": answer_linked_ask_report(vault),
+        # R-A16 / IMPL-5 — asks CAUSED by the prompt-channel taint clamp. Reported
+        # beside the others and never folded in: these are not asks systemu could have
+        # avoided by trying harder, they are asks a SAFETY control deliberately added.
+        # Blending them into the avoidable rate would score a working control as a
+        # defect. Kept adjacent because they answer the same operator question — "why
+        # is it asking me so much?" — and this is the one contributor that used to be
+        # unmeasurable.
+        "taint_clamp": taint_clamp_report(vault),
     }
 
 
@@ -1044,6 +1165,9 @@ def format_avoidable_ask(report: Dict[str, Any]) -> List[str]:
     al = r.get("answer_linked")
     if isinstance(al, dict):
         lines.extend(format_answer_linked_ask(al))
+    tc = r.get("taint_clamp")
+    if isinstance(tc, dict):
+        lines.extend(format_taint_clamp(tc))
     return lines
 
 
