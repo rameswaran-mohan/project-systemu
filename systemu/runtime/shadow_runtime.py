@@ -4306,7 +4306,8 @@ class ShadowRuntime:
         """R-A13a §5.6 — one INPUT HarnessRequest for a cross-objective ask_bundle, each
         requirement mapped to a form slot keyed by its FULL schema_path (NOT the leaf —
         the leaf would collide same-named nested paths and lose nesting). Mirrors the
-        missing_required INPUT shape (:7381-7439): carries requested_schema + pending_tool
+        missing_required INPUT shape built in ``_run_shadow_loop`` (search
+        ``missing_required``): carries requested_schema + pending_tool
         so the SAME resume rail re-dispatches with the operator's answers nested back in.
         Returns None when the bundle yields no form slot."""
         from systemu.core.models import HarnessRequest, HarnessKind
@@ -4314,6 +4315,16 @@ class ShadowRuntime:
             elicitation_schema_from_fields, split_secret_fields,
         )
         fields = []
+        # R-A16 §5.9 — the ask-time requirement snapshot for the answer-linked
+        # avoidable-ask signal. It MUST be stamped here: the Requirement objects are
+        # local to the mid-loop binder and die at the suspend (only ``spec`` survives
+        # into the sticky note → the operator card → the grant reconciler), and the
+        # resume path never re-derives them — ``param_answers`` comes back as bare
+        # schema_path→value strings with no confidence / value_origin / bound_value_ref.
+        # So an answer-time-only join is impossible; the join key has to travel.
+        # requirement_snapshot() refuses credential/secret-mode requirements and
+        # digests the bound value, so nothing secret enters this (plaintext) spec.
+        _req_snaps = []
         for r in (ask_bundle or []):
             sp = getattr(r, "schema_path", None)
             if not sp:
@@ -4331,17 +4342,27 @@ class ShadowRuntime:
             if getattr(r, "kind", None) == "credential":
                 f["format"] = "password"          # → is_secret_field ⇒ URL-mode
             fields.append(f)
+            try:
+                from systemu.runtime.replay_metrics import requirement_snapshot
+                _snap = requirement_snapshot(r)
+                if _snap:
+                    _req_snaps.append(_snap)
+            except Exception:
+                pass                              # observability-only — never block a card
         if not fields:
             return None
         form_fields, secret_fields = split_secret_fields(fields)
+        _spec = {
+            "question": (f"'{tool_name}' needs {len(fields)} value(s) to proceed."),
+            "requested_schema": elicitation_schema_from_fields(form_fields),
+            "secret_fields": [f["name"] for f in secret_fields],
+            "pending_tool": {"tool_name": tool_name, "parameters": dict(parameters or {})},
+        }
+        if _req_snaps:
+            _spec["requirement_snapshot"] = _req_snaps
         return HarnessRequest(
             kind=HarnessKind.INPUT,
-            spec={
-                "question": (f"'{tool_name}' needs {len(fields)} value(s) to proceed."),
-                "requested_schema": elicitation_schema_from_fields(form_fields),
-                "secret_fields": [f["name"] for f in secret_fields],
-                "pending_tool": {"tool_name": tool_name, "parameters": dict(parameters or {})},
-            },
+            spec=_spec,
             rationale=(f"Requirements for '{tool_name}': "
                        f"{', '.join(f['name'] for f in fields)}."),
             fallback=reasoning or "",

@@ -269,12 +269,31 @@ def surface_ask_bundle_requirement(req: Any, *, vault=None, config=None) -> Dict
     message = f"Input needed for '{leaf}'."
     if rationale:
         message = f"{message} {rationale}"
-    return resolve_structured_input(
+    envelope = resolve_structured_input(
         message=message,
         requested_schema=schema,
         vault=vault,
         config=config,
     )
+    # R-A16 / G-LEARN §5.9 — the ANSWER-LINKED avoidable-ask signal. This is the ONE
+    # frame where the full Requirement (confidence / value_origin / bound_value_ref)
+    # and the operator's answer coexist, so it is the natural producer. Only an
+    # ``accept`` is an answer. OBSERVABILITY-ONLY: wrapped so a recorder hiccup can
+    # never change what this rail returns (the credential/secret exclusion lives in
+    # ``requirement_snapshot``, which refuses to snapshot a secret-mode requirement).
+    try:
+        if vault is not None and isinstance(envelope, dict) \
+                and envelope.get("action") == "accept":
+            from systemu.runtime import replay_metrics as _rm
+            _rm.record_ask_avoidable(
+                vault,
+                ask_id=_elicitation_request_id(message, schema),
+                snapshot=_rm.requirement_snapshot(req),
+                answer=(envelope.get("content") or {}).get(leaf),
+            )
+    except Exception:
+        pass
+    return envelope
 
 
 def resolve_structured_input(

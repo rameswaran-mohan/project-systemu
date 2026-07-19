@@ -145,8 +145,12 @@ def _reask_satisfied_precede(
                         and getattr(req, "kind", None) == kind
                         and getattr(req, "schema_path", None) == schema_path
                         and getattr(req, "state", None) == "have"):
+                    # bound_value_digest goes with the ref: it is a digest of the value
+                    # THAT ref stood for, so leaving it behind would let a stale digest
+                    # be compared against a later answer (R-A16 §5.9).
                     _new_reqs.append(req.model_copy(
-                        update={"state": "missing", "bound_value_ref": None}))
+                        update={"state": "missing", "bound_value_ref": None,
+                                "bound_value_digest": None}))
                 else:
                     _new_reqs.append(req)
             out.append(o.model_copy(update={"requirements": _new_reqs}))

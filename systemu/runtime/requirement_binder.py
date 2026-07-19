@@ -170,7 +170,7 @@ def _bind_provided_params(bc: _BindCtx, key: str, spec: dict,
     val = _descend_provided(params, segs)
     if val is None:                               # absent / None ⇒ not a supplied value
         return None
-    return (f"provided:{'/'.join(str(s) for s in segs)}", "provided", _SYSTEMU, 1.0)
+    return (f"provided:{'/'.join(str(s) for s in segs)}", "provided", _SYSTEMU, 1.0, val)
 
 
 # ── source #1: a granted-root salient FileHandle ─────────────────────────────
@@ -189,7 +189,8 @@ def _bind_filehandle(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, 
     if verdict.state != "resolvable" or not verdict.referent:
         return None                                   # → falls through → input/missing ask-for-path
     # CLAMP to content_derived regardless of score (IMPL-5 fail-untrusted).
-    return (f"file:{verdict.referent}", "situation", _CONTENT_DERIVED, float(verdict.confidence))
+    return (f"file:{verdict.referent}", "situation", _CONTENT_DERIVED,
+            float(verdict.confidence), verdict.referent)
 
 
 # ── source #2: run-context / a prior objective's output ──────────────────────
@@ -203,7 +204,7 @@ def _bind_run_context(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str,
     for p in produced:
         if isinstance(p, str) and p:
             # heuristic, low-confidence, content_derived → always an ask
-            return (f"run_context:{p}", "run_context", _CONTENT_DERIVED, 0.5)
+            return (f"run_context:{p}", "run_context", _CONTENT_DERIVED, 0.5, p)
     return None
 
 
@@ -222,7 +223,9 @@ def _bind_inventory_entry(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[
     creds = _situation_list(bc.situation, "credentials")
     for name in creds or []:
         if isinstance(name, str) and name and (name.lower() in kl or kl in name.lower()):
-            return (f"credential:{name}", "situation", _OPERATOR, 0.85)
+            # NO resolved value: the bind is a credential NAME, and the value behind it
+            # is a secret that must never be digested into an observability corpus.
+            return (f"credential:{name}", "situation", _OPERATOR, 0.85, None)
 
     # services — a leaf about an account / service identity. TWO matching services
     # (two acting identities) is an IMPL-8 DECISION, not a silent pick.
@@ -239,7 +242,8 @@ def _bind_inventory_entry(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[
                 # clamps to content_derived (its claimed origin_class is unvalidated str
                 # and can be forged); never launders a forged 'operator' into a silent bind.
                 origin = _entry_origin(s)
-                return (f"service:{_get(s, 'name')}#{acct}", "situation", origin, 0.85)
+                return (f"service:{_get(s, 'name')}#{acct}", "situation", origin,
+                        0.85, acct)
 
     # declared_intents / capabilities — a curated-first name match.
     for field_name in ("capabilities", "declared_intents"):
@@ -258,7 +262,8 @@ def _bind_inventory_entry(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[
             # claimed origin_class is unvalidated str). A genuinely systemu_authored value
             # comes from source #5 (schema default), not a fuzzy inventory name match.
             origin = _entry_origin(best)
-            return (f"inventory:{field_name}", "situation", origin, 0.8)
+            return (f"inventory:{field_name}", "situation", origin, 0.8,
+                    _get(best, "name") or _get(best, "tool_id"))
     return None
 
 
@@ -309,7 +314,7 @@ def _bind_profile(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, str
     for f in _PROFILE_SPINE:
         val = profile.get(f)
         if val and (f in kl or kl in f or _key_token_overlap(kl, f)):
-            return (f"profile:{f}", "operator_profile", _OPERATOR, 1.0)
+            return (f"profile:{f}", "operator_profile", _OPERATOR, 1.0, val)
 
     # user_facts — scan by a tag OR key-token match; carry the fact's confidence.
     facts = profile.get("user_facts")
@@ -325,8 +330,13 @@ def _bind_profile(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, str
                 conf = _get(fact, "confidence")
                 conf = float(conf) if isinstance(conf, (int, float)) else 1.0
                 fid = _get(fact, "id") or "fact"
+                # NO resolved value: a user_fact is a SENTENCE ("my default repo is
+                # acme/prod"), not the parameter value. The bind names a fact id and
+                # leaves extraction to the operator, so there is nothing to compare an
+                # answer against. Digesting the sentence would guarantee a mismatch and
+                # report every profile-fact ask as "the binder's value was wrong".
                 return (f"profile_fact:{fid}", "operator_profile",
-                        _fact_origin(fact), conf)
+                        _fact_origin(fact), conf, None)
     return None
 
 
@@ -405,17 +415,30 @@ def _bind_schema_default(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[s
     if not isinstance(spec, dict):
         return None
     if "default" in spec and spec.get("default") is not None:
-        return (f"schema_default:{key}", "schema", _SYSTEMU, 1.0)
+        return (f"schema_default:{key}", "schema", _SYSTEMU, 1.0, spec.get("default"))
     if "const" in spec:
-        return (f"schema_const:{key}", "schema", _SYSTEMU, 1.0)
+        return (f"schema_const:{key}", "schema", _SYSTEMU, 1.0, spec.get("const"))
     enum = spec.get("enum")
     if isinstance(enum, list) and enum:
-        return (f"schema_enum0:{key}", "schema", _SYSTEMU, 1.0)
+        return (f"schema_enum0:{key}", "schema", _SYSTEMU, 1.0, enum[0])
     return None
 
 
 # the ordered bind pipeline (spec §5.3). R-A12c: _bind_provided_params is FIRST — a
 # value the current tool-call already supplied wins over inventory / schema default.
+#
+# BIND TUPLE CONTRACT: ``(bound_value_ref, source, value_origin, confidence,
+# resolved_value)``.
+#   * ``bound_value_ref`` is a namespaced HANDLE naming the SOURCE (``file:<path>``,
+#     ``profile:<field>``, …) — it is NOT the value and can never equal an answer.
+#   * ``resolved_value`` (R-A16 §5.9) is the VALUE the handle stands for — what the
+#     operator would have to type to confirm this bind. It is consumed ONLY to compute
+#     a keyed, non-reversible digest (``Requirement.bound_value_digest``) and is never
+#     stored, logged or persisted. A source that binds an IDENTIFIER rather than an
+#     extractable value (``credential:`` — a secret; ``profile_fact:`` — a sentence)
+#     returns ``None`` here, which degrades the §5.9 signal to candidate-only rather
+#     than manufacturing a guaranteed mismatch.
+# A legacy 4-tuple is tolerated by ``_bind_one_leaf`` (⇒ no digest).
 _SOURCES = (_bind_provided_params, _bind_filehandle, _bind_run_context,
             _bind_inventory_entry, _bind_profile, _bind_schema_default)
 
@@ -513,7 +536,7 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
                               schema_path=schema_path, state="have", source="schema",
                               value_origin=_SYSTEMU,
                               bound_value_ref=f"schema_{schema_value_kind or 'value'}:{key}",
-                              confidence=1.0,
+                              confidence=1.0, resolved_value=schema_value,
                               rationale=f"schema {schema_value_kind or 'value'} (systemu_authored)")
             return
 
@@ -542,7 +565,9 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
                               rationale="no source bound this required leaf (schema-diff gap)")
             return
 
-        bound_ref, source, value_origin, confidence = bound
+        # 5-tuple contract (see _SOURCES); a legacy 4-tuple binds with NO value digest.
+        bound_ref, source, value_origin, confidence = bound[:4]
+        resolved_value = bound[4] if len(bound) > 4 else None
         if is_path:
             slot_kind = "input"
         elif source == "situation" and str(bound_ref).startswith("credential:"):
@@ -554,6 +579,7 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
         _emit_requirement(bc, kind=slot_kind, schema_path=schema_path, state=state,
                           source=source, value_origin=value_origin,
                           bound_value_ref=bound_ref, confidence=float(confidence),
+                          resolved_value=resolved_value,
                           rationale=("content_derived → one-click operator confirm "
                                      "(never silent-bound)"
                                      if _coerce_origin(value_origin) == _CONTENT_DERIVED
@@ -572,18 +598,56 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
 
 
 def _emit_requirement(bc: _BindCtx, *, kind, schema_path, state, source, value_origin,
-                      bound_value_ref, confidence, rationale) -> None:
+                      bound_value_ref, confidence, rationale,
+                      resolved_value=None) -> None:
     """Construct + append one Requirement, CLAMPING ``value_origin`` to a canonical
     taint value first (Finding 2 / #2 fail-safe): a non-canonical origin can never
     raise a ValidationError that propagates to the outer except and empties the whole
-    objective. ``None`` (a genuine no-value gap) is preserved as-is."""
+    objective. ``None`` (a genuine no-value gap) is preserved as-is.
+
+    ``resolved_value`` is digested (never stored) into ``bound_value_digest``."""
     from systemu.core.models import Requirement
     vo = None if value_origin is None else _coerce_origin(value_origin)
     bc.reqs.append(Requirement(
         kind=kind, schema_path=schema_path, state=state, source=source,
         value_origin=vo, bound_value_ref=bound_value_ref, confidence=float(confidence),
+        bound_value_digest=_value_digest(bc, kind=kind, schema_path=schema_path,
+                                         value=resolved_value),
         rationale=rationale,
     ))
+
+
+def _value_digest(bc: _BindCtx, *, kind, schema_path, value) -> Optional[str]:
+    """R-A16 §5.9 — the KEYED, non-reversible digest of a bind's RESOLVED VALUE.
+
+    THE ONLY thing the value is used for. It is never stored, logged or persisted; the
+    digest is what crosses the suspend inside a card spec, so the answer-side can ask
+    "did the operator confirm what the binder held?" — a question ``bound_value_ref``
+    (a source HANDLE) cannot answer.
+
+    SECRET BOUNDARY AT THE PRODUCER: a credential-kind or secret-mode leaf gets NO
+    digest, using the codebase's canonical secret marker (via ``replay_metrics``, which
+    delegates to ``elicitation.is_secret_field``) rather than a bespoke rule. So no
+    secret-derived datum is even computed here, let alone carried.
+
+    Observability-only and TOTALLY defensive: an unavailable vault, an unkeyable
+    value, any failure at all ⇒ ``None`` (the §5.9 row degrades to candidate-only).
+    A metric must never be able to perturb a bind."""
+    if value is None:
+        return None
+    try:
+        from systemu.runtime import replay_metrics as _rm
+        if str(kind or "").lower() == "credential":
+            return None
+        if _rm._is_secret_path(str(schema_path or ""), str(kind or "")):
+            return None
+        vault = getattr(getattr(bc, "ctx", None), "vault", None)
+        if vault is None:
+            return None
+        return _rm.value_ref(value, vault)
+    except Exception:
+        logger.debug("[binder] value digest skipped for %s", schema_path, exc_info=True)
+        return None
 
 
 def _s4_stamp_mode() -> str:

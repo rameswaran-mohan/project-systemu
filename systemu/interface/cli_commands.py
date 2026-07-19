@@ -1648,12 +1648,20 @@ def debug_avoidable_forge(ctx):
 @debug_group.command("avoidable-ask")
 @click.pass_context
 def debug_avoidable_ask(ctx):
-    """R-A13.5 · §10 — the avoidable-ask signal over the accreted ask corpus.
+    """§10 / §5.9 — the avoidable-ask signals over the accreted ask corpora.
 
-    Deterministic (never an LLM judge): counts harness asks made with no recorded
-    resolution attempt (zero tool-attempts + no blocking signal) — a §10 lower-bound
-    that decides DEC-7 (the quick-lane ask cap), reported beside the avoidable-forge
-    rate. The corpus accretes from real runs at the ask point. READ-ONLY.
+    Deterministic (never an LLM judge), READ-ONLY. Two signals, LABELLED APART:
+
+    \b
+      * R-A13.5 DIRECTIONAL proxy — harness asks made with no recorded resolution
+        attempt (zero tool-attempts + no blocking signal); a DEC-7 input, accreted at
+        the ASK point.
+      * R-A16 / G-LEARN §5.9 ANSWER-LINKED signal — accreted at the ANSWER point, so
+        each event knows what the operator actually chose. Its resolvable-confirmed
+        sub-case (the binder HELD the value and asked only for the T_high /
+        content_derived confirm) is DEFINITIVE, not a proxy; missing-answered is
+        reported separately as a candidate only. Includes the §5.9 ask->resolve
+        conversion trend. Credential asks are excluded by design.
     """
     from systemu.runtime.replay_metrics import avoidable_ask_report, format_avoidable_ask
     _, vault = _get_vault_and_config(ctx)

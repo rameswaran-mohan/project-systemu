@@ -234,6 +234,56 @@ def _map_grant_payload(harness_kind: str, materialise: dict) -> dict:
     return payload
 
 
+def record_bundled_ask_outcomes(vault, dctx, answers) -> None:
+    """R-A16 / G-LEARN §5.9 — the ANSWER-TIME join for the mid-loop bundled scope card.
+
+    The card's Requirement objects die at the suspend (``shadow_runtime`` builds them
+    mid-loop and only ``spec`` survives into the sticky note / operator card / this
+    reconciler), and the resume path never re-derives them — ``param_answers`` comes
+    back as bare ``schema_path → value`` strings. So the card STAMPS a secret-free
+    ``requirement_snapshot`` at build time (``_build_bundled_scope_card``) and this is
+    where it rejoins the operator's answers, keyed by the same full ``schema_path``.
+
+    Cards from the OTHER INPUT rails (missing_required, the B9 runtime fold, scroll
+    param-substitution) carry no stamp ⇒ strict no-op; never a guess.
+
+    ONE ANSWERED PATH ⇒ ONE ROW. The stamp can carry SEVERAL snapshots for the same
+    ``schema_path``: ``build_requirement_report`` deliberately keeps
+    same-path/different-``bound_value_ref`` asks distinct (that ref is in its dedupe
+    key), while ``elicitation_schema_from_fields`` collapses same-named fields into ONE
+    schema property. So the operator sees one form slot and answers it once, and the
+    pre-fix loop wrote one row PER SNAPSHOT — halving ``definitive_rate`` and recording
+    a ``necessary_overridden`` observation nobody made. Group by ``schema_path`` first;
+    the recorder classifies the group as confirmed if ANY of its candidates matched.
+
+    OBSERVABILITY-ONLY, append-only, NEVER raises — the credential/secret exclusion is
+    enforced inside ``replay_metrics`` (both at snapshot build and at record)."""
+    try:
+        snaps = ((dctx or {}).get("spec") or {}).get("requirement_snapshot")
+        if not isinstance(snaps, list) or not snaps:
+            return
+        if not isinstance(answers, dict) or not answers:
+            return
+        from systemu.runtime import replay_metrics as _rm
+        ask_id = str((dctx or {}).get("request_id", "") or "")
+        by_path: dict = {}                # insertion-ordered: file order is preserved
+        for snap in snaps:
+            if not isinstance(snap, dict):
+                continue
+            path = str(snap.get("schema_path", "") or "")
+            if not path:
+                continue
+            by_path.setdefault(path, []).append(snap)
+        for path, group in by_path.items():
+            answer = answers.get(path)
+            if answer is None or str(answer) == "":
+                continue          # unanswered slot — the signal is answer-linked
+            _rm.record_ask_avoidable(vault, ask_id=ask_id, snapshot=group, answer=answer)
+    except Exception:
+        logger.debug("[HarnessGrantReconciler] R-A16 ask-outcome record skipped",
+                     exc_info=True)
+
+
 def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> int:
     """Daemon-tick EXECUTOR for operator-resolved harness ESCALATE gates.
 
@@ -335,6 +385,9 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
         try:
             harness_kind = str(dctx.get("harness_kind") or "").lower()
             choice = str(decision.choice or "").strip().lower()
+            # R-A16 §5.9 — the coerced answers, stashed for the avoidable-ask record
+            # that fires only AFTER a successful dispatch (see below).
+            _ask_answers = None
 
             if choice in {"deny", "reject", "skip"}:
                 grant_payload = {
@@ -366,6 +419,7 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
                     except Exception:
                         _raw = {}
                     _coerced = param_answers_from_choice(_req_schema, _raw)
+                    _ask_answers = _coerced
                     if _pending:
                         # missing-param: merge the typed answers + re-dispatch the
                         # original tool call (which re-validates).
@@ -445,6 +499,13 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
             decision.context["harness_grant_dispatched"] = True
             vault.save_decision(decision)
             dispatched += 1
+
+            # R-A16 §5.9 — the ANSWER-TIME join for the bundled scope card. Deliberately
+            # AFTER the idempotency stamp: this reconciler retries a row whose dispatch
+            # raised, so recording at the coercion point would double-count the same
+            # answer on every retry. Here it fires exactly once per dispatched decision,
+            # and only for an answer that was actually applied to the run.
+            record_bundled_ask_outcomes(vault, dctx, _ask_answers)
         except Exception:
             logger.exception(
                 "[HarnessGrantReconciler] dispatch failed for decision %s "

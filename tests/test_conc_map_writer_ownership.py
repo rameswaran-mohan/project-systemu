@@ -82,8 +82,31 @@ WRITER_OWNERSHIP = {
         "allowed": {"runtime/shadow_runtime.py"},    # the shadow exec loop, at the ask point
         "def": "runtime/replay_metrics.py",
         "note": ("APPEND-only deterministic ask corpus (observability; the §10 avoidable-ask "
-                 "signal). O_APPEND line-atomic (records << PIPE_BUF) so concurrent shadow "
-                 "runs interleave whole lines safely. Any further writer needs a DEC-10 review."),
+                 "signal). Appends are SERIALIZED (process lock + best-effort OS file lock, "
+                 "then one os.write to an O_APPEND fd) so concurrent shadow runs interleave "
+                 "whole lines AND lose none. Any further writer needs a DEC-10 review."),
+    },
+    "R-A16 answer-linked ask corpus (<root>/audit/ask_avoidable.jsonl)": {
+        "call": "record_ask_avoidable(",
+        "allowed": {
+            "runtime/elicitation.py",   # the pre-loop B10 rail — Requirement + accept
+                                        # envelope in one frame (shadow exec thread)
+            "scheduler/jobs.py",        # the harness-grant reconciler — the bundled
+                                        # scope card's answer-time join (daemon thread)
+        },
+        "def": "runtime/replay_metrics.py",
+        "note": ("R-A16/G-LEARN §5.9 AskWasAvoidable events. APPEND-only, "
+                 "observability-only (never raises, never affects a run). Appends are "
+                 "SERIALIZED (process lock + best-effort OS file lock, then one "
+                 "os.write to an O_APPEND fd) so the two writer threads interleave "
+                 "whole lines AND lose none — a bare buffered append silently dropped "
+                 "~4% of rows under load. DELIBERATELY a separate file from "
+                 "ask_corpus.jsonl: folding answer-linked rows in would have them "
+                 "silently counted by avoidable_ask_report's no-attempt proxy (absent "
+                 "attempt fields default to 0), corrupting the shipped DEC-7 metric. "
+                 "Records REFS ONLY — credential/secret-mode asks are excluded at both "
+                 "requirement_snapshot() and record_ask_avoidable(). Any further "
+                 "writer needs a DEC-10 review."),
     },
     "CapabilitySlots index (<root>/capabilities/capability_index.json)": {
         "call": "reconcile_index(",

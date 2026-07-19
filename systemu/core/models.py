@@ -157,7 +157,19 @@ class Requirement(BaseModel):
     # IMMUTABLE taint: operator|systemu_authored|content_derived). IMPL-5 — copied
     # from the bind source, NEVER recomputed; content_derived never silent-binds.
     value_origin: Optional[Literal["operator", "systemu_authored", "content_derived"]] = None
-    bound_value_ref: Optional[str] = None  # a REFERENCE, never the raw value/secret
+    # A namespaced HANDLE naming where the value came from — `file:<path>`,
+    # `profile:<field>`, `run_context:<path>`, `schema_default:<key>`, … — never the
+    # raw value/secret. It identifies the SOURCE, so it is NOT comparable to a value.
+    bound_value_ref: Optional[str] = None
+    # R-A16 §5.9: a KEYED, non-reversible digest of the bind's RESOLVED VALUE
+    # (`replay_metrics.value_ref` — HMAC under a per-vault key). NEVER the value
+    # itself, and NEVER stamped for a credential/secret-mode leaf. This is what makes
+    # "did the operator confirm the binder's value?" answerable: `bound_value_ref` is a
+    # handle and can never equal an answer. Valid ONLY beside the handle the binder
+    # emitted — any rewrite of that handle (param-substitution, the runtime-fold
+    # re-ask flip) MUST clear this too, or the digest goes stale and a genuine
+    # confirm reads as an override.
+    bound_value_digest: Optional[str] = None
     confidence: float = 0.0                # feeds the T_high gate
     rationale: str = ""
 
