@@ -120,6 +120,19 @@ marker and are off by default; gate them on an env var
 (`SYSTEMU_RUN_REAL_LLM=1`) so contributors without an API key still
 get a green local run.
 
+### Real-keyring tests
+
+Credential-store tests use an in-memory fake keyring (see
+`tests/test_keyring_routing.py::_FakeKeyring`) so they never touch a
+real OS credential store. The one test that verifies the real
+`keyring` package integration against whatever backend the host
+actually has (Windows Credential Manager / macOS Keychain /
+SecretService) lives behind `@pytest.mark.real_keyring` and is off by
+default; gate it on `SYSTEMU_RUN_REAL_KEYRING=1`. This project
+routinely runs several agents concurrently against one machine, and
+the OS credential store is machine-global, not `tmp_path`-scoped, so
+leaving it on by default would make concurrent local/CI runs flaky.
+
 ---
 
 ## Documentation

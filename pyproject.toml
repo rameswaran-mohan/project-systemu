@@ -134,6 +134,7 @@ sharing_on = "sharing_on.cli:main"
 
 [tool.pytest.ini_options]
 markers = [
+    "real_keyring: exercises the REAL OS credential store (Windows Credential Manager / macOS Keychain / SecretService) instead of the fake keyring double — opt-in via SYSTEMU_RUN_REAL_KEYRING=1, off by default (machine-global state, not tmp_path-scoped)",
     "linux_only: tests that only run on Linux (playwright, posix-only paths)",
     "docker_required: tests that need a docker daemon",
     "e2e: end-to-end live tests (skipped by default)",

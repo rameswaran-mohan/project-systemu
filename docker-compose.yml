@@ -26,6 +26,8 @@
 #   huey_data     SQLite Huey broker file (docker-local only)
 #   vault_data    legacy JSON vault (docker-local migration window)
 #   redis_data    Redis AOF (docker-enterprise only)
+#   pip_cache     pip download cache for ephemeral tool containers
+#                 (docker-sandbox only — see the `name:` override below)
 
 services:
 
@@ -345,4 +347,16 @@ volumes:
   pg_data:
   huey_data:
   redis_data:
+  # DockerBackend (systemu/runtime/backend/docker.py) mounts this cache into
+  # each EPHEMERAL tool container via a bare `docker run -v
+  # systemu_pip_cache:/root/.cache/pip` — never through compose — so the
+  # actual Docker volume it creates/reuses is the literal name
+  # "systemu_pip_cache", with NO project prefix. Without this `name:`
+  # override, compose would instead create/track
+  # "<project>_pip_cache", a distinct, never-referenced volume that
+  # `docker compose down -v` would happily remove while leaving the real
+  # one (the one the tool containers actually use) orphaned. The override
+  # makes both paths resolve to the SAME literal volume, so `down -v`
+  # actually cleans up the cache the tools use.
   pip_cache:
+    name: systemu_pip_cache

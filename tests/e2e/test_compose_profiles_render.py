@@ -146,3 +146,31 @@ def test_enterprise_dashboard_depends_on_healthy_services(stage):
         assert deps["redis"]["condition"] == "service_healthy"
     else:
         assert "postgres" in deps and "redis" in deps
+
+
+def test_docker_sandbox_pip_cache_volume_matches_the_backend_default(stage):
+    """DockerBackend (systemu/runtime/backend/docker.py) mounts the pip cache
+    into each EPHEMERAL tool container via a bare `docker run -v
+    <name>:/root/.cache/pip` — never through compose. That `docker run` call
+    creates the volume under its LITERAL name (no compose project prefix), so
+    the compose-declared `pip_cache` volume must carry a `name:` override
+    equal to that same literal name. Otherwise compose creates/tracks its own
+    "<project>_pip_cache" — a distinct volume the tool containers never
+    touch — and `docker compose down -v` cleans up the wrong one, orphaning
+    the cache the tools actually use."""
+    if not _has_compose_v2():
+        pytest.skip("docker compose V2 plugin not available")
+    import inspect
+    from systemu.runtime.backend.docker import DockerBackend
+
+    backend_default = inspect.signature(DockerBackend.__init__).parameters[
+        "pip_cache_volume"
+    ].default
+
+    cfg = _config_yaml(stage, profile="docker-sandbox")
+    declared = cfg["volumes"]["pip_cache"]
+    assert declared.get("name") == backend_default, (
+        f"compose's pip_cache volume resolves to {declared.get('name')!r} but "
+        f"DockerBackend's ephemeral tool containers mount {backend_default!r} — "
+        "`docker compose down -v` would clean up the wrong volume"
+    )

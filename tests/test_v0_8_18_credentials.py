@@ -28,16 +28,99 @@ class TestCredentialRequirement:
         assert t.requires_credentials[0].key == "API_KEY"
 
 
+class _FakeKeyring:
+    """An in-memory OS-keyring stand-in — hermetic, no real Credential
+    Manager / Keychain / SecretService writes. Mirrors the fake already used
+    by tests/test_keyring_routing.py; assigning it to CredentialStore._keyring
+    is the pattern this repo already uses to isolate this exact external
+    state (see also test_file_fallback_when_no_keyring below, which does the
+    same by assigning ``None``). It never touches ``usable_keyring()`` or
+    ``platform_profile.keyring_backend`` — the privacy-surface report of
+    which backend is "really" in use — so it cannot make that surface lie;
+    it only stands in for CredentialStore's own instance-local reference to
+    a backend.
+    """
+
+    def __init__(self):
+        self.store = {}
+
+    def get_password(self, service, key):
+        return self.store.get((service, key))
+
+    def set_password(self, service, key, value):
+        self.store[(service, key)] = value
+
+    def delete_password(self, service, key):
+        self.store.pop((service, key), None)
+
+
 class TestCredentialStore:
     def test_keyring_roundtrip(self, tmp_path):
+        # Hermetic by construction: a fake backend swapped in AFTER
+        # construction (same pattern as test_file_fallback_when_no_keyring
+        # just below). Before this fix, CredentialStore's real
+        # _init_keyring() wired up whatever OS keyring backend is actually
+        # usable on the host (WinVaultKeyring / macOS Keychain /
+        # SecretService), and set()/delete() round-tripped "POC_TEST_KEY"
+        # through the REAL, machine-global store under service "systemu" —
+        # confirmed by execution: `keyring.set_password("systemu",
+        # "POC_TEST_KEY", ...)` created a real Windows Credential Manager
+        # entry (`cmdkey /list` showed `Target: LegacyGeneric:target=systemu`,
+        # `User: POC_TEST_KEY`). Two agents running this test at once raced
+        # that ONE global entry: reproduced directly — concurrent
+        # set/get/delete against the real store intermittently returned a
+        # PEER's value or resurrected an entry after this test's own delete.
+        # A real integration check against the actual OS store is preserved,
+        # opt-in, below as test_keyring_roundtrip_real_os_store.
         from systemu.runtime.credentials.store import CredentialStore
         s = CredentialStore(base_dir=tmp_path)
+        s._keyring = _FakeKeyring()
         s.set("POC_TEST_KEY", "secret-123")
         assert s.get("POC_TEST_KEY") == "secret-123"
         assert s.status("POC_TEST_KEY")["present"] is True
         assert s.status("POC_TEST_KEY")["last4"] == "-123"
         s.delete("POC_TEST_KEY")
         assert s.get("POC_TEST_KEY") is None
+
+    @pytest.mark.real_keyring
+    @pytest.mark.skipif(
+        os.environ.get("SYSTEMU_RUN_REAL_KEYRING") != "1",
+        reason="opt-in: writes to the REAL OS credential store (Windows "
+                "Credential Manager / macOS Keychain / SecretService), which "
+                "is machine-global rather than tmp_path-scoped. This repo "
+                "routinely runs several agents concurrently on one machine, "
+                "so a shared literal key collides across runs. Set "
+                "SYSTEMU_RUN_REAL_KEYRING=1 to opt in (mirrors the "
+                "@pytest.mark.real_llm / SYSTEMU_RUN_REAL_LLM convention in "
+                "CONTRIBUTING.md).",
+    )
+    def test_keyring_roundtrip_real_os_store(self, tmp_path):
+        """Integration check that CredentialStore's real keyring path
+        actually round-trips against whatever OS backend `keyring` resolves
+        to on THIS host — the fake in test_keyring_roundtrip above proves the
+        CredentialStore logic but can never catch a real dependency/OS-API
+        regression (e.g. keyring package upgrade, WinVaultKeyring behavior
+        change). Isolated from concurrent runs via a per-invocation unique
+        key (never the shared literal "POC_TEST_KEY"), and guarantees
+        teardown of the real, machine-global entry even if an assertion
+        fails partway through."""
+        import uuid
+        from systemu.runtime.credentials.store import CredentialStore, usable_keyring
+
+        if usable_keyring() is None:
+            pytest.skip("no usable OS keyring backend on this host")
+
+        key = f"POC_TEST_KEY_REAL_{uuid.uuid4().hex}"
+        s = CredentialStore(base_dir=tmp_path)
+        assert s._keyring is not None, "expected the real keyring backend to be wired"
+        try:
+            s.set(key, "secret-123")
+            assert s.get(key) == "secret-123"
+            assert s.status(key)["present"] is True
+            assert s.status(key)["last4"] == "-123"
+        finally:
+            s.delete(key)
+        assert s.get(key) is None
 
     def test_file_fallback_when_no_keyring(self, tmp_path, monkeypatch):
         import systemu.runtime.credentials.store as st
