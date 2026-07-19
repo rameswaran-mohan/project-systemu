@@ -91,6 +91,35 @@ class ToolRow(Base):
     dry_run_evidence:      Mapped[dict]     = mapped_column(JSON, default=dict, nullable=True)
     last_successful_params: Mapped[list]    = mapped_column(JSON, default=list, nullable=True)
     evolution_history:     Mapped[list]     = mapped_column(JSON, default=list, nullable=True)
+    # ── Tool-model fields this row had stopped tracking ──────────────────────
+    # These existed on the Pydantic ``Tool`` for several releases but were never
+    # added here, so every one of them silently read back as its model DEFAULT on
+    # a SQL backend while the file vault (which persists the whole model as JSON)
+    # kept them. ``effect_tags`` is the load-bearing one: it feeds the action
+    # gate, so the SAME tool was governed differently depending on storage.
+    #
+    # They are added together ON PURPOSE. ``effect_tags`` and ``trusted_inprocess``
+    # currently cancel each other out — a forged money_move tool loses the tag
+    # that forces isolation, but also loses the trusted_inprocess=True that would
+    # let it skip isolation, so it still runs isolated. Persisting either one
+    # ALONE re-opens that hole (§13.3: forged money-capable code in-daemon at full
+    # privilege with an ambient secret). Do not split this set.
+    #
+    # All nullable so a pre-migration row reads NULL and ``_row_to_tool`` maps it
+    # back to the model default.
+    requires_credentials:  Mapped[list]     = mapped_column(JSON, default=list, nullable=True)
+    forged_by_execution_id: Mapped[str|None] = mapped_column(String, nullable=True)
+    grounding_inputs:      Mapped[list]     = mapped_column(JSON, default=list, nullable=True)
+    effect_tags:           Mapped[list]     = mapped_column(JSON, default=list, nullable=True)
+    external_verification_channel: Mapped[str|None] = mapped_column(String, nullable=True)
+    trusted_inprocess:     Mapped[bool]     = mapped_column(Boolean, default=False, nullable=True)
+    forge_reattempts:      Mapped[int]      = mapped_column(Integer, default=0, nullable=True)
+    forge_rejected:        Mapped[bool]     = mapped_column(Boolean, default=False, nullable=True)
+    is_action_tool:        Mapped[bool]     = mapped_column(Boolean, default=False, nullable=True)
+    toolset:               Mapped[str|None] = mapped_column(String, nullable=True)
+    max_result_size_chars: Mapped[int|None] = mapped_column(Integer, nullable=True)
+    timeout_seconds:       Mapped[int|None] = mapped_column(Integer, nullable=True)
+    check_fn_name:         Mapped[str|None] = mapped_column(String, nullable=True)
     created_at:           Mapped[datetime] = mapped_column(DateTime, default=func.now())
     updated_at:           Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 

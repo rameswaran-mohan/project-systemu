@@ -108,6 +108,17 @@ def _dt(val: Any) -> datetime:
     return utcnow()
 
 
+def _nn(val: Any, default: Any) -> Any:
+    """``default`` when the column is SQL NULL, else the stored value.
+
+    A row written before a column existed reads NULL, which must become the
+    model's default. This is deliberately NOT ``val or default``: ``0``, ``""``
+    and ``False`` are legitimate STORED values that ``or`` would silently
+    rewrite (a ``timeout_seconds`` of 0 is not an absent timeout).
+    """
+    return default if val is None else val
+
+
 def _scroll_to_row(s: Scroll) -> ScrollRow:
     data = s.model_dump(mode="json")
     return ScrollRow(
@@ -188,6 +199,22 @@ def _tool_to_row(t: Tool) -> ToolRow:
         dry_run_evidence=data.get("dry_run_evidence", {}),
         last_successful_params=data.get("last_successful_params", []),
         evolution_history=data.get("evolution_history", []),
+        # Fields this converter had stopped tracking — see the ToolRow comment.
+        # Read off ``data`` (the JSON dump) so nested models like
+        # CredentialRequirement arrive already serialized.
+        requires_credentials=data.get("requires_credentials", []),
+        forged_by_execution_id=data.get("forged_by_execution_id"),
+        grounding_inputs=data.get("grounding_inputs", []),
+        effect_tags=data.get("effect_tags", []),
+        external_verification_channel=data.get("external_verification_channel"),
+        trusted_inprocess=data.get("trusted_inprocess", False),
+        forge_reattempts=data.get("forge_reattempts", 0),
+        forge_rejected=data.get("forge_rejected", False),
+        is_action_tool=data.get("is_action_tool", False),
+        toolset=data.get("toolset"),
+        max_result_size_chars=data.get("max_result_size_chars"),
+        timeout_seconds=data.get("timeout_seconds"),
+        check_fn_name=data.get("check_fn_name"),
         created_at=_dt(t.created_at),
         updated_at=_dt(t.updated_at),
     )
@@ -210,6 +237,22 @@ def _row_to_tool(r: ToolRow) -> Tool:
         "dry_run_evidence": getattr(r, "dry_run_evidence", None) or {},
         "last_successful_params": getattr(r, "last_successful_params", None) or [],
         "evolution_history": getattr(r, "evolution_history", None) or [],
+        # Fields this converter had stopped tracking — see the ToolRow comment.
+        # ``_nn`` (not ``or``) so a stored 0 / "" / False is preserved and only a
+        # genuine NULL — a row written before the column existed — falls back.
+        "requires_credentials": _nn(getattr(r, "requires_credentials", None), []),
+        "forged_by_execution_id": getattr(r, "forged_by_execution_id", None),
+        "grounding_inputs": _nn(getattr(r, "grounding_inputs", None), []),
+        "effect_tags": _nn(getattr(r, "effect_tags", None), []),
+        "external_verification_channel": getattr(r, "external_verification_channel", None),
+        "trusted_inprocess": bool(_nn(getattr(r, "trusted_inprocess", None), False)),
+        "forge_reattempts": _nn(getattr(r, "forge_reattempts", None), 0),
+        "forge_rejected": bool(_nn(getattr(r, "forge_rejected", None), False)),
+        "is_action_tool": bool(_nn(getattr(r, "is_action_tool", None), False)),
+        "toolset": getattr(r, "toolset", None),
+        "max_result_size_chars": getattr(r, "max_result_size_chars", None),
+        "timeout_seconds": getattr(r, "timeout_seconds", None),
+        "check_fn_name": getattr(r, "check_fn_name", None),
         "created_at": r.created_at,
         "updated_at": r.updated_at,
     })
@@ -835,6 +878,27 @@ class SqliteVault:
             ("evolutions", "edit_classification", "TEXT"),
             ("evolutions", "fields_changed",      "JSON DEFAULT '[]'"),
             ("evolutions", "reverted",             "INTEGER DEFAULT 0"),
+            # Tool-model fields ToolRow had stopped tracking. Every one of them
+            # read back as a model DEFAULT on this backend while the file vault
+            # kept it — ``effect_tags`` most consequentially, since it feeds the
+            # action gate and made the same tool score differently per backend.
+            # ADD COLUMN is non-destructive: existing rows keep every value they
+            # had and read NULL for the new column, which ``_row_to_tool`` maps
+            # to the model default. See the ToolRow comment for why these must
+            # land together rather than one at a time.
+            ("tools", "requires_credentials",          "JSON DEFAULT '[]'"),
+            ("tools", "forged_by_execution_id",        "TEXT"),
+            ("tools", "grounding_inputs",              "JSON DEFAULT '[]'"),
+            ("tools", "effect_tags",                   "JSON DEFAULT '[]'"),
+            ("tools", "external_verification_channel", "TEXT"),
+            ("tools", "trusted_inprocess",             "INTEGER DEFAULT 0"),
+            ("tools", "forge_reattempts",              "INTEGER DEFAULT 0"),
+            ("tools", "forge_rejected",                "INTEGER DEFAULT 0"),
+            ("tools", "is_action_tool",                "INTEGER DEFAULT 0"),
+            ("tools", "toolset",                       "TEXT"),
+            ("tools", "max_result_size_chars",         "INTEGER"),
+            ("tools", "timeout_seconds",               "INTEGER"),
+            ("tools", "check_fn_name",                 "TEXT"),
         ]
         with self._engine.connect() as conn:
             for table, col, col_type in new_cols:
@@ -843,7 +907,11 @@ class SqliteVault:
                     conn.commit()
                     logger.debug("[SqliteVault] Added column %s.%s", table, col)
                 except Exception:
-                    pass  # column already exists
+                    # Already present — ADD COLUMN has no IF NOT EXISTS on SQLite,
+                    # so the duplicate-column error IS the idempotency mechanism.
+                    # Nothing has been written at this point, so a failure here
+                    # leaves the store exactly as it was.
+                    conn.rollback()
 
     # ── Elder memory bootstrap ────────────────────────────────────────────────
 
