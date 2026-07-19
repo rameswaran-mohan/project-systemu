@@ -118,6 +118,37 @@ def build_systemu_chat_page() -> None:
     # so the timer tick that fires *just after* cancel() can't touch deleted DOM.
     _disconnected  = [False]
 
+    # ── T3 first-run banner (§5.10.c "First-run lands on CHAT with a prominent,
+    # dismissible 'Set the table (~10 min)' banner"). Shown only on a cold,
+    # provider-having, undismissed install; never blocks the page.
+    _consult_banner = ui.row().classes("w-full items-center s-card q-pa-sm") \
+        .style("gap: 10px; margin-bottom: 12px;")
+    try:
+        _v = getattr(state, "vault", None)
+        from systemu.runtime import table_consult as _tc
+        if _v is not None and _tc.should_show_first_run_banner(_v):
+            def _dismiss_consult_banner() -> None:
+                _tc.dismiss_first_run_banner(_v)
+                try:
+                    _consult_banner.delete()
+                except Exception:
+                    pass
+
+            with _consult_banner:
+                ui.icon("auto_awesome", size="sm").props("color=primary")
+                ui.label("Set the table — guided setup (~10 min). Tell systemu "
+                         "what you have and it stops guessing.").classes("s-muted")
+                ui.link("Start →", "/table").classes("s-pill")
+                ui.button(icon="close", on_click=_dismiss_consult_banner) \
+                    .props("flat dense round size=sm color=grey")
+        else:
+            _consult_banner.delete()
+    except Exception:
+        try:
+            _consult_banner.delete()
+        except Exception:
+            pass
+
     # ── Page header ───────────────────────────────────────────────────────────
     with ui.row().classes("w-full items-center justify-between").style("margin-bottom: 16px;"):
         with ui.column().style("gap: 2px;"):

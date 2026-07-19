@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -60,7 +61,7 @@ class TableItem(BaseModel):
     name: str
     detail: str = ""
     status: str = "declared"
-    provenance: str = "migrated"          # consulted | operator_added | learned | migrated
+    provenance: str = "migrated"          # consulted | operator_added | learned | migrated | proposed
     # operator | systemu_authored | content_derived. IMMUTABLE across status
     # transitions; RE-DERIVED by the projector each tick (see the module docstring).
     origin_class: str = "operator"
@@ -366,6 +367,209 @@ def add_learned_item(vault, item: "TableItem") -> bool:
     items.append(item)
     save_learned_items(vault, items)
     return True
+
+
+# ── consulted items — the T3 "Set the table" sidecar (§5.10.1) ────────────────
+# The THIRD sidecar, and a separate file for the same reason `learned_items.json`
+# is: each loader force-stamps the values its own file's WRITER can vouch for, and
+# no loader may vouch for another writer's content.
+#
+# `consulted_items.json` is written ONLY by `table_consult.commit()`, which runs
+# after the operator has passed the mandatory one-screen review — i.e. every row
+# here is operator-typed text the operator then re-read and approved. §5.10.b#7
+# names that case explicitly ("consult answers ... trusted operator input, same as
+# a §5.6 elicitation answer"), so the loader force-stamps `origin_class="operator"`
+# on the same basis `load_operator_items` does.
+#
+# It force-stamps `provenance="consulted"`, NOT `operator_added`: the anti-forgery
+# stamp on `operator_items.json` belongs to the direct-UI-action path and is not
+# borrowed here. The two provenances stay distinguishable on the card badge, which
+# is the honest thing to render — the operator DECLARED one and ANSWERED the other.
+
+def make_consulted_item(kind: str, name: str, detail: str = "") -> "TableItem":
+    """Construct a DECLARED consult item (§5.10.1 "declare-now-configure-later is
+    the DEFAULT"): status ``declared``, never ``ready``/``configuring`` — the
+    consult captures INTENT and the setup happens later in the existing flows.
+
+    Credential declarations carry the NAME only, with no free-text note, matching
+    ``make_operator_item`` (§5.10.b#6 — nothing on a Keys-zone item where a value
+    could be parked)."""
+    ref = _operator_ref(kind, name)
+    if kind == "credential_ref":
+        detail = ""
+    return TableItem(
+        id=id_for_key(ref_key(kind, ref)), kind=kind, name=name, detail=detail,
+        status="declared", provenance="consulted", origin_class="operator", ref=ref)
+
+
+def _consulted_items_path(vault) -> Path:
+    return _dir(vault) / "consulted_items.json"
+
+
+def load_consulted_items(vault) -> List[TableItem]:
+    """Persisted consult declarations. Defensive: broken/absent ⇒ [].
+
+    All three of ``provenance``/``origin_class``/``status`` are force-stamped. The
+    first two for the reason above; ``status`` because this file holds pure INTENT
+    — a consult item is only ever projected while NO live object exists at its
+    ref_key, so a row claiming ``ready`` would paint a healthy status dot on
+    something that was never configured."""
+    try:
+        path = _consulted_items_path(vault)
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        out: List[TableItem] = []
+        for entry in (raw or []):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                it = TableItem(**entry)
+                it.provenance = "consulted"
+                it.origin_class = "operator"
+                it.status = "declared"
+                out.append(it)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def save_consulted_items(vault, items: List[TableItem]) -> None:
+    payload = [it.model_dump(mode="json") for it in items]
+    _write_atomic(_consulted_items_path(vault), json.dumps(payload, indent=2))
+
+
+def add_consulted_item(vault, item: "TableItem") -> bool:
+    """Append a consult declaration, deduped by ``ref_key``. Returns True when
+    written.
+
+    Clears a prior tombstone, exactly like ``add_operator_item``: naming X in the
+    consult is a DIRECT operator action, and a stale tombstone silently swallowing
+    it while the review screen reported success is the failure that rule exists to
+    prevent. (Contrast ``add_learned_item``, which must NOT clear one — a learned
+    suggestion is not a direct operator action.)"""
+    key = ref_key(item.kind, item.ref)
+    remove_tombstone(vault, key)
+    items = load_consulted_items(vault)
+    if any(ref_key(it.kind, it.ref) == key for it in items):
+        return False
+    items.append(item)
+    save_consulted_items(vault, items)
+    return True
+
+
+# ── proposed items — the bounded `table_propose` sidecar (§5.10.b#2) ───────────
+# The FOURTH sidecar. Everything in this file arrives from a NON-consult context —
+# a task calling the `table_propose` registry tool — so it is untrusted by
+# construction, and the loader clamps to the untrusted end UNCONDITIONALLY.
+#
+# That unconditional clamp is why this is not a row in `learned_items.json`. That
+# loader must PRESERVE `origin_class`, because a §5.9 learned item can legitimately
+# be `operator` (the operator typed the answer being promoted). A task proposal
+# never can be — so giving it its own file buys a strictly stronger guarantee: no
+# byte a task (or a hand-edit) can write here reaches a trusted axis.
+#
+# NOTE ON THE VOCABULARY. `provenance="proposed"` is a FIFTH value beyond the four
+# the spec's model literal lists. The alternative was to reuse `learned`, which
+# would have (a) misattributed a task's guess to the §5.9 promotion path in the
+# audit trail and on the card badge, and (b) forced this content through a loader
+# that cannot clamp. The /table card renders any non-`migrated` provenance as a
+# badge, so the new value surfaces honestly with no UI change.
+
+def make_proposed_item(kind: str, name: str, detail: str = "") -> "TableItem":
+    """Construct a task-proposed item: ``suggested`` + ``content_derived``
+    (§5.10.b#2 "any other task's writes land suggested+content_derived").
+
+    There is no ``origin_class`` parameter on purpose — unlike
+    ``make_learned_item``, this constructor has exactly one correct answer, and a
+    parameter would only create a way to get it wrong."""
+    ref = _operator_ref(kind, name)
+    if kind == "credential_ref":
+        detail = ""
+    return TableItem(
+        id=id_for_key(ref_key(kind, ref)), kind=kind, name=name, detail=detail,
+        status="suggested", provenance="proposed", origin_class="content_derived",
+        ref=ref)
+
+
+def _proposed_items_path(vault) -> Path:
+    return _dir(vault) / "proposed_items.json"
+
+
+def load_proposed_items(vault) -> List[TableItem]:
+    """Persisted task proposals. Defensive: broken/absent ⇒ [], malformed entry
+    skipped. ``provenance``/``origin_class``/``status`` are ALL force-stamped — a
+    row here claiming operator trust, a ``consulted`` badge or a ``ready`` status
+    is a forgery whichever way it got written."""
+    try:
+        path = _proposed_items_path(vault)
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        out: List[TableItem] = []
+        for entry in (raw or []):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                it = TableItem(**entry)
+                it.provenance = "proposed"
+                it.origin_class = "content_derived"
+                it.status = "suggested"     # never auto-promoted (§5.10.b#1)
+                out.append(it)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def save_proposed_items(vault, items: List[TableItem]) -> None:
+    payload = [it.model_dump(mode="json") for it in items]
+    _write_atomic(_proposed_items_path(vault), json.dumps(payload, indent=2))
+
+
+#: Standing cap on the proposal tray. §5.10.b#2 words the bound as "capped per
+#: session", but a task has no session object to carry a counter on, and a
+#: per-call cap is no cap at all against a loop. A ceiling on the FILE is the
+#: bound that actually holds however many tasks call the tool.
+MAX_PROPOSED_ITEMS = 25
+
+
+#: The one genuinely CONCURRENT writer among the four table sidecars. The other
+#: three are UI-owned (one nicegui thread) or daemon-owned; this one is reached
+#: from `table_propose` inside a shadow execution thread, and two concurrent runs
+#: proposing at once would race the read-modify-write below — atomic writes stop a
+#: torn file, they do not stop a lost update. In-process only, which is the whole
+#: exposure: concurrent runs are threads of one daemon.
+_PROPOSED_LOCK = threading.Lock()
+
+
+def add_proposed_item(vault, item: "TableItem") -> str:
+    """Append a task proposal. Returns ``""`` on success, else a refusal reason.
+
+    A reason string rather than a bool so the caller can report accurately WITHOUT
+    re-implementing these checks: the tombstone and dedup guards are STORE-level
+    invariants that protect every caller, and a second copy upstream would make
+    this one unkillable (delete it and no test fails).
+
+    Like ``add_learned_item`` and unlike ``add_operator_item``, this does NOT clear
+    a tombstone. Resurrecting something the operator removed is precisely the
+    re-add flapping tombstones exist to prevent, and a task's guess is nowhere near
+    the direct operator action that earns the override."""
+    key = ref_key(item.kind, item.ref)
+    if key in load_tombstones(vault):
+        return "tombstoned"
+    with _PROPOSED_LOCK:
+        items = load_proposed_items(vault)
+        if any(ref_key(it.kind, it.ref) == key for it in items):
+            return "duplicate"
+        if len(items) >= MAX_PROPOSED_ITEMS:
+            return "capped"
+        items.append(item)
+        save_proposed_items(vault, items)
+    return ""
 
 
 def ref_key(kind: str, ref: Dict[str, Any]) -> str:

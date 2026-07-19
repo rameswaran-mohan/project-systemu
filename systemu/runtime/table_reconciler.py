@@ -172,6 +172,31 @@ def project(vault) -> List[TableItem]:
         item.pinned = key in pins
         projected.setdefault(item.id, item)
 
+    # merge T3 CONSULT declarations (§5.10.1). Both this and the palette above are
+    # operator-typed, so their relative order only decides which BADGE an operator
+    # sees when they name the same thing twice; the palette's is the more
+    # deliberate act, so it goes first and wins.
+    #
+    # NOTE the shape difference from the two loops that bracket it: this one and
+    # the proposals loop below check ONLY the tombstone, not `live_keys` or a
+    # per-source key set. Precedence here is carried entirely by loop ORDER plus
+    # `setdefault`, because every id — live and sidecar alike — derives from the
+    # shared `ref_key` through the same function (`_id_for` == `ts.id_for_key`),
+    # so the earlier, more-trusted card already occupies the id this one would
+    # claim. Adding a key check back would be a guard no test could kill, which
+    # this codebase treats as a defect in its own right. The two things that ARE
+    # load-bearing are pinned directly:
+    # `test_the_projector_and_the_store_derive_the_same_item_id` (the derivation)
+    # and `test_an_operator_declaration_outranks_a_proposal_for_the_same_thing`
+    # (the order). The tombstone check is NOT redundant: a tombstoned live object
+    # is skipped above, so without it a sidecar row would resurrect the removal.
+    for item in ts.load_consulted_items(vault):
+        key = ts.ref_key(item.kind, item.ref)
+        if key in tombstones:
+            continue
+        item.pinned = key in pins
+        projected.setdefault(item.id, item)
+
     # merge §5.9 LEARNED items (G-LEARN slice 3) — LAST, deliberately. An operator
     # declaration and a live store object both outrank a learned suggestion, so this
     # loop runs after both and uses `setdefault`: a ref_key collision keeps the
@@ -183,6 +208,17 @@ def project(vault) -> List[TableItem]:
     for item in ts.load_learned_items(vault):
         key = ts.ref_key(item.kind, item.ref)
         if key in tombstones or key in live_keys or key in operator_keys:
+            continue
+        item.pinned = key in pins
+        projected.setdefault(item.id, item)
+
+    # merge T3 task PROPOSALS (`table_propose`, §5.10.b#2) — the least-trusted
+    # source, so it goes LAST. Same shape and same reasoning as the consult loop
+    # above. `status`/`origin_class` are clamped by the loader; nothing here
+    # promotes a suggestion to anything.
+    for item in ts.load_proposed_items(vault):
+        key = ts.ref_key(item.kind, item.ref)
+        if key in tombstones:
             continue
         item.pinned = key in pins
         projected.setdefault(item.id, item)

@@ -1,10 +1,17 @@
-"""T1b — the read-only OnTheTable page (`/table`), spec UNIFIED-v2 §5.10.c.
+"""T1b/T2/T3 — the OnTheTable page (`/table`), spec UNIFIED-v2 §5.10.c.
 
 Renders the projected inventory (`table_reconciler.project`) as a zoned board:
 Services & Accounts · Tools & Capabilities · Files & Data · Keys · Preferences ·
-Devices. READ-ONLY in this release — no add/remove/consult (those are T2/T3). The
-zoning + summary logic is pure and unit-tested here; the nicegui rendering itself
-is operator-verifiable.
+Devices. T2 added curation (search, pin, remove-with-undo, "+ Put on the table",
+broken-card repair deep-links); T3 added the guided "Set the table" consult
+(§5.10.1) — a SYNCHRONOUS UI flow, not a chat task, so it spends no
+harness-request budget. The zoning + summary logic is pure and unit-tested here;
+the consult's own logic lives in `runtime/table_consult.py` and is tested there;
+the nicegui rendering itself is operator-verifiable.
+
+The page writes only the UI-owned curation sidecars (tombstones/pins/
+operator_items, and — via `table_consult.commit` — consulted_items). It never
+writes `items.json`, which stays single-writer (the reconciler, DEC-10).
 
 All values crossing into nicegui are plain strings (name/detail/status/kind) — no
 functions or non-serializable objects — per the v0.9.45 serialization-crash rule.
@@ -16,6 +23,7 @@ from typing import Any, Dict, List
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState
+from systemu.runtime import table_consult as tc
 from systemu.runtime import table_store as ts
 
 # zone label -> the item kinds it holds (ordered for display)
@@ -149,6 +157,22 @@ def repair_route(kind: str, status: str) -> tuple:
         return ("", "")
     route, label = route_label
     return (label, route)
+
+
+def consult_button_label(vault) -> str:
+    """"Set the table" on a cold install, "Resume setting the table" once some
+    areas are already answered (§5.10.1). Pure enough to test; defensive because
+    it runs while building the header and must never take the page down."""
+    try:
+        s = tc.ConsultSession()
+        remaining = tc.uncovered_areas(vault, s)
+    except Exception:
+        return "Set the table"
+    if not remaining:
+        return "Review your table"
+    if len(remaining) < len(tc.AREAS):
+        return "Resume setting the table"
+    return "Set the table"
 
 
 def removal_notice(kind: str, name: str) -> tuple:
@@ -287,6 +311,138 @@ def build_table_page() -> None:
         ui.notify(f"Added “{name}” to your table.", type="positive")
         _board.refresh()
 
+    # ── T3 "Set the table" (§5.10.1) — a synchronous, UI-guided flow. NOT a chat
+    # task: no ReAct loop, no HarnessRequest, so it spends no harness budget and
+    # cannot be force-terminated by a request cap. Ghosts live in `sess` (in
+    # memory) until the operator passes the review; only then does `tc.commit`
+    # write anything.
+    def _open_consult() -> None:
+        if not tc.consult_available():
+            ui.notify("Connect a model to unlock the guided consult.",
+                      type="warning")
+            return
+        sess = tc.ConsultSession()
+        tc.uncovered_areas(vault, sess)            # re-run diff: skip covered areas
+        state_: Dict[str, Any] = {"area": tc.next_area(sess), "review": False}
+
+        with ui.dialog().props("persistent") as dlg, \
+                ui.card().classes("s-card").style("min-width: 460px; max-width: 620px;"):
+
+            @ui.refreshable
+            def _panel() -> None:
+                done, total = tc.progress(sess)
+                area_id = state_["area"]
+
+                if state_["review"]:
+                    # the MANDATORY one-screen review (§5.10.1). Nothing has
+                    # landed yet; this is the last look before it does — and the
+                    # only fence on a parse that invented something, so every
+                    # ghost is shown, renamable and deletable right here.
+                    ui.label("Here's your table — anything wrong?").classes("text-h6")
+                    ghosts = list(sess.pending)
+                    if not ghosts:
+                        ui.label("Nothing to add.").classes("s-muted")
+                    for idx, ghost in enumerate(ghosts):
+                        with ui.row().classes("items-center no-wrap w-full").style("gap: 6px;"):
+                            ui.label(tc.area_label_for_kind(ghost.kind)) \
+                                .classes("s-muted").style("min-width: 130px; font-size: 12px;")
+                            ui.input(value=ghost.name,
+                                     on_change=lambda e, i=idx: _rename(i, e.value)) \
+                                .props("dense outlined").classes("col")
+                            ui.button(icon="close",
+                                      on_click=lambda _e=None, i=idx: _drop(i)) \
+                                .props("flat dense round size=sm color=grey")
+                    with ui.row().classes("w-full justify-end q-mt-sm").style("gap: 8px;"):
+                        ui.button("Back", on_click=_back).props("flat color=grey")
+                        ui.button(f"Put {len(ghosts)} on my table",
+                                  on_click=_commit).props("color=primary")
+                    return
+
+                if not area_id:
+                    state_["review"] = True
+                    _panel.refresh()
+                    return
+
+                spec = tc.area(area_id)
+                ui.label("Set the table").classes("text-h6")
+                ui.label(f"{spec['label']} — {done} of {total}").classes("s-muted")
+
+                # the form is DRIVEN BY the area's `requested_schema` (§5.10.1
+                # "reusing the existing requested_schema form path"), so a change
+                # to the schema reaches the operator without touching this file.
+                schema = tc.area_schema(area_id)
+                fields: Dict[str, Any] = {}
+                for fname, fspec in (schema.get("properties") or {}).items():
+                    label = str(fspec.get("description") or fname)
+                    if fname == "items":
+                        ui.label(label).classes("q-mt-sm")
+                        fields[fname] = ui.textarea() \
+                            .props("outlined dense autogrow").classes("w-full")
+                    else:
+                        fields[fname] = ui.input(label=label) \
+                            .props("outlined dense").classes("w-full")
+
+                with ui.row().classes("w-full justify-end q-mt-sm").style("gap: 8px;"):
+                    ui.button("Skip", on_click=lambda: _next(area_id, {})) \
+                        .props("flat color=grey")
+                    ui.button(
+                        "Next",
+                        on_click=lambda: _next(
+                            area_id, {k: w.value for k, w in fields.items()}),
+                    ).props("color=primary")
+                if sess.pending:
+                    ui.separator().classes("q-my-sm")
+                    ui.label(f"On your table so far ({len(sess.pending)}) — "
+                             "nothing is saved yet").classes("s-muted")
+                    for line in tc.review_lines(sess):
+                        ui.label(f"· {line}").classes("s-muted ellipsis") \
+                            .style("font-size: 12px;")
+
+            def _next(area_id: str, answers: Dict[str, Any]) -> None:
+                try:
+                    parsed = tc.parse_area_answers(
+                        area_id, answers,
+                        llm_fn=tc.default_llm_fn(), config=getattr(state, "config", None))
+                except Exception:
+                    parsed = []
+                tc.stage_parsed(sess, area_id, parsed)
+                state_["area"] = tc.next_area(sess)
+                if not state_["area"]:
+                    state_["review"] = True
+                _panel.refresh()
+
+            def _rename(index: int, value: str) -> None:
+                # no refresh — the operator is typing; re-rendering would steal
+                # focus. The ghost's ref/id are re-derived by `edit_pending`.
+                tc.edit_pending(sess, index, name=value)
+
+            def _drop(index: int) -> None:
+                tc.drop_pending(sess, index)
+                _panel.refresh()
+
+            def _back() -> None:
+                state_["review"] = False
+                state_["area"] = tc.next_area(sess) or tc.AREAS[-1]["id"]
+                _panel.refresh()
+
+            def _commit() -> None:
+                sess.reviewed = True           # the operator just passed the review
+                try:
+                    n = tc.commit(vault, sess)
+                except Exception:
+                    ui.notify("Couldn't save your table.", type="negative")
+                    return
+                try:
+                    dlg.close()
+                except Exception:
+                    pass
+                ui.notify(f"Your table — {n} item(s). "
+                          "Click any of them to finish setup.", type="positive")
+                _board.refresh()
+
+            _panel()
+        dlg.open()
+
     def _open_add_palette() -> None:
         # "+ Put on the table" (§5.10.c). The declare flows CREATE operator_added
         # items directly (operator-typed = trusted); the deeper setup happens in the
@@ -327,6 +483,14 @@ def build_table_page() -> None:
         with ui.row().classes("items-center no-wrap").style("gap: 8px;"):
             ui.input(placeholder="Search your table…", on_change=_on_search) \
                 .props("dense clearable outlined").classes("s-table-search").style("min-width: 200px;")
+            # "Set the table" is provider-gated (§5.10.1); with no model the
+            # deterministic palette is the only offer, and says why.
+            if tc.consult_available():
+                # a partly-done table gets the RESUME wording (§5.10.1 "'Resume
+                # setting the table' chip returns to the next uncovered area") —
+                # the diff-on-rerun that makes it true lives in `uncovered_areas`.
+                ui.button(consult_button_label(vault), icon="auto_awesome",
+                          on_click=_open_consult).props("dense flat color=primary")
             ui.button("Put on the table", icon="add", on_click=_open_add_palette) \
                 .props("dense color=primary")
 
@@ -354,8 +518,20 @@ def build_table_page() -> None:
                         "Declare what you have, or connect a service / forge a tool "
                         "and it'll appear here."
                     ).classes("s-muted")
-                    ui.button("Put on the table", icon="add", on_click=_open_add_palette) \
-                        .props("color=primary").classes("q-mt-sm")
+                    # §5.10.c — the empty state leads with the guided consult when
+                    # a provider exists, and with the DETERMINISTIC palette when
+                    # it does not (saying why, rather than hiding the feature).
+                    cta = tc.empty_state_cta()
+                    with ui.row().classes("items-center q-mt-sm").style("gap: 8px;"):
+                        if cta["primary"] == "set_the_table":
+                            ui.button(cta["label"], icon="auto_awesome",
+                                      on_click=_open_consult).props("color=primary")
+                            ui.button("Put on the table", icon="add",
+                                      on_click=_open_add_palette).props("flat color=primary")
+                        else:
+                            ui.button(cta["label"], icon="add",
+                                      on_click=_open_add_palette).props("color=primary")
+                    ui.label(cta["note"]).classes("s-muted").style("font-size: 12px;")
             return
 
         for label, _kinds in list(_ZONE_ORDER) + [(_OTHER, set())]:
