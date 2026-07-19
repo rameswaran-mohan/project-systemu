@@ -839,11 +839,14 @@ def _emit_requirement(bc: _BindCtx, *, kind, schema_path, state, source, value_o
         value_origin=vo, bound_value_ref=bound_value_ref, confidence=float(confidence),
         bound_value_digest=_value_digest(bc, kind=kind, schema_path=schema_path,
                                          value=resolved_value),
+        bound_value_canon_digest=_value_digest(bc, kind=kind, schema_path=schema_path,
+                                               value=resolved_value, canonical=True),
         rationale=rationale,
     ))
 
 
-def _value_digest(bc: _BindCtx, *, kind, schema_path, value) -> Optional[str]:
+def _value_digest(bc: _BindCtx, *, kind, schema_path, value,
+                  canonical: bool = False) -> Optional[str]:
     """R-A16 §5.9 — the KEYED, non-reversible digest of a bind's RESOLVED VALUE.
 
     THE ONLY thing the value is used for. It is never stored, logged or persisted; the
@@ -880,6 +883,12 @@ def _value_digest(bc: _BindCtx, *, kind, schema_path, value) -> Optional[str]:
                                                       "vault", None)
         if vault is None:
             return None
+        # ``canonical=True`` stamps the FORM-INSENSITIVE twin (R-A16 F2). BOTH pass
+        # through the SAME credential/secret refusals above — deliberately one
+        # function, so a future guard added here can never protect one digest and
+        # silently miss the other.
+        if canonical:
+            return _rm.canonical_value_ref(value, vault)
         return _rm.value_ref(value, vault)
     except Exception:
         logger.debug("[binder] value digest skipped for %s", schema_path, exc_info=True)

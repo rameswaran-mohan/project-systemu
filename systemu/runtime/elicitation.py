@@ -320,6 +320,9 @@ def surface_ask_bundle_requirement(req: Any, *, vault=None, config=None) -> Dict
                 ask_id=_elicitation_request_id(message, schema),
                 snapshot=_rm.requirement_snapshot(req),
                 answer=(envelope.get("content") or {}).get(leaf),
+                # R-B4/F3 — ground truth about "did the operator take the binder's
+                # value?", narrowed to THIS field. Ranks above any digest inference.
+                picked=(leaf in (envelope.get("picked") or [])),
             )
     except Exception:
         pass
@@ -391,9 +394,21 @@ def resolve_structured_input(
     if isinstance(answer, dict) and set(answer.keys()) == {"_raw"}:
         return {"action": "decline", "content": {}}
 
-    content = param_answers_from_choice(schema, answer if isinstance(answer, dict) else {})
+    raw = answer if isinstance(answer, dict) else {}
+    content = param_answers_from_choice(schema, raw)
     if not content:
         # Nothing coerced through (empty / non-coercible) — treat as cancel, never
         # an accept with a fabricated value.
         return {"action": "cancel", "content": {}}
-    return {"action": "accept", "content": content}
+    # R-B4/F3 — surface the pick marker as a SIBLING of `content`, never inside it.
+    # `param_answers_from_choice` strips it (correctly: it must never become a tool
+    # argument), and this rail had no other way to see it, so an explicit pick was
+    # invisible to the §5.9 recorder downstream. Intersected with the coerced keys so
+    # it can only ever name a field that actually came back. Callers that only read
+    # `action`/`content` (the MCP elicitation callback) are unaffected.
+    picked = [p for p in (raw.get(PICK_MARKER_KEY) or [])
+              if isinstance(p, str) and p in content]
+    out = {"action": "accept", "content": content}
+    if picked:
+        out["picked"] = picked
+    return out

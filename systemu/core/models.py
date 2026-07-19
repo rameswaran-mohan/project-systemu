@@ -170,6 +170,19 @@ class Requirement(BaseModel):
     # re-ask flip) MUST clear this too, or the digest goes stale and a genuine
     # confirm reads as an override.
     bound_value_digest: Optional[str] = None
+    # R-A16 §5.9 (F2): the CANONICAL-FORM twin of the digest above
+    # (`replay_metrics.canonical_value_ref`), stamped beside it and under the same
+    # per-vault key. Additive with a default, so legacy on-disk data validates
+    # unchanged and simply degrades to the exact comparison.
+    #
+    # It exists because the resolved VALUE dies at the suspend — only digests cross —
+    # so a form-insensitive comparison is impossible unless both sides were
+    # canonicalised BEFORE hashing. Kept SEPARATE from `bound_value_digest` rather
+    # than widening it: that digest is what `ask_promotion` compares to decide a
+    # promoted fact's taint ORIGIN, and this observability fix must not move a
+    # security decision. Cleared wherever the handle is rewritten, exactly as the
+    # exact digest is — a stale canonical digest miscompares the same way.
+    bound_value_canon_digest: Optional[str] = None
     confidence: float = 0.0                # feeds the T_high gate
     rationale: str = ""
 

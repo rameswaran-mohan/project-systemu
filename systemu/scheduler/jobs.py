@@ -234,7 +234,7 @@ def _map_grant_payload(harness_kind: str, materialise: dict) -> dict:
     return payload
 
 
-def record_bundled_ask_outcomes(vault, dctx, answers) -> None:
+def record_bundled_ask_outcomes(vault, dctx, answers, *, picked=None) -> None:
     """R-A16 / G-LEARN §5.9 — the ANSWER-TIME join for the mid-loop bundled scope card.
 
     The card's Requirement objects die at the suspend (``shadow_runtime`` builds them
@@ -267,6 +267,13 @@ def record_bundled_ask_outcomes(vault, dctx, answers) -> None:
         from systemu.runtime import replay_metrics as _rm
         from systemu.runtime import reference_synonyms_learned as _rsl
         ask_id = str((dctx or {}).get("request_id", "") or "")
+        # R-B4/F3 — the EXPLICIT pick marker, keyed by schema_path exactly as
+        # ``answers`` is. It is read off the RAW choice by the caller because
+        # ``param_answers_from_choice`` strips it before it could reach a tool, which
+        # is also why it never used to reach this recorder: the promoter was handed it
+        # and this function was not. Non-str entries dropped — it rides a persisted
+        # decision across a suspend, so it is attacker-shaped here too.
+        picked_fields = {p for p in (picked or []) if isinstance(p, str)}
         by_path: dict = {}                # insertion-ordered: file order is preserved
         for snap in snaps:
             if not isinstance(snap, dict):
@@ -279,7 +286,8 @@ def record_bundled_ask_outcomes(vault, dctx, answers) -> None:
             answer = answers.get(path)
             if answer is None or str(answer) == "":
                 continue          # unanswered slot — the signal is answer-linked
-            _rm.record_ask_avoidable(vault, ask_id=ask_id, snapshot=group, answer=answer)
+            _rm.record_ask_avoidable(vault, ask_id=ask_id, snapshot=group, answer=answer,
+                                     picked=(path in picked_fields))
             # R-A16 §5.9 slice 4 — the LEARNED synonym overlay, fed from the same
             # answer-time join. Deterministic (no LLM judge), capped and secret-fenced.
             # It can only WIDEN the resolver's candidate set — the resolved file is
@@ -541,7 +549,7 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
             # raised, so recording at the coercion point would double-count the same
             # answer on every retry. Here it fires exactly once per dispatched decision,
             # and only for an answer that was actually applied to the run.
-            record_bundled_ask_outcomes(vault, dctx, _ask_answers)
+            record_bundled_ask_outcomes(vault, dctx, _ask_answers, picked=_ask_picked)
 
             # G-LEARN slice 3 §5.9 — PROMOTE the accepted answers into the operator
             # profile (+ a `learned` TableItem) so the next identical situation

@@ -81,18 +81,25 @@ def _raw(tmp_path) -> str:
 def _req(**kw):
     base = dict(kind="input", schema_path="report/output_path", state="missing",
                 source="schema", value_origin="operator", bound_value_ref=None,
-                bound_value_digest=None, confidence=0.0, rationale="where to write")
+                bound_value_digest=None, bound_value_canon_digest=None,
+                confidence=0.0, rationale="where to write")
     base.update(kw)
     return Requirement(**base)
 
 
 def _bound(vault, value, *, ref=None, **kw):
-    """A REALISTICALLY bound requirement: a NAMESPACED binder handle plus the keyed
-    digest of the bind's RESOLVED VALUE — exactly the pair ``_emit_requirement``
-    now stamps. ``value`` is what the operator would have to type to confirm."""
+    """A REALISTICALLY bound requirement: a NAMESPACED binder handle plus BOTH keyed
+    digests of the bind's RESOLVED VALUE — exactly the triple ``_emit_requirement``
+    now stamps. ``value`` is what the operator would have to type to confirm.
+
+    The canonical twin is stamped here for the same fixture-realism reason the exact
+    digest is: a real bind emits both, so a helper that emitted only one would leave
+    the form-insensitive comparison structurally unreachable in every test that uses
+    it — the identical failure mode as F1's value-shaped ``bound_value_ref``."""
     kw.setdefault("state", "resolvable")
     return _req(bound_value_ref=(ref or f"run_context:{value}"),
-                bound_value_digest=rm.value_ref(value, vault), **kw)
+                bound_value_digest=rm.value_ref(value, vault),
+                bound_value_canon_digest=rm.canonical_value_ref(value, vault), **kw)
 
 
 def _record(v, req, answer, ask_id="hreq_test"):
@@ -1203,3 +1210,504 @@ def test_no_fixture_uses_a_value_shaped_bound_value_ref():
         f"sources emit a namespaced handle ({', '.join(BINDER_REF_PREFIXES)}); a "
         f"value-shaped ref makes the pin agree with itself and not with production."
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  F2 — the CANONICAL-FORM comparison, the version stamp, and the explicit pick
+#
+#  THE DEFECT. `record_ask_avoidable` classified by exact equality over minimally-
+#  normalised keyed digests. A confirmed answer differing only in FORM — a separator
+#  swapped, a quote pair a widget added, a trailing period, a URL-encoded space, case
+#  on a path — compared unequal and scored `resolvable_overridden`: "the ask was
+#  NECESSARY, the binder was wrong". The exact inverse of what happened, and the same
+#  family as F1 (which compared against a namespaced HANDLE and likewise reported the
+#  inverse).
+#
+#  WHY IT IS URGENT RATHER THAN MERELY WRONG. The corpus is APPEND-ONLY and its refs
+#  are NON-REVERSIBLE, so a row can never be re-scored: every mis-labelled row is
+#  permanent. The error is DIRECTIONAL — the definitive count reads low and the
+#  "necessary" count high — in a metric that feeds a decision about how often systemu
+#  asks for what it already knew, and it is blind in exactly the direction an
+#  over-clamping taint fix would show up. It also suppresses G-LEARN S4's
+#  `threshold_sensitive` counters, which only count `resolvable_confirmed` rows.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: Reshapes of ONE bound path that must all read as a CONFIRM. Every one is a real
+#: widget/round-trip artefact, not a hypothetical.
+_RESHAPES = [
+    ("out/prior_report.md", "exact - v1 behaviour, must not regress"),
+    ("out\\prior_report.md", "separator swapped"),
+    ("OUT/PRIOR_REPORT.MD", "case folded on a path"),
+    ('"out/prior_report.md"', "surrounding double quotes"),
+    ("'out/prior_report.md'", "surrounding single quotes"),
+    ("out/prior_report.md.", "trailing period"),
+    ("out/prior_report.md,", "trailing comma"),
+    ("out%2Fprior_report.md", "URL-encoded separator"),
+    ("out//prior_report.md", "duplicated separator"),
+    ("  out/prior_report.md  ", "surrounding whitespace"),
+]
+
+#: Answers that are GENUINELY different values. These pin the line the canonical form
+#: must never cross: a prefix, a suffix, a sibling and an extension-stripped path are
+#: all reachable by a substring-style fold, and every one of them would be a FALSE
+#: confirmation — inflating exactly the number this fix exists to make trustworthy.
+_NOT_CONFIRMS = [
+    ("out/other_report.md", "a different file in the same directory"),
+    ("out", "a PREFIX of the candidate"),
+    ("prior_report.md", "a SUFFIX of the candidate"),
+    ("out/prior_report", "the extension dropped"),
+    ("outprior_report.md", "the separator DELETED, not normalised"),
+    ("out/prior_report.md.bak", "a longer path that CONTAINS the candidate"),
+]
+
+
+def _bound_via_real_binder(v, produced="out/prior_report.md"):
+    """The REAL producer chain — ExecutionContext → binder → Requirement.
+
+    Hand-built snapshot dicts have produced false results in this module repeatedly
+    (F1's whole lesson), so the candidate digests here are the ones a real bind
+    stamps, canonical twin included."""
+    from systemu.runtime.requirement_binder import build_requirement_report
+    ctx = _real_execution_context([produced])
+    cap = _Cap({"out_path": {"type": "string", "description": "where to write"}})
+    req = build_requirement_report([_Obj()], cap, {}, ctx, vault=v).ask_bundle[0]
+    assert req.bound_value_ref == f"run_context:{produced}", req.bound_value_ref
+    return req
+
+
+@pytest.mark.parametrize("answer,label", _RESHAPES, ids=[l for _, l in _RESHAPES])
+def test_a_reshaped_answer_is_a_CONFIRM_not_an_override(tmp_path, answer, label):
+    """THE FIX. Each of these is the operator confirming the binder's own value, and
+    each used to score `resolvable_overridden` — "the ask was necessary"."""
+    v = _Vault(tmp_path)
+    _record(v, _bound_via_real_binder(v), answer)
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "resolvable_confirmed", (
+        f"{label}: a confirm differing only in FORM was scored "
+        f"{rec['resolution']!r} — the inverse of what happened")
+    assert rec["matched_candidate"], label
+
+
+@pytest.mark.parametrize("answer,label", _NOT_CONFIRMS,
+                         ids=[l for _, l in _NOT_CONFIRMS])
+def test_a_genuinely_different_answer_is_still_an_override(tmp_path, answer, label):
+    """THE LINE THE FOLD MUST NOT CROSS — the negative half, and the more important
+    one. Canonicalising into a substring/prefix match would manufacture FALSE
+    confirmations, which is strictly worse than the under-count being fixed."""
+    v = _Vault(tmp_path)
+    _record(v, _bound_via_real_binder(v), answer)
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "resolvable_overridden", (
+        f"{label}: a genuinely different value was scored a CONFIRM — the canonical "
+        f"form has collapsed into a substring match and is inventing avoidable asks")
+    assert rec["matched_candidate"] is None, label
+
+
+def test_the_comparison_is_exact_over_canonical_forms_not_a_containment_test():
+    """Directly on the canonicaliser: it is a TOTAL rewrite compared with ``==``.
+
+    Pinned at this level too because the record-level pins above could be satisfied by
+    a fold that happens to separate these particular fixtures while still being
+    substring-ish for other inputs."""
+    c = rm.canonical_compare_form
+    assert c("out/report.md") == c("OUT\\Report.MD.")          # form only
+    # structure is never deleted, and containment is never equality
+    for other in ("out", "report.md", "outreport.md", "out/report",
+                  "out/report.md.bak", "a/out/report.md"):
+        assert c("out/report.md") != c(other), other
+    # interior punctuation is preserved — only TRAILING is stripped
+    assert c("a.b.c") != c("abc")
+    # a UNC root is meaningful and must not fold into an absolute path
+    assert c("//srv/share/f.md") != c("/srv/share/f.md")
+    # an all-punctuation answer keeps its form rather than collapsing to ""
+    assert c("...") != ""
+
+
+def test_the_canonical_form_folds_separators_independently_of_the_platform():
+    """A PLATFORM-INDEPENDENT pin, and it exists because a mutation survived without it.
+
+    Deleting the separator fold from the canonical form changed NOTHING in the
+    record-level reshape pins — on Windows ``normalize_value`` already normcases
+    separators, so the exact digest matches first and the canonical pass is never
+    reached. On POSIX ``normalize_value`` deliberately does nothing (``a\\b`` is a
+    legal filename there), so the canonical fold is the ONLY thing folding
+    ``out/r.md`` against ``out\\r.md`` — and a Windows-only suite could not see it
+    being removed. Asserted directly on the canonicaliser, where the platform cannot
+    mask it."""
+    c = rm.canonical_compare_form
+    assert c("out\\r.md") == c("out/r.md") == "out/r.md"
+    assert c("C:\\work\\sprint.xlsx") == c("C:/work/sprint.xlsx")
+    # and the fold must NORMALISE separators, never delete them
+    assert c("out\\r.md") != c("outr.md")
+
+
+def test_requirement_snapshot_refuses_a_raw_value_in_the_canonical_field():
+    """GUARD 1's twin, pinned where it actually bites — also added because a mutation
+    survived without it.
+
+    The snapshot is stamped into a card spec that is PERSISTED IN PLAINTEXT, so this
+    guard runs one layer earlier than the recorder's: a Requirement carrying a raw
+    value in ``bound_value_canon_digest`` would write that value into the card spec
+    before the recorder ever saw it. The recorder-level guard cannot cover this path,
+    which is why removing this one changed no test until now."""
+    r = _req(bound_value_ref="run_context:out/r.md",
+             bound_value_canon_digest="out/r.md")     # a RAW value, not a digest
+    snap = rm.requirement_snapshot(r)
+    assert snap["candidate_canon_ref"] is None, (
+        "a raw value survived into the snapshot and would be persisted in the "
+        "plaintext card spec")
+    # not vacuous: a genuine canonical digest IS carried through
+    good = _req(bound_value_ref="run_context:out/r.md",
+                bound_value_canon_digest="hmac256c:" + "0" * 8 + ":" + "0" * 16)
+    assert rm.requirement_snapshot(good)["candidate_canon_ref"] is not None
+
+
+def test_the_canonical_fold_does_not_eat_a_lone_or_mismatched_quote():
+    """Only MATCHED pairs are wrappers. A lone quote is part of the value."""
+    c = rm.canonical_compare_form
+    assert c('"out/r.md') != c("out/r.md")
+    assert c("out/r.md'") != c("out/r.md")
+
+
+def test_a_non_escape_percent_survives_url_decoding():
+    """`unquote` must not mangle a value that merely CONTAINS a percent sign."""
+    c = rm.canonical_compare_form
+    assert c("100% cotton") == "100% cotton"
+    assert c("%APPDATA%/systemu") == "%appdata%/systemu"
+    assert c("50%") == "50%"
+
+
+# ── the version stamp ────────────────────────────────────────────────────────
+
+def test_every_row_carries_the_scoring_rule_that_produced_it(tmp_path):
+    """The corpus is append-only with non-reversible digests, so a row can NEVER be
+    re-scored. A corpus that cannot say which rule produced which row cannot be
+    trusted later — the v1 rows' inflated `resolvable_overridden` count has to stay
+    visible rather than being averaged into the v2 rows."""
+    v = _Vault(tmp_path)
+    _record(v, _bound_via_real_binder(v), "out/prior_report.md")
+    rec = _lines(tmp_path)[0]
+    assert rec["scoring_version"] == rm.ASK_SCORING_VERSION
+    assert rm.ASK_SCORING_VERSION >= 2, (
+        "the canonical-comparison rule must be a NEW version — reusing v1 makes the "
+        "two populations inseparable in an append-only file")
+
+
+def test_the_report_separates_the_two_scoring_populations(tmp_path):
+    """A mixed corpus must stay interpretable: old rows report as v1 even though they
+    predate the stamp entirely."""
+    v = _Vault(tmp_path)
+    _record(v, _bound_via_real_binder(v), "out/prior_report.md")
+    # a legacy row, exactly as v1 wrote it — no scoring_version key at all
+    path = Path(tmp_path) / "audit" / "ask_avoidable.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ask_id": "legacy", "class": "input",
+                             "schema_path": "report/output_path",
+                             "resolution": "resolvable_overridden",
+                             "candidates": [], "matched_candidate": None}) + "\n")
+    rep = rm.answer_linked_ask_report(v)
+    assert rep["scoring_versions"] == {"2": 1, "1": 1}, rep["scoring_versions"]
+    assert rep["scoring_version"] == rm.ASK_SCORING_VERSION
+
+
+def test_the_row_records_WHICH_witness_confirmed_it(tmp_path):
+    """`match_basis` makes the confirm auditable: an exact match, a form-only match
+    and an explicit pick are different strengths of evidence."""
+    v = _Vault(tmp_path)
+    _record(v, _bound_via_real_binder(v), "out/prior_report.md")
+    assert _lines(tmp_path)[0]["match_basis"] == "digest"
+
+    sub = Path(tmp_path) / "b"
+    v2 = _Vault(sub)
+    _record(v2, _bound_via_real_binder(v2), '"out/prior_report.md".')
+    rec = [json.loads(x) for x in
+           (sub / "audit" / "ask_avoidable.jsonl")
+           .read_text(encoding="utf-8").splitlines() if x.strip()][0]
+    assert rec["match_basis"] == "canonical", rec
+    assert rec["resolution"] == "resolvable_confirmed"
+
+
+def test_an_override_records_no_match_basis(tmp_path):
+    v = _Vault(tmp_path)
+    _record(v, _bound_via_real_binder(v), "out/something_else.md")
+    assert _lines(tmp_path)[0]["match_basis"] is None
+
+
+# ── the explicit R-B4/F3 pick marker ─────────────────────────────────────────
+
+def test_an_explicit_pick_outranks_a_digest_mismatch(tmp_path):
+    """R-B4 shipped a marker recording what the UI KNOWS at the moment of the click.
+    It is ground truth about this very question, so it outranks any inference."""
+    v = _Vault(tmp_path)
+    rm.record_ask_avoidable(v, ask_id="a",
+                            snapshot=rm.requirement_snapshot(_bound_via_real_binder(v)),
+                            answer="a value that digests differently", picked=True)
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "resolvable_confirmed", rec
+    assert rec["match_basis"] == "picked"
+    assert rec["matched_candidate"], "a pick must credit a real candidate"
+
+
+def test_a_pick_cannot_invent_a_candidate_that_never_existed(tmp_path):
+    """The marker is attacker-shaped (it rides a persisted decision across a suspend).
+    With NO comparable candidate there was nothing to pick, so the row must stay
+    `missing_answered` — a forged pick can never fabricate a confirm out of nothing."""
+    v = _Vault(tmp_path)
+    rm.record_ask_avoidable(v, ask_id="a", snapshot=rm.requirement_snapshot(_req()),
+                            answer="anything", picked=True)
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "missing_answered", rec
+    assert rec["matched_candidate"] is None
+
+
+@pytest.mark.parametrize("bogus", ["yes", "true", 1, {"a": 1}, [], (), "", 0, None])
+def test_only_a_real_pick_assertion_counts(tmp_path, bogus):
+    """A truthy-looking non-assertion must not be read as a pick."""
+    v = _Vault(tmp_path)
+    rm.record_ask_avoidable(v, ask_id="a",
+                            snapshot=rm.requirement_snapshot(_bound_via_real_binder(v)),
+                            answer="a value that digests differently", picked=bogus)
+    assert _lines(tmp_path)[0]["resolution"] == "resolvable_overridden", bogus
+
+
+def test_the_pick_marker_is_stripped_before_this_call_site_and_is_restored(monkeypatch):
+    """WHERE THE STRIP HAPPENS, pinned rather than assumed.
+
+    `param_answers_from_choice` drops PICK_MARKER_KEY unconditionally (correctly — it
+    must never become a tool argument), so `resolve_structured_input`'s coerced content
+    cannot carry it. The rail therefore surfaces it as a SIBLING of `content`."""
+    from systemu.runtime import elicitation as el
+
+    schema = {"type": "object", "properties": {"output_path": {"type": "string"}}}
+    coerced = el.param_answers_from_choice(
+        schema, {"output_path": "out/r.md", el.PICK_MARKER_KEY: ["output_path"]})
+    assert el.PICK_MARKER_KEY not in coerced, (
+        "the strip site moved — this pin no longer describes the code")
+
+    # `notifications` is imported INSIDE resolve_structured_input, so the patch has to
+    # land on the source module rather than on an attribute of `el`.
+    from systemu.interface import notifications
+    monkeypatch.setattr(notifications, "request_choice",
+                        lambda *a, **k: {"output_path": "out/r.md",
+                                         el.PICK_MARKER_KEY: ["output_path"]})
+    env = el.resolve_structured_input(message="m", requested_schema=schema)
+    assert env["action"] == "accept"
+    assert env["picked"] == ["output_path"], "the rail must restore the marker"
+    assert el.PICK_MARKER_KEY not in env["content"], (
+        "the marker must never be re-introduced INTO the tool parameters")
+
+
+def test_the_restored_marker_can_only_name_a_field_that_came_back(monkeypatch):
+    """Intersected with the coerced keys, so a forged marker cannot name a field the
+    operator never answered."""
+    from systemu.runtime import elicitation as el
+    schema = {"type": "object", "properties": {"output_path": {"type": "string"}}}
+    # `notifications` is imported INSIDE resolve_structured_input, so the patch has to
+    # land on the source module rather than on an attribute of `el`.
+    from systemu.interface import notifications
+    monkeypatch.setattr(notifications, "request_choice",
+                        lambda *a, **k: {"output_path": "out/r.md",
+                                         el.PICK_MARKER_KEY: ["not_a_field", 7, None]})
+    env = el.resolve_structured_input(message="m", requested_schema=schema)
+    assert "picked" not in env
+
+
+def test_the_elicitation_rail_threads_the_pick_into_the_record(tmp_path, monkeypatch):
+    """END-TO-END on the pre-loop rail: an explicit pick reaches the corpus."""
+    from systemu.runtime import elicitation as el
+    v = _Vault(tmp_path)
+    monkeypatch.setattr(el, "resolve_structured_input",
+                        lambda **kw: {"action": "accept",
+                                      "content": {"output_path": "typed-something-else"},
+                                      "picked": ["output_path"]})
+    el.surface_ask_bundle_requirement(
+        _bound(v, "out/r.md", ref="file:out/r.md", confidence=0.44),
+        vault=v, config=None)
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "resolvable_confirmed"
+    assert rec["match_basis"] == "picked"
+
+
+def test_the_grant_reconciler_threads_the_pick_per_schema_path(tmp_path):
+    """The reconciler holds the marker as a list of FIELD NAMES and must resolve it
+    per path — a pick on one slot must not confirm a different slot."""
+    from systemu.scheduler.jobs import record_bundled_ask_outcomes
+    v = _Vault(tmp_path)
+    snap_a = rm.requirement_snapshot(_bound(v, "out/a.md", ref="file:out/a.md",
+                                            schema_path="a", confidence=0.5))
+    snap_b = rm.requirement_snapshot(_bound(v, "out/b.md", ref="file:out/b.md",
+                                            schema_path="b", confidence=0.5))
+    dctx = {"request_id": "r1", "spec": {"requirement_snapshot": [snap_a, snap_b]}}
+    record_bundled_ask_outcomes(v, dctx,
+                                {"a": "totally different", "b": "totally different"},
+                                picked=["a"])
+    rows = {r["schema_path"]: r for r in _lines(tmp_path)}
+    assert rows["a"]["resolution"] == "resolvable_confirmed"
+    assert rows["a"]["match_basis"] == "picked"
+    assert rows["b"]["resolution"] == "resolvable_overridden", (
+        "a pick on slot 'a' must not confirm slot 'b'")
+
+
+# ── containment: this fix must not reach the SECURITY decision ───────────────
+
+def test_a_canonical_ref_can_never_pass_the_promoters_candidate_guard(tmp_path):
+    """THE CONTAINMENT PIN. `ask_promotion` compares `value_ref` digests to decide a
+    promoted fact's taint ORIGIN — a security decision this observability fix must not
+    move. The canonical ref is a DIFFERENT shape (and a different length), so the
+    promoter's guard 3 rejects it on sight and cannot be fed one even by a hand-built
+    snapshot."""
+    v = _Vault(tmp_path)
+    canon = rm.canonical_value_ref("out/r.md", v)
+    exact = rm.value_ref("out/r.md", v)
+    assert canon and exact and canon != exact
+    assert not rm._is_value_ref(canon), (
+        "a canonical digest passed the promoter's value-ref guard — the observability "
+        "fold can now reach the taint decision")
+    assert not rm._is_canonical_ref(exact)
+    assert len(canon) != len(exact), "the two shapes must not even be confusable"
+
+
+def test_the_exact_digest_rule_is_unchanged(tmp_path):
+    """`normalize_value` / `value_ref` are shared with the promoter and with every
+    already-stamped on-disk digest. Widening them would move the security decision AND
+    make every in-flight candidate incomparable, so this fix must leave them alone."""
+    v = _Vault(tmp_path)
+    assert rm.value_ref('"out/r.md"', v) != rm.value_ref("out/r.md", v), (
+        "value_ref has been widened — the canonical fold belongs in its OWN digest")
+    assert rm.value_ref("out/r.md.", v) != rm.value_ref("out/r.md", v)
+    assert rm.normalize_value("Acme Corp") == "Acme Corp", (
+        "normalize_value must not casefold — ask_promotion compares with it")
+
+
+# ── the no-secrets invariant, re-verified against the new surface ────────────
+
+def test_the_canonical_layer_records_nothing_for_a_credential_ask(tmp_path):
+    """The highest-severity pin, re-run against the F2 surface: the canonical form is
+    a LOWER-entropy transform of the answer, so if it ever escaped the secret fences it
+    would be a worse leak than the raw digest. A credential ask still records NOTHING."""
+    v = _Vault(tmp_path)
+    _record(v, _req(kind="credential", schema_path="auth/api_key"), SECRET)
+    assert _lines(tmp_path) == []
+    _record(v, _req(kind="input", schema_path="service/client_secret"), SECRET)
+    assert _lines(tmp_path) == []
+    raw = _raw(tmp_path)
+    assert SECRET not in raw
+    assert rm.canonical_compare_form(SECRET) not in raw
+
+
+def test_a_secret_shaped_answer_to_an_ordinary_ask_leaks_neither_form(tmp_path):
+    """An ordinary ask DOES record (correctly), but neither the value nor its
+    canonical form may appear — only keyed, non-reversible digests."""
+    v = _Vault(tmp_path)
+    _record(v, _bound_via_real_binder(v), SECRET)
+    raw = _raw(tmp_path)
+    assert raw.strip(), "a non-secret ask must still record"
+    assert SECRET not in raw
+    assert rm.canonical_compare_form(SECRET) not in raw
+
+
+def test_the_binder_never_stamps_a_canonical_digest_for_a_secret(tmp_path):
+    """BOTH digests pass through the SAME credential/secret refusals — pinned, so a
+    future guard cannot protect one and silently miss the other."""
+    from systemu.runtime import requirement_binder as rb
+
+    class _BC:
+        def __init__(self, vault):
+            self.vault = vault
+
+    bc = _BC(_Vault(tmp_path))
+    for kind, path in (("credential", "auth/api_key"),
+                       ("input", "service/client_secret"),
+                       ("input", "login/password")):
+        assert rb._value_digest(bc, kind=kind, schema_path=path, value=SECRET,
+                                canonical=True) is None, (kind, path)
+        assert rb._value_digest(bc, kind=kind, schema_path=path,
+                                value=SECRET) is None, (kind, path)
+    # not vacuous — an ordinary leaf DOES stamp both
+    assert rb._value_digest(bc, kind="input", schema_path="report/output_path",
+                            value="out/r.md", canonical=True)
+
+
+def test_a_hand_built_snapshot_cannot_smuggle_a_raw_value_through_the_canonical_field(
+        tmp_path):
+    """Guard 3's twin. `candidate_canon_ref` rides the same card spec across the same
+    suspend, so it gets the same shape check — a raw value in that field is DROPPED,
+    degrading the row to candidate-only rather than writing plaintext."""
+    v = _Vault(tmp_path)
+    snap = rm.requirement_snapshot(_bound_via_real_binder(v))
+    snap["candidate_canon_ref"] = "out/prior_report.md"        # a raw value
+    rm.record_ask_avoidable(v, ask_id="a", snapshot=snap, answer="out/prior_report.md.")
+    raw = _raw(tmp_path)
+    assert "out/prior_report.md" not in raw, "a raw value reached a plaintext audit file"
+    rec = _lines(tmp_path)[0]
+    assert all("canon_ref" not in c or rm._is_canonical_ref(c["canon_ref"])
+               for c in rec["candidates"])
+
+
+def test_a_canonical_digest_under_a_different_vault_key_is_dropped_not_miscompared(
+        tmp_path):
+    """A key rotation makes every in-flight candidate incomparable at once. That must
+    degrade the row, never be reported as "the operator overrode the binder"."""
+    v = _Vault(tmp_path)
+    other = _Vault(Path(tmp_path) / "other")
+    snap = rm.requirement_snapshot(_bound_via_real_binder(v))
+    snap["candidate_canon_ref"] = rm.canonical_value_ref("out/prior_report.md", other)
+    assert rm._is_canonical_ref(snap["candidate_canon_ref"])
+    rm.record_ask_avoidable(v, ask_id="a", snapshot=snap, answer='"out/prior_report.md"')
+    rec = _lines(tmp_path)[0]
+    assert all("canon_ref" not in c for c in rec["candidates"]), (
+        "a foreign-keyed canonical digest was kept and compared")
+
+
+# ── the S4 unblock ───────────────────────────────────────────────────────────
+
+def test_a_reshaped_confirm_now_reaches_the_S4_threshold_counters(tmp_path):
+    """`_threshold_sensitive_counts` only counts `resolvable_confirmed` rows, so every
+    form-only confirm mis-scored as an override was invisible to S4's trigger evidence.
+    A confidence-gated confirm answered in a reshaped form must now count."""
+    v = _Vault(tmp_path)
+    req = _bound(v, "out/r.md", ref="file:out/r.md", confidence=0.5,
+                 value_origin="operator")
+    _record(v, req, '"out/r.md".')
+    rec = _lines(tmp_path)[0]
+    assert rec["resolution"] == "resolvable_confirmed"
+    counts = rm.answer_linked_ask_report(v)["threshold_sensitive"]
+    assert counts["eligible_total"] == 1, (
+        "a reshaped confirm is still dark to S4 — its trigger evidence stays "
+        "suppressed by the comparison bug")
+
+
+# ── the stale-digest invariant extends to the twin ───────────────────────────
+
+def test_the_runtime_fold_clears_the_canonical_digest_with_the_handle(tmp_path):
+    """The re-ask flip clears `bound_value_ref` + `bound_value_digest` because a stale
+    digest would be compared against a LATER answer. The canonical twin is the same
+    value under a deliberately easier-to-match rule, so leaving it behind is strictly
+    more dangerous."""
+    from systemu.runtime import runtime_fold
+
+    v = _Vault(tmp_path)
+    req = _bound(v, "out/r.md", ref="file:out/r.md", schema_path="report/output_path",
+                 source="runtime_error", state="have")
+    req = req.model_copy(update={
+        "bound_value_canon_digest": rm.canonical_value_ref("out/r.md", v)})
+    assert req.bound_value_canon_digest
+
+    class _O:
+        id = 1
+
+        def __init__(self):
+            self.requirements = [req]
+
+        def model_copy(self, update):
+            o = _O()
+            o.requirements = update["requirements"]
+            return o
+
+    out = runtime_fold._reask_satisfied_precede(
+        [_O()], precede_id=1, kind="input", schema_path="report/output_path")
+    flipped = out[0].requirements[0]
+    assert flipped.bound_value_digest is None
+    assert flipped.bound_value_canon_digest is None, (
+        "a stale canonical digest survived the re-ask flip and can confirm a later, "
+        "unrelated answer")

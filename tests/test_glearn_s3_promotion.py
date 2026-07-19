@@ -69,6 +69,11 @@ class _Obj:
 SNAPSHOT_KEYS = frozenset({
     "schema_path", "class", "state", "source", "value_origin", "confidence",
     "candidate_ref",
+    # R-A16 F2: the CANONICAL-form twin of ``candidate_ref``, carried for the
+    # observability comparison only. THE PROMOTER MUST NOT READ IT — its origin
+    # decision stays exact-digest-only, and the two ref shapes are disjoint so
+    # ``_is_value_ref`` rejects a canonical digest outright.
+    "candidate_canon_ref",
 })
 
 

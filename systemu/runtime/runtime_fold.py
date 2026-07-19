@@ -147,10 +147,14 @@ def _reask_satisfied_precede(
                         and getattr(req, "state", None) == "have"):
                     # bound_value_digest goes with the ref: it is a digest of the value
                     # THAT ref stood for, so leaving it behind would let a stale digest
-                    # be compared against a later answer (R-A16 §5.9).
+                    # be compared against a later answer (R-A16 §5.9). The F2 canonical
+                    # twin is the SAME value under a form-insensitive rule, so it goes
+                    # with it — and it is the more dangerous of the two to leave behind,
+                    # being deliberately easier to match.
                     _new_reqs.append(req.model_copy(
                         update={"state": "missing", "bound_value_ref": None,
-                                "bound_value_digest": None}))
+                                "bound_value_digest": None,
+                                "bound_value_canon_digest": None}))
                 else:
                     _new_reqs.append(req)
             out.append(o.model_copy(update={"requirements": _new_reqs}))

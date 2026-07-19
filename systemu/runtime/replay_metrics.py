@@ -31,9 +31,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 
 #: Serializes appenders inside THIS process. The documented writer set for both
@@ -344,6 +346,172 @@ def _ref_key_id(ref: Any) -> Optional[str]:
     return parts[1] if len(parts) >= 3 else None
 
 
+# ── the CANONICAL comparison form (F2) ────────────────────────────────────────
+#
+# WHY A SECOND DIGEST RATHER THAN A WIDER ``normalize_value``.
+# ``value_ref`` is NOT ours alone. ``ask_promotion`` digests the answer with it and
+# compares against the same ``bound_value_digest`` to decide the promoted fact's
+# ORIGIN — the operator/content_derived TAINT axis, a security decision. Widening
+# ``normalize_value`` would silently move that decision for every value in the system,
+# and would also invalidate every digest already stamped on an in-flight card (the
+# candidate is hashed at BIND time and only the digest crosses the suspend, so a
+# changed normalizer makes old candidates permanently incomparable). So the canonical
+# form gets its OWN keyed ref, stamped ALONGSIDE the exact one, and only the
+# observability comparison reads it.
+#
+# The two shapes are DISJOINT BY LENGTH (33 vs 34), so a canonical ref can never pass
+# ``_is_value_ref`` — the promoter's guard 3 rejects one on sight and cannot be fed a
+# canonical digest even by a hand-built snapshot. That is deliberate: this file must be
+# unable to reach the security decision at all.
+#
+# ══ SECRETS ══ The canonical form is LOWER-entropy than the raw value (it casefolds
+# and strips), so it is digested under the SAME per-vault HMAC key with a distinct
+# domain prefix — never a bare hash. Non-reversibility here rests on the key, exactly
+# as it does for ``value_ref``; the class/secret-path exclusions upstream are unchanged
+# and still mean a credential ask records NOTHING at all.
+
+#: The SCORING RULE that produced a row. The corpus is APPEND-ONLY and its refs are
+#: NON-REVERSIBLE, so a row can NEVER be re-scored — whatever rule saw its inputs is
+#: the only rule that ever will. A corpus that mixes rules without saying which
+#: produced which row is not interpretable evidence, so every row carries this.
+#:   1 — exact equality over ``normalize_value`` alone. Systematically UNDER-counted
+#:       ``resolvable_confirmed`` and OVER-counted ``resolvable_overridden`` ("the ask
+#:       was necessary, the binder was wrong") for any confirm differing only in FORM.
+#:   2 — adds the canonical-form comparison and the explicit R-B4/F3 pick marker.
+ASK_SCORING_VERSION = 2
+
+_CANON_SCHEME = "hmac256c"
+#: Domain separation from ``value_ref``'s MAC input, so the same value never produces
+#: a colliding mac under the shared key.
+_CANON_MAC_PREFIX = b"systemu/r-a16/ask-avoidable/canonical-form/v1\x00"
+
+#: Matched pairs only — a lone leading quote is not a wrapper and must not be eaten.
+_QUOTE_PAIRS = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+                ("«", "»"), ("`", "`"))
+#: TRAILING only, and never an interior character: stripping interior punctuation
+#: would fold ``a.b.c`` into ``abc`` — a SUBSTRING-style collapse that manufactures
+#: false confirmations, which is the one failure mode worse than the one being fixed.
+_TRAILING_PUNCT = ".,;:!?)]}>"
+_DUP_SEP = re.compile(r"/{2,}")
+
+
+def _strip_wrappers(s: str) -> str:
+    """Peel matched surrounding quotes and trailing punctuation until stable.
+
+    Bounded (never unbounded), and never strips to empty — an answer that is ENTIRELY
+    punctuation keeps its own form rather than collapsing to ``""`` and colliding with
+    every other such answer."""
+    for _ in range(4):
+        before = s
+        for lo, hi in _QUOTE_PAIRS:
+            if len(s) >= 2 and s.startswith(lo) and s.endswith(hi):
+                s = s[1:-1].strip()
+                break
+        trimmed = s.rstrip(_TRAILING_PUNCT)
+        if trimmed:
+            s = trimmed
+        if s == before:
+            break
+    return s
+
+
+def canonical_compare_form(value: Any) -> str:
+    """The FORM-INSENSITIVE canonical string of a value, applied to BOTH sides.
+
+    A confirmed answer that differs from the binder's candidate only in FORM — a
+    separator swapped, a quote pair a widget added, a trailing period, a URL-encoded
+    space, case on a path — is a CONFIRM. Scored by exact equality it read as
+    ``resolvable_overridden``: "the ask was necessary, the binder was wrong" — the
+    exact inverse. The error was DIRECTIONAL, so the definitive count read low and the
+    "necessary" count high, in a metric that feeds a decision about how often systemu
+    asks for what it already knew.
+
+    THE LINE THIS MUST NOT CROSS. Every step is a TOTAL rewrite to a full canonical
+    string, and the comparison over the result stays EXACT (``==``). It never becomes a
+    prefix/suffix/containment test and never deletes a structural character:
+    ``out/report.md`` must not equal ``out``, ``report.md``, or ``outreport.md``.
+    Substring-ish folding would manufacture FALSE confirmations — inflating exactly the
+    number this fix exists to make trustworthy. Pinned by the negative half of
+    ``test_reshaped_answers_compare_equal_but_different_values_do_not``.
+
+    Order matters: unwrap first (a quoted value may hide the ``%``), then URL-decode
+    (a decode can REVEAL a separator: ``out%2Fr.md`` → ``out/r.md``), then fold
+    separators, then casefold.
+
+    Deliberately NOT folded: a trailing separator (``out/`` vs ``out`` is file-vs-
+    directory, a semantic difference, not a form one) and interior punctuation. Both
+    omissions under-count, which is the safe direction for this metric."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    s = str(value).strip()
+    low = s.lower()
+    if low in ("true", "false"):
+        return low
+    s = _strip_wrappers(s)
+    if "%" in s:
+        # errors="strict" so a mangled sequence RAISES rather than silently mojibaking
+        # two distinct values into one. `unquote` leaves non-escape '%' alone, so
+        # "100% cotton" and "%APPDATA%/x" pass through untouched.
+        try:
+            decoded = unquote(s, errors="strict")
+            if decoded and decoded != s:
+                s = _strip_wrappers(decoded.strip())
+        except Exception:
+            pass
+    if "/" in s or "\\" in s:
+        s = s.replace("\\", "/")
+        scheme, sep, rest = s.partition("://")
+        if sep:
+            # a URL: collapse runs inside the path but never touch the "://"
+            s = scheme + sep + _DUP_SEP.sub("/", rest)
+        else:
+            # a leading "//" is a UNC root and is MEANINGFUL — preserve it, collapse
+            # only the runs after it, so //srv/share never folds into /srv/share.
+            lead = "//" if s.startswith("//") else ""
+            s = lead + _DUP_SEP.sub("/", s[len(lead):])
+    return s.casefold()
+
+
+def canonical_value_ref(value: Any, vault: Any) -> Optional[str]:
+    """A NON-REVERSIBLE, per-vault-KEYED address for a value's CANONICAL form.
+
+    Shape ``hmac256c:<key_id>:<mac>`` — one character longer than ``value_ref``'s, so
+    the two are disjoint and neither shape guard can ever accept the other's output.
+    ``None`` when there is no value or no derivable key (fail-closed, as ever)."""
+    if value is None:
+        return None
+    s = canonical_compare_form(value)
+    if not s:
+        return None
+    try:
+        key, key_id = _ref_key(vault)
+    except Exception:
+        return None
+    mac = hmac.new(key, _CANON_MAC_PREFIX + s.encode("utf-8"),
+                   hashlib.sha256).hexdigest()[:_REF_MAC_HEX]
+    return f"{_CANON_SCHEME}:{key_id}:{mac}"
+
+
+_CANON_REF_LEN = len(_CANON_SCHEME) + 1 + _REF_KEY_ID_HEX + 1 + _REF_MAC_HEX
+
+
+def _is_canonical_ref(ref: Any) -> bool:
+    """True only for a string in the exact shape :func:`canonical_value_ref` emits.
+
+    Guard 3's twin: ``candidate_canon_ref`` rides the same card spec across the same
+    suspend, so it is the same attacker-shaped input and gets the same treatment —
+    accepted only in the emitted digest shape, dropped (never written) otherwise."""
+    if not isinstance(ref, str) or len(ref) != _CANON_REF_LEN:
+        return False
+    scheme, _, rest = ref.partition(":")
+    if scheme != _CANON_SCHEME:
+        return False
+    key_id, sep, mac = rest.partition(":")
+    if sep != ":" or len(key_id) != _REF_KEY_ID_HEX or len(mac) != _REF_MAC_HEX:
+        return False
+    return all(c in _HEX for c in key_id) and all(c in _HEX for c in mac)
+
+
 def _is_secret_path(schema_path: str, kind: str) -> bool:
     """Defence-in-depth secret detection, REUSING the shipped marker rather than a
     bespoke rule: build the same field descriptor the elicitation rail builds and ask
@@ -411,6 +579,11 @@ def requirement_snapshot(req: Any) -> Optional[Dict[str, Any]]:
         # Guard 1 also covers the digest: only the exact keyed shape is ever stamped,
         # so a hand-built requirement cannot smuggle a raw value in through this field.
         digest = get("bound_value_digest", None)
+        # F2: the CANONICAL-form twin, stamped by the binder beside the exact digest.
+        # It must be stamped at BIND time for the same reason the exact one is — the
+        # resolved value dies at the suspend and only digests cross it, so a canonical
+        # comparison is impossible unless both sides were canonicalised before hashing.
+        canon = get("bound_value_canon_digest", None)
         return {
             "schema_path": schema_path,
             "class": kind,
@@ -419,13 +592,35 @@ def requirement_snapshot(req: Any) -> Optional[Dict[str, Any]]:
             "value_origin": (str(vo) if vo else None),
             "confidence": conf,
             "candidate_ref": digest if _is_value_ref(digest) else None,
+            "candidate_canon_ref": canon if _is_canonical_ref(canon) else None,
         }
     except Exception:
         return None
 
 
+def _pick_asserted(picked: Any) -> bool:
+    """Did the caller assert an EXPLICIT R-B4/F3 pick for THIS answer?
+
+    Strict, because the marker rides a persisted decision across a suspend and is
+    therefore attacker-shaped. Only a literal ``True`` counts. A non-empty list/tuple/
+    set counts too — the reconciler holds the marker as the list of PICKED FIELD NAMES
+    and resolves it per schema_path before calling, so by the time it arrives it has
+    already been narrowed to this one path. Everything else (a string, a dict, a
+    number, an empty collection) is not an assertion and reads False.
+
+    Note the blast radius is bounded by construction: a forged pick can only move a row
+    from ``resolvable_overridden`` to ``resolvable_confirmed`` in an OBSERVABILITY file,
+    and only when the binder genuinely held a comparable candidate. It cannot reach the
+    promoter's origin decision, which reads the marker on its own."""
+    if picked is True:
+        return True
+    if isinstance(picked, (list, tuple, set, frozenset)):
+        return len(picked) > 0
+    return False
+
+
 def record_ask_avoidable(vault, *, ask_id: Any = "", snapshot: Any = None,
-                         answer: Any = None) -> None:
+                         answer: Any = None, picked: Any = False) -> None:
     """Append ONE ``AskWasAvoidable`` event (§5.9). OBSERVABILITY-ONLY, append-only,
     NEVER raises — a recording hiccup must never affect the run that made the ask.
 
@@ -445,6 +640,16 @@ def record_ask_avoidable(vault, *, ask_id: Any = "", snapshot: Any = None,
         confirmed it unchanged (ANY candidate for the path matching is a confirm).
         Avoidable **by construction**; near-miss = that bind's confidence. No replay
         needed — this is the definitive core of the metric.
+
+        A confirm is recognised by THREE witnesses, strongest first, recorded in
+        ``match_basis`` so the corpus says which one fired:
+          ``digest``    — exact equality, unchanged from v1;
+          ``canonical`` — equal after :func:`canonical_compare_form` on both sides,
+                          i.e. the answer differed only in FORM;
+          ``picked``    — R-B4/F3: the operator EXPLICITLY clicked the suggestion.
+                          Ground truth about this very question, so it is preferred
+                          over any inference — but it names no particular candidate,
+                          so the highest-scoring comparable one is credited.
       * **resolvable-overridden** — candidates existed and the operator answered
         something else. The ask was NECESSARY (the binder's value was wrong); never
         counted as avoidable.
@@ -480,9 +685,13 @@ def record_ask_avoidable(vault, *, ask_id: Any = "", snapshot: Any = None,
         if not answer_ref:
             return
         key_id = _ref_key_id(answer_ref)
+        # F2: the canonical twin of the answer. Same key ⇒ same key_id, so the
+        # key-rotation guard below covers it too.
+        answer_canon_ref = canonical_value_ref(answer, vault)
 
         candidates: List[Dict[str, Any]] = []
         matched: Optional[str] = None
+        match_basis: Optional[str] = None
         seen_refs: Dict[str, int] = {}
         for s in snaps:
             # Every element must agree with the head's identity — guard 2 applies per
@@ -510,17 +719,47 @@ def record_ask_avoidable(vault, *, ask_id: Any = "", snapshot: Any = None,
                 score = float(s.get("confidence", 0.0) or 0.0)
             except (TypeError, ValueError):
                 score = 0.0
+            # Guard 3's twin for the canonical digest — same shape check, and the same
+            # key-rotation check, so a stale-keyed canonical ref is dropped rather than
+            # allowed to miscompare.
+            cand_canon = s.get("candidate_canon_ref") or None
+            if not _is_canonical_ref(cand_canon) or _ref_key_id(cand_canon) != key_id:
+                cand_canon = None
             if cand_ref in seen_refs:     # same value bound twice ⇒ one candidate
                 i = seen_refs[cand_ref]
                 if score > candidates[i]["score"]:
                     candidates[i]["score"] = score
                     candidates[i]["value_origin"] = s.get("value_origin")
+                if cand_canon and not candidates[i].get("canon_ref"):
+                    candidates[i]["canon_ref"] = cand_canon
                 continue
             seen_refs[cand_ref] = len(candidates)
-            candidates.append({"ref": cand_ref, "score": score,
-                               "value_origin": s.get("value_origin")})
+            entry: Dict[str, Any] = {"ref": cand_ref, "score": score,
+                                     "value_origin": s.get("value_origin")}
+            if cand_canon:
+                entry["canon_ref"] = cand_canon
+            candidates.append(entry)
             if cand_ref == answer_ref and matched is None:
-                matched = cand_ref
+                matched, match_basis = cand_ref, "digest"
+
+        # ── the FORM-INSENSITIVE pass, only where exact equality found nothing ──
+        # Second, never first: an exact match is the strongest witness and must keep
+        # its own basis label, so v2 rows stay comparable to v1 rows on that subset.
+        if matched is None and answer_canon_ref:
+            for c in candidates:
+                if c.get("canon_ref") == answer_canon_ref:
+                    matched, match_basis = c["ref"], "canonical"
+                    break
+
+        # ── R-B4/F3: the EXPLICIT pick — ground truth, so it outranks inference ──
+        # It says a suggestion WAS taken but not which one, so the highest-scoring
+        # comparable candidate is credited (the same convention `near_miss` already
+        # uses when nothing matched). Only ever promotes overridden → confirmed: with
+        # no comparable candidate at all there is nothing to have picked, and the row
+        # stays `missing_answered`.
+        if matched is None and candidates and _pick_asserted(picked):
+            best = max(candidates, key=lambda c: c["score"])
+            matched, match_basis = best["ref"], "picked"
 
         if candidates:
             resolution = "resolvable_confirmed" if matched else "resolvable_overridden"
@@ -539,6 +778,10 @@ def record_ask_avoidable(vault, *, ask_id: Any = "", snapshot: Any = None,
             "near_miss_score": near_miss,
             "resolution": resolution,
             "answer_ref": answer_ref,
+            # WHICH RULE produced this row. Append-only + non-reversible refs ⇒ a row
+            # can never be re-scored, so the corpus has to be self-describing.
+            "scoring_version": ASK_SCORING_VERSION,
+            "match_basis": match_basis,
         }
         _append_line(_avoidable_ask_path(vault), rec)
     except Exception:
@@ -593,10 +836,24 @@ def answer_linked_ask_report(vault) -> Dict[str, Any]:
     total = len(recs)
     by_class: Dict[str, Dict[str, int]] = {}
     counts = _bucket()
+    # Which SCORING RULE produced each row, and (for v2) which witness fired. A v1 row
+    # was scored by exact equality alone and its `resolvable_overridden` count is known
+    # to be inflated; it can never be re-scored, so the split has to be visible rather
+    # than averaged away. Rows written before the stamp existed report as version 1.
+    scoring_versions: Dict[str, int] = {}
+    match_bases: Dict[str, int] = {}
     for r in recs:
         cls = str(r.get("class", "") or "?")
         b = by_class.setdefault(cls, _bucket())
         res = str(r.get("resolution", "") or "")
+        try:
+            ver = int(r.get("scoring_version", 1) or 1)
+        except (TypeError, ValueError):
+            ver = 1
+        scoring_versions[str(ver)] = scoring_versions.get(str(ver), 0) + 1
+        basis = r.get("match_basis")
+        if basis:
+            match_bases[str(basis)] = match_bases.get(str(basis), 0) + 1
         for tgt in (counts, b):
             tgt["total"] += 1
             if res == "resolvable_confirmed":
@@ -640,6 +897,10 @@ def answer_linked_ask_report(vault) -> Dict[str, Any]:
         "necessary_overridden": counts["necessary_overridden"],
         "missing_answered": counts["missing_answered"],
         "by_class": by_class,
+        # F2 provenance: which rule scored each row, and which witness confirmed it.
+        "scoring_version": ASK_SCORING_VERSION,
+        "scoring_versions": scoring_versions,
+        "match_bases": match_bases,
         "conversion": {
             "groups": len(groups),
             "eligible": eligible,
