@@ -196,7 +196,17 @@ def _seed_tool(vault: Path, tid: str, name: str, source: str) -> Path:
     (impl_dir / f"{name}.py").write_text(source, encoding="utf-8")
     body = {
         "id": tid, "name": name, "description": "d", "tool_type": "python",
-        "implementation_path": f"{name}.py", "status": "deployed",
+        # The shape every real writer emits — `tool_forge`/`tool_recalibrator`
+        # store `impl_path.relative_to(vault_dir.parent)`, and
+        # `tool_sandbox.execute_tool` reads it back as
+        # `vault_root.parent / implementation_path`. A BARE `{name}.py` (what
+        # this fixture used to write) is NOT a production value: no writer has
+        # emitted one since the initial commit, and it does not resolve at
+        # execution time. Writing it here hid the fact that the backfill
+        # anchored the field at the implementations dir instead.
+        "implementation_path": str(
+            (impl_dir / f"{name}.py").relative_to(vault.parent)),
+        "status": "deployed",
     }
     (tools / f"tool_{tid}.json").write_text(json.dumps(body), encoding="utf-8")
     idx = tools / "index.json"

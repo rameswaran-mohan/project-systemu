@@ -159,11 +159,20 @@ def _bind_provided_params(bc: _BindCtx, key: str, spec: dict,
     schema-walk ``path`` (R-A13a) — NOT a flat ``key in dict`` (which falsely flagged a
     nested/array/oneOf leaf the LLM DID supply nested: the R-A12c over-ask defects #2/#3).
 
-    IMPL-5 taint (the judgment call): raw provided params carry NO taint signal, so an
-    LLM-emitted plan value is ``systemu_authored`` (systemu's own reasoning, non-content ⇒
-    binds silently, state="have", never asked — the over-ask fix). NOT laundering: there is
-    no content_derived signal on raw provided params to preserve; a future per-key taint map
-    slots in here and would route content_derived → the ask."""
+    IMPL-5 taint (the judgment call): raw provided params carry NO taint signal of their
+    own, so an LLM-emitted plan value defaults to ``systemu_authored`` (systemu's own
+    reasoning, non-content ⇒ binds silently, state="have", never asked — the over-ask fix).
+
+    THE PROMPT-CHANNEL EXCEPTION (see :func:`_provided_value_is_content_seeded`). An
+    earlier version of this docstring claimed "NOT laundering: there is no
+    content_derived signal on raw provided params to preserve". That is FALSE whenever
+    the value came out of a ``content_derived`` user_fact that this system itself put in
+    front of the model: the signal exists — it is sitting in the profile — and defaulting
+    to ``systemu_authored`` DISCARDS it. Executed end-to-end, the same value bound
+    ``content_derived``/ASK through source #4 and ``systemu_authored``/SILENT through this
+    source, purely because it took a detour through a prompt. The clamp below is the
+    "future per-key taint map" this docstring anticipated, for the one carrier where the
+    taint record already exists."""
     params = getattr(bc, "provided_params", None)
     if not isinstance(params, dict):
         return None
@@ -175,7 +184,9 @@ def _bind_provided_params(bc: _BindCtx, key: str, spec: dict,
     val = _descend_provided(params, segs)
     if val is None:                               # absent / None ⇒ not a supplied value
         return None
-    return (f"provided:{'/'.join(str(s) for s in segs)}", "provided", _SYSTEMU, 1.0, val)
+    origin = (_CONTENT_DERIVED if _provided_value_is_content_seeded(bc, val)
+              else _SYSTEMU)
+    return (f"provided:{'/'.join(str(s) for s in segs)}", "provided", origin, 1.0, val)
 
 
 # ── source #1: a granted-root salient FileHandle ─────────────────────────────
@@ -418,6 +429,138 @@ def _fact_origin(fact) -> str:
         # instead of relying on the broad except.
         return _CONTENT_DERIVED
     return _coerce_origin(raw)
+
+
+# ── the PROMPT-CHANNEL taint clamp (source #0) ───────────────────────────────
+#
+# THE CHANNEL. ``content_derived`` user_facts are injected verbatim into planning
+# prompts (``scroll_refiner``'s tier-1 elder_intake payload, recent 20; the planner's
+# fenced SituationReport, which carries the whole profile). Nothing stops the model
+# from copying such a value into a tool call's params — and source #0 then stamped it
+# ``systemu_authored`` at confidence 1.0, a TRUSTED axis, so it bound SILENTLY. The
+# taint laundered through the MODEL rather than through the store: the same value that
+# source #4 confirm-gates as ``content_derived`` came back clean.
+#
+# WHY A GATE AND NOT A PROMPT MARKER. Rendering provenance inline and asking the model
+# to honour it is not a control — it is a request to an untrusted component, and the
+# tainted fact itself can carry text arguing against it. CAP-0 #4 already bans exactly
+# this shape ("NOT ... any tool self-report" as the source of truth for a trust
+# decision). The evidence is direct: the planner's fenced SituationReport ALREADY
+# renders ``origin_class`` verbatim on every user_fact, and the laundering completed
+# anyway — because the decision is made HERE, not there. So the clamp is deterministic
+# and carrier-agnostic: it does not care which prompt exposed the value, only that the
+# value matches something this system recorded as tainted.
+#
+# WHAT THIS DOES NOT CLOSE (deliberate, documented, not implied by the code):
+#   * IN-CONTEXT content with no stored taint record — a tool result, a fetched page, a
+#     file the model read this turn. There IS no recorded origin to match against; that
+#     needs a real per-key taint map threaded from the content source.
+#   * THE QUICK LANE — ``quick_task`` builds its own prompt (via
+#     ``user_context.profile_context_block``) and dispatches through ``ToolSandbox``
+#     WITHOUT ever calling the binder, so no IMPL-5 gate runs there at all.
+#   * Values shorter than ``_MIN_TAINT_MATCH_LEN`` (see below).
+
+#: Minimum length for a provided value to be matched against the tainted corpus. A
+#: short value ("is", "id", "on") is a token of almost any sentence, so matching it
+#: would clamp unrelated leaves and re-introduce the R-A12c over-ask defect wholesale.
+#: 4 keeps realistic identifiers (account ids, emails, paths, bare amounts like "5000")
+#: in scope. Values below it bind unchanged — a documented residual, not an oversight.
+_MIN_TAINT_MATCH_LEN = 4
+
+
+def _tainted_fact_texts(bc) -> List[str]:
+    """The casefolded TEXT of every ``content_derived`` user_fact in this bind context.
+
+    Read from ``bc.situation["profile"]["user_facts"]``, which
+    ``situational_inventory.build_profile`` already threads — so this needs no new
+    plumbing and no vault access. Taint is decided by :func:`_fact_origin`, the SAME
+    reader source #4 uses, so the legacy unstamped ``auto_extract`` corpus is covered by
+    that function's clamp here too (one taint definition, not two).
+
+    NOTE the corpus here is a SUPERSET of what any single prompt showed the model
+    (``build_profile`` carries every fact; the prompts cap at 5/20 most-recent). That
+    asymmetry is deliberate and fail-safe — matching against more tainted values can
+    only add confirms, never remove one.
+
+    Defensive: a rehydrated profile can hold anything, so every step is guarded and any
+    failure yields ``[]`` (⇒ no clamp ⇒ prior behavior), never an exception that would
+    propagate to the per-leaf except and degrade the leaf to a spurious gap."""
+    out: List[str] = []
+    try:
+        profile = _get(bc.situation, "profile")
+        if not isinstance(profile, dict):
+            return out
+        facts = profile.get("user_facts")
+        if not isinstance(facts, list):
+            return out
+        for fact in facts:
+            try:
+                if _fact_origin(fact) != _CONTENT_DERIVED:
+                    continue
+                txt = _get(fact, "fact")
+                if isinstance(txt, str) and txt:
+                    out.append(txt.casefold())
+            except Exception:
+                continue                          # one bad row never voids the corpus
+    except Exception:
+        return []
+    return out
+
+
+def _appears_as_token(haystack: str, needle: str) -> bool:
+    """True if ``needle`` occurs in ``haystack`` delimited by non-alphanumerics.
+
+    Token-delimited rather than raw ``in``: a raw substring test lets a short value
+    match inside a longer word ("acct" inside "accounting"), which manufactures
+    over-asks. Implemented by inspecting the adjacent characters rather than with a
+    regex ``\\b`` — the values that matter most here (an email, a POSIX path, a
+    hyphenated account id) START or END with a non-word character, where ``\\b`` has
+    the opposite meaning and would silently fail to match."""
+    n = len(needle)
+    if not n:
+        return False
+    start = 0
+    while True:
+        i = haystack.find(needle, start)
+        if i < 0:
+            return False
+        j = i + n
+        if ((i == 0 or not haystack[i - 1].isalnum())
+                and (j >= len(haystack) or not haystack[j].isalnum())):
+            return True
+        start = i + 1
+
+
+def _provided_value_is_content_seeded(bc, val) -> bool:
+    """True when a provided param's VALUE appears as a token inside a ``content_derived``
+    user_fact — i.e. the model most plausibly lifted it out of tainted content that this
+    system itself placed in its context.
+
+    Containment, not equality: a user_fact is a SENTENCE ("account_id is acct-42") while
+    the model emits the extracted VALUE ("acct-42"). An equality test would miss the
+    realistic shape entirely.
+
+    ON "FALSE POSITIVES". A value that the operator really did supply, which also happens
+    to appear as a token inside a tainted fact, clamps to an extra one-click confirm.
+    That is the correct reading, not a bug: the value DID occur in untrusted content, and
+    the binder cannot distinguish "operator typed it" from "model copied it" — the two
+    are byte-identical by the time they reach ``provided_params``. Erring toward the
+    confirm is the IMPL-5 fail-untrusted direction.
+
+    Cost is bounded and usually zero: the corpus is empty in every run with no
+    ``content_derived`` facts, which is the overwhelmingly common case, so this returns
+    False on the first line and behavior is byte-identical to before the clamp."""
+    try:
+        s = str(val).strip()
+    except Exception:
+        return False                              # unstringable ⇒ no match, no raise
+    if len(s) < _MIN_TAINT_MATCH_LEN:
+        return False
+    s = s.casefold()
+    for txt in _tainted_fact_texts(bc):
+        if _appears_as_token(txt, s):
+            return True
+    return False
 
 
 def _key_token_overlap(kl: str, other: str) -> bool:

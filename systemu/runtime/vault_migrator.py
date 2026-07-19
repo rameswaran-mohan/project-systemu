@@ -168,6 +168,20 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
     path), so it runs once per version bump and is a no-op on every boot after.
     NEVER raises — a classification failure on one tool must not break boot; it
     leaves that tool's tags empty (⇒ UNKNOWN-at-gate) and moves on.
+
+    The implementation is resolved by ``_resolve_vault_impl`` — the RUNTIME's
+    anchoring (relative ⇒ vault root's PARENT) plus containment inside
+    ``vault/tools/implementations/``. This previously anchored at the
+    implementations dir, which does not resolve for ANY shipped seed body and so
+    stamped ``[]`` on all of them; ``skipped_impl_path`` now counts the bodies
+    refused for pointing outside, so that state is visible rather than silent.
+
+    NOTE on the empty stamp: ``[]`` is fail-closed at the action SCORER
+    (``action_governance._effective_tags`` maps an empty set to ``UNKNOWN``) but
+    is NOT fail-closed in every consumer built on top of it — see
+    ``messaging.decision_bridge.classify_resolution``, where a present-but-empty
+    list satisfies the money/irreversible floor check. Correct tags therefore
+    matter beyond classification quality.
     """
     log = logger_ or logger
     vault_dir = Path(vault_dir)
@@ -194,6 +208,7 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
 
         impl_dir = vault_dir / "tools" / "implementations"
         stamped = 0
+        skipped_impl_path = 0
         errors: list = []
         for entry in entries:
             tid = entry.get("id")
@@ -209,15 +224,47 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
                 errors.append(f"read {tid}: {exc}")
                 continue
 
-            impl_rel = body.get("implementation_path") or (f"{name}.py" if name else "")
+            # Resolve the implementation the way the RUNTIME resolves it: a
+            # relative `implementation_path` is anchored at the vault root's
+            # PARENT, not at the implementations dir. That is how the value is
+            # WRITTEN (`tool_forge`/`tool_recalibrator`:
+            # `impl_path.relative_to(vault_dir.parent)`) and how it is READ back
+            # (`tool_sandbox.execute_tool`: `vault_root.parent / path`), which is
+            # why every shipped seed body carries
+            # `vault/tools/implementations/<name>.py`. Anchoring that string at
+            # `impl_dir` yielded `<vault>/tools/implementations/vault/tools/
+            # implementations/<name>.py` — a path that never exists — so the
+            # defensively-wrapped read silently produced EMPTY source and every
+            # tool was stamped `[]` while the pass reported success.
+            #
+            # Shares `_resolve_vault_impl` with `normalize_seed_forged_flags`:
+            # same anchoring, same refusal of anything landing outside
+            # `vault/tools/implementations/` (via `..`, a symlink, or an absolute
+            # path) by path-COMPONENT containment after `.resolve()`.
+            declared = body.get(_IMPL_PATH_FIELD)
+            blank = declared is None or (
+                isinstance(declared, str) and not declared.strip())
+            if blank and not name:
+                # No declared path AND no name to fall back on: there is nothing
+                # to resolve, which is not the same thing as a REFUSAL.
+                impl_path = None
+            else:
+                impl_path = _resolve_vault_impl(vault_dir, impl_dir, name, declared)
+                if impl_path is None:
+                    # Declared, but it does not land inside the implementations
+                    # dir. Counted so an operator can SEE it: a silently empty
+                    # tag list is exactly the failure this fix removes.
+                    skipped_impl_path += 1
+
             source = ""
-            if impl_rel:
-                impl_path = impl_dir / impl_rel
-                if impl_path.exists():
-                    try:
-                        source = impl_path.read_text(encoding="utf-8", errors="replace")
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"source {tid}: {exc}")
+            # is_file(), not exists(): a declared path may name the implementations
+            # DIRECTORY itself, which passes containment — reading it would only
+            # raise into the handler below.
+            if impl_path is not None and impl_path.is_file():
+                try:
+                    source = impl_path.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"source {tid}: {exc}")
 
             # R-A13b-2ii — PREFER a tool's SELF-DECLARED effect_tags (TOOL_META) over the
             # structural+curated scan, then apply the MONOTONIC money-move FLOOR: any
@@ -252,8 +299,11 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"marker: {exc}")
 
-        log.info("[EffectTagBackfill] version=%s stamped=%d errors=%d", version, stamped, len(errors))
-        return {"fast_path": False, "effect_tags_seed": version, "stamped": stamped, "errors": errors}
+        log.info(
+            "[EffectTagBackfill] version=%s stamped=%d skipped_impl_path=%d errors=%d",
+            version, stamped, skipped_impl_path, len(errors))
+        return {"fast_path": False, "effect_tags_seed": version, "stamped": stamped,
+                "skipped_impl_path": skipped_impl_path, "errors": errors}
     except Exception as exc:  # noqa: BLE001 — never break boot
         log.error("[EffectTagBackfill] unexpected failure (non-fatal): %s", exc)
         return {"error": str(exc)}

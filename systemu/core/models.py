@@ -400,7 +400,14 @@ class Tool(BaseModel):
     return_schema:       Dict[str, Any] = {}    # JSON Schema describing output
     implementation_notes: str = ""              # Library choices, approach, API hints for code gen
     dependencies:        List[str] = []         # pip packages required (e.g. ["playwright"])
-    implementation_path: str = ""               # relative to vault/tools/implementations/
+    # Relative to the VAULT ROOT'S PARENT (e.g. "vault/tools/implementations/x.py"),
+    # not to the implementations dir — that is what `tool_forge`/`tool_recalibrator`
+    # write (`impl_path.relative_to(vault_dir.parent)`) and what
+    # `tool_sandbox.execute_tool` resolves (`vault_root.parent / path`). An
+    # absolute path is also legal and is used as-is. This comment previously said
+    # "relative to vault/tools/implementations/", which is what led the effect-tag
+    # backfill to anchor it there and silently read empty source for every tool.
+    implementation_path: str = ""
     tool_md_path:        str = ""               # path to TOOL.md manifest
     status:              ToolStatus = ToolStatus.PROPOSED
     forged_by_systemu:   bool = False

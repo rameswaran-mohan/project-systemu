@@ -562,7 +562,10 @@ async def test_capabilities_stamp_via_real_backfill(tmp_path):
     import json
     body_path = vault.root / "tools" / f"tool_{tool_id}.json"
     body = json.loads(body_path.read_text(encoding="utf-8"))
-    body["implementation_path"] = "writer_tool.py"
+    # Relative to the vault root's PARENT — the shape `tool_forge` writes and
+    # the runtime resolves. A bare filename does not resolve at execution time.
+    body["implementation_path"] = str(
+        (impl_dir / "writer_tool.py").relative_to(vault.root.parent))
     body_path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
 
     report1, stamps1 = await survey_situation(None, vault=vault)

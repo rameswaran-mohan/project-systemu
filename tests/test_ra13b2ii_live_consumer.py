@@ -84,8 +84,13 @@ def _seed_and_backfill(vault: Path, tid: str, name: str, source: str) -> list:
     tools = vault / "tools"
     (tools / "implementations").mkdir(parents=True, exist_ok=True)
     (tools / "implementations" / f"{name}.py").write_text(source, encoding="utf-8")
+    # Relative to the vault root's PARENT — the shape `tool_forge` writes and
+    # `tool_sandbox.execute_tool` reads back. A bare `{name}.py` is not a
+    # production value and does not resolve at execution time.
+    impl_rel = str(
+        (tools / "implementations" / f"{name}.py").relative_to(vault.parent))
     body = {"id": tid, "name": name, "description": "fixture", "tool_type": "python",
-            "implementation_path": f"{name}.py", "status": "deployed"}
+            "implementation_path": impl_rel, "status": "deployed"}
     (tools / f"tool_{tid}.json").write_text(json.dumps(body), encoding="utf-8")
     (tools / "index.json").write_text(json.dumps([{"id": tid, "name": name}]), encoding="utf-8")
     vm.backfill_effect_tags(vault, version="0.9.73")

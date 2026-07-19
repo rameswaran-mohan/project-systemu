@@ -101,9 +101,14 @@ def _seed(vault: Path, tid: str, name: str, source: str) -> Path:
     tools = vault / "tools"
     (tools / "implementations").mkdir(parents=True, exist_ok=True)
     (tools / "implementations" / f"{name}.py").write_text(source, encoding="utf-8")
+    # `implementation_path` in the shape real writers emit: relative to the
+    # vault root's PARENT (`tool_forge`), which is how `tool_sandbox` resolves
+    # it. A bare `{name}.py` is not a production value.
+    impl_rel = str(
+        (tools / "implementations" / f"{name}.py").relative_to(vault.parent))
     (tools / f"tool_{tid}.json").write_text(json.dumps(
         {"id": tid, "name": name, "description": "d", "tool_type": "python",
-         "implementation_path": f"{name}.py", "status": "deployed"}), encoding="utf-8")
+         "implementation_path": impl_rel, "status": "deployed"}), encoding="utf-8")
     (tools / "index.json").write_text(json.dumps([{"id": tid, "name": name}]), encoding="utf-8")
     return tools / f"tool_{tid}.json"
 
