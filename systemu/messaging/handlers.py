@@ -57,13 +57,20 @@ def handle_help(_: InboundCommand) -> str:
 
 
 def handle_chat(cmd: InboundCommand) -> str:
-    """Submit a chat task — routes through direct_task with route_through_supervisor=True."""
+    """Submit a chat task — routes through direct_task with route_through_supervisor=True.
+
+    R-UTL1: ``submit_chat_task`` did not exist until this release, so every
+    ``/chat`` raised ImportError and answered "No chat pipeline available in
+    this build" WITHOUT enqueuing anything — the command has been inert since it
+    was written. It now shares one submission path with the U-1a HTTP API
+    (RUL-5: no second executor).
+    """
     if not cmd.args:
         return "Usage: /chat <prompt>"
     try:
         from systemu.pipelines.direct_task import submit_chat_task
         submission_id = submit_chat_task(
-            prompt=cmd.args,
+            cmd.args,
             state=_state(),
             route_through_supervisor=True,
             source=f"telegram:{cmd.user_id}",
@@ -72,10 +79,6 @@ def handle_chat(cmd: InboundCommand) -> str:
             f"✓ Submitted (id: {submission_id}).  "
             f"Use /status to check progress."
         )
-    except ImportError:
-        # submit_chat_task is an aspirational helper; fall back to a direct
-        # queue submission so the gateway at least confirms receipt.
-        return f"Queued: {cmd.args[:120]}.  (No chat pipeline available in this build.)"
     except Exception as exc:
         logger.exception("[Handler] /chat failed")
         return f"Sorry — /chat failed: {exc}"

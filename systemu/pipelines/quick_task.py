@@ -922,6 +922,7 @@ def promote_to_workflow(prompt: str, config, vault):
 
 
 def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = None,
+                      extra: Optional[Dict[str, Any]] = None,
                       **kwargs) -> QuickResult:
     """Chat-facing wrapper: run the quick lane AND keep the chat-history
     contract (same fields direct_task writes), so the Status dropdown, the
@@ -932,6 +933,11 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
     Used VERBATIM as the chat-history entry id so the per-entry Stop button
     (``request_cancel(entry["ts"])``) matches the registry key. When None
     (non-chat callers) the ts is generated internally as before.
+
+    R-UTL1: ``extra`` carries additive provenance (``origin``/``source``/
+    ``project_id``) from ``submit_chat_task`` into the row this creates. Merged
+    on creation only; the terminal ``update_chat_history_entry`` merges into the
+    same row, so the fields survive. Default None = unchanged behaviour.
     """
     from datetime import datetime
 
@@ -939,6 +945,7 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
     try:
         vault.append_chat_history({
             "ts": ts, "prompt": prompt, "status": "running", "lane": "quick",
+            **(extra or {}),
         })
     except Exception:
         logger.debug("[QuickTask] could not append chat history", exc_info=True)
@@ -989,4 +996,17 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
         )
     except Exception:
         logger.debug("[QuickTask] episodic capture skipped", exc_info=True)
+
+    # R-UTL1 / U-12: the no-UI Outbox contract. The quick lane is the DEFAULT
+    # lane and never touches ExecutionContext, so hooking only the workflow
+    # lane's build_result would silently miss most runs.
+    try:
+        from systemu.runtime.outbox import write_outbox_for_run
+        write_outbox_for_run(
+            vault, task_id=ts, prompt=prompt, status=result.status,
+            summary=result.answer_md or "",
+            files_produced=list(result.files_produced),
+            execution_id=getattr(result, "execution_id", None))
+    except Exception:
+        logger.debug("[QuickTask] outbox hook skipped", exc_info=True)
     return result

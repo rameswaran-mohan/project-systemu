@@ -1,12 +1,14 @@
 {
   "name": "sharing_on Omni-Capture",
-  "description": "Extracts DOM events to track SaaS actions for sharing_on.",
-  "version": "1.0",
+  "description": "Extracts DOM events to track SaaS actions for sharing_on, and sends the current page or selection to systemu.",
+  "version": "1.1",
   "manifest_version": 3,
   "permissions": [
     "nativeMessaging",
     "activeTab",
-    "scripting"
+    "scripting",
+    "contextMenus",
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -14,6 +16,13 @@
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "systemu"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "content_scripts": [
     {

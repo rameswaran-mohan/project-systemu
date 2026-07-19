@@ -42,6 +42,14 @@ from systemu.core.utils import utcnow as _now
 #  v0.8.16: Origin taxonomy — canonical trigger origin for every event
 # ─────────────────────────────────────────────────────────────────────────────
 
+# R-UTL1 note: this set is the EVENT-PANE PARTITION AXIS, not a provenance
+# vocabulary. Every live pane declares an explicit subset of it
+# (`live_events_pane.py` = {"chat"}, `console.py`/`insights.py` =
+# {"capture","manual","scheduled"}), and `_passes_origin_filter` is a plain
+# `o in origins` — so an origin no pane names is not "extra detail", it is an
+# event that renders NOWHERE. U-1a/U-1b submissions therefore keep
+# origin="chat" (they genuinely run the chat lane) and carry their real
+# provenance on the additive `submitted_via` / `source` fields instead.
 ORIGINS = {"chat", "capture", "manual", "scheduled", "system"}
 
 # The CLOSED taint axis (§5.10.b / IMPL-5) — where a stored VALUE came from, as opposed

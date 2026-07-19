@@ -69,6 +69,8 @@ multi-writer × missing-serialization.
 | `affinity_log.json` / `rejection_store.json` / `tool_metrics.json` / `capabilities/_usage.json` | termination / UI / exec threads | **LOCK+A** | lock ✓ (in-proc) | LOW |
 | `granted_roots.json` | *(no live writer today; read-only)* | `A`, unlocked | none yet | LOW (until a grant UI wires) |
 | R-SEC1 `dashboard_auth.json` / `dashboard_session.secret` | `set_passphrase` (CLI) / boot (dashboard thread) | `A` | single ✓ | LOW |
+| R-UTL1 `secrets/api_token.json` (U-1a) | **only** `dashboard_auth.mint_api_token` ← `cli doctor --make-api-token` (CLI proc) | `A` (reuses `_write_secret_file`) | **single ✓** (the request path only READS it) | LOW |
+| **U-12 Outbox** `<root>/Outbox/<yyyy-mm-dd>-<slug>/` (R-UTL1) | **only** `outbox.write_outbox_for_run` ← the two LANE TERMINALS (`pipelines/direct_task.py`, `pipelines/quick_task.py`) → the submitting task's own thread | `A` per file (tmp + `os.replace`); `.done` written LAST as the folder-complete marker | genuinely multi-writer — **concurrent RUNS** are threads of one daemon — but each run writes its OWN uniquely-named folder (`_unique_dir` collide-check), so two writers never share a path and no lock is needed. NOT covered: a second daemon process racing the same `_unique_dir` check (same exposure as `items.json`) | LOW |
 | `.credentials.json` / `.env` (gate mode) | NiceGUI settings handlers | **PLAIN (not atomic)** | single-surface | LOW (corruption-capable) |
 
 The **★ pinned single/known-writer stores** (ExecutionSnapshot, OnTheTable, fatigue-metrics

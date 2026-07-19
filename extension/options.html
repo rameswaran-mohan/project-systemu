@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>systemu — options</title>
+    <style>
+      body {
+        font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+        margin: 0;
+        padding: 1.5rem;
+        max-width: 34rem;
+        color: #14151a;
+      }
+      h1 { font-size: 1.1rem; margin: 0 0 1.25rem; }
+      label { display: block; font-weight: 600; margin: 1rem 0 0.3rem; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.5rem 0.6rem;
+        border: 1px solid #c9ccd3;
+        border-radius: 6px;
+        font: inherit;
+      }
+      .hint { color: #6b7280; font-size: 0.82rem; margin: 0.35rem 0 0; }
+      button {
+        margin-top: 1.25rem;
+        padding: 0.5rem 1rem;
+        border: 0;
+        border-radius: 6px;
+        background: #2563eb;
+        color: #fff;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #status { margin-left: 0.75rem; color: #15803d; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h1>Send to systemu</h1>
+
+    <label for="endpoint">systemu address</label>
+    <input id="endpoint" type="text" placeholder="http://localhost:8080" />
+    <p class="hint">Where the systemu dashboard is running.</p>
+
+    <label for="token">API token</label>
+    <input id="token" type="password" autocomplete="off" />
+    <p class="hint">
+      Generate one with <code>sharing_on doctor --make-api-token</code>. It is
+      shown once. Stored only in this browser profile
+      (<code>chrome.storage.local</code>) and sent only to the address above.
+    </p>
+
+    <button id="save">Save</button><span id="status"></span>
+
+    <script src="options.js"></script>
+  </body>
+</html>

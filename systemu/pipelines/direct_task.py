@@ -282,6 +282,7 @@ def run_direct_task(
     route_through_supervisor: bool = False,
     chat_ts: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Run a free-text task through the full pipeline.
 
@@ -303,6 +304,12 @@ def run_direct_task(
             VERBATIM as the chat-history entry id so the per-entry Stop button
             (``request_cancel(entry["ts"])``) matches the registry key. When None
             (CLI / non-chat callers) the ts is generated internally as before.
+        extra:
+            R-UTL1 — additive provenance fields merged into the chat-history row
+            this function CREATES (``origin``/``source``/``lane``/``project_id``
+            from ``submit_chat_task``). Merged only on creation; later
+            ``update_chat_history_entry`` calls merge into the same row, so the
+            fields survive to the terminal state. Default None = unchanged.
 
     Returns:
         The Activity if execution was attempted (or queued, when
@@ -337,10 +344,12 @@ def run_direct_task(
         scroll = refine_from_text(clean_prompt or prompt, vault, config, prior_task=prior_task)
     except Exception as exc:
         logger.error("[DirectTask] Scroll refinement failed: %s", exc)
-        vault.append_chat_history({"ts": ts, "prompt": prompt, "status": "failed", "error": str(exc)})
+        vault.append_chat_history({"ts": ts, "prompt": prompt, "status": "failed",
+                                   "error": str(exc), **(extra or {})})
         return None
 
-    vault.append_chat_history({"ts": ts, "prompt": prompt, "scroll_id": scroll.id, "status": "running"})
+    vault.append_chat_history({"ts": ts, "prompt": prompt, "scroll_id": scroll.id,
+                               "status": "running", **(extra or {})})
 
     # ── Stage 2: Activity ─────────────────────────────────────────────────
     from systemu.pipelines.activity_extractor import extract_and_process
@@ -595,6 +604,21 @@ def run_direct_task(
     except Exception:
         logger.debug("[DirectTask] episodic capture hook swallowed error", exc_info=True)
 
+    # R-UTL1 / U-12: the no-UI Outbox contract. A sibling of the episodic hook
+    # rather than a wrapper inside it — that one is gated on
+    # config.summarize_after_run and returns early when unset, which has nothing
+    # to do with whether the operator wants their files handed back.
+    try:
+        from systemu.runtime.outbox import write_outbox_for_run
+        write_outbox_for_run(
+            vault, task_id=ts, prompt=prompt,
+            status=result.get("status", "unknown"),
+            summary=result.get("final_summary") or result.get("summary") or "",
+            files_produced=list(result.get("files_produced") or []),
+            execution_id=result.get("execution_id"))
+    except Exception:
+        logger.debug("[DirectTask] outbox hook swallowed error", exc_info=True)
+
     # v0.9.6 (Layer 7): auto-skill extraction + memory consolidation.
     # Best-effort, never raises. This is where the skill library EARNS new
     # SKILL.md recipes from successful multi-step runs (auto-skill-extraction pattern).
@@ -611,3 +635,88 @@ def run_direct_task(
             logger.warning("[DirectTask] Wild Card reflection failed (non-fatal): %s", exc)
 
     return activity
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  R-UTL1 — THE shared non-UI submission entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def submit_chat_task(
+    prompt: str,
+    *,
+    state: Any = None,
+    config: Optional[Config] = None,
+    vault: Optional[Vault] = None,
+    lane: str = "workflow",
+    route_through_supervisor: bool = True,
+    source: Optional[str] = None,
+    submitted_via: str = "chat",
+    project_id: Optional[str] = None,
+) -> str:
+    """Submit a free-text task and return its ``task_id`` IMMEDIATELY.
+
+    THE shared submission path for every non-UI caller — the Telegram ``/chat``
+    handler and the U-1a HTTP API both land here, so there is exactly ONE
+    executor (RUL-5). It runs no pipeline of its own: it resolves config/vault,
+    stamps provenance, and hands off to the same two lane entry points the chat
+    page uses (``run_direct_task`` / ``submit_quick_task``).
+
+    Why it returns before the work is done: both lanes make several LLM calls
+    BEFORE anything is queued, so a synchronous call would hold an HTTP request
+    (or a Telegram webhook) open for tens of seconds. The pipeline therefore
+    runs on a daemon thread and the caller polls ``GET /api/tasks/<id>``.
+
+    ``task_id`` is the chat-history ``ts``, generated HERE and passed down as
+    ``chat_ts`` — the only way to know the id before the pipeline runs. It keeps
+    microsecond precision because two same-second submissions would otherwise
+    collide on one history row (the v0.9.32 fix ``chat_page`` documents).
+
+    Historical note: ``messaging/handlers.handle_chat`` has imported this name
+    since it was written, but the function never existed — every Telegram
+    ``/chat`` raised ``ImportError`` and replied "No chat pipeline available in
+    this build" without enqueuing anything. Defining it here repairs that path
+    and backs the new API from the same code.
+    """
+    if lane not in ("quick", "workflow"):
+        raise ValueError(f"lane must be 'quick' or 'workflow', got {lane!r}")
+
+    if config is None or vault is None:
+        st = state
+        if st is None:
+            from systemu.interface.dashboard_state import AppState
+            st = AppState.get()
+        config = config or getattr(st, "config", None)
+        vault = vault or getattr(st, "vault", None)
+    if config is None or vault is None:
+        raise RuntimeError("systemu is not initialised (no config/vault) — "
+                           "cannot accept a submission")
+
+    ts = utcnow().isoformat()
+    # `origin` stays "chat" for EVERY surface here: it is the event-pane
+    # partition key (see models.ORIGINS), the panes name a closed set, and these
+    # submissions really do run the chat lane. The surface that actually sent
+    # the work rides on `submitted_via` ("chat" | "api" | "extension" |
+    # "telegram") and `source` ("api:<fingerprint>", "telegram:<uid>") — additive
+    # fields nothing partitions on, so adding one can never hide an event.
+    extra = {"origin": "chat", "submitted_via": submitted_via,
+             "source": source or "", "lane": lane, "project_id": project_id}
+
+    def _run() -> None:
+        try:
+            if lane == "quick":
+                from systemu.pipelines.quick_task import submit_quick_task
+                submit_quick_task(prompt, config, vault, chat_ts=ts, extra=extra)
+            else:
+                run_direct_task(
+                    prompt, config, vault,
+                    route_through_supervisor=route_through_supervisor,
+                    chat_ts=ts, extra=extra)
+        except Exception:
+            logger.exception("[DirectTask] submitted task %r failed", ts)
+            try:
+                vault.update_chat_history_entry(ts, {"status": "failed"})
+            except Exception:
+                logger.debug("[DirectTask] could not mark %r failed", ts, exc_info=True)
+
+    threading.Thread(target=_run, name=f"submit-{ts}", daemon=True).start()
+    return ts

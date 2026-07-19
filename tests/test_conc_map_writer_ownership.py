@@ -150,6 +150,20 @@ WRITER_OWNERSHIP = {
         "scan_subdir": "messaging",
         "note": "Single-writer append on the telegram-gateway thread.",
     },
+    "U-12-Outbox (<root>/Outbox/<yyyy-mm-dd>-<slug>/)": {
+        "call": "write_outbox_for_run(",
+        "allowed": {
+            "pipelines/direct_task.py",  # workflow-lane terminal
+            "pipelines/quick_task.py",   # quick-lane terminal (the DEFAULT lane)
+        },
+        "def": "runtime/outbox.py",
+        "note": ("R-UTL1 U-12. The two LANE TERMINALS are the only writers. Each "
+                 "run writes its OWN uniquely-named folder (_unique_dir), so "
+                 "concurrent runs never share a path and no lock is needed — that "
+                 "invariant is what makes a third caller dangerous: it could drop "
+                 "artifacts into a folder another writer is about to seal with "
+                 ".done, which is exactly the torn-read `.done` exists to prevent."),
+    },
 }
 
 
@@ -183,6 +197,7 @@ _ATOMIC_WRITE_STORES = {
     "runtime/command_approvals.py",   # _save
     "runtime/metrics_store.py",       # _write_atomic
     "runtime/dashboard_auth.py",      # LockoutStore._save + _write_secret_file
+    "runtime/outbox.py",              # _write_atomic (receipt/.done/FAILED note)
 }
 
 

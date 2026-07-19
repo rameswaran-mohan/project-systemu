@@ -1166,6 +1166,41 @@ def _doctor_set_passphrase(passphrase: Optional[str], vault_dir: Optional[str]) 
     click.echo(f"SYSTEMU_DASHBOARD_PASSPHRASE_HASH={stored}")
 
 
+def _doctor_make_api_token(vault_dir: Optional[str]) -> None:
+    """Mint a NEW API token for the local task API (R-UTL1 / U-1a).
+
+    Stores only a SHA-256 hash via
+    :func:`systemu.runtime.dashboard_auth.mint_api_token`, then prints the token
+    ONCE. Unlike --set-passphrase (where printing the secret would be a bug),
+    this value is generated here and stored nowhere in plaintext, so printing it
+    once is the ONLY way the operator can ever have it. Minting again revokes
+    the previous token — that is the revoke path.
+    """
+    from systemu.runtime import dashboard_auth
+
+    if vault_dir is None:
+        from sharing_on.config import Config
+        vault_dir = Config.from_env().vault_dir
+    if not vault_dir:
+        click.echo("ERROR: could not determine the vault directory — pass --vault.",
+                   err=True)
+        sys.exit(2)
+
+    token = dashboard_auth.mint_api_token(vault_dir)
+    if not dashboard_auth.is_api_token_configured(vault_dir):
+        click.echo("ERROR: the token was minted but could not be read back.", err=True)
+        sys.exit(1)
+
+    click.echo(f"✓ New systemu API token minted (vault: {vault_dir}).")
+    click.echo("\nIt is shown ONCE and cannot be recovered — copy it now:\n")
+    click.echo(f"    {token}\n")
+    click.echo("Use it as a bearer token:")
+    click.echo('    curl -H "Authorization: Bearer <token>" \\')
+    click.echo('         -H "Content-Type: application/json" \\')
+    click.echo("         -d '{\"prompt\": \"...\"}' http://localhost:8080/api/tasks")
+    click.echo("\nAny previously issued token is now revoked.")
+
+
 @cli.command()
 @click.argument("scope_id", required=False)
 @click.option("--apply", "apply_mode", is_flag=True,
@@ -1180,10 +1215,17 @@ def _doctor_set_passphrase(passphrase: Optional[str], vault_dir: Optional[str]) 
 @click.option("--passphrase", "passphrase", default=None,
               help="Passphrase value for --set-passphrase (non-interactive). "
                    "Prefer stdin/prompt to keep it out of your shell history.")
+@click.option("--make-api-token", "make_api_token_mode", is_flag=True,
+              help="Mint a NEW bearer token for the local task API (R-UTL1 / "
+                   "U-1a). Printed ONCE and stored only as a hash; minting "
+                   "again revokes the previous token. Does not require a "
+                   "scope_id.")
 @click.option("--vault", "vault_dir", default=None,
-              help="Vault directory for --set-passphrase (defaults to Config.vault_dir).")
+              help="Vault directory for --set-passphrase / --make-api-token "
+                   "(defaults to Config.vault_dir).")
 def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
-           passphrase: Optional[str], vault_dir: Optional[str]):
+           passphrase: Optional[str], make_api_token_mode: bool,
+           vault_dir: Optional[str]):
     """Diagnose pending gates for a scroll/activity/shadow/tool.
 
     \b
@@ -1196,6 +1238,10 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
 
     if set_passphrase_mode:
         _doctor_set_passphrase(passphrase, vault_dir)
+        return
+
+    if make_api_token_mode:
+        _doctor_make_api_token(vault_dir)
         return
 
     if not scope_id:

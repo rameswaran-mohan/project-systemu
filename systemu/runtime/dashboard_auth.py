@@ -401,6 +401,126 @@ def session_secret(vault) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# R-UTL1 / U-1a — static bearer API token
+#
+# An EXTENSION of this auth core, not a fork: same secrets dir, same at-rest
+# envelope, same fail-closed discipline, same constant-time compare.
+# --------------------------------------------------------------------------- #
+
+_API_TOKEN_FILENAME = "api_token.json"
+_API_TOKEN_HASH_KEY = "api_token_hash"
+_API_TOKEN_FP_KEY = "api_token_fingerprint"
+#: 32 bytes of urandom -> a 43-char urlsafe token (~256 bits of entropy).
+_API_TOKEN_BYTES = 32
+_API_TOKEN_SCHEME = "sha256"
+#: Fingerprint length: enough to identify a token in a record or a log line,
+#: far too short to walk back to the token (which has ~256 bits of entropy).
+_API_TOKEN_FP_CHARS = 12
+
+
+def _api_token_file(vault) -> Path:
+    return _secrets_dir(vault) / _API_TOKEN_FILENAME
+
+
+def hash_api_token(token: str) -> str:
+    """``sha256$<hex>`` over the token.
+
+    Deliberately NOT scrypt (which :func:`hash_passphrase` uses). A passphrase
+    is low-entropy and human-chosen, so it needs a memory-hard KDF to survive
+    offline cracking. An API token is 256 bits of urandom — there is no
+    dictionary to attack, so the KDF buys nothing, while scrypt's ~128MB/~100ms
+    cost would run on EVERY request and hand any caller a trivial
+    memory-exhaustion lever against the 30/min budget.
+    """
+    return f"{_API_TOKEN_SCHEME}${hashlib.sha256(str(token).encode('utf-8')).hexdigest()}"
+
+
+def api_token_fingerprint(token: str) -> str:
+    """A short, non-reversible id for a token — safe to put in a log line or a
+    record's ``source``. Domain-separated from :func:`hash_api_token` so a
+    leaked fingerprint can never be replayed as the stored verifier."""
+    digest = hashlib.sha256(b"systemu-api-fp\x00" + str(token).encode("utf-8")).hexdigest()
+    return digest[:_API_TOKEN_FP_CHARS]
+
+
+def verify_api_token(token: str, stored: str) -> bool:
+    """Constant-time compare of ``token`` against a stored ``sha256$<hex>``.
+    Never raises — any parse/format error is a fail-closed ``False``."""
+    try:
+        if not token or not stored:
+            return False
+        scheme, _, digest = str(stored).partition("$")
+        if scheme != _API_TOKEN_SCHEME or not digest:
+            return False
+        return hmac.compare_digest(hash_api_token(token), str(stored))
+    except Exception:
+        logger.debug("[DashboardAuth] API-token verify failed - refusing", exc_info=True)
+        return False
+
+
+def mint_api_token(vault) -> str:
+    """Generate a NEW API token, persist only its hash, and return the token.
+
+    This is the only moment the token exists in plaintext — it is never stored
+    and cannot be recovered. Minting again REVOKES the previous token (there is
+    exactly one), which is the documented revoke path.
+    """
+    token = secrets.token_urlsafe(_API_TOKEN_BYTES)
+    _write_secret_file(_api_token_file(vault), {
+        _API_TOKEN_HASH_KEY: hash_api_token(token),
+        _API_TOKEN_FP_KEY: api_token_fingerprint(token),
+    })
+    return token
+
+
+def get_api_token_hash(vault) -> Optional[str]:
+    """The stored token hash, or None when no token has been minted."""
+    try:
+        data = _read_secret_file(_api_token_file(vault))
+        if not isinstance(data, dict):
+            return None
+        value = data.get(_API_TOKEN_HASH_KEY)
+        return str(value) if value else None
+    except Exception:
+        logger.debug("[DashboardAuth] API-token read failed", exc_info=True)
+        return None
+
+
+def is_api_token_configured(vault) -> bool:
+    return get_api_token_hash(vault) is not None
+
+
+def revoke_api_token(vault) -> None:
+    """Delete the stored token. Idempotent; never raises."""
+    try:
+        _api_token_file(vault).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.debug("[DashboardAuth] API-token revoke failed", exc_info=True)
+
+
+def check_api_token(vault, presented: str) -> Optional[str]:
+    """Verify ``presented`` against the stored token.
+
+    Returns the token's FINGERPRINT on success (so the caller can stamp
+    ``source=api:<fp>``), or None. Fail-closed: no stored token, no presented
+    token, or any error -> None. This is the single entry point callers should
+    use; it never distinguishes "no token configured" from "wrong token".
+    """
+    try:
+        stored = get_api_token_hash(vault)
+        if not stored or not presented:
+            return None
+        if not verify_api_token(presented, stored):
+            return None
+        return api_token_fingerprint(presented)
+    except Exception:
+        logger.debug("[DashboardAuth] API-token check failed - refusing", exc_info=True)
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # per-IP lockout
 # --------------------------------------------------------------------------- #
 

@@ -209,6 +209,22 @@ def _install_route_guard(ng_app, state) -> None:
                 authed = _ng_app.storage.user.get("authed") is True
             except Exception:
                 authed = False
+            # R-UTL1 / U-1a: a valid static bearer token is an EQUAL credential
+            # to a session, so an API client is not denied before it reaches the
+            # handler. This only ever ADDS a way to pass; it never waives the
+            # guard (a bad/absent token leaves `authed` exactly as it was), and
+            # the /api handlers re-check independently — the guard is one of two
+            # fences, not the only one.
+            if not authed:
+                try:
+                    from systemu.interface.task_api import authenticate as _api_auth
+                    _st = _ROUTE_GUARD_STATE[0]
+                    _vault = getattr(_st, "vault", None)
+                    if _vault is not None:
+                        authed = _api_auth(
+                            _vault, request.headers.get("authorization"))[0]
+                except Exception:
+                    authed = False
             return _guard_decision(path, accept, authed=authed, active=active)
         except Exception:
             logger.warning("[Dashboard] route guard error — failing closed",
@@ -1220,6 +1236,19 @@ def register_routes() -> None:
 
     for _path, _target in _legacy_redirect_routes():
         ng_app.add_route(_path, _make_redirect(_target))
+
+    # R-UTL1 / U-1a: the JSON task API. Registered the same way (plain Starlette
+    # routes on the ASGI router) — these are NOT ui.page routes, so they carry
+    # no spine and no onboarding gate; they authenticate per-request instead.
+    try:
+        from systemu.interface.task_api import register_task_api
+        # A GETTER, not the object: the holder is re-pointed on a second
+        # run_dashboard(), and capturing the state once would strand the API on
+        # a stale vault. Reading the same holder the guard reads also means the
+        # two fences can never disagree about which install they are protecting.
+        register_task_api(ng_app, lambda: _ROUTE_GUARD_STATE[0])
+    except Exception:
+        logger.warning("[Dashboard] task API registration failed", exc_info=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
