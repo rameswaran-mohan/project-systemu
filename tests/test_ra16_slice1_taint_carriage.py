@@ -435,7 +435,7 @@ def test_parallel_vault_carries_origin_class_to_the_SECONDARY_store_too(tmp_path
 # safety pins above stay in the edit-safe tier; the source-reading structural
 # companions run in the full tier.
 
-_FACT_WRITE_NAMES = {"add_fact", "append_user_fact"}
+_FACT_WRITE_NAMES = {"add_fact", "append_user_fact", "_promote_fact"}
 
 # Pure FORWARDERS: they carry no origin of their own, they pass the caller's through —
 # which is why they are exempt from the "must stamp" rule below.
@@ -453,6 +453,17 @@ _FORWARDERS = {
     ("systemu/storage/sqlite/vault.py", "append_user_fact"),
     ("systemu/storage/file_vault.py", "append_user_fact"),
     ("systemu/storage/parallel_vault.py", "append_user_fact"),
+    # G-LEARN slice 3 (§5.9): the promoter's SOLE chokepoint onto ``add_fact``. It is a
+    # pure forwarder in the strict sense this allowlist requires — it takes
+    # ``origin_class`` (keyword-only, NO default, so omitting it is a TypeError rather
+    # than a silent grandfather) and passes it through verbatim; it deliberately does
+    # not clamp, because ``UserFact.origin_class`` is a closed vocabulary that rejects
+    # a non-canonical value at construction and the single clamp lives at the promoter's
+    # decision site. Added to ``_FACT_WRITE_NAMES`` as well, so its OWN caller
+    # (``promote_answered_asks``) is inventoried at depth 2 rather than escaping.
+    # Behaviourally pinned by tests/test_glearn_s3_promotion.py; structurally by
+    # tests/test_glearn_s3_promotion_source.py.
+    ("systemu/runtime/ask_promotion.py", "_promote_fact"),
 }
 
 # Genuine OPERATOR SURFACES — each verified to originate from operator-authored input:

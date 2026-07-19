@@ -358,6 +358,13 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
         from systemu.runtime.governor import Governor as Governor  # noqa: F811
 
     dispatched = 0
+    # G-LEARN slice 3 §5.9 — ONE promotion budget for the whole tick, shared by every
+    # card promoted in the loop below. `promote_answered_asks`'s own caps are
+    # call-local, so N answered decisions in one tick would otherwise multiply the
+    # bound by N (5 cards ⇒ 20 promotions against a batch cap of 8). Built here, once,
+    # OUTSIDE the loop — that placement is the fix.
+    from systemu.runtime.ask_promotion import PromotionBudget
+    _promotion_budget = PromotionBudget()
     for did in candidate_ids:
         try:
             decision = vault.get_decision(did)
@@ -506,6 +513,30 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
             # answer on every retry. Here it fires exactly once per dispatched decision,
             # and only for an answer that was actually applied to the run.
             record_bundled_ask_outcomes(vault, dctx, _ask_answers)
+
+            # G-LEARN slice 3 §5.9 — PROMOTE the accepted answers into the operator
+            # profile (+ a `learned` TableItem) so the next identical situation
+            # RESOLVES instead of ASKING. Same placement rationale as the recorder
+            # above: AFTER the idempotency stamp, because this reconciler retries a
+            # row whose dispatch raised — promoting at the coercion point would
+            # re-promote on every retry and would promote an answer that was never
+            # applied to the run.
+            #
+            # Kept a SEPARATE call rather than folded into the recorder: that function
+            # is observability-only and append-only, while this one is a durable WRITE
+            # to the profile. Independent so a failure in either cannot suppress the
+            # other. Both are never-raises.
+            #
+            # Its own try: the dispatch has already SUCCEEDED and been stamped by this
+            # point, so letting an import error fall through to the outer handler would
+            # log a false "dispatch failed … will retry" for a row that is complete.
+            try:
+                from systemu.runtime.ask_promotion import promote_answered_asks
+                promote_answered_asks(vault, dctx, _ask_answers,
+                                      budget=_promotion_budget)
+            except Exception:
+                logger.debug("[HarnessGrantReconciler] §5.9 ask promotion skipped",
+                             exc_info=True)
         except Exception:
             logger.exception(
                 "[HarnessGrantReconciler] dispatch failed for decision %s "

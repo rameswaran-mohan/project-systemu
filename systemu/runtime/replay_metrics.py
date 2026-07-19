@@ -272,12 +272,30 @@ def normalize_value(value: Any) -> str:
     The binder holds a TYPED schema value; the operator answers through a form that
     hands back a string. Without one shared normalisation a genuine confirm reads as
     an override — the same inverted-signal failure the handle-vs-value bug produced.
-    Deliberately minimal: strip surrounding whitespace, and fold the two spellings of
-    a boolean (Python's ``True`` vs a form's ``true``)."""
+    Deliberately minimal: strip surrounding whitespace, fold the two spellings of a
+    boolean (Python's ``True`` vs a form's ``true``), and normcase a PATH.
+
+    The path fold matters because paths are the dominant ``content_derived`` source:
+    ``out/draft.md``, ``out\\draft.md`` and ``OUT/DRAFT.MD`` are ONE file on Windows,
+    but compared raw they digest differently, so confirming the binder's own candidate
+    read as an override — and the consumer treats "override" as "the operator typed
+    this", i.e. TRUSTED. The failure direction was toward trust, which is the wrong way
+    for a value the binder scraped off a page.
+
+    ``os.path.normcase`` is used rather than a hand-rolled lower()+replace() precisely
+    because it encodes the PLATFORM's rule: fold case and separators on Windows, and do
+    NOTHING on POSIX, where ``a\\b`` is a legitimate filename and folding it would
+    conflate two genuinely different files. A URL is excluded — it carries separators
+    but its path segment is case-SENSITIVE."""
     if isinstance(value, bool):
         return "true" if value else "false"
     s = str(value).strip()
-    return s.lower() if s.lower() in ("true", "false") else s
+    low = s.lower()
+    if low in ("true", "false"):
+        return low
+    if ("/" in s or "\\" in s) and "://" not in s:
+        return os.path.normcase(s)
+    return s
 
 
 def value_ref(value: Any, vault: Any) -> Optional[str]:

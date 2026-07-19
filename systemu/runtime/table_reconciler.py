@@ -171,6 +171,21 @@ def project(vault) -> List[TableItem]:
             continue
         item.pinned = key in pins
         projected.setdefault(item.id, item)
+
+    # merge §5.9 LEARNED items (G-LEARN slice 3) — LAST, deliberately. An operator
+    # declaration and a live store object both outrank a learned suggestion, so this
+    # loop runs after both and uses `setdefault`: a ref_key collision keeps the
+    # operator's / the live object's card, never the learned one. Tombstoned refs are
+    # skipped here too — a learned suggestion must never resurrect something the
+    # operator removed (`add_learned_item` refuses at the write; this is the read-side
+    # half, so a sidecar written before the tombstone still cannot re-add).
+    operator_keys = {ts.ref_key(i.kind, i.ref) for i in ts.load_operator_items(vault)}
+    for item in ts.load_learned_items(vault):
+        key = ts.ref_key(item.kind, item.ref)
+        if key in tombstones or key in live_keys or key in operator_keys:
+            continue
+        item.pinned = key in pins
+        projected.setdefault(item.id, item)
     return list(projected.values())
 
 

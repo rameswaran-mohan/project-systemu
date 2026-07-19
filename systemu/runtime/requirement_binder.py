@@ -345,6 +345,22 @@ def _bind_profile(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, str
     return None
 
 
+#: ``UserFact.source`` values for which an ABSENT ``origin_class`` must NOT be
+#: grandfathered to ``operator``. Both are sole-writer strings for writers that are
+#: NOT operator-authoring surfaces:
+#:
+#:   * ``auto_extract`` — ``fact_extractor.extract_from_chat`` (R-A16): an LLM picks
+#:     which sentences of operator-DELIVERED text become durable facts; nobody reviews
+#:     the result. Closes that legacy corpus with no migration.
+#:   * ``ask_promotion`` — ``ask_promotion`` (G-LEARN slice 3, §5.9): the promoter
+#:     STAMPS the answer's original origin explicitly, so this entry is pure
+#:     defence-in-depth. It is the difference between the slice's most likely defect
+#:     (a forgotten ``origin_class=`` kwarg) causing an extra confirm — safe — and
+#:     causing a page-derived value to silent-bind as trusted — the laundering bug.
+#:     Fail-untrusted is the right default for a value systemu wrote on its own.
+_UNTRUSTED_ABSENT_SOURCES = frozenset({"auto_extract", "ask_promotion"})
+
+
 def _fact_origin(fact) -> str:
     """The taint for a ``user_facts`` bind (R-A16 slice-1, IMPL-5 "taint travels").
 
@@ -389,7 +405,7 @@ def _fact_origin(fact) -> str:
     """
     raw = _get(fact, "origin_class")
     if raw is None:
-        if _get(fact, "source") == "auto_extract":
+        if _get(fact, "source") in _UNTRUSTED_ABSENT_SOURCES:
             return _CONTENT_DERIVED
         return _OPERATOR
     if not isinstance(raw, str):

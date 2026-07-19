@@ -276,6 +276,98 @@ def add_operator_item(vault, item: "TableItem") -> None:
     save_operator_items(vault, items)
 
 
+# ── learned items — the §5.9 promotion sidecar (G-LEARN slice 3) ──────────────
+# The MIRROR IMAGE of the operator_items sidecar above, and a SEPARATE file for a
+# load-bearing reason: `load_operator_items` force-stamps BOTH `provenance` and
+# `origin_class`. That is right for a direct operator declaration and fatal for a
+# learned one — it would destroy the very taint §5.9 promotion exists to carry, and
+# would badge the /table card as operator-declared when the operator never declared it.
+# So this loader force-stamps `provenance="learned"` only, and PRESERVES the origin
+# (clamping a non-canonical value to `content_derived`, fail-untrusted).
+#
+# It must also be its own file rather than a row in `items.json`: the reconciler is
+# that file's SOLE writer and re-projects from scratch, so an item written there is
+# GONE after one `reconcile_once` tick. `table_reconciler.project()` merges this
+# sidecar AFTER the operator loop (an operator declaration wins any ref_key collision).
+
+#: Canonical taint values — mirrors `requirement_binder`'s clamp. Anything else fails
+#: UNTRUSTED to `content_derived` rather than passing through to a trusted axis.
+_CANONICAL_ORIGINS = frozenset({"operator", "systemu_authored", "content_derived"})
+
+
+def make_learned_item(kind: str, name: str, *, origin_class: str,
+                      detail: str = "") -> "TableItem":
+    """Construct a §5.9 learned item. ``origin_class`` is keyword-only with NO default
+    — the whole point of the slice is that the answer's ORIGINAL origin travels, so a
+    forgotten stamp must be a ``TypeError``, never a silent trusted default.
+
+    ``status="suggested"``: a learned proposal enters the "New on your table" tray
+    (§5.10.a). It is never auto-confirmed."""
+    ref = _operator_ref(kind, name)
+    if kind == "credential_ref":
+        detail = ""                       # §5.10.b#6 — never a note on a Keys item
+    origin = origin_class if origin_class in _CANONICAL_ORIGINS else "content_derived"
+    return TableItem(
+        id=id_for_key(ref_key(kind, ref)), kind=kind, name=name, detail=detail,
+        status="suggested", provenance="learned", origin_class=origin, ref=ref)
+
+
+def _learned_items_path(vault) -> Path:
+    return _dir(vault) / "learned_items.json"
+
+
+def load_learned_items(vault) -> List[TableItem]:
+    """Persisted §5.9 learned items. Defensive: broken/absent ⇒ [], malformed entry
+    skipped. ``provenance`` is force-stamped; ``origin_class`` is PRESERVED (see the
+    section comment) but clamped to the canonical vocabulary, fail-untrusted."""
+    try:
+        path = _learned_items_path(vault)
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        out: List[TableItem] = []
+        for entry in (raw or []):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                it = TableItem(**entry)
+                # a hand-edited sidecar cannot claim to be an operator declaration and
+                # collect an operator badge...
+                it.provenance = "learned"
+                # ...nor launder its taint by claiming an unknown/trusted origin.
+                if it.origin_class not in _CANONICAL_ORIGINS:
+                    it.origin_class = "content_derived"
+                out.append(it)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def save_learned_items(vault, items: List[TableItem]) -> None:
+    payload = [it.model_dump(mode="json") for it in items]
+    _write_atomic(_learned_items_path(vault), json.dumps(payload, indent=2))
+
+
+def add_learned_item(vault, item: "TableItem") -> bool:
+    """Append a learned item, deduped by ``ref_key``. Returns True when written.
+
+    Unlike ``add_operator_item`` this does NOT clear a tombstone: an explicit "Put on
+    the table" is a direct operator action that overrides a prior removal, but a
+    LEARNED suggestion is not — resurrecting something the operator removed is exactly
+    the re-add flapping tombstones exist to prevent."""
+    key = ref_key(item.kind, item.ref)
+    if key in load_tombstones(vault):
+        return False
+    items = load_learned_items(vault)
+    if any(ref_key(it.kind, it.ref) == key for it in items):
+        return False
+    items.append(item)
+    save_learned_items(vault, items)
+    return True
+
+
 def ref_key(kind: str, ref: Dict[str, Any]) -> str:
     """Stable per-kind identity key for dedup / tombstone / heal (§5.10.a).
 
