@@ -93,6 +93,22 @@ class BrowserPool:
                 ctx.close()
 
     def screenshot(self, url: str, output_path: str, timeout_ms: int = 20000) -> str:
+        # R-A11 parity (gap closed in R-B5): `screenshot` carried ONLY the domain
+        # policy, while the otherwise-identical `render_html` above carried the
+        # IP-level SSRF gate too. `is_url_allowed` has no IP awareness and returns
+        # True for loopback/RFC-1918/IMDS on a default install, so this path could
+        # point a local Chromium at 169.254.169.254 or at systemu's own dashboard
+        # and write the result to a PNG on disk. Same gate, same order as render_html.
+        from systemu.runtime import net_safety
+        if not net_safety.url_is_admissible(url, allowed_hosts=net_safety.allowed_outbound_hosts()):
+            raise PermissionError(f"URL blocked by SSRF guard: {url}")
+        # §5.10.b#6 / AC4b — never capture systemu's own surfaces. Checked
+        # INDEPENDENTLY of the SSRF gate: an allow-listed or LAN-bound dashboard
+        # host is SSRF-admissible and would otherwise be screenshotted.
+        from systemu.runtime import capture_exclusion
+        refusal = capture_exclusion.refusal_reason(url)
+        if refusal:
+            raise PermissionError(refusal)
         if not is_url_allowed(url):
             raise PermissionError(f"URL blocked by domain policy: {url}")
         with self._sem:

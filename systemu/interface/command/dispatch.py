@@ -39,15 +39,14 @@ def _dashboard_origin() -> str:
     Used to tag the spawned recorder so it can drop captures of systemu's own
     dashboard chrome (v0.9.32 Item 2, Layer 1). A 0.0.0.0 bind is rewritten to
     localhost so the value matches what the browser actually loads.
+
+    R-B5: the resolution now lives in ``runtime.capture_exclusion`` and this
+    delegates to it. Both callers are answering the same question — "which origin
+    is our own UI?" — and the recorder self-filter (v0.9.32) and the §5.10.b#6
+    capture exclusion must never end up with two different answers.
     """
-    pre = os.environ.get("SYSTEMU_DASHBOARD_ORIGIN")
-    if pre:
-        return pre
-    host = os.environ.get("SYSTEMU_DASHBOARD_HOST") or "localhost"
-    if host in ("0.0.0.0", "::", ""):
-        host = "localhost"
-    port = os.environ.get("SYSTEMU_DASHBOARD_PORT") or "8765"
-    return f"http://{host}:{port}"
+    from systemu.runtime.capture_exclusion import dashboard_origin
+    return dashboard_origin()
 
 
 def _verb_to_argv(verb: str, args: List[str]) -> List[str]:

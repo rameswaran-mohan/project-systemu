@@ -191,6 +191,18 @@ class Requirement(BaseModel):
     # security decision. Cleared wherever the handle is rewritten, exactly as the
     # exact digest is — a stale canonical digest miscompares the same way.
     bound_value_canon_digest: Optional[str] = None
+    # R-B5 / T5 (§5.10.d): the id of the TableItem that supplied this bind, when the
+    # winning SituationReport entry was a curated/table-backed one. Additive with a
+    # default, so legacy on-disk data validates unchanged and simply reads as
+    # "not table-attributed".
+    #
+    # This is ATTRIBUTION ONLY and carries NO trust: it never changes `value_origin`,
+    # never relaxes `_needs_ask`, and never promotes a state. Its sole consumers are
+    # the §5.10.c "using/answered from your table" chips and the §10 inventory-hit
+    # metric. A `content_derived` table item is still confirm-gated exactly as before —
+    # being on the operator's table is not evidence about the VALUE, only about where
+    # systemu looked. Do not read this field as a trust signal.
+    table_item_id: Optional[str] = None
     confidence: float = 0.0                # feeds the T_high gate
     rationale: str = ""
 

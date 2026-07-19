@@ -202,7 +202,7 @@ def _bind_provided_params(bc: _BindCtx, key: str, spec: dict,
 
 
 # ── source #1: a granted-root salient FileHandle ─────────────────────────────
-def _bind_filehandle(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, str, str, float]]:
+def _bind_filehandle(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple]:
     """R-A11a §5.4: resolve a path leaf to a granted-root file by SCORING the objective's
     reference text against the situation's salient handles (was: blind first-salient @0.9).
     Preserves the 4-tuple contract and the IMPL-5 clamp — a resolved FILE is inherently
@@ -217,8 +217,42 @@ def _bind_filehandle(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, 
     if verdict.state != "resolvable" or not verdict.referent:
         return None                                   # → falls through → input/missing ask-for-path
     # CLAMP to content_derived regardless of score (IMPL-5 fail-untrusted).
+    # R-B5 / T5: attribute the file to the curated ROOT that contains it — a
+    # `data_root` is the item kind operators most often put on the table, and
+    # without this the chip would under-report folders specifically.
     return (f"file:{verdict.referent}", "situation", _CONTENT_DERIVED,
-            float(verdict.confidence), verdict.referent)
+            float(verdict.confidence), verdict.referent,
+            _root_table_id(bc, verdict.referent))
+
+
+def _root_table_id(bc: _BindCtx, path) -> Optional[str]:
+    """The table id of the curated granted-root CONTAINING ``path``, else None.
+
+    Longest-prefix wins, so a curated sub-root nested inside a plain parent is
+    attributed to the sub-root rather than to whichever happened to be enumerated
+    first. Matching mirrors ``compose_table``'s own ``os.path.normcase`` comparison
+    so the two agree about what "the same root" means.
+
+    Attribution only, and best-effort: any failure returns None (not attributed)
+    rather than disturbing a bind that has already succeeded."""
+    try:
+        target = os.path.normcase(os.path.abspath(str(path or "")))
+        if not target:
+            return None
+        best_len, best_id = -1, None
+        for root in _situation_list(bc.situation, "roots") or []:
+            tid = _get(root, "table_item_id")
+            if not isinstance(tid, str) or not tid:
+                continue
+            rp = os.path.normcase(os.path.abspath(str(_get(root, "path") or "")))
+            if not rp:
+                continue
+            # component-boundary safe: `/data` must not match `/database/x`
+            if (target == rp or target.startswith(rp + os.sep)) and len(rp) > best_len:
+                best_len, best_id = len(rp), tid
+        return best_id
+    except Exception:
+        return None
 
 
 # ── source #2: run-context / a prior objective's output ──────────────────────
@@ -237,13 +271,19 @@ def _bind_run_context(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str,
 
 
 # ── source #3: a SituationReport inventory ENTRY (services/caps/roots/creds) ──
-def _bind_inventory_entry(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[str, str, str, float]]:
+def _bind_inventory_entry(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple]:
     """Bind from a matching inventory entry, preferring ``curated=True``. The taint is
     DERIVED from the source kind (scanned inventory content clamps to content_derived —
     IMPL-5 fail-untrusted; a forged ``origin_class`` can never launder into a silent
     bind). Handles the IMPL-8 multi-identity case: two services matching the same leaf ⇒
     signal a DECISION (return None here so the leaf falls through to a decision
-    requirement)."""
+    requirement).
+
+    R-B5 / T5: a table-backed winner ALSO returns a 6th tuple element — the
+    ``table_item_id`` ``compose_table`` stamped on the entry. Attribution only; it
+    never changes the taint, the confidence, or the ask decision (see
+    ``Requirement.table_item_id``). Sources with no table provenance return the
+    5-tuple unchanged, which reads as "not table-attributed"."""
     kl = (key or "").lower()
 
     # credentials are NAMES only (AC2 of R-A9) — a leaf naming a service whose
@@ -271,7 +311,7 @@ def _bind_inventory_entry(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[
                 # and can be forged); never launders a forged 'operator' into a silent bind.
                 origin = _entry_origin(s)
                 return (f"service:{_get(s, 'name')}#{acct}", "situation", origin,
-                        0.85, acct)
+                        0.85, acct, _table_id(s))
 
     # declared_intents / capabilities — a curated-first name match.
     for field_name in ("capabilities", "declared_intents"):
@@ -291,8 +331,33 @@ def _bind_inventory_entry(bc: _BindCtx, key: str, spec: dict) -> Optional[Tuple[
             # comes from source #5 (schema default), not a fuzzy inventory name match.
             origin = _entry_origin(best)
             return (f"inventory:{field_name}", "situation", origin, 0.8,
-                    _get(best, "name") or _get(best, "tool_id"))
+                    _get(best, "name") or _get(best, "tool_id"), _table_id(best))
     return None
+
+
+def _table_id(entry) -> Optional[str]:
+    """The TableItem id behind an inventory entry, or None when the entry is not
+    table-backed (R-B5 / T5 attribution).
+
+    Two shapes, because ``compose_table`` produces two:
+      * an ANNOTATED live entry (service / capability / root) carries ``table_item_id``;
+      * a ``declared_intents`` row is a plain dict that IS a table item — its ``id``.
+
+    A ``declared_intents`` row is table-backed BY CONSTRUCTION (``compose_table`` is
+    its sole producer), so the ``id`` fallback is read only for that shape and only
+    after ``table_item_id`` is absent — never as a general "any dict with an id"
+    rule, which would let an unrelated inventory entry claim table provenance.
+
+    Returns None on anything non-str/empty: attribution is decorative, and a
+    malformed id must degrade to "not attributed", never raise into the bind."""
+    try:
+        tid = _get(entry, "table_item_id")
+        if not tid and isinstance(entry, dict) and entry.get("kind"):
+            # a declared_intents row (dict + kind) — its own id IS the table id
+            tid = entry.get("id")
+        return tid if isinstance(tid, str) and tid else None
+    except Exception:
+        return None
 
 
 def _entry_origin(entry) -> str:
@@ -1035,8 +1100,11 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
             return
 
         # 5-tuple contract (see _SOURCES); a legacy 4-tuple binds with NO value digest.
+        # R-B5 / T5: an OPTIONAL 6th element carries the TableItem id behind the bind
+        # (attribution only — never trust). Absent ⇒ not table-attributed.
         bound_ref, source, value_origin, confidence = bound[:4]
         resolved_value = bound[4] if len(bound) > 4 else None
+        table_item_id = bound[5] if len(bound) > 5 else None
         if is_path:
             slot_kind = "input"
         elif source == "situation" and str(bound_ref).startswith("credential:"):
@@ -1048,7 +1116,7 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
         _emit_requirement(bc, kind=slot_kind, schema_path=schema_path, state=state,
                           source=source, value_origin=value_origin,
                           bound_value_ref=bound_ref, confidence=float(confidence),
-                          resolved_value=resolved_value,
+                          resolved_value=resolved_value, table_item_id=table_item_id,
                           rationale=("content_derived → one-click operator confirm "
                                      "(never silent-bound)"
                                      if _coerce_origin(value_origin) == _CONTENT_DERIVED
@@ -1068,7 +1136,7 @@ def _bind_one_leaf(bc: _BindCtx, *, node, key, required, kind, path,
 
 def _emit_requirement(bc: _BindCtx, *, kind, schema_path, state, source, value_origin,
                       bound_value_ref, confidence, rationale,
-                      resolved_value=None) -> None:
+                      resolved_value=None, table_item_id=None) -> None:
     """Construct + append one Requirement, CLAMPING ``value_origin`` to a canonical
     taint value first (Finding 2 / #2 fail-safe): a non-canonical origin can never
     raise a ValidationError that propagates to the outer except and empties the whole
@@ -1084,6 +1152,11 @@ def _emit_requirement(bc: _BindCtx, *, kind, schema_path, state, source, value_o
                                          value=resolved_value),
         bound_value_canon_digest=_value_digest(bc, kind=kind, schema_path=schema_path,
                                                value=resolved_value, canonical=True),
+        # R-B5 / T5 attribution. Coerced to a plain str-or-None here so a malformed
+        # 6th tuple element can never raise a ValidationError that the outer except
+        # would turn into an emptied objective diff (the Finding-2 fail-safe).
+        table_item_id=(table_item_id if isinstance(table_item_id, str) and table_item_id
+                       else None),
         rationale=rationale,
     ))
 

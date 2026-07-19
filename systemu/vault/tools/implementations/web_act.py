@@ -14,6 +14,18 @@ def run(**kwargs) -> dict:
     try:
         from systemu.runtime.web.browser_pool import BrowserPool, is_url_allowed
         from systemu.runtime.web.act_loop import run_act_loop
+        from systemu.runtime import capture_exclusion, net_safety
+        # R-A11 parity: this path drives a real browser but carried only the
+        # IP-blind domain policy — the same gap `screenshot` had.
+        if not net_safety.url_is_admissible(url, allowed_hosts=net_safety.allowed_outbound_hosts()):
+            return {"success": False, "result": "", "steps": [],
+                    "error": f"URL blocked by SSRF guard: {url}"}
+        # §5.10.b#6 — `web_act` is named explicitly in the capture exclusion, and it
+        # is the sharpest of the three paths: it does not merely READ the table, it
+        # can operate its controls (reveal-on-hover key names, remove, re-grant).
+        refusal = capture_exclusion.refusal_reason(url)
+        if refusal:
+            return {"success": False, "result": "", "steps": [], "error": refusal}
         if not is_url_allowed(url):
             return {"success": False, "result": "", "steps": [], "error": f"URL blocked by domain policy: {url}"}
         pool = BrowserPool.get()
