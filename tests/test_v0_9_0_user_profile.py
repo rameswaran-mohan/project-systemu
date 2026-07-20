@@ -356,7 +356,17 @@ class TestScrollRefinerConsumesProfile:
                               tags=["preference"])
 
         captured = {}
-        def fake_llm(*, tier, system, user, config, temperature=0.2, max_tokens=4000, **kw):
+        # `tier` and `stage` BOTH default to None here because that is the real
+        # `llm_router.llm_call_json` contract — a caller passes one or the other.
+        # This stub used to require `tier=`, which was never a faithful mirror of
+        # the signature; it only held while every caller happened to hard-code a
+        # tier. `refine_from_text` now tags the DEC-12 MODEL-MATRIX stage
+        # `refiner` instead, so requiring `tier=` raised TypeError. Do not
+        # re-tighten it: this test's subject is the PAYLOAD, not the routing
+        # (routing is pinned, with mutation coverage, in
+        # tests/test_model_matrix_routing.py).
+        def fake_llm(*, system, user, config, tier=None, stage=None,
+                     temperature=0.2, max_tokens=4000, **kw):
             captured["user"] = user
             return {
                 "title": "Find burritos in Bangalore",

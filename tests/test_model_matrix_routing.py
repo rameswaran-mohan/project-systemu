@@ -16,6 +16,7 @@ transport is installed at `_get_client`, above the key-resolution layer.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -144,6 +145,7 @@ def test_wired_set_is_exactly_what_the_doc_claims():
     """docs/MODEL-MATRIX.md's last column is checkable, not assertable."""
     assert set(mm.wired_stages()) == {
         "planner", "binder_assist", "consult_parse", "desk_extraction",
+        "refiner",
     }
 
 
@@ -374,6 +376,349 @@ def test_planner_resolves_through_the_matrix():
     assert owp._resolve_planner_tier(_cfg(planner_tier="tier3")) == 3
     assert owp._resolve_planner_tier(_cfg(planner_tier="tier1")) == 1
     assert owp._resolve_planner_tier(_cfg()) == 1
+
+
+# --------------------------------------------------------------------------
+# the `refiner` call sites, driven for real
+# --------------------------------------------------------------------------
+#
+# scroll_refiner.py has FIVE llm_call_json call sites, all previously hard-coded
+# `tier=1`. All five now tag stage="refiner". Only THREE are on a live
+# production path; the other two live in `_refine_with_gui_guard`, which nothing
+# in production calls (refine_scroll re-implements that guard inline). The tests
+# below drive the three live ones through the real router and assert the model
+# id that reached the wire. See docs/MODEL-MATRIX.md.
+
+#: A draft the real pipeline accepts, with a clean (non-GUI-codified) objective.
+_CLEAN_DRAFT = {
+    "title": "Document weather",
+    "intent": "Document weather",
+    "expected_outcome": "a weather doc exists",
+    "narrative_md": "x",
+    "objectives": [
+        {"id": 1, "goal": "fetch weather data",
+         "success_criteria": "data received", "output_type": "data"},
+    ],
+    "constraints": {}, "observed_preferences": {}, "tags": ["weather"],
+    "self_check_passed": True, "self_check_notes": "",
+}
+
+#: Same, but the objective trips detect_gui_codification ("screenshot"), which
+#: is what forces refine_scroll's inline GUI-rewrite retry — the SECOND live
+#: call site. Without a matching goal that site never runs and a routing
+#: assertion over it would pass vacuously.
+_GUI_DRAFT = {
+    **_CLEAN_DRAFT,
+    "objectives": [
+        {"id": 1, "goal": "take a screenshot of the dashboard",
+         "success_criteria": "image saved", "output_type": "side_effect"},
+    ],
+}
+
+
+class _ScriptedCompletions:
+    """`_FakeCompletions` with a scriptable body per successive call."""
+
+    def __init__(self, sink, bodies):
+        self._sink = sink
+        self._bodies = bodies
+
+    async def create(self, **kwargs):
+        self._sink.append(kwargs["model"])
+        return _FakeResponse(self._bodies[min(len(self._sink) - 1,
+                                              len(self._bodies) - 1)])
+
+
+class _ScriptedChat:
+    def __init__(self, sink, bodies):
+        self.completions = _ScriptedCompletions(sink, bodies)
+
+
+class _ScriptedClient:
+    def __init__(self, sink, bodies):
+        self.chat = _ScriptedChat(sink, bodies)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def scripted_wire(monkeypatch):
+    """Fake transport whose response body the test can script.
+
+    Yields ``(sink, set_bodies)``: `sink` is the list of model ids that reached
+    the wire, in order; `set_bodies` replaces the scripted responses.
+    """
+    sink: list = []
+    bodies: list = [json.dumps(_CLEAN_DRAFT)]
+    monkeypatch.setattr(llm_router, "_get_client",
+                        lambda config, tier=0: _ScriptedClient(sink, bodies))
+    monkeypatch.setattr(llm_router, "_uses_native_path", lambda tier, config: False)
+    # The scroll validator makes its OWN untagged tier=1 call and is env-gated;
+    # clear the env so these tests see only what the config asks for.
+    monkeypatch.delenv("SYSTEMU_SCROLL_VALIDATOR", raising=False)
+
+    def set_bodies(*payloads):
+        bodies[:] = [p if isinstance(p, str) else json.dumps(p) for p in payloads]
+
+    return sink, set_bodies
+
+
+def _refiner_cfg(**overrides):
+    """A `_cfg` with the scroll validator OFF.
+
+    The validator issues its own untagged `tier=1` call from inside
+    `refine_scroll`; switching it off keeps `sink` to just the refiner's calls.
+    `test_planner_tier_moves_the_refiner_but_not_the_validator` turns it back on
+    on purpose.
+    """
+    overrides.setdefault("scroll_validator", False)
+    overrides.setdefault("intelligent_supervisor_enabled", False)
+    return _cfg(**overrides)
+
+
+def _refiner_vault(tmp_path):
+    vault = _bootstrap_vault(tmp_path)
+    (tmp_path / "global_memory.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "chat_history.jsonl").write_text("", encoding="utf-8")
+    return vault
+
+
+def _capture_session(tmp_path):
+    """A capture session dir refine_scroll will accept."""
+    sess = tmp_path / "captures" / "s1"
+    sess.mkdir(parents=True, exist_ok=True)
+    (sess / "instructions.md").write_text(
+        "## Intent\n\n- **Intent:** document weather\n\n# Body\n", encoding="utf-8")
+    (sess / "session.json").write_text(
+        json.dumps({"name": "weather session", "session_id": "sess_matrix"}),
+        encoding="utf-8")
+    return sess
+
+
+@pytest.mark.parametrize("label,expected_model", [
+    ("tier1", TIER1_MODEL),
+    ("tier2", TIER2_MODEL),
+    ("tier3", TIER3_MODEL),
+])
+def test_refine_scroll_call_site_honours_planner_tier(
+        scripted_wire, tmp_path, label, expected_model):
+    """refine_scroll -> the wire, with `planner_tier` deciding the model.
+
+    Three knob values, three different models: this is the assertion the matrix
+    exists to make true. Before the stage tag, all three landed on tier 1.
+    """
+    sink, _ = scripted_wire
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll = scroll_refiner.refine_scroll(
+        _capture_session(tmp_path), _refiner_cfg(planner_tier=label), vault)
+
+    assert scroll.objectives, "pipeline did not consume a draft — call never ran"
+    assert sink, "no LLM call reached the wire; the routing assertion is vacuous"
+    assert sink[0] == expected_model, f"planner_tier={label!r} did not route: {sink}"
+
+
+def test_refine_scroll_default_is_still_tier1(scripted_wire, tmp_path):
+    """Behaviour preservation: the shipped default keeps the tier-1 model.
+
+    The five call sites hard-coded `tier=1`. `planner_tier` defaults to "tier1",
+    so tagging them must be a routing-plumbing change, not a behaviour change.
+    """
+    sink, _ = scripted_wire
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll_refiner.refine_scroll(
+        _capture_session(tmp_path), _refiner_cfg(), vault)
+    assert sink and sink[0] == TIER1_MODEL, sink
+
+
+@pytest.mark.parametrize("label,expected_model", [
+    ("tier1", TIER1_MODEL),
+    ("tier2", TIER2_MODEL),
+    ("tier3", TIER3_MODEL),
+])
+def test_refine_from_text_call_site_honours_planner_tier(
+        scripted_wire, tmp_path, label, expected_model):
+    """The chat path (`elder_intake`) — the third live refiner call site."""
+    sink, _ = scripted_wire
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll = scroll_refiner.refine_from_text(
+        "document the weather", vault, _refiner_cfg(planner_tier=label))
+
+    assert scroll.objectives, "pipeline did not consume a draft — call never ran"
+    assert sink, "no LLM call reached the wire; the routing assertion is vacuous"
+    assert sink[0] == expected_model, f"planner_tier={label!r} did not route: {sink}"
+
+
+def test_refine_from_text_default_is_still_tier1(scripted_wire, tmp_path):
+    sink, _ = scripted_wire
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll_refiner.refine_from_text(
+        "document the weather", vault, _refiner_cfg())
+    assert sink and sink[0] == TIER1_MODEL, sink
+
+
+def test_refiner_gui_rewrite_retry_runs_on_the_knobs_model(scripted_wire, tmp_path):
+    """The SECOND live site: refine_scroll's inline GUI-rewrite retry.
+
+    The first draft is GUI-codified, which forces the rewrite call. Both calls
+    must land on the knob's model — a retry that silently reverted to a literal
+    tier 1 would be exactly the drift the stage tag removes.
+    """
+    sink, set_bodies = scripted_wire
+    set_bodies(_GUI_DRAFT, _CLEAN_DRAFT)
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll_refiner.refine_scroll(
+        _capture_session(tmp_path), _refiner_cfg(planner_tier="tier3"), vault)
+
+    assert len(sink) >= 2, f"the GUI-rewrite retry never fired: {sink}"
+    assert sink[:2] == [TIER3_MODEL, TIER3_MODEL], sink
+
+
+def test_refiner_selfcheck_retry_runs_on_the_knobs_model(scripted_wire, tmp_path):
+    """The self-check auto-retry re-enters `_call_refine` — same call site."""
+    sink, set_bodies = scripted_wire
+    failing = {**_CLEAN_DRAFT, "self_check_passed": False,
+               "self_check_notes": "objective 1 does not serve the intent"}
+    set_bodies(failing, _CLEAN_DRAFT)
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll_refiner.refine_scroll(
+        _capture_session(tmp_path), _refiner_cfg(planner_tier="tier2"), vault)
+
+    assert len(sink) >= 2, f"the self-check retry never fired: {sink}"
+    assert sink[:2] == [TIER2_MODEL, TIER2_MODEL], sink
+
+
+def test_planner_tier_moves_the_refiner_but_not_the_untagged_validator(
+        scripted_wire, tmp_path):
+    """The knob is TARGETED, not global.
+
+    `refine_scroll` also invokes `scroll_validator`, which still hard-codes
+    `tier=1` and is one of the ~36 deliberately untouched call sites. Moving
+    `planner_tier` must move the refiner and leave the validator where it is —
+    otherwise the knob is a global tier override wearing a stage's name.
+    """
+    sink, _ = scripted_wire
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll_refiner.refine_scroll(
+        _capture_session(tmp_path),
+        _refiner_cfg(planner_tier="tier3", scroll_validator=True),
+        vault)
+
+    assert len(sink) >= 2, f"the validator call never fired: {sink}"
+    assert sink[0] == TIER3_MODEL, f"refiner did not move: {sink}"
+    assert sink[1] == TIER1_MODEL, f"untagged validator moved with it: {sink}"
+
+
+def test_whitespace_planner_tier_at_the_refiner_call_site(scripted_wire, tmp_path):
+    """A whitespace-only knob must fall back to tier 1, not tier 2.
+
+    Same live-bug class as `test_whitespace_only_knob_falls_back_to_the_class_default`,
+    asserted at the wire through a real call site: the `or "tier1"` idiom only
+    caught FALSY values, so "  " was truthy, fell through, and routed to tier 2.
+    """
+    sink, _ = scripted_wire
+    from systemu.pipelines import scroll_refiner
+    vault = _refiner_vault(tmp_path / "vault")
+    scroll_refiner.refine_from_text(
+        "document the weather", vault, _refiner_cfg(planner_tier="   "))
+    assert sink and sink[0] == TIER1_MODEL, sink
+
+
+def test_the_gui_guard_helpers_two_call_sites_route_on_the_knob(
+        scripted_wire, tmp_path):
+    """`_refine_with_gui_guard` holds the other two of the five call sites.
+
+    Nothing in production calls it (pinned separately, twice, below), but both
+    of its calls are tagged for consistency, so pin that they actually route.
+    The `wired=True` claim in the matrix rests on the three LIVE sites above,
+    not on this one.
+
+    Reads no source, so it stays inside the EDIT-SAFE gate — without it, a
+    revert of either of these two `stage=` tags would survive
+    `pytest -m "not source_sensitive"`.
+    """
+    sink, set_bodies = scripted_wire
+    set_bodies(_GUI_DRAFT, _CLEAN_DRAFT)
+    import systemu.pipelines.scroll_refiner as sr
+    sr._refine_with_gui_guard(
+        payload={"x": 1}, prompt_text="p",
+        config=_refiner_cfg(planner_tier="tier2"))
+    assert sink[:2] == [TIER2_MODEL, TIER2_MODEL], sink
+
+
+def test_production_paths_never_invoke_the_gui_guard_helper(
+        scripted_wire, tmp_path, monkeypatch):
+    """The dead-helper claim, pinned by BEHAVIOUR — and edit-safe.
+
+    `refine_scroll` re-implements this guard inline, so neither live entry point
+    may reach the helper. A source-text version of this claim lives in
+    `test_no_call_to_the_gui_guard_helper_anywhere_in_the_module`; that one has
+    to be `source_sensitive` (it reads the file under test, so an unrelated
+    mid-edit comment naming the helper reds it). This one cannot be fooled by a
+    comment, and it checks what the doc actually asserts: that the LIVE paths
+    do not call it.
+
+    Weaker than the source pin in one direction — it only covers the branches it
+    drives — which is why both exist.
+    """
+    sink, set_bodies = scripted_wire
+    import systemu.pipelines.scroll_refiner as sr
+
+    seen: list = []
+    real = sr._refine_with_gui_guard
+    monkeypatch.setattr(sr, "_refine_with_gui_guard",
+                        lambda **kw: (seen.append("called"), real(**kw))[1])
+
+    # The spy must be demonstrably able to fire, or `seen == []` below is
+    # vacuous — a monkeypatch that silently failed to bind would "pass".
+    set_bodies(_CLEAN_DRAFT)
+    sr._refine_with_gui_guard(payload={"x": 1}, prompt_text="p",
+                              config=_refiner_cfg())
+    assert seen == ["called"], "spy never fired — the assertion below proves nothing"
+    seen.clear()
+
+    # Both live entry points, including the GUI-codified branch — the closest
+    # analogue of what the helper does, and where a re-wiring would land.
+    set_bodies(_GUI_DRAFT, _CLEAN_DRAFT)
+    sr.refine_scroll(_capture_session(tmp_path), _refiner_cfg(),
+                     _refiner_vault(tmp_path / "v1"))
+    set_bodies(_CLEAN_DRAFT)
+    sr.refine_from_text("document the weather",
+                        _refiner_vault(tmp_path / "v2"), _refiner_cfg())
+    assert seen == [], f"a live path invoked the supposedly-dead helper: {seen}"
+
+
+@pytest.mark.source_sensitive
+def test_no_call_to_the_gui_guard_helper_anywhere_in_the_module():
+    """The same claim over the WHOLE module, including undriven branches.
+
+    Explicitly `source_sensitive`: it reads `scroll_refiner.py` off disk, so a
+    subagent mid-edit reds it spuriously. GATE-TIER/DEC-14's auto-tagger only
+    detects the `inspect.getsource` idiom, and this reads the file directly —
+    so the marker has to be manual or this silently breaks the EDIT-SAFE gate's
+    "safe to run concurrently with source edits" promise.
+    """
+    from pathlib import Path
+    import systemu.pipelines.scroll_refiner as sr
+    src = Path(sr.__file__).read_text(encoding="utf-8")
+    # The ONLY occurrence of the name followed by "(" must be its own def —
+    # i.e. the module never calls it. A bare `== 0` would be wrong here (the
+    # def line itself matches), and `not in` would be vacuously false.
+    assert "def _refine_with_gui_guard(" in src, "helper vanished — retarget this pin"
+    assert src.count("_refine_with_gui_guard(") == 1, (
+        "production now calls _refine_with_gui_guard — update the matrix note "
+        "and docs/MODEL-MATRIX.md, which both state that it does not"
+    )
 
 
 # --------------------------------------------------------------------------

@@ -598,9 +598,6 @@ async def llm_call(
     if tools:
         kwargs["tools"] = tools
 
-    # NB: this line's exact text is an anchor in the tracked one-off
-    # patch_llm_router.py, so the stage is logged in _effective_tier instead of
-    # being appended here.
     logger.info("[LLM] tier=%d model=%s max_tokens=%d ...", tier, model, max_tokens)
     t0 = time.monotonic()
 

@@ -34,7 +34,12 @@ from systemu.core.utils import utcnow
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import create_engine, event, func, select, delete, text
+from sqlalchemy import (
+    Boolean, Column, MetaData, Table,
+    create_engine, event, func, select, delete, text,
+    false as sql_false, true as sql_true,
+)
+from sqlalchemy.schema import CreateColumn
 from sqlalchemy.orm import sessionmaker, Session
 
 from systemu.core.models import (
@@ -655,6 +660,124 @@ _No personalisation notes yet._
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Additive schema upgrades (columns added after the initial schema)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Only (table, column) is listed. The column TYPE and its DEFAULT are derived
+# from the ORM model and compiled for the LIVE dialect.
+#
+# They used to be hand-written SQL strings, which cannot be right for both
+# backends this class serves: SQLite is dynamically typed, so declaring a model
+# ``Boolean`` as ``INTEGER`` is invisible there, while PostgreSQL creates a
+# genuine ``integer`` column instead of the boolean the ORM expects. Four
+# columns were affected. Deriving from the model also stops the older drift
+# this list has already suffered once — see the ToolRow comment in models.py.
+#
+# ``create_all()`` does NOT cover this: it only creates missing TABLES, never
+# adds a column to a table that already exists. For the three ``evolutions``
+# columns this path is the only thing that ever adds them — no alembic revision
+# mentions them.
+_UPGRADE_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("evolutions", "edit_classification"),
+    ("evolutions", "fields_changed"),
+    ("evolutions", "reverted"),
+    # Tool-model fields ToolRow had stopped tracking. Every one of them read
+    # back as a model DEFAULT on this backend while the file vault kept it —
+    # ``effect_tags`` most consequentially, since it feeds the action gate and
+    # made the same tool score differently per backend. ADD COLUMN is
+    # non-destructive: existing rows keep every value they had and read NULL
+    # for the new column, which ``_row_to_tool`` maps to the model default.
+    # See the ToolRow comment for why these must land together.
+    ("tools", "requires_credentials"),
+    ("tools", "forged_by_execution_id"),
+    ("tools", "grounding_inputs"),
+    ("tools", "effect_tags"),
+    ("tools", "external_verification_channel"),
+    ("tools", "trusted_inprocess"),
+    ("tools", "forge_reattempts"),
+    ("tools", "forge_rejected"),
+    ("tools", "is_action_tool"),
+    ("tools", "toolset"),
+    ("tools", "max_result_size_chars"),
+    ("tools", "timeout_seconds"),
+    ("tools", "check_fn_name"),
+)
+
+
+def _model_server_default(model_col: Column) -> Optional[Any]:
+    """Mirror a model column's python-side default as a dialect-neutral one.
+
+    Returns a SQLAlchemy expression (not a string) so each dialect renders its
+    own literal. This reproduces the defaults the pre-derivation code emitted on
+    SQLite exactly — ``'[]'`` for the JSON list columns and ``0`` for the
+    boolean/integer ones — while staying legal on PostgreSQL, where ``DEFAULT 0``
+    on a boolean column is not a boolean literal.
+    """
+    default = model_col.default
+    if default is None:
+        return None
+    try:
+        value = default.arg(None) if default.is_callable else default.arg
+    except Exception:  # pragma: no cover — a context-dependent default
+        return None
+
+    # In Python ``bool`` IS an ``int``, so a boolean reaching the numeric branch
+    # would render ``str(False)`` -> the literal ``DEFAULT False``. That happens
+    # to be legal on both dialects, which is what makes it dangerous: it is not
+    # the ``DEFAULT 0`` the SQLite path emitted before, so it would silently
+    # change the rendering there. Booleans are therefore matched first AND
+    # excluded from the numeric branch, so neither ordering can emit a repr.
+    if isinstance(model_col.type, Boolean) or isinstance(value, bool):
+        return sql_true() if value else sql_false()
+    if isinstance(value, (list, dict)):
+        return text(f"'{json.dumps(value)}'")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return text(str(value))
+    return None
+
+
+#: Rendered DDL memo, keyed (table, column, dialect name). The rendering is a
+#: pure function of those three — the ORM model does not change at runtime — and
+#: ``_upgrade_schema`` runs on EVERY vault construction, so without this the
+#: compile cost is paid thousands of times over a process's life. Measured on
+#: the re-open path, 25 iterations: ~13 ms -> ~2.4 ms per ``_upgrade_schema``
+#: call, against ~2.6 ms for the pre-derivation hand-written strings. Without
+#: it the full test suite ran 1438 s instead of ~950 s, and the dashboard
+#: smoke test timed out waiting for its subprocess to boot.
+_ADD_COLUMN_DDL_CACHE: Dict[Tuple[str, str, str], str] = {}
+
+
+def _add_column_ddl(table: str, column: str, dialect: Any) -> str:
+    """Render ``ALTER TABLE ... ADD COLUMN`` for `column` on `dialect`.
+
+    The type and default come from the ORM model, so they cannot drift from it.
+    Raises KeyError if the pair does not name a real model column — that is a
+    programming error, and silently skipping the column is exactly how the
+    original drift went unnoticed.
+    """
+    cache_key = (table, column, getattr(dialect, "name", type(dialect).__name__))
+    cached = _ADD_COLUMN_DDL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    model_col = Base.metadata.tables[table].columns[column]
+    # nullable=True unconditionally. ``ADD COLUMN ... NOT NULL`` fails on a
+    # table that already has rows, and two of these columns are non-nullable on
+    # the model. The pre-derivation path never emitted NOT NULL either.
+    probe = Column(
+        column,
+        model_col.type,
+        nullable=True,
+        server_default=_model_server_default(model_col),
+    )
+    Table(f"_addcol_{table}_{column}", MetaData(), probe)
+    spec = str(CreateColumn(probe).compile(dialect=dialect)).strip()
+    ddl = f"ALTER TABLE {table} ADD COLUMN {spec}"
+    _ADD_COLUMN_DDL_CACHE[cache_key] = ddl
+    return ddl
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  SqliteVault
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -873,37 +996,20 @@ class SqliteVault:
         create_all() skips existing tables, so new columns must be added via
         ALTER TABLE.  SQLite does not support IF NOT EXISTS on ADD COLUMN, so
         we catch the OperationalError that fires when the column already exists.
+
+        The DDL is rendered per-column for the LIVE dialect from the ORM model
+        (see ``_add_column_ddl``) rather than hand-written as SQL, because this
+        class backs both the sqlite and the postgres mode and one literal type
+        string cannot be correct for both.
         """
-        new_cols = [
-            ("evolutions", "edit_classification", "TEXT"),
-            ("evolutions", "fields_changed",      "JSON DEFAULT '[]'"),
-            ("evolutions", "reverted",             "INTEGER DEFAULT 0"),
-            # Tool-model fields ToolRow had stopped tracking. Every one of them
-            # read back as a model DEFAULT on this backend while the file vault
-            # kept it — ``effect_tags`` most consequentially, since it feeds the
-            # action gate and made the same tool score differently per backend.
-            # ADD COLUMN is non-destructive: existing rows keep every value they
-            # had and read NULL for the new column, which ``_row_to_tool`` maps
-            # to the model default. See the ToolRow comment for why these must
-            # land together rather than one at a time.
-            ("tools", "requires_credentials",          "JSON DEFAULT '[]'"),
-            ("tools", "forged_by_execution_id",        "TEXT"),
-            ("tools", "grounding_inputs",              "JSON DEFAULT '[]'"),
-            ("tools", "effect_tags",                   "JSON DEFAULT '[]'"),
-            ("tools", "external_verification_channel", "TEXT"),
-            ("tools", "trusted_inprocess",             "INTEGER DEFAULT 0"),
-            ("tools", "forge_reattempts",              "INTEGER DEFAULT 0"),
-            ("tools", "forge_rejected",                "INTEGER DEFAULT 0"),
-            ("tools", "is_action_tool",                "INTEGER DEFAULT 0"),
-            ("tools", "toolset",                       "TEXT"),
-            ("tools", "max_result_size_chars",         "INTEGER"),
-            ("tools", "timeout_seconds",               "INTEGER"),
-            ("tools", "check_fn_name",                 "TEXT"),
-        ]
         with self._engine.connect() as conn:
-            for table, col, col_type in new_cols:
+            for table, col in _UPGRADE_COLUMNS:
+                # Rendered OUTSIDE the try: a pair that does not name a real
+                # model column is a programming error and must surface, not be
+                # swallowed by the duplicate-column handler below.
+                ddl = _add_column_ddl(table, col, conn.dialect)
                 try:
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"))
+                    conn.execute(text(ddl))
                     conn.commit()
                     logger.debug("[SqliteVault] Added column %s.%s", table, col)
                 except Exception:

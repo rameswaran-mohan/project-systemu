@@ -1,7 +1,18 @@
 """Stage 2 — Scroll Refiner.
 
 Takes a completed Sharing-On capture session directory and refines the
-raw `instructions.md` into a structured Scroll using Tier 1 reasoning.
+raw `instructions.md` into a structured Scroll.
+
+All five ``llm_call_json`` call sites in this module are tagged with the DEC-12
+MODEL-MATRIX stage ``refiner`` (planner class), so the operator's
+``planner_tier`` knob decides which model runs. That knob defaults to tier1 —
+the tier these call sites previously hard-coded — so the shipped behaviour is
+unchanged. See ``docs/MODEL-MATRIX.md``.
+
+Scoped to THIS module, deliberately: ``refine_scroll`` also invokes
+``scroll_validator.validate_scroll``, which still hard-codes ``tier=1`` and is
+one of the ~36 call sites left untouched by that slice. ``planner_tier`` moves
+the refinement calls below and does NOT move the validator.
 
 After refinement, the scroll is saved as PENDING_APPROVAL.
 If auto_approve_scrolls is enabled in config, it is immediately advanced
@@ -148,8 +159,10 @@ def _refine_with_gui_guard(*, payload: Dict[str, Any], prompt_text: str,
     has a ``_v065_gui_guard`` key with first/second pass offender lists for
     the caller to record on scroll.pipeline_trace.
     """
+    # DEC-12: planner-class `refiner` stage — `planner_tier` decides the model,
+    # not a literal 1. That knob defaults to tier1, so behaviour is unchanged.
     result = llm_call_json(
-        tier=1, system=prompt_text, user=json.dumps(payload, default=str),
+        stage="refiner", system=prompt_text, user=json.dumps(payload, default=str),
         config=config, temperature=0.1, max_tokens=4096,
     )
 
@@ -184,7 +197,7 @@ def _refine_with_gui_guard(*, payload: Dict[str, Any], prompt_text: str,
     }
     try:
         fix_result = llm_call_json(
-            tier=1, system=fix_prompt, user=json.dumps(fix_payload),
+            stage="refiner", system=fix_prompt, user=json.dumps(fix_payload),
             config=config, temperature=0.1, max_tokens=2048,
         )
     except Exception as exc:
@@ -317,15 +330,19 @@ def refine_scroll(
                 )
                 return existing
 
-    logger.info("[Scroll] Refining session '%s' with Tier 1 ...", session_name)
+    logger.info("[Scroll] Refining session '%s' ...", session_name)
 
-    # ── Tier 1 call (v0.6.0-c: with self-check retry loop) ─────────────────
+    # ── refiner-stage call (v0.6.0-c: with self-check retry loop) ──────────
+    # DEC-12: planner-class `refiner` stage — `planner_tier` decides the model,
+    # not a literal 1. That knob defaults to tier1, so behaviour is unchanged.
+    # The tier is no longer named here because the knob can move it; the router
+    # logs the resolved tier.
     prompt = load_prompt("refine_scroll.md")
     user_msg = f"Session name: {session_name}\n\n---\n\n{raw_md}"
 
     def _call_refine(extra_context: str = "") -> Dict[str, Any]:
         return llm_call_json(
-            tier=1, system=prompt,
+            stage="refiner", system=prompt,
             user=user_msg + (("\n\n---\n\n" + extra_context) if extra_context else ""),
             config=config, temperature=0.2, max_tokens=6000,
         )
@@ -395,7 +412,7 @@ def refine_scroll(
                 ]
             }
             fix_result = llm_call_json(
-                tier=1, system=fix_prompt, user=json.dumps(fix_payload),
+                stage="refiner", system=fix_prompt, user=json.dumps(fix_payload),
                 config=config, temperature=0.1, max_tokens=2048,
             )
             rewrites = {
@@ -854,7 +871,7 @@ def refine_from_text(
     intake_prompt = load_prompt("elder_intake.md")
     try:
         result = llm_call_json(
-            tier=1,
+            stage="refiner",
             system=intake_prompt,
             user=json.dumps(user_payload),
             config=config,

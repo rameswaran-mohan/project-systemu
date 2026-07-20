@@ -27,7 +27,7 @@ knob, and every call site tagged with a stage in that class moves to a different
 | Stage | Tier class | `Config` knob | Default tier | Locality (DEC-20a) | Tagged at a call site? |
 |---|---|---|---|---|---|
 | `planner` | planner | `planner_tier` | 1 | `cloud_default` | **yes** — `systemu/runtime/open_world_planner.py` |
-| `refiner` | planner | `planner_tier` | 1 | `cloud_default` | no |
+| `refiner` | planner | `planner_tier` | 1 | `cloud_default` | **yes** — `systemu/pipelines/scroll_refiner.py` |
 | `binder_assist` | binder | `binder_tier` | 1 | `cloud_default` | **yes** — `systemu/pipelines/fact_extractor.py` |
 | `consult_parse` | parser | `parser_tier` | 3 | `local_capable` | **yes** — `systemu/runtime/table_consult.py` |
 | `desk_extraction` | parser | `parser_tier` | 3 | `local_capable` | **yes** — `systemu/runtime/extractor.py` |
@@ -48,12 +48,9 @@ always win). The matrix picks a *tier*; presets pick the *model* behind that tie
 
 ## What is honestly not wired
 
-Read the last column literally. Five of the nine stages are **registered but untagged**:
+Read the last column literally. Four of the nine stages are **registered but untagged**:
 they resolve correctly if you ask for them, and nothing asks for them.
 
-- **`refiner`** — `systemu/pipelines/scroll_refiner.py` makes five `tier=1` calls that
-  by intent belong to this stage. They still hard-code the literal. Setting
-  `planner_tier` moves the planner but not the refiner.
 - **`brief_phrasing`, `router_suggestion`, `slot_canonicalization`** — named by DEC-20a.
   No call site in this build performs them under those names.
 - **`verification`** — `goal_verifier.py`, `objective_verifier.py`, `harness_judge.py`
@@ -61,6 +58,40 @@ they resolve correctly if you ask for them, and nothing asks for them.
   already works; it is registered here so the class is nameable, but those call sites
   were **not** re-routed through `stage=` in this slice. Changing `verifier_tier` does
   move them — through the old path, not through the matrix.
+
+### A caveat on `refiner`, which *is* tagged
+
+`refiner` is wired: all five `llm_call_json` call sites in
+`systemu/pipelines/scroll_refiner.py` now pass `stage="refiner"` instead of a literal
+`tier=1`, so `planner_tier` moves them. But only **three of the five sit on a live
+production path**:
+
+| Call site | Live? |
+|---|---|
+| `refine_scroll` → `_call_refine` (the main refine + its self-check retry) | yes |
+| `refine_scroll` → the inline GUI-rewrite retry | yes |
+| `refine_from_text` → `elder_intake` (the chat path) | yes |
+| `_refine_with_gui_guard` → main call | **no — nothing in production calls this function** |
+| `_refine_with_gui_guard` → its rewrite retry | **no — same** |
+
+`_refine_with_gui_guard` is a v0.6.5-c helper whose logic was later re-implemented inline
+inside `refine_scroll`. Its only remaining callers are `tests/test_v065_stage2_gui_guard.py`
+and `tests/test_v065_e2e_replay.py`. Both of its calls are tagged for consistency and are
+pinned to route, but the `wired=True` claim rests on the three live ones: the tests behind
+it drive `refine_scroll` and `refine_from_text` through the real router and assert the model
+id that reached the wire.
+
+That "production never calls it" claim is itself pinned twice, deliberately:
+`test_production_paths_never_invoke_the_gui_guard_helper` spies on the helper while driving
+both live entry points (edit-safe, and it cannot be fooled by a comment that merely names
+the helper), and `test_no_call_to_the_gui_guard_helper_anywhere_in_the_module` covers the
+branches the spy does not drive by reading the module text. The second one reads the file
+under test, so it carries a manual `source_sensitive` marker — GATE-TIER/DEC-14's
+auto-tagger only detects the `inspect.getsource` idiom, and an unmarked file-reading pin
+silently breaks the EDIT-SAFE gate's "safe to run concurrently with source edits" promise.
+
+The dead helper is filed, not fixed: deleting it is a separate change that has to rewrite
+four existing tests.
 
 There is also an asymmetry worth naming: `systemu/runtime/requirement_binder.py` — the
 thing actually called "the binder" — makes **no LLM call at all**. It is deterministic.

@@ -89,9 +89,16 @@ MATRIX: Dict[str, StageRow] = {
     ),
     "refiner": StageRow(
         stage="refiner", tier_class="planner", locality="cloud_default",
-        wired=False, call_site="",
-        note="Scroll refinement. systemu/pipelines/scroll_refiner.py hard-codes "
-             "tier=1 at 5 call sites; none tags this stage yet.",
+        wired=True, call_site="systemu/pipelines/scroll_refiner.py",
+        note="Scroll refinement: a capture session or a free-text prompt -> a "
+             "Scroll with objectives. All 5 llm_call_json call sites in that "
+             "module tag this stage. THREE are on live production paths "
+             "(refine_scroll's _call_refine + its GUI-rewrite retry, and "
+             "refine_from_text's elder_intake); the other TWO are inside "
+             "_refine_with_gui_guard, which nothing in production calls — "
+             "refine_scroll re-implements that guard inline. Those two are "
+             "tagged for consistency, but the wired=True claim rests on the "
+             "three live ones.",
     ),
     # ---- binder class (advisory bind-judgment) ------------------------------
     "binder_assist": StageRow(
