@@ -150,6 +150,39 @@ WRITER_OWNERSHIP = {
         "scan_subdir": "messaging",
         "note": "Single-writer append on the telegram-gateway thread.",
     },
+    "World-model facts (<root>/world_model/facts.json)": {
+        "call": "put_facts(",
+        "allowed": {"runtime/world_model_populator.py"},   # the WRITE-ONLY projector
+        "def": "runtime/world_model.py",
+        "note": ("R-W1 §5.11.a. The projector is the SOLE writer, called from the shadow "
+                 "exec thread's post-survey step. Concurrent RUNS are concurrent writers, "
+                 "but the write is idempotent-convergent (ids derive from (kind, value)), "
+                 "so a lost update costs a re-confirmation, never a fact. W-A's final "
+                 "slice made the store READABLE (situational_inventory composes a view, "
+                 "world_tools exposes the query tool) — both are read-only and neither "
+                 "may appear here. The R-W4 world gardener is the standing writer DEC-10 "
+                 "names explicitly: it needs its own review AND this allowlist update."),
+    },
+    "World-model negatives (<root>/world_model/negatives.json)": {
+        "call": "put_negative(",
+        "allowed": {"runtime/world_model_discovery.py"},   # the discovery-miss loop
+        "def": "runtime/world_model.py",
+        "note": ("R-W1 WM-2 'searched and not found'. Unlocked RMW across concurrent "
+                 "runs; a lost update drops a SUPPRESSION, whose cost is a repeated "
+                 "search and never a missed one. A writer that could assert absence "
+                 "from a NEW source needs a DEC-10 review — NegativeFact refuses "
+                 "content_derived at construction, and that must stay the only way in."),
+    },
+    "World-model survey watermarks (<root>/world_model/surveys.json)": {
+        "call": "record_survey(",
+        "allowed": {"runtime/world_model_populator.py"},
+        "def": "runtime/world_model.py",
+        "note": ("R-W1 read-side staleness. Same single writer/call as put_facts. A lost "
+                 "watermark makes staleness_of UNDER-report, its documented safe "
+                 "direction. A second writer would let one survey claim another's "
+                 "coverage, which is the one error that turns a live fact into "
+                 "'may be gone' — hence the pin."),
+    },
     "U-12-Outbox (<root>/Outbox/<yyyy-mm-dd>-<slug>/)": {
         "call": "write_outbox_for_run(",
         "allowed": {
@@ -198,6 +231,7 @@ _ATOMIC_WRITE_STORES = {
     "runtime/metrics_store.py",       # _write_atomic
     "runtime/dashboard_auth.py",      # LockoutStore._save + _write_secret_file
     "runtime/outbox.py",              # _write_atomic (receipt/.done/FAILED note)
+    "runtime/world_model.py",         # _write_atomic (facts/negatives/surveys)
 }
 
 

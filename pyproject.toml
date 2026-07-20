@@ -4,7 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "systemu"
-version = "0.10.21"
+# SINGLE-SOURCED — resolved from `systemu/__init__.py` at build time (see
+# [tool.setuptools.dynamic] below).  A literal here drifted from
+# `systemu.__version__` by 22 releases (0.9.59 vs 0.10.21), and because that
+# dunder gates the vault migrator's `.seed_version` fast path, every seed-tool
+# change in those releases silently stopped reaching operator vaults.  Bump
+# `systemu/__init__.py` only; this metadata follows it.
+dynamic = ["version"]
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
 license = {text = "MIT"}
@@ -151,6 +157,14 @@ markers = [
 # bare `pip install systemu` carry the curated tool pack + Wild Card shadow so
 # the daemon boots with a working capability set out of the box.
 include-package-data = true
+
+[tool.setuptools.dynamic]
+# `systemu/__init__.py` is a docstring plus a string literal, so setuptools
+# resolves this by STATIC AST read — it never imports the package, so the build
+# does not need systemu's runtime dependencies present.  Keep that file literal
+# (no computed version, no `importlib.metadata` lookup) or setuptools falls back
+# to importing it at build time.
+version = {attr = "systemu.__version__"}
 
 [tool.setuptools.packages.find]
 # Both top-level packages are part of the editable install:

@@ -111,7 +111,10 @@ def extract_records(
     })
 
     try:
-        raw = llm_call_json(tier=3, system=_SYSTEM_PROMPT, user=user_payload,
+        # DEC-12: parse-class stage — `parser_tier` decides the model, not a
+        # literal 3. Defaults to tier 3, so the shipped behaviour is unchanged.
+        raw = llm_call_json(stage="desk_extraction", system=_SYSTEM_PROMPT,
+                            user=user_payload,
                             config=config, temperature=0.0, max_tokens=4000, timeout=timeout)
     except Exception as exc:
         logger.warning("[extractor] Tier-3 LLM call failed: %s", exc)

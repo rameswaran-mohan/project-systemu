@@ -633,6 +633,24 @@ def find_data(store: FactStore, like: str, under: Optional[str] = None,
     return _rank_by_overlap(rows, like, limit)
 
 
+def ranked_view(store: FactStore, goal: str,
+                limit: Optional[int] = None) -> List[Fact]:
+    """WM-4's GOAL-CONDITIONED ranked view over the WHOLE store — it ranks, it never
+    filters (§5.11.b: "deterministic filters + relevance ranking").
+
+    Deliberately NOT :func:`about`. ``about`` answers "what is known about X" and so
+    drops every fact with zero token overlap; a goal-conditioned view must not, or a
+    goal phrased in words the operator's setup does not use ("file my receipts" over a
+    folder called ``Invoices``) would render an EMPTY world instead of a low-ranked one
+    — the failure mode that would make the whole view look broken while the store is
+    fine.
+
+    Trimming to ``limit`` is only legitimate because the registered ``world_query`` tool
+    can always reach PAST the trim (never-subtract binds the STORE, §5.10.d/§5.11 AC4).
+    Deterministic and total ordering (overlap, then confidence, then fact_id)."""
+    return _rank_by_overlap(store.all_facts(), goal, limit)
+
+
 def about(store: FactStore, key: str, limit: Optional[int] = None) -> List[Fact]:
     """Everything the world model believes about ``key`` (a host / app / account
     identifier — WM-6 tie), across all kinds, ranked by overlap. The broadening

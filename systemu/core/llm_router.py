@@ -9,6 +9,23 @@ All calls go through OpenRouter via the openai-compatible client.
 Usage:
   - llm_call_json(...)        -- synchronous, works from CLI or NiceGUI callbacks
   - async_llm_call_json(...)  -- async, for use inside async functions / coroutines
+
+MODEL-MATRIX stages (DEC-12, docs/MODEL-MATRIX.md)
+--------------------------------------------------
+Every entry point accepts EITHER an explicit ``tier=`` (the legacy shape, still
+fully supported) OR a ``stage=`` naming a registered MODEL-MATRIX stage. With
+``stage=``, the tier is resolved from the operator's per-stage ``Config`` knob
+(``planner_tier`` / ``binder_tier`` / ``parser_tier`` / ``verifier_tier``)
+instead of being hard-coded at the call site — which is what makes those knobs
+route anything at all.
+
+Two rules keep this honest:
+  * an UNREGISTERED stage name raises — it never falls back to some default
+    tier, because silently accepting a stage and routing it elsewhere is the
+    exact bug the matrix exists to remove;
+  * when a call passes both ``stage=`` and a disagreeing ``tier=``, the MATRIX
+    wins and the override is logged. The stage tag is the statement of intent;
+    a literal tier beside it is the stale hard-coding being replaced.
 """
 
 from __future__ import annotations
@@ -88,6 +105,39 @@ def _fallback_model_for_tier(tier: int, current: str) -> "str | None":
         return fb if fb and fb != current else None
     except Exception:
         return None
+
+
+def _effective_tier(tier: Optional[int], stage: Optional[str], config) -> int:
+    """Resolve the tier a call actually runs at (DEC-12 MODEL-MATRIX).
+
+    * ``stage=None`` -> the explicit ``tier`` (the pre-matrix behaviour, byte
+      for byte). ``tier=None`` with no stage is a programming error and raises.
+    * ``stage=<registered>`` -> the tier from that stage's ``Config`` knob. An
+      explicit ``tier`` passed alongside is OVERRIDDEN and the override logged:
+      the stage tag is the intent, the literal is the hard-coding it replaces.
+    * ``stage=<unregistered>`` -> ``ValueError`` from ``require_stage``. NOT
+      caught here on purpose — a typo'd stage must fail loudly rather than
+      quietly route to a model the operator never chose.
+    """
+    if stage is None:
+        if tier is None:
+            raise ValueError(
+                "llm_router: a call must carry either an explicit tier= or a "
+                "MODEL-MATRIX stage= (see docs/MODEL-MATRIX.md)")
+        return int(tier)
+
+    from sharing_on.model_matrix import config_field_for, resolve_stage_tier
+    resolved = resolve_stage_tier(stage, config)
+    if tier is not None and int(tier) != resolved:
+        logger.info(
+            "[LLM] stage=%s resolves to tier %d via the MODEL-MATRIX (knob "
+            "%s); the call site's tier=%s is overridden.",
+            stage, resolved, config_field_for(stage), tier)
+    else:
+        logger.info(
+            "[LLM] stage=%s resolves to tier %d via the MODEL-MATRIX (knob %s)",
+            stage, resolved, config_field_for(stage))
+    return resolved
 
 
 def _provider_override(tier: int, config) -> str:
@@ -504,11 +554,12 @@ async def _llm_call_via_provider(
 
 
 async def llm_call(
-    tier: int,
-    system: str,
-    user: str,
-    config: Config,
+    tier: Optional[int] = None,
+    system: str = "",
+    user: str = "",
+    config: Optional[Config] = None,
     *,
+    stage: Optional[str] = None,
     response_format: Optional[Dict[str, Any]] = None,
     tools: Optional[List[Dict[str, Any]]] = None,
     temperature: float = 0.3,
@@ -516,12 +567,19 @@ async def llm_call(
 ) -> Dict[str, Any]:
     """Make a tiered LLM call and return parsed response (async).
 
+    Pass ``tier=`` (legacy) or ``stage=`` (DEC-12 MODEL-MATRIX); see the module
+    docstring. ``tier`` keeps its leading position so the existing positional
+    callers keep working unchanged.
+
     The AsyncOpenAI client is used as an async context manager so that
     httpx.AsyncClient.aclose() is called *inside* the event loop's lifetime —
     before _run_coroutine() calls loop.close().  Without this, CPython's GC
     schedules aclose() as a finalizer after the loop is already dead, flooding
     the logs with "RuntimeError: Event loop is closed" for every API call.
     """
+    if config is None:
+        raise ValueError("llm_router.llm_call: config is required")
+    tier = _effective_tier(tier, stage, config)
     model = _model_for_tier(tier, config)
 
     messages = [
@@ -540,6 +598,9 @@ async def llm_call(
     if tools:
         kwargs["tools"] = tools
 
+    # NB: this line's exact text is an anchor in the tracked one-off
+    # patch_llm_router.py, so the stage is logged in _effective_tier instead of
+    # being appended here.
     logger.info("[LLM] tier=%d model=%s max_tokens=%d ...", tier, model, max_tokens)
     t0 = time.monotonic()
 
@@ -662,13 +723,19 @@ async def llm_call(
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def async_llm_call_json(
-    tier: int,
-    system: str,
-    user: str,
-    config: Config,
+    tier: Optional[int] = None,
+    system: str = "",
+    user: str = "",
+    config: Optional[Config] = None,
+    *,
+    stage: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Async convenience wrapper -- always requests JSON.
+
+    Accepts ``tier=`` or a MODEL-MATRIX ``stage=`` (see the module docstring).
+    The stage is resolved to a tier ONCE here, so the repair call and every
+    retry below run at the same model as the first attempt.
 
     Returns the parsed JSON dict from the LLM directly.
 
@@ -687,6 +754,14 @@ async def async_llm_call_json(
     # apply via asyncio.wait_for() so the caller's intent (cap wall-clock)
     # is preserved without breaking llm_call's strict keyword-only API.
     timeout_s = kwargs.pop("timeout", None)
+
+    if config is None:
+        raise ValueError("llm_router.async_llm_call_json: config is required")
+    # Resolve the MODEL-MATRIX stage ONCE, then drive the retry/repair loop on
+    # the numeric tier. Resolving per-attempt would re-log the override and, if
+    # the operator edited the knob mid-run, could repair at a different model
+    # than the call it is repairing.
+    tier = _effective_tier(tier, stage, config)
 
     result: Dict[str, Any] = {}
     for _attempt in range(_NETWORK_MAX_RETRIES + 1):
@@ -762,14 +837,17 @@ async def async_llm_call_json(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def llm_call_json(
-    tier: int,
-    system: str,
-    user: str,
-    config: Config,
+    tier: Optional[int] = None,
+    system: str = "",
+    user: str = "",
+    config: Optional[Config] = None,
+    *,
+    stage: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Synchronous wrapper for async_llm_call_json.
 
+    Accepts ``tier=`` or a MODEL-MATRIX ``stage=`` (see the module docstring).
     Returns the parsed JSON dict from the LLM directly.
     Safe to call from CLI subprocesses and NiceGUI callbacks.
     """
@@ -778,5 +856,6 @@ def llm_call_json(
         system=system,
         user=user,
         config=config,
+        stage=stage,
         **kwargs,
     ))

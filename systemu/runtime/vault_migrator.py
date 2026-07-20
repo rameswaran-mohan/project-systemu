@@ -563,6 +563,81 @@ def normalize_seed_forged_flags(vault_dir, *, logger_=None) -> Dict[str, Any]:
         return {"error": str(exc)}
 
 
+_PRE_MIGRATION_DIRNAME = ".pre-migration"
+
+
+def _diverges(dest: Path, source: Path) -> bool:
+    """True when ``dest`` exists AND its bytes differ from ``source``'s — i.e. an
+    overwrite would actually lose something.
+
+    Keeps ``preserved`` meaning "you had local edits". Without it, every updated
+    seed's body JSON is copied aside on every upgrade, so an operator who edited
+    NOTHING still gets a non-zero count and a warning naming their vault. Across
+    41 seeds that is a false alarm big enough to train people to ignore the real
+    one, which would defeat the point of surfacing the count at all.
+
+    Fail-SAFE direction: an existing-but-unhashable ``dest`` returns True, so the
+    file is preserved anyway (and if preservation then fails, the overwrite is
+    skipped). Never report "no divergence" from missing evidence.
+    """
+    try:
+        if not dest.is_file():
+            return False          # nothing there to lose
+        if not source.is_file():
+            return True           # replacing with something unreadable — keep a copy
+        return _file_sha256(dest) != _file_sha256(source)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _safe_version_label(version: Any) -> str:
+    """Filesystem-safe path segment from a version string.
+
+    ``.seed_version`` is FILE CONTENT — corruptible, operator-writable, and read
+    on the boot path — and this turns it into a PATH SEGMENT. Anything that could
+    escape the backup root (``..``, ``/``, ``\\``, a drive letter, a NUL) is
+    replaced rather than trusted, and a value that survives as empty / ``.`` /
+    ``..`` degrades to ``unknown``. Length-capped so a garbage marker cannot
+    blow the path limit.
+    """
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(version))
+    return (safe.strip(".")[:64] or "unknown")
+
+
+def _preserve_before_overwrite(target: Path, backup_root: Path, relname: str) -> None:
+    """Copy ``target`` aside before the migrator overwrites it. RAISES on failure.
+
+    Raising is the point. Every caller sits inside the per-tool ``try`` whose
+    ``except`` records an error and moves on, and the ``shutil.copy2`` that
+    destroys the file comes AFTER this call — so a failed preservation SKIPS the
+    overwrite instead of proceeding with it. A stale seed tool (the status quo
+    for the last 22 releases) is strictly better than unrecoverable loss of an
+    operator's edits.
+
+    WHY THIS EXISTS: ``run``'s update branch treats identity by NAME, so a seed
+    tool the operator EDITED has the same name and different bytes — the exact
+    shape that falls through to ``copy2`` and is clobbered with nothing retained.
+    Forged tools are excluded by name, but an edited SEED never was. The version
+    single-sourcing fix re-opens this gate after 22 releases, which is what turns
+    a latent hazard into a first-boot event.
+
+    WHY THE BACKUP LIVES OUTSIDE ``tools/implementations/``: files under that
+    directory pass ``_resolve_vault_impl``'s containment check, so a tool body
+    declaring ``implementation_path`` pointing at a preserved copy would EXECUTE
+    it. Keeping backups at ``<vault>/.pre-migration/<from_version>/`` puts them
+    where that containment REFUSES them, so preserved operator code can never be
+    reached as an implementation.
+    """
+    dest = backup_root / relname
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        # Re-running the migrator at the same from-version must not overwrite the
+        # backup with the already-migrated file. The FIRST copy is the true
+        # pre-migration state; keep it.
+        return
+    shutil.copy2(target, dest)
+
+
 def _maybe_log_profile_notice(vault_dir) -> None:
     """v0.9.0 (Layer 1): if vault has no user_profile.json, log a one-line
     nudge so operators discover the wizard."""
@@ -633,10 +708,29 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     updated: list = []
     skipped_forged = 0
     skipped_identical = 0
+    preserved = 0
 
     pkg_impl_dir = pkg_vault / "tools" / "implementations"
     vault_impl_dir = vault_dir / "tools" / "implementations"
     vault_impl_dir.mkdir(parents=True, exist_ok=True)
+
+    # Where clobbered vault files are copied before being replaced. Labelled with
+    # the version being migrated FROM — that is what the preserved bytes are.
+    # Sanitised because the label comes from `.seed_version`'s CONTENT.
+    backup_root = (vault_dir / _PRE_MIGRATION_DIRNAME
+                   / _safe_version_label(vault_seed))
+
+    # NOTE — WHY ONLY THE IMPLEMENTATION IS PRESERVED, NOT THE TOOL BODY JSON.
+    # `backfill_effect_tags` runs ABOVE this, on the same boot, and rewrites EVERY
+    # tool body to stamp `effect_tags` (measured: 41/41 bodies rewritten, so every
+    # body already differs from the package's by the time this loop compares).
+    # Copying a body aside here would therefore preserve a machine-generated
+    # intermediate the migrator itself had just written — never the operator's
+    # original, which was already gone — while presenting itself as protection.
+    # A backup that cannot hold what it claims to hold is worse than none, so the
+    # body is deliberately left out and `preserved` counts implementations only.
+    # If body preservation is ever wanted it has to happen BEFORE the backfill,
+    # not here.
 
     for pkg_entry in pkg_idx:
         name = pkg_entry.get("name")
@@ -649,12 +743,26 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
             # package entry has no impl file (e.g., shipped as data only); skip
             continue
         vault_entry = vault_by_name.get(name)
+        # The two destinations this loop can CLOBBER. Bound once, and both the
+        # preservation and the copy2 below use these SAME objects — a backup
+        # taken from a differently-resolved path would look like protection while
+        # protecting nothing. Note this is deliberately `{name}.py`, NOT
+        # `_resolve_vault_impl`: the overwrite here is by name, and the backup has
+        # to follow the overwrite rather than the other passes' resolution.
+        dest_impl = vault_impl_dir / f"{name}.py"
+        dest_body = vault_dir / "tools" / f"tool_{tid}.json"
         if vault_entry is None:
             # ADD: new seed tool
             try:
-                shutil.copy2(pkg_impl, vault_impl_dir / f"{name}.py")
+                # An ADD can still clobber: a vault may hold an ORPHANED
+                # implementation file with no index entry backing it.
+                if _diverges(dest_impl, pkg_impl):
+                    _preserve_before_overwrite(
+                        dest_impl, backup_root, f"implementations/{name}.py")
+                    preserved += 1
+                shutil.copy2(pkg_impl, dest_impl)
                 if pkg_body.exists():
-                    shutil.copy2(pkg_body, vault_dir / "tools" / f"tool_{tid}.json")
+                    shutil.copy2(pkg_body, dest_body)   # body: see NOTE in `run`
                 vault_idx.append(pkg_entry)
                 added.append(tid)
             except Exception as exc:
@@ -662,14 +770,21 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
         else:
             # Identity by NAME → treat as seed regardless of forged flag.
             # UPDATE if impl content differs.
-            existing_impl = vault_impl_dir / f"{name}.py"
+            existing_impl = dest_impl
             try:
                 if existing_impl.exists() and _file_sha256(existing_impl) == _file_sha256(pkg_impl):
                     skipped_identical += 1
                 else:
+                    # Differing bytes under a seed NAME is exactly the
+                    # operator-edited-seed case. Preserve first; if that fails we
+                    # land in the handler below and the copy2 never runs.
+                    if _diverges(existing_impl, pkg_impl):
+                        _preserve_before_overwrite(
+                            existing_impl, backup_root, f"implementations/{name}.py")
+                        preserved += 1
                     shutil.copy2(pkg_impl, existing_impl)
                     if pkg_body.exists():
-                        shutil.copy2(pkg_body, vault_dir / "tools" / f"tool_{tid}.json")
+                        shutil.copy2(pkg_body, dest_body)   # body: see NOTE in `run`
                     # Replace vault index entry with package authoritative version
                     for i, e in enumerate(vault_idx):
                         if e.get("name") == name:
@@ -712,11 +827,25 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
         "skipped_identical": skipped_identical,
         "wild_card_added": wild_card_added,
         "forged_normalized": forged_norm.get("normalized", 0),
+        # Seed IMPLEMENTATIONS copied aside because this run was about to
+        # overwrite bytes that were not the package's. Non-zero means the operator
+        # had LOCAL EDITS. Returned, not just logged, so the daemon's summary
+        # carries it to the operator — a count buried in a log line is a count
+        # nobody reads. Counts only genuine divergence: if it fired on every
+        # replaced file it would be non-zero on a vault nobody had touched, and a
+        # warning that cries wolf across 41 seeds trains people to ignore it.
+        "preserved": preserved,
+        "preserved_dir": str(backup_root) if preserved else "",
         "errors": errors,
     }
-    log.info("[VaultMigrator] %s → %s: added=%d updated=%d skipped=%d wild_card_added=%d errors=%d",
+    log.info("[VaultMigrator] %s → %s: added=%d updated=%d skipped=%d wild_card_added=%d "
+             "preserved=%d errors=%d",
              vault_seed, installed, len(added), len(updated),
-             skipped_forged + skipped_identical, wild_card_added, len(errors))
+             skipped_forged + skipped_identical, wild_card_added, preserved, len(errors))
+    if preserved:
+        log.warning("[VaultMigrator] %d locally-modified vault file(s) were replaced by the "
+                    "packaged version; the previous contents are preserved at %s",
+                    preserved, backup_root)
     return summary
 
 

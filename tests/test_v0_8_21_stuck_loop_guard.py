@@ -53,8 +53,15 @@ class TestExtractorEmptyInput:
 class TestExtractorHappyPath:
     def test_returns_validated_records(self, monkeypatch):
         from systemu.runtime import extractor as ex
-        def _fake_llm(tier, system, user, config, **kw):
-            assert tier == 3 and "UNTRUSTED" in system
+        def _fake_llm(stage, system, user, config, **kw):
+            # DEC-12: the call site now names its MODEL-MATRIX stage instead of
+            # hard-coding tier=3. The tier-3 guarantee this line used to assert
+            # is preserved below (and pinned at the wire in
+            # tests/test_model_matrix_routing.py).
+            from sharing_on.model_matrix import resolve_stage_tier
+            from sharing_on.config import Config
+            assert stage == "desk_extraction" and "UNTRUSTED" in system
+            assert resolve_stage_tier(stage, Config()) == 3
             return {"records": [{"name": "French Loaf", "rating": 4.5},
                                 {"name": "Hot Breads",  "rating": 4.3}]}
         monkeypatch.setattr(ex, "llm_call_json", _fake_llm)
@@ -71,7 +78,7 @@ class TestExtractorSchemaMismatch:
     def test_invalid_record_yields_extraction_failed(self, monkeypatch):
         from systemu.runtime import extractor as ex
         # LLM "complies" with injection: returns wrong shape
-        def _fake_llm(tier, system, user, config, **kw):
+        def _fake_llm(stage, system, user, config, **kw):
             return {"records": [{"x": 1}]}  # missing required 'name'
         monkeypatch.setattr(ex, "llm_call_json", _fake_llm)
         schema = {"type": "object",

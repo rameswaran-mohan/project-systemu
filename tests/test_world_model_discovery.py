@@ -312,17 +312,51 @@ def test_the_fenced_surface_never_raises_on_a_malformed_fact():
     assert "untrusted_inventory_data" in wq.render_negative_for_prompt(None)
 
 
-# ── the deferred inversion: planner input is untouched this slice ─────────────
+# ── the inversion has LANDED — what the pin protects now ─────────────────────
+# This slot used to hold `test_the_planner_input_builder_does_not_reference_the_fenced_
+# read_surface`: a SEQUENCING pin asserting that `situational_inventory` never mentions
+# world_query/world_model. Its stated purpose was "until the inversion lands, planner
+# input must not change, so the rest of slice-2c is verifiable in isolation". W-A's final
+# slice IS that inversion, so the premise is spent — the builder now reaches for
+# world_query BY DESIGN (`compose_world_view` + the world block in
+# `render_situation_for_prompt`).
+#
+# Deleting it outright would silently drop the protection it stood in for. What actually
+# needed guarding was never "no import" — it was "a stored fact cannot reach the planner
+# except as fenced, allowlisted, taint-clamped data". That is pinned below, and in
+# tests/test_rw1_wa_final.py.
 
-def test_the_planner_input_builder_does_not_reference_the_fenced_read_surface():
-    # The "SituationReport becomes a ranked view over the store" inversion is sequenced
-    # LAST because it changes what the model sees. Until it lands, the module that builds
-    # planner input must not reach for world_query — this pin is what lets the rest of
-    # slice-2c be verified without changing the planner's input at all.
+
+def test_the_planner_input_builder_reaches_the_store_ONLY_through_the_fence():
+    """`situational_inventory` may now read the store — through `world_query` and
+    nothing else. It must never open a `FactStore` itself: doing so would hand it live
+    `Fact` objects carrying `origin_class`/`confidence`, i.e. the exact two fields the
+    fenced row exists to withhold, one `json.dumps` away from the planner prompt."""
     import pathlib
     from systemu.runtime import situational_inventory as si
     text = pathlib.Path(si.__file__).read_text(encoding="utf-8", errors="replace")
-    assert "world_query" not in text and "world_model" not in text
+    assert "world_query" in text                     # the fenced surface IS the seam…
+    assert "FactStore(" not in text                  # …and it is the ONLY one
+    assert "from systemu.runtime.world_model import" not in text
+    assert "world_model.FactStore" not in text
+
+
+def test_no_stored_fact_field_reaches_the_prompt_outside_the_row_allowlist():
+    """The end-to-end property the deleted pin was standing in for, asserted on the
+    REAL render rather than on an import graph: whatever the store holds, only the five
+    allowlisted fields are rendered, and the taint is the clamped one."""
+    import json
+    from systemu.runtime import situational_inventory as si
+    row = {"fact_id": "f", "kind": "service", "value": "acme",
+           "bind_taint": "content_derived", "staleness": "confirmed",
+           "origin_class": "operator", "confidence": 1.0, "secret": "hunter2"}
+    out = si.render_situation_for_prompt({"services": [], "world_facts": [row]})
+    body = out.split("# WORLD MODEL", 1)[1].split("---\n", 1)[1]
+    body = body.rsplit("\n</untrusted_inventory_data", 1)[0]
+    rendered = json.loads(body)["results"][0]
+    assert set(rendered) == set(wq.FENCED_ROW_FIELDS)
+    assert rendered["bind_taint"] == "content_derived"
+    assert "hunter2" not in out and "confidence" not in out.split("# WORLD MODEL", 1)[1]
 
 
 def test_the_discovery_loop_adds_nothing_to_the_harness_request_spec():

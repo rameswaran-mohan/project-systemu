@@ -209,20 +209,29 @@ _HOST_KEYS = ("url", "endpoint", "host")
 _HOSTNAME_RE = _re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]*[A-Za-z0-9])?(:\d{1,5})?$")
 
 
-def _read_action_audit(vault, execution_id=None, since_ts=None) -> "list[dict]":
+def _read_action_audit(vault, execution_id=None, since_ts=None, until_ts=None) -> "list[dict]":
     """Action-audit rows in append order. A specific ``execution_id`` routes through
     the backend-aware vault query; the FULL projection reads the file backend's
     ``audit/actions.jsonl`` directly.
+
+    ``since_ts``/``until_ts`` are INCLUSIVE bounds compared on the normalized
+    (fixed-width) stamp, so the compliance export can name a CLOSED range whose
+    re-export stays byte-stable even after later rows land (AC3).
 
     Degrades gracefully (skips a corrupt/non-object line, tolerates a stray non-UTF-8
     byte) — EXCEPT it raises loudly on a non-file backend, so a compliance consumer
     can never mistake a silently-empty ledger (no full-scan API yet) for "no actions
     happened"."""
+    _until = norm_ts(str(until_ts)) if until_ts else None
     if execution_id:
         try:
-            return vault.query_action_audit(execution_id=execution_id, since_ts=since_ts) or []
+            got = vault.query_action_audit(execution_id=execution_id, since_ts=since_ts) or []
         except Exception:
             return []
+        if _until:      # the backend query has no upper bound — apply it here
+            got = [r for r in got if isinstance(r, dict)
+                   and norm_ts(str(r.get("ts", ""))) <= _until]
+        return got
     # Full projection — file backend only in this slice.
     backend = getattr(vault, "_storage_backend", "file")
     if backend != "file":
@@ -251,7 +260,10 @@ def _read_action_audit(vault, execution_id=None, since_ts=None) -> "list[dict]":
             continue
         if not isinstance(r, dict):
             continue                              # valid JSON but not an object — skip (never crash)
-        if _since and norm_ts(str(r.get("ts", ""))) < _since:
+        _rts = norm_ts(str(r.get("ts", "")))
+        if _since and _rts < _since:
+            continue
+        if _until and _rts > _until:
             continue
         rows.append(r)
     return rows
@@ -309,10 +321,19 @@ def _effect_row(audit: dict) -> LedgerRow:
     )
 
 
+EXPORT_EID_PREFIX = "export_"     # operator-initiated compliance export (ledger_export)
+
+
 def _derive_origin(eid: str) -> str:
     """A coerce_origin token (never a fabricated compound string). Quick-lane eids
-    are chat; otherwise default to 'system' honestly (no id-bearing invention)."""
-    return "chat" if eid.startswith("quick_") else "system"
+    are chat; an operator-initiated compliance export is 'manual' (it is a person at
+    the dashboard, not the scheduler); otherwise default to 'system' honestly (no
+    id-bearing invention)."""
+    if eid.startswith("quick_"):
+        return "chat"
+    if eid.startswith(EXPORT_EID_PREFIX):
+        return "manual"
+    return "system"
 
 
 def _enrich_with_receipt(row: LedgerRow, receipts: dict, oid: str) -> bool:
@@ -333,7 +354,7 @@ def _enrich_with_receipt(row: LedgerRow, receipts: dict, oid: str) -> bool:
     return True
 
 
-def iter_rows(vault, *, data_dir=None, execution_id=None, since_ts=None):
+def iter_rows(vault, *, data_dir=None, execution_id=None, since_ts=None, until_ts=None):
     """Project the persisted sources into LedgerRows (RUL-7 — reads only). The
     effect-row spine is action-audit successes (AC1: one row per side-effectful
     execution); each is MASK-redacted (AC4). A run's receipt is per-OBJECTIVE, so it
@@ -342,7 +363,8 @@ def iter_rows(vault, *, data_dir=None, execution_id=None, since_ts=None):
     corrupt source degrades to fewer rows and never raises (a non-file backend raises
     loudly instead of a silently-empty ledger — see _read_action_audit)."""
     from systemu.runtime import receipts_store
-    audits = _read_action_audit(vault, execution_id=execution_id, since_ts=since_ts)
+    audits = _read_action_audit(vault, execution_id=execution_id,
+                                since_ts=since_ts, until_ts=until_ts)
     _receipt_cache: dict = {}
     _receipted: set = set()                # (eid, oid) already carrying the objective's receipt
     for a in audits:

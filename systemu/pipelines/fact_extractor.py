@@ -73,8 +73,11 @@ def extract_from_chat(
             "status": chat_entry.get("status"),
         }
         system_prompt = load_prompt("extract_user_facts.md")
+        # DEC-12: binder-class stage (advisory bind-judgment — these candidates
+        # feed the profile binder). `binder_tier` decides the model; its
+        # default is tier 1, so the shipped behaviour is unchanged.
         result = llm_call_json(
-            tier=1,
+            stage="binder_assist",
             system=system_prompt,
             user=_json.dumps(user_payload),
             config=config,

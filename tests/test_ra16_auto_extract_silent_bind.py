@@ -189,7 +189,8 @@ def test_fact_extractor_stamps_content_derived_on_every_persisted_fact(
     from systemu.pipelines import fact_extractor as fe
     from systemu.vault.vault import Vault
 
-    def fake_llm(*, tier, system, user, config, temperature=0.2, max_tokens=2000, **kw):
+    # DEC-12: the call site names its MODEL-MATRIX stage, not a literal tier.
+    def fake_llm(*, stage, system, user, config, temperature=0.2, max_tokens=2000, **kw):
         return {"facts": [
             {"fact": "account_id is acct-42", "tags": ["account_id"],
              "confidence": 0.95},
@@ -229,7 +230,8 @@ def test_extracted_fact_round_trips_from_the_vault_to_a_gated_bind(
     from systemu.pipelines import fact_extractor as fe
     from systemu.vault.vault import Vault
 
-    def fake_llm(*, tier, system, user, config, temperature=0.2, max_tokens=2000, **kw):
+    # DEC-12: the call site names its MODEL-MATRIX stage, not a literal tier.
+    def fake_llm(*, stage, system, user, config, temperature=0.2, max_tokens=2000, **kw):
         return {"facts": [{"fact": "account_id is acct-42",
                            "tags": ["account_id"], "confidence": 0.95}]}
 

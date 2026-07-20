@@ -298,11 +298,37 @@ _WM_ALLOWED = {
         "to _req.spec or any prompt, and it never skips the deterministic pass."),
     "world_query.py": (
         "the FENCED read surface (WM-4/WM-15) — renders view results as untrusted data "
-        "with a RE-DERIVED bind-taint. Not wired into the planner prompt this slice; the "
-        "SituationReport-as-view inversion is sequenced last."),
+        "with a RE-DERIVED bind-taint. Now also owns `goal_view` (the composed report "
+        "view) and `run_view` (the tool dispatcher)."),
+    # ── W-A's FINAL slice widened this allowlist by exactly TWO more modules. Both are
+    # READ-ONLY w.r.t. the store, and both exist to close a gap that made an earlier
+    # claim untrue rather than to add reach:
+    "situational_inventory.py": (
+        "the §5.11.b INVERSION — composes a goal-conditioned ranked VIEW over the fact "
+        "store onto `SituationReport.world_facts` and renders it through world_query's "
+        "fence. READ-ONLY: it never writes the store, and `world_facts` is NOT one of "
+        "the field names `requirement_binder` enumerates, so a stored fact still cannot "
+        "reach a bind. Before this, the dependency ran ONE WAY (report -> store) and a "
+        "fact from any non-report producer had nowhere to surface."),
+    "world_tools.py": (
+        "the registered `world_query` TOOL (WM-4) — the never-subtract escape hatch. "
+        "Read-only, non-action, results fenced. Without it the report view's trim had "
+        "no 'the planner can always query for more' to rest on, so §5.10.d's "
+        "never-subtract floor was a claim rather than a mechanism."),
     # outside runtime — operator-facing, never on a decision path.
     "cli_commands.py": "read-only operator CLI surface",
 }
+
+#: What counts as "referencing the world model". BOTH needles, deliberately.
+#:
+#: Scanning for ``world_model`` alone had a hole big enough to drive this whole slice
+#: through: ``world_query`` is a store READER whose own name does not contain the
+#: string, so any module could reach every fact in the store — through the fenced
+#: surface, but reach them nonetheless — and the invariant would stay green. That is
+#: not a hypothetical; it is exactly the import the inversion needed, and taking it
+#: silently was available. Adding the second needle makes the allowlist mean "may reach
+#: the store", not "spells a particular module name".
+_WM_MODULE_NEEDLES = ("world_model", "world_query")
 
 #: The read surface. Checked only against the small write-only projector — a read API
 #: includes generic names (``get``) that cannot be grepped across a large module without
@@ -313,18 +339,47 @@ _WM_READ_SURFACE = ("find_services", "what_can", "find_data", "about(", "provena
 
 
 def test_only_the_allowed_modules_reference_the_world_model_anywhere():
-    # The load-bearing invariant: the store is WRITE-ONLY on every decision path today —
-    # reading it to influence a bind is the trust-critical, separately-gated slice-2c.
-    # Gate on REFERENCE, not on a symbol blocklist: a reader added anywhere trips this no
-    # matter which call it uses (including `about()`/`get()`, which a substring list would
-    # miss or false-positive on). Scan the WHOLE package, so the invariant does not quietly
-    # depend on where decision code happens to live.
+    # The load-bearing invariant: every module that can REACH the fact store is named,
+    # with the role it is allowed to play. Gate on REFERENCE, not on a symbol blocklist:
+    # a reader added anywhere trips this no matter which call it uses (including
+    # `about()`/`get()`, which a substring list would miss or false-positive on). Scan the
+    # WHOLE package, so the invariant does not quietly depend on where decision code
+    # happens to live — and scan for BOTH needles (see _WM_MODULE_NEEDLES), so reaching
+    # the store through the fenced read surface is not a way around the allowlist.
     import pathlib
     systemu_root = pathlib.Path(wm.__file__).parent.parent          # systemu/
-    touching = {p.name for p in systemu_root.rglob("*.py")
-                if "world_model" in p.read_text(encoding="utf-8", errors="replace")}
+    touching = set()
+    for p in systemu_root.rglob("*.py"):
+        text = p.read_text(encoding="utf-8", errors="replace")
+        if any(n in text for n in _WM_MODULE_NEEDLES):
+            touching.add(p.name)
     unexpected = touching - set(_WM_ALLOWED)
     assert unexpected == set(), f"these modules must not touch the world model: {unexpected}"
+
+
+def test_the_second_needle_is_live_not_decorative():
+    """A needle that matches nothing is indistinguishable from one that is missing.
+
+    ``world_query`` was added to :data:`_WM_MODULE_NEEDLES` to close a real hole — a
+    module could import the fenced read surface and reach every fact without the string
+    ``world_model`` ever appearing. This asserts the needle actually SELECTS files that
+    the ``world_model`` needle alone would not, so deleting it would change the scan's
+    verdict rather than merely its wording."""
+    import pathlib
+    # First: the needle is actually IN the constant the scan uses. Without this the
+    # test passes on its own hardcoded string while the scan quietly narrows — the
+    # "passed on the strength of a comment" failure mode.
+    assert "world_query" in _WM_MODULE_NEEDLES
+    systemu_root = pathlib.Path(wm.__file__).parent.parent
+    only_via_query = set()
+    for p in systemu_root.rglob("*.py"):
+        text = p.read_text(encoding="utf-8", errors="replace")
+        if "world_query" in text and "world_model" not in text:
+            only_via_query.add(p.name)
+    assert only_via_query, (
+        "no module reaches the store via `world_query` alone — the second needle is "
+        "decorative; either it is unnecessary or a reader was renamed")
+    assert only_via_query <= set(_WM_ALLOWED)
 
 
 def test_the_write_only_projector_never_reads_the_store():

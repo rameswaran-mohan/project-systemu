@@ -269,8 +269,8 @@ class TestFactExtractor:
         vlt = self._vault(tmp_path)
 
         captured = {}
-        def fake_llm(*, tier, system, user, config, temperature=0.2, max_tokens=2000, **kw):
-            captured["tier"] = tier
+        def fake_llm(*, stage, system, user, config, temperature=0.2, max_tokens=2000, **kw):
+            captured["stage"] = stage
             captured["user"] = user
             return {
                 "facts": [
@@ -293,7 +293,12 @@ class TestFactExtractor:
         assert all(f.source == "auto_extract" for f in facts)
         assert all(f.source_ref == "chat:2026-06-06T00:00:00" for f in facts)
         assert any(f.confidence == 0.95 for f in facts)
-        assert captured["tier"] == 1
+        # DEC-12: the call site names a stage; the MODEL-MATRIX maps it to the
+        # tier this test has always pinned. Both halves asserted so the tier-1
+        # guarantee is not weakened by the indirection.
+        from sharing_on.model_matrix import resolve_stage_tier
+        assert captured["stage"] == "binder_assist"
+        assert resolve_stage_tier(captured["stage"], cfg) == 1
         assert "find me pizza" in captured["user"]
 
     def test_extract_with_empty_facts_is_noop(self, tmp_path, monkeypatch):

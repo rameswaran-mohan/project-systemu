@@ -278,8 +278,10 @@ def parse_area_answers(area_id: str, answers: Dict[str, Any], *,
     parsed: List[Dict[str, str]] = []
     if llm_fn is not None and config is not None:
         try:
+            # DEC-12: parse-class stage — the tier comes from the operator's
+            # `parser_tier` knob via the MODEL-MATRIX, not a literal 3 here.
             result = llm_fn(
-                tier=3, system=_PARSE_SYSTEM,
+                stage="consult_parse", system=_PARSE_SYSTEM,
                 user=json.dumps({"question": spec["question"], "answer": raw}),
                 config=config,
             )

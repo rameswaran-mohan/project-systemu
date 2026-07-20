@@ -208,6 +208,15 @@ def build_settings_page() -> None:
         with ui.column().classes("s-card").style("gap: 14px; padding: 20px;"):
             price_editor_card()
 
+        # ── Compliance export (R-P3b, spec Part II §6) ───────────────────
+        # The action-ledger exporters are byte-stable and frozen; this is the
+        # only surface that reaches them. Preview-then-write: an export is a
+        # file leaving the system, so the operator sees the row count, the
+        # destination path and the not-yet-populated columns FIRST.
+        _section_header("Compliance export")
+        with ui.column().classes("s-card").style("gap: 14px; padding: 20px;"):
+            compliance_export_card()
+
         # ── Vault ──────────────────────────────────────────────────────────
         _section_header("Storage")
         with ui.column().style(
@@ -1087,6 +1096,137 @@ def stuck_settings_card() -> None:
 
     ui.button("Save Stuck-loop guard", on_click=_save).style(
         f"background: {THEME['primary']}; color: white; border-radius: 8px; margin-top: 8px;")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Compliance export — R-P3b (MASTER-SPEC Part II §6)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Reaches runtime.ledger's frozen, byte-stable exporters, which had no caller at
+#  all before this card. Two-step by design: an export is a file leaving the
+#  machine, so nothing is written until the operator has seen a preview of THAT
+#  EXACT artifact — and the write then reuses the preview's resolved range, so
+#  what was confirmed is what lands.
+
+
+def export_vault():
+    """The vault the ledger projection reads (AppState holds the IVault adapter)."""
+    from systemu.interface.dashboard_state import AppState
+    return AppState.get().vault
+
+
+def export_preview_lines(pv: dict) -> list:
+    """Plain-language confirmation text for a preview dict. Pure — unit-tested.
+
+    Every line here is a claim the artifact must actually satisfy; the blank-column
+    warning is not decoration. An auditor reading a blank ``gate_verdict`` would
+    otherwise conclude no approval was required.
+    """
+    lines = [
+        f"{pv['row_count']} row(s), {pv['column_count']} columns, "
+        f"{pv['format'].upper()} format.",
+        f"Range: {pv['since_ts'] or 'the beginning'} to {pv['until_ts']} (UTC, inclusive).",
+        f"Writes to: {pv['destination_path']}",
+        f"Plus a manifest: {pv['manifest_path']}",
+    ]
+    for note in pv.get("excluded", []):
+        lines.append(f"Excluded — {note}")
+    unpop = pv.get("unpopulated_columns") or {}
+    if unpop:
+        lines.append(
+            f"{len(unpop)} of {pv['column_count']} columns are ALWAYS blank in this "
+            f"build and are not evidence of anything: " + ", ".join(sorted(unpop)) +
+            ". The manifest records why for each."
+        )
+    if pv["row_count"] == 0:
+        lines.append(
+            "This range contains no recorded actions — the export will hold a header "
+            "row only."
+        )
+    return lines
+
+
+def compliance_export_card() -> None:
+    """Render the Settings → Compliance export section. Caller wraps it in a column."""
+    from systemu.runtime import ledger_export
+
+    ui.label(
+        "Export the action ledger as a CSV or JSONL file for an audit or a SIEM. "
+        "The file is written to this machine only — nothing is uploaded. Raw "
+        "parameter values, message bodies and credentials are never included; "
+        "actions are identified by a one-way digest."
+    ).classes("s-muted").style("font-size: 12px;")
+
+    with ui.row().style("gap: 16px; align-items: center;"):
+        fmt = ui.select(list(ledger_export.FORMATS), value="csv",
+                        label="Format").classes("s-input").style("width: 130px;")
+        since = ui.input(label="From (YYYY-MM-DD, optional)").classes("s-input")
+        until = ui.input(label="To (YYYY-MM-DD, optional)").classes("s-input")
+
+    summary = ui.column().classes("w-full").style("gap: 4px;")
+    # Holds the CONFIRMED preview. Cleared whenever an input changes, so the
+    # operator can never approve one artifact and write a different one.
+    confirmed: dict = {}
+
+    write_btn = ui.button("Write export file").props("no-caps").classes(
+        "s-btn s-btn--primary").style("margin-top: 8px;")
+    write_btn.disable()
+
+    def _invalidate(_=None) -> None:
+        confirmed.clear()
+        summary.clear()
+        write_btn.disable()
+
+    for widget in (fmt, since, until):
+        widget.on("change", _invalidate)
+
+    def _preview(_=None) -> None:
+        _invalidate()
+        try:
+            pv = ledger_export.preview(export_vault(), fmt=fmt.value,
+                                       since=since.value, until=until.value)
+        except ValueError as exc:
+            ui.notify(f"Cannot export: {exc}", type="negative")
+            return
+        except NotImplementedError as exc:
+            # A storage backend with no full-scan API. Fail loudly — a silently
+            # empty compliance export is the worst possible outcome here.
+            ui.notify(f"Export unavailable on this storage backend: {exc}",
+                      type="negative")
+            return
+        except Exception as exc:
+            ui.notify(f"Preview failed: {exc}", type="negative")
+            return
+        confirmed.update(pv)
+        with summary:
+            for line in export_preview_lines(pv):
+                ui.label(line).classes("s-cell w-full").style("font-size: 12px;")
+        write_btn.enable()
+
+    def _write(_=None) -> None:
+        if not confirmed:
+            ui.notify("Preview the export first — nothing is written unconfirmed.",
+                      type="warning")
+            return
+        try:
+            # Reuse the PREVIEW's resolved range, not the raw inputs: 'To' defaults
+            # to now, so re-resolving here would write a wider range than the one
+            # the operator just approved.
+            res = ledger_export.write_export(
+                export_vault(), fmt=confirmed["format"],
+                since=confirmed["since_ts"], until=confirmed["until_ts"])
+        except Exception as exc:
+            ui.notify(f"Export failed: {exc}", type="negative")
+            return
+        msg = (f"Wrote {res['row_count']} row(s) to {res['destination_path']} "
+               f"(sha256 {res['sha256'][:12]}…).")
+        if not res.get("event_recorded"):
+            msg += " NOTE: the export event could not be recorded in the ledger."
+        ui.notify(msg, type="positive", multi_line=True)
+        _invalidate()
+
+    ui.button("Preview export", on_click=_preview).props("no-caps").classes(
+        "s-btn s-btn--ghost")
+    write_btn.on("click", _write)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

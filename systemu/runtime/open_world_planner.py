@@ -59,10 +59,16 @@ def _has_llm_provider(config) -> bool:
 
 def _resolve_planner_tier(config) -> int:
     """Map ``config.planner_tier`` ("tier1"/"tier_2"/"tier3"…) to the numeric tier
-    llm_router expects, via the execution_mind.py:447 idiom. Defaults to Tier-1
-    (deepest reasoning) — the planner is an open-world reasoning step."""
-    label = str(getattr(config, "planner_tier", "tier1") or "tier1")
-    return 1 if "1" in label else (3 if "3" in label else 2)
+    llm_router expects. Defaults to Tier-1 (deepest reasoning) — the planner is
+    an open-world reasoning step.
+
+    DEC-12: delegates to the MODEL-MATRIX so the string->int idiom has ONE
+    home. Kept as a named function (rather than folded into a ``stage=`` tag at
+    the call site) because ``test_rp3a_attribution`` monkeypatches it — turning
+    it into a no-op would silently hollow out that test.
+    """
+    from sharing_on.model_matrix import resolve_stage_tier
+    return resolve_stage_tier("planner", config)
 
 
 def _build_planner_prompt(*, scroll_intent: str, situation_report: Any,
