@@ -1512,6 +1512,27 @@ def _populate_requirement_report(context, *, objectives, capability, situation,
         )
         return
 
+    # DEC-25 §5.10.e AC7 — the clamp-regression tripwire, evaluated on EVERY report.
+    #
+    # ORDERING IS LOAD-BEARING: this runs BEFORE the empty-ask early return below.
+    # A table-sourced silent bind is by definition NOT in the ask_bundle, so the very
+    # regression this wire exists to catch is the one that empties the bundle. Moving
+    # this check after the `if not ask: return` would make it blind to exactly the
+    # worst case — a run where the clamp was punched so thoroughly that nothing asked
+    # at all. Healthy is zero, so in normal operation this is a silent no-op.
+    #
+    # READ-ONLY and fail-safe: it logs and returns. It stashes nothing on `context`
+    # and writes nothing to the snapshot, so AC6 byte-identity is preserved.
+    try:
+        from systemu.runtime.table_payoff import clamp_tripwire
+        _tw = clamp_tripwire(report_dict)
+        if _tw.get("fired"):
+            logger.warning("[Runtime] %s", _tw.get("message"))
+        elif not _tw.get("evaluated"):
+            logger.debug("[Runtime] %s", _tw.get("message"))
+    except Exception:
+        logger.debug("[Runtime] clamp tripwire skipped (non-fatal)", exc_info=True)
+
     # AC6 no-op: no missing requirements ⇒ leave the snapshot BYTE-IDENTICAL. We do
     # NOT stash an empty-ask report (that would flip the persisted requirement_report
     # from None → {} on every run); a resume needs nothing restored when there's no
