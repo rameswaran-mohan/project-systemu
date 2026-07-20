@@ -604,6 +604,115 @@ def _safe_version_label(version: Any) -> str:
     return (safe.strip(".")[:64] or "unknown")
 
 
+_ENABLED_FIELD = "enabled"
+
+
+def _operator_disabled(vault_dir: Path, vault_entry: Any, dest_body: Path) -> bool:
+    """Has this vault got the tool explicitly switched OFF?
+
+    ``enabled`` is Gate 3's input — ``tool_registry.execute`` does
+    ``if not tool.enabled: raise ToolNotEnabledError`` and tells the operator to
+    "flip the toggle ON" in the dashboard, so it is a deliberate operator
+    control (the dry-run reconciler also auto-clears it after a failure). Every
+    packaged seed ships ``enabled: true``, and the update branch copies the
+    package body over the vault's, so without this the migration silently
+    re-arms tools that were switched off.
+
+    ONLY AN EXPLICIT ``False`` COUNTS. Absent is not evidence: a vault predating
+    the field has no value, and ``Vault._backfill_tool_index_enabled`` writes
+    ``False`` whenever it cannot find a body — reading "absent or falsey" as
+    intent would latch tools off that nobody had touched.
+
+    BOTH RECORDS ARE CONSULTED, and either one is enough. Identity here is by
+    NAME, so the vault may hold the seed under its OWN id: its body is
+    ``tool_<vault id>.json`` while the file the migration overwrites is
+    ``tool_<package id>.json``. Checking only one of them would miss the disable
+    exactly when the two ids disagree.
+
+    UNREADABLE ⇒ DISABLED, deliberately. This is mutation S12's shape: ``_diverges``
+    once returned ``False`` from its ``except``, so a file that EXISTS but cannot be
+    hashed read as "nothing to lose" and was clobbered. Missing evidence must fall to
+    the restrictive side. A tool wrongly left off costs one dashboard click and Gate 3
+    names it in the error; a tool wrongly switched back on is a control revoked in
+    silence. A body that is simply ABSENT is different — there is no tool there to
+    have an opinion about — and reads as not-disabled.
+
+    THE TWO HANDLERS POINT OPPOSITE WAYS ON PURPOSE; do not "make them
+    consistent". The inner one is per-FILE and evidence-bearing: this tool's
+    record exists and is unreadable, so this tool stays off — blast radius one.
+    The outer one catches a structural failure of this function itself, which
+    would hit every seed in the loop; resolving that to "disabled" would take a
+    bug here and turn it into all 41 seed tools switched off at once, so it
+    degrades to the pre-existing behaviour (the package's value wins) instead.
+    Restrictive where the evidence is specific, status-quo where it is not.
+    """
+    def _says_off(p: Path) -> bool:
+        try:
+            if not p.is_file():
+                return False          # no record ⇒ no opinion
+        except Exception:  # noqa: BLE001 — an unstattable path is not evidence
+            return False
+        try:
+            return json.loads(p.read_text(encoding="utf-8")).get(
+                _ENABLED_FIELD) is False
+        except Exception:  # noqa: BLE001 — present but unreadable ⇒ fail closed
+            return True
+
+    try:
+        if isinstance(vault_entry, dict):
+            if vault_entry.get(_ENABLED_FIELD) is False:
+                return True
+            vault_tid = vault_entry.get("id")
+            if vault_tid and _says_off(
+                    vault_dir / "tools" / f"tool_{vault_tid}.json"):
+                return True
+        return _says_off(dest_body)
+    except Exception:  # noqa: BLE001 — never break boot; the copy still happens
+        return False
+
+
+def _entry_keeping_disable(pkg_entry: Dict[str, Any], disabled: bool) -> Dict[str, Any]:
+    """The package's index header, with an operator DISABLE carried across.
+
+    A COPY, not the package entry itself: ``pkg_entry`` is an element of the
+    package index still being iterated, and mutating it in place would leak this
+    vault's state into the authoritative catalog for the rest of the run.
+
+    Only ``enabled`` is carried. The other five fields a live header has and the
+    packaged one lacks — ``dry_run_status``, ``version``,
+    ``parameters_schema_summary``, ``return_schema_summary``,
+    ``implementation_path`` — are all DERIVED from the tool body by
+    ``vault._tool_header`` and are re-derived by
+    ``jobs._backfill_tool_headers_v061`` on the next boot (measured). Carrying
+    two of them would be actively wrong: the schema summaries would describe the
+    OLD schema while the body is now the package's, and ``implementation_path``
+    is vault-declared — re-stamping it would carry a redirected path across a
+    migration that just replaced ``{name}.py``.
+    """
+    entry = dict(pkg_entry)
+    if disabled:
+        entry[_ENABLED_FIELD] = False
+    return entry
+
+
+def _install_body(pkg_body: Path, dest_body: Path, disabled: bool) -> None:
+    """Write the package's tool body, carrying an operator disable across.
+
+    Patched IN MEMORY and written once, rather than ``copy2`` then re-stamp:
+    a copy-then-patch leaves the tool momentarily enabled on disk, and a failure
+    between the two would leave it enabled permanently. Raising instead lands in
+    the caller's per-tool ``except``, which leaves the vault's existing (still
+    disabled) body in place — the fail-closed direction, and the same posture
+    ``_preserve_before_overwrite`` takes.
+    """
+    if not disabled:
+        shutil.copy2(pkg_body, dest_body)
+        return
+    body = json.loads(pkg_body.read_text(encoding="utf-8"))
+    body[_ENABLED_FIELD] = False
+    _write_text_atomic(dest_body, json.dumps(body, indent=2) + "\n")
+
+
 def _preserve_before_overwrite(target: Path, backup_root: Path, relname: str) -> None:
     """Copy ``target`` aside before the migrator overwrites it. RAISES on failure.
 
@@ -709,6 +818,7 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     skipped_forged = 0
     skipped_identical = 0
     preserved = 0
+    kept_disabled: list = []
 
     pkg_impl_dir = pkg_vault / "tools" / "implementations"
     vault_impl_dir = vault_dir / "tools" / "implementations"
@@ -731,6 +841,29 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     # body is deliberately left out and `preserved` counts implementations only.
     # If body preservation is ever wanted it has to happen BEFORE the backfill,
     # not here.
+    #
+    # NOTE — WHY `tools/index.json` IS MERGED AND NOT COPIED ASIDE EITHER.
+    # The write-back below rewrites the whole file, and the update branch swaps
+    # each matched entry for the package's. Three measurements say a
+    # `_preserve_before_overwrite` backup is the wrong shape for it:
+    #   1. THE SAME TRAP AS THE BODY JSON. `normalize_seed_forged_flags` runs
+    #      ABOVE this and rewrites `tools/index.json` itself whenever it clears a
+    #      mis-flag — and the POC finding is that real vaults mis-flag EVERY seed,
+    #      so it is the common case. A copy taken here would preserve a file the
+    #      migrator had already rewritten on this boot.
+    #   2. NO DIVERGENCE PREDICATE EXISTS. A vault index always differs from the
+    #      package's (user-forged tools live only in the vault's), so a
+    #      `_diverges`-gated backup would fire on 100% of migrations and
+    #      `preserved` would stop meaning "you had local edits" — the cry-wolf
+    #      failure the body NOTE above exists to avoid.
+    #   3. NOTHING IN IT IS UNIQUE TO IT. Every field `vault._tool_header` emits
+    #      is derived from the tool body, and `jobs._backfill_tool_headers_v061`
+    #      re-derives the five a live header carries and the packaged one lacks
+    #      (`dry_run_status`, `version`, the two schema summaries,
+    #      `implementation_path`) on the next boot.
+    # What does NOT self-heal is `enabled`, because the body it is derived from is
+    # replaced by the package's in the same pass and every seed ships enabled.
+    # That one field is carried across instead — see `_operator_disabled`.
 
     for pkg_entry in pkg_idx:
         name = pkg_entry.get("name")
@@ -751,6 +884,10 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
         # to follow the overwrite rather than the other passes' resolution.
         dest_impl = vault_impl_dir / f"{name}.py"
         dest_body = vault_dir / "tools" / f"tool_{tid}.json"
+        # Does this vault have the tool switched OFF? Read BEFORE anything is
+        # overwritten — the body carrying the answer is one of the files this
+        # iteration replaces. See `_operator_disabled`.
+        disabled = _operator_disabled(vault_dir, vault_entry, dest_body)
         if vault_entry is None:
             # ADD: new seed tool
             try:
@@ -762,9 +899,14 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
                     preserved += 1
                 shutil.copy2(pkg_impl, dest_impl)
                 if pkg_body.exists():
-                    shutil.copy2(pkg_body, dest_body)   # body: see NOTE in `run`
-                vault_idx.append(pkg_entry)
+                    # body: see NOTE in `run` — replaced, not preserved, but an
+                    # ORPHANED body's disable is still operator intent, and this
+                    # run is about to make it reachable again by re-indexing it.
+                    _install_body(pkg_body, dest_body, disabled)
+                vault_idx.append(_entry_keeping_disable(pkg_entry, disabled))
                 added.append(tid)
+                if disabled:
+                    kept_disabled.append(name)
             except Exception as exc:
                 errors.append(f"add {name}: {exc}")
         else:
@@ -784,13 +926,16 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
                         preserved += 1
                     shutil.copy2(pkg_impl, existing_impl)
                     if pkg_body.exists():
-                        shutil.copy2(pkg_body, dest_body)   # body: see NOTE in `run`
+                        _install_body(pkg_body, dest_body, disabled)  # see NOTE
                     # Replace vault index entry with package authoritative version
+                    # — MERGED, not copied: the operator's `enabled` survives.
                     for i, e in enumerate(vault_idx):
                         if e.get("name") == name:
-                            vault_idx[i] = pkg_entry
+                            vault_idx[i] = _entry_keeping_disable(pkg_entry, disabled)
                             break
                     updated.append(tid)
+                    if disabled:
+                        kept_disabled.append(name)
             except Exception as exc:
                 errors.append(f"update {name}: {exc}")
 
@@ -836,16 +981,28 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
         # warning that cries wolf across 41 seeds trains people to ignore it.
         "preserved": preserved,
         "preserved_dir": str(backup_root) if preserved else "",
+        # Seeds this run replaced that the vault had switched OFF, and which stay
+        # off. Named rather than counted because the operator has to be able to
+        # tell WHICH tool is still disabled after an upgrade that shipped it a new
+        # implementation — the alternative posture (re-arming them) is the silent
+        # one. Zero on a vault where nothing was disabled, so it never cries wolf.
+        "kept_disabled": len(kept_disabled),
+        "kept_disabled_names": list(kept_disabled),
         "errors": errors,
     }
     log.info("[VaultMigrator] %s → %s: added=%d updated=%d skipped=%d wild_card_added=%d "
-             "preserved=%d errors=%d",
+             "preserved=%d kept_disabled=%d errors=%d",
              vault_seed, installed, len(added), len(updated),
-             skipped_forged + skipped_identical, wild_card_added, preserved, len(errors))
+             skipped_forged + skipped_identical, wild_card_added, preserved,
+             len(kept_disabled), len(errors))
     if preserved:
         log.warning("[VaultMigrator] %d locally-modified vault file(s) were replaced by the "
                     "packaged version; the previous contents are preserved at %s",
                     preserved, backup_root)
+    if kept_disabled:
+        log.warning("[VaultMigrator] %d updated seed tool(s) were left DISABLED because this "
+                    "vault had them switched off: %s. Enable them on the Tools page if the "
+                    "new version should run.", len(kept_disabled), ", ".join(kept_disabled))
     return summary
 
 

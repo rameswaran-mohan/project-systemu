@@ -65,25 +65,42 @@ THE ORIGIN DECISION (§5.9's "picked vs typed": VALUE-EQUALITY + an explicit pic
 requirement-ask producer sets ``enum`` — every slot renders as one free-text input — so
 the PRIMARY observable is VALUE EQUALITY against the binder's own candidate, which
 crosses the suspend as a keyed digest (``candidate_ref``). R-B4/F3 later added an
-EXPLICIT pick marker (the ``picked`` argument), so there are now two witnesses, and the
-digest is the weaker one:
+EXPLICIT pick marker (the ``picked`` argument), and R-A16 F2 added the binder's
+CANONICAL-form twin of that digest (``candidate_canon_ref``). Three witnesses:
 
     answer digest == a candidate digest  ⇒ the operator ACCEPTED that candidate
                                            ⇒ promote with THAT candidate's origin
     digest matches nothing, but the
     field was explicitly PICKED          ⇒ the operator took a suggestion whose digest
-                                           merely failed to compare (a widget
-                                           round-trip can reshape the value past
-                                           ``normalize_value``)
+                                           merely failed to compare
                                            ⇒ ``_most_tainted`` over EVERY comparable
                                            candidate — we know one was taken, not which
-    digest matches nothing and the
-    field was NOT picked                 ⇒ the operator TYPED something new
+    digest matches nothing, the field
+    was NOT picked, but the answer's
+    CANONICAL form matches a candidate's ⇒ the operator confirmed that candidate and
+                                           only its FORM differs (quotes a widget
+                                           added, a trailing period, a URL-encoded
+                                           separator — all past ``normalize_value``,
+                                           which folds only case and separators)
+                                           ⇒ promote with THAT candidate's origin
+    nothing matches at all               ⇒ the operator TYPED something new
                                            ⇒ promote as ``operator``
 
-The pick marker is honoured ONLY in the tainting direction: it can make an origin more
-tainted, never less. It is also attacker-shaped input (it rides a persisted decision
-across a suspend), which is why non-``str`` entries are dropped at the read.
+Both inferred witnesses are honoured ONLY in the tainting direction: each fires only
+where the result would otherwise be ``operator`` (the LEAST-tainted rank), so no path
+through this decision is less tainted than it was before either was added. The pick is
+checked FIRST and stays the broader of the two — it names no particular candidate, so
+it widens to all of them, whereas a canonical match names exactly one.
+
+Without the canonical witness this was a live laundering path, not a theoretical one:
+an operator who confirmed a scraped candidate through a form that merely reshaped it
+promoted ``operator`` at confidence 1.0 ≥ T_high, and every LATER run then silent-bound
+a value that came out of fetched content — the confirm gate gone for good.
+
+Both are attacker-shaped input (each rides a persisted decision across a suspend),
+which is why non-``str`` pick entries are dropped at the read and a canonical ref is
+accepted only in the exact shape ``canonical_value_ref`` emits, signed by this vault's
+key (:func:`_comparable_canon_ref`).
 
 A multi-candidate match resolves to the MOST-TAINTED origin. Deliberately NOT the
 highest-confidence collapse ``replay_metrics`` uses for its own metric: confidence is
@@ -94,13 +111,17 @@ A candidate only participates in that comparison if it is a well-formed ``value_
 signed by THIS vault's key (see the guards at the decision site). Anything else is not
 evidence in either direction and reaches the fail-closed branch.
 
-DOCUMENTED RESIDUAL — now CONDITIONAL, not absolute. A candidate whose MAC is altered
-but whose shape and key-id are intact reads as "the operator typed something new" ⇒
-``operator`` — but ONLY when the field was not explicitly picked. Executed both ways on
-one flipped hex character: ``picked=None`` ⇒ ``operator``; ``picked=[<field>]`` ⇒
-``content_derived``. So R-B4's marker narrowed this residual to the case where no pick
-signal reached the promoter (a producer that does not thread ``picked``, or an answer
-genuinely typed).
+DOCUMENTED RESIDUAL — now CONDITIONAL, not absolute, and narrower again since F2. A
+candidate whose MAC is altered but whose shape and key-id are intact reads as "the
+operator typed something new" ⇒ ``operator`` — but ONLY when the field was not
+explicitly picked AND the canonical twin fails too. Measured across all four tamper
+combinations on a genuine confirm: flip neither ⇒ ``content_derived``; flip the exact
+MAC alone ⇒ ``content_derived`` (the canonical witness recovers it); flip the canonical
+MAC alone ⇒ ``content_derived`` (the exact witness holds); flip BOTH ⇒ ``operator``.
+The binder stamps both digests from the SAME resolved value, so forcing the residual now
+means corrupting two independent MACs rather than one — and R-B4's marker still
+narrows it further to the case where no pick signal reached the promoter (a producer
+that does not thread ``picked``, or an answer genuinely typed).
 
 In that remaining case it is not closable: a well-formed same-key non-match is
 byte-for-byte the same signal as a genuine override, and the promoter holds digests,
@@ -324,6 +345,41 @@ def _is_secret(schema_path: str, klass: str) -> bool:
         return bool(_is_secret_path(schema_path, klass))
     except Exception:
         return True
+
+
+def _comparable_canon_ref(snap: Any, key_id: Optional[str]) -> Optional[str]:
+    """The snapshot's CANONICAL-form candidate digest, or ``None`` if it cannot act as
+    a witness in the origin decision.
+
+    Guarded exactly as ``candidate_ref`` is at the decision site, and for the same
+    reason: it rides a persisted card spec across a suspend, so it is attacker-shaped
+    input here. Only the shape ``replay_metrics.canonical_value_ref`` actually emits,
+    signed by THIS vault's key, is evidence of anything — a malformed, truncated,
+    raw-valued or foreign-keyed ref is dropped rather than guessed at.
+
+    The two ref schemes are DISJOINT BY LENGTH (``hmac256:`` 33 vs ``hmac256c:`` 34),
+    so an EXACT ref handed in through this field is rejected on sight and can never be
+    mistaken for a canonical one. Import failure ⇒ ``None`` (no witness), which is the
+    conservative answer: it leaves the decision exactly where it stood before the
+    canonical witness existed rather than inventing a match.
+
+    BOTH CHECKS ARE REDUNDANT FOR THE MATCH DECISION, and that is recorded here rather
+    than discovered again later. The caller compares this value with ``==`` against a
+    freshly computed, well-formed, this-key ``ans_canon``, so a malformed ref (wrong
+    scheme or length) and a foreign-keyed one (different MAC) both fail that comparison
+    on their own — mutation testing confirms neither guard is independently observable,
+    and the pins that look like they hold them actually hold the outcome. They are kept
+    deliberately: they mirror the structure ``record_ask_avoidable`` applies to the same
+    field, they make the refusal explicit rather than incidental, and they are what
+    keeps this correct if the comparison above ever stops being exact."""
+    try:
+        from systemu.runtime import replay_metrics as rm
+        ref = snap.get("candidate_canon_ref")
+        if not rm._is_canonical_ref(ref):
+            return None
+        return ref if rm._ref_key_id(ref) == key_id else None
+    except Exception:
+        return None
 
 
 #: The two secret shapes ``mask_outbound`` provably does not cover (verified against it
@@ -681,28 +737,58 @@ def promote_answered_asks(vault, dctx, answers,
             # needs no attacker at all. An unusable digest is not evidence of anything,
             # so it must reach the fail-closed branch below instead.
             key_id = rm._ref_key_id(ans_ref)
-            cands = [(s.get("candidate_ref"), s.get("value_origin")) for s in group
+            cands = [(s.get("candidate_ref"), _comparable_canon_ref(s, key_id),
+                      s.get("value_origin")) for s in group
                      if rm._is_value_ref(s.get("candidate_ref"))
                      and rm._ref_key_id(s.get("candidate_ref")) == key_id]
             if not cands:
                 capped.append(f"{path} (no comparable candidate digest)")
                 continue
-            matched = [origin for ref, origin in cands if ref == ans_ref]
+            matched = [origin for ref, _canon, origin in cands if ref == ans_ref]
             if not matched and path in picked_fields:
                 # R-B4/F3 — the operator EXPLICITLY picked the offered suggestion,
-                # but the digests did not compare equal. The digest comparison is
-                # the weaker witness here: `normalize_value` folds case and path
-                # separators, yet an answer that round-tripped through a widget can
-                # still differ from the candidate the binder digested, and any such
-                # difference reads as "the operator typed this" ⇒ `_OPERATOR`, the
-                # TRUSTED axis. That is a laundering path for a scraped value.
+                # but the digests did not compare equal. An explicit pick is direct
+                # evidence about the SAME question, so it is honoured — and only ever
+                # in the tainting direction: it can make the origin more tainted,
+                # never less. `_most_tainted` over every comparable candidate is the
+                # conservative reading when we know a candidate was taken but not
+                # which one.
                 #
-                # An explicit pick is direct evidence about the SAME question, so it
-                # is honoured — and only ever in the tainting direction: it can make
-                # the origin more tainted, never less. `_most_tainted` over every
-                # comparable candidate is the conservative reading when we know a
-                # candidate was taken but not which one.
-                matched = [origin for _ref, origin in cands]
+                # This branch is checked BEFORE the canonical witness below and stays
+                # the broader of the two: the pick names no particular candidate, so
+                # it widens to all of them, while a canonical match names exactly one.
+                # Letting the narrower witness win here could resolve a PICKED answer
+                # to LESS taint than it carried before the canonical witness existed.
+                matched = [origin for _ref, _canon, origin in cands]
+            elif not matched:
+                # R-A16 F2's canonical witness, applied to the ORIGIN decision.
+                #
+                # `normalize_value` folds only case and path separators, so an answer
+                # that round-tripped through a widget — quotes added, a trailing
+                # period, a URL-encoded separator — still fails the exact comparison
+                # above even when the operator did nothing but CONFIRM the binder's
+                # own candidate. Every such difference used to read as "the operator
+                # typed this" ⇒ `_OPERATOR`, the TRUSTED axis, and the file already
+                # named that a laundering path for a scraped value. The pick marker
+                # closed it only for operators who clicked the suggestion; this closes
+                # it for the ones who retyped or reshaped it.
+                #
+                # The binder stamps the canonical twin at BIND time beside the exact
+                # digest (the resolved value dies at the suspend, so both sides must
+                # be canonicalised BEFORE hashing). It is the same total-rewrite fold
+                # `record_ask_avoidable` scores its metric with — compared with `==`,
+                # never a containment test, so a prefix, a suffix, a sibling and an
+                # extension-stripped path all still read as genuine overrides.
+                #
+                # DIRECTION. Like the pick, this can only ever ADD taint: it fires
+                # only where the result would otherwise be `_OPERATOR` (rank 0, the
+                # least tainted), so no path through this decision is less tainted
+                # than it was before. `canonical_value_ref` returns None with no
+                # derivable key, which simply leaves the decision unchanged.
+                ans_canon = rm.canonical_value_ref(answer, vault)
+                if ans_canon is not None:
+                    matched = [origin for _ref, canon, origin in cands
+                               if canon is not None and canon == ans_canon]
             origin = _most_tainted(matched) if matched else _OPERATOR
 
             # ── bounds: per-call, per-class, and the shared per-TICK budget ──

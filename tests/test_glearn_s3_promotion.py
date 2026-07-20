@@ -75,10 +75,14 @@ class _Obj:
 SNAPSHOT_KEYS = frozenset({
     "schema_path", "class", "state", "source", "value_origin", "confidence",
     "candidate_ref",
-    # R-A16 F2: the CANONICAL-form twin of ``candidate_ref``, carried for the
-    # observability comparison only. THE PROMOTER MUST NOT READ IT — its origin
-    # decision stays exact-digest-only, and the two ref shapes are disjoint so
-    # ``_is_value_ref`` rejects a canonical digest outright.
+    # R-A16 F2: the CANONICAL-form twin of ``candidate_ref``. Introduced for the
+    # observability comparison in ``record_ask_avoidable``; the promoter now reads it
+    # too, as the THIRD witness in the origin decision (see PIN 2b). It is consulted
+    # only where the answer matched no exact digest and the field was not explicitly
+    # picked — the branch that previously fell through to ``operator`` and laundered a
+    # reshaped confirm onto the trusted axis. The two ref shapes stay disjoint by
+    # length, so ``_is_value_ref`` still rejects a canonical digest outright and
+    # neither field can ever stand in for the other.
     "candidate_canon_ref",
 })
 
@@ -373,6 +377,222 @@ def test_a_POISONED_value_origin_in_the_stamp_fails_UNTRUSTED(tmp_path):
         assert got == "content_derived", (
             f"a poisoned value_origin {poison!r} was promoted as {got!r} — an unknown "
             f"origin must fail UNTRUSTED")
+
+
+# ══ PIN 2b — the RESHAPED confirm (R-A16 F2's canonical witness, applied here) ══
+#
+#  THE DEFECT. The origin decision had exactly two witnesses: exact digest equality,
+#  and R-B4/F3's explicit pick marker. An operator who CONFIRMS the binder's
+#  content_derived candidate through a form that merely reshapes it — a widget adding
+#  quotes, a trailing period, a URL-encoded separator — matches neither, so the answer
+#  read as "the operator TYPED something new" and promoted as ``operator``: the TRUSTED
+#  axis. The file already named this "a laundering path for a scraped value"; what it
+#  lacked was the witness to close it.
+#
+#  WHY IT MATTERS MORE HERE THAN IN THE SIBLING METRIC. In ``replay_metrics`` the same
+#  miscomparison costs a mislabelled row. Here it costs the CONFIRM GATE: a promoted
+#  ``operator`` fact binds at confidence 1.0 ≥ T_high, so every later run silent-binds
+#  a value that was scraped out of fetched content — measured below, both directions.
+#
+#  Each reshape is chosen to be PLATFORM-INDEPENDENT: ``normalize_value`` normcases a
+#  path on Windows, so a case/separator reshape would already fold at the EXACT digest
+#  there and these pins would pass on Windows against an unfixed promoter.
+_RESHAPED_CONFIRMS = [
+    ('"out/draft.md"', "surrounding double quotes (widget/JSON round-trip)"),
+    ("out/draft.md.", "a trailing period"),
+    ("out/draft.md,", "a trailing comma"),
+    ("out%2Fdraft.md", "a URL-encoded separator"),
+]
+
+#: The line the canonical witness must not cross. Each is a GENUINELY different value
+#: reachable by a substring-style fold; promoting any of them as ``content_derived``
+#: would re-ask the operator forever for something they really did type — destroying
+#: the payoff PIN 1(b) exists to protect.
+_STILL_OVERRIDES = [
+    ("out/other.md", "a sibling file"),
+    ("out", "a PREFIX of the candidate"),
+    ("draft.md", "a SUFFIX of the candidate"),
+    ("out/draft", "the extension dropped"),
+]
+
+
+@pytest.mark.parametrize("answer,label", _RESHAPED_CONFIRMS,
+                         ids=[l for _, l in _RESHAPED_CONFIRMS])
+def test_a_RESHAPED_confirm_is_not_laundered_into_a_trusted_silent_bind(
+        tmp_path, answer, label):
+    """THE FIX. The operator confirmed the binder's own content_derived candidate; only
+    its FORM differs. It must keep the value's taint, and must still be confirm-gated
+    on the next run."""
+    v = _Vault(tmp_path)
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
+    # positive controls: the binder really held a TAINTED candidate, it really stamped
+    # the canonical twin, and the answer really is a form-only reshape of it.
+    assert snaps[0]["value_origin"] == "content_derived"
+    assert snaps[0]["candidate_canon_ref"] is not None, (
+        "the binder did not stamp the canonical twin — this pin would be vacuous")
+    assert rm.canonical_compare_form(answer) == rm.canonical_compare_form("out/draft.md")
+
+    assert ap.promote_answered_asks(v, _dctx(snaps), {"recipient": answer}) == 1
+    assert _promoted(v)[0].origin_class == "content_derived", (
+        f"LAUNDERING via {label}: a scraped value the operator merely RESHAPED was "
+        f"promoted as operator-trusted")
+
+    req, asked = _rebind(v, SCHEMA)
+    assert req.value_origin == "content_derived"
+    assert asked, (
+        f"LAUNDERING at re-bind via {label}: the confirm gate is gone — every later "
+        f"run now silent-binds a value that came out of fetched content")
+
+
+@pytest.mark.parametrize("answer,label", _STILL_OVERRIDES,
+                         ids=[l for _, l in _STILL_OVERRIDES])
+def test_a_genuinely_different_answer_still_promotes_TRUSTED(tmp_path, answer, label):
+    """The negative half, and the more important one. Over-tainting is not "the safe
+    direction" here: it re-asks the operator forever for what they typed, which is
+    precisely the payoff PIN 1(b) protects. The canonical witness must stay a TOTAL
+    rewrite compared with ``==``, never a containment test."""
+    v = _Vault(tmp_path)
+    snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
+    assert ap.promote_answered_asks(v, _dctx(snaps), {"recipient": answer}) == 1
+    assert _promoted(v)[0].origin_class == "operator", (
+        f"OVER-TAINT via {label}: a value the operator genuinely typed was recorded "
+        f"untrusted — the canonical witness has collapsed into a substring match")
+    _req, asked = _rebind(v, SCHEMA)
+    assert not asked, f"the payoff is gone for {label}: it no longer silent-binds"
+
+
+def test_a_canonical_ref_signed_by_ANOTHER_vault_key_is_not_a_witness(tmp_path):
+    """Key-rotation / cross-vault OUTCOME, mirroring the one the exact ref already has.
+
+    A canonical digest signed under a different key is incomparable, not evidence, and
+    must never produce a match.
+
+    WHAT THIS DOES AND DOES NOT HOLD. It pins the OUTCOME, not the key-id guard inside
+    ``_comparable_canon_ref``: deleting that guard leaves this green, because a foreign
+    key yields a different MAC and the exact ``==`` fails anyway. Measured — the guard
+    is redundant for the match decision and is kept as defence-in-depth, matching the
+    structure ``record_ask_avoidable`` uses on the same field. Do not read this test as
+    protection for the guard itself."""
+    v = _Vault(tmp_path)
+    other = _Vault(tmp_path / "other_vault")
+    snaps = _real_snaps(v, SCHEMA, candidate_value="out/draft.md")
+    foreign = rm.canonical_value_ref("out/draft.md", other)
+    assert foreign is not None
+    assert rm._ref_key_id(foreign) != rm._ref_key_id(rm.value_ref("x", v)), (
+        "the two vaults derived the same key — this pin would be vacuous")
+    snap = {**snaps[0], "candidate_canon_ref": foreign}
+    assert set(snap) == SNAPSHOT_KEYS                    # still the producer's shape
+
+    assert ap.promote_answered_asks(v, _dctx([snap]), {"recipient": '"out/draft.md"'}) == 1
+    assert _promoted(v)[0].origin_class == "operator", (
+        "a foreign-keyed canonical digest was accepted as a witness")
+
+
+@pytest.mark.parametrize("bad", [
+    "out/draft.md",                                  # a RAW value, not a digest
+    "hmac256:" + "0" * 8 + ":" + "0" * 16,           # the EXACT-ref shape, not canonical
+    "hmac256c:" + "0" * 8 + ":" + "0" * 15,          # right prefix, wrong length
+    "hmac256c:zzzzzzzz:" + "0" * 16,                 # non-hex key id
+    "", None, 7, ["hmac256c"], {"a": 1},
+])
+def test_a_MALFORMED_canonical_ref_is_not_a_witness(tmp_path, bad):
+    """``candidate_canon_ref`` rides a persisted card spec across a suspend, so it is
+    attacker-shaped input exactly as ``candidate_ref`` is. Only the emitted shape may
+    ever act as a witness; anything else is dropped, never guessed at.
+
+    The EXACT-ref shape is in this list deliberately: the two schemes are disjoint by
+    length, and accepting one where the other belongs is how a shape-confusion bug
+    would launder a value.
+
+    SAME CAVEAT as the cross-key pin above — this holds the OUTCOME, not the shape
+    guard. Deleting ``_is_canonical_ref`` from ``_comparable_canon_ref`` leaves this
+    green: none of these shapes can equal a well-formed ``ans_canon`` under an exact
+    comparison, so the guard cannot change the result. It is belt-and-braces, kept for
+    symmetry with the sibling recorder and against a future non-exact comparison."""
+    v = _Vault(tmp_path / f"v{abs(hash(str(bad)))}")
+    snaps = _real_snaps(v, SCHEMA, candidate_value="out/draft.md")
+    snap = {**snaps[0], "candidate_canon_ref": bad}
+
+    assert ap.promote_answered_asks(v, _dctx([snap]),
+                                    {"recipient": '"out/draft.md"'}) == 1
+    assert _promoted(v)[0].origin_class == "operator", (
+        f"a malformed canonical ref {bad!r} was accepted as a witness")
+
+
+def test_an_ABSENT_canonical_ref_still_promotes_and_does_not_fail_closed(tmp_path):
+    """Legacy compatibility. Cards stamped before the canonical twin existed carry no
+    ``candidate_canon_ref``; they must keep working exactly as they did (exact-digest
+    witness only), not start refusing to promote."""
+    v = _Vault(tmp_path)
+    snaps = _real_snaps(v, SCHEMA, candidate_value="out/draft.md")
+    legacy = {**snaps[0], "candidate_canon_ref": None}
+
+    # the EXACT witness still fires on an exact confirm
+    assert ap.promote_answered_asks(v, _dctx([legacy]),
+                                    {"recipient": "out/draft.md"}) == 1
+    assert _promoted(v)[0].origin_class == "content_derived", (
+        "a legacy card without the canonical twin stopped honouring the exact witness")
+
+
+def test_the_explicit_pick_still_widens_to_EVERY_candidate(tmp_path):
+    """R-B4/F3's marker is the BROADER witness — it says a suggestion was taken but not
+    which one, so it resolves to ``_most_tainted`` over every comparable candidate. The
+    canonical witness names ONE candidate, so it must not narrow the picked case and
+    quietly make a picked answer LESS tainted than it was before this change.
+
+    THE TWO CANDIDATES MUST DIFFER IN BOTH VALUE AND ORIGIN, and that is what makes this
+    pin real rather than decorative. A first attempt gave both snapshots the same
+    digests and differed only in ``value_origin``: the canonical witness then matched
+    BOTH candidates, ``_most_tainted`` collapsed them to the same answer either way, and
+    disabling the pick branch entirely still passed. Here the reshaped answer confirms
+    ONLY the ``operator`` candidate, so pick-first (⇒ ``content_derived``, the taint of
+    the OTHER candidate) and canonical-first (⇒ ``operator``) give different results and
+    the ordering is actually observable."""
+    v = _Vault(tmp_path)
+    picked_val, other_val = "out/other.md", "out/draft.md"
+    tainted = _assert_realistic(
+        _real_snaps(v, SCHEMA, candidate_value=other_val))[0]
+    assert tainted["value_origin"] == "content_derived"
+    # a second REAL candidate for the same path: genuinely computed digests under this
+    # same vault key, carrying the TRUSTED origin
+    trusted = {**tainted,
+               "candidate_ref": rm.value_ref(picked_val, v),
+               "candidate_canon_ref": rm.canonical_value_ref(picked_val, v),
+               "value_origin": "operator"}
+    assert trusted["candidate_ref"] != tainted["candidate_ref"]
+    group = _assert_realistic([tainted, trusted])
+
+    # the answer is a reshaped confirm of the TRUSTED candidate only
+    n = ap.promote_answered_asks(v, _dctx(group), {"recipient": f'"{picked_val}"'},
+                                 picked=["recipient"])
+    assert n == 1
+    assert _promoted(v)[0].origin_class == "content_derived", (
+        "a PICKED answer resolved to less taint than _most_tainted over every "
+        "candidate — the canonical witness narrowed the pick, which is a REGRESSION "
+        "in the trusting direction on a security decision")
+
+
+def test_without_a_pick_the_canonical_witness_credits_the_matched_candidate(tmp_path):
+    """The control for the pin above: the SAME two-candidate group and the SAME answer,
+    differing only in that no pick marker arrives. Now the canonical witness is the only
+    inferred witness and it credits the candidate it actually matched.
+
+    Without this control the pin above would also pass against a promoter that ignored
+    the canonical witness completely and simply always widened."""
+    v = _Vault(tmp_path)
+    picked_val, other_val = "out/other.md", "out/draft.md"
+    tainted = _real_snaps(v, SCHEMA, candidate_value=other_val)[0]
+    trusted = {**tainted,
+               "candidate_ref": rm.value_ref(picked_val, v),
+               "candidate_canon_ref": rm.canonical_value_ref(picked_val, v),
+               "value_origin": "operator"}
+
+    n = ap.promote_answered_asks(v, _dctx([tainted, trusted]),
+                                 {"recipient": f'"{picked_val}"'})
+    assert n == 1
+    assert _promoted(v)[0].origin_class == "operator", (
+        "the canonical witness credited the wrong candidate — it must name the one it "
+        "matched, not collapse over all of them the way an explicit pick does")
 
 
 def test_the_secret_and_spine_guards_FAIL_CLOSED_when_their_import_breaks(tmp_path,
@@ -873,12 +1093,24 @@ def test_a_WELL_FORMED_same_key_NON_MATCH_is_an_override_by_construction(tmp_pat
     ``user_facts.jsonl`` itself, where they could simply author a fact stamped
     ``operator`` and skip this path entirely. The guards exist for the shapes that
     arise WITHOUT vault write access: a non-conforming producer, and a vault-key
-    rotation, which needs no attacker at all."""
+    rotation, which needs no attacker at all.
+
+    BOTH digests are flipped, and that is the point of the fixture rather than an
+    incidental detail. The binder stamps the exact ref and its canonical twin from the
+    SAME resolved value, so flipping only one of them describes no reachable state: it
+    asserts "this answer both is and is not the binder's value". Since the canonical
+    witness landed, that inconsistent pair resolves — correctly — to ``content_derived``
+    (see the companion pin below), so a one-digest fixture would silently stop
+    exercising this residual. The residual itself is unchanged; the tamper surface it
+    needs is strictly larger, because BOTH digests must now be corrupted to force it."""
     v = _Vault(tmp_path)
     snaps = _assert_realistic(_real_snaps(v, SCHEMA, candidate_value="out/draft.md"))
-    flipped = {**snaps[0], "candidate_ref": _flip_last_hex(snaps[0]["candidate_ref"])}
-    # the mutation really did leave a comparable ref — that is the whole point
+    flipped = {**snaps[0],
+               "candidate_ref": _flip_last_hex(snaps[0]["candidate_ref"]),
+               "candidate_canon_ref": _flip_last_hex(snaps[0]["candidate_canon_ref"])}
+    # the mutation really did leave comparable refs — that is the whole point
     assert rm._is_value_ref(flipped["candidate_ref"])
+    assert rm._is_canonical_ref(flipped["candidate_canon_ref"])
     assert (rm._ref_key_id(flipped["candidate_ref"])
             == rm._ref_key_id(rm.value_ref("out/draft.md", v)))
 
@@ -887,6 +1119,32 @@ def test_a_WELL_FORMED_same_key_NON_MATCH_is_an_override_by_construction(tmp_pat
     assert _promoted(v)[0].origin_class == "operator", (
         "a comparable, non-matching candidate must read as an override — clamping it "
         "to content_derived would re-ask the operator forever for values they typed")
+
+
+def test_flipping_ONLY_the_exact_mac_is_recovered_by_the_canonical_witness(tmp_path):
+    """The companion to the residual above, and the reason its fixture had to change.
+
+    Corrupting one of the two digests no longer forces ``operator``: the surviving
+    witness still recognises the operator's answer as the binder's own value, so the
+    taint travels. Pinned in BOTH directions so neither witness can be quietly dropped
+    while the other masks it."""
+    checks = (("candidate_ref", "candidate_canon_ref", rm._is_canonical_ref),
+              ("candidate_canon_ref", "candidate_ref", rm._is_value_ref))
+    for field, other, other_is_wellformed in checks:
+        vv = _Vault(tmp_path / f"only_{field}")
+        snap = _assert_realistic(
+            _real_snaps(vv, SCHEMA, candidate_value="out/draft.md"))[0]
+        # positive control: BOTH digests were stamped, so corrupting one really does
+        # leave exactly one intact witness rather than testing an absent field.
+        assert snap[field] is not None and snap[other] is not None
+        snap = {**snap, field: _flip_last_hex(snap[field])}
+        assert other_is_wellformed(snap[other]), "the surviving twin was not left intact"
+
+        assert ap.promote_answered_asks(vv, _dctx([snap]),
+                                        {"recipient": "out/draft.md"}) == 1
+        assert _promoted(vv)[0].origin_class == "content_derived", (
+            f"corrupting {field} alone forced the TRUSTED axis — the surviving "
+            f"{other} witness should still have recognised the confirm")
 
 
 def test_the_incomparable_ref_control_promotes_when_UNMUTATED(tmp_path):

@@ -435,3 +435,467 @@ class TestMigratorActuallyDelivers:
         assert marker.read_text(encoding="utf-8").strip() == systemu.__version__
         # Converged ⇒ the next boot is a no-op.
         assert vm.backfill_effect_tags(vault_dir).get("fast_path") is True
+
+
+class TestSeedUpdateKeepsTheOperatorsDisable:
+    """`tools/index.json` — MERGED, not backed up, and the merge is one field.
+
+    Measured on a real vault before writing any of this (see
+    `test_dropped_header_fields_self_heal_on_next_boot` and
+    `test_the_index_is_already_rewritten_earlier_in_the_same_run`):
+
+      * A live vault's index headers carry FIVE fields the packaged seed index
+        does not — `dry_run_status`, `version`, `parameters_schema_summary`,
+        `return_schema_summary`, `implementation_path` — because they are
+        written by `vault._tool_header`, not shipped in the seed file. `run`'s
+        update branch replaces the whole entry with `pkg_entry`, so all five go.
+      * Every one of those five is DERIVED from the tool body and is re-derived
+        by `jobs._backfill_tool_headers_v061` on the next boot. They self-heal.
+      * `enabled` does NOT. It is Gate 3's input
+        (`tool_registry.execute` → `if not tool.enabled: raise
+        ToolNotEnabledError`), the migration copies the package body over the
+        vault's, and every packaged seed ships `enabled: true` — so an upgrade
+        silently re-arms a tool the operator switched OFF in the dashboard.
+
+    Hence a merge rather than a copy-aside. See
+    `test_the_index_is_already_rewritten_earlier_in_the_same_run` for why a
+    `_preserve_before_overwrite`-style whole-file backup is the wrong shape here.
+    """
+
+    _make_vault = staticmethod(TestMigratorActuallyDelivers._make_vault)
+
+    @staticmethod
+    def _booted(vault_dir: Path):
+        """A vault as it exists AFTER a real boot: headers written by
+        `vault._tool_header` (15 fields), not the 10-field packaged seed index.
+
+        The concrete production type — a test that hand-writes a header proves
+        nothing about the fields the real writer emits.
+        """
+        from systemu.vault.vault import Vault
+        v = Vault(vault_dir)
+        for hdr in list(v.load_index("tools")):
+            v.save_tool(v.get_tool(hdr["id"]))
+        return v
+
+    @staticmethod
+    def _stale(vault_dir: Path) -> None:
+        (vault_dir / vm._SEED_VERSION_FILENAME).write_text("0.9.59", encoding="utf-8")
+
+    @staticmethod
+    def _bump_impl(vault_dir: Path, name: str) -> None:
+        """Make the package's implementation win the update branch — the ordinary
+        case where upstream changed a seed, not only the operator-edited one."""
+        impl = vault_dir / "tools" / "implementations" / f"{name}.py"
+        impl.write_text(impl.read_text(encoding="utf-8") + "\n# older release\n",
+                        encoding="utf-8")
+
+    def test_operator_disable_survives_a_seed_update(self, tmp_path):
+        """THE PIN. Reproduced on a real vault before the fix: `enabled` went
+        False → True and the tool became callable again."""
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        name = v.load_index("tools")[0]["name"]
+
+        tool = v.find_tool_by_name(name)
+        tool.enabled = False
+        v.save_tool(tool)
+        assert v.find_tool_by_name(name).enabled is False
+
+        self._bump_impl(vault_dir, name)
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+        assert summary["updated"] >= 1, summary
+
+        from systemu.vault.vault import Vault
+        after = Vault(vault_dir)
+        # Gate 3's OWN input expression, not a proxy for it.
+        assert after.find_tool_by_name(name).enabled is False, (
+            "the migration re-armed a tool the operator switched off")
+        hdr = {e["name"]: e for e in after.load_index("tools")}[name]
+        assert hdr["enabled"] is False, (
+            "index header disagrees with the body — the merge must cover both")
+
+    def test_the_seed_update_still_lands_while_the_disable_is_kept(self, tmp_path):
+        """The merge must not turn into a skip: package-authoritative fields
+        still win, only `enabled` is carried across."""
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        name = v.load_index("tools")[0]["name"]
+        tool = v.find_tool_by_name(name)
+        tool.enabled = False
+        tool.description = "operator's stale description"
+        v.save_tool(tool)
+
+        impl = vault_dir / "tools" / "implementations" / f"{name}.py"
+        pkg_impl_bytes = (vm._package_vault_root() / "tools" / "implementations"
+                          / f"{name}.py").read_bytes()
+        impl.write_text("# an older release's body\n", encoding="utf-8")
+        self._stale(vault_dir)
+
+        vm.run(vault_dir)
+
+        pkg_entry = {e["name"]: e for e in json.loads(
+            (vm._package_vault_root() / "tools" / "index.json").read_text(
+                encoding="utf-8"))}[name]
+        hdr = {e["name"]: e for e in json.loads(
+            (vault_dir / "tools" / "index.json").read_text(encoding="utf-8"))}[name]
+        assert impl.read_bytes() == pkg_impl_bytes, "the seed update must still land"
+        assert hdr["description"] == pkg_entry["description"], (
+            "description is package-authoritative and must still be replaced")
+        assert hdr["enabled"] is False
+
+    def test_nothing_the_operator_left_enabled_is_switched_off(self, tmp_path):
+        """No over-firing. A vault nobody disabled anything in must come out with
+        every seed still enabled and `kept_disabled` at zero — otherwise the
+        count means nothing and an upgrade would break working tools."""
+        vault_dir = self._make_vault(tmp_path)
+        self._booted(vault_dir)
+        idx = json.loads((vault_dir / "tools" / "index.json").read_text(encoding="utf-8"))
+        for entry in idx[:3]:
+            self._bump_impl(vault_dir, entry["name"])
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["updated"] >= 3, summary
+        assert summary["kept_disabled"] == 0, summary
+        after = json.loads((vault_dir / "tools" / "index.json").read_text(encoding="utf-8"))
+        assert all(e["enabled"] is True for e in after), (
+            [e["name"] for e in after if e["enabled"] is not True])
+
+    def test_a_brand_new_seed_arrives_enabled(self, tmp_path):
+        """The other over-fire, and the one that would hurt everybody.
+
+        A seed the vault has never held has NO body at either id — the probe's
+        last source is a file that does not exist. If "no record" fell to the
+        restrictive side, every new tool in every release would install switched
+        OFF and the operator would have to hunt for it. Absent is not a disable;
+        only an existing record can express intent.
+
+        Added because the mutation flipping `_says_off`'s missing-file branch to
+        `True` SURVIVED the first cut: every fixture had all its bodies present,
+        so the branch never ran.
+        """
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        entry = v.load_index("tools")[0]
+        name, tid = entry["name"], entry["id"]
+
+        # A seed shipped after this vault's last migration: nothing of it here.
+        idx_path = vault_dir / "tools" / "index.json"
+        idx = [e for e in json.loads(idx_path.read_text(encoding="utf-8"))
+               if e["id"] != tid]
+        idx_path.write_text(json.dumps(idx, indent=2) + "\n", encoding="utf-8")
+        (vault_dir / "tools" / f"tool_{tid}.json").unlink()
+        (vault_dir / "tools" / "implementations" / f"{name}.py").unlink()
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["added"] >= 1, summary
+        assert summary["kept_disabled"] == 0, summary
+        from systemu.vault.vault import Vault
+        assert Vault(vault_dir).find_tool_by_name(name).enabled is True, (
+            "a brand-new seed installed switched OFF")
+        hdr = {e["name"]: e for e in json.loads(
+            idx_path.read_text(encoding="utf-8"))}[name]
+        assert hdr["enabled"] is True
+
+    def test_absent_enabled_key_is_not_read_as_a_disable(self, tmp_path):
+        """`enabled` ABSENT is no evidence of operator intent.
+
+        `Vault._backfill_tool_index_enabled` writes `False` when it cannot find a
+        body, so reading "absent or falsey" as a disable would latch tools off on
+        vaults predating the field. Only an explicit `False` counts.
+        """
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        name = v.load_index("tools")[0]["name"]
+
+        idx_path = vault_dir / "tools" / "index.json"
+        idx = json.loads(idx_path.read_text(encoding="utf-8"))
+        entry = next(e for e in idx if e["name"] == name)
+        entry.pop("enabled", None)
+        idx_path.write_text(json.dumps(idx, indent=2) + "\n", encoding="utf-8")
+        body_path = vault_dir / "tools" / f"tool_{entry['id']}.json"
+        body = json.loads(body_path.read_text(encoding="utf-8"))
+        body.pop("enabled", None)
+        body_path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+
+        self._bump_impl(vault_dir, name)
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["kept_disabled"] == 0, summary
+        hdr = {e["name"]: e for e in json.loads(
+            idx_path.read_text(encoding="utf-8"))}[name]
+        assert hdr["enabled"] is True
+
+    def test_kept_disabled_reaches_the_caller(self, tmp_path):
+        """A count that only reaches a log line is a count nobody reads — the
+        same rule `preserved`/`preserved_dir` follow."""
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        name = v.load_index("tools")[0]["name"]
+        tool = v.find_tool_by_name(name)
+        tool.enabled = False
+        v.save_tool(tool)
+        self._bump_impl(vault_dir, name)
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["kept_disabled"] == 1, summary
+        assert name in summary["kept_disabled_names"], summary
+
+    def test_an_unreadable_body_is_treated_as_disabled(self, tmp_path):
+        """Mutation S12's shape, on this path.
+
+        `_diverges` once returned False from its `except`, so a file that EXISTS
+        but cannot be read counted as "no divergence" and was clobbered. The same
+        trap here reads an unreadable body as "not disabled" and re-arms the
+        tool. Missing evidence must fall to the RESTRICTIVE side: a tool wrongly
+        left off is one dashboard click away and Gate 3 says so by name; a tool
+        wrongly switched on is a silent control revocation.
+        """
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        entry = v.load_index("tools")[0]
+        name, tid = entry["name"], entry["id"]
+
+        (vault_dir / "tools" / f"tool_{tid}.json").write_text(
+            "{ this is not json", encoding="utf-8")
+        self._bump_impl(vault_dir, name)
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["kept_disabled"] == 1, summary
+        hdr = {e["name"]: e for e in json.loads(
+            (vault_dir / "tools" / "index.json").read_text(encoding="utf-8"))}[name]
+        assert hdr["enabled"] is False, (
+            "an unreadable body must not read as 'operator left this on'")
+
+    def test_add_branch_keeps_an_orphaned_bodys_disable(self, tmp_path):
+        """The ADD branch clobbers `tool_<id>.json` too. A body left behind when
+        its index entry was lost is re-indexed by this run — and re-indexing it
+        as enabled is the same silent re-arm."""
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        entry = v.load_index("tools")[0]
+        name, tid = entry["name"], entry["id"]
+
+        tool = v.find_tool_by_name(name)
+        tool.enabled = False
+        v.save_tool(tool)
+
+        idx_path = vault_dir / "tools" / "index.json"
+        idx = [e for e in json.loads(idx_path.read_text(encoding="utf-8"))
+               if e["id"] != tid]
+        idx_path.write_text(json.dumps(idx, indent=2) + "\n", encoding="utf-8")
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["added"] >= 1, summary
+        assert summary["kept_disabled"] == 1, summary
+        from systemu.vault.vault import Vault
+        assert Vault(vault_dir).find_tool_by_name(name).enabled is False
+        # BOTH records. Asserting only the body let a mutation that reverted the
+        # ADD branch's index merge to a plain `append(pkg_entry)` survive: the
+        # header then advertised the tool as enabled while the body refused it,
+        # so the Tools page showed a toggle that did not match the gate.
+        hdr = {e["name"]: e for e in json.loads(
+            idx_path.read_text(encoding="utf-8"))}[name]
+        assert hdr["enabled"] is False, "ADD branch wrote a header that lies about the gate"
+
+    def test_disable_is_found_when_the_vault_holds_the_seed_under_its_own_id(self, tmp_path):
+        """Identity here is by NAME, so the ids need not match.
+
+        `normalize_seed_forged_flags` already documents this: a vault can hold a
+        seed under its OWN id, in which case its body is `tool_<vault id>.json`
+        while the file the update branch overwrites is `tool_<package id>.json`.
+        A probe that reads only the destination path finds no record and re-arms
+        the tool. Added because the mutation that passed `None` for the vault
+        entry SURVIVED the first cut of these tests — every fixture there had the
+        two ids equal, so the two sources were indistinguishable.
+
+        The header carries no `enabled` here on purpose, so the only thing that
+        can answer is the vault entry's OWN body.
+        """
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        entry = v.load_index("tools")[0]
+        name, pkg_tid = entry["name"], entry["id"]
+        vault_tid = f"{pkg_tid}_local"
+
+        tool = v.find_tool_by_name(name)
+        tool.enabled = False
+        v.save_tool(tool)
+
+        # re-home the body under the vault's own id, and strip the header's copy
+        body_path = vault_dir / "tools" / f"tool_{pkg_tid}.json"
+        body = json.loads(body_path.read_text(encoding="utf-8"))
+        body["id"] = vault_tid
+        (vault_dir / "tools" / f"tool_{vault_tid}.json").write_text(
+            json.dumps(body, indent=2) + "\n", encoding="utf-8")
+        body_path.unlink()
+        idx_path = vault_dir / "tools" / "index.json"
+        idx = json.loads(idx_path.read_text(encoding="utf-8"))
+        for e in idx:
+            if e["id"] == pkg_tid:
+                e["id"] = vault_tid
+                e.pop("enabled", None)
+        idx_path.write_text(json.dumps(idx, indent=2) + "\n", encoding="utf-8")
+        assert not body_path.exists(), "fixture unreal — the ids still collide"
+
+        self._bump_impl(vault_dir, name)
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["updated"] >= 1, summary
+        assert summary["kept_disabled"] == 1, summary
+        from systemu.vault.vault import Vault
+        assert Vault(vault_dir).find_tool_by_name(name).enabled is False
+
+    def test_a_header_only_disable_is_honoured(self, tmp_path):
+        """Either record is enough.
+
+        `Vault._backfill_tool_index_enabled` writes `enabled` into the INDEX from
+        whatever it can find, so the header can carry a disable the body does not.
+        Reading only the body would drop it.
+        """
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        entry = v.load_index("tools")[0]
+        name, tid = entry["name"], entry["id"]
+
+        idx_path = vault_dir / "tools" / "index.json"
+        idx = json.loads(idx_path.read_text(encoding="utf-8"))
+        next(e for e in idx if e["id"] == tid)["enabled"] = False
+        idx_path.write_text(json.dumps(idx, indent=2) + "\n", encoding="utf-8")
+        body_path = vault_dir / "tools" / f"tool_{tid}.json"
+        body = json.loads(body_path.read_text(encoding="utf-8"))
+        assert body["enabled"] is True, "fixture unreal — the body already agrees"
+
+        self._bump_impl(vault_dir, name)
+        self._stale(vault_dir)
+
+        summary = vm.run(vault_dir)
+
+        assert summary["kept_disabled"] == 1, summary
+        from systemu.vault.vault import Vault
+        assert Vault(vault_dir).find_tool_by_name(name).enabled is False
+
+    def test_the_merge_does_not_mutate_the_package_catalog(self, tmp_path):
+        """`_entry_keeping_disable` must COPY.
+
+        Dropping the copy currently changes nothing observable — `run` re-parses
+        the package index from disk each call, computes `pkg_names` before the
+        loop, and never reads `pkg_idx` again afterwards — so the mutation that
+        aliased it SURVIVED, and this pin exists to stop that staying true by
+        accident. Writing a vault's state into the authoritative package catalog
+        is the kind of aliasing that only bites once something starts caching it.
+        """
+        pkg_entry = {"id": "tool_x", "name": "x", "enabled": True}
+        merged = vm._entry_keeping_disable(pkg_entry, True)
+        assert merged["enabled"] is False
+        assert pkg_entry["enabled"] is True, (
+            "the package catalog entry was mutated in place")
+        assert merged is not pkg_entry
+
+    def test_the_index_is_already_rewritten_earlier_in_the_same_run(self, tmp_path):
+        """WHY `tools/index.json` GETS NO `_preserve_before_overwrite` BACKUP.
+
+        Measured, not assumed. `normalize_seed_forged_flags` runs ABOVE the
+        write-back inside the same `run()` and rewrites `tools/index.json` itself
+        whenever it clears a mis-flag — and the POC finding is that real vaults
+        mis-flag every seed tool, so that is the field state, not an edge case.
+        A copy-aside taken at the write-back would therefore capture a file the
+        migrator had already rewritten on this same boot, and present a
+        machine-edited intermediate as "your previous contents" — the exact trap
+        that got body-JSON preservation removed one commit ago.
+
+        Two further reasons the shape is wrong, both checked here:
+          * there is no divergence predicate. A vault index legitimately differs
+            from the package's on every real vault (user-forged tools are only
+            in the vault's), so a `_diverges`-gated backup would fire on 100% of
+            migrations and `preserved` would stop meaning "you had local edits".
+          * nothing in the index is unique to it — every field `_tool_header`
+            emits is derived from the tool body.
+
+        If this test ever fails, an earlier index writer was removed and
+        whole-file preservation becomes worth re-costing.
+        """
+        vault_dir = self._make_vault(tmp_path)
+        self._booted(vault_dir)
+        idx_path = vault_dir / "tools" / "index.json"
+
+        # The POC field state: every seed mis-flagged as LLM-forged.
+        idx = json.loads(idx_path.read_text(encoding="utf-8"))
+        for e in idx:
+            e["forged_by_systemu"] = True
+        idx_path.write_text(json.dumps(idx, indent=2) + "\n", encoding="utf-8")
+        for e in idx:
+            bp = vault_dir / "tools" / f"tool_{e['id']}.json"
+            body = json.loads(bp.read_text(encoding="utf-8"))
+            body["forged_by_systemu"] = True
+            bp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+        self._stale(vault_dir)
+
+        # Record the atomic writes `run` performs BEFORE its own write-back;
+        # the real function still does the work.
+        seen: list = []
+        real = vm._write_text_atomic
+
+        def recording(path, text):
+            seen.append(Path(path))
+            return real(path, text)
+
+        import unittest.mock as _mock
+        with _mock.patch.object(vm, "_write_text_atomic", recording):
+            summary = vm.run(vault_dir)
+
+        assert summary["forged_normalized"] > 0, summary
+        assert any(p == idx_path for p in seen), (
+            "no earlier writer touched tools/index.json — the measurement that "
+            "rules out whole-file preservation no longer holds; re-cost it")
+
+    def test_dropped_header_fields_self_heal_on_next_boot(self, tmp_path):
+        """The other five dropped fields need no carrying — they are derived.
+
+        This is the evidence for merging ONE field instead of all of them.
+        Carrying `parameters_schema_summary` / `return_schema_summary` forward
+        would be actively wrong (they would describe the OLD schema while the
+        body is the package's new one), and `implementation_path` is
+        vault-declared — re-stamping it from the old entry would carry a
+        redirected path across a migration that just replaced `{name}.py`.
+        """
+        vault_dir = self._make_vault(tmp_path)
+        v = self._booted(vault_dir)
+        name = v.load_index("tools")[0]["name"]
+        derived = ("dry_run_status", "version", "parameters_schema_summary",
+                   "return_schema_summary", "implementation_path")
+        hdr = {e["name"]: e for e in v.load_index("tools")}[name]
+        assert all(k in hdr for k in derived), sorted(hdr)
+
+        self._bump_impl(vault_dir, name)
+        self._stale(vault_dir)
+        vm.run(vault_dir)
+
+        from systemu.vault.vault import Vault
+        from systemu.scheduler.jobs import _backfill_tool_headers_v061
+        v2 = Vault(vault_dir)
+        hdr = {e["name"]: e for e in v2.load_index("tools")}[name]
+        assert not any(k in hdr for k in derived), (
+            "fixture unreal — the migration no longer drops these")
+
+        _backfill_tool_headers_v061(v2)
+
+        hdr = {e["name"]: e for e in Vault(vault_dir).load_index("tools")}[name]
+        assert all(k in hdr for k in derived), (
+            f"a dropped header field did NOT self-heal: {sorted(hdr)}")
