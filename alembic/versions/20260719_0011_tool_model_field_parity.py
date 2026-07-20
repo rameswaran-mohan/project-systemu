@@ -44,16 +44,38 @@ depends_on    = None
 
 
 # (column, type, server_default) — mirrors ToolRow in systemu/storage/sqlite/models.py
+#
+# Boolean defaults use ``sa.false()``, NOT ``sa.text("0")``. This migration runs
+# on Postgres as well as SQLite (docker/entrypoint.sh runs `alembic upgrade head`
+# whenever SYSTEMU_DATABASE_URL is set, and the docker-* compose profiles always
+# set it to postgresql://), and Postgres has no implicit integer→boolean cast:
+#
+#     ALTER TABLE tools ADD COLUMN trusted_inprocess BOOLEAN DEFAULT 0
+#     → DatatypeMismatch: column "trusted_inprocess" is of type boolean but
+#       default expression is of type integer            [PostgreSQL 16.2]
+#
+# Postgres DDL is transactional, so that rejection rolled back the WHOLE
+# revision — effect_tags included — and the entrypoint's soft-fallback then
+# `alembic stamp head`s it, so the columns are never added and never retried.
+# ``sa.false()`` is dialect-aware: it renders `false` on Postgres and `0` on
+# SQLite, so the SQLite DDL is byte-identical to what shipped. Revisions 0004
+# and 0009 already use it.
+#
+# The sa.JSON() defaults are deliberately left uncast: Postgres coerces the
+# unknown-typed literal and stores `'[]'::json`, and writing an explicit
+# `::json` cast here would emit it on SQLite too, which cannot parse it.
+# ``forge_reattempts`` is an Integer, so a bare `0` is correct on both.
+# Pinned per-dialect in tests/test_migration_0011_postgres_ddl.py.
 _COLUMNS = [
     ("requires_credentials",          sa.JSON(),    sa.text("'[]'")),
     ("forged_by_execution_id",        sa.String(),  None),
     ("grounding_inputs",              sa.JSON(),    sa.text("'[]'")),
     ("effect_tags",                   sa.JSON(),    sa.text("'[]'")),
     ("external_verification_channel", sa.String(),  None),
-    ("trusted_inprocess",             sa.Boolean(), sa.text("0")),
+    ("trusted_inprocess",             sa.Boolean(), sa.false()),
     ("forge_reattempts",              sa.Integer(), sa.text("0")),
-    ("forge_rejected",                sa.Boolean(), sa.text("0")),
-    ("is_action_tool",                sa.Boolean(), sa.text("0")),
+    ("forge_rejected",                sa.Boolean(), sa.false()),
+    ("is_action_tool",                sa.Boolean(), sa.false()),
     ("toolset",                       sa.String(),  None),
     ("max_result_size_chars",         sa.Integer(), None),
     ("timeout_seconds",               sa.Integer(), None),
