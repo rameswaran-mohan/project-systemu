@@ -423,7 +423,14 @@ class TestMigratorActuallyDelivers:
 
     def test_effect_tag_backfill_reruns_on_a_stale_marker(self, tmp_path):
         """`.effect_tags_seed` is an INDEPENDENT marker on the same dunder, so it
-        froze too."""
+        froze too.
+
+        The marker payload is `<version>+<derivation generation>`, not the bare
+        version: a fix to the DERIVATION RULES has to re-derive on vaults already
+        sitting on the installed version, and the live-tryout rule means those
+        vaults may never see a bump. The version is still IN the payload — that is
+        what this asserts — so a release bump re-derives exactly as before.
+        """
         vault_dir = self._make_vault(tmp_path)
         marker = vault_dir / vm._EFFECT_TAGS_SEED_FILENAME
         marker.write_text("0.9.59", encoding="utf-8")
@@ -432,7 +439,14 @@ class TestMigratorActuallyDelivers:
 
         assert out.get("fast_path") is False, out
         assert out["stamped"] > 0, out
-        assert marker.read_text(encoding="utf-8").strip() == systemu.__version__
+        written = marker.read_text(encoding="utf-8").strip()
+        assert written == vm._effect_tags_marker_value(systemu.__version__)
+        assert systemu.__version__ in written, (
+            "the marker stopped carrying the version — a release bump would no "
+            "longer re-derive")
+        assert written != systemu.__version__, (
+            "the marker is the bare version again, so a derivation-rules fix can "
+            "never reach a vault already on this version")
         # Converged ⇒ the next boot is a no-op.
         assert vm.backfill_effect_tags(vault_dir).get("fast_path") is True
 

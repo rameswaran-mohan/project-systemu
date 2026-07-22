@@ -816,11 +816,15 @@ def _gate_skip_reason(
 
     1. ``forged_network_denied`` — a STRUCTURAL re-scan of the source. This is
        what closes the DECLARED-TAGS SPOOF: ``_net_egress_skip_reason`` trusts a
-       non-empty self-declared ``effect_tags`` and never scans when tags are
-       present (``vault_migrator`` PREFERS the declaration over the scan), so a
-       forged body declaring ``["local_read"]`` while importing ``urllib``
-       otherwise egresses during "dry run". The scan re-derives egress precisely
-       BECAUSE a declaration is declare-away-able.
+       non-empty ``effect_tags`` and never scans when tags are present, so a body
+       whose stamped tags say ``["local_read"]`` while it imports ``urllib``
+       would otherwise egress during "dry run". The scan re-derives egress
+       independently, and STILL MUST: ``vault_migrator``'s backfill now UNIONS a
+       ``TOOL_META`` declaration with the AST scan rather than letting it replace
+       the scan, so a BACKFILLED body can no longer declare egress away — but the
+       backfill is a once-per-version BOOT pass and ``tool_forge`` dry-runs a
+       freshly-forged tool immediately, long before any backfill has run over it.
+       Untagged-at-this-moment is the normal case here, not the exception.
     2. ``evaluate_action`` over the SAME ``ActionContext`` ``_maybe_gate_tool``
        builds (tool_sandbox.py:1073-1081). Any non-ALLOW verdict skips.
        ``tests/test_dryrun_gate_skip.py`` (``TestParityWithLiveGate``) pins the
@@ -884,14 +888,51 @@ def _gate_skip_reason(
     is byte-identical to the live gate's.
 
     ── Caveat on "the live gate cards it at first live call anyway" ─────────
-    That holds only while the tool's tags stay honest. ``vault_migrator``'s
-    once-per-version boot backfill PREFERS a self-authored
-    ``TOOL_META["effect_tags"]`` over the structural scan (vault_migrator.py
-    :231), flooring only ``money_move``. So after that backfill, a forged tool
-    that declared ``["local_read"]`` scores ALLOW at ``_maybe_gate_tool`` and is
-    NEVER carded. "The live gate catches it later" is a claim about tools whose
-    stamped tags reflect their body — not a guarantee that survives a
-    self-declaration.
+    That holds only while the tool's tags stay honest. The route through a
+    self-authored ``TOOL_META["effect_tags"]`` is now closed in BOTH directions
+    by ``vault_migrator.backfill_effect_tags``, and it took two rules because the
+    first one only covered half of it:
+
+      * SUBTRACTION. The stamp used to be ``declared if declared else scanned``,
+        so a forged body declaring ``["local_read"]`` over a scan that saw
+        ``net_mutate`` was stamped ``['local_read']``, scored ALLOW at
+        ``_maybe_gate_tool``, and was never carded. The declaration is now UNIONED
+        with the scan, so it cannot remove a class the scanner found.
+      * MANUFACTURE. The union does nothing when the scan finds NOTHING — and a
+        dangerous body scanning clean is the NORMAL case here, not an exotic one,
+        because the scanner is import-binding analysis and any effect reached
+        through a cross-module call is invisible to it. Measured: an undeclared
+        such body stamped ``[]`` and scored REQUIRE_APPROVAL; declaring
+        ``["local_read"]`` stamped exactly that and scored ALLOW. The backfill now
+        seeds UNKNOWN whenever the scan is silent and the body declared something,
+        so a declared-only stamp scores identically to no stamp at all.
+
+    What that does NOT promise. The residual is NOT a declaration route — MEASURED
+    through the real backfill and the real ``evaluate_action``:
+
+        silent scan, no declaration       ['']            -> REQUIRE_APPROVAL
+        silent scan, benign declaration   ['local_read',
+                                           'unknown']     -> REQUIRE_APPROVAL
+        scan sees net_read, a shell effect hidden by DATAFLOW, no declaration
+                                          ['net_read']    -> ALLOW   ← the gap
+        ...same body, HONEST-but-incomplete declaration ["net_read"]
+                                          ['net_read']    -> ALLOW   ← same gap
+
+    The last two are the same defect and the declaration is IRRELEVANT to it: the
+    UNKNOWN floor keys on the scan being SILENT, and a scan that saw one real
+    effect is not silent even when it missed a second. So a body whose scanned
+    classes are all ALLOW-band is stamped with exactly those, carries no UNKNOWN,
+    and is not carded — declared or not. That is the ``sp = subprocess`` dataflow
+    limit above, reached through the stamp instead of directly, and it is bounded
+    by the classifier's coverage rather than by anything a declaration does.
+
+    Note this is a DIFFERENT residual from the one an earlier version of this
+    comment named. That one hedged on an UNDER-stamp still being caught later,
+    which had it backwards: the under-stamp is the one case that is NOT caught,
+    while the over-stamp it treated as covered was the live exploitable hole until
+    the UNKNOWN floor landed. "The live gate catches it later" is a claim about
+    bodies whose SCANNED classes reflect what they do — never one about bodies
+    whose declaration does.
 
     ``is_destructive_param`` may be supplied by ``replay_against_history``, which
     scores the union over its whole history rather than one params set.
@@ -969,12 +1010,23 @@ def _gate_skip_result(
 
     The safety argument is ENABLEMENT IS NOT EXECUTION APPROVAL: S1b cards the
     first live effectful call. That holds CONDITIONALLY, not unconditionally —
-    it depends on the tool's stamped ``effect_tags`` reflecting its body.
-    ``vault_migrator``'s once-per-version boot backfill PREFERS a self-authored
-    ``TOOL_META["effect_tags"]`` over the structural scan (vault_migrator.py
-    :231) and floors only ``money_move``, so a forged tool that declares
-    ``["local_read"]`` scores ALLOW at ``_maybe_gate_tool`` and is never carded.
-    Enabling such a tool is not backstopped by a later gate.
+    it depends on the tool's stamped ``effect_tags`` reflecting its body, and the
+    boot backfill that writes that stamp had two ways of not doing so. Both are
+    now closed in ``vault_migrator.backfill_effect_tags``: a self-authored
+    ``TOOL_META["effect_tags"]`` used to REPLACE the structural scan (a forged
+    tool declaring ``["local_read"]`` over a ``net_mutate`` scan scored ALLOW at
+    ``_maybe_gate_tool`` and was never carded) — the two are now UNIONED; and the
+    union alone still let a declaration MANUFACTURE a benign class where the scan
+    found nothing at all, which was the live privilege downgrade, so a silent scan
+    now seeds UNKNOWN and a declared-only stamp scores exactly as ``[]`` does.
+
+    The residual is real and it is NOT the declaration. It is the AST scan's own
+    coverage: a body whose scanned classes are all ALLOW-band, but which reaches a
+    further effect through the ``sp = subprocess`` dataflow limit, is stamped with
+    only the benign classes, carries no UNKNOWN (the scan was not silent — it just
+    saw the wrong half), and enabling it is NOT backstopped by a later gate.
+    Measured: ``['net_read']`` → ALLOW on a body that also shells out, with or
+    without a declaration. See ``_gate_skip_reason`` for the same measurement.
     """
     return DryRunResult(
         success=False, status="skipped", operator_verify=True,

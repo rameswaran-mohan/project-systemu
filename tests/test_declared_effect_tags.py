@@ -1,18 +1,29 @@
-"""R-A13b-2ii-b — the TOOL_META.effect_tags SELF-DECLARATION path + backfill PREFERENCE.
+"""R-A13b-2ii-b — the TOOL_META.effect_tags SELF-DECLARATION path + backfill UNION.
 
 `_declared_effect_tags(source)` AST-parses the module-level `TOOL_META = {...}` dict literal
 and `ast.literal_eval`s its `effect_tags` value, coercing each entry to a KNOWN tag (unknown /
 blank → skipped). It NEVER imports the tool module (AST-parse only; the registry defers import)
 and NEVER raises (→ empty set on any error).
 
-The backfill then PREFERS a declared tag set over the structural scan while PRESERVING the
-MONOTONIC money-move FLOOR:
-    tags = declared if declared else scanned      # declaration PREFERRED
+The backfill UNIONS the declared set with the structural scan, seeds UNKNOWN when the scan
+was SILENT, then applies the MONOTONIC money-move FLOOR:
+    tags = scanned | declared                     # a declaration may only ADD
+    if declared and not scanned: tags |= {UNKNOWN} # ...and may never MANUFACTURE a class
     if any_money_move_signal(source): tags |= {MONEY_MOVE}   # the floor RAISES, never drops
 
-THE LOAD-BEARING GUARANTEE (2i residual-3 / 2ii-a fail-closed): a tool that DECLARES a
-non-money tag but whose SOURCE has a scanner-detected money signal STILL ends with money_move —
-a declaration can RAISE severity but can NEVER declare-away a DETECTED money-move.
+THE LOAD-BEARING GUARANTEE (2i residual-3 / 2ii-a fail-closed): a declaration can RAISE
+severity but can NEVER move the tagset toward the permissive side. Two distinct ways it could:
+
+  * SUBTRACT a class the scanner found — blocked by the union (and, for money-move,
+    independently by the floor). Earlier shape: `declared if declared else scanned`.
+  * MANUFACTURE a classification the scanner never made — blocked by the UNKNOWN seed. The
+    union does NOT cover this: with an empty scan `scanned | declared == declared`, so a body
+    whose dangerous effect the AST scan cannot follow could declare a benign class and take
+    its stamp from `[]` (UNKNOWN ⇒ REQUIRE_APPROVAL) to `['local_read']` (⇒ ALLOW).
+
+Both lines are held by `TestADeclarationCannotSubtract` and
+`TestADeclarationCannotManufactureAClassification` in
+tests/test_effect_tags_reach_the_index.py, which measure the controls each one flipped.
 """
 from __future__ import annotations
 
@@ -174,5 +185,9 @@ def test_backfill_declared_can_raise_severity(tmp_path):
     body = _seed(tmp_path, "d5", "raiser", src)
     tags = _backfilled_tags(body)
     assert _MONEY in tags, tags
-    # declared PREFERRED over scan → the scanned net_read is REPLACED (not merged).
-    assert EffectTag.NET_READ.value not in tags, tags
+    # ...and the scanned class is KEPT, not replaced. This assertion was inverted
+    # (`NET_READ not in tags`) while the backfill let a declaration REPLACE the scan;
+    # that shape is what allowed a body to subtract its own classification, so the
+    # pin now runs the other way. Raising still works — money_move is here — but the
+    # union means it can only ever ADD.
+    assert EffectTag.NET_READ.value in tags, tags

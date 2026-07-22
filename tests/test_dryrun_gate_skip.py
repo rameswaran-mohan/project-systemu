@@ -14,10 +14,15 @@ The confirmed holes in ``systemu/pipelines/tool_dry_run.py``:
    ``scheduler/jobs.py``, the tool reconciler, the recalibrator), so there is no
    operator in the loop to notice.
 2. **The declared-tags spoof.** ``_net_egress_skip_reason`` trusts a NON-EMPTY
-   self-declared ``effect_tags`` and never scans the source when tags are
-   present (``vault_migrator`` PREFERS the declaration over the scan). A forged
-   body declaring ``["local_read"]`` while calling ``urllib.request.urlopen``
+   ``effect_tags`` and never scans the source when tags are present. A body
+   whose tags say ``["local_read"]`` while it calls ``urllib.request.urlopen``
    therefore sails past the egress guard and egresses during "dry run".
+   ``vault_migrator.backfill_effect_tags`` no longer lets a ``TOOL_META``
+   declaration REPLACE the AST scan (it unions them), which removes one way a
+   body arrives here mis-stamped — but NOT this hazard: the backfill is a
+   once-per-version boot pass and these dry-runs fire on freshly-forged tools
+   that it has never seen, so the tags reaching this guard are whatever the
+   tool's own record happens to hold.
 3. **The declared-``dry_run``-param loophole.** The pre-existing destructive
    guard only refuses when ``"dry_run" not in params``, so a destructive-NAMED
    tool whose SCHEMA declares a ``dry_run`` parameter slips past it. Nothing
@@ -245,11 +250,15 @@ class TestGateSkipStopsUngatedExecution:
         assert "require_approval" in (result.skip_reason or "").lower()
 
     def test_declared_local_read_but_net_source_is_skipped(self, tmp_path, vault):
-        """t2 — THE SPOOF. Declared ``effect_tags=["local_read"]`` (which the
-        pre-existing egress guard TRUSTS, because vault_migrator prefers a
-        self-declared TOOL_META over the scan) while the source structurally
-        egresses. ``forged_network_denied`` re-scans the source precisely because
-        a declaration is declare-away-able, so the spoof lands on DENY.
+        """t2 — THE SPOOF. Stamped ``effect_tags=["local_read"]`` (which the
+        pre-existing egress guard TRUSTS) while the source structurally egresses.
+        ``forged_network_denied`` re-scans the source independently, so the spoof
+        lands on DENY.
+
+        Still load-bearing after the backfill started UNIONING a TOOL_META
+        declaration with the scan instead of letting it replace the scan: this
+        tool's tags are set directly on the record, which is the state a
+        freshly-forged tool is dry-run in, long before any backfill sees it.
         """
         from systemu.pipelines.tool_dry_run import dry_run_tool
         from systemu.runtime.action_governance import has_network_egress

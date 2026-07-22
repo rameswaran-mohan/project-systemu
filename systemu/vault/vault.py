@@ -103,6 +103,22 @@ def _tool_header(t: Tool) -> Dict[str, Any]:
         # header never carried it, so that gate rejected EVERY catalog tool and
         # the capability index derived empty on every real vault.
         "implementation_path": t.implementation_path or "",
+        # CAP-2: `derive_index` and `table_reconciler._project_tools` both read the
+        # HEADER (`list_tools()` returns `load_index("tools")`), so a field this
+        # producer drops is structurally absent from both no matter what the Tool
+        # model holds. Same class of gap as `implementation_path` above.
+        #
+        # LOAD-BEARING FOR DURABILITY, not just for newly-saved tools.
+        # `_update_index` REPLACES the whole header dict, and
+        # `jobs._backfill_tool_headers_v061` re-saves every tool whenever any
+        # header is missing `parameters_schema_summary` — which is exactly the
+        # state `vault_migrator.run`'s seed loop leaves behind. Without this line
+        # that sweep silently strips the tags `converge_index_effect_tags` just
+        # projected, on a later boot, with nothing to show for it.
+        #
+        # The VALUE is not self-describing: `[]` means "no effects" and "never
+        # classified" alike — see `capability_index.IndexRow.effect_tags`.
+        "effect_tags": list(t.effect_tags or []),
         "created_at": t.created_at.isoformat(),
     }
 

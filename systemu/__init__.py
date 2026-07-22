@@ -20,7 +20,12 @@
 #
 # THIS VALUE IS LOAD-BEARING, NOT COSMETIC.  It gates, per version marker:
 #   * `vault_migrator.run` — seed-tool add/update (`.seed_version`)
-#   * `vault_migrator.backfill_effect_tags` (`.effect_tags_seed`)
+#   * `vault_migrator.backfill_effect_tags` (`.effect_tags_seed`) — this one is
+#     keyed on `<version>+<_EFFECT_TAGS_GENERATION>`, NOT on the version alone,
+#     so a fix to the DERIVATION RULES can re-derive without a release bump.
+#     That matters because the live-tryout rule folds fixes into the current
+#     version; anything gated on this string alone would never reach a deployed
+#     vault.  Bump the generation there, not this, for a rules change.
 #   * `first_gate_review.maybe_post_first_gate_review` (bulk review card)
 #   * `tool_reconciler.recover_stale_dry_run_failures` (re-validate once/upgrade)
 # Freezing it freezes all four: a vault whose marker already holds this string

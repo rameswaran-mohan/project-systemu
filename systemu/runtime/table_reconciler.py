@@ -104,8 +104,13 @@ def _project_tools(vault) -> List[TableItem]:
                 # same objects.
                 origin_class="systemu_authored",
                 ref={"tool_id": tid, "name": name},
-                # effect_tags (populated once G0 lands) ride in usage metadata for
-                # the page + later gate context; empty on the plain v0.9.52 base.
+                # effect_tags ride in usage metadata for the page + later gate
+                # context. This reads the INDEX HEADER (`list_tools()` returns
+                # `load_index("tools")`), so it is only non-empty because
+                # `vault._tool_header` emits the key and
+                # `vault_migrator.converge_index_effect_tags` projects each body's
+                # tags onto its header every boot. Empty is UNKNOWN, not "no
+                # effects" — see `capability_index.IndexRow.effect_tags`.
                 usage={"effect_tags": list(t.get("effect_tags") or [])},
             ))
         except Exception:

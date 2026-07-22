@@ -39,14 +39,40 @@ class IndexRow(BaseModel):
     slots: List[str] = Field(default_factory=list)     # canonical "verb:target"
     # Row data per the CAP-2 schema (spec §5.5.1) / the CapabilityRow interface
     # stub -- populated from the G0 AST-derived backfill, persisted, and
-    # round-tripped through load_index(). NOT currently a ranking input: CAP-3's
+    # round-tripped through load_index(). NOT a ranking input: CAP-3's
     # untrusted-origin trust weighting (score_key's `effectful` branch) keys off
     # the QUERY's verb (_EFFECTFUL_VERBS below), not a row's own declared tags --
     # deliberately, since an mcp/forged row's self-declared effect_tags are
     # exactly the untrusted content CAP-3 exists to discount, so trusting them to
     # set the row's OWN trust weight would let a tool suppress its own severity.
-    # This field stays as groundwork for the deferred CAP-6b near-dupe net and
-    # CAP-9 world-model convergence, both of which read effect_tags per spec.
+    # `test_a_rows_OWN_effect_tags_never_trigger_the_trust_weighting` pins that;
+    # wiring them in was reviewed once and rejected as a security regression.
+    #
+    # HOW IT GETS HERE, and why that took three fixes. `derive_index` builds every
+    # row from `vault.list_tools()`, which is the INDEX HEADER list -- not the tool
+    # bodies. So the field needs all of: `_tool_header` to emit it (both backends),
+    # `vault_migrator.backfill_effect_tags` to stamp the bodies, and
+    # `vault_migrator.converge_index_effect_tags` to project body -> header on
+    # every boot. Any one missing and this list is structurally always empty.
+    #
+    # `[]` IS NOT EVIDENCE OF "NO EFFECTS". It conflates at least: classified-and-
+    # genuinely-none; never classified (the backfill is version-gated and file-
+    # layout-only, so a sqlite catalog is uniformly empty); and classification
+    # ATTEMPTED AND FAILED (a body whose implementation cannot be read, or whose
+    # implementation_path points outside vault/tools/implementations/ -- counted as
+    # `skipped_impl_path` -- is stamped `[]` while the runtime still EXECUTES it).
+    # `Tool.effect_tags` is a plain List[str] with no tri-state and the sqlite row
+    # converter collapses a pre-0011 SQL NULL to `[]`, so the information needed to
+    # tell these apart is gone upstream of this projection; an Optional tri-state
+    # here would look like a resolved ambiguity while `[]` still meant both "no
+    # effects" and "the classifier failed", which is the more dangerous half.
+    # The in-repo precedent for consuming it safely is
+    # `tool_sandbox._derive_effect_tags_from_source` ("Empty is not evidence of
+    # 'no effects'"): treat empty as UNDETERMINABLE and re-derive from the body.
+    #
+    # LIVE CONSUMERS TODAY (this is not latent groundwork):
+    # `table_reconciler._project_tools` rides it in `usage={"effect_tags": ...}`,
+    # off the same `list_tools()` header. CAP-6b and CAP-9 read it per spec.
     effect_tags: List[str] = Field(default_factory=list)
     io_shape_hash: str = ""
     usage: Dict[str, Any] = Field(default_factory=dict)  # last_used_at, invocations, verified_done_count
@@ -226,6 +252,29 @@ def derive_index(vault) -> List[IndexRow]:
                 # MCP effect tags are UNKNOWN (no source to AST-scan) — carried as
                 # empty here; the risk tier is decided at the dispatch gate, and
                 # ranking never lets an mcp row's lexical match downgrade severity.
+                #
+                # DELIBERATELY not filled from the server's self-reported tool
+                # annotations: for a hostile server those are attacker-controlled,
+                # which is the input CAP-3 exists to discount. THIS SIDE GRANTS A
+                # SELF-REPORT ZERO INFLUENCE — the value is hardcoded, so there is
+                # no input for a server to move.
+                #
+                # The vault-tool side is the SAME trust boundary but NOT the same
+                # posture, and the difference is worth stating because it has been
+                # mis-stated before. `vault_migrator.backfill_effect_tags` lets a
+                # body's `TOOL_META["effect_tags"]` contribute real, gate-moving
+                # tags; it is bounded to the ADDITIVE direction by two rules (a
+                # UNION with the AST scan, so a declaration cannot subtract; and an
+                # UNKNOWN floor when the scan is silent, so it cannot manufacture a
+                # classification either) but "bounded" is not "zero". A declaration
+                # can still raise a tool's band there. So: same rule — a capability
+                # never AUTHORS its own classification — two different amounts of
+                # residual influence. Do not describe them as converged.
+                #
+                # A consumer must not read `[]` on an `origin="mcp:*"` row as
+                # "safe"; it is the `[]`-is-ambiguous problem in its purest form
+                # (the comment says UNKNOWN, the value says "no effects", and the
+                # row type cannot express the difference).
                 effect_tags=[],
                 io_shape_hash=io_shape_hash(e.get("schema", {}) or {}),
                 usage=_usage_for(vault, name),

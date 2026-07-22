@@ -282,6 +282,20 @@ def _tool_header(r: ToolRow) -> Dict[str, Any]:
         # R-CAP1: see vault._tool_header — capability_index._ready() gates on this,
         # and its absence derived an EMPTY capability index on every real vault.
         "implementation_path": r.implementation_path or "",
+        # CAP-2: see vault._tool_header. `derive_index` reads the header, so
+        # dropping this made IndexRow.effect_tags structurally always empty on this
+        # backend too. ``_nn`` (not ``or``) to match `_row_to_tool`: a row written
+        # before migration 0011 added the column reads SQL NULL and must fall back
+        # to the model default rather than raise.
+        #
+        # Unlike the file backend there is no persisted header to converge — this
+        # is recomputed from the live ToolRow on every load_index() — so this line
+        # alone makes the sqlite index current, and `converge_index_effect_tags`
+        # deliberately does not touch this backend. NOTE the sqlite seed writes no
+        # tags and `backfill_effect_tags` only walks the FILE layout, so on a
+        # sqlite catalog this reports whatever the column actually holds, which for
+        # a freshly seeded one is uniformly empty.
+        "effect_tags": list(_nn(getattr(r, "effect_tags", None), []) or []),
         "created_at": r.created_at.isoformat() if r.created_at else "",
     }
 

@@ -76,6 +76,38 @@ def _file_sha256(p: Path) -> str:
 
 _EFFECT_TAGS_SEED_FILENAME = ".effect_tags_seed"
 
+# The DERIVATION GENERATION, independent of the release version.
+#
+# `.effect_tags_seed` gates the backfill on the INSTALLED VERSION, which makes a
+# fix to the DERIVATION RULES invisible to every vault already sitting on the
+# version that shipped the bug — the marker matches, the fast path returns, and
+# the only re-deriver never runs. That is not hypothetical: this project's
+# live-tryout rule deliberately folds fixes into the current version WITHOUT a
+# bump, so "the next release repairs it" describes a release that never happens.
+#
+# Bumping this string makes every existing marker mismatch exactly ONCE, which
+# re-derives every body under the current rules and then re-converges the
+# headers. Bump it whenever the derivation changes in a way that makes an
+# ALREADY-WRITTEN stamp wrong — a stamp that is merely absent is repaired by the
+# `unclassified_bodies` self-heal in `run` instead, which needs no bump at all.
+#
+# g2: the UNKNOWN floor in `backfill_effect_tags`. Bodies stamped by g1 under
+#     `declared if declared else scanned` (and by the intermediate union-only
+#     shape) can carry a benign self-declared class against a SILENT scan — a
+#     stamp that is PRESENT and WRONG, so nothing that keys on absence can find
+#     it. This bump is what makes that fix reach a deployed vault.
+_EFFECT_TAGS_GENERATION = "g2"
+
+
+def _effect_tags_marker_value(version) -> str:
+    """The `.effect_tags_seed` payload: version AND derivation generation.
+
+    Both halves matter. The version re-derives when the SOURCE may have changed
+    (a release replaces implementations); the generation re-derives when the
+    RULES changed against unchanged source. A marker carrying only the version
+    cannot express the second, which is the whole defect this suffix closes."""
+    return f"{version}+{_EFFECT_TAGS_GENERATION}"
+
 
 def _write_text_atomic(path: Path, text: str) -> None:
     """tempfile + os.replace so an interrupted write leaves the target intact."""
@@ -103,9 +135,11 @@ def _declared_effect_tags(source) -> Set[str]:
     non-literal values on other keys). Each entry is coerced to a KNOWN tag value; anything
     unknown / blank is skipped. NEVER raises → ``set()`` on any error.
 
-    The backfill PREFERS this declared set over the structural scan but the MONOTONIC
-    money-move FLOOR still unions ``money_move`` in, so a declaration can RAISE severity but
-    can NEVER declare-away a scanner-detected money-move (the fail-closed-on-money guarantee).
+    The backfill treats this set as ADDITIVE ONLY. It is UNIONED with the structural scan
+    (so it cannot SUBTRACT a class the scanner found) and, when the scan came back SILENT,
+    ``UNKNOWN`` is seeded alongside it (so it cannot MANUFACTURE a classification either).
+    A declaration can therefore RAISE severity and nothing else — see the long comment at
+    the union in ``backfill_effect_tags`` for the measurements behind both rules.
     """
     if not isinstance(source, str) or not source.strip():
         return set()
@@ -159,7 +193,8 @@ def _declared_effect_tags(source) -> Set[str]:
         return set()
 
 
-def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None) -> Dict[str, Any]:
+def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None,
+                         force: bool = False) -> Dict[str, Any]:
     """G0 — one-pass, idempotent backfill of ``Tool.effect_tags`` onto every vault
     tool body, classified deterministically from its implementation source
     (spec UNIFIED-v2 §5.7 / §9 G0).
@@ -182,6 +217,31 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
     ``messaging.decision_bridge.classify_resolution``, where a present-but-empty
     list satisfies the money/irreversible floor check. Correct tags therefore
     matter beyond classification quality.
+
+    ``force=True`` bypasses the marker. ``run`` uses it for TWO distinct repairs,
+    both of which happen on a boot where the marker is ALREADY current:
+
+      * after its seed loop, which OVERWRITES tool bodies with the package's
+        (which carry no ``effect_tags``) — the wipe would otherwise persist until
+        the next version bump;
+      * when ``converge_index_effect_tags`` reports ``unclassified_bodies`` — a
+        body that lost the key on some EARLIER boot, under a build that had
+        neither repair. That is the state a vault damaged by the pre-fix migrator
+        is left in, and no version-gated pass can reach it.
+
+    Re-deriving rather than carrying the old tags across is the correct repair in
+    both: the seed loop also replaced the IMPLEMENTATION, so the pre-migration
+    classification describes code that no longer exists (the same reason
+    ``_entry_keeping_disable`` refuses to carry the schema summaries across).
+
+    ``force`` does NOT reach a stamp that is present but derived under an older
+    RULE SET — nothing can detect that by inspection, because the wrong value
+    looks exactly like a right one. ``_EFFECT_TAGS_GENERATION`` is what repairs
+    that class, by making the marker itself mismatch once.
+
+    This function stamps BODIES ONLY. Projecting a body's tags up onto the index
+    header is ``converge_index_effect_tags``'s job and hers alone — one writer, so
+    there is no second path to keep in agreement.
     """
     log = logger_ or logger
     vault_dir = Path(vault_dir)
@@ -189,8 +249,15 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
 
     try:
         marker = vault_dir / _EFFECT_TAGS_SEED_FILENAME
-        if marker.exists() and marker.read_text(encoding="utf-8").strip() == str(version):
-            return {"fast_path": True, "effect_tags_seed": version}
+        marker_value = _effect_tags_marker_value(version)
+        # The marker carries the DERIVATION GENERATION as well as the version, so a
+        # vault stamped by an older generation re-derives even though it is already
+        # on the installed version. A pre-generation marker holds the bare version
+        # string, which never equals `<version>+gN` — so it mismatches too, which is
+        # exactly the one-shot repair a vault that never sees a bump depends on.
+        if (not force and marker.exists()
+                and marker.read_text(encoding="utf-8").strip() == marker_value):
+            return {"fast_path": True, "effect_tags_seed": marker_value}
 
         idx_path = vault_dir / "tools" / "index.json"
         if not idx_path.exists():
@@ -266,19 +333,100 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"source {tid}: {exc}")
 
-            # R-A13b-2ii — PREFER a tool's SELF-DECLARED effect_tags (TOOL_META) over the
-            # structural+curated scan, then apply the MONOTONIC money-move FLOOR: any
-            # independent money signal (import/host/attr) ALWAYS adds MONEY_MOVE, so a
-            # money-move tool can never be stamped WITHOUT it (the fail-closed-on-money
-            # guarantee). A declaration can RAISE severity (2ii-b) but the floor means it
-            # can NEVER declare-away a scanner-detected money-move. The floor is re-derived
-            # from source each version → idempotent.
+            # R-A13b-2ii — a tool's SELF-DECLARED effect_tags (TOOL_META) may only ever
+            # ADD to the independently-derived classification. Two rules enforce that,
+            # and they close DIFFERENT halves of the same hole:
+            #
+            #   (i)  UNION, never replace — a declaration cannot SUBTRACT a class the
+            #        scanner found;
+            #   (ii) the UNKNOWN FLOOR — a declaration cannot take the tagset from
+            #        EMPTY to non-empty, i.e. it cannot manufacture a classification
+            #        where the scanner produced none.
+            #
+            # Then the MONOTONIC money-move FLOOR: any independent money signal
+            # (import/host/attr) ALWAYS adds MONEY_MOVE. All re-derived from source each
+            # pass → idempotent.
+            #
+            # THIS IS A SECURITY BOUNDARY. `TOOL_META` lives in the tool BODY, so on a
+            # forged or operator-substituted tool it is attacker-controlled — exactly the
+            # input an independent classifier exists to not depend on.
+            #
+            # (i) MEASURED, on the real backfill: a body doing
+            # `requests.post("https://.../pay", json=k)` (scan ⇒ ['net_mutate']) that
+            # declares `["local_read"]` was stamped ['local_read'] under
+            # `declared if declared else scanned` — and FOUR independent controls read
+            # that stamp, all of which flipped to the permissive side because the class
+            # they key on had been subtracted:
+            #   action_governance.requires_isolation   True → False  (MUST_ISOLATE)
+            #   action_governance.has_network_egress   True → False  (NET_EFFECTS)
+            #   effect_tags.is_high_severity           True → False  (HIGH_SEVERITY)
+            #   requirement_binder._effect_tags_are_dangerous
+            #                                          True → False  (_STAMP_EFFECTS)
+            # Under the union it is stamped ['local_read','net_mutate'] and all four
+            # read True again.
+            #
+            # (ii) THE UNION ALONE DOES NOT CLOSE THIS. Measured on the real backfill +
+            # the real gate, with the union in place: a body whose dangerous effect is
+            # reached through a call the AST scan cannot follow —
+            #     import helpers
+            #     TOOL_META = {'effect_tags': ['local_read']}
+            #     def run(**kw): return helpers.nuke(kw)
+            # — scans to NOTHING, so `scanned | declared` == `{'local_read'}`, and there
+            # is no scanner-found class for the union to protect. The stamp then went
+            #     no declaration      → []              → evaluate_action REQUIRE_APPROVAL
+            #     declares local_read → ['local_read']  → evaluate_action ALLOW
+            # A non-empty benign list ALSO satisfies `_effective_tags`'s `local_only`
+            # test, which suppresses the name verb-map escalation — so declaring a
+            # benign class removed the second line of defence too. That is a tool
+            # authoring its own privilege downgrade, and it is strictly BETTER than
+            # declaring nothing, which is the wrong incentive for a self-report.
+            #
+            # The floor: when the scan is SILENT, UNKNOWN is seeded alongside whatever
+            # the body declared. A self-report may ADD information; it may never REMOVE
+            # the unclassified status a silent scan implies. `['local_read','unknown']`
+            # and `[]` are then scored IDENTICALLY by `evaluate_action` (UNKNOWN is in
+            # the set either way, so `local_only` is False and the two-band UNKNOWN rule
+            # governs both) and by `requirement_binder._effect_tags_are_dangerous`
+            # (UNKNOWN ⇒ True, exactly as `[]` ⇒ True). Declaring a HIGH-severity class
+            # against a silent scan still RAISES — `['money_move','unknown']` reaches the
+            # DENY floor where `[]` only reaches REQUIRE_APPROVAL — so the direction
+            # stays monotonic.
+            #
+            # Measured blast radius on the shipped catalog: ZERO of the 41 packaged
+            # implementations declare `TOOL_META["effect_tags"]` at all, so this floor
+            # adds no friction to any first-party tool. It only ever fires on a body
+            # that chose to self-report, which is the only body that could exploit it.
+            #
+            # This is the SAME trust boundary `capability_index.derive_index` draws for
+            # MCP rows — but NOT the same posture, and the comments there say so: MCP
+            # grants a server's self-report ZERO influence (hardcoded `[]`), whereas
+            # here a declaration retains real, gate-moving influence in the ADDITIVE
+            # direction. Converging further (dropping declarations entirely) is
+            # possible; it is not what this code does.
             try:
                 if source:
                     declared = _declared_effect_tags(source)          # self-report (2ii-b)
                     scanned = {t.value for t in classify_source(source)}
-                    tagset = set(declared) if declared else scanned   # declared PREFERRED
-                    if effect_signals.any_money_move_signal(source):  # MONOTONIC money FLOOR
+                    tagset = scanned | set(declared)                  # (i) may only ADD
+                    if declared and not scanned:
+                        # (ii) UNKNOWN FLOOR — a silent scan stays unclassified no
+                        # matter what the body says about itself. Deliberately NOT
+                        # `if not tagset`: an EMPTY stamp is already UNKNOWN at every
+                        # consumer, and it is the empty→non-empty EDGE that moves the
+                        # gate, so the floor keys on the edge itself.
+                        tagset.add(EffectTag.UNKNOWN.value)
+                    # MONOTONIC money FLOOR. NOW REDUNDANT WITH THE SCAN, and kept
+                    # deliberately: `classify_source` consults the SAME curated
+                    # `effect_signals` map, so once `scanned` is always unioned in it
+                    # already carries `money_move` on every input where this predicate
+                    # is True (no divergent input was found). It was load-bearing under
+                    # `declared if declared else scanned`, which DISCARDED the scan
+                    # whenever a declaration existed. One line of belt to the union's
+                    # braces on the one guarantee that must never fail open.
+                    # `TestADeclarationCannotSubtract` measures the redundancy rather
+                    # than asserting either mechanism alone — deleting BOTH fails it,
+                    # deleting either does not.
+                    if effect_signals.any_money_move_signal(source):
                         tagset.add(EffectTag.MONEY_MOVE.value)
                     tags = sorted(tagset)
                 else:
@@ -295,17 +443,181 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None)
                 errors.append(f"write {tid}: {exc}")
 
         try:
-            _write_text_atomic(marker, str(version))
+            _write_text_atomic(marker, marker_value)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"marker: {exc}")
 
         log.info(
-            "[EffectTagBackfill] version=%s stamped=%d skipped_impl_path=%d errors=%d",
-            version, stamped, skipped_impl_path, len(errors))
-        return {"fast_path": False, "effect_tags_seed": version, "stamped": stamped,
+            "[EffectTagBackfill] marker=%s stamped=%d skipped_impl_path=%d errors=%d",
+            marker_value, stamped, skipped_impl_path, len(errors))
+        return {"fast_path": False, "effect_tags_seed": marker_value, "stamped": stamped,
                 "skipped_impl_path": skipped_impl_path, "errors": errors}
     except Exception as exc:  # noqa: BLE001 — never break boot
         log.error("[EffectTagBackfill] unexpected failure (non-fatal): %s", exc)
+        return {"error": str(exc)}
+
+
+_EFFECT_TAGS_FIELD = "effect_tags"
+
+
+def converge_index_effect_tags(vault_dir, *, logger_=None) -> Dict[str, Any]:
+    """Project each tool BODY's ``effect_tags`` onto its ``tools/index.json``
+    header, so the field reaches every reader that goes through the header.
+
+    WHY THIS IS A SEPARATE PASS AND NOT PART OF THE BACKFILL. Readers do not read
+    tool bodies. ``vault.Vault.list_tools()`` returns ``load_index("tools")`` —
+    the header list — and BOTH live consumers sit on top of that:
+    ``capability_index.derive_index`` (``IndexRow.effect_tags``) and
+    ``table_reconciler._project_tools`` (``usage={"effect_tags": ...}``). A pass
+    that stamps only bodies is therefore invisible to both. The dashboard reaches
+    the same list through the ``storage.file_vault.FileVault`` adapter, which
+    forwards ``list_tools``/``load_index`` verbatim (it is a wrapper around a
+    ``Vault``, NOT a second implementation).
+
+    Doing it inside ``backfill_effect_tags`` was measured NOT to work, twice over:
+
+      1. THE BACKFILL IS VERSION-GATED AND THE INDEX IS NOT. Its ``.effect_tags_seed``
+         fast path returns before any work on every vault that has already booted
+         once on the installed version — i.e. on every real deployed vault — so an
+         index-write behind that gate never executes. This pass runs
+         FAST-PATH-INDEPENDENTLY on every boot, the way
+         ``normalize_seed_forged_flags`` does and for the same reason: a fix that
+         only runs on a version bump has not shipped to anybody already on that
+         version.
+      2. ``run``'s SEED LOOP OVERWRITES THE INDEX AFTERWARDS. It replaces a matched
+         entry with the PACKAGED header (``_entry_keeping_disable(pkg_entry, ...)``)
+         and the packaged ``tools/index.json`` carries no ``effect_tags`` key at
+         all, so a write performed before that loop is not merely stale — it is
+         gone. Measured on a real vault via ``run()``: ``updated=1``,
+         ``skipped_identical=40``, and the updated tool ended with the key ABSENT
+         from both its body and its header, permanently, because the marker for
+         this version had already been written. ``run`` therefore calls this pass
+         AGAIN after the loop.
+
+    Cost once converged: one index read plus one small JSON read per tool and NO
+    write — the divergence check is what gates the write. That is strictly less
+    work than the sibling ``normalize_seed_forged_flags`` already does per boot
+    (it hashes two files per tool).
+
+    THE RULE IS EXACT MIRRORING, including absence. A body with no ``effect_tags``
+    key is NOT CLASSIFIED, and a header that keeps a value across that is
+    advertising a classification derived from an implementation the migrator has
+    already replaced — a stale ``['local_read']`` on a body that is now a shell
+    tool is a silent DOWNGRADE. So an absent body field clears the header field.
+    Absent reads as UNKNOWN and is fail-closed at both
+    ``requirement_binder._effect_tags_are_dangerous`` (empty ⇒ demand external
+    verification) and ``action_governance._effective_tags`` (empty ⇒ UNKNOWN).
+
+    A body that cannot be READ is different — that is missing evidence, not
+    evidence of absence — so it is skipped and counted rather than cleared.
+
+    ``unclassified_bodies`` — WHY A PURE MIRROR CANNOT REPAIR A DAMAGED VAULT.
+    Mirroring an absent body field is fail-closed but it is NOT a repair: the
+    header ends up as unclassified as the body, and the tool stays UNKNOWN at
+    every gate forever. That is precisely the state the pre-fix migrator left
+    behind — its seed loop overwrote bodies with the packaged ones (no
+    ``effect_tags`` key) on a boot whose ``.effect_tags_seed`` was already
+    current, so the ONLY re-deriver, ``backfill_effect_tags``, took its fast path
+    on every subsequent boot and the damage was permanent.
+
+    MEASURED on a vault damaged by the REAL pre-fix migrator (a subprocess boot of
+    1b454da2), then booted FIVE times on the fixed build at the SAME version:
+    ``run_command`` and ``file_write`` stayed ABSENT in body AND header, and the
+    vault held 15/41 non-empty header tag lists against 17/41 on a freshly
+    migrated one. Three gates each independently prevented the repair — the
+    backfill's marker, this pass's mirror-only rule, and ``run``'s own fast path
+    returning before the post-loop ``force=True`` re-derive.
+
+    So this pass COUNTS the bodies it cannot classify and returns the count.
+    ``run`` reads it and orders one forced re-derive. The counting is deliberately
+    kept here (this pass already reads every body, so it costs nothing) while the
+    DECISION lives in ``run`` — this function still never derives and never
+    writes a tag it did not read from a body. It converges in a single extra pass
+    because ``backfill_effect_tags`` writes the key onto EVERY body it processes,
+    including the ones it classifies to ``[]``, so the trigger self-clears.
+
+    File layout only, like its two siblings. The sqlite backend needs no pass:
+    ``storage.sqlite.vault._tool_header`` recomputes the header from the live
+    ``ToolRow`` on every ``load_index()``.
+
+    NEVER raises — this runs on the boot path.
+    """
+    log = logger_ or logger
+    vault_dir = Path(vault_dir)
+    errors: list = []
+
+    try:
+        idx_path = vault_dir / "tools" / "index.json"
+        if not idx_path.exists():
+            return {"skipped": True, "reason": "no tool index"}
+        try:
+            entries = json.loads(idx_path.read_text(encoding="utf-8")) or []
+        except Exception as exc:  # noqa: BLE001
+            return {"skipped": True, "reason": f"index unreadable: {exc}"}
+        if not isinstance(entries, list):
+            return {"skipped": True, "reason": "index not a list"}
+
+        converged = 0
+        cleared = 0
+        skipped_unreadable = 0
+        unclassified_bodies = 0
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            tid = entry.get("id")
+            if not tid:
+                continue
+            body_path = vault_dir / "tools" / f"tool_{tid}.json"
+            try:
+                if not body_path.is_file():
+                    continue          # no body ⇒ no evidence either way
+                body = json.loads(body_path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001 — unreadable is NOT "absent"
+                skipped_unreadable += 1
+                errors.append(f"read {tid}: {exc}")
+                continue
+            if not isinstance(body, dict):
+                skipped_unreadable += 1
+                continue
+
+            if _EFFECT_TAGS_FIELD in body:
+                tags = body.get(_EFFECT_TAGS_FIELD)
+                if not isinstance(tags, list):
+                    skipped_unreadable += 1
+                    continue
+                tags = list(tags)
+                if entry.get(_EFFECT_TAGS_FIELD) != tags:
+                    entry[_EFFECT_TAGS_FIELD] = tags
+                    converged += 1
+            else:
+                # THE BODY IS UNCLASSIFIED, and this pass cannot fix that — it
+                # MIRRORS, it never derives. Report it so `run` can order a forced
+                # re-derive; see `unclassified_bodies` in the docstring.
+                unclassified_bodies += 1
+                if _EFFECT_TAGS_FIELD in entry:
+                    # Body says "unclassified"; the header must not say otherwise.
+                    del entry[_EFFECT_TAGS_FIELD]
+                    cleared += 1
+
+        if converged or cleared:
+            try:
+                _write_text_atomic(idx_path, json.dumps(entries, indent=2) + "\n")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"index_write: {exc}")
+                converged = cleared = 0
+
+        if converged or cleared or unclassified_bodies or errors:
+            log.info(
+                "[EffectTagIndexConverge] converged=%d cleared=%d "
+                "unclassified_bodies=%d skipped_unreadable=%d errors=%d",
+                converged, cleared, unclassified_bodies, skipped_unreadable,
+                len(errors))
+        return {"converged": converged, "cleared": cleared,
+                "unclassified_bodies": unclassified_bodies,
+                "skipped_unreadable": skipped_unreadable, "errors": errors}
+    except Exception as exc:  # noqa: BLE001 — never break boot
+        log.error("[EffectTagIndexConverge] unexpected failure (non-fatal): %s", exc)
         return {"error": str(exc)}
 
 
@@ -783,6 +1095,46 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     # already equals `installed` and anything behind that return would never run.
     forged_norm = normalize_seed_forged_flags(vault_dir, logger_=log)
 
+    # Project body tags onto the index headers the readers actually read. Runs on
+    # EVERY boot, ahead of the fast path below, for the reason its two siblings
+    # do: a vault already sitting on the installed version takes the fast path,
+    # and the backfill above takes ITS fast path too, so anything gated behind
+    # either would never execute on a real deployed vault. Idempotent; no write
+    # once converged.
+    converged = converge_index_effect_tags(vault_dir, logger_=log)
+
+    # REPAIR A VAULT DAMAGED BY AN EARLIER BOOT.
+    #
+    # The pass above MIRRORS; it cannot DERIVE. A body that lost its
+    # `effect_tags` key on some earlier boot therefore stays unclassified and its
+    # header is cleared to match — fail-closed, but permanently UNKNOWN at every
+    # gate. That is exactly the state the pre-fix migrator left behind: its seed
+    # loop overwrote bodies with the packaged ones (which carry no `effect_tags`)
+    # on a boot whose `.effect_tags_seed` was already current, so the only
+    # re-deriver took its fast path on every later boot.
+    #
+    # Three independent gates each blocked the repair and none could re-derive:
+    # the backfill's marker (above), this pass's mirror-only rule, and the
+    # `installed == vault_seed` fast path immediately below — which returns
+    # BEFORE the post-seed-loop `force=True` re-derive, putting that call out of
+    # reach on precisely the vaults that need it. Measured against a vault
+    # damaged by a real subprocess boot of the pre-fix build: five boots of the
+    # fixed build at the SAME version left `run_command` and `file_write` absent
+    # in body AND header, 15/41 non-empty against 17/41 on a fresh vault.
+    #
+    # So the repair has to sit HERE, above the fast path, keyed on OBSERVED
+    # DAMAGE rather than on a version. `force=True` because the marker is current
+    # by construction on every vault this fires for. One pass suffices: the
+    # backfill writes the key onto EVERY body it processes, including ones it
+    # classifies to `[]`, so `unclassified_bodies` is 0 on the next boot and this
+    # cannot loop. A vault with nothing to repair pays one dict lookup.
+    if converged.get("unclassified_bodies"):
+        log.info("[VaultMigrator] %d tool bodies carry no effect_tags — "
+                 "re-deriving (a previous boot wiped them)",
+                 converged["unclassified_bodies"])
+        backfill_effect_tags(vault_dir, version=installed, logger_=log, force=True)
+        converge_index_effect_tags(vault_dir, logger_=log)
+
     vault_seed = _read_seed_version(vault_dir)
 
     # Fast path
@@ -948,6 +1300,29 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
             vault_idx_path.write_text(json.dumps(vault_idx, indent=2) + "\n", encoding="utf-8")
         except Exception as exc:
             errors.append(f"vault_index_write: {exc}")
+
+    # RE-DERIVE EFFECT TAGS FOR WHAT THIS LOOP JUST REPLACED.
+    #
+    # Every ADD and every UPDATE above overwrites BOTH the tool body
+    # (`_install_body`) and its index header (`_entry_keeping_disable(pkg_entry,
+    # ...)`) with the PACKAGED versions — and the packaged `tools/index.json` and
+    # tool bodies carry no `effect_tags` key at all. So this loop WIPES the
+    # classification the backfill stamped at the top of this same boot, and
+    # because that backfill already wrote `.effect_tags_seed` for the installed
+    # version, its own fast path means no later boot re-stamps it either. Measured
+    # before this block existed: `run()` reported updated=1 / skipped_identical=40
+    # and the updated tool ended with the key ABSENT from both records,
+    # permanently.
+    #
+    # `force=True` is required precisely because the marker is already current.
+    # Re-DERIVING (rather than carrying the pre-migration tags across) is the
+    # correct repair: the loop replaced the IMPLEMENTATION too, so the old
+    # classification describes source that is no longer there — carrying it would
+    # be the same mistake `_entry_keeping_disable` avoids by refusing to carry the
+    # schema summaries across.
+    if added or updated:
+        backfill_effect_tags(vault_dir, version=installed, logger_=log, force=True)
+        converge_index_effect_tags(vault_dir, logger_=log)
 
     # Wire Wild Card (ADD-only)
     wild_card_added = 0
