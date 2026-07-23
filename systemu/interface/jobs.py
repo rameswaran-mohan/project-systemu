@@ -345,6 +345,8 @@ class JobManager:
                 self._dispatcher_tick()
             except Exception:
                 logger.exception("[Jobs] Dispatcher loop error — continuing")
+            # offload-lint: ok — this IS the dispatcher's own background thread
+            # ("jobs-execute-dispatcher", started in JobManager.__init__)
             time.sleep(1.0)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -369,6 +371,8 @@ class JobManager:
                     if job.status == JobStatus.CANCELLED:
                         return
 
+                # offload-lint: ok — runs on the per-job monitor thread that
+                # start_job dispatches (threading.Thread(target=self._poll, ...))
                 time.sleep(_POLL_INTERVAL)
 
             # ── Watchdog: process exceeded time limit ─────────────────────────

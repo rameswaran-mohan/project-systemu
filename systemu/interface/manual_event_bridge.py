@@ -90,15 +90,20 @@ class ManualEventBridge:
                 if self._check_rotation():
                     self._tail_pos = 0
 
+                # offload-lint: ok — _tail_loop IS the bridge's own daemon
+                # thread (started in start()); this interruptible wait is how it
+                # paces itself, and it never runs on the event loop.
                 if self._stop_event.wait(timeout=_TAIL_INTERVAL_S):
                     break
             except FileNotFoundError:
                 Path(self._path).touch()
                 self._tail_pos = 0
+                # offload-lint: ok — same daemon thread as above
                 if self._stop_event.wait(timeout=_TAIL_INTERVAL_S):
                     break
             except Exception:
                 logger.exception("[ManualBridge] tail loop error — continuing")
+                # offload-lint: ok — same daemon thread as above
                 if self._stop_event.wait(timeout=_TAIL_INTERVAL_S):
                     break
 

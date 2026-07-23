@@ -33,6 +33,7 @@ NiceGUI builders compose them with design-system token classes only (lint
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, List
 
 from systemu.interface.nav_helpers import tile_nav_target
@@ -405,18 +406,83 @@ def _stat_card(icon: str, label: str, value: int, subtitle: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _force_restart_workers() -> None:
-    """Gracefully restart the Supervisor background threads."""
-    from nicegui import ui
-    try:
+# Serialises the restart sequence itself. Making the handler ``async`` moved it
+# off the event loop (below) but ALSO moved it out of nicegui's inline dispatch,
+# so two quick clicks can now overlap — see the docstring. This lock stops one
+# click's teardown from landing inside another's join/restart window and killing
+# the workers it just replaced.
+_RESTART_LOCK = threading.Lock()
+
+
+async def _force_restart_workers() -> None:
+    """Gracefully restart the Supervisor background threads.
+
+    R-UX2 / SPEC §15-UX **UX-9(a)**. The restart sequence contains a 500ms
+    settle between stopping and restarting the workers. This was a SYNC nicegui
+    click handler, so that sleep ran on the asyncio event loop: every click
+    froze the whole dashboard for half a second — ten times the 50ms budget, and
+    exactly the missed-heartbeat / "Connection lost" class this release exists
+    to remove. The blocking sequence now runs in a worker thread via
+    ``run.io_bound`` and the handler awaits it, so the loop stays free and the
+    websocket keeps its heartbeat.
+
+    That trade is not free, and the first cut of this change did not pay for it.
+    ``nicegui/events.py`` runs a **sync** handler inline (``result = handler()``)
+    but hands an **async** one to ``background_tasks.create_or_defer``, so
+    concurrent clicks stop being serialised by the loop the moment the handler
+    becomes a coroutine. ``_RESTART_LOCK`` is therefore taken NON-blockingly
+    here, so a second click while a restart is in flight is reported as such
+    instead of queueing another teardown behind the first.
+
+    **The restart itself goes through** :meth:`Supervisor.restart_workers`, not
+    ``Supervisor.start()``. Routing it through ``start()`` was a REGRESSION: that
+    method's ``is_alive()`` check is an idempotency guard, and a wedged thread is
+    alive, so the worker the operator pressed this button to clear was the one it
+    specifically preserved — while this handler still said "successfully".
+
+    Three outcomes, three distinct notify types, and the degraded one cannot
+    render as the healthy one: every worker replaced -> positive; a click that
+    overlapped another -> warning; **any** worker that could not be stopped ->
+    negative, naming it.
+
+    nicegui's ``handle_event`` schedules the awaitable **inside the sender's
+    parent slot**, so the ``ui.notify`` calls below still reach this operator's
+    browser after the await.
+    """
+    from nicegui import run, ui
+
+    def _restart():
+        """-> None if another restart holds the lock, else {thread name: replaced}."""
         from systemu.runtime.supervisor import Supervisor
-        import time as _time
-        sup = Supervisor.get()
-        sup._shutdown_event.set()
-        _time.sleep(0.5)
-        sup._shutdown_event.clear()
-        sup.start()
-        ui.notify("Workers restarted successfully.", type="positive")
+        # offload-lint: ok — a NON-blocking try-acquire (blocking=False), and it
+        # runs in the run.io_bound worker thread, never on the event loop.
+        if not _RESTART_LOCK.acquire(blocking=False):
+            return None
+        try:
+            # offload-lint: ok — joins the workers, but in the run.io_bound
+            # worker thread, never on the event loop.
+            return Supervisor.get().restart_workers()
+        finally:
+            _RESTART_LOCK.release()
+
+    try:
+        replaced = await run.io_bound(_restart)
+        if replaced is None:
+            ui.notify("A restart is already in progress — ignored.",
+                      type="warning")
+        elif replaced and all(replaced.values()):
+            # `replaced and ...` is load-bearing: `all({}.values())` is
+            # vacuously True, so a result naming NO workers would otherwise
+            # render as the healthy value — the one thing this path must never
+            # be able to emit without evidence.
+            ui.notify("Workers restarted successfully.", type="positive")
+        else:
+            stuck = ", ".join(sorted(n for n, ok in replaced.items() if not ok))
+            ui.notify(
+                f"Restart INCOMPLETE — {stuck} would not stop and was left in "
+                f"place. Restart the app to clear it.",
+                type="negative",
+            )
     except Exception as exc:
         ui.notify(f"Restart failed: {exc}", type="negative")
 

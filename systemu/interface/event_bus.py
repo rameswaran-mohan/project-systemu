@@ -215,6 +215,12 @@ class EventBus:
             },
         })
 
+        # offload-lint: ok — this method's contract IS "block the caller's
+        # thread", and the caller is a WORKER: SqliteApprovalGate.notify_user
+        # (worker process) → broker.request_approval → here. The dashboard side
+        # of this handshake only ever calls resolve_approval(), which does not
+        # wait. Bounded by timeout_s (120s default) and never awaited on the
+        # event loop.
         resolved = gate["event"].wait(timeout=timeout_s)
 
         with self._approval_lock:

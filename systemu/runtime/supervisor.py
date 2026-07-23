@@ -276,6 +276,8 @@ class Supervisor:
         # Background threads (started by .start())
         self._dispatcher_thread: Optional[threading.Thread] = None
         self._heartbeat_thread:  Optional[threading.Thread] = None
+        # Serialises start(); see the idempotency note in start().
+        self._start_lock = threading.Lock()
 
         # Queue persistence path
         vault_path = Path(getattr(vault, "root", str(config.vault_dir)))
@@ -345,20 +347,61 @@ class Supervisor:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _thread_alive(t: Optional[threading.Thread]) -> bool:
+        return t is not None and t.is_alive()
+
     def start(self) -> None:
-        """Start the dispatcher and heartbeat background threads."""
-        self._dispatcher_thread = threading.Thread(
-            target=self._dispatcher_loop,
-            daemon=True,
-            name="supervisor-dispatcher",
-        )
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            daemon=True,
-            name="supervisor-heartbeat",
-        )
-        self._dispatcher_thread.start()
-        self._heartbeat_thread.start()
+        """Start the dispatcher and heartbeat background threads. **Idempotent.**
+
+        R-UX2. This used to construct and start two threads unconditionally on
+        every call, so a second ``start()`` while the first pair was still alive
+        left a DUPLICATE dispatcher and a duplicate heartbeat running forever —
+        two threads draining one queue and two heartbeats writing one set of
+        stamps. That is the same double-cleanup class as FIX-3/FIX-4.
+
+        It became reachable from the UI when the "Restart Workers" click handler
+        was made ``async`` to get its 500ms settle off the event loop: nicegui
+        runs a **sync** handler inline (``events.py`` — ``result = handler()``)
+        but schedules an **async** one via ``background_tasks.create_or_defer``,
+        so two quick clicks now overlap where before they were serialised by the
+        loop. Idempotency here is the durable fix — it holds for every caller,
+        including ``Supervisor.get()``'s own auto-start — rather than depending
+        on each call site to not race.
+
+        Threads are checked individually so a half-dead pair is repaired rather
+        than left alone: if the heartbeat died and the dispatcher lives, calling
+        start() restarts exactly the heartbeat.
+
+        **This guard is NOT a restart predicate.** ``is_alive()`` is false only
+        for a thread that has RETURNED; a thread wedged inside a blocking call
+        is alive, so ``start()`` deliberately leaves it alone. Callers that mean
+        "replace these workers" — the Restart Workers button — must use
+        :meth:`restart_workers`, which stops the old threads first and reports
+        which ones it could not stop.
+        """
+        with self._start_lock:
+            want_dispatcher = not self._thread_alive(self._dispatcher_thread)
+            want_heartbeat = not self._thread_alive(self._heartbeat_thread)
+            if not want_dispatcher and not want_heartbeat:
+                logger.debug("[Supervisor] start() ignored — dispatcher and "
+                             "heartbeat threads are already running")
+                return
+
+            if want_dispatcher:
+                self._dispatcher_thread = threading.Thread(
+                    target=self._dispatcher_loop,
+                    daemon=True,
+                    name="supervisor-dispatcher",
+                )
+                self._dispatcher_thread.start()
+            if want_heartbeat:
+                self._heartbeat_thread = threading.Thread(
+                    target=self._heartbeat_loop,
+                    daemon=True,
+                    name="supervisor-heartbeat",
+                )
+                self._heartbeat_thread.start()
 
         self._publish("🚀 Supervisor started", level="SUCCESS", context={
             "max_concurrent": self._max_concurrent,
@@ -368,6 +411,91 @@ class Supervisor:
         })
         logger.info("[Supervisor] Started — max_concurrent=%d stuck_threshold=%ds",
                     self._max_concurrent, STUCK_THRESHOLD_S)
+
+    #: Worst case for a worker to notice ``_shutdown_event``. The dispatcher
+    #: blocks in ``self._queue.get(timeout=2.0)`` and again in
+    #: ``self._semaphore.acquire(timeout=2.0)``; neither is interrupted by
+    #: ``Event.set()``, so it can need two full timeouts plus the dispatch work
+    #: between them before it looks at the flag.
+    RESTART_JOIN_TIMEOUT_S = 6.0
+
+    def restart_workers(
+        self,
+        *,
+        join_timeout: float = RESTART_JOIN_TIMEOUT_S,
+    ) -> Dict[str, bool]:
+        """Stop the worker threads and replace them. Returns {thread name: replaced}.
+
+        R-UX2. **This is the restart path; ``start()`` is not.** An earlier cut
+        drove the Restart Workers button through ``start()``, whose per-thread
+        ``is_alive()`` guard is an IDEMPOTENCY guard, and an idempotency guard is
+        not a restart predicate: a wedged thread is alive, so the one worker the
+        operator pressed the button to clear was the one specifically preserved.
+        The button then reported unqualified success. Reproduced on this box, 7
+        runs in 8: ``DISPATCHER RESTARTED? False / HEARTBEAT RESTARTED? True /
+        UI said: [('Workers restarted successfully.', 'positive')]``.
+
+        The old code paired ``_shutdown_event.set()`` with a fixed 0.5s sleep.
+        That is not long enough to be a stop: ``_heartbeat_loop`` waits ON the
+        event so it returns at once, but ``_dispatcher_loop`` blocks in
+        ``queue.get(timeout=2.0)``, which ``Event.set()`` does not interrupt — so
+        the dispatcher routinely outlived the settle. The sleep is replaced by a
+        real ``join`` against a shared deadline: correct threads are now stopped
+        because they ARE stopped, not because 0.5s was hoped to be enough.
+
+        A thread that survives the join is genuinely wedged, and is NOT replaced.
+        Starting a second dispatcher over a live one is the duplicate-drain class
+        (two threads on one queue, FIX-3/FIX-4) that base ``start()`` produced
+        unconditionally. The caller is told instead, so the UI can downgrade —
+        see ``console._force_restart_workers``.
+        """
+        specs = (
+            ("_dispatcher_thread", "supervisor-dispatcher", self._dispatcher_loop),
+            ("_heartbeat_thread",  "supervisor-heartbeat",  self._heartbeat_loop),
+        )
+        replaced: Dict[str, bool] = {}
+        with self._start_lock:
+            self._shutdown_event.set()
+            try:
+                # ONE deadline for both joins, not one each — two sequential
+                # per-thread timeouts would block the caller for twice as long.
+                deadline = time.monotonic() + join_timeout
+                for attr, _name, _target in specs:
+                    t = getattr(self, attr, None)
+                    if t is not None and t.is_alive():
+                        t.join(timeout=max(0.0, deadline - time.monotonic()))
+            finally:
+                # Must clear even when a join timed out, or the replacements
+                # would see a set flag and return immediately.
+                self._shutdown_event.clear()
+
+            for attr, name, target in specs:
+                old = getattr(self, attr, None)
+                if old is not None and old.is_alive():
+                    replaced[name] = False
+                    logger.error(
+                        "[Supervisor] %s did not stop within %.1fs — NOT replacing it "
+                        "(a second worker on the same queue is the duplicate-drain bug)",
+                        name, join_timeout,
+                    )
+                    continue
+                fresh = threading.Thread(target=target, daemon=True, name=name)
+                setattr(self, attr, fresh)
+                fresh.start()
+                replaced[name] = True
+
+        stuck = sorted(n for n, ok in replaced.items() if not ok)
+        if stuck:
+            self._publish(
+                "⚠️ Worker restart incomplete — still wedged: " + ", ".join(stuck),
+                level="WARNING",
+                context={"replaced": replaced},
+            )
+        else:
+            self._publish("↻ Workers restarted", level="SUCCESS",
+                          context={"replaced": replaced})
+        logger.info("[Supervisor] restart_workers -> %s", replaced)
+        return replaced
 
     def shutdown(self) -> None:
         """Graceful shutdown: persist pending queue items, signal threads to stop."""

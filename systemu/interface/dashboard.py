@@ -884,6 +884,9 @@ def _stop_capture(jm):
         def _launch_refine(captured_name=job_name):
             import time
             # Wait for the capture process to flush events.db + session.json
+            # offload-lint: ok — runs on the "refine-launcher" daemon thread
+            # started below (threading.Thread(target=_launch_refine, ...)),
+            # never on the event loop.
             time.sleep(2)
             if not captures_dir.exists():
                 logger.warning("[Dashboard] captures dir does not exist: %s", captures_dir)
@@ -1251,6 +1254,40 @@ def register_routes() -> None:
         logger.warning("[Dashboard] task API registration failed", exc_info=True)
 
 
+def _install_loop_lag_watchdog(ng_app) -> None:
+    """R-UX2 / SPEC §15-UX **UX-9(a)** — run the loop-lag watchdog for the app's life.
+
+    Registered as startup/shutdown hooks rather than started at import time: the
+    watchdog's heartbeat is a coroutine that measures the very event loop it
+    runs on, and that loop does not exist until nicegui starts one. ``on_startup``
+    is the first moment it does.
+
+    This is the meter DEC-20c's PIV-1/PIV-2 triggers read after ship, so it must
+    run on the REAL dashboard loop — a watchdog wired only in tests would report
+    a permanently healthy install. Failures are swallowed: a broken meter must
+    never take the dashboard down with it. What makes that swallow survivable is
+    that a watchdog which never starts has no samples, and a watchdog whose
+    heartbeat dies goes stale — both render "LOAD NOT MEASURED", never
+    "RESPONSIVE".
+    """
+    from systemu.runtime.loop_lag import get_watchdog
+
+    @ng_app.on_startup
+    async def _start_loop_lag_watchdog():
+        try:
+            get_watchdog().start()
+        except Exception:
+            logger.debug("[Dashboard] loop-lag watchdog did not start", exc_info=True)
+
+    @ng_app.on_shutdown
+    async def _stop_loop_lag_watchdog():
+        try:
+            await get_watchdog().stop()
+        except Exception:
+            logger.debug("[Dashboard] loop-lag watchdog did not stop cleanly",
+                         exc_info=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Public entry points
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1456,6 +1493,9 @@ def run_dashboard(
         )
 
     register_routes()
+
+    # R-UX2 / UX-9(a): the loop-lag meter, started with the app's event loop.
+    _install_loop_lag_watchdog(ng_app)
 
     # ── Graceful shutdown hook ─────────────────────────────────────────────
     @ng_app.on_shutdown

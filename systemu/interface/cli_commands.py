@@ -1082,6 +1082,9 @@ def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool, origin: str
     from systemu.runtime.shadow_runtime import ShadowRuntime
     runtime = ShadowRuntime(config=config, vault=vault)
 
+    # offload-lint: ok — a terminal CLI command (@click army_execute), not a
+    # dashboard handler: there is no running event loop here, and this call is
+    # what creates one.
     result = asyncio.run(runtime.execute(shadow, activity, dry_run=dry_run, origin=origin))
 
     status  = result.get("status", "?")
