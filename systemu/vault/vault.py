@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -210,8 +211,59 @@ def _empty_shadow_memory_md(shadow: Shadow) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+class VaultUnreadable(RuntimeError):
+    """A vault artifact a fail-CLOSED reader needs EXISTS-or-not certainty about could
+    not be read — raised by :meth:`Vault.load_tool_index_strict` and its facades, and
+    NEVER by the forgiving :meth:`Vault.load_index`.
+
+    Carries the ``stage`` the read failed at (one of ``root``/``scan``/``read``/
+    ``parse``/``shape``), the ``path`` under inspection, and the ``original`` OSError /
+    JSONDecodeError it wraps (``None`` for a shape violation, which has no native
+    exception of its own). ``stage``/``path`` are operator-visible diagnostics — the
+    vault's own filesystem layout, never a credential value or key name — so a
+    fail-closed caller can say WHY it refused.
+
+    The whole reason this type exists: on a fail-closed path "unknown" must be
+    UNREPRESENTABLE as "empty". An unreadable roster travels as this exception; it can
+    never arrive as ``[]``/``False``/``0.0`` and be mistaken for a witnessed absence.
+    That collapse — an unreadable tool index read as "no secrets declared" — is what
+    three earlier fixes each patched one layer of; this makes it structurally
+    impossible instead.
+    """
+
+    #: The ordered read stages, coarsest first. Named so a diagnostic can spell the
+    #: stage; NOT consulted for control flow (a fence that branches on which stage
+    #: failed is inferring completeness rather than witnessing it).
+    _STAGES = ("root", "scan", "read", "parse", "shape")
+
+    def __init__(self, message: str, *, path: Any, stage: str,
+                 original: Optional[BaseException] = None) -> None:
+        super().__init__(message)
+        self.path = path
+        self.stage = stage
+        self.original = original
+
+
 class Vault:
     """File-based vault with atomic index writes and full CRUD for all entities."""
+
+    #: entity type → index file path, RELATIVE to ``self.root``. The single source of
+    #: truth for the on-disk index layout, shared by :meth:`load_index` (forgiving) and
+    #: :meth:`load_tool_index_strict` (fail-closed) so a layout change updates BOTH
+    #: readers at once. A fence-private copy that drifted would read a stale path, see a
+    #: verified-absent file, and conclude "complete + empty" — the very failure mode the
+    #: strict reader exists to prevent.
+    _INDEX_FILES = {
+        "scrolls":       "scrolls/index.json",
+        "activities":    "activities/index.json",
+        "skills":        "skills/index.json",
+        "tools":         "tools/index.json",
+        "shadow_army":   "shadow_army/index.json",
+        "evolutions":    "evolutions/index.json",
+        "notifications": "notifications/pending.json",
+        "decisions":     "decisions/index.json",
+    }
 
     def __init__(
         self,
@@ -334,7 +386,11 @@ class Vault:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to read %s: %s", path, exc)
+            # Q3: name the exception CLASS as well as the path, so a swallowed read is
+            # visible in the log rather than vanishing into []. The RETURN contract is
+            # unchanged — this reader still yields [] and never raises; only the two
+            # secret-fence packets migrate to load_tool_index_strict, which RAISES.
+            logger.warning("Failed to read %s (%s): %s", path, type(exc).__name__, exc)
             return []
 
     def load_index(self, entity: str) -> List[Dict[str, Any]]:
@@ -343,19 +399,113 @@ class Vault:
         entity: "scrolls" | "activities" | "skills" | "tools" |
                 "shadow_army" | "evolutions" | "notifications"
         """
-        index_file = {
-            "scrolls":       "scrolls/index.json",
-            "activities":    "activities/index.json",
-            "skills":        "skills/index.json",
-            "tools":         "tools/index.json",
-            "shadow_army":   "shadow_army/index.json",
-            "evolutions":    "evolutions/index.json",
-            "notifications": "notifications/pending.json",
-            "decisions":     "decisions/index.json",
-        }.get(entity)
+        index_file = self._INDEX_FILES.get(entity)
         if index_file is None:
             raise ValueError(f"Unknown entity type: {entity!r}")
         return self._read_json(self.root / index_file)
+
+    def load_tool_index_strict(self) -> List[Dict[str, Any]]:
+        """WITNESSED read of the tool roster: an unreadable roster RAISES; it can never
+        arrive as an empty list.
+
+        The fail-CLOSED twin of :meth:`load_index` for the ONE consumer that must tell
+        "this vault registers no tools" apart from "the tool roster could not be read":
+        the secret-promotion fence (``runtime.credentials.known_values``).
+        :meth:`load_index` reads through :meth:`_read_json`, which SWALLOWS
+        ``JSONDecodeError``/``OSError`` and returns ``[]``; sixteen callers depend on
+        that (a corrupt sidecar should grey out a panel, not crash a page), so it is left
+        alone. But it makes an unreadable roster indistinguishable from an empty one, and
+        a fence that reads emptiness as "no secrets declared" then promotes a live
+        credential.
+
+        The rule this method enforces: **"absent" is trustworthy only as an ENOENT from a
+        real syscall on a child whose parent was positively ``stat``-verified.**
+        :meth:`pathlib.Path.exists` appears NOWHERE — it swallows ENOENT/ENOTDIR/EBADF/
+        ELOOP itself and can never provide that witness. A missing vault ROOT makes
+        ``root/tools/index.json`` `.exists()` return ``False``, which is how an earlier
+        strict reader still read a vanished vault as "empty, complete" — the fourth layer
+        of the same bug.
+
+        Five stages, each raising :class:`VaultUnreadable` with its stage and path:
+
+        * ``root``  — ``os.stat(self.root)`` fails, or the root is not a directory. A
+          missing vault root is NEVER an empty vault.
+        * ``scan``  — the ``tools`` directory is a FILE where a dir belongs, or cannot be
+          scanned. Its genuine ABSENCE (``FileNotFoundError`` from :func:`os.scandir`,
+          the parent root already verified) is the ONLY branch that legitimately returns
+          ``[]``.
+        * ``read``  — the index file cannot be opened/read: it is a directory, a
+          permission/device error, or absent inside its verified parent dir.
+        * ``parse`` — the index bytes are not valid UTF-8 JSON.
+        * ``shape`` — the parsed value is not a list of ``{"id": <non-empty str>, …}``
+          header dicts. The index schema is vault-owned, so this check lives here, not in
+          the fence.
+        """
+        # ── root: a real stat, never Path.exists() — a vanished root must RAISE ──
+        try:
+            st = os.stat(self.root)
+        except OSError as exc:
+            raise VaultUnreadable(
+                "vault root is unreadable", path=self.root, stage="root",
+                original=exc) from exc
+        if not stat.S_ISDIR(st.st_mode):
+            raise VaultUnreadable(
+                "vault root is not a directory", path=self.root, stage="root")
+
+        # The index path comes from the SAME layout constant load_index uses — one source
+        # of truth, so a drift updates both readers together instead of stranding this
+        # one on a stale path.
+        index_path = self.root / self._INDEX_FILES["tools"]
+        tools_dir = index_path.parent
+
+        # ── scan: the ONLY place an ABSENCE may legitimately mean "empty", because the
+        #    parent (root) was just positively stat-verified. A `tools` path that is a
+        #    FILE raises here (NotADirectoryError); a genuinely absent `tools` dir is the
+        #    real, complete "this vault registers no tools" answer. ──
+        try:
+            with os.scandir(tools_dir) as it:
+                for _ in it:
+                    break            # touch the iterator so any deferred error surfaces
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise VaultUnreadable(
+                "tools directory is unreadable", path=tools_dir, stage="scan",
+                original=exc) from exc
+
+        # ── read + parse: no broad except. An absent index file INSIDE the verified dir
+        #    is NOT the legitimate-absence branch — it raises like any other read error.
+        #    Read bytes first so a bad-UTF-8 file lands in `parse`, not `read`. ──
+        try:
+            raw = index_path.read_bytes()
+        except OSError as exc:
+            raise VaultUnreadable(
+                "tools index is unreadable", path=index_path, stage="read",
+                original=exc) from exc
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise VaultUnreadable(
+                "tools index is not valid JSON", path=index_path, stage="parse",
+                original=exc) from exc
+
+        # ── shape: vault-owned schema. A truthy NON-list (a dict / a bare scalar) and a
+        #    list of non-headers are the shapes a plain `load_index(...) or []` accepted
+        #    in silence — the first iterated its KEYS to a complete-empty key set, the
+        #    second an int straight into `TypeError`. Both refuse here. ──
+        if not isinstance(data, list):
+            raise VaultUnreadable(
+                "tools index is not a list", path=index_path, stage="shape")
+        for entry in data:
+            if not isinstance(entry, dict):
+                raise VaultUnreadable(
+                    "tools index entry is not a header dict", path=index_path,
+                    stage="shape")
+            entry_id = entry.get("id")
+            if not isinstance(entry_id, str) or not entry_id:
+                raise VaultUnreadable(
+                    "tools index entry has no string id", path=index_path, stage="shape")
+        return data
 
     def _update_index(
         self,

@@ -443,10 +443,16 @@ def _value_is_secret(value: Any, vault: Any = None) -> bool:
     when it is absent the known-value half simply does not run.
 
     Import failure ⇒ treat as secret (fail-closed), matching the other two guards. The
-    known-value check fails closed here too — unlike at the outbound mask, where a
-    failure must not break a push. The asymmetry is deliberate: the cost of a false
-    refusal here is one un-promoted fact (an over-ask), and the cost of a false pass is
-    a credential persisted to disk and replayed into future prompts."""
+    known-value check fails closed here too, and by CONSTRUCTION rather than by comment:
+    it reads the TRI-STATE :func:`known_secret_status` (via :func:`_status_with_reason`)
+    and refuses on BOTH ``MATCH`` and ``UNKNOWN`` (the corpus could not be built) — only a
+    fully-built corpus that does not contain the value (``NO_MATCH``) falls through to the
+    shape rules. A prior version read a bare bool, so an unusable corpus was
+    indistinguishable from a clean miss and the credential was promoted. This is UNLIKE
+    the outbound mask, where the same ``UNKNOWN`` passes text through (a failure must not
+    break a push). The asymmetry is deliberate: the cost of a false refusal here is one
+    un-promoted fact (an over-ask), and the cost of a false pass is a credential persisted
+    to disk and replayed into future prompts."""
     try:
         s = str(value)
         if not s:
@@ -454,8 +460,27 @@ def _value_is_secret(value: Any, vault: Any = None) -> bool:
         if _URI_USERINFO_RE.search(s) or _CRED_FLAG_RE.search(s):
             return True
         if vault is not None:
-            from systemu.runtime.credentials.known_values import contains_known_secret
-            if contains_known_secret(s, vault):
+            from systemu.runtime.credentials.known_values import (
+                KnownSecret, _status_with_reason)
+            # TRI-STATE, not a bare bool. MATCH is a stored credential; UNKNOWN is "the
+            # known-value corpus could not be built" (unreadable tool roster/record,
+            # per-vault HMAC unavailable, import failure). BOTH refuse — this fence fails
+            # CLOSED, so a value we could not clear is treated as a secret. Only a
+            # fully-built corpus that does NOT contain the value (NO_MATCH) falls through
+            # to the shape rules below. A prior version read a bare bool here, so an
+            # unusable corpus was indistinguishable from a clean miss and the credential
+            # was promoted.
+            status, reason = _status_with_reason(s, vault)
+            if status is KnownSecret.MATCH:
+                return True
+            if status is KnownSecret.UNKNOWN:
+                # The refusal is operator-visible WITH the failure's stage/path, so a
+                # silent over-refusal is diagnosable. The reason names the vault's own
+                # layout — never the value or its shape (the promoter's own capped
+                # refusal line stays generic for exactly that reason).
+                logger.warning(
+                    "[S3] promotion fence refusing a value it could not clear — "
+                    "known-value corpus INCOMPLETE: %s", reason)
                 return True
         from systemu.messaging.gateway import mask_outbound
         return mask_outbound(s) != s

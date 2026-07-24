@@ -41,6 +41,18 @@ class FileVault:
     def load_index(self, entity: str) -> List[Dict[str, Any]]:
         return self._v.load_index(entity)
 
+    def load_tool_index_strict(self) -> List[Dict[str, Any]]:
+        """Forwards :meth:`Vault.load_tool_index_strict` — raises ``VaultUnreadable`` for
+        a tool roster that exists but cannot be witnessed as a list of headers.
+
+        This facade has NO ``__getattr__``, so the strict reader must be forwarded
+        explicitly. Omitting it would not open a hole — the promotion fence treats a
+        missing strict reader as "cannot witness" and fails CLOSED — but it would
+        silently refuse EVERY promotion on the default file backend, which is the
+        concrete vault ``AppState`` holds.
+        """
+        return self._v.load_tool_index_strict()
+
     # ── Scroll ────────────────────────────────────────────────────────────────
 
     def save_scroll(self, scroll: Scroll) -> None:

@@ -89,6 +89,14 @@ class ParallelVault:
     def load_index(self, entity: str) -> List[Dict[str, Any]]:
         return self._p.load_index(entity)
 
+    def load_tool_index_strict(self) -> List[Dict[str, Any]]:
+        """Strict read from the PRIMARY only — the same vault reads already come from. A
+        secondary that disagrees is a dual-write mismatch this class reports by warning;
+        it is not evidence about whether the primary's roster is readable, and consulting
+        it here would let a healthy secondary paper over a corrupt primary for the
+        fail-closed caller."""
+        return self._p.load_tool_index_strict()
+
     # ── Scroll ────────────────────────────────────────────────────────────────
 
     def save_scroll(self, scroll: Scroll) -> None:

@@ -1101,6 +1101,44 @@ class SqliteVault:
             else:
                 raise ValueError(f"Unknown entity type: {entity!r}")
 
+    def load_tool_index_strict(self) -> List[Dict[str, Any]]:
+        """Strict twin of :meth:`load_index` for the tool roster — see
+        ``Vault.load_tool_index_strict``.
+
+        On this backend the completeness witness is the query itself: :meth:`load_index`
+        already PROPAGATES (a DB that cannot be opened or queried raises out of
+        ``_session``/``execute`` rather than swallowing to ``[]``), so a returned list IS
+        a witnessed roster and a failure travels as an exception. A query failure is
+        wrapped as ``VaultUnreadable(stage="read")`` and a non-list / non-header shape is
+        refused as ``stage="shape"``, so the fence gets the SAME typed answer it gets
+        from the file backend. Defined explicitly, not aliased, so the guarantee is
+        stated per backend rather than inherited by accident.
+
+        ``path`` is ``self.root`` (the memory dir), NEVER ``self._url`` — a SQLAlchemy
+        URL can carry ``user:password@host`` and this value is surfaced to an
+        operator-visible log.
+        """
+        from systemu.vault.vault import VaultUnreadable
+        diag = getattr(self, "root", "<sql-backend>")
+        try:
+            rows = self.load_index("tools")
+        except Exception as exc:
+            raise VaultUnreadable(
+                "tool roster query failed", path=diag, stage="read",
+                original=exc) from exc
+        if not isinstance(rows, list):
+            raise VaultUnreadable(
+                "tool roster is not a list", path=diag, stage="shape")
+        for entry in rows:
+            if not isinstance(entry, dict):
+                raise VaultUnreadable(
+                    "tool roster entry is not a header dict", path=diag, stage="shape")
+            entry_id = entry.get("id")
+            if not isinstance(entry_id, str) or not entry_id:
+                raise VaultUnreadable(
+                    "tool roster entry has no string id", path=diag, stage="shape")
+        return rows
+
     # ── Scroll ────────────────────────────────────────────────────────────────
 
     def save_scroll(self, scroll: Scroll) -> None:
