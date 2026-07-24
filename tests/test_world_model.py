@@ -315,6 +315,31 @@ _WM_ALLOWED = {
         "Read-only, non-action, results fenced. Without it the report view's trim had "
         "no 'the planner can always query for more' to rest on, so §5.10.d's "
         "never-subtract floor was a claim rather than a mechanism."),
+    # ── R-W2 (W-B) widened this allowlist by exactly ONE module — the NINTH.
+    #
+    # Justified rather than assumed, because silently widening this list is how the
+    # boundary stops being one. Three properties make it the same KIND of entry as
+    # `world_model_populator`, not a new kind of reach:
+    #
+    #   1. It is a PRODUCER. The census is the machine-centric fact source (installed
+    #      apps / CLIs on PATH / cloud-sync roots) that WM-7 exists to add; it has to
+    #      write the store or it has no output at all.
+    #   2. It never READS a fact to decide anything — no call to the WM-4 read family
+    #      (pinned below by the same scan used on the populator). Its one deletion call
+    #      (`purge_source_ref`, on consent revocation) is a WRITE, and the selection
+    #      logic lives inside the store, not here.
+    #   3. It adds no bind reach whatsoever. Census facts surface only through
+    #      `world_facts`, which `requirement_binder` does not enumerate; and the read
+    #      path clamps every stored row to `content_derived` regardless.
+    #
+    # Note `census_consent.py` is deliberately NOT here: consent state is pure, it never
+    # references the store, and revocation's purge is orchestrated from `ambient_census`
+    # precisely so the consent module stays off this list.
+    "ambient_census.py": (
+        "the WM-7 AMBIENT CENSUS — a WRITE-ONLY producer of machine-centric facts "
+        "(installed apps / CLIs on PATH / cloud-sync roots), consent-gated per "
+        "category. Also owns revocation's purge, which is a write. It never reads a "
+        "fact to decide anything."),
     # outside runtime — operator-facing, never on a decision path.
     "cli_commands.py": "read-only operator CLI surface",
 }
@@ -388,6 +413,19 @@ def test_the_write_only_projector_never_reads_the_store():
         encoding="utf-8", errors="replace")
     hits = [s for s in _WM_READ_SURFACE if s in text]
     assert hits == [], f"the populator is write-only; it must not read: {hits}"
+
+
+def test_the_census_never_reads_the_store():
+    """R-W2's ninth allowlist entry rests on property 2 (see :data:`_WM_ALLOWED`) — the
+    census is a PRODUCER, not a reader. Pinned with the SAME `_WM_READ_SURFACE` the
+    populator is checked against, deliberately reusing the constant rather than
+    restating it: two lists would drift, and the one that drifts is always the one
+    guarding the newer module."""
+    import pathlib
+    text = (pathlib.Path(wm.__file__).parent / "ambient_census.py").read_text(
+        encoding="utf-8", errors="replace")
+    hits = [s for s in _WM_READ_SURFACE if s in text]
+    assert hits == [], f"the census is write-only; it must not read: {hits}"
 
 
 def test_the_write_host_reaches_the_store_only_through_the_populator():

@@ -79,6 +79,15 @@ FACT = f"The transfer account on file is {STORED} for this vendor."
     ("zero-width joiner", "acct‍-99-attacker"),
     ("quoted + period",   '"acct-99-attacker".'),
     ("upper + underscore", "ACCT_99_ATTACKER"),
+    # URL-encoding that REVEALS A WRAPPER once decoded (``%22``→``"``, ``%27``→``'``,
+    # ``%2E``→``.``). The peel that removes such a wrapper runs only AFTER the URL-decode
+    # — the SECOND ``_strip_wrappers`` call in ``_canonical_taint_form``. The plain
+    # ``url-encoded`` row above decodes to a SEPARATOR, which the separator fold collapses
+    # regardless, so it never exercised that second peel; each of these does.
+    ("url + double-quote",   "%22acct-99-attacker%22"),
+    ("url + single-quote",   "%27acct-99-attacker%27"),
+    ("url + trailing dot",   "acct-99-attacker%2E"),
+    ("url wrap + encoded -", "%22acct%2D99%2Dattacker%22"),
 ])
 def test_reshaped_value_still_clamps(label, emitted):
     """Every one of these LAUNDERED before the canonicalisation. A model that requotes,
@@ -163,6 +172,74 @@ def test_canonical_form_is_never_empty_for_punctuation_only_values():
     ``_canonical_taint_form`` that does not re-check length."""
     for v in ("...", "().,;", "?!?!?!", "'''", '"""'):
         assert rb._canonical_taint_form(v) != "", v
+
+
+# ── the wrapper-peeling half has ONE owner, and this file is routed to it ─────
+#
+# ``requirement_binder`` used to redeclare ``_QUOTE_PAIRS``/``_TRAILING_PUNCT`` and
+# redefine ``_strip_wrappers`` with the SAME values and logic, under a comment asking a
+# future reader to keep the constants "byte-identical" to ``replay_metrics``'. That ask
+# was never a control — and overclaimed even as written: the two copies' comments and the
+# helper's docstring already differed, so only the executable logic was ever identical,
+# and either could drift with nothing to fail. The duplicate is now deleted and the helper
+# imported, which is checked from two DIFFERENT directions below — an agreement check
+# ("both copies behave the same") is deliberately NOT one of them, because it stays
+# green whether the code is shared or merely coincidentally equal, which is precisely
+# how the duplication survived this long.
+
+def test_strip_wrappers_is_the_one_shared_object_not_a_local_copy():
+    """IDENTITY PIN — nothing can hide a reimplementation behind the name.
+
+    Fails the moment ``requirement_binder`` grows its own ``_strip_wrappers`` again, even
+    one that behaves identically today. The two constants are pinned absent for the same
+    reason: re-declaring them is the first half of how the fork previously reappeared."""
+    from systemu.runtime import replay_metrics as rm
+    assert rb._strip_wrappers is rm._strip_wrappers, (
+        "requirement_binder has re-forked _strip_wrappers; it must be the imported one")
+    assert "_QUOTE_PAIRS" not in vars(rb), "a mirrored _QUOTE_PAIRS is back"
+    assert "_TRAILING_PUNCT" not in vars(rb), "a mirrored _TRAILING_PUNCT is back"
+
+
+def test_canonical_taint_form_actually_routes_through_the_shared_helper(monkeypatch):
+    """CALL-SITE PIN — nothing can keep the name while routing past it.
+
+    The identity pin alone would stay green if someone kept the import and INLINED the
+    peeling, leaving the shared helper imported-but-unused. So mutate the helper the
+    module resolves and require the canonical form to move with it. Both call sites are
+    covered: the plain path, and the second peel after URL-decoding.
+
+    Each site is pinned for CALLED and for RESULT-USED separately — a call whose return
+    value is thrown away is exactly the "routes past it" shape and passes a CALLED-only
+    check. RESULT-USED needs care at site #2: the plain peel (site #1) has already stamped
+    one marker onto the very string site #2 receives, so the marker's mere PRESENCE proves
+    nothing there. The sentinel stamps once per call, so site #2's result being used shows
+    up as the marker appearing TWICE; a mutation that keeps the decode but drops the peel
+    leaves it once."""
+    calls = []
+
+    def _sentinel(s):
+        calls.append(s)
+        return s + "ZZQQ"
+
+    monkeypatch.setattr(rb, "_strip_wrappers", _sentinel)
+
+    out = rb._canonical_taint_form("'acct-99-attacker'")
+    assert calls, "_canonical_taint_form never called _strip_wrappers"
+    assert "zzqq" in out, f"_strip_wrappers' result was discarded: {out!r}"
+
+    # Site #2 — the peel AFTER url-decode. A url-encoded WRAPPER (``%22`` → ``"``) is what
+    # reaches it: the wrapper only appears once the ``%`` is decoded, so site #1 cannot
+    # have removed it. CALLED is ``len(calls) >= 2``; RESULT-USED is the marker COUNT, not
+    # its presence — site #1 already stamped one ``zzqq`` onto this same string, so
+    # ``"zzqq" in out2`` stays true even when site #2's return is discarded. Two stamps
+    # means site #2's result reached the output; one means the decode was kept but the
+    # peel dropped.
+    calls.clear()
+    out2 = rb._canonical_taint_form("%22acct-99-attacker%22")
+    assert len(calls) >= 2, (
+        f"the post-URL-decode peel no longer routes through the helper: {calls!r}")
+    assert out2.count("zzqq") >= 2, (
+        f"site #2's _strip_wrappers result was discarded (decode kept, peel dropped): {out2!r}")
 
 
 def test_short_values_still_bypass_the_match():

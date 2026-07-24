@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 _SYSTEMU = Path(__file__).resolve().parent.parent / "systemu"
+_CONC_MAP = Path(__file__).resolve().parent.parent / "docs" / "CONC-MAP.md"
 
 
 def _relpath(p: Path) -> str:
@@ -67,6 +68,7 @@ WRITER_OWNERSHIP = {
             "scheduler/jobs.py",
         },
         "def": "runtime/execution_snapshot.py",
+        "conc_map_row": '**ExecutionSnapshot** `data/audit/exec_*/resume_snapshot.json`',
         "note": ("DEC-10 R-A12 GUARD — external_wait_reconciler (scheduler/jobs.py) is "
                  "the reviewed 4th writer: writes pending_waits ONLY on PARKED runs "
                  "(per-execution_id invariant). Any FURTHER writer needs the same review."),
@@ -75,12 +77,14 @@ WRITER_OWNERSHIP = {
         "call": "save_items(",
         "allowed": {"runtime/table_reconciler.py"},  # the sole 60s table reconciler
         "def": "runtime/table_store.py",
+        "conc_map_row": '**OnTheTable** `table/items.json`',
         "note": "Clean single writer.",
     },
     "R-A13.5 ask corpus (<root>/audit/ask_corpus.jsonl)": {
         "call": "record_ask(",
         "allowed": {"runtime/shadow_runtime.py"},    # the shadow exec loop, at the ask point
         "def": "runtime/replay_metrics.py",
+        "conc_map_row": '**R-A13.5 ask corpus** `audit/ask_corpus.jsonl`',
         "note": ("APPEND-only deterministic ask corpus (observability; the §10 avoidable-ask "
                  "signal). Appends are SERIALIZED (process lock + best-effort OS file lock, "
                  "then one os.write to an O_APPEND fd) so concurrent shadow runs interleave "
@@ -95,6 +99,7 @@ WRITER_OWNERSHIP = {
                                         # scope card's answer-time join (daemon thread)
         },
         "def": "runtime/replay_metrics.py",
+        "conc_map_row": '**R-A16 answer-linked ask corpus** `audit/ask_avoidable.jsonl`',
         "note": ("R-A16/G-LEARN §5.9 AskWasAvoidable events. APPEND-only, "
                  "observability-only (never raises, never affects a run). Appends are "
                  "SERIALIZED (process lock + best-effort OS file lock, then one "
@@ -112,6 +117,7 @@ WRITER_OWNERSHIP = {
         "call": "reconcile_index(",
         "allowed": {"scheduler/daemon.py"},          # the sole 60s capability reconciler job
         "def": "runtime/capability_index.py",
+        "conc_map_row": '**CapabilitySlots index** `capabilities/capability_index.json`',
         "note": ("R-CAP1 CAP-0.1: reconcile_index is DERIVE-ONLY (rebuilds the whole file "
                  "from {Tool catalog ∪ mcp enabled_tools}; no RMW). The daemon job is the "
                  "sole writer; read-only callers use find_tools(live=True) which derives in "
@@ -121,12 +127,14 @@ WRITER_OWNERSHIP = {
         "call": "record_resolution(",
         "allowed": {"approval/decision_queue.py", "interface/command/inbox.py"},
         "def": "runtime/metrics_store.py",
+        "conc_map_row": '| Fatigue metrics `metrics/metrics.json`',
         "note": "Resolution-side writer set; creation side is incr() on the exec thread.",
     },
     "S4 shadow meter (<root>/metrics/metrics.json — s4_shadow bucket)": {
         "call": "incr_s4_shadow_meter(",
         "allowed": {"runtime/shadow_runtime.py"},  # the record-only meter at the credit seam
         "def": "runtime/metrics_store.py",
+        "conc_map_row": '**S4 shadow meter** `metrics/metrics.json`',
         "note": ("R-A13b-1 park-surface meter: the SOLE writer is the shadow exec loop's "
                  "credit-seam meter branch (record-only, same single writer thread as incr()). "
                  "Any further writer needs a DEC-10 review + this allowlist update."),
@@ -135,6 +143,7 @@ WRITER_OWNERSHIP = {
         "call": "record_usage(",
         "allowed": {"core/llm_router.py"},  # the router's token-capture hook, sole writer
         "def": "runtime/costing.py",
+        "conc_map_row": '**R-P3a cost ledger** (in-process `costing._LEDGER`',
         "note": ("R-P3a cost accumulator: the SOLE writer is the LLM router's "
                  "per-call token-capture hook (_record_usage_safe → record_usage), "
                  "reading the ambient execution_id. In-process ledger (not a durable "
@@ -148,25 +157,94 @@ WRITER_OWNERSHIP = {
         # common private name used by unrelated modules elsewhere.
         "def": "",
         "scan_subdir": "messaging",
+        "conc_map_row": '**R-P1 resolve audit** `messaging/resolve_audit.jsonl`',
         "note": "Single-writer append on the telegram-gateway thread.",
     },
     "World-model facts (<root>/world_model/facts.json)": {
         "call": "put_facts(",
-        "allowed": {"runtime/world_model_populator.py"},   # the WRITE-ONLY projector
+        "allowed": {
+            "runtime/world_model_populator.py",   # the WRITE-ONLY projector (R-W1)
+            # R-W2 (DEC-10 reviewed): the WM-7 ambient census. Same thread, same
+            # post-survey step, SERIAL with the projector within a run.
+            "runtime/ambient_census.py",
+        },
         "def": "runtime/world_model.py",
-        "note": ("R-W1 §5.11.a. The projector is the SOLE writer, called from the shadow "
-                 "exec thread's post-survey step. Concurrent RUNS are concurrent writers, "
-                 "but the write is idempotent-convergent (ids derive from (kind, value)), "
-                 "so a lost update costs a re-confirmation, never a fact. W-A's final "
-                 "slice made the store READABLE (situational_inventory composes a view, "
-                 "world_tools exposes the query tool) — both are read-only and neither "
-                 "may appear here. The R-W4 world gardener is the standing writer DEC-10 "
-                 "names explicitly: it needs its own review AND this allowlist update."),
+        "conc_map_row": '**World-model facts** `world_model/facts.json`',
+        "note": ("R-W1 §5.11.a + R-W2 §5.11.c. TWO writers, both on the shadow exec "
+                 "thread's post-survey step and serial with each other within a run. "
+                 "Concurrent RUNS are concurrent writers, but the ADD path is "
+                 "idempotent-convergent (ids derive from (kind, value)), so a lost "
+                 "update costs a re-confirmation, never a fact. R-W2 also adds the one "
+                 "DELETION path (purge_source_ref, on consent revocation), which is NOT "
+                 "convergent — mitigated at both ends (revoke withdraws consent before "
+                 "purging; run_census re-checks consent immediately before its write and "
+                 "discards a revoked category), narrowing the window to one read+save. "
+                 "W-A's final slice made the store READABLE (situational_inventory "
+                 "composes a view, world_tools exposes the query tool) — both are "
+                 "read-only and neither may appear here. The R-W4 world gardener is the "
+                 "standing writer DEC-10 names explicitly: it needs its own review AND "
+                 "this allowlist update."),
+    },
+    "World-model facts — DELETION path (<root>/world_model/facts.json)": {
+        # Registered as its OWN entry, not folded into the `put_facts(` row above.
+        #
+        # R-W2 shipped `purge_source_ref` — the fact store's first and only deletion
+        # path — and registered it in the CONC-MAP row's PROSE while the guard kept
+        # grepping `put_facts(`. Prose is not a guard: verified by mutation, adding a
+        # `purge_source_ref(` call to `interface/cli_commands.py` (a file already
+        # allowlisted for `put_facts`-adjacent reasons and already inside `_WM_ALLOWED`)
+        # left this suite AND tests/test_world_model.py at 51 passed. Neither the
+        # writer-ownership guard nor `_WM_MODULE_NEEDLES` could see it: the former was
+        # keyed on a different call, the latter gates on MODULE reference and that module
+        # already referenced the world model.
+        #
+        # Deletion deserves its own row anyway: it is the one non-convergent operation on
+        # this store, so "who may delete" is a strictly stronger question than "who may
+        # write".
+        "call": "purge_source_ref(",
+        "allowed": {"runtime/ambient_census.py"},   # consent revocation, and nothing else
+        "def": "runtime/world_model.py",
+        # Deletion-SPECIFIC anchor, NOT the shared `**World-model facts**` header the
+        # put_facts entry uses. That header is present whether or not the deletion prose
+        # survives, so anchoring on it let someone strip the `purge_source_ref` sentences
+        # from the CONC-MAP row while this guard stayed green (verified: the header count is
+        # unaffected by removing the deletion prose). This anchor is a phrase from the
+        # deletion prose itself, so `test_every_guarded_store_has_a_conc_map_row` now fails
+        # if that prose is deleted — the one NON-CONVERGENT operation's documentation is
+        # pinned, not merely the store header it shares.
+        "conc_map_row": '**R-W2 adds the one DELETION path**',
+        "note": ("R-W2 §5.11.c. The ONLY deletion path on the positive fact store, and "
+                 "the only NON-convergent operation on it: a census in flight can re-add "
+                 "rows a concurrent purge just removed. Its sole legitimate caller is "
+                 "consent revocation (ambient_census.revoke_category), which withdraws "
+                 "consent BEFORE purging so run_census's pre-write re-check discards the "
+                 "revoked category. A second deleter breaks that pairing and needs a "
+                 "DEC-10 review: deleting a fact some other subsystem believes it owns "
+                 "is not recoverable by re-surveying if the source is gone."),
+    },
+    "R-W2 census consent (<root>/census_consent.json)": {
+        # Guard on CONSTRUCTION, not on `_write(`: the store's only writers are its own
+        # lock-held methods, so `_write` has no external caller and the def file is
+        # excluded from the scan — that guard would pass vacuously on zero hits. Who can
+        # obtain a mutable handle is the question that actually matters here.
+        "call": "CensusConsentStore(",
+        "allowed": {"runtime/ambient_census.py"},   # the sole holder today
+        "def": "runtime/census_consent.py",
+        "conc_map_row": '**R-W2 census consent** `census_consent.json`',
+        "note": ("R-W2 §5.11.c WM-7 per-category census consent. The store is its own "
+                 "sole writer: grant/revoke/set_paused come from the operator surface, "
+                 "mark_ran from run_census on the shadow exec thread. LOCK+A — "
+                 "_CONSENT_LOCK wraps the whole read-modify-write because every mutator "
+                 "rewrites the file from its own load, so unlocked, a mark_ran that "
+                 "loads before a revoke and writes after it RESURRECTS the revoked grant "
+                 "(verified reproducible during R-W2) and thereby defeats run_census's "
+                 "pre-write consent re-check. Any further writer needs a DEC-10 review."),
     },
     "World-model negatives (<root>/world_model/negatives.json)": {
         "call": "put_negative(",
         "allowed": {"runtime/world_model_discovery.py"},   # the discovery-miss loop
         "def": "runtime/world_model.py",
+        "conc_map_row": '**World-model negatives** `world_model/negatives.json`',
         "note": ("R-W1 WM-2 'searched and not found'. Unlocked RMW across concurrent "
                  "runs; a lost update drops a SUPPRESSION, whose cost is a repeated "
                  "search and never a missed one. A writer that could assert absence "
@@ -177,6 +255,7 @@ WRITER_OWNERSHIP = {
         "call": "record_survey(",
         "allowed": {"runtime/world_model_populator.py"},
         "def": "runtime/world_model.py",
+        "conc_map_row": '**World-model survey watermarks** `world_model/surveys.json`',
         "note": ("R-W1 read-side staleness. Same single writer/call as put_facts. A lost "
                  "watermark makes staleness_of UNDER-report, its documented safe "
                  "direction. A second writer would let one survey claim another's "
@@ -190,6 +269,7 @@ WRITER_OWNERSHIP = {
             "pipelines/quick_task.py",   # quick-lane terminal (the DEFAULT lane)
         },
         "def": "runtime/outbox.py",
+        "conc_map_row": '**U-12 Outbox** `<root>/Outbox/<yyyy-mm-dd>-<slug>/`',
         "note": ("R-UTL1 U-12. The two LANE TERMINALS are the only writers. Each "
                  "run writes its OWN uniquely-named folder (_unique_dir), so "
                  "concurrent runs never share a path and no lock is needed — that "
@@ -223,6 +303,53 @@ def test_writer_set_matches_conc_map(store, spec):
     )
 
 
+@pytest.mark.parametrize("store,spec", WRITER_OWNERSHIP.items(),
+                         ids=[k.split(" ")[0] for k in WRITER_OWNERSHIP])
+def test_every_guarded_store_has_a_conc_map_row(store, spec):
+    """The guard and the document must be bound BOTH ways.
+
+    Until this existed the binding ran one way only: this file held its own hardcoded
+    ownership dict and never opened `docs/CONC-MAP.md`, so the document was decorative
+    with respect to CI. Verified by mutation, not assumed — deleting the entire
+    "R-W2 census consent" row from the markdown left this suite at 22 passed. A store
+    could also be added to WRITER_OWNERSHIP with no row ever written, which is how
+    `messaging/resolve_audit.jsonl` came to be enforced by test while the table never
+    mentioned it (the summary line below the table claimed it was pinned; the table had
+    no such row). Both directions now fail loudly.
+
+    Deliberately asserts EXACTLY ONE occurrence. Zero means the row was deleted or never
+    written; two means the anchor is ambiguous and the next reader cannot tell which row
+    the guard is talking about."""
+    anchor = spec.get("conc_map_row")
+    assert anchor, (
+        f"{store} has no `conc_map_row` anchor. Every guarded store must name the "
+        f"docs/CONC-MAP.md row that documents it — a guard with no document is how the "
+        f"DEC-10 review gets skipped."
+    )
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    hits = text.count(anchor)
+    assert hits == 1, (
+        f"\nCONC-MAP row binding BROKEN for: {store}\n"
+        f"  anchor {anchor!r} appears {hits} time(s) in docs/CONC-MAP.md (expected 1).\n"
+        f"  If you deleted or renamed the row, the concurrency documentation for a store "
+        f"with a live writer guard is now missing — restore it or update the anchor.\n"
+        f"  If you ADDED a store here, write its CONC-MAP row: the DEC-10 review is the "
+        f"row, not the allowlist entry."
+    )
+
+
+def test_the_conc_map_anchor_check_is_not_vacuous():
+    """A row-existence check that would pass on an empty document proves nothing.
+
+    Pins that (a) the file actually read is non-trivial, and (b) a deliberately absent
+    anchor really does count zero — so the assertion above is measuring the document
+    rather than always-truthy string behaviour."""
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    assert len(text) > 2000, "CONC-MAP.md is unexpectedly small — is the path right?"
+    assert text.count("| **R-W2 census consent** `census_consent.json`") == 1
+    assert text.count("**A row that does not exist**") == 0
+
+
 # --- atomic-write invariant: every guarded side-store must write via tmp + os.replace ---
 _ATOMIC_WRITE_STORES = {
     "runtime/execution_snapshot.py",  # write_snapshot
@@ -232,6 +359,7 @@ _ATOMIC_WRITE_STORES = {
     "runtime/dashboard_auth.py",      # LockoutStore._save + _write_secret_file
     "runtime/outbox.py",              # _write_atomic (receipt/.done/FAILED note)
     "runtime/world_model.py",         # _write_atomic (facts/negatives/surveys)
+    "runtime/census_consent.py",      # R-W2 per-category census consent (_write)
 }
 
 

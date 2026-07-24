@@ -79,6 +79,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
+#: The wrapper-peeling half of the taint canonicalisation, IMPORTED from its single
+#: owner rather than mirrored here. See :func:`_canonical_taint_form` for why only this
+#: half is shared and the top-level function is not.
+#:
+#: This direction cannot cycle, and that is structural rather than lucky:
+#: ``replay_metrics`` imports NOTHING from systemu at module scope (stdlib only), and
+#: its two reads of THIS module are function-local by construction.
+from systemu.runtime.replay_metrics import _strip_wrappers
+
 logger = logging.getLogger(__name__)
 
 # The silent-bind threshold. A bind at/above T_HIGH that is NOT content_derived is
@@ -628,15 +637,14 @@ _PROMPT_FACT_WINDOW = 20
 _ZERO_WIDTH = dict.fromkeys(
     map(ord, "​‌‍⁠﻿"), None)
 
-#: Matched pairs only — a lone leading quote is not a wrapper and must not be eaten.
-#: Kept byte-identical to ``replay_metrics._QUOTE_PAIRS`` (R-A16 F2) so the two
-#: canonicalisers stay unifiable; see ``_canonical_taint_form``.
-_QUOTE_PAIRS = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
-                ("«", "»"), ("`", "`"))
-
-#: TRAILING only, never interior — stripping interior punctuation would fold ``a.b.c``
-#: into ``abc``, a substring-style collapse that manufactures over-asks.
-_TRAILING_PUNCT = ".,;:!?)]}>"
+#: ``_QUOTE_PAIRS`` (matched pairs only — a lone leading quote is not a wrapper) and
+#: ``_TRAILING_PUNCT`` (trailing only, never interior) used to be redeclared here under
+#: a comment asking that the constants be "kept byte-identical to ``replay_metrics``' so
+#: the two canonicalisers stay unifiable". That was a promise a future reader had to keep,
+#: not a property the code had — and it never even held at the source level: the two
+#: copies' comments and the helper's docstring already differed, only the values and logic
+#: matched. They now live only at their owner, reached through the imported
+#: :func:`_strip_wrappers`.
 
 #: The SEPARATOR CLASS. ``-``, ``_`` and whitespace are interchangeable FORM for the
 #: same identifier, and which one is stored is chosen by whoever authored the content —
@@ -650,26 +658,6 @@ _TRAILING_PUNCT = ".,;:!?)]}>"
 #: step that would start manufacturing false matches.
 _SEP_RUN = re.compile(r"[-_\s]+")
 _DUP_SLASH = re.compile(r"/{2,}")
-
-
-def _strip_wrappers(s: str) -> str:
-    """Peel matched surrounding quotes and trailing punctuation until stable.
-
-    Bounded (never unbounded), and never strips to empty — a value that is ENTIRELY
-    punctuation keeps its own form rather than collapsing to ``""``, which would match
-    inside every fact in the corpus. Mirrors ``replay_metrics._strip_wrappers``."""
-    for _ in range(4):
-        before = s
-        for lo, hi in _QUOTE_PAIRS:
-            if len(s) >= 2 and s.startswith(lo) and s.endswith(hi):
-                s = s[1:-1].strip()
-                break
-        trimmed = s.rstrip(_TRAILING_PUNCT)
-        if trimmed:
-            s = trimmed
-        if s == before:
-            break
-    return s
 
 
 def _canonical_taint_form(value) -> str:
@@ -691,16 +679,40 @@ def _canonical_taint_form(value) -> str:
     UNMATCHED — pinned negatively by
     ``test_ra16_taint_corpus_bound.test_canonicalisation_does_not_become_a_substring_match``.
 
-    ORDER MATTERS, and follows ``replay_metrics.canonical_compare_form`` (R-A16 F2) so
-    the two stay unifiable once both land: strip zero-width first (one can sit between
-    a quote and the value), unwrap (a quoted value may hide the ``%``), URL-decode (a
-    decode can REVEAL a separator: ``acct%2D99`` → ``acct-99``), then fold separators,
-    then casefold.
+    ORDER MATTERS, and follows ``replay_metrics.canonical_compare_form`` (R-A16 F2):
+    strip zero-width first (one can sit between a quote and the value), unwrap (a quoted
+    value may hide the ``%``), URL-decode (a decode can REVEAL a separator:
+    ``acct%2D99`` → ``acct-99``), then fold separators, then casefold.
 
-    That sibling is NOT imported: it lives on an unmerged branch, and ``value_ref`` /
-    ``normalize_value`` may not be widened because every already-stamped on-disk digest
-    depends on their exact output. This is a separate, comparison-only helper that
-    persists nothing.
+    WHY THIS IS STILL NOT ``canonical_compare_form``. This docstring used to say that
+    sibling "lives on an unmerged branch" and that the two would "stay unifiable once
+    both land". Both halves of that are now FALSE and have been corrected: the sibling
+    HAS landed — ``replay_metrics`` is imported from this module today, and the
+    wrapper-peeling half (:func:`_strip_wrappers`) is now taken FROM it rather than
+    mirrored here. What remains is not a duplicate awaiting a merge. It is a DIFFERENT
+    function, and every difference is load-bearing:
+
+      * The SEPARATOR-CLASS fold (``[-_\\s]+`` → one space) exists only here. Without it
+        ``acct_99_attacker`` / ``acct 99 attacker`` stop matching a stored
+        ``acct-99-attacker``.
+      * ZERO-WIDTH stripping exists only here. Without it an interposed U+200B or U+200D
+        (the pinned cases) stops matching; ``_ZERO_WIDTH`` also removes U+200C, U+2060 and
+        the U+FEFF no-break space, which are code-covered but not separately pinned.
+      * NEVER-RAISES exists only here. ``canonical_compare_form`` calls ``str(value)``
+        unguarded; a raise on THIS path reaches the per-leaf handler and degrades the
+        leaf to a spurious gap.
+
+    Measured, not asserted: substituting the sibling for this function turns SIX pins in
+    ``tests/test_ra16_taint_corpus_bound.py`` red — five reshape classes the R-A16 packet
+    measured CLOSED (separator→``_``, separator→space, ``ACCT_99_ATTACKER``, zero-width
+    space, zero-width joiner) plus ``test_unstringable_value_never_raises``. Unifying
+    would REOPEN measured-closed laundering vectors.
+
+    And the converse is why the sibling must not simply adopt these steps instead:
+    ``canonical_compare_form`` feeds ``canonical_value_ref``, whose digests are STAMPED
+    into the append-only ask corpus and compared on read, so widening it silently
+    re-forms every already-stamped row. The two canonicalisers have different jobs; the
+    remaining duplication is a real difference, not an unpaid debt.
 
     Never raises — an unstringable value yields ``""``, which callers treat as no-match."""
     try:

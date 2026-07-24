@@ -185,8 +185,9 @@ class NegativeFact(BaseModel):
 # looked. The survey is scope-varying (grant-scoped roots, a per-run file cap, per-source
 # timeouts), so "not re-seen" alone would mass-stale perfectly valid facts. Recording the
 # COVERAGE lets staleness be derived READ-SIDE — with no mutation of the facts themselves,
-# so the store stays append-only/confirm-in-place and belief revision (a later program)
-# is not pre-empted.
+# so the SURVEY path stays append-only/confirm-in-place and belief revision (a later
+# program) is not pre-empted. (R-W2's ``purge_source_ref`` is the one deletion path, and
+# it is not belief revision: it is an operator withdrawing consent for a SOURCE.)
 
 #: keep the last N watermarks — enough to reason about recent coverage, bounded on disk.
 _MAX_SURVEYS = 20
@@ -451,6 +452,66 @@ class FactStore:
         if limit is not None:
             rows = rows[:max(0, int(limit))]
         return rows
+
+    def purge_source_ref(self, source_kind: str, ref: str) -> Dict[str, int]:
+        """Remove every fact whose ONLY evidence is the ``(source_kind, ref)`` pair, and
+        DETACH that step from facts that also carry other evidence. Returns
+        ``{"removed": N, "detached": M}``.
+
+        The ONLY deletion path on the positive store, added by R-W2 because WM-7 makes
+        consent revocation PURGE the facts a revoked census category produced. That is a
+        privacy control, and it has to outrank the store's otherwise
+        append-only/confirm-in-place discipline: refusing would leave the store asserting
+        what the operator's consent no longer covers.
+
+        Deleting a belief is normally the dangerous direction; the two things that make
+        it safe here are that the operator ASKED, and that the scope is a source rather
+        than a claim — a fact with INDEPENDENT evidence is kept, with only the revoked
+        step detached, because revoking one source is not a statement that the fact is
+        false.
+
+        THE ``detached`` BRANCH IS UNREACHABLE FROM THE CENSUS TODAY, and an earlier
+        revision of this docstring motivated it with an example that cannot occur ("a
+        live inventory entry the census happened to agree with"). It cannot occur
+        because a chain only grows past one step when two producers write the SAME
+        ``fact_id``, and :func:`fact_id_for` folds ``kind`` into that id while the two
+        producers' kinds are disjoint:
+
+            census    (source_kind="census")    installed_application / cli_on_path /
+                                                cloud_sync_root
+            inventory (source_kind="inventory") service / capability / data_location /
+                                                credential_ref
+
+        A OneDrive folder is ``cloud_sync_root`` from the census and ``data_location``
+        from the survey — two different ids, two separate facts, neither carrying the
+        other's step. So every census fact today has exactly one provenance step and
+        revocation always takes the ``removed`` path.
+
+        The branch is kept rather than deleted because the RULE is the correct one for a
+        source-scoped purge and this method is general over ``(source_kind, ref)``; it
+        is exercised by test, not by production. Whoever adds a producer whose kinds
+        overlap an existing producer's — or a second ref within one source_kind — makes
+        it live, and should re-read this note rather than assume it was already load-
+        bearing.
+
+        Idempotent and defensive: an unknown pair matches nothing and writes nothing."""
+        sk, rf = str(source_kind or ""), str(ref or "")
+        facts = self._load_facts()
+        removed = detached = 0
+        for fid, f in list(facts.items()):
+            chain = list(f.source_chain)
+            keep = [s for s in chain if not (s.source_kind == sk and s.ref == rf)]
+            if len(keep) == len(chain):
+                continue                       # this source never contributed to it
+            if keep:
+                facts[fid] = f.model_copy(update={"source_chain": keep})
+                detached += 1
+            else:
+                facts.pop(fid, None)
+                removed += 1
+        if removed or detached:
+            self._save_facts(facts)
+        return {"removed": removed, "detached": detached}
 
     # ── negative facts ─────────────────────────────────────────────────────────
     def _load_negatives(self) -> Dict[str, NegativeFact]:

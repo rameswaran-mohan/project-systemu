@@ -2379,6 +2379,44 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
     #: called stale — the last survey did not cover that scope, so absence is not evidence.
     _MARK = {"confirmed": "", "unconfirmed": "  ⚠ not re-confirmed by the last survey",
              "not_surveyed": "  (scope not surveyed)", "unknown": ""}
+    # R-W2 (WM-7 / M3): the STANDING-SCAN surface. Consenting to a census category is an
+    # ONGOING permission, not a one-off snapshot, so the operator has to be able to see
+    # what is still being watched and when it last ran — a standing scan you cannot see
+    # is not meaningfully revocable.
+    #
+    # Rendered BEFORE the `if q:` branch, not after it. After it, the whole disclosure
+    # sat behind that branch's `return 0`, so `sharing_on world <query>` — the form an
+    # operator uses most — silently never showed what was being watched. It is also
+    # before the empty-store early-return, because "granted but has found nothing yet"
+    # is exactly the state most worth showing and the state that return would hide.
+    #
+    # Renders nothing on a FRESH install (no census_consent.json in the vault): no grant
+    # surface ships, so no operator can consent and census_status is []. It is NOT dead,
+    # though — run_census is wired live and reads the consent file directly, so a planted
+    # consent file makes this block render. Kept, and kept correct, because the operator
+    # grant surface will turn it on without revisiting this file.
+    try:
+        from systemu.runtime.ambient_census import census_status
+        _grants = census_status(vault)
+    except Exception:
+        _grants = []
+    if _grants:
+        click.echo(f"Ambient census — STANDING permission to scan this machine, "
+                   f"{len(_grants)} categor(y/ies):")
+        for g in _grants:
+            click.echo(f"  {g['category']:<18} "
+                       f"{'PAUSED ' if g['paused'] else 'active '}"
+                       f" last ran: {g['last_ran_at'] or 'never'}")
+        # Says what is TRUE, not what would be reassuring. The previous wording — "these
+        # re-run until revoked" — offered a control that does not exist in this build,
+        # which is the shape R-W2 was held for. Revocation is real and does delete the
+        # derived facts; what is missing is any command that calls it, so BOTH halves
+        # are stated rather than the comfortable one alone.
+        click.echo("  These re-run on later runs. What they find is included in the "
+                   "planning prompt sent to systemu's model provider.")
+        click.echo("  Revoking a category also DELETES the facts it produced — but this "
+                   "build ships no command to grant, pause or revoke one.")
+
     q = (query or "").strip()
     if q:
         hits = _wm.about(store, q, limit=(None if not limit else int(limit)))

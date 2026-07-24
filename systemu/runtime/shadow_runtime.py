@@ -5849,6 +5849,26 @@ class ShadowRuntime:
                     )
                 except Exception:
                     logger.debug("[Runtime] world-model populate skipped (non-fatal)", exc_info=True)
+                # R-W2 (W-B): the WM-7 AMBIENT CENSUS — the machine-centric half of the
+                # world model (installed apps / CLIs on PATH / cloud-sync roots), which
+                # no live inventory source can produce. CONSENT-GATED per category: with
+                # no grant it scans nothing and writes nothing, so the default install
+                # pays only three tiny file reads. Same contract as the populator above:
+                # off-loop, in a thread, separately time-bounded, and fully swallowed —
+                # a census failure can never affect the run.
+                #
+                # Like the populator, it writes AFTER this run's `compose_world_view`
+                # already read the store, so a newly-censused fact surfaces to the
+                # planner on the NEXT run. That one-run lag is inherent to the seam, not
+                # to the census.
+                try:
+                    from systemu.runtime.ambient_census import run_census
+                    await _asyncio.wait_for(
+                        _asyncio.to_thread(run_census, self.vault),
+                        timeout=8.0,      # > the census's own 6s internal budget
+                    )
+                except Exception:
+                    logger.debug("[Runtime] ambient census skipped (non-fatal)", exc_info=True)
             except Exception:
                 logger.debug(
                     "[Runtime] situational inventory survey skipped (non-fatal)",
