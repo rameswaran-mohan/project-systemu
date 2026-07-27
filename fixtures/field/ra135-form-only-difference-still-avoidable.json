@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "ra135-form-only-difference-still-avoidable",
+  "title": "The operator retyped the bound value in a different FORM — still avoidable",
+  "provenance": {
+    "release": "R-A13.5",
+    "source_test": "tests/test_ra135_resolver_replay.py::test_exact_and_canonical_confirms_are_reported_apart",
+    "added": "2026-07-22"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "render the monthly report",
+    "success_criteria": "a titled report exists"
+  },
+  "capability": {
+    "name": "render_report",
+    "parameters_schema": {
+      "title": { "type": "string", "default": "Monthly Report" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {},
+    "declared_intents": []
+  },
+  "asks": [
+    {
+      "schema_path": "title",
+      "class": "decision",
+      "operator_answer": "monthly report",
+      "label": "avoidable",
+      "why": "Source #5 bound the authored default 'Monthly Report'. The operator answered the SAME value in a different form (case). Scored by exact equality this would read 'the binder held a different value' — i.e. NECESSARY — which is the exact inverse of the truth, and the error is directional: it inflates the necessary count in the metric that decides DEC-7. The R-A16 F2 canonical fold catches it, and the report records match_basis='canonical' so this confirm is visibly resting on the lossier comparison. This is the ONLY corpus scenario exercising the canonical branch; before it, every shipped confirm was 'exact' and mutating the canonical branch's reported basis survived the whole suite. A PLAIN STRING leaf is used deliberately, not a path: normalize_value applies os.path.normcase, which folds case on Windows and does nothing on POSIX, so a path leaf's match_basis is platform-dependent (see README)."
+    }
+  ]
+}

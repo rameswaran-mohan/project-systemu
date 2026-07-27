@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "id": "ra10-ac6-content-derived-salient-path",
+  "title": "A granted-root salient file the goal references resolves the path leaf — the ask was avoidable (R-A10 AC6 / R-A11a)",
+  "provenance": {
+    "release": "R-A10",
+    "source_test": "tests/test_ra10_binder.py::test_ac6_content_derived_only_candidate_never_silent",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "ingest the data",
+    "success_criteria": "the rows are loaded"
+  },
+  "capability": {
+    "name": "ingest",
+    "parameters_schema": {
+      "source_path": { "type": "string", "description": "input csv path" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "credentials": [],
+    "profile": {},
+    "declared_intents": [],
+    "roots": [
+      {
+        "path": "{root}/g",
+        "origin_class": "operator",
+        "curated": false,
+        "salient": [
+          {
+            "path": "{root}/g/data.csv",
+            "name": "data.csv",
+            "ext": ".csv",
+            "size": 4,
+            "mtime": 0.0,
+            "origin_class": "content_derived",
+            "source_kind": "file"
+          }
+        ]
+      }
+    ]
+  },
+  "files": [
+    { "path": "g/data.csv", "text": "a,b\n" }
+  ],
+  "granted_roots": ["g"],
+  "asks": [
+    {
+      "schema_path": "source_path",
+      "class": "input",
+      "operator_answer": "{root}/g/data.csv",
+      "label": "avoidable",
+      "why": "The objective goal references 'the data' and a granted-root salient named data.csv scores above threshold, so reference_resolver resolves the leaf to exactly the path the operator typed. The bind is clamped to content_derived (IMPL-5) so it is never SILENT — it becomes a one-click confirm — but the value was derivable without asking the operator to hand-type a path, which is what the avoidable-ask metric measures."
+    }
+  ]
+}

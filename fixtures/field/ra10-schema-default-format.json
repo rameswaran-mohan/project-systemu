@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "ra10-schema-default-format",
+  "title": "A schema default supplies the leaf (source #5) — the ask was avoidable",
+  "provenance": {
+    "release": "R-A10",
+    "source_test": "tests/test_ra10_binder.py::test_schema_default_binds_systemu_authored",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "render the report",
+    "success_criteria": "a file exists"
+  },
+  "capability": {
+    "name": "fmt",
+    "parameters_schema": {
+      "format": { "type": "string", "default": "pdf" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {},
+    "declared_intents": []
+  },
+  "asks": [
+    {
+      "schema_path": "format",
+      "class": "decision",
+      "operator_answer": "pdf",
+      "label": "avoidable",
+      "why": "§10 names 'a schema default' explicitly as a source that makes an ask avoidable. Source #5 binds the authored default 'pdf' at systemu_authored origin, confidence 1.0, and the operator answered the same thing."
+    }
+  ]
+}

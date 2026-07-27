@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "note": "DEC-27 committed roster — the INDEPENDENT denominator for the R-A13.5 resolver replay. This list, not the directory glob, decides how many fixtures the corpus must contain. `missing = declared - observed` and `extra = observed - declared` are BOTH hard failures (see systemu/runtime/resolver_replay.py). Add a fixture => add it here in the same commit; test_field_roster_matches_fixtures turns any drift into a red suite.",
+  "fixtures": [
+    "ra10-ac1-unbindable-repo-leaf.json",
+    "ra10-ac5-profile-user-fact-account.json",
+    "ra10-ac6-content-derived-salient-path.json",
+    "ra10-ac7-multi-account-decision.json",
+    "ra10-profile-spine-output-dir.json",
+    "ra10-run-context-produced-file.json",
+    "ra10-schema-default-format.json",
+    "ra12c-provided-params-source0.json",
+    "ra135-binder-held-a-different-value.json",
+    "ra135-form-only-difference-still-avoidable.json",
+    "ra9-credential-leaf-never-digested.json"
+  ]
+}

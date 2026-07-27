@@ -1672,6 +1672,57 @@ def debug_avoidable_ask(ctx):
         click.echo(line)
 
 
+@debug_group.command("resolver-replay")
+@click.option("--corpus", default=None, type=click.Path(),
+              help="Scenario corpus directory (default: fixtures/field).")
+def debug_resolver_replay(corpus):
+    """R-A13.5 · §10 IMPL-15 — the DEFINITIVE avoidable-ask rate, by resolver replay.
+
+    This is the ask-side twin of ``avoidable-forge``, and it is a genuine replay:
+    for each labelled scenario in ``fixtures/field/`` it re-runs the REAL resolver
+    (``requirement_binder.compute_requirements`` — the same function the runtime
+    calls) over the scenario's recorded inventory, with the operator's answer known,
+    and asks whether a source would have bound that answer. Never an LLM judge.
+
+    \b
+    HOW THIS DIFFERS FROM ``avoidable-ask``:
+      * ``avoidable-ask`` AGGREGATES the live ``ask_corpus.jsonl``. Those rows carry
+        no situation snapshot — not even a schema_path — so nothing can replay them.
+        It is a directional proxy and says so.
+      * this command REPLAYS. It can tell "the binder held exactly this value" apart
+        from "the binder held a DIFFERENT value", which no attempt-counting signal
+        can, at any sample size.
+
+    Reads the checked-in fixture corpus, not the vault: no vault is required and
+    nothing is written. A rate of "no assessable asks" is reported as such and is
+    NEVER rendered as 0%.
+
+    \b
+    EXIT STATUS:
+      0  DEFINITIVE — the corpus reconciled against its roster (a rate, or an
+         honest "no assessable asks")
+      1  NOT definitive — a scenario failed to load/replay, or the corpus drifted
+         from roster.json (a rostered fixture is missing, or an unrostered one is
+         present)
+
+    The non-zero status is the point of this being a command rather than a
+    printout: a scripted caller reads ``$?``, not prose, and the one state this
+    command exists to surface is exactly the one where the printed rate is
+    absent. Exiting 0 there hands the caller a clean run over a corpus the
+    harness could not vouch for.
+    """
+    from pathlib import Path
+    from systemu.runtime.resolver_replay import (
+        format_resolver_replay, resolver_replay_report)
+    report = resolver_replay_report(Path(corpus) if corpus else None)
+    for line in format_resolver_replay(report):
+        click.echo(line)
+    # `definitive` is a DERIVED property — declared>0, no errors, no roster drift.
+    # A dict `.get("complete")` cannot express it; the dataclass property can.
+    if not report.definitive:
+        raise SystemExit(1)
+
+
 @debug_group.command("rejection-log")
 @click.option("--clear", is_flag=True, help="Wipe the rejection store after listing.")
 @click.option("--window-hours", default=None, type=int,

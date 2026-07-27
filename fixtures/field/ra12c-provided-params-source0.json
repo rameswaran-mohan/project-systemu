@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "ra12c-provided-params-source0",
+  "title": "The tool call already supplied the parameter (source #0) — asking for it again is avoidable (R-A12c)",
+  "provenance": {
+    "release": "R-A12c",
+    "source_test": "tests/test_ra10_paramsub_merge.py",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "archive the folder",
+    "success_criteria": "an archive exists"
+  },
+  "capability": {
+    "name": "archive",
+    "parameters_schema": {
+      "destination": { "type": "string", "description": "where the archive goes" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {},
+    "declared_intents": []
+  },
+  "provided_params": {
+    "destination": "{root}/archive.zip"
+  },
+  "asks": [
+    {
+      "schema_path": "destination",
+      "class": "input",
+      "operator_answer": "{root}/archive.zip",
+      "label": "avoidable",
+      "why": "R-A12c added source #0: a required leaf already present in the CURRENT tool call's parameters binds instead of generating a spurious ask. The value was in hand before the ask was made, so the ask is avoidable by the strictest reading."
+    }
+  ]
+}

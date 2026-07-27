@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "ra10-ac1-unbindable-repo-leaf",
+  "title": "A required leaf no source can supply is a genuinely necessary ask (R-A10 AC1)",
+  "provenance": {
+    "release": "R-A10",
+    "source_test": "tests/test_ra10_binder.py::test_ac1_unbindable_leaf_is_decision_missing_no_value",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "push the change",
+    "success_criteria": "it is pushed"
+  },
+  "capability": {
+    "name": "push_repo",
+    "parameters_schema": {
+      "repo": { "type": "string", "description": "which repository" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {},
+    "declared_intents": []
+  },
+  "asks": [
+    {
+      "schema_path": "repo",
+      "class": "decision",
+      "operator_answer": "acme/prod",
+      "label": "necessary",
+      "why": "The situation is empty: no profile fact, no service, no granted-root file and no schema default names a repository. The resolver returns state=missing, so the operator had to be asked. This is the definitive negative case."
+    }
+  ]
+}
