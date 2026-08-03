@@ -1900,17 +1900,58 @@ def _gen_execution_id() -> str:
 _AUDIT_PARAM_VALUE_CAP = 200  # max chars per stringified param value in the audit row
 
 
-def _truncate_audit_params(params: Any) -> Dict[str, Any]:
-    """Return a shallow, length-capped copy of ``params`` safe for the audit log.
+#: Emitted when the masker could not be reached. Deliberately NOT ``[REDACTED]``
+#: (DEC-27): the healthy signal must not be emitted by a failure path, or an
+#: operator reading the audit row cannot tell "we masked this" from "we never
+#: managed to look".
+_AUDIT_MASK_UNAVAILABLE = "[redaction unavailable - value dropped]"
 
-    Each value is stringified and clipped to ``_AUDIT_PARAM_VALUE_CAP`` chars so a
-    huge ``content=`` blob can't bloat the audit JSONL (and the verifier prompt).
-    Never raises — returns ``{}`` for non-dict / unserialisable input.
+
+def _truncate_audit_params(params: Any) -> Dict[str, Any]:
+    """Return a shallow, MASKED, length-capped copy of ``params`` for the audit log.
+
+    Each value is masked, then stringified and clipped to
+    ``_AUDIT_PARAM_VALUE_CAP`` chars so a huge ``content=`` blob can't bloat the
+    audit JSONL (and the verifier prompt). Never raises — returns ``{}`` for
+    non-dict / unserialisable input.
+
+    **DEC-31 — masking runs FIRST, before the clip.** ``params`` is
+    ``decision["parameters"]``: model-authored, and the row it produces is
+    written durably by ``vault.append_action_audit``. This function used to clip
+    to 200 characters and mask nothing at all; the only masking on the path was
+    ``ledger.mask_and_digest_params`` further downstream, which therefore saw
+    the ALREADY-CLIPPED husk. Reproduced on this tree: a 392-char JWT under the
+    neutral key ``body`` was written as 200 clear characters whose base64
+    decoded to ``{"sub":…,"role":"admin","apikey":"SECRET-VALUE-DO-NOT-LOG"}``,
+    and the downstream mask then found nothing to mask — the JWT pattern needs
+    all three segments and the clip had removed the third.
+
+    ``_mask_evidence`` is the masker the audit-evidence path already uses
+    downstream, reused rather than reinvented, so the ledger's later pass is now
+    idempotent instead of load-bearing. It also brings key-targeted redaction
+    (``api_key``/``token``/``password``…) to a durable row that previously had
+    none.
+
+    Fail-CLOSED on an unreachable masker: the row is still written (the run must
+    not break, and the verifier needs to see that the tool ran) but the values
+    are dropped rather than emitted in clear.
     """
     out: Dict[str, Any] = {}
     if not isinstance(params, dict):
         return out
-    for k, v in params.items():
+    try:
+        from systemu.runtime.external_verifier import _mask_evidence
+        masked = _mask_evidence(params)
+    except Exception:
+        logger.debug("[Runtime] audit-param masker unavailable - dropping values",
+                     exc_info=True)
+        masked = None
+    if not isinstance(masked, dict):
+        # Either the import failed, or _mask_evidence hit its own internal
+        # fail-safe and returned its scalar marker for the whole structure.
+        # Both mean "this was never masked" — emit nothing from the values.
+        return {str(k): _AUDIT_MASK_UNAVAILABLE for k in params}
+    for k, v in masked.items():
         try:
             sv = v if isinstance(v, (int, float, bool)) or v is None else str(v)
             if isinstance(sv, str) and len(sv) > _AUDIT_PARAM_VALUE_CAP:
