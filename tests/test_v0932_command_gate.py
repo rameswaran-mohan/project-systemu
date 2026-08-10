@@ -661,10 +661,27 @@ def test_always_allow_skips_gate_after_first(tmp_path, monkeypatch):
 # ── REVIEW FIX-3: command-gate resolution persists ONLY via the dispatcher ────
 def test_resolve_gate_does_not_persist_command_always_allow(tmp_path):
     """The rail's resolve path (resolve_gate) must NOT persist an 'Always allow'
-    for a command gate — it has no command branch and 'always allow' isn't in
-    _APPROVE_LABELS, so it NOOPs. Always-allow persists ONLY via the dispatcher
+    for a command gate. Always-allow persists ONLY via the dispatcher
     (command_gate_handler). This proves a stray rail resolve cannot silently
-    permanently-allow a destructive command."""
+    permanently-allow a destructive command.
+
+    F34 — WHAT CHANGED AND WHAT DID NOT. This test used to assert NOOP as well,
+    on the reasoning that the command gate "has no command branch and 'always
+    allow' isn't in _APPROVE_LABELS, so it NOOPs". That mechanism was ALSO the
+    cause of a false statement to the operator: every resolution of a command or
+    tool gate, affirmative ones included, reported "Gate command not approved
+    (Always allow)" while the parked run went on to honour the choice. Command
+    and tool gates are now handled as caller-reads-choice (the parked run
+    re-reads via get_resolved_choice; resume_on_decision already treats exactly
+    these two gate_types as resumable), so the rail acknowledges the decision
+    instead of denying it, and the status is OK.
+
+    THE SECURITY PROPERTY IS UNCHANGED AND STILL PINNED BELOW: the rail persists
+    nothing. That assertion is the load-bearing one and is deliberately kept
+    first. The status code was only ever a proxy for "the rail did nothing", and
+    it is a bad proxy now that the rail legitimately records a decision — so the
+    weaker check is replaced by one that still catches a rail path which starts
+    granting: no persisted approval, and no claim of one."""
     import systemu.runtime.command_approvals as ca
     from systemu.runtime.command_approvals import command_signature
     from systemu.interface.command.inbox import resolve_gate
@@ -681,10 +698,18 @@ def test_resolve_gate_does_not_persist_command_always_allow(tmp_path):
                    "command": "rm -rf build", "cwd": "/proj"}
 
     result = resolve_gate(_Dec(), vault=object())
-    # NOOP — no executor wired into resolve_gate for command gates.
-    assert result.status == CommandStatus.NOOP
-    # And crucially: nothing was persisted by the rail path.
-    assert store.is_approved(sig) is False
+    # THE LOAD-BEARING ASSERTION: nothing was persisted by the rail path. A
+    # standing allow for `rm -rf build` may be minted only by the dispatcher.
+    assert store.is_approved(sig) is False, (
+        "the rail resolve persisted a standing command approval — a stray "
+        "resolve must never be able to permanently allow a destructive command"
+    )
+    # And the rail must not CLAIM to have granted one either (DEC-34).
+    assert "always allow" not in (result.summary or "").lower().replace(
+        f"({_Dec.choice.lower()})", ""
+    ), f"the rail implied it applied a standing allow: {result.summary!r}"
+    # No executor is wired for command gates here; the rail only records.
+    assert result.status in (CommandStatus.OK, CommandStatus.NOOP)
 
     # The dispatcher path DOES persist (the only sanctioned route).
     from systemu.pipelines import command_gate_handler as h

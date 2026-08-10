@@ -19,10 +19,25 @@ logger = logging.getLogger(__name__)
 _APPROVE_LABELS = {"approve", "approve & apply", "approve & install", "forge",
                    "enable & run"}
 
-# Operator gates are render-only: resolving ANY option unblocks the waiting
-# run (the caller re-reads the choice via get_resolved_choice). They are
-# therefore NOT gated on _APPROVE_LABELS — every resolution is a valid answer.
-_RENDER_ONLY_GATES = {"operator"}
+# CALLER-READS-CHOICE gates: resolving ANY option unblocks the waiting run,
+# because the parked caller re-reads the answer via get_resolved_choice and
+# `resume_on_decision` dispatches a resume. Nothing here should re-execute, so
+# these are NOT gated on _APPROVE_LABELS — every resolution is a valid answer.
+#
+# F34: "command" and "tool" belong here and were missing. Their own option
+# labels are Deny / Approve once / Always allow, none of which appear in
+# _APPROVE_LABELS, so EVERY resolution — including the affirmative ones — fell
+# through to the generic early-exit and reported
+#     Gate tool not approved (Always allow).
+# The standing allow was in fact recorded and the tool ran on the next attempt,
+# so the only feedback the operator received about a permission they had just
+# granted was false. DEC-34: a false assertion about what just happened is a
+# defect in its own right. Observed live while driving the forge end to end.
+#
+# resume_on_decision.py already treats exactly these two gate_types as
+# resumable (is_cmd_gate / is_tool_gate), which is the same contract stated
+# from the other side.
+_RENDER_ONLY_GATES = {"operator", "command", "tool"}
 
 
 def _handle_forge_rejection(decision, vault) -> CommandResult:

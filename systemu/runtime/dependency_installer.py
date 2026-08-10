@@ -229,11 +229,32 @@ def _is_satisfied(pkg: str) -> bool:
     # re-gated packages the operator had installed and approved long ago
     # (field RCA 2026-06-12: requests/playwright installed + approved, yet
     # every dep-declaring tool blocked).
+    name = _dist_name(pkg)
     try:
         from importlib import metadata as _metadata
-        _metadata.version(_dist_name(pkg))
+        _metadata.version(name)
     except Exception:
-        return False
+        # F32: fall back to IMPORTABILITY. What a tool needs is to `import X`;
+        # whether a distribution of that exact name exists is a different
+        # question and not the one the gate is asking. The forge is an LLM
+        # writing dependency lists, so it naturally writes IMPORT names, and the
+        # well-known splits are the popular packages: PIL/pillow,
+        # cv2/opencv-python, sklearn/scikit-learn, yaml/pyyaml,
+        # bs4/beautifulsoup4. Observed live: a forged tool declared "PIL",
+        # pillow was already installed, `metadata.version("PIL")` raised, and the
+        # tool was blocked pending `pip install PIL` -- a name pip cannot
+        # resolve. It could never be enabled and the offered remedy could never
+        # succeed.
+        #
+        # Strictly WIDER, never permissive: if neither metadata nor import finds
+        # it, this still returns False. find_spec does not execute the module,
+        # and a malformed name simply raises and is treated as absent.
+        try:
+            import importlib.util as _ilu
+            if _ilu.find_spec(name) is None:
+                return False
+        except Exception:
+            return False
     _mark_satisfied([pkg])
     return True
 
