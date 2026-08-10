@@ -456,7 +456,19 @@ def test_the_card_flags_a_tier_pointed_at_an_unusable_provider():
 
 
 def test_the_card_stays_quiet_when_every_selected_tier_is_usable(fake_ollama):
-    cfg = _cfg(tier1_provider="ollama", ollama_url=fake_ollama)
+    """EVERY tier, which is what this test always claimed and did not build.
+
+    It used to pin tier 1 alone and expect silence, because the banner scored
+    the explicit ``tier{N}_provider`` OVERRIDES and tiers 2-3 had none. Those
+    tiers were never unselected, though: their MODELS are the shipped
+    OpenRouter-served defaults and there is no OpenRouter key here, so they
+    would have failed at call time while this card said nothing. That gap is
+    the DEC-43 split closed in tests/test_provider_selection_parity.py -- the
+    banner now scores what the ROUTER will really call for all three, so the
+    quiet machine is the one where all three genuinely run.
+    """
+    cfg = _cfg(tier1_provider="ollama", tier2_provider="ollama",
+               tier3_provider="ollama", ollama_url=fake_ollama)
     rec = _render_card(cfg)
     assert not [t for t in rec.texts("label") if "Selected for a tier" in t]
 

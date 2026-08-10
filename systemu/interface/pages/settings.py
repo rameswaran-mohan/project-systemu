@@ -564,8 +564,8 @@ def provider_credentials_card(config) -> None:
         "Credentials are loaded from .env and never typed in the browser. "
         "Set the env var, then restart the daemon. Ollama takes no key, so "
         "its row reports whether it actually ANSWERS — a URL alone proves "
-        "nothing. A ✗ on a provider you've selected above is why a tier "
-        "would fail."
+        "nothing. A ✗ on a provider one of your tiers is routed to — by its "
+        "model id, not only by the dropdown above — is why a tier would fail."
     ).classes("s-muted")
 
     def _statuses(probe=None) -> dict:
@@ -591,15 +591,22 @@ def provider_credentials_card(config) -> None:
                     "s-pill " + _STATE_PILL.get(st.state, "s-pill--muted"))
                 ui.label(st.detail).classes("s-muted")
 
-        # W14 S8: red-flag the sharp edge — a provider SELECTED for a tier that
-        # is not usable fails at call time (an explicit override never
-        # reroutes). Held back until the probes have actually run, so the
-        # banner is never a claim about a verdict we have not made yet.
+        # W14 S8: red-flag the sharp edge - a provider a tier will be CALLED ON
+        # that is not usable fails at call time. Held back until the probes
+        # have actually run, so the banner is never a claim about a verdict we
+        # have not made yet.
+        #
+        # DEC-43, the last split: this fed the mint the explicit
+        # `tier{N}_provider` OVERRIDES alone, which are EMPTY on a fresh
+        # install - so it stayed dark on exactly the machine whose tiers cannot
+        # run (no key, Ollama answering, the shipped OpenRouter-served default
+        # models), while /welcome, deriving the same word differently, warned.
+        # `routed_tier_providers` is that one derivation, and it SUBSUMES the
+        # override: the router obeys an explicit pin literally.
         if not held["observed"]:
             return
         unusable = _ps.unusable_selected(
-            statuses,
-            [getattr(config, f"tier{i}_provider", "") for i in (1, 2, 3)])
+            statuses, _ps.routed_tier_providers(config))
         if unusable:
             ui.label(
                 "Selected for a tier but not usable: "

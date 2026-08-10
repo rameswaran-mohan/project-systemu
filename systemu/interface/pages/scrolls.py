@@ -17,6 +17,7 @@ from systemu.interface.design import card
 from systemu.interface.design.primitives import status_pill_html
 from systemu.interface.scroll_gate import open_scroll_review_dialog
 from systemu.interface.scroll_rebuild import open_scroll_rebuild_dialog
+from systemu.interface.ui_helpers import format_event_time
 
 
 def build_scrolls_page() -> None:
@@ -186,11 +187,10 @@ def _show_scroll_detail(scroll_id: str) -> None:
                             )
                             if keys:
                                 ui.label(keys).classes("s-muted")
-                        try:
-                            ts_str = ev.ts.strftime("%H:%M:%S")
-                        except Exception:
-                            ts_str = str(getattr(ev, "ts", ""))[:8]
-                        ui.label(ts_str).classes("s-muted")
+                        # TraceEvent.ts is aware UTC (core.models); render the
+                        # operator's LOCAL clock via the ONE shared formatter.
+                        ui.label(format_event_time(getattr(ev, "ts", None))) \
+                            .classes("s-muted")
 
         # v0.6.8-b: embedded recovery panel for this scroll
         ui.separator().classes("s-sep")

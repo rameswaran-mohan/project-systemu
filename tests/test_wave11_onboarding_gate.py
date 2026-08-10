@@ -35,8 +35,18 @@ def _config(key: str = ""):
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
+    """Construct the bare machine; never inherit one.
+
+    Every provider env var is removed, not just OpenRouter: the gate asks THE
+    MINT "is any provider usable", so a GOOGLE_API_KEY (or an OLLAMA_URL
+    pointing at a server the developer happens to be running) in the ambient
+    environment would answer for the config under test.
+    """
+    from systemu.runtime import provider_status as ps
     monkeypatch.delenv("SYSTEMU_SKIP_ONBOARDING", raising=False)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    for spec in ps.PROVIDER_SPECS:
+        monkeypatch.delenv(spec.env, raising=False)
+    ps.clear_probe_cache()
 
 
 class TestOnboardingGate:

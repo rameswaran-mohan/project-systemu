@@ -338,7 +338,7 @@ def _is_network_retriable(exc: BaseException) -> bool:
     return False
 
 
-def _resolve_provider_keyaware(model: str, override: str, config) -> type:
+def resolve_provider_keyaware(model: str, override: str, config) -> type:
     """W12 (audit F3): key-aware provider resolution.
 
     Auto-detection routes ``google/*`` / ``anthropic/*`` / ``gpt-*`` model
@@ -347,6 +347,16 @@ def _resolve_provider_keyaware(model: str, override: str, config) -> type:
     the OpenRouter key is present, fall back to OpenRouter instead of
     failing with a cryptic 400 ("Missing or invalid Authorization header").
     An explicit ``SYSTEMU_TIER{N}_PROVIDER`` override always wins.
+
+    PUBLIC ON PURPOSE (DEC-43). "Which provider will this tier actually be
+    called on" is decided HERE and nowhere else, and it is a question the
+    operator-facing surfaces have to ask too: /welcome step 1 and the Settings
+    red flag both warn about tiers that cannot run, and a model-prefix guess
+    written on either page would be a second copy of this rule that cries wolf
+    on every machine where OpenRouter legitimately serves a native id. They ask
+    through ``provider_status.routed_tier_providers``, which asks this. The
+    underscore name below is kept as an alias for the in-tree callers that
+    predate the promotion; it is the same object, not a wrapper.
     """
     from systemu.llm.providers import resolve_provider_class
     from systemu.llm.providers.openrouter import OpenRouterProvider
@@ -367,6 +377,12 @@ def _resolve_provider_keyaware(model: str, override: str, config) -> type:
             cls.__name__, model)
         return OpenRouterProvider
     return cls
+
+
+#: The pre-promotion name. An ALIAS, not a wrapper: the callers below, the
+#: W12/W14 tests and anything else already bound to it keep the same function
+#: object, so no surface can drift onto a second resolution.
+_resolve_provider_keyaware = resolve_provider_keyaware
 
 
 def _get_client(config: Config, tier: int = 0) -> AsyncOpenAI:

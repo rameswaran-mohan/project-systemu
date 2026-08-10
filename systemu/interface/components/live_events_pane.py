@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from nicegui import ui
 
 from systemu.interface.dashboard_state import THEME
+from systemu.interface.ui_helpers import format_event_time
 
 _MAX_EVENTS = 50
 
@@ -62,18 +63,16 @@ def _level_color(level: str) -> str:
     }.get((level or "").upper(), THEME["text_muted"])
 
 
-def _format_event_time(ts) -> str:
-    """Return HH:MM:SS from an ISO string, epoch float/int, or '' if missing/unparseable."""
-    from datetime import datetime, timezone
-    if not ts:
-        return ""
-    try:
-        if isinstance(ts, (int, float)):
-            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
-        s = str(ts).replace("Z", "+00:00")
-        return datetime.fromisoformat(s).strftime("%H:%M:%S")
-    except Exception:
-        return ""
+def _format_event_time(ts, *, tz=None) -> str:
+    """Return HH:MM:SS in the operator's LOCAL zone, or '' if missing/unparseable.
+
+    Thin delegate to the ONE shared formatter so this pane, the Home right
+    rail, the Notifications page and the Chat live feed can never drift apart
+    again. Event ``ts`` values are stored in UTC (see ``ui_helpers``); this
+    used to print those UTC digits verbatim while /chat converted, so the same
+    event read 20:16:56 here and 01:46:56 there. ``tz`` is a test seam.
+    """
+    return format_event_time(ts, tz=tz)
 
 
 def _display_order(buf) -> list:

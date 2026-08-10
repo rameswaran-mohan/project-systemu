@@ -13,6 +13,7 @@ from nicegui import ui
 
 from systemu.interface.dashboard_state import THEME
 from systemu.interface.name_resolver import resolve_name, short_id
+from systemu.interface.ui_helpers import format_stamp
 from systemu.runtime.workflow_tracker import STAGES, WorkflowTracker
 
 
@@ -367,9 +368,13 @@ def _link_row(icon: str, label: str, entity_id: str, route: str) -> None:
             )
 
 
-def _short_ts(iso: str) -> str:
-    """Trim the ISO timestamp to a human-readable form (seconds precision)."""
-    return (iso or "")[:19].replace("T", " ")
+def _short_ts(iso: str, *, tz=None) -> str:
+    """Stored timestamp -> the operator's LOCAL wall clock (seconds precision).
+
+    Delegates to the ONE shared formatter (``ui_helpers.format_stamp``); the
+    old ISO slice printed stored UTC digits unconverted. ``tz`` is a test seam.
+    """
+    return format_stamp(iso, tz=tz)
 
 
 def _build_affinity_log_panel(shadow_id: str) -> None:

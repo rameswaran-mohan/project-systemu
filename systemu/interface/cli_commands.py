@@ -1401,6 +1401,7 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
     becomes ready is reported honestly with a nonzero exit instead of hanging.
     """
     config, vault = _get_vault_and_config(ctx)
+    from systemu.scheduler import daemon as _daemon_mod
     from systemu.scheduler.daemon import start_daemon
 
     # ── F21: the [dashboard] group gate, BEFORE anything is spawned ─────────
@@ -1475,12 +1476,25 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
     # DEC-41 / DEC-43: the claim below is gated on the MINTED witness, never on
     # the fact that Popen returned. `daemon status` consumes the same mint, so
     # the two surfaces cannot contradict each other.
+    # The vault-root fence (DEC-32) is a REFUSAL, not a failed start: nothing
+    # was spawned, nothing was written, and the remedy is a directory change —
+    # not `daemon stop`. Reported on its own branch so the operator is not sent
+    # to a daemon.log that was never opened.
+    if verdict is not None and verdict.refused:
+        from rich.markup import escape as _esc
+        console.print(f"[red]{_esc(verdict.reason)}[/red]")
+        ctx.exit(_daemon_mod.VAULT_ROOT_REFUSED_EXIT)
+
     if verdict is not None and verdict.ready:
         console.print("[green]✓ Daemon ready.[/green]")
         console.print(f"  Accepting connections on {verdict.url}")
         _print_daemon_build(verdict.build_match, verdict.build_note)
         console.print("  Use [bold]systemu daemon status[/bold] to check.")
-        return
+        # The MINTED verdict is handed back so a caller (`systemu start`) can
+        # gate on the same witness instead of re-deriving one. Click ignores a
+        # command callback's return value, so nothing about `daemon start` as
+        # an operator sees it changes here.
+        return verdict
 
     console.print("[red]✗ Daemon did not become ready.[/red]")
     reason = verdict.reason if verdict is not None else "no readiness verdict was produced"
@@ -1578,6 +1592,106 @@ def daemon_status(ctx, port):
             "Start with: [bold]systemu daemon start[/bold]",
             title="⚡ Systemu Daemon", border_style="dim"
         ))
+
+
+# -----------------------------------------------------------------------------
+#  `systemu start` -- the one-command golden path
+# -----------------------------------------------------------------------------
+#  One command for a first run: start the daemon, then put the operator in
+#  front of the dashboard. It is a THIN CALLER of `daemon start` --- the
+#  provider gate, the interactive setup fallback, the vault-root refusal
+#  (DEC-32) and the DEC-41 readiness witness are that command's code, reached
+#  through `ctx.invoke`, never a second copy that can drift out of agreement
+#  with the first.
+#
+#  DEC-41 IN UX FORM. Opening a browser is a CLAIM that something is serving at
+#  that URL. So the browser is gated on the SAME minted witness the exit code is
+#  gated on: no ready verdict, no browser, and the nonzero exit propagates
+#  untouched. A browser pointed at a daemon that never bound its port is the
+#  false assertion `daemon start` already refuses to make in words.
+
+def should_open_browser(verdict, *, no_browser: bool, interactive: bool) -> bool:
+    """PURE. The minted readiness verdict (plus the two suppressors) decides.
+
+    Answers the question only --- it opens nothing, prints nothing, and reads
+    no environment --- so the rule can be tested without a daemon anywhere near
+    it.
+
+    Fail-closed on every axis (DEC-36: the concrete type is pinned in this
+    frame, because `or` / `!=` / `bool()` all dispatch to the operand):
+
+      * no verdict, or a REFUSED one --- nothing was spawned; there is no URL
+      * `ready` that is not the literal bool `True` --- a truthy stand-in is
+        not the witness `probe_readiness` mints
+      * ``no_browser`` --- the operator said not to
+      * a non-interactive session --- `start` must then do exactly what
+        `daemon start` does today, which is nothing. Not a style choice: on a
+        DISPLAY-less box `webbrowser` can fall through to a console browser it
+        runs with `p.wait()`, hanging a CI job on a daemon that is genuinely up.
+    """
+    if type(no_browser) is not bool or no_browser:
+        return False
+    if type(interactive) is not bool or not interactive:
+        return False
+    if verdict is None:
+        return False
+    refused = getattr(verdict, "refused", False)
+    if type(refused) is not bool or refused:
+        return False
+    ready = getattr(verdict, "ready", None)
+    return type(ready) is bool and ready
+
+
+def _is_interactive() -> bool:
+    """Is there a human at a terminal? Same predicate `daemon start` uses for
+    its interactive setup fallback, so the two agree on what "headless" means."""
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def _open_dashboard(url: str) -> bool:
+    """Best effort, and it SAYS which. Never raises, never changes the exit.
+
+    The daemon is up and the URL was printed by `daemon start` either way, so a
+    box with no browser is a note --- turning it into a failure would red a
+    working install for a cosmetic reason.
+    """
+    try:
+        import webbrowser
+        opened = webbrowser.open(url)
+    except Exception:
+        opened = False
+    if type(opened) is bool and opened:
+        console.print(f"  Opened {url} in your browser.")
+        return True
+    console.print(f"  [dim]No browser opened here - visit {url}[/dim]")
+    return False
+
+
+@click.command("start")
+@click.option("--port", default=8765, show_default=True,
+              help="Port for the web dashboard.")
+@click.option("--no-browser", "no_browser", is_flag=True, default=False,
+              help="Start the daemon but do not open a browser "
+                   "(headless boxes, scripts, CI).")
+@click.pass_context
+def start_cmd(ctx, port: int, no_browser: bool):
+    """Start Systemu and open the dashboard.
+
+    The whole first run in one command: it does exactly what
+    `systemu daemon start` does --- same provider gate, same setup fallback,
+    same refusals, same exit codes --- and then, once a real connection to the
+    dashboard has been witnessed, opens it in your browser.
+
+    No witness, no browser: a start that did not become ready keeps its own
+    nonzero exit and its own diagnosis. Use --no-browser on a headless box.
+    """
+    verdict = ctx.invoke(daemon_start, port=port, foreground=False, wait_s=None)
+    if should_open_browser(verdict, no_browser=no_browser,
+                           interactive=_is_interactive()):
+        _open_dashboard(verdict.url)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

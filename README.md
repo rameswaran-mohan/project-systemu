@@ -226,12 +226,19 @@ In your chosen working directory:
 
 ```bash
 systemu init           # seeds the starter catalog (41 tools, idempotent)
-systemu setup          # pick your LLM provider + model preset, store keys securely
-systemu daemon start
+systemu start          # sets up your provider if needed, then opens the dashboard
 ```
 
+`systemu start` is the whole first run in one command: it walks you through
+choosing an LLM provider and model preset if you have not picked one yet, brings
+up the daemon, waits until the dashboard is genuinely accepting connections, and
+opens it in your browser. Add `--no-browser` for a headless box or a script, and
+`--port` to move it off 8765. The individual commands are permanent and
+unchanged — `systemu setup`, `systemu daemon start` / `stop` / `status` — so
+existing scripts keep working exactly as they do today.
+
 > Plain `pip install systemu` gives you the full CLI, the runtime, the vault and
-> all 41 starter tools — but not the web UI, and `daemon start` needs it (the
+> all 41 starter tools — but not the web UI, and `systemu start` needs it (the
 > command reports success only once a real connection to the dashboard port
 > succeeds, so without it there is nothing to witness). It will tell you so and
 > name the command. See [Optional capability groups](#optional-capability-groups).
@@ -246,7 +253,7 @@ systemu daemon start
 `systemu setup` walks you through choosing a provider (OpenRouter, Google,
 OpenAI, Anthropic, or a local Ollama) per tier and stores the keys in a local
 `.env` — entered hidden, never echoed, never typed into a browser. Skip it and
-`daemon start` runs the same flow on first launch.
+`systemu start` runs the same flow on first launch.
 
 ### Optional capability groups
 
@@ -270,9 +277,10 @@ table with the state of each. `systemu daemon start` without `[dashboard]`
 refuses immediately and names the command, rather than printing a URL that
 nothing serves.
 
-Open <http://localhost:8765>. A short setup wizard and guided tour take it from
-there: confirm your models, say who you are, run a starter task — then hit
-**Record** and teach it something real.
+`systemu start` opens <http://localhost:8765> for you (it is printed either way,
+so `--no-browser` and remote boxes lose nothing). A short setup wizard and
+guided tour take it from there: confirm your models, say who you are, run a
+starter task — then hit **Record** and teach it something real.
 
 **The one-page guide:** [OPERATOR-SOP.md](OPERATOR-SOP.md) — the
 record → approve → run → results loop, what each approval card means, and
@@ -772,7 +780,8 @@ surface; the headline groups:
 |---|---|
 | `sharing_on record` / `analyze` | Capture a workflow / re-analyze a recorded session |
 | `sharing_on init` | Seed the working-directory vault from the bundled starter catalog |
-| `sharing_on setup` | Pick the LLM provider + model preset per tier and store keys securely (hidden entry → `.env`); auto-runs on first `daemon start` if unconfigured |
+| `sharing_on start` | The one-command first run: provider setup if needed, daemon up, dashboard opened in your browser (`--no-browser`, `--port`) |
+| `sharing_on setup` | Pick the LLM provider + model preset per tier and store keys securely (hidden entry → `.env`); auto-runs on first `systemu start` if unconfigured |
 | `sharing_on daemon start` / `stop` / `status` | Run the background daemon + web dashboard |
 | `sharing_on doctor <id>` | Diagnose pending gates/blockers for a scroll/activity/shadow/tool (`--apply` to auto-fix) |
 | `sharing_on scrolls list` / `show` / `refine` / `approve` | Manage Scrolls (refined SOPs) |

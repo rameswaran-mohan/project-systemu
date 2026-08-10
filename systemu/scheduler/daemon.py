@@ -40,6 +40,35 @@ DEFAULT_DASHBOARD_PORT = 8765
 # Bounded wait applied to `daemon start` before it is allowed to claim success.
 _DEFAULT_START_TIMEOUT_S = 60.0
 
+# Exit status used by every surface that refuses to boot onto a vault root
+# inside the systemu package (EX_CONFIG). Nonzero, and distinct from the
+# "spawned but never became ready" exit so the two cannot be confused.
+VAULT_ROOT_REFUSED_EXIT = 78
+
+
+def resolve_child_vault_dir(vault_dir: str) -> str:
+    """THE CHILD-SIDE BOUNDARY for the operating vault root.
+
+    Returns the ONE absolute root the daemon child may operate out of, or
+    refuses -- loudly, on stderr, with a nonzero exit -- when that root lies
+    inside the installed systemu package.
+
+    DEC-32: the fence is the ``refused`` bit ON THE MINTED VALUE, read in the
+    frame that decides to open the vault. The refusal path (this message + this
+    exit code) is not producible by the success path, and there is no
+    intermediate frame between the check and the decision that could swallow it.
+    The child needs its own copy of this check because a child can be launched
+    directly (`python -m systemu.scheduler.daemon --vault-dir ...`), not only by
+    :func:`start_daemon`.
+    """
+    from systemu.runtime.vault_root import refusal_message, resolve_vault_root
+
+    verdict = resolve_vault_root(explicit=vault_dir)
+    if verdict.refused:
+        print(refusal_message(verdict), file=sys.stderr, flush=True)
+        raise SystemExit(VAULT_ROOT_REFUSED_EXIT)
+    return verdict.root
+
 
 def _pid_file_path(vault_dir: str) -> Path:
     return Path(vault_dir).parent / _PID_FILE_NAME
@@ -138,6 +167,12 @@ class DaemonReadiness:
     cli_path: Optional[str] = None
     build_match: Optional[bool] = None
     build_note: str = ""
+
+    # -- the vault-root fence (DEC-32) ---------------------------------------
+    # True only when the boot was REFUSED because the operating vault root lies
+    # inside the installed systemu package. Distinct from a plain not-ready:
+    # nothing was spawned, nothing was written, and the remedy is different.
+    refused: bool = False
 
     @property
     def url(self) -> str:
@@ -545,6 +580,27 @@ def start_daemon(
     mint, and the minted verdict is RETURNED so the caller's success claim can
     be gated on the witness rather than on the spawn (DEC-41).
     """
+    # ── THE VAULT-ROOT BOUNDARY (DEC-32) ────────────────────────────────────
+    # FIRST statement in the function, ahead of every write: the pidfile, the
+    # log file and the runtime sidecar all hang off this path. `vault_dir` used
+    # to travel onward as the caller's own string -- typically the RELATIVE
+    # `systemu/vault` -- and the child then resolved it against a DIFFERENT cwd.
+    # The mint turns it into ONE absolute path and hands back the fence bit
+    # alongside it; from here down nothing reads `vault_dir` again.
+    from systemu.runtime.vault_root import refusal_message as _refusal_message
+    from systemu.runtime.vault_root import resolve_vault_root as _resolve_vault_root
+
+    _root_verdict = _resolve_vault_root(explicit=vault_dir)
+    if _root_verdict.refused:
+        logger.error("[Daemon] %s", _root_verdict.reason)
+        return DaemonReadiness(
+            ready=False, pid=None, process_alive=False,
+            host=_readiness_host(), port=int(port),
+            reason=_refusal_message(_root_verdict),
+            refused=True,
+        )
+    vault_dir = _root_verdict.root
+
     pid_file = _pid_file_path(vault_dir)
 
     if foreground:
@@ -601,21 +657,37 @@ def start_daemon(
                     f"(`systemu daemon stop --all`, or pick another --port)"),
         )
 
-    # Spawn as a detached subprocess
+    # Spawn as a detached subprocess.
+    #
+    # `vault_dir` is the MINTED ABSOLUTE root by now, so the child cannot
+    # re-resolve it against its own cwd. This argv used to carry the caller's
+    # relative string.
     cmd = [
         sys.executable, "-m", "systemu.scheduler.daemon",
         "--vault-dir", vault_dir,
         "--port", str(port),
     ]
+    Path(vault_dir).mkdir(parents=True, exist_ok=True)
     log_file = open(Path(vault_dir) / "daemon.log", "a", encoding="utf-8")
     import subprocess
     import os
     import systemu
 
-    # v0.7.3 Bug #7 fix — prefer CWD when it looks like a systemu working dir
-    # (has .env or .systemu_mode). For pip-installed wheel users the previous
-    # systemu.__file__-based resolution landed the vault inside site-packages,
-    # which gets clobbered on `pip install --upgrade`.
+    # The OPERATING HOME — the directory the operator is standing in. It is the
+    # child's cwd, so every relative path the child touches lands where the
+    # parent's would have.
+    #
+    # This used to be conditional: cwd only when it "looked like" a systemu
+    # working dir (a `.env` or `.systemu_mode` present), else
+    # `Path(systemu.__file__).parent.parent`. Launching from an empty directory
+    # therefore ran the whole daemon inside the package tree — that is the
+    # v0.10.23 defect this file's `resolve_child_vault_dir` fences. The shape of
+    # the cwd no longer decides anything.
+    operating_home = Path(_root_verdict.home)
+
+    # project_root stays derived exactly as before, and ONLY feeds PYTHONPATH:
+    # it answers "where is the code", which is a different question from "where
+    # is the operator standing" and must keep its F13 behaviour byte-for-byte.
     _cwd = Path.cwd().absolute()
     if (_cwd / ".env").exists() or (_cwd / ".systemu_mode").exists():
         project_root = _cwd
@@ -648,7 +720,16 @@ def start_daemon(
     # environment so AppState._resolve_project_root() picks it up via Tier 1
     # instead of recomputing (broken on pip installs) or walking the vault.
     # setdefault so an operator override on the parent shell still wins.
-    env.setdefault("SYSTEMU_PROJECT_ROOT", str(project_root))
+    env.setdefault("SYSTEMU_PROJECT_ROOT", str(operating_home))
+
+    # The child re-reads SYSTEMU_VAULT_DIR in several places (skill migrator,
+    # credential store, memory backends, Config.from_env). Pin it to the SAME
+    # absolute value carried in argv so argv and env cannot disagree — an
+    # unset/relative value here is exactly how the child's own reads used to
+    # land in a different directory than the one it was told to serve. Assigned,
+    # not setdefault: the mint already honoured any operator-set value when it
+    # produced this root, so this IS the operator's choice, absolutised.
+    env["SYSTEMU_VAULT_DIR"] = vault_dir
 
     # F13: written BEFORE the spawn, and with NO build.
     #   * no build — the parent knows the build IT imported, and nothing at all
@@ -665,7 +746,7 @@ def start_daemon(
         stderr=subprocess.STDOUT,
         close_fds=True,
         start_new_session=True,
-        cwd=str(project_root),
+        cwd=str(operating_home),
         env=env,
     )
     pid_file.write_text(str(proc.pid))
@@ -1004,7 +1085,11 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # directories on operator upgrade.
     try:
         from systemu.storage.skill_migrator import migrate_skill_layout
-        vault_dir = Path(os.environ.get("SYSTEMU_VAULT_DIR", "systemu/vault"))
+        # The mint, not a second relative default: this migrator REWRITES the
+        # skill layout on disk, and a `systemu/vault` resolved against the
+        # wrong cwd is how it came to rewrite the PACKAGED seed catalog.
+        from systemu.runtime.vault_root import resolve_vault_root as _rvr
+        vault_dir = Path(_rvr().root)
         report = migrate_skill_layout(vault_dir)
         if report.migrated:
             logger.info(
@@ -1484,10 +1569,18 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
+    # ── THE VAULT-ROOT BOUNDARY (DEC-32) ────────────────────────────────────
+    # Before the first byte is written anywhere: mint the absolute operating
+    # root and refuse if it lands inside the installed package. Everything below
+    # — the log file, the pidfile, the Vault itself — hangs off `_vault_root`,
+    # never off the raw argument.
+    _vault_root = resolve_child_vault_dir(args.vault_dir)
+
     import logging
     import logging.handlers
 
-    log_file_path = str(Path(args.vault_dir) / "systemu_exec.log")
+    Path(_vault_root).mkdir(parents=True, exist_ok=True)
+    log_file_path = str(Path(_vault_root) / "systemu_exec.log")
 
     # ── Format ────────────────────────────────────────────────────────────────
     fmt = logging.Formatter(
@@ -1530,9 +1623,13 @@ if __name__ == "__main__":
         "[Daemon] Logging configured — stdout: INFO+ | file: DEBUG+ | log: %s", log_file_path
     )
 
+    # The child's own env now names the SAME absolute root the parent minted
+    # (start_daemon assigns it), so Config.from_env() cannot pick a different
+    # vault than the one this process was told to serve.
+    os.environ["SYSTEMU_VAULT_DIR"] = _vault_root
     _config = Config.from_env()
-    _vault = Vault(args.vault_dir)
-    pid_file = _pid_file_path(args.vault_dir)
+    _vault = Vault(_vault_root)
+    pid_file = _pid_file_path(_vault_root)
 
     # ── v0.8.0.2: refuse to start when port is already in use ───────────────
     _bind_host = "127.0.0.1"

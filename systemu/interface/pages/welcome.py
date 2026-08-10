@@ -96,29 +96,162 @@ def detect_timezone() -> str:
 
 
 def _refresh_key_status(config, *, env_file: str = ".env") -> bool:
-    """Notice a key added to .env while /welcome is open (W11.4).
+    """Notice a provider added to .env while /welcome is open (W11.4).
 
-    The key is never typed in the browser — the operator edits .env in their
-    editor and clicks Re-check. Reads the live environment first, then the
-    .env file next to the app, WITHOUT stomping the process environment (no
-    load_dotenv override — the daemon's env stays exactly as booted). Updates
-    the live config snapshot on success. Never raises.
+    THE RE-CHECK WRITER — and only a writer: it never decides whether the
+    install is usable (that verdict comes from the mint, see
+    ``finalize_onboarding``). Credentials are never typed in the browser, so the
+    operator edits .env in their editor and clicks Re-check; this reads the live
+    environment first, then the named .env file, WITHOUT stomping the process
+    environment (no ``load_dotenv`` override — the daemon's env stays exactly as
+    it booted), and writes what it finds onto the live config snapshot the mint
+    is about to score. Returns True when at least one provider value was
+    refreshed. Never raises.
+
+    IT REFRESHES EVERY PROVIDER, not just OpenRouter. It used to read
+    ``OPENROUTER_API_KEY`` alone, which made Re-check useless for the very
+    remedies step 1 offers a few lines below: an operator who added a Google key
+    — or who pointed ``OLLAMA_URL`` at a server they had just started, the one
+    remedy needing no credential at all — clicked Re-check and was told nothing
+    had changed. The attribute/env-var pairing is read off
+    ``provider_status.PROVIDER_SPECS``, so this page names no credential of its
+    own and a sixth provider is picked up with nobody editing this function.
     """
     import os
-    key = (os.environ.get("OPENROUTER_API_KEY", "") or "").strip()
-    if not key:
+    from systemu.runtime import provider_status as _ps
+
+    file_values = None   # read the .env at most once, and only if needed
+    found = False
+    for spec in _ps.PROVIDER_SPECS:
+        value = (os.environ.get(spec.env, "") or "").strip()
+        if not value:
+            if file_values is None:
+                try:
+                    from dotenv import dotenv_values
+                    file_values = dotenv_values(env_file) or {}
+                except Exception:
+                    file_values = {}
+            raw = file_values.get(spec.env)
+            value = raw.strip() if type(raw) is str else ""
+        if not value:
+            continue
         try:
-            from dotenv import dotenv_values
-            key = ((dotenv_values(env_file) or {})
-                   .get("OPENROUTER_API_KEY") or "").strip()
+            setattr(config, spec.attr, value)
+            found = True
         except Exception:
-            key = ""
-    if key:
-        try:
-            config.openrouter_api_key = key
-        except Exception:
-            pass
-    return bool(key)
+            logger.debug("[Welcome] could not refresh %s", spec.provider,
+                         exc_info=True)
+    return found
+
+
+def presets_that_run_here(config, usable) -> list:
+    """The step-2 presets whose EVERY tier would route to a usable provider.
+
+    ``[(name, [provider ids it uses]), ...]``, in dropdown order.
+
+    THE REMEDY LIST IS COMPUTED, NEVER ASSERTED. "Pick a preset below that uses
+    Ollama" is a true sentence only while such a preset is actually in the
+    dropdown three lines down, and today none is: every shipped preset names a
+    cloud model id. Adding a local preset later turns the offer on with nobody
+    editing the copy, and a preset that is only PARTLY local never qualifies --
+    one unkeyed tier is still a failed task.
+
+    The current per-tier provider OVERRIDES are applied while scoring, because
+    picking a preset changes the tier MODELS only: an operator pinned to a dead
+    provider is not rescued by any preset, and must not be told they are.
+
+    Scored with the mint's own ``routed_provider`` -- the same resolution the
+    SELECTION comes from, so an offer made here cannot rest on different
+    routing from the sentence that makes it.
+    """
+    from sharing_on.model_presets import PRESETS
+    from systemu.runtime import provider_status as _ps
+    out = []
+    for name in sorted(PRESETS):
+        tiers = PRESETS.get(name) or {}
+        served: "List[str] | None" = []
+        for i in (1, 2, 3):
+            try:
+                override = getattr(config, f"tier{i}_provider", "")
+            except Exception:
+                override = ""
+            pid = _ps.routed_provider(tiers.get(f"tier{i}", ""), override, config)
+            if pid not in usable:
+                served = None
+                break
+            if pid not in served:
+                served.append(pid)
+        if served:
+            out.append((name, served))
+    return out
+
+
+def _sentence(text: str) -> str:
+    """End a borrowed clause exactly once (mint details already carry '?')."""
+    body = (text or "").strip()
+    return body if body.endswith((".", "!", "?")) else body + "."
+
+
+def tier_readiness_warning(statuses, config) -> str:
+    """Step 1's second sentence: "...but not for the tiers you are on". Or "".
+
+    THE GAP DEC-43 LEFT. Making satisfaction unconditional on selection was
+    right, and it means step 1 now tells the keyless operator "Provider ready:
+    Ollama" and Finish lets them through. Both true -- about SATISFACTION. The
+    router routes by the tier MODELS, and the shipped defaults are served by
+    OpenRouter, which has no key on that machine. The first starter click fails.
+
+    The second fact already had a mint (``unusable_selected``) and a surface
+    (the Settings red flag). It did not have one HERE, which is where a fresh
+    operator stands. So this consumes that mint -- the same ``statuses`` the
+    "Provider ready" line above was minted from, so the two sentences cannot be
+    about different observations -- and adds no verdict of its own.
+
+    It does not derive the SELECTION it scores either: ``routed_tier_providers``
+    is the mint's, and Settings reads the same one. This page briefly owned that
+    derivation while the Settings banner used another, which is how one screen
+    warned about a machine the other called fine.
+
+    Silent when nothing is satisfied: that machine belongs to the no-provider
+    banner, and two banners each telling half of "you cannot run" is the
+    reader's version of two verdicts. ASCII (DEC-32c). Never raises.
+    """
+    from systemu.runtime import provider_status as _ps
+    try:
+        satisfied = _ps.satisfied_providers(statuses)
+        if not satisfied:
+            return ""
+        unusable = _ps.unusable_selected(
+            statuses, _ps.routed_tier_providers(config))
+        if not unusable:
+            return ""
+        blocked = ", ".join(u.display for u in unusable)
+        ready = ", ".join(s.display for s in satisfied)
+        # THE REMEDY TEXT IS THE MINT'S OWN, per blocked provider: "add
+        # GOOGLE_API_KEY to .env" for a key-based one, "is `ollama serve`
+        # running?" for the keyless one. Writing a remedy here would be a
+        # second recipe, and it would tell an Ollama operator to add a key.
+        detail = (unusable[0].detail if len(unusable) == 1 else
+                  "; ".join(f"{u.display}: {u.detail}" for u in unusable))
+        line = (f"Heads up: your model tiers are set to run on {blocked}, "
+                f"which this machine cannot use yet, so the first real task "
+                f"would fail. ")
+        runnable = presets_that_run_here(config,
+                                         {s.provider for s in satisfied})
+        if runnable:
+            name, served = runnable[0]
+            serves = ", ".join(_ps.SPEC_BY_PROVIDER[p].display for p in served)
+            line += (f"Pick the '{name}' preset in step 2 below - it runs on "
+                     f"{serves}, which is working here. Or fix the provider "
+                     f"instead: {_sentence(detail)}")
+        else:
+            # No preset changes the answer, so do not imply one does.
+            line += (f"No preset in step 2 runs entirely on {ready}, so the "
+                     f"fix is on the provider side: {_sentence(detail)}")
+        return line.encode("ascii", "backslashreplace").decode("ascii")
+    except Exception:
+        logger.debug("[Welcome] tier readiness line failed", exc_info=True)
+        return ""
 
 
 # The W11.4 redirect funnels fresh installs to /welcome on these checks ONLY.
@@ -286,17 +419,33 @@ def build_welcome_page() -> None:
             ui.label(f"1 · {onboarding_steps()[0]}").classes("s-section-head")
             # F19: the STATUS disclosure consumes the mint, so this step and the
             # Settings page cannot disagree about the same machine.
+            #
+            # THE SAME WITNESS FINISH SPENDS. This used to hand the mint
+            # `unprobed` unless a tier already named the keyless provider, so on
+            # a keyless machine with Ollama answering it printed "No LLM
+            # provider is usable yet" — under a Finish button that (once
+            # unified) accepts that machine, and on an install whose daemon had
+            # already booted on it. A status line and the gate beside it must be
+            # the same claim. The render cost is bounded by the mint's 20 s memo,
+            # which the health banner on this very page has usually just warmed.
             from systemu.runtime import provider_status as _ps
+            _view = _ps.env_overlay(config)
             _pstat = _ps.all_provider_statuses(
-                _ps.env_overlay(config), probe=_ps.unprobed
-                if not _ps.selects_keyless(config) else None,
-                cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
+                _view, cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
             _usable = _ps.satisfied_providers(_pstat)
             if _usable:
                 ui.label(
                     "Provider ready: " + ", ".join(u.display for u in _usable)
                     + " — you're set to run tasks."
                 ).classes("s-cell")
+                # "Ready" is a claim about SATISFACTION; the router routes by
+                # the tier MODELS. On the machine DEC-43 was found on those are
+                # two different providers, and the line above alone would send a
+                # fresh operator into a first task that cannot run. Same
+                # `_pstat`, so the caveat and the claim are one observation.
+                _tier_warn = tier_readiness_warning(_pstat, _view)
+                if _tier_warn:
+                    ui.label(_tier_warn).classes("s-banner s-banner--warn w-full")
             else:
                 ui.label(
                     "No LLM provider is usable yet — and Systemu can't think "

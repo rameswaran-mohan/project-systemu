@@ -1641,7 +1641,12 @@ try:
         session_cli,
         capability_cli,
         skill_cli,
+        start_cmd,
     )
+    # The one-command golden path: `start` runs `daemon start` and then opens
+    # the dashboard on a WITNESSED-ready daemon. Top-level on purpose: it is
+    # the first command a fresh install types.
+    cli.add_command(start_cmd,       name="start")
     cli.add_command(scrolls_group,   name="scrolls")
     cli.add_command(army_group,      name="army")
     cli.add_command(tools_group,     name="tools")

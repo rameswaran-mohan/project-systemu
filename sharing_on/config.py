@@ -118,6 +118,28 @@ def _resolve_capture_sources_mode() -> str:
     return "all"  # legacy "broad", invalid, or unset
 
 
+def _resolve_vault_dir() -> str:
+    """THE operating vault root -- an ABSOLUTE path, minted once.
+
+    Delegates to ``systemu.runtime.vault_root`` (DEC-43: one mint per
+    operator-facing fact).  Config used to hand out the RELATIVE string
+    ``systemu/vault``, which every process then re-resolved against its own
+    cwd; the CLI and the daemon child it spawns do not share a cwd, so the two
+    silently operated different vaults (see that module's docstring).  Handing
+    out an absolute path removes the second derivation entirely.
+
+    The fence bit is deliberately NOT consulted here: Config is the LOADER of
+    the environment, never the judge of it (same division as ``validate()``).
+    The refusal belongs at the boot boundary, where the decision to write is
+    actually made.
+    """
+    try:
+        from systemu.runtime.vault_root import resolve_vault_root
+    except Exception:  # pragma: no cover - systemu always ships alongside
+        return os.getenv("SYSTEMU_VAULT_DIR", "systemu/vault")
+    return resolve_vault_root().root
+
+
 def _resolve_generalization_mode() -> str:
     """Read SYSTEMU_GENERALIZATION; fall back to 'standard' for invalid values.
 
@@ -549,7 +571,7 @@ class Config:
             auto_forge_tools=_load_auto_forge_tools(),
             tool_backend=_resolve_tool_backend(),
             docker_tool_timeout=int(os.getenv("SYSTEMU_DOCKER_TOOL_TIMEOUT", "300")),
-            vault_dir=os.getenv("SYSTEMU_VAULT_DIR", "systemu/vault"),
+            vault_dir=_resolve_vault_dir(),
             output_dir=os.getenv(
                 "SYSTEMU_OUTPUT_DIR",
                 str(Path.home() / "Documents"),   # native Windows/Mac default

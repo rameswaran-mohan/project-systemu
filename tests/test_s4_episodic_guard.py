@@ -21,6 +21,26 @@ import pytest
 from systemu.runtime import episodic_memory
 
 
+def _keyless_config():
+    """A machine with NOTHING usable -- stated honestly.
+
+    ``Config()`` leaves every key empty but invents ``ollama_url =
+    http://localhost:11434`` with no operator input, and the guard's keyless
+    witness is a LIVE PROBE. So on a developer box with `ollama serve` running,
+    a bare ``Config()`` is not "no provider configured" at all -- it is a
+    perfectly usable install, and this file's premise would be false while its
+    assertions stayed green only by accident of the environment.
+
+    Blanking the URL is the honest expression of "nothing to reach", and it also
+    keeps these unit tests off the network: the mint answers ``unknown`` for an
+    unset base URL without opening a socket.
+    """
+    from sharing_on.config import Config
+    cfg = Config()
+    cfg.ollama_url = ""
+    return cfg
+
+
 class _FakeVault:
     """A minimal vault stand-in for capture(): the idempotency read returns no
     existing summaries, and append is a no-op recorder."""
@@ -52,7 +72,6 @@ def test_no_provider_key_skips_llm_call_and_returns_none(monkeypatch):
     SAME degraded value (None) it already returns on a failed call. We patch the
     module's OWN llm_call_json binding to RAISE if invoked — asserting it is never
     called proves the guard fires before the doomed ~380s network ladder."""
-    from sharing_on.config import Config
 
     def _boom(*a, **k):
         raise AssertionError(
@@ -61,7 +80,7 @@ def test_no_provider_key_skips_llm_call_and_returns_none(monkeypatch):
 
     monkeypatch.setattr(episodic_memory, "llm_call_json", _boom, raising=True)
 
-    cfg = Config()  # all provider keys default to "" (no OPENROUTER/GOOGLE/etc.)
+    cfg = _keyless_config()  # no keys, and nothing keyless to reach either
     assert episodic_memory._has_llm_provider(cfg) is False
 
     vault = _FakeVault()
@@ -76,8 +95,6 @@ def test_provider_key_present_does_attempt_the_llm_call(monkeypatch):
     """With a provider key configured, the guard passes and capture DOES attempt
     the Tier-1 summarize call. We stub llm_call_json to a valid summary dict and
     assert it was invoked (and a SessionSummary is produced + persisted)."""
-    from sharing_on.config import Config
-
     called = {"n": 0}
 
     def _stub(*a, **k):
@@ -90,7 +107,7 @@ def test_provider_key_present_does_attempt_the_llm_call(monkeypatch):
 
     monkeypatch.setattr(episodic_memory, "llm_call_json", _stub, raising=True)
 
-    cfg = Config()
+    cfg = _keyless_config()
     cfg.openrouter_api_key = "sk-test-key"  # a configured provider key
     assert episodic_memory._has_llm_provider(cfg) is True
 
@@ -107,17 +124,15 @@ def test_provider_key_present_does_attempt_the_llm_call(monkeypatch):
 def test_has_llm_provider_detects_any_of_the_four_keys():
     """The guard is satisfied by ANY of the four provider keys (openrouter /
     google / anthropic / openai), and is defensive against a missing attr."""
-    from sharing_on.config import Config
-
-    assert episodic_memory._has_llm_provider(Config()) is False
+    assert episodic_memory._has_llm_provider(_keyless_config()) is False
 
     for attr in ("openrouter_api_key", "google_api_key",
                  "anthropic_api_key", "openai_api_key"):
-        cfg = Config()
+        cfg = _keyless_config()
         setattr(cfg, attr, "some-value")
         assert episodic_memory._has_llm_provider(cfg) is True, attr
 
     # Whitespace-only is treated as unset.
-    cfg = Config()
+    cfg = _keyless_config()
     cfg.openrouter_api_key = "   "
     assert episodic_memory._has_llm_provider(cfg) is False

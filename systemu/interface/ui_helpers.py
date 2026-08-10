@@ -26,9 +26,89 @@ from __future__ import annotations
 
 import itertools
 import logging
-from typing import Any, Callable
+from datetime import datetime, timezone, tzinfo
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# -- Timestamp rendering: ONE convention for every dashboard surface ---------
+#
+# STORAGE CONVENTION (verified across the codebase): every timestamp that
+# reaches a dashboard surface is UTC.
+#   * systemu.interface.event_bus stamps an event's ``ts`` with
+#     ``datetime.now(timezone.utc).isoformat()``          -> tz-AWARE UTC.
+#   * systemu.runtime.workflow_tracker._now does the same for ``started_at`` /
+#     ``updated_at`` / timeline entries.                  -> tz-AWARE UTC.
+#   * systemu.core.utils.utcnow returns a NAIVE datetime that holds UTC, so
+#     anything serialising it yields a naive ISO string.  -> NAIVE, means UTC.
+#
+# Hence the explicit naive rule: A NAIVE TIMESTAMP IS ASSUMED TO BE UTC.
+# Reading a naive stamp as local time would leave it unconverted, which is
+# exactly the defect these helpers exist to prevent.
+#
+# DISPLAY CONVENTION: the audience is a desk operator, not a server admin, so
+# every surface renders the operator's LOCAL wall-clock time. Before v0.10.24
+# the Home right rail, the live-events pane, the Work card and the workflow
+# detail page printed the stored UTC digits verbatim while the Chat live feed
+# converted -- the same event read 20:16:56 on one page and 01:46:56 on
+# another for an operator in Asia/Kolkata.
+#
+# ``tz`` is a TEST SEAM: production always passes None (the system local
+# zone); tests pin a named zone so they assert the real conversion instead of
+# re-deriving it from whatever zone the test host sits in.
+
+
+def to_local_datetime(ts: Any, *, tz: Optional[tzinfo] = None) -> Optional[datetime]:
+    """Coerce a stored timestamp to an AWARE datetime in the operator's zone.
+
+    Accepts an ISO string (aware, ``Z``-suffixed, or naive), epoch seconds
+    (int/float), or a ``datetime``. A naive input is treated as UTC -- see the
+    storage convention above. Returns None when the value is missing or
+    unparseable; never raises.
+    """
+    if ts is None:
+        return None
+    try:
+        if isinstance(ts, datetime):
+            dt = ts
+        elif isinstance(ts, bool):          # bool is an int subclass -- reject
+            return None
+        elif isinstance(ts, (int, float)):
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        else:
+            s = str(ts).strip()
+            if not s:
+                return None
+            if s[-1] in ("Z", "z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz) if tz is not None else dt.astimezone()
+    except Exception:
+        return None
+
+
+def format_event_time(ts: Any, *, tz: Optional[tzinfo] = None) -> str:
+    """``HH:MM:SS`` in the operator's LOCAL zone; ``''`` if missing/unparseable.
+
+    The one formatter for event-feed clock stamps (live-events pane, Home
+    right rail, Notifications page, Chat live feed).
+    """
+    dt = to_local_datetime(ts, tz=tz)
+    return dt.strftime("%H:%M:%S") if dt is not None else ""
+
+
+def format_stamp(ts: Any, *, tz: Optional[tzinfo] = None) -> str:
+    """``YYYY-MM-DD HH:MM:SS`` in the operator's LOCAL zone; ``''`` if unusable.
+
+    The one formatter for date-carrying stamps (Work page workflow cards,
+    workflow detail stats + timeline). The date rolls with the clock: an event
+    stored at 20:16 UTC on the 10th reads 01:46 on the 11th in Asia/Kolkata.
+    """
+    dt = to_local_datetime(ts, tz=tz)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else ""
 
 
 def safe_timer(

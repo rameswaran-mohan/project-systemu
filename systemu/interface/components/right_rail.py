@@ -37,7 +37,7 @@ def format_live_run_line(event: Dict[str, Any]) -> str:
     return f"[{level}] {message}"
 
 
-def live_event_row(event: Dict[str, Any]) -> Dict[str, Any]:
+def live_event_row(event: Dict[str, Any], *, tz=None) -> Dict[str, Any]:
     """Pure row model for one Live-pane event (W5.3).
 
     Every event becomes a header row — timestamp + event name — and the model
@@ -46,7 +46,9 @@ def live_event_row(event: Dict[str, Any]) -> Dict[str, Any]:
       * ``title``       — event["message"], falling back to context.title
                           (operator_decision_* events used to render as a
                           blank "[INFO] " line because they carry no message).
-      * ``time``        — HH:MM:SS from the event ts.
+      * ``time``        - HH:MM:SS from the event ts, in the operator's LOCAL
+                          zone (the shared ``ui_helpers`` formatter; ``tz`` is
+                          a test seam).
       * ``level``       — for the level tint.
       * ``details``     — the expand-arrow payload (reasoning / tool params /
                           tool result / LLM ref / outcome summary / artifacts).
@@ -65,7 +67,7 @@ def live_event_row(event: Dict[str, Any]) -> Dict[str, Any]:
         if event.get("category") == "operator_decision_posted" else None
     )
     return {
-        "time": _format_event_time(event.get("ts")),
+        "time": _format_event_time(event.get("ts"), tz=tz),
         "level": str(event.get("level") or "INFO").upper(),
         "title": title[:200],
         "details": (event.get("details") or {}) if _has_details(event) else {},

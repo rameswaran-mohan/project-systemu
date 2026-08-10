@@ -21,12 +21,12 @@ from __future__ import annotations
 import collections
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
 
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME
+from systemu.interface.ui_helpers import format_event_time
 
 logger = logging.getLogger(__name__)
 
@@ -379,12 +379,9 @@ def build_systemu_chat_page() -> None:
                 pass
             _empty_label[0] = None
 
-        # Format timestamp
-        try:
-            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            ts_str = ts.astimezone().strftime("%H:%M:%S")
-        except Exception:
-            ts_str = ts_raw[11:19] if len(ts_raw) >= 19 else ts_raw
+        # Format timestamp: the ONE shared local-time formatter (this feed was
+        # the only surface converting to local; the rest now share its answer).
+        ts_str = format_event_time(ts_raw)
 
         style = LEVEL_STYLES.get(level, LEVEL_STYLES["INFO"])
         cat_icon = CATEGORY_ICONS.get(category, "•")

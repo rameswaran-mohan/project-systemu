@@ -28,6 +28,19 @@ THE PROPERTY
     REACHABILITY for a keyless one. Satisfaction is per-provider and declared
     in exactly ONE place.
 
+    …and ONE POLICY, not just one recipe (DEC-43, closed later than the rest):
+    a keyless provider that ANSWERS is usable on every surface — boot gate,
+    wizard gate, checklist, doctor — whatever a tier currently SELECTS.
+    Satisfaction and selection are different facts; ``unusable_selected`` is
+    the surface for the second one. When ``any_provider_usable`` made the
+    keyless witness conditional on selection, ``daemon start`` booted a machine
+    the /welcome wizard then refused. See that function for the full account.
+
+    ...and the SELECTION itself is derived in one place too
+    (``routed_tier_providers``). It was not, and the two surfaces that red-flag
+    an unrunnable tier disagreed about which tiers those were - see that
+    function.
+
 HOW THE SHAPE ENFORCES IT
 -------------------------
 * ``PROVIDER_SPECS`` is the ONE table. It carries, per provider: display name,
@@ -55,7 +68,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 # ── satisfaction rules ──────────────────────────────────────────────────────
 RULE_CREDENTIAL = "credential"      # a key-based provider: the string is it
@@ -349,6 +362,31 @@ def _memoised(provider: str, fn, ttl_s: float, now):
     return _wrapped
 
 
+def _effective_probe(spec: ProviderSpec, probe, cache_ttl_s, _now=None):
+    """The witness ``spec`` will actually be scored with.
+
+    Shared by ``all_provider_statuses`` and ``any_provider_usable`` so the two
+    cannot memoise — or decline to memoise — differently. A second copy of this
+    resolution would be a DEC-43 form (i) recipe split in miniature, and one of
+    the two would inevitably grow its own policy: that is exactly what happened
+    to the keyless witness itself (see ``any_provider_usable``).
+    """
+    if spec.rule != RULE_REACHABILITY or not cache_ttl_s or cache_ttl_s <= 0:
+        return probe
+    base = probe if probe is not None else _PROBES.get(spec.provider)
+    # THE NULL WITNESS NEVER READS THE MEMO EITHER. `unprobed` means "this
+    # caller may not spend an observation on this path"; letting it cash
+    # someone else's would make the answer depend on whether an unrelated
+    # surface happened to probe in the last 20 s, which is precisely the
+    # hidden coupling that makes two surfaces disagree. Caught by
+    # test_s4_episodic_guard: `_has_llm_provider(Config())` returned True
+    # only when a settings-page probe had run first in the same process.
+    # Identity on the function object (DEC-36: `is`, no dispatch).
+    if base is None or base is unprobed:
+        return probe
+    return _memoised(spec.provider, base, float(cache_ttl_s), _now)
+
+
 def all_provider_statuses(config, *, timeout: float = DEFAULT_PROBE_TIMEOUT,
                           probe=None, cache_ttl_s: float = 0.0,
                           _now=None) -> Dict[str, ProviderStatus]:
@@ -361,20 +399,9 @@ def all_provider_statuses(config, *, timeout: float = DEFAULT_PROBE_TIMEOUT,
     """
     out: Dict[str, ProviderStatus] = {}
     for s in PROVIDER_SPECS:
-        fn = probe
-        if s.rule == RULE_REACHABILITY and cache_ttl_s and cache_ttl_s > 0:
-            base = probe if probe is not None else _PROBES.get(s.provider)
-            # THE NULL WITNESS NEVER READS THE MEMO EITHER. `unprobed` means "this
-            # caller may not spend an observation on this path"; letting it cash
-            # someone else's would make the answer depend on whether an unrelated
-            # surface happened to probe in the last 20 s, which is precisely the
-            # hidden coupling that makes two surfaces disagree. Caught by
-            # test_s4_episodic_guard: `_has_llm_provider(Config())` returned True
-            # only when a settings-page probe had run first in the same process.
-            # Identity on the function object (DEC-36: `is`, no dispatch).
-            if base is not None and base is not unprobed:
-                fn = _memoised(s.provider, base, float(cache_ttl_s), _now)
-        out[s.provider] = provider_status(s, config, timeout=timeout, probe=fn)
+        out[s.provider] = provider_status(
+            s, config, timeout=timeout,
+            probe=_effective_probe(s, probe, cache_ttl_s, _now))
     return out
 
 
@@ -391,42 +418,62 @@ def any_satisfied(statuses: Dict[str, ProviderStatus]) -> bool:
     return bool(satisfied_providers(statuses))
 
 
-def selects_keyless(config) -> bool:
-    """Does an explicit tier selection point at a provider decided by a probe?
-
-    The tier selection is a DIFFERENT fact from satisfaction, and reading it is
-    not a second copy of the recipe — the same pairing already drives
-    ``unusable_selected``. It exists so a hot path can spend the loopback probe
-    exactly when the operator has actually chosen the keyless provider, instead
-    of either paying it on every call or silently answering "no" for the
-    operator who chose Ollama.
-    """
-    keyless = {s.provider for s in PROVIDER_SPECS if s.rule == RULE_REACHABILITY}
-    for i in (1, 2, 3):
-        try:
-            v = getattr(config, f"tier{i}_provider", "")
-        except Exception:
-            continue
-        if type(v) is str and v.strip().lower() in keyless:
-            return True
-    return False
-
-
 def any_provider_usable(config, *, probe=None, timeout: float = DEFAULT_PROBE_TIMEOUT,
-                        cache_ttl_s: float = PROBE_CACHE_TTL_S) -> bool:
+                        cache_ttl_s: float = PROBE_CACHE_TTL_S,
+                        _now=None) -> bool:
     """"Can this install reach a model at all?" — for hot, non-render callers.
 
-    The keyless witness is spent only when ``selects_keyless`` says a tier
-    actually points at it; otherwise that provider reports ``unknown`` and is,
-    as always, not satisfied. Never raises.
+    EXACTLY ``any_satisfied(all_provider_statuses(...))``, evaluated lazily.
+    ``tests/test_provider_verdict_unification`` pins that equality over every
+    machine shape, because the difference between those two expressions is the
+    defect this function used to be.
+
+    WHAT IT USED TO DO, AND WHY THAT WAS WRONG (DEC-43)
+    ---------------------------------------------------
+    It spent the keyless witness only when a helper called ``selects_keyless``
+    reported that a tier already NAMED the keyless provider. That made
+    SATISFACTION conditional on SELECTION — two facts this module elsewhere
+    keeps apart on purpose (``unusable_selected`` is the surface for the second
+    one). The result, on one machine in one minute: ``daemon start`` BOOTED on a
+    keyless install whose Ollama was answering (its gate,
+    ``setup_flow.provider_available``, always spent the witness), ``doctor``
+    printed "Ollama  OK  Reachable", and the /welcome wizard — whose own step-1
+    remedy text offers "use Ollama (no key)" — refused to finish, because its
+    gate came through here. F19 removed the six copies of the RECIPE; this was a
+    split in the POLICY, one layer further in, and it produced the same thing:
+    two answers to one operator-facing question.
+
+    So the witness is now spent unconditionally, and the answer is the same one
+    every other surface gets.
+
+    THE COST, WHICH IS REAL AND IS PAID ELSEWHERE
+    ---------------------------------------------
+    The keyless probe costs ~1-2 s of loopback and this runs at the end of every
+    capture (``episodic_memory``) and per objective (``open_world_planner``).
+    Two things keep that bounded WITHOUT reintroducing a second verdict:
+
+    * the operands are ordered, not filtered. ``any_satisfied`` is an OR, so
+      once a keyed provider is satisfied the keyless operand cannot change the
+      result and is never evaluated. A machine with any key pays nothing. The
+      machine that pays is the one with no key — where the probe is the only
+      thing that can answer the question at all;
+    * the surviving probe rides the module's 20 s memo by default, the same one
+      the health banner spends on every route render.
+
+    Never raises.
     """
     try:
-        statuses = all_provider_statuses(
-            config, timeout=timeout, cache_ttl_s=cache_ttl_s,
-            probe=probe if selects_keyless(config) else unprobed)
+        keyed = [s for s in PROVIDER_SPECS if s.rule != RULE_REACHABILITY]
+        keyless = [s for s in PROVIDER_SPECS if s.rule == RULE_REACHABILITY]
+        for s in keyed + keyless:
+            st = provider_status(
+                s, config, timeout=timeout,
+                probe=_effective_probe(s, probe, cache_ttl_s, _now))
+            if st.satisfied:
+                return True
     except Exception:
         return False
-    return any_satisfied(statuses)
+    return False
 
 
 class _EnvOverlay:
@@ -512,12 +559,89 @@ def status_line(st: ProviderStatus) -> str:
     return line.encode("ascii", "backslashreplace").decode("ascii")
 
 
+# ── the SELECTION half: what the tiers will really be called on ─────────────
+#
+# The pair this module keeps apart is SATISFACTION ("is this provider usable")
+# and SELECTION ("is what we are set to use among them"). Everything above is
+# the first. These three are the second, and they live here for the same reason
+# the first does: there were two derivations of "selected" in the tree and the
+# two surfaces that consume `unusable_selected` disagreed because of it (see
+# `routed_tier_providers`).
+
+
+def routed_provider(model, override, config) -> str:
+    """Which provider will the ROUTER actually call for this tier? "" if unknown.
+
+    THE ROUTER IS ASKED, NOT IMITATED. ``llm_router.resolve_provider_keyaware``
+    is where "which provider serves this model on this machine" is decided, and
+    the decision is KEY-AWARE: a ``google/*`` or ``anthropic/*`` tier on a box
+    that holds only an OpenRouter key is genuinely served BY OpenRouter. A
+    model-prefix guess written here would be a second copy of that rule (DEC-43
+    form (i)) and would cry wolf on exactly that machine -- warning about a
+    provider the call never reaches.
+
+    The import is deferred because this module is loaded by the CLI, the boot
+    gate and every dashboard render, while ``llm_router`` pulls in the OpenAI
+    SDK and loads very early itself. The name it reaches for is PUBLIC, so this
+    is a seam the router maintains rather than a private coupling.
+
+    An id the mint cannot score returns "", so an unrecognised provider can only
+    ever WITHHOLD a warning, never manufacture one. Never raises.
+    """
+    try:
+        from systemu.core.llm_router import resolve_provider_keyaware
+        cls = resolve_provider_keyaware(
+            model if type(model) is str else "",
+            (override if type(override) is str else "").strip(), config)
+        name = getattr(cls, "__name__", "")
+    except Exception:
+        return ""
+    if type(name) is not str:
+        return ""
+    # The provider registry's own id convention (``providers._by_name``).
+    suffix = "Provider"
+    pid = (name[:-len(suffix)] if name.endswith(suffix) else name).lower()
+    return pid if pid in SPEC_BY_PROVIDER else ""
+
+
+def routed_tier_providers(config) -> List[str]:
+    """The provider each of tiers 1-3 will really be called on.
+
+    THE SELECTION ``unusable_selected`` IS MEANT TO SCORE, and the last DEC-43
+    split. Its two consumers used to derive that word differently: /welcome fed
+    it this, while the Settings banner fed it the explicit ``tier{N}_provider``
+    OVERRIDE alone -- which is EMPTY on a fresh install, so Settings stayed
+    silent on the very machine the wizard warned about (no keys, a keyless
+    endpoint answering, the shipped cloud tier models). One fact, one mint, two
+    derivations of its input, and therefore two answers on one screen apiece.
+
+    The override is not discarded, it is SUBSUMED: the router obeys it
+    literally, so a tier pinned to a dead provider still scores as that
+    provider. What it adds is the tier whose provider was never named out loud
+    and is implied by the MODEL id -- which is every tier on a default install.
+
+    Never raises; a tier it cannot score contributes "" and is ignored
+    downstream.
+    """
+    out: List[str] = []
+    for i in (1, 2, 3):
+        try:
+            model = getattr(config, f"tier{i}_model", "")
+            override = getattr(config, f"tier{i}_provider", "")
+        except Exception:
+            model, override = "", ""
+        out.append(routed_provider(model, override, config))
+    return out
+
+
 def unusable_selected(statuses: Dict[str, ProviderStatus], selected) -> list:
     """The selected providers whose satisfaction was NOT observed.
 
     ``selected`` is any iterable of provider ids ("", "auto" and unknown ids
-    are ignored). Consumed by the Settings banner that red-flags a tier
-    pointed at a provider that will fail at call time.
+    are ignored) -- in practice ``routed_tier_providers(config)``, which is the
+    one derivation of that word both consuming surfaces now share. Consumed by
+    the Settings banner and by /welcome step 1, each of which red-flags a tier
+    that will fail at call time.
     """
     out = []
     for p in sorted({str(x).strip().lower() for x in (selected or ())}

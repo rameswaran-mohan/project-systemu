@@ -86,9 +86,10 @@ _ALLOWED = {
         "explicitly-named .env onto the config it hands the mint.",
     "install.py":
         "THE INSTALLER: writes the initial .env.",
-    "systemu/interface/pages/welcome.py":
-        "THE ONBOARDING WRITER: reloads a freshly-saved OpenRouter key from .env "
-        "into the live config. Its STATUS disclosure consumes the mint.",
+    # (welcome.py was exempted here as "THE ONBOARDING WRITER". Its Re-check
+    #  writer now loops PROVIDER_SPECS instead of naming OPENROUTER_API_KEY, so
+    #  it names no credential at all and the exemption was dropped -- see
+    #  tests/test_provider_verdict_unification.py.)
     # CONSUMPTION: hands the credential to a client. Not a verdict.
     "systemu/core/llm_router.py":
         "CONSUMPTION: passes the credential to the provider client and picks a "
@@ -398,11 +399,19 @@ def test_the_probe_cache_expires_and_never_caches_across_urls():
     ps.clear_probe_cache()
 
 
-def test_any_provider_usable_probes_only_when_a_tier_selects_the_keyless_one():
-    """A hot path may not pay ~1-2 s of loopback I/O on every call.
+def test_any_provider_usable_spends_the_keyless_witness_unconditionally():
+    """A hot path may not pay ~1-2 s of loopback I/O it does not need -- but the
+    saving may not come out of the VERDICT.
 
-    It also may not silently answer "no" for an operator who chose Ollama -- so
-    the probe is spent exactly when a tier points at a keyless provider.
+    This used to assert the opposite: the witness was spent only when a tier
+    already named the keyless provider, so satisfaction was conditional on
+    selection and this gate disagreed with `setup_flow.provider_available`,
+    which always spent it. One machine, two answers (DEC-43). The cost is now
+    saved by ORDERING the operands of an OR instead: a satisfied keyed provider
+    means the keyless one is never asked, because it cannot change the result.
+
+    The full cross-surface property lives in
+    tests/test_provider_verdict_unification.py.
     """
     from systemu.runtime import provider_status as ps
     calls = {"n": 0}
@@ -412,14 +421,14 @@ def test_any_provider_usable_probes_only_when_a_tier_selects_the_keyless_one():
         return _answering(url, timeout)
 
     ps.clear_probe_cache()
-    assert ps.any_provider_usable(_cfg(ollama_url="http://y:1"), probe=_count) is False
-    assert calls["n"] == 0, "no tier selects a keyless provider - no probe"
+    assert ps.any_provider_usable(_cfg(ollama_url="http://y:1"), probe=_count) is True
+    assert calls["n"] == 1, "no tier selects it, but it still gets asked"
 
     ps.clear_probe_cache()
     assert ps.any_provider_usable(_cfg(ollama_url="http://y:1",
-                                       tier2_provider="ollama"),
+                                       openrouter_api_key="k"),
                                   probe=_count) is True
-    assert calls["n"] == 1
+    assert calls["n"] == 1, "a satisfied keyed provider must cost no probe"
     ps.clear_probe_cache()
 
 
@@ -603,8 +612,20 @@ def test_the_llm_short_circuits_consume_the_mint(mod):
 
 
 @pytest.mark.parametrize("mod", ["episodic_memory", "open_world_planner"])
-def test_the_short_circuits_do_no_network_io_unless_ollama_is_selected(mod):
-    """DEC-44 aside, this one is about latency: these run per-objective."""
+def test_the_short_circuits_pay_for_the_witness_only_when_it_can_matter(mod):
+    """DEC-44 aside, this one is about latency: these run per-objective.
+
+    The saving used to come out of the VERDICT: the witness was spent only when
+    a tier already NAMED the keyless provider, so these gates -- and the wizard
+    gate beside them -- answered "no provider" on a machine `daemon start` had
+    booted and `doctor` called reachable (DEC-43; the cross-surface property is
+    pinned in tests/test_provider_verdict_unification.py).
+
+    It now comes out of the ORDER of an OR instead: a satisfied keyed provider
+    ends the question, so the probe is skipped in exactly the case where it
+    could not have changed the answer -- and is spent in the case where it is
+    the only thing that can answer at all.
+    """
     import importlib
     from systemu.runtime import provider_status as ps
     m = importlib.import_module(f"systemu.runtime.{mod}")
@@ -618,11 +639,11 @@ def test_the_short_circuits_do_no_network_io_unless_ollama_is_selected(mod):
     real = ps._PROBES.get("ollama")
     ps._PROBES["ollama"] = _boom
     try:
-        m._has_llm_provider(_cfg(ollama_url="http://z:1"))
-        assert seen["n"] == 0
         assert m._has_llm_provider(_cfg(ollama_url="http://z:1",
-                                        tier1_provider="ollama")) is True
-        assert seen["n"] == 1
+                                        openrouter_api_key="k")) is True
+        assert seen["n"] == 0, "a keyed provider was satisfied - no probe is due"
+        assert m._has_llm_provider(_cfg(ollama_url="http://z:1")) is True
+        assert seen["n"] == 1, "with no key, the keyless provider must be asked"
     finally:
         ps._PROBES["ollama"] = real
         ps.clear_probe_cache()

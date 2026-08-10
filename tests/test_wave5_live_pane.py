@@ -10,19 +10,26 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from systemu.interface.components.right_rail import (
     format_live_run_line, live_event_row)
 
+IST = ZoneInfo("Asia/Kolkata")   # the operator's zone in the field report
+
 
 class TestLiveEventRow:
     def test_plain_run_event(self):
+        # A stored (naive-UTC) ts renders as the operator's LOCAL wall clock —
+        # 10:00:05 UTC is 15:30:05 IST. The old assertion pinned the raw-UTC
+        # defect the timestamp unification removed; ``tz`` is the test seam.
         row = live_event_row({"ts": "2026-06-12T10:00:05", "level": "INFO",
-                              "message": "Tool maps_search returned 3 results"})
+                              "message": "Tool maps_search returned 3 results"},
+                             tz=IST)
         assert row["title"] == "Tool maps_search returned 3 results"
-        assert row["time"] == "10:00:05"
+        assert row["time"] == "15:30:05"
         assert row["has_details"] is False
         assert row["decision_id"] is None
 

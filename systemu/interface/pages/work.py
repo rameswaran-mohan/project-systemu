@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from systemu.interface.ui_helpers import format_stamp
 from systemu.runtime.workflow_tracker import STAGES, WorkflowSnapshot
 
 
@@ -189,9 +190,15 @@ def rerun_workflow_by_activity(activity_id: str) -> str:
     return _resubmit_activity(
         next((a for a in acts if a.get("id") == activity_id), None), label=activity_id)
 
-def _short_ts(iso: str) -> str:
-    """ISO timestamp → human-readable (seconds precision)."""
-    return (iso or "")[:19].replace("T", " ")
+def _short_ts(iso: str, *, tz=None) -> str:
+    """Stored timestamp -> the operator's LOCAL wall clock (seconds precision).
+
+    Delegates to the ONE shared formatter. This used to slice the ISO string
+    (``[:19].replace("T", " ")``), which printed the stored UTC digits with no
+    conversion: a card read ``2026-08-10 20:56:54`` for a run the live feed
+    stamped ``02:24``. ``tz`` is a test seam.
+    """
+    return format_stamp(iso, tz=tz)
 
 
 def _load_rows() -> List[Dict[str, Any]]:
