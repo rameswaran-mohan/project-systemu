@@ -10,7 +10,10 @@ from __future__ import annotations
 _GLOSSARY = {
     "scrolls":    "Workflows — captured task definitions you can run again",
     "activities": "Tasks — the executable steps extracted from a workflow",
-    "shadows":    "Agents — the personas that run your workflows",
+    # "agents", not "personas": since the persona-onboarding work, "persona"
+    # means the OPERATOR's usage profile — reusing it here for shadow-agents
+    # would give one word two meanings a first-timer has to untangle.
+    "shadows":    "Agents — the workers that run your workflows",
     "forge":      "Build a tool — create a new capability",
     "evolutions": "Improvements — proposed upgrades the system has learned",
     # W11.6: every spine page explains itself in one line, not just the

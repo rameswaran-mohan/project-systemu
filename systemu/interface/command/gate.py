@@ -25,6 +25,27 @@ _SEVERITY_TO_RISK = {"blocker": "high", "warning": "medium", "info": "low"}
 # Mirrors harness_review._HARNESS_OPTIONS verbatim (index 0 is the safe default).
 _HARNESS_OPTIONS: List[str] = ["Deny", "Approve"]
 
+# The plain-English opening of the one-time bulk first-gate card. This is the FIRST
+# security decision a new operator is ever asked to make, and the card used to open cold
+# on the generated consent record — a correct, unreadable enumeration of effect classes
+# and dated rulings. A one-click, inventory-wide grant whose first line cannot be parsed
+# is consent in name only.
+#
+# Every claim here is checked against the machine in tests/test_gate_card_plain_lead.py:
+# money_move / oauth_call / net_mutate are all outside ``effect_tags.BATCH_APPROVABLE``.
+# Note the scoping — "reaches the network in NEW ways", not "uses the network", because
+# ``net_read`` IS batch-approvable by the 2026-08-09 operator ruling. Copy that overstates
+# the fence is the F9 defect, one surface earlier.
+#
+# ASCII only: this is the first line an operator reads, on whatever codepage their console
+# happens to run.
+_BULK_CARD_PLAIN_LEAD = (
+    "In plain English: this one-time review lists what Systemu may do without "
+    "asking every time. Batch approval covers only safe, reversible kinds of "
+    "action. Anything that moves money, uses a credential, or reaches the "
+    "network in new ways always asks you first, one card at a time."
+)
+
 # IMPL-2: the exact option label a DENY tool card offers as the remedy, AND the exact
 # choice string the Inbox panel resolves with. ``decision_queue.resolve`` validates
 # choice-in-options, so a one-character drift between the two would raise instead of
@@ -384,7 +405,11 @@ class GateDescriptor(BaseModel):
         rule = batch_rule_sentence()
 
         def _render(limit: int) -> list:
-            out = [rule, ""]
+            # The lead goes INSIDE _render so it is display copy like the listing: it
+            # sits inside the clip loop below and yields with everything else if the
+            # card ever has to shrink. The consent record still never yields (F17).
+            out = [_BULK_CARD_PLAIN_LEAD, ""]
+            out += [rule, ""]
             out += [f"{len(eligible)} tool(s) can be approved as a batch:"]
             out += _listing(eligible, limit=limit) or ["  (none)"]
             if excluded:

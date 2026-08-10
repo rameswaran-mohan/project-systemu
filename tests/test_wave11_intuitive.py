@@ -52,9 +52,11 @@ class TestPagesCarrySublabels:
 
 class TestActionableEmptyStates:
     def test_work_empty_state_links_to_chat(self):
+        # Re-anchored (persona-onboarding): the copy is registry-skinned now,
+        # so the pin anchors on the RENDER CALL, not on any copy literal.
         from systemu.interface.pages import work
         src = inspect.getsource(work)
-        empty_region = src.split("No workflows yet")[1][:400]
+        empty_region = src.split("ui.label(_empty_work_text())")[1][:400]
         assert "/chat" in empty_region, \
             "the empty state must take the operator to the action, not describe absence"
 

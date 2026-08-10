@@ -106,6 +106,38 @@ def build_settings_page() -> None:
             _brain_advisory()
             tier1.on("change", lambda _: _brain_advisory.refresh())
 
+        # -- How you use Systemu (persona switcher) -------------------------
+        # The persona fact (written at onboarding) drives starter tasks, empty
+        # states and tour order through systemu.interface.persona_content.
+        # Switching APPENDS a new fact and newest wins, so the re-skin is live
+        # and needs no migration. Emphasis only: no feature is persona-gated.
+        _section_header("How you use Systemu")
+        with ui.column().classes("s-card").style("gap: 8px; padding: 20px;"):
+            from systemu.interface.persona_content import current_persona
+            from systemu.interface.pages.welcome import personas
+
+            persona_now = current_persona(state.vault)
+
+            def _on_persona_change(e=None) -> None:
+                chosen = getattr(e, "value", None) or persona_select.value
+                chosen = (chosen or "").strip()
+                # Re-read (never the render-time snapshot) so switching back to
+                # an earlier answer still records.
+                if not chosen or chosen == (current_persona(state.vault) or ""):
+                    return                      # same answer: nothing to record
+                notice = set_persona(state.vault, chosen)
+                if notice:
+                    ui.notify(notice, type="info")
+
+            persona_select = ui.select(
+                personas(), label="How you use Systemu",
+                value=persona_now, on_change=_on_persona_change,
+            ).classes("s-input")
+            ui.label(
+                "Changes which starter tasks, empty-state hints and tour order "
+                "you see. Every feature stays available whichever you pick."
+            ).classes("s-muted")
+
         # ── Provider credentials (W14; F8 rebuild) ─────────────────────────
         _section_header("Provider credentials")
         with ui.column().classes("s-card").style("gap: 8px; padding: 20px;"):
@@ -638,6 +670,22 @@ def save_credential(key: str, value: str) -> None:
 def delete_credential(key: str) -> None:
     from systemu.runtime.credentials.store import CredentialStore
     CredentialStore().delete(key)
+
+
+def set_persona(vault, persona) -> str:
+    """Record a persona switch; return the operator-facing notice ("" = no-op).
+
+    APPEND-only, exactly like the onboarding writer: `current_persona` reads the
+    newest 'Usage persona:' fact, so the switch re-skins immediately with no
+    migration and no edit of the original answer. A blank choice writes nothing.
+    """
+    value = (persona or "").strip()
+    if not value:
+        return ""
+    from systemu.runtime.user_profile import add_fact
+    add_fact(vault, f"Usage persona: {value}", source="settings",
+             tags=["office_context", "persona"])
+    return f"Content re-tuned for {value}."
 
 
 def _section_header(title: str) -> None:

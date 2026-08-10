@@ -245,6 +245,26 @@ def _render_schedules_list_panel() -> None:
                 )
 
 
+def _empty_shadows_text(vault=None) -> str:
+    """Persona-skinned copy for the empty Shadows grid (persona_content registry).
+
+    ``vault`` defaults to the AppState vault; tests pass one directly.
+    Defensive by contract: no AppState, unreadable facts, or no persona
+    recorded all fall back to DEFAULT_SKIN, whose ``empty_shadows``
+    reproduces the literal this page used before the registry - so the
+    no-persona path renders byte-identically.
+    """
+    from systemu.interface.persona_content import (
+        DEFAULT_SKIN, current_persona, skin_for,
+    )
+    try:
+        if vault is None:
+            vault = AppState.get().vault
+        return skin_for(current_persona(vault)).empty_shadows
+    except Exception:
+        return DEFAULT_SKIN.empty_shadows
+
+
 def build_army_page() -> None:
     state = AppState.get()
     vault = state.vault
@@ -282,7 +302,7 @@ def build_army_page() -> None:
     _all_shadows = vault.load_index("shadow_army")
 
     if not _all_shadows:
-        ui.label("No shadows yet — process a scroll to create your first shadow.").style(
+        ui.label(_empty_shadows_text(vault)).style(
             f"color: {THEME['text_muted']}; font-style: italic; padding: 20px;"
         )
         return

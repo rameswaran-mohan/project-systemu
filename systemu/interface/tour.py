@@ -70,6 +70,43 @@ def tour_step(index: int) -> Optional[Dict[str, str]]:
     return None
 
 
+def tour_steps_for(persona: Optional[str]) -> List[Dict[str, str]]:
+    """The six steps in this persona's order (default order when unknown).
+
+    A skin re-emphasises, it never hides a room: an order that is not a clean
+    run of in-range indices falls back to ``TOUR_STEPS`` whole rather than
+    stranding a surface. Pure + deterministic, so ``?tour=N`` links stay
+    stateless. Never raises.
+    """
+    try:
+        from systemu.interface.persona_content import skin_for
+        order = skin_for(persona).tour_order
+        if type(order) is list and len(order) == len(TOUR_STEPS) and all(
+                type(i) is int and 0 <= i < len(TOUR_STEPS) for i in order):
+            return [TOUR_STEPS[i] for i in order]
+    except Exception:
+        logger.debug("[Tour] persona order lookup failed", exc_info=True)
+    return list(TOUR_STEPS)
+
+
+def _persona_steps() -> List[Dict[str, str]]:
+    """Resolve the operator's persona ONCE per render, then order the steps.
+
+    Defensive by construction: no app state, no vault, or a vault that throws
+    all land on the default order: the tour must render regardless.
+    """
+    try:
+        from systemu.interface.dashboard_state import AppState
+        from systemu.interface.persona_content import current_persona
+        vault = AppState.get().vault
+        if vault is None:
+            return list(TOUR_STEPS)
+        return tour_steps_for(current_persona(vault))
+    except Exception:
+        logger.debug("[Tour] persona resolution failed", exc_info=True)
+        return list(TOUR_STEPS)
+
+
 def is_tour_pending(vault) -> bool:
     """True when the wizard is done but the tour never finished.
 
@@ -119,23 +156,34 @@ def maybe_render_tour(current_path: str) -> None:
     """Render the floating tour card when ``?tour=N`` is active.
 
     Called from ``_build_layout`` on every page — the card floats over
-    whatever route the active step navigated to. Out-of-range indices
-    render nothing (stale links are harmless).
+    whatever route the active step navigated to. ``N`` indexes the
+    persona-ordered list; out-of-range indices render nothing (stale links
+    are harmless).
     """
     idx = _active_step_index()
-    if idx is None or tour_step(idx) is None:
+    if idx is None:
         return
-    render_tour_card(idx)
+    steps = _persona_steps()
+    if not 0 <= idx < len(steps):
+        return
+    render_tour_card(idx, steps=steps)
 
 
-def render_tour_card(idx: int) -> None:
-    """The floating step card: progress, plain-language copy, Back/Next."""
+def render_tour_card(idx: int,
+                     steps: Optional[List[Dict[str, str]]] = None) -> None:
+    """The floating step card: progress, plain-language copy, Back/Next.
+
+    ``steps`` is the persona-ordered list the caller already resolved; it is
+    resolved here when omitted so the card stays independently callable.
+    """
     from nicegui import ui
     from systemu.interface.dashboard_state import AppState
     from systemu.interface.design.primitives import button
 
-    step = TOUR_STEPS[idx]
-    total = len(TOUR_STEPS)
+    if steps is None:
+        steps = _persona_steps()
+    step = steps[idx]
+    total = len(steps)
 
     def _vault():
         try:
@@ -163,11 +211,11 @@ def render_tour_card(idx: int) -> None:
             if idx > 0:
                 button("Back", variant="ghost",
                        on_click=lambda _=None, i=idx - 1: ui.navigate.to(
-                           f"{TOUR_STEPS[i]['route']}?tour={i}"))
+                           f"{steps[i]['route']}?tour={i}"))
             if idx + 1 < total:
                 button("Next", variant="primary",
                        on_click=lambda _=None, i=idx + 1: ui.navigate.to(
-                           f"{TOUR_STEPS[i]['route']}?tour={i}"))
+                           f"{steps[i]['route']}?tour={i}"))
             else:
                 def _finish(_=None) -> None:
                     _complete(False)

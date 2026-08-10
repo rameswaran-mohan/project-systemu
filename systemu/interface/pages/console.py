@@ -34,7 +34,7 @@ NiceGUI builders compose them with design-system token classes only (lint
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from systemu.interface.nav_helpers import tile_nav_target
 
@@ -133,6 +133,115 @@ def _pending_approvals_count(vault) -> int:
     return proposed + deps
 
 
+# ---------------------------------------------------------------------------
+#  "Your Systemu grows" - capability odometer + getting-started quests
+#  (pure models; unit-tested in tests/test_home_growth_card.py)
+# ---------------------------------------------------------------------------
+
+# The separator between the odometer's counters.  Written as an escape so this
+# source stays ASCII while rendering the same dot the needs-you list uses.
+_ODOMETER_DOT = " • "
+
+# The three getting-started quests, in the order the card renders them.
+_QUEST_PROFILE    = "Set up your profile"
+_QUEST_TOUR       = "Meet the six rooms (tour)"
+_QUEST_FIRST_TASK = "Hand over your first task"
+
+
+def _safe_len(read) -> int:
+    """len() of what ``read()`` returns - 0 for None, a raise, or a vault that
+    does not implement the method at all."""
+    try:
+        return len(read() or [])
+    except Exception:
+        return 0
+
+
+def growth_counts(vault) -> Dict[str, int]:
+    """How much capability the install currently holds (pure, never raises).
+
+    Reads the three list APIs every vault backend implements
+    (``abstractions/vault.py``).  Each counter is guarded on its own, so one
+    unhappy backend read costs that number only - the rest of the odometer
+    still tells the truth.
+    """
+    return {
+        "tools":   _safe_len(lambda: vault.list_tools()),
+        "shadows": _safe_len(lambda: vault.list_shadows()),
+        "skills":  _safe_len(lambda: vault.list_skills()),
+    }
+
+
+def forged_tool_count(vault) -> int:
+    """How many registered tools Systemu forged itself (pure, never raises).
+
+    ``list_tools()`` returns the tools index, and ``_tool_header`` puts
+    ``forged_by_systemu`` on every row on both the file and SQLite backends
+    (the Tools page's "Agent-built" facet filters on that same key), so this
+    number is read off the store rather than inferred.
+    """
+    try:
+        rows = vault.list_tools() or []
+        return sum(1 for r in rows if r.get("forged_by_systemu"))
+    except Exception:
+        return 0
+
+
+def _odometer_line(counts: Dict[str, int], forged: int = 0) -> str:
+    """"Tools N * Shadows N * Skills N" (+ how many Systemu built, if any).
+
+    The forged clause is omitted entirely at 0 rather than rendering a zero.
+    """
+    line = _ODOMETER_DOT.join([
+        f"Tools {counts.get('tools', 0)}",
+        f"Shadows {counts.get('shadows', 0)}",
+        f"Skills {counts.get('skills', 0)}",
+    ])
+    if forged > 0:
+        line += f" - {forged} built for you"
+    return line
+
+
+def _quest_profile_done(vault) -> bool:
+    try:
+        return vault.get_user_profile() is not None
+    except Exception:
+        return False
+
+
+def _quest_tour_done(vault) -> bool:
+    try:
+        from systemu.runtime import first_run
+        return bool(first_run.tour_completed(vault))
+    except Exception:
+        return False
+
+
+def _quest_first_task_done() -> bool:
+    """True once /work has at least one workflow row.
+
+    Reuses ``work._load_rows()`` - the very loader the Work page renders its
+    list from - so this quest can never disagree with what the operator sees
+    there.  (It is already defensive: any failure yields an empty list.)
+    """
+    try:
+        from systemu.interface.pages import work
+        return bool(work._load_rows())
+    except Exception:
+        return False
+
+
+def quest_states(vault) -> List[Tuple[str, bool]]:
+    """The three getting-started quests as ``(label, done)`` (pure, never
+    raises).  Each check is independently guarded: a broken read means "not
+    done yet", never a broken Home page."""
+    return [
+        (_QUEST_PROFILE,    _quest_profile_done(vault)),
+        (_QUEST_TOUR,       _quest_tour_done(vault)),
+        (_QUEST_FIRST_TASK, _quest_first_task_done()),
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Data loaders (vault / tracker → pure-model inputs).  Defensive: any failure
 #  yields an empty result so the Home shell never breaks.
@@ -207,6 +316,12 @@ def build_home_page() -> None:
             _build_needs_you_card(vault)
         with ui.column().style("flex: 1; min-width: 320px;"):
             _build_whats_running_card()
+
+    # "Your Systemu grows" - capability odometer + getting-started quests
+    _build_growth_card(vault)
+
+    # "Systemu noticed" - at most ONE declinable proposal, derived right here
+    _build_proposal_card(vault)
 
     # ── Today's spend (R-P3a) — both lanes, no caps, estimate only ──────
     _build_daily_cost_banner()
@@ -314,6 +429,83 @@ def _build_needs_you_card(vault) -> None:
 
         _summary()
         safe_timer(2.0, _summary.refresh)
+
+
+def _build_growth_card(vault) -> None:
+    """"Your Systemu grows" - the capability odometer + the getting-started
+    quests.
+
+    Both halves are read off what the vault actually holds (no projections, no
+    promises): the odometer counts registered tools / shadows / skills, and the
+    quest list is three concrete next steps whose done-ness is checked against
+    the same sources the matching pages render from.  The quest section retires
+    itself once all three are done - the odometer stays.
+    """
+    from nicegui import ui
+    from systemu.interface.design.primitives import card
+
+    counts = growth_counts(vault)
+    line = _odometer_line(counts, forged_tool_count(vault))
+    quests = quest_states(vault)
+
+    with card(classes="w-full q-mb-md"):
+        with ui.row().classes("w-full items-center justify-between q-mb-sm"):
+            ui.label("Your Systemu grows").classes("s-cell s-cell--bold")
+            ui.label(line).classes("s-pill s-pill--muted s-mono")
+        if not all(done for _, done in quests):
+            ui.label("Getting started").classes("s-muted q-mb-sm")
+            for label, done in quests:
+                with ui.row().classes("w-full items-center q-gutter-sm"):
+                    ui.label("done" if done else "to do") \
+                        .classes("s-pill s-pill--accent" if done else "s-pill s-pill--muted")
+                    ui.label(label).classes("s-muted" if done else "s-cell")
+
+
+def _build_proposal_card(vault) -> None:
+    """"Systemu noticed" - one quiet, declinable growth proposal.
+
+    The proposal is DERIVED AT RENDER from the same vault reads the odometer
+    above uses (``proposals.derive_proposal``): no hook runs, no new store
+    exists, and nothing is written to OnTheTable - that store keeps its single
+    writer.  At most one proposal is ever on screen, and it only ever points at
+    a page that exists.
+
+    "No thanks" persists a decline as a user fact and refreshes, so the card
+    disappears on the spot and that suggestion never comes back.  The refresh
+    happens only AFTER the decline is stored: a card that stays put is telling
+    the operator the truth about what was saved.
+    """
+    from nicegui import ui
+    from systemu.interface.design.primitives import card
+    from systemu.interface.proposals import decline, derive_proposal
+
+    @ui.refreshable
+    def _proposal() -> None:
+        found = derive_proposal(vault)
+        if not found:
+            return
+        key, text, route = found
+
+        def _dismiss() -> None:
+            try:
+                decline(vault, key)
+            except Exception as exc:
+                ui.notify(f"Could not save that preference: {exc}", type="negative")
+                return
+            _proposal.refresh()
+
+        with card(classes="w-full q-mb-md"):
+            with ui.row().classes("w-full items-center justify-between q-mb-sm"):
+                ui.label("Systemu noticed").classes("s-cell s-cell--bold")
+                ui.label("suggestion").classes("s-pill s-pill--muted")
+            ui.label(text).classes("s-muted q-mb-sm")
+            with ui.row().classes("items-center q-gutter-sm"):
+                ui.button("Show me", on_click=lambda r=route: ui.navigate.to(r)) \
+                    .props("flat no-caps").classes("s-btn s-btn--primary")
+                ui.button("No thanks", on_click=_dismiss) \
+                    .props("flat no-caps").classes("s-btn s-btn--ghost")
+
+    _proposal()
 
 
 def _build_whats_running_card() -> None:

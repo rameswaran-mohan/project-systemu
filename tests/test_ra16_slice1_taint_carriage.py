@@ -488,6 +488,16 @@ _OPERATOR_SURFACES = {
     ("systemu/interface/pages/welcome.py", "mark_skipped"),
     ("systemu/interface/tour.py", "mark_tour_completed"),
     ("systemu/interface/cli_commands.py", "user_remember"),
+    # Persona-onboarding (2026-08-11), same two shapes as the entries above:
+    #   settings.set_persona — the fact value is one of the CLOSED personas()
+    #     list, picked by an operator click in Settings; the identical fact
+    #     ``Usage persona: X`` that ``welcome.save_onboarding`` already writes
+    #     from the wizard. No free text, no content mediation.
+    #   proposals.decline   — systemu sentinel (``declined:<key>``, key from a
+    #     closed in-module set) written on an operator "No thanks" click; the
+    #     same class as ``mark_skipped`` / ``mark_tour_completed``.
+    ("systemu/interface/pages/settings.py", "set_persona"),
+    ("systemu/interface/proposals.py", "decline"),
 }
 
 

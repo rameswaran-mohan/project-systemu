@@ -41,12 +41,35 @@ def personas() -> List[str]:
 
 def starter_prompts() -> List[str]:
     """W10.4: one-click first tasks — safe, local, instantly demonstrative
-    (each lands pre-filled in Chat's quick lane; the operator clicks Run)."""
+    (each lands pre-filled in Chat's quick lane; the operator clicks Run).
+
+    Kept as the DEFAULT: `persona_content.DEFAULT_SKIN.starters` equals this
+    list (pinned by tests), so an operator who hasn't answered step 3 sees
+    exactly the pre-registry page.
+    """
     return [
         "List the files in my deliverables folder and write a short markdown index of them",
         "Create a CSV named expenses_template.csv with columns Date, Vendor, Amount, Category",
         "Search the web for today's top 3 news headlines about AI assistants and summarize them",
     ]
+
+
+#: Appended to the dare when the reasoning tier is flash/free-class. Forging a
+#: tool is the hardest thing the agent does and it degrades badly on budget
+#: models — the dare must not oversell what this install will actually manage.
+DARE_BUDGET_CAVEAT = " (works best on the quality preset)"
+
+
+def dare_label(skin, config) -> str:
+    """The persona's forge dare, tier-caveated. Pure — no UI, never raises."""
+    line = getattr(skin, "dare_line", "") or ""
+    try:
+        from sharing_on.model_presets import is_budget_class
+        if is_budget_class(getattr(config, "tier1_model", "") or ""):
+            return line + DARE_BUDGET_CAVEAT
+    except Exception:
+        logger.debug("[Welcome] dare tier check failed", exc_info=True)
+    return line
 
 
 def detect_timezone() -> str:
@@ -235,6 +258,7 @@ def build_welcome_page() -> None:
     from sharing_on.model_presets import PRESETS, is_budget_class
     from systemu.interface.dashboard_state import AppState
     from systemu.interface.design.primitives import button
+    from systemu.interface.persona_content import DARE_PROMPT, skin_for
 
     state = AppState.get()
     vault = state.vault
@@ -249,7 +273,13 @@ def build_welcome_page() -> None:
             ui.label("Welcome to Systemu").classes("s-page-title")
             ui.label(
                 "Your office assistant learns how you work and runs it for "
-                "you — with you in control. Four quick steps."
+                "you — with you in control. Four quick steps. "
+                # The growth thesis: both halves are shipped, gated behaviour
+                # (forge offers ask first; the recorder learns workflows), so
+                # this is a description, not a roadmap.
+                "What you see today is the smallest Systemu will ever be — it "
+                "builds new tools when it's missing one (with your approval) "
+                "and learns workflows by watching you work."
             ).classes("s-muted")
 
             # ── 1. API key (status only — never typed here) ────────────────
@@ -355,16 +385,37 @@ def build_welcome_page() -> None:
                 "the superpower."
             ).classes("s-muted")
             from urllib.parse import quote as _q
-            for _p in starter_prompts():
-                _label = ui.label(f"›  {_p}").classes("s-cell")
+
+            def _starter_line(text: str, prompt: str) -> None:
+                _label = ui.label(f"›  {text}").classes("s-cell")
                 _label.style("cursor: pointer;")
                 # Finalize onboarding FIRST, then open the starter pre-filled —
                 # a bare navigate to /chat would be bounced back by the W11.4
                 # onboarding gate (the "just refreshes" bug).
                 _label.on("click",
-                          lambda _, p=_p: _run_finalize(
+                          lambda _, p=prompt: _run_finalize(
                               f"/chat?prefill={_q(p)}",
                               "Setup saved — opening your starter…"))
+
+            @ui.refreshable
+            def _starters() -> None:
+                """The persona answer's first consumer (Charter v2 req 5).
+
+                Step 3's picker re-renders this block; before anything is
+                picked `skin_for(None)` yields DEFAULT_SKIN, whose starters
+                equal `starter_prompts()` — the pre-registry page, unchanged.
+                """
+                skin = skin_for(persona_in.value)
+                for _p in skin.starters:
+                    _starter_line(_p, _p)
+                # The dare is a fourth starter, not decoration: DARE_PROMPT is
+                # deliberately something the stock toolbox lacks, so clicking
+                # it walks the operator into a real forge offer (which still
+                # asks for approval before building anything).
+                _starter_line(dare_label(skin, config), DARE_PROMPT)
+
+            _starters()
+            persona_in.on_value_change(lambda _=None: _starters.refresh())
 
             def _finish(_=None) -> None:
                 # W11.4: setup is enforced (key + name required). Shared

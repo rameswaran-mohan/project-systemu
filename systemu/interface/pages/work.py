@@ -219,6 +219,27 @@ def _load_unlinked() -> List[Dict[str, Any]]:
         return []
 
 
+def _empty_work_text(vault: Any = None) -> str:
+    """Persona-skinned copy for the empty Work list (persona_content registry).
+
+    ``vault`` defaults to the AppState vault; tests pass one directly.
+    Defensive by contract: no AppState, unreadable facts, or no persona
+    recorded all fall back to DEFAULT_SKIN, whose ``empty_work`` reproduces
+    the literal this page used before the registry - so the no-persona path
+    renders byte-identically.
+    """
+    from systemu.interface.persona_content import (
+        DEFAULT_SKIN, current_persona, skin_for,
+    )
+    try:
+        if vault is None:
+            from systemu.interface.dashboard_state import AppState
+            vault = AppState.get().vault
+        return skin_for(current_persona(vault)).empty_work
+    except Exception:
+        return DEFAULT_SKIN.empty_work
+
+
 def build_work_page() -> None:
     """Render the /work list: search + status filter over tracker rows,
     5-stage chips per row, and the defensive "Unlinked items" section.
@@ -259,8 +280,14 @@ def build_work_page() -> None:
     def _rows_view() -> None:
         rows = _filter_rows(_load_rows(), filt["query"], filt["status"])
         if not rows:
+            # Persona-skinned copy (DEFAULT_SKIN reproduces the pre-registry
+            # wording for an operator who never answered the persona
+            # question).  The W11 pin in tests/test_wave11_intuitive.py
+            # anchors on the render call below and asserts the "/chat" link
+            # stays adjacent -- an empty state must offer the action, not
+            # just describe the absence.
             with ui.row().classes("q-pa-md items-center").style("gap: 6px;"):
-                ui.label("No workflows yet —").classes("s-muted")
+                ui.label(_empty_work_text()).classes("s-muted")
                 ui.link("submit a task in Chat", "/chat").classes("s-muted")
                 ui.label("or hit ＋New → Record session.").classes("s-muted")
         for row in rows:
