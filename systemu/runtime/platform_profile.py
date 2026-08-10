@@ -78,13 +78,43 @@ def _in_container() -> bool:
     return False
 
 
-def _provider_configured() -> bool:
-    """Is the LLM provider configured? (env-driven so the profile stays
-    deterministic + hermetic — never prints the key, only its presence)."""
+def provider_statuses(config=None, *, probe=None,
+                      cache_ttl_s: Optional[float] = None) -> dict:
+    """Every provider's MINTED verdict, for the profile / doctor / health page.
+
+    F19 / DEC-43. ``_provider_configured`` used to be
+    ``bool(os.environ["OPENROUTER_API_KEY"])`` — a fifth private copy of the
+    recipe, and the one behind ``doctor`` telling an operator with a working
+    Google key that "LLM provider is not configured (OPENROUTER_API_KEY is
+    missing) — nothing can run."
+
+    ``config`` defaults to ``Config.from_env()``, which reads the same
+    environment the old predicate did (dotenv already applied at import), so the
+    profile stays deterministic and hermetic — it just now scores all five
+    providers through the one mint instead of one env var through a proxy.
+    Never raises: a mint that cannot run yields no statuses, and every consumer
+    below treats that as "not configured", which is fail-closed.
+    """
+    from systemu.runtime import provider_status as _ps
     try:
-        return bool((os.environ.get("OPENROUTER_API_KEY", "") or "").strip())
+        if config is None:
+            from sharing_on.config import Config
+            config = Config.from_env()
+        ttl = _ps.PROBE_CACHE_TTL_S if cache_ttl_s is None else cache_ttl_s
+        return _ps.all_provider_statuses(config, probe=probe, cache_ttl_s=ttl)
     except Exception:
-        return False
+        return {}
+
+
+def _provider_configured(config=None, *, probe=None) -> bool:
+    """Is ANY provider usable? Derived from the mint, never from an env var.
+
+    Kept under this name and this zero-arg-callable shape because
+    ``tests/test_onthetable_consult.py`` and ``systemu/runtime/table_consult.py``
+    both address it as ``platform_profile._provider_configured``.
+    """
+    from systemu.runtime import provider_status as _ps
+    return _ps.any_satisfied(provider_statuses(config, probe=probe))
 
 
 def _usable_keyring():
@@ -210,6 +240,24 @@ def _pkg_version() -> str:
         return "unknown"
 
 
+def _pkg_path() -> str:
+    """The resolved directory of the systemu package THIS process imported.
+
+    Two installs can share a version and be different code — the live F13
+    incident was a stale editable install pointing at a different worktree — so
+    the location is part of the build identity, not decoration.
+    """
+    try:
+        import systemu
+        f = getattr(systemu, "__file__", None)
+        if type(f) is not str:
+            return "unknown"
+        from pathlib import Path as _P
+        return str(_P(f).resolve().parent)
+    except Exception:
+        return "unknown"
+
+
 def _versions() -> dict:
     try:
         py = _platform.python_version()
@@ -242,16 +290,71 @@ def _probe_keyring_locked() -> bool:
         return True
 
 
-def _probe_daemon_running(vault_dir: Optional[str] = None) -> Optional[bool]:
-    """Best-effort daemon liveness. Returns None if it can't be determined."""
+def _probe_daemon_state(vault_dir: Optional[str] = None) -> Optional[dict]:
+    """THE daemon probe for `doctor` and the dashboard health page — the whole
+    projection of the readiness mint, not just its boolean.
+
+    DEC-43: consumes the single readiness mint via ``daemon.get_status`` — whose
+    ``running`` key is an alias of ``ready``, i.e. a TCP connection to the
+    dashboard port was OBSERVED to succeed. It is deliberately not a second,
+    cheaper derivation from the pidfile: doctor used to answer "daemon: running"
+    off process liveness alone, and so agreed with `daemon status` that a daemon
+    still 12 s away from binding its port was up.
+
+    F13 made the *build* fact ride the same mint, so this returns the dict
+    rather than a bool: deriving "is it up?" and "which build is it?" from two
+    separate probes is how the two would come to disagree. ``None`` when the
+    probe is undeterminable at all.
+    """
     try:
         if vault_dir is None:
             from sharing_on.config import Config
             vault_dir = Config.from_env().vault_dir
         from systemu.scheduler.daemon import get_status
-        return bool(get_status(vault_dir).get("running"))
+        st = get_status(vault_dir)
+        return st if type(st) is dict else None
     except Exception:
         return None
+
+
+def _probe_daemon_running(vault_dir: Optional[str] = None) -> Optional[bool]:
+    """Best-effort daemon READINESS. A thin projection of ``_probe_daemon_state``
+    (never a second derivation). Returns None if undeterminable."""
+    st = _probe_daemon_state(vault_dir)
+    return None if type(st) is not dict else bool(st.get("running"))
+
+
+def _daemon_build_view(state: Optional[dict]) -> dict:
+    """F13 render-DATA: which systemu build the daemon is executing.
+
+    ``match`` is TRI-STATE and this function NEVER invents agreement:
+      * ``True``  — the daemon recorded exactly the build this process imported
+      * ``False`` — SKEW; the daemon is serving different code
+      * ``None``  — UNVERIFIED (no probe, or the daemon recorded nothing)
+
+    ``observed`` says whether a tracked daemon process was actually seen, so an
+    unverified build is only ever flagged as a problem when there IS a daemon.
+    """
+    mine_v, mine_p = _pkg_version(), _pkg_path()
+    if type(state) is not dict:
+        return {"observed": False, "match": None, "note": "",
+                "daemon_version": None, "daemon_path": None,
+                "cli_version": mine_v, "cli_path": mine_p}
+    m = state.get("build_match")
+    note = state.get("build_note")
+    dv = state.get("daemon_version")
+    dp = state.get("daemon_path")
+    cv = state.get("cli_version")
+    cp = state.get("cli_path")
+    return {
+        "observed": bool(state.get("process_alive")),
+        "match": m if type(m) is bool else None,
+        "note": note if type(note) is str else "",
+        "daemon_version": dv if type(dv) is str else None,
+        "daemon_path": dp if type(dp) is str else None,
+        "cli_version": cv if type(cv) is str else mine_v,
+        "cli_path": cp if type(cp) is str else mine_p,
+    }
 
 
 def _last_error() -> Optional[str]:
@@ -270,20 +373,38 @@ def build_doctor_report(*, provider_configured: Optional[bool] = None,
                         provider_reachable: Optional[bool] = None,
                         keyring_locked: Optional[bool] = None,
                         daemon_running: Optional[bool] = None,
+                        daemon_state: Optional[dict] = None,
                         last_error: Optional[str] = None,
                         vault_dir: Optional[str] = None,
                         platform_str: Optional[str] = None,
-                        in_container: Optional[bool] = None) -> dict:
+                        in_container: Optional[bool] = None,
+                        config=None, provider_probe=None) -> dict:
     """The self-diagnosis report. Pure given its inputs; every probe is
-    injectable so tests drive killed/locked states deterministically."""
+    injectable so tests drive killed/locked states deterministically.
+
+    F19: ``report["providers"]`` carries EVERY provider's minted verdict, and
+    ``report["provider"]["configured"]`` is derived from those same values — so
+    ``doctor``'s summary row and its per-provider table cannot disagree, and
+    neither can disagree with the dashboard.
+    """
+    from systemu.runtime import provider_status as _ps
+
+    statuses = provider_statuses(config, probe=provider_probe)
     if provider_configured is None:
-        provider_configured = _provider_configured()
+        provider_configured = _ps.any_satisfied(statuses)
     if provider_reachable is None:
         provider_reachable = _probe_provider_reachable()
     if keyring_locked is None:
         keyring_locked = _probe_keyring_locked()
+    # ONE daemon probe feeds BOTH "is it up?" and "which build is it?" (DEC-43).
+    # Skipped entirely when a caller/test has already injected the verdict, so
+    # the hermetic doctor/health tests stay free of real socket I/O.
+    if daemon_state is None and daemon_running is None:
+        daemon_state = _probe_daemon_state(vault_dir)
     if daemon_running is None:
-        daemon_running = _probe_daemon_running(vault_dir)
+        daemon_running = (bool(daemon_state.get("running"))
+                          if type(daemon_state) is dict else None)
+    daemon_build = _daemon_build_view(daemon_state)
     if last_error is None:
         last_error = _last_error()
 
@@ -292,12 +413,13 @@ def build_doctor_report(*, provider_configured: Optional[bool] = None,
     problems = []
 
     # -- LLM provider (BLOCKING) ------------------------------------------
+    # F19: the message names every provider the operator could configure, not
+    # only the one this check used to read. Generated from PROVIDER_SPECS.
     if not provider_configured:
         problems.append({
             "id": "provider_absent", "severity": "danger", "blocking": True,
-            "message": "LLM provider is not configured (OPENROUTER_API_KEY is "
-                       "missing) — nothing can run.",
-            "cta": "Add OPENROUTER_API_KEY=… to .env and restart the daemon.",
+            "message": "No LLM provider is usable — nothing can run.",
+            "cta": _ps.configure_hint(statuses) + " Then restart the daemon.",
         })
     elif provider_reachable is False:
         problems.append({
@@ -330,15 +452,69 @@ def build_doctor_report(*, provider_configured: Optional[bool] = None,
             "id": "daemon_down", "severity": "warning", "blocking": False,
             "message": "The Systemu daemon is not running — recordings and tasks "
                        "will not be picked up.",
-            "cta": "Start it: sharing_on daemon start",
+            "cta": "Start it: systemu daemon start",
+        })
+
+    # -- F13 daemon BUILD SKEW (non-blocking warning) ----------------------
+    # Loud, but never blocking: a user mid-upgrade must still be able to run
+    # `daemon stop`, and `doctor` exiting nonzero is a blocking signal.
+    if daemon_build["match"] is False:
+        problems.append({
+            "id": "daemon_build_skew", "severity": "warning", "blocking": False,
+            "message": (daemon_build["note"]
+                        or "The daemon is executing a different systemu build "
+                           "than this CLI."),
+            "cta": "Restart the daemon: systemu daemon stop, then "
+                   "systemu daemon start.",
+        })
+    elif daemon_build["observed"] and daemon_build["match"] is None:
+        problems.append({
+            "id": "daemon_build_unverified", "severity": "warning",
+            "blocking": False,
+            "message": (daemon_build["note"]
+                        or "The daemon did not record which systemu build it "
+                           "loaded, so it cannot be compared with this CLI."),
+            "cta": "Restart the daemon: systemu daemon stop, then "
+                   "systemu daemon start.",
+        })
+
+    # -- F21 optional capability groups (non-blocking warning) -------------
+    # A pure-CLI operator who never wanted the dashboard must not see `doctor`
+    # exit nonzero, so these are warnings by construction. They are reported at
+    # all because "the dashboard URL does nothing" and "web_read says it cannot
+    # run" are the two questions a slimmer default install creates, and the
+    # answer to both is one line the operator can copy.
+    from systemu.runtime import optional_deps as _od
+    optional_groups = _od.group_status()
+    for _g in optional_groups:
+        if _g["installed"]:
+            continue
+        problems.append({
+            "id": f"optional_group_missing:{_g['extra']}",
+            "severity": "warning", "blocking": False,
+            "message": (f"{_g['label']} is not installed — {_g['covers']} "
+                        f"cannot run. This is optional; nothing else is affected."),
+            "cta": _g["remedy"],
         })
 
     report = {
         "profile": prof,
         "provider": {"configured": bool(provider_configured),
                      "reachable": provider_reachable},
+        # F21: the same rows the dashboard health page and /health read, minted
+        # once here so no surface can disagree about which extras are present.
+        "optional_groups": optional_groups,
+        # F19: the per-provider table `doctor` renders. Plain dicts, so the
+        # report stays JSON-serialisable for /health; `satisfied` is copied from
+        # the minted value, never recomputed from `state` by a consumer.
+        "providers": [{"provider": s.provider, "display": s.display,
+                       "env": s.env, "rule": s.rule, "state": s.state,
+                       "detail": s.detail, "satisfied": s.satisfied}
+                      for s in (statuses.get(spec.provider)
+                                for spec in _ps.PROVIDER_SPECS)
+                      if s is not None],
         "keyring": {"backend": prof["keyring_backend"], "locked": bool(keyring_locked)},
-        "daemon": {"running": daemon_running},
+        "daemon": {"running": daemon_running, "build": daemon_build},
         "versions": _versions(),
         "last_error": last_error,
         "problems": problems,

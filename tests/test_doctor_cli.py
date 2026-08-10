@@ -11,6 +11,25 @@ from click.testing import CliRunner
 from systemu.runtime import platform_profile as pp
 
 
+# F13 unified the daemon probe: `build_doctor_report` derives BOTH "is it up?"
+# and "which build is it running?" from ONE `_probe_daemon_state` call, so that
+# is now the injection point. Patching `_probe_daemon_running` here would be a
+# silent no-op and these tests would quietly start doing real socket I/O.
+
+def _ready_daemon() -> dict:
+    """A daemon that is up and running the same build as this process."""
+    import systemu
+    from pathlib import Path
+    own = str(Path(systemu.__file__).resolve().parent)
+    return {"running": True, "ready": True, "pid": 1234, "process_alive": True,
+            "host": "127.0.0.1", "port": 8765, "url": "http://127.0.0.1:8765",
+            "reason": "accepting connections",
+            "daemon_version": systemu.__version__, "daemon_path": own,
+            "cli_version": systemu.__version__, "cli_path": own,
+            "build_match": True,
+            "build_note": f"same build on both sides: systemu {systemu.__version__}"}
+
+
 # ── the pure report builder (deterministic, injected states) ─────────────────
 
 def test_report_healthy_has_no_blocking_problems():
@@ -81,7 +100,7 @@ def test_doctor_cli_exits_nonzero_on_killed_provider_and_locked_keyring(monkeypa
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-configured")   # configured but killed
     monkeypatch.setattr(pp, "_probe_provider_reachable", lambda: False)
     monkeypatch.setattr(pp, "_probe_keyring_locked", lambda: True)
-    monkeypatch.setattr(pp, "_probe_daemon_running", lambda vault_dir=None: True)
+    monkeypatch.setattr(pp, "_probe_daemon_state", lambda vault_dir=None: _ready_daemon())
     res = _invoke()
     assert res.exit_code != 0, res.output
     low = res.output.lower()
@@ -92,7 +111,7 @@ def test_doctor_cli_exits_zero_when_healthy(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-configured")
     monkeypatch.setattr(pp, "_probe_provider_reachable", lambda: True)
     monkeypatch.setattr(pp, "_probe_keyring_locked", lambda: False)
-    monkeypatch.setattr(pp, "_probe_daemon_running", lambda vault_dir=None: True)
+    monkeypatch.setattr(pp, "_probe_daemon_state", lambda vault_dir=None: _ready_daemon())
     res = _invoke()
     assert res.exit_code == 0, res.output
 
@@ -101,7 +120,7 @@ def test_doctor_cli_renders_the_platform_profile(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-configured")
     monkeypatch.setattr(pp, "_probe_provider_reachable", lambda: True)
     monkeypatch.setattr(pp, "_probe_keyring_locked", lambda: False)
-    monkeypatch.setattr(pp, "_probe_daemon_running", lambda vault_dir=None: True)
+    monkeypatch.setattr(pp, "_probe_daemon_state", lambda vault_dir=None: _ready_daemon())
     res = _invoke()
     low = res.output.lower()
     # the capability card renders the jail-absent row + the DEP-10 honesty table
@@ -118,7 +137,7 @@ def test_bare_sharing_on_doctor_runs_self_diagnosis_and_blocks(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-configured")   # configured but killed
     monkeypatch.setattr(pp, "_probe_provider_reachable", lambda: False)
     monkeypatch.setattr(pp, "_probe_keyring_locked", lambda: True)
-    monkeypatch.setattr(pp, "_probe_daemon_running", lambda vault_dir=None: True)
+    monkeypatch.setattr(pp, "_probe_daemon_state", lambda vault_dir=None: _ready_daemon())
     res = CliRunner().invoke(doctor, [])
     assert res.exit_code != 0, res.output
     low = res.output.lower()
@@ -130,6 +149,6 @@ def test_bare_sharing_on_doctor_healthy_exits_zero(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-configured")
     monkeypatch.setattr(pp, "_probe_provider_reachable", lambda: True)
     monkeypatch.setattr(pp, "_probe_keyring_locked", lambda: False)
-    monkeypatch.setattr(pp, "_probe_daemon_running", lambda vault_dir=None: True)
+    monkeypatch.setattr(pp, "_probe_daemon_state", lambda vault_dir=None: _ready_daemon())
     res = CliRunner().invoke(doctor, [])
     assert res.exit_code == 0, res.output

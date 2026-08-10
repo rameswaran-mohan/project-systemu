@@ -1311,7 +1311,27 @@ def run_dashboard(
                  docker-compose.yml so the port mapping works.
         reload:  Hot-reload on file changes (dev only).
         dark:    Enable NiceGUI dark mode.
+
+    Raises:
+        OptionalDependencyMissing: the ``[dashboard]`` extra is not installed.
     """
+    # ── F21: the availability gate, FIRST ────────────────────────────────────
+    # This used to live 80 lines down as `try: from nicegui import ui / except
+    # ImportError: logger.error("Run: pip install nicegui"); return`. Three
+    # things were wrong with that and all three mattered:
+    #   * it named a bare package, not the extra that is the real remedy;
+    #   * it RETURNED, so `run_dashboard_thread` completed "successfully" and
+    #     the daemon logged "Dashboard thread launched on http://…" over a
+    #     dashboard that had never started — the exact silently-does-nothing
+    #     shape this packet exists to remove;
+    #   * everything above it had already run, so a refused start had already
+    #     stamped SYSTEMU_DASHBOARD_PORT/_ORIGIN and completed the R-SEC1
+    #     exposure check for a server that would never bind.
+    # Now: probe before any side effect, and RAISE a typed error whose message
+    # is the whole remedy.
+    from systemu.runtime import optional_deps as _od
+    _od.require(("nicegui",), what="The systemu dashboard cannot start")
+
     import os
     if not host:
         host = os.getenv("SYSTEMU_DASHBOARD_HOST", "127.0.0.1")
@@ -1369,13 +1389,21 @@ def run_dashboard(
     except Exception:
         logger.debug("[Dashboard] TLS env passthrough skipped", exc_info=True)
 
+    # F21: the availability gate ran at the TOP of this function (see the block
+    # above `import os`), before any side effect. Reaching this import with
+    # nicegui absent is impossible via `run_dashboard`; a plain import here
+    # would therefore be honest, but the belt is cheap and the message is the
+    # same single source, so a future caller that skips the entry point still
+    # gets the remedy instead of a traceback.
     try:
         from nicegui import ui, app as ng_app
-    except ImportError:
-        logger.error(
-            "[Dashboard] NiceGUI not installed. Run: pip install nicegui"
-        )
-        return
+    except ImportError as exc:
+        from systemu.runtime import optional_deps as _od2
+        raise _od2.OptionalDependencyMissing(
+            _od2.unavailable_reason(("nicegui",))
+            or f"nicegui could not be imported: {exc}",
+            packages=("nicegui",), extra="dashboard",
+        ) from exc
 
     # W3.1: suppress NiceGUI's benign post-navigation timer traceback spam
     # ('parent slot of the element has been deleted') — see log_filters.

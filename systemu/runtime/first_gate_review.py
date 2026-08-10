@@ -14,6 +14,24 @@ front, instead of being interrupted N times mid-task.
     individually via the IMPL-2 reclassify flow + high-friction typed-confirm — never
     swept in by a bulk Always-allow."
 
+── F9: the band is NOT the batch rule ───────────────────────────────────────────
+
+The spec sentence above, implemented literally, shipped a card that offered 30 seed
+tools for one-click standing approval — ``run_command``, ``run_cli_command``,
+``launch_application``, ``close_application`` (``shell_exec``) and ``file_delete``
+(``local_delete``) among them — while truthfully reporting "0 excluded", because the
+DENY floor is ``UNKNOWN ∩ high-severity`` and a tool declaring ``shell_exec`` is neither
+UNKNOWN nor (per ``effect_tags.HIGH_SEVERITY``) high-severity.
+
+The band answers "must the operator SEE this call?". Batch approval removes the card AND
+the arguments, permanently, so it needs its own, strictly narrower question — answered by
+``action_governance.batch_approvable`` against the ``effect_tags.BATCH_APPROVABLE``
+ALLOWLIST. Default-exclude is the load-bearing part: a shell tool or a novel actuation
+class added tomorrow is refused with nobody updating a denylist.
+
+The card's rule sentence is GENERATED from that allowlist (:func:`batch_rule_sentence`)
+so the promise on screen cannot drift from the set in code — the drift WAS the defect.
+
 ── The DENY carve-out is enforced on BOTH sides, and it has to be ───────────────
 
 RECORD side (here): :func:`apply_bulk_always_allow` RE-SCORES every entry from its raw
@@ -87,6 +105,29 @@ OPT_BULK_ALLOW = "Always allow the approvable ones"
 # operator is deciding about, and the truncation is always disclosed.
 MAX_LISTED_PER_BAND = 40
 
+# How long ONE excluded tool's reason may render. Same bound, same reason as
+# MAX_LISTED_PER_BAND: the reason is printed once per excluded tool, so without a cap the
+# card's size scales with inventory x reason length. Measured: 400 excluded tools rendered
+# 10,547 chars, past the dashboard's 8000-char detail clip (R-UX2, `live_events_pane
+# .clip_detail`) — i.e. the card would be cut mid-listing by the renderer instead of
+# truncating on its own terms with a disclosure line.
+#
+# DISPLAY-ONLY, exactly like MAX_LISTED_PER_BAND: the decision, the counts and the
+# recorded allow-set are all unaffected, and the effect class always leads the string so
+# a clip can never remove the part that names WHY.
+MAX_REASON_CHARS = 100
+
+# The dashboard's detail clip (``live_events_pane.clip_detail``). The card must truncate
+# on its OWN terms, with a disclosure line, before the renderer cuts it silently.
+#
+# F17: the card now has a part that MAY NOT yield — ``batch_rule_sentence``'s attribution
+# of every dated operator ruling is the consent record, and it grows by one clause per
+# ruling. So the caller shrinks the per-band listing (display-only, self-disclosing)
+# against this bound instead of holding the listing fixed and letting the record run off
+# the end. Pinned by ``test_the_excluded_listing_with_reasons_stays_inside_the_dashboard_clip``
+# and ``test_a_third_ruling_does_not_push_the_card_past_the_clip``.
+MAX_CARD_CHARS = 8000
+
 
 class ReviewEntry(BaseModel):
     """One backfilled tool as it appears on the review card.
@@ -121,6 +162,22 @@ class BulkReviewPartition(BaseModel):
         return bool(self.eligible or self.excluded)
 
 
+def _migration_context(name: str, effect_tags: Iterable[str]):
+    """The ONE ActionContext both migration-time scorers see.
+
+    Built once so the verdict and the batch-approvability answer can never be derived
+    from differently-shaped inputs — a disagreement between them is exactly the kind of
+    seam this surface has been bitten by.
+    """
+    from systemu.runtime.action_governance import ActionContext
+
+    return ActionContext(
+        tool=name or "",
+        effect_tags={str(t) for t in (effect_tags or ())},
+        is_destructive_param=False,
+    )
+
+
 def migration_verdict(name: str, effect_tags: Iterable[str]) -> Tuple[str, str]:
     """Score a backfilled tool AT MIGRATION TIME — i.e. with no call parameters.
 
@@ -130,14 +187,77 @@ def migration_verdict(name: str, effect_tags: Iterable[str]) -> Tuple[str, str]:
     is False because there is no call in hand — which is exactly why a swept allow can
     still meet a DENY later, and why the consumption-side guard is load-bearing.
     """
-    from systemu.runtime.action_governance import ActionContext, evaluate_action
+    from systemu.runtime.action_governance import evaluate_action
 
-    verdict, reason = evaluate_action(ActionContext(
-        tool=name or "",
-        effect_tags={str(t) for t in (effect_tags or ())},
-        is_destructive_param=False,
-    ))
+    verdict, reason = evaluate_action(_migration_context(name, effect_tags))
     return verdict.value, reason
+
+
+def migration_batch_approvable(name: str, effect_tags: Iterable[str]) -> Tuple[bool, str]:
+    """F9 — may this backfilled tool receive a STANDING, BLANKET allow in one click?
+
+    Delegates to the ONE governor (``action_governance.batch_approvable``) over the same
+    migration context ``migration_verdict`` scores, so the band and the batch answer
+    describe the same action.
+    """
+    from systemu.runtime.action_governance import batch_approvable
+
+    return batch_approvable(_migration_context(name, effect_tags))
+
+
+#: F17 — leads every dated-ruling attribution clause on the card, and is the token a
+#: reader (and ``tests/test_f17_ruling_attribution.py``) uses to delimit one clause
+#: from the next. The ruling's DATE follows it immediately.
+RULING_ATTRIBUTION_MARKER = "An explicit operator decision of "
+
+
+def batch_rule_sentence() -> str:
+    """The operator-facing sentence stating the rule the card ACTUALLY applies.
+
+    GENERATED from the allowlist, never written alongside it. F9 was precisely a text/set
+    drift: the card promised "an unclassifiable high-severity effect can never be
+    batch-approved" — true, and useless, because nothing in the inventory was
+    high-severity — while offering ``run_command`` and ``file_delete`` in the batch.
+    Deriving the sentence means widening the set rewrites the promise automatically, and
+    the widening itself is what the disjointness test refuses.
+    """
+    from systemu.runtime import effect_tags as _et
+
+    allowed = ", ".join(_et.batch_approvable_tags())
+    sentence = (
+        f"Only a tool whose effects are fully classified AND limited to {allowed} can "
+        "be batch-approved. Anything that runs a shell, deletes, sends, moves money, "
+        "uses a credential, reaches the network by any other route — or that could "
+        "not be classified at all — is EXCLUDED from the batch and stays gated until "
+        "you approve it individually, with its arguments in front of you."
+    )
+    # F14 — DISCLOSE THE RULING ON THE CARD. Several of the allowlist's members are
+    # capture/actuation/network-read classes admitted by an explicit operator decision,
+    # not by the "reversible and local" reasoning that admits the rest. An operator
+    # reading the sentence above alone would infer that everything in the batch is
+    # harmless-local, which is precisely the promise/reality gap F9 was.
+    #
+    # F17 — ATTRIBUTE EVERY RULING, EACH TO ITS OWN DATE. This clause used to be
+    # generated from the 08-07 constant alone, so when the 08-09 ruling admitted
+    # `net_read` that class sat in the allowlist above with no attribution — the card
+    # read as though it had always been allowed. The loop below walks
+    # `effect_tags.OPERATOR_RULINGS`, THE registry from which the ruled set is itself
+    # derived, so (a) every ruled member is necessarily attributed and (b) a third
+    # ruling tomorrow is attributed automatically, with nobody editing this sentence.
+    # Read back off the rendered card by `tests/test_f17_ruling_attribution.py`.
+    #
+    # The DATE leads each clause, immediately after the marker, so the clause a reader
+    # (or the test) delimits cannot borrow tag names from the allowlist enumeration
+    # above or from a sibling ruling.
+    for ruling in _et.OPERATOR_RULINGS:
+        named = ", ".join(sorted(t.value for t in ruling.tags))
+        if not named:
+            continue
+        sentence += (
+            f" {RULING_ATTRIBUTION_MARKER}{ruling.date} admits {named} to that list, "
+            f"taken with the risks stated: {ruling.risks}."
+        )
+    return sentence
 
 
 def build_entry(*, tool_id: str, name: str, effect_tags: Sequence[str],
@@ -189,12 +309,47 @@ def _authoritative_verdict(entry: ReviewEntry) -> str:
         return Verdict.DENY.value
 
 
-def partition_entries(entries: Iterable[ReviewEntry]) -> BulkReviewPartition:
-    """Split the backfilled inventory by band.
+def batch_exclusion_reason(entry: ReviewEntry) -> str:
+    """WHY this entry may not be batch-approved — "" iff it may.
 
-    Classifies on the RE-DERIVED verdict (see :func:`_authoritative_verdict`) while
-    carrying the original entry objects through, so the card renders what was scored and
-    a stale stamped verdict cannot move a tool between bands.
+    Re-derived from the entry's raw signals by the same predicate that made the
+    decision, so the reason the card prints and the reason the code acted on cannot
+    disagree. Fails CLOSED: an entry we cannot score gets a refusal, not a blank.
+    """
+    try:
+        ok, reason = migration_batch_approvable(entry.name, entry.effect_tags)
+    except Exception:  # noqa: BLE001 — a scoring hiccup must never widen the batch
+        logger.warning("[FirstGateReview] could not score %r for batch approval — "
+                       "refusing it", entry.name, exc_info=True)
+        return "could not be scored for batch approval"
+    return "" if ok else (reason or "not batch-approvable")
+
+
+def _is_batch_eligible(entry: ReviewEntry) -> bool:
+    """The FULL eligibility test: the REQUIRE_APPROVAL band AND the F9 effect allowlist.
+
+    Both conjuncts are required and they answer different questions. The band answers
+    "would this tool gate at all?" — an ALLOW-band tool needs no stored approval, and a
+    DENY-band tool is individually remediable only. The allowlist answers "may this
+    effect class be granted blanket, unattended, argument-free permission?" — which the
+    band does NOT answer, and whose absence WAS the F9 defect: the whole
+    REQUIRE_APPROVAL band was swept, so `shell_exec` and `local_delete` tools were
+    offered under one click while the card reported "0 excluded".
+    """
+    return (is_bulk_eligible(_authoritative_verdict(entry))
+            and not batch_exclusion_reason(entry))
+
+
+def partition_entries(entries: Iterable[ReviewEntry]) -> BulkReviewPartition:
+    """Split the backfilled inventory into what the card may batch and what it may not.
+
+    Classifies on RE-DERIVED signals (see :func:`_authoritative_verdict` and
+    :func:`batch_exclusion_reason`) while carrying the original entry objects through, so
+    the card renders what was scored and a stale stamped verdict cannot move a tool
+    between groups.
+
+    ``excluded`` is no longer "the DENY band" — it is "everything that gates but may not
+    be batched", which is the group the operator actually needs named on the card.
     """
     from systemu.runtime.action_governance import Verdict
 
@@ -204,13 +359,16 @@ def partition_entries(entries: Iterable[ReviewEntry]) -> BulkReviewPartition:
 
     for entry in entries or ():
         verdict = _authoritative_verdict(entry)
-        if is_bulk_eligible(verdict):
+        if _is_batch_eligible(entry):
             eligible.append(entry)
         elif verdict == Verdict.ALLOW.value:
+            # never gates ⇒ nothing to remember; an entry for it would be noise on a
+            # safety surface. (It is not batch-approvable either, but the batch is a
+            # convenience for tools that WOULD prompt, and this one never will.)
             frictionless.append(entry)
         else:
-            # DENY — and any band this function does not recognise. Fail closed: an
-            # unrecognised verdict is treated as un-sweepable, never as eligible.
+            # DENY, a high-authority/unclassified REQUIRE_APPROVAL tool, and any band
+            # this function does not recognise. Fail closed: not sweepable.
             excluded.append(entry)
 
     return BulkReviewPartition(eligible=tuple(eligible), excluded=tuple(excluded),
@@ -221,11 +379,16 @@ def apply_bulk_always_allow(entries: Iterable[ReviewEntry], *, store) -> List[st
     """Record a STANDING allow for every genuinely eligible entry. Returns the signatures
     written.
 
-    Two rules make this safe to run over an operator-supplied batch:
+    Three rules make this safe to run over an operator-supplied batch:
 
       1. every entry is RE-SCORED here (never trusting the stamped verdict), so only the
          REQUIRE_APPROVAL band is written;
-      2. nothing else is minted — in particular NO single-use resume bridge. A migration
+      2. the F9 effect ALLOWLIST is re-applied here too, not only at partition time. The
+         entries round-trip through the decision store as JSON, and a card posted by an
+         OLDER BUILD lists `run_command` in its stored context as eligible. The operator
+         clicking that card months later must not sweep a shell tool because the card
+         was rendered before the rule existed;
+      3. nothing else is minted — in particular NO single-use resume bridge. A migration
          card has no parked run to resume, so a one-shot would sit unconsumed on a
          params-INDEPENDENT signature until some later, unrelated call to that tool spent
          it. That is the dangling-bridge hazard the coords-less rescue path documents,
@@ -244,6 +407,11 @@ def apply_bulk_always_allow(entries: Iterable[ReviewEntry], *, store) -> List[st
             logger.info("[FirstGateReview] %r is not REQUIRE_APPROVAL-band — excluded "
                         "from the bulk allow (the remedy is IMPL-2 reclassify)",
                         entry.name)
+            continue
+        _why = batch_exclusion_reason(entry)
+        if _why:
+            logger.info("[FirstGateReview] %r may not be batch-approved (%s) — it stays "
+                        "gated and is approvable individually", entry.name, _why)
             continue
         try:
             store.approve(entry.signature)
@@ -396,7 +564,8 @@ def maybe_post_first_gate_review(*, vault, vault_dir, version: str) -> str:
                 # the post failed — do NOT stamp; retry on the next boot
                 return ""
             logger.info("[FirstGateReview] posted the one-time first-gate review card: "
-                        "%d approvable, %d excluded (unclassifiable + high-severity)",
+                        "%d batch-approvable, %d excluded (a high-authority or "
+                        "unclassified effect — each stays individually gated)",
                         len(partition.eligible), len(partition.excluded))
         if marker is not None:
             marker.write_text(str(version), encoding="utf-8")

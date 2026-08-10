@@ -150,7 +150,7 @@ class TestMigratorActuallyDelivers:
         assert summary.get("fast_path") is False, summary
         assert summary["seed_version_to"] == systemu.__version__
         assert summary["added"] == 1, summary
-        assert summary["updated"] == 1, summary
+        assert summary["impl_replaced"] == 1, summary
         assert summary["errors"] == [], summary
 
         back = json.loads(idx_path.read_text(encoding="utf-8"))
@@ -200,7 +200,7 @@ class TestMigratorActuallyDelivers:
         summary = vm.run(vault_dir)
 
         # half 1 — the seed update still lands
-        assert summary["updated"] >= 1, summary
+        assert summary["impl_replaced"] >= 1, summary
         assert impl.read_bytes() == pkg_bytes, "package version must win in the live tree"
 
         # half 2 — and the operator's work is recoverable, byte for byte
@@ -438,7 +438,8 @@ class TestMigratorActuallyDelivers:
         out = vm.backfill_effect_tags(vault_dir)
 
         assert out.get("fast_path") is False, out
-        assert out["stamped"] > 0, out
+        assert out["bodies_written"] > 0, out
+        assert out["classified"] > 0, out   # F14: written != classified
         written = marker.read_text(encoding="utf-8").strip()
         assert written == vm._effect_tags_marker_value(systemu.__version__)
         assert systemu.__version__ in written, (
@@ -520,7 +521,7 @@ class TestSeedUpdateKeepsTheOperatorsDisable:
         self._stale(vault_dir)
 
         summary = vm.run(vault_dir)
-        assert summary["updated"] >= 1, summary
+        assert summary["impl_replaced"] >= 1, summary
 
         from systemu.vault.vault import Vault
         after = Vault(vault_dir)
@@ -533,7 +534,19 @@ class TestSeedUpdateKeepsTheOperatorsDisable:
 
     def test_the_seed_update_still_lands_while_the_disable_is_kept(self, tmp_path):
         """The merge must not turn into a skip: package-authoritative fields
-        still win, only `enabled` is carried across."""
+        still win, only `enabled` is carried across.
+
+        F26 CHANGED WHICH PACKAGE COPY IS AUTHORITATIVE FOR THE HEADER — the tool
+        BODY, not the packaged ``tools/index.json``. Those two disagree on
+        ``description`` for 4 of the 41 shipped tools (extract_records,
+        web_extract, web_read, web_search), and the body is the one that wins
+        everywhere else: ``vault._tool_header`` derives the header from the Tool,
+        so the packaged header's value survived only until the next
+        ``save_tool``. ``converge_package_manifest`` therefore derives the header
+        from the refreshed body, which is the value the runtime would have
+        produced anyway. The assertion below reads the package BODY for that
+        reason — the operator's stale text is still replaced, which is what this
+        test is about."""
         vault_dir = self._make_vault(tmp_path)
         v = self._booted(vault_dir)
         name = v.load_index("tools")[0]["name"]
@@ -550,13 +563,16 @@ class TestSeedUpdateKeepsTheOperatorsDisable:
 
         vm.run(vault_dir)
 
-        pkg_entry = {e["name"]: e for e in json.loads(
-            (vm._package_vault_root() / "tools" / "index.json").read_text(
-                encoding="utf-8"))}[name]
+        pkg_root = vm._package_vault_root()
+        pkg_tid = {e["name"]: e["id"] for e in json.loads(
+            (pkg_root / "tools" / "index.json").read_text(encoding="utf-8"))}[name]
+        pkg_body = json.loads(
+            (pkg_root / "tools" / f"tool_{pkg_tid}.json").read_text(encoding="utf-8"))
         hdr = {e["name"]: e for e in json.loads(
             (vault_dir / "tools" / "index.json").read_text(encoding="utf-8"))}[name]
         assert impl.read_bytes() == pkg_impl_bytes, "the seed update must still land"
-        assert hdr["description"] == pkg_entry["description"], (
+        assert hdr["description"] != "operator's stale description"
+        assert hdr["description"] == pkg_body["description"], (
             "description is package-authoritative and must still be replaced")
         assert hdr["enabled"] is False
 
@@ -573,7 +589,7 @@ class TestSeedUpdateKeepsTheOperatorsDisable:
 
         summary = vm.run(vault_dir)
 
-        assert summary["updated"] >= 3, summary
+        assert summary["impl_replaced"] >= 3, summary
         assert summary["kept_disabled"] == 0, summary
         after = json.loads((vault_dir / "tools" / "index.json").read_text(encoding="utf-8"))
         assert all(e["enabled"] is True for e in after), (
@@ -771,7 +787,7 @@ class TestSeedUpdateKeepsTheOperatorsDisable:
 
         summary = vm.run(vault_dir)
 
-        assert summary["updated"] >= 1, summary
+        assert summary["impl_replaced"] >= 1, summary
         assert summary["kept_disabled"] == 1, summary
         from systemu.vault.vault import Vault
         assert Vault(vault_dir).find_tool_by_name(name).enabled is False
@@ -888,6 +904,17 @@ class TestSeedUpdateKeepsTheOperatorsDisable:
         body is the package's new one), and `implementation_path` is
         vault-declared — re-stamping it from the old entry would carry a
         redirected path across a migration that just replaced `{name}.py`.
+
+        F26 LEANS ON THIS SWEEP AND MUST NOT DISARM IT.
+        `converge_package_manifest` refreshes a stale `parameters_schema` from the
+        packaged catalog, which leaves the header's summary describing the OLD
+        schema. It DELETES the stale summary rather than rewriting it, precisely
+        so this sweep — whose guard is
+        `if all("parameters_schema_summary" in t ...): return` — stays the single
+        writer of every derived header field. An earlier revision of that pass
+        WROTE the summary instead, which made the guard true and left
+        `dry_run_status` / `version` / `implementation_path` permanently missing.
+        This test is what caught it.
         """
         vault_dir = self._make_vault(tmp_path)
         v = self._booted(vault_dir)

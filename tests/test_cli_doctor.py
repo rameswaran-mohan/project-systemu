@@ -37,7 +37,13 @@ def db(tmp_path, monkeypatch):
 
 def _run(args, db_url):
     import os
-    env = {**os.environ, "SYSTEMU_DATABASE_URL": db_url}
+    # F2: scoped `doctor` now opens the ACTIVE backend via open_vault instead of
+    # reading SYSTEMU_DATABASE_URL behind the factory's back, so selecting the
+    # SQL backend takes the same two vars every other component uses (and that
+    # .env.example / install.py already write).
+    env = {**os.environ,
+           "SYSTEMU_STORAGE": "sqlite",
+           "SYSTEMU_DATABASE_URL": db_url}
     return subprocess.run(
         [sys.executable, "-m", "sharing_on", *args],
         cwd=str(REPO), capture_output=True, text=True, timeout=60, env=env,

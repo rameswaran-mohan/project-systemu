@@ -72,6 +72,89 @@ _API_TIMEOUT_SECONDS = 120.0
 _NETWORK_MAX_RETRIES  = 2
 _NETWORK_BACKOFF_S    = [5.0, 15.0]
 
+# The default completion budget for ANY call. Named (rather than a literal in
+# llm_call's signature) so the JSON escalation ceiling below cannot drift away
+# from "the budget every configured model is already assumed to accept".
+_DEFAULT_MAX_TOKENS = 8192
+
+# ── F12: structured-output completion budgets ────────────────────────────────
+# `max_tokens` is a total COMPLETION cap, and on reasoning models the reasoning
+# tokens are billed against it. Measured live on the shipped tier-1 default
+# (deepseek/deepseek-v4-flash) with the episodic-memory budget of 400:
+#     finish_reason='length'  completion_tokens=401  reasoning_tokens=357
+# i.e. 357 of 400 went to reasoning and the JSON was cut off mid-string. A
+# structured-output request under-budgeted like that does not save money — it
+# spends the whole budget and returns nothing usable. max_tokens is a CAP, not
+# a spend, so raising the floor costs nothing when it is not needed.
+_JSON_MIN_BUDGET     = 2048
+_JSON_BUDGET_CEILING = _DEFAULT_MAX_TOKENS
+
+
+def _json_budget(requested: Optional[int]) -> int:
+    """The floor every structured-output request is dispatched at."""
+    try:
+        req = int(requested) if requested is not None else _DEFAULT_MAX_TOKENS
+    except (TypeError, ValueError):
+        req = _DEFAULT_MAX_TOKENS
+    return max(req, _JSON_MIN_BUDGET)
+
+
+def _escalated_budget(current: int) -> int:
+    """A wider completion budget for a retry, never smaller than ``current``.
+
+    Returns ``current`` unchanged once there is no headroom left to give — the
+    caller must then NOT re-dispatch, because re-running a call at the budget
+    that already truncated it is re-running a configuration proven insufficient.
+    """
+    cur = max(1, int(current))
+    return max(min(max(cur * 4, _JSON_MIN_BUDGET), _JSON_BUDGET_CEILING), cur)
+
+
+def _repair_budget(current: int, *, truncated: bool) -> int:
+    """P2: the budget granted to the JSON repair call.
+
+    ALWAYS ``>= current`` — the repair prompt is strictly harder than the
+    original (it must reproduce the answer AND obey a format instruction) while
+    carrying a longer prompt, so it may never be granted less headroom than the
+    call it is repairing. Strictly greater when the original was truncated.
+    """
+    return _escalated_budget(current) if truncated else max(int(current), _JSON_MIN_BUDGET)
+
+
+# Every provider family's name for "I hit the token cap".
+_TRUNCATION_REASONS = frozenset({"length", "max_tokens", "model_length", "max_output_tokens"})
+
+
+def _normalize_finish_reason(raw: Any) -> str:
+    """Map a provider-native stop signal onto the OpenAI vocabulary.
+
+    OpenAI/OpenRouter: ``choices[0].finish_reason``; Anthropic: ``stop_reason``
+    (``max_tokens``); Ollama: ``done_reason``. EVERY provider's way of saying
+    "I hit the token cap" collapses to the single canonical ``"length"`` so no
+    downstream consumer can miss a truncation by comparing against the one
+    spelling it happens to know. That is what lets ONE truncation fence cover
+    every tier and every provider instead of only the OpenAI-shape path
+    (GATE-7a corollary — never widen one gate of a multi-surface fact).
+    Non-truncation reasons pass through verbatim; unknown/absent → "".
+    """
+    if raw is None:
+        return ""
+    for holder in (raw, *(raw.get("choices") or [] if isinstance(raw, dict) else []),
+                   *(getattr(raw, "choices", None) or [])):
+        for attr in ("finish_reason", "stop_reason", "done_reason"):
+            val = holder.get(attr) if isinstance(holder, dict) else getattr(holder, attr, None)
+            if type(val) is str and val:
+                return "length" if val.strip().lower() in _TRUNCATION_REASONS else val
+    return ""
+
+
+def _is_truncated(finish_reason: Any) -> bool:
+    """True iff the completion was cut off by the token cap. Type-pinned
+    (DEC-36): only a real ``str`` can answer yes."""
+    if type(finish_reason) is not str:
+        return False
+    return finish_reason.strip().lower() in _TRUNCATION_REASONS
+
 # Google AI Studio OpenAI-compatible endpoint
 _GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
@@ -191,6 +274,52 @@ def _emit_drift_flag(*, tier: int, dead: str, fallback: str) -> None:
     except Exception:
         logger.warning("[LLM] tier-%d model %r drifted → %r (flag emit failed)",
                         tier, dead, fallback)
+
+
+def _ascii(text: str) -> str:
+    """DEC-32c: operator-visible verdict strings are ASCII-only. They cross into
+    event_log.jsonl, the dashboard panes and a Windows console whose codepage
+    mangles anything else — a mojibaked verdict is a broken verdict."""
+    return str(text).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _emit_structured_output_failure(
+    *, tier: int, model: str, truncated: bool, budgets: List[int],
+    attempts: int, raw_preview: str,
+) -> None:
+    """F12 / P1 — tell the OPERATOR that a structured-output request produced
+    nothing usable.
+
+    This is the single choke point every ``llm_call_json`` call site in the
+    package passes through, which is why the notice lives here rather than at
+    the 40-plus callers: a feature that quietly degrades because a WARNING went
+    only to a log file is the DEC-34 class (a false assertion of capability).
+    Best-effort — telling the operator must never break the call path.
+    """
+    # ASCII-only (DEC-32c): this string crosses into the dashboard, the CLI and
+    # event_log.jsonl, and a mojibaked verdict is a broken verdict.
+    if truncated:
+        detail = (
+            f"the model's answer was TRUNCATED by the completion budget "
+            f"(tried max_tokens={budgets}). Raise max_tokens for this call or "
+            f"pick a model that spends fewer reasoning tokens."
+        )
+    else:
+        detail = "the model did not return parseable JSON, even after a repair prompt."
+    message = _ascii(
+        f"Tier-{tier} structured-output request to '{model}' failed after "
+        f"{attempts} attempt(s): {detail}"
+    )
+    try:
+        from systemu.interface.notifications import log_event
+        log_event(
+            "WARNING", "llm", message,
+            {"tier": tier, "model": model, "kind": "structured_output_failed",
+             "truncated": bool(truncated), "budgets": list(budgets),
+             "attempts": int(attempts), "raw_preview": raw_preview[:200]},
+        )
+    except Exception:
+        logger.error("[LLM] %s (operator notice failed to emit)", message)
 
 
 def _is_network_retriable(exc: BaseException) -> bool:
@@ -521,7 +650,7 @@ async def _llm_call_via_provider(
                 raise RuntimeError(
                     f"LLM call failed (tier={tier}, model={model}): this model "
                     f"was never validated and the provider rejects it — fix your "
-                    f"config (sharing_on setup / Settings).") from exc
+                    f"config (systemu setup / Settings).") from exc
             # Validated native model drifted. Unlike the OpenRouter path we do
             # NOT silently degrade to the budget default — that would switch
             # PROVIDER (and cost). Flag loudly and fail honestly so the
@@ -543,13 +672,14 @@ async def _llm_call_via_provider(
                 tier, model, in_tok, out_tok, elapsed_ms)
     _record_usage_safe(model, in_tok, out_tok)
 
+    finish_reason = _normalize_finish_reason(resp.raw)
     content: Any = raw_text
     if response_format and response_format.get("type") == "json_object":
         content = _extract_json(raw_text, tier)
     return {
         "content": content, "model": model, "tier": tier,
         "input_tokens": in_tok, "output_tokens": out_tok,
-        "latency_ms": elapsed_ms,
+        "latency_ms": elapsed_ms, "finish_reason": finish_reason,
     }
 
 
@@ -563,7 +693,7 @@ async def llm_call(
     response_format: Optional[Dict[str, Any]] = None,
     tools: Optional[List[Dict[str, Any]]] = None,
     temperature: float = 0.3,
-    max_tokens: int = 8192,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
 ) -> Dict[str, Any]:
     """Make a tiered LLM call and return parsed response (async).
 
@@ -638,11 +768,11 @@ async def llm_call(
                     logger.error(
                         "[LLM] tier=%d model %r was NEVER validated and the "
                         "provider rejects it — CONFIG ERROR, not degrading. "
-                        "Fix it: `sharing_on setup` or Settings.", tier, model)
+                        "Fix it: `systemu setup` or Settings.", tier, model)
                     raise RuntimeError(
                         f"LLM call failed (tier={tier}, model={model}): this "
                         f"model was never validated and the provider rejects "
-                        f"it — fix your config (sharing_on setup / Settings).") from exc
+                        f"it — fix your config (systemu setup / Settings).") from exc
                 fb = _fallback_model_for_tier(tier, model)
                 if fb:
                     logger.error(
@@ -701,6 +831,16 @@ async def llm_call(
     )
     _record_usage_safe(model, in_tok, out_tok)
 
+    # F12: a completion cut off by the token cap is NOT "the model ignored the
+    # instructions" — without this the two are indistinguishable downstream and
+    # a budget bug reads as a model-quality problem.
+    finish_reason = _normalize_finish_reason(choice)
+    if _is_truncated(finish_reason):
+        logger.warning(
+            "[LLM] tier=%d model=%s response TRUNCATED by the completion budget "
+            "(max_tokens=%d, out=%d, finish_reason=%r)",
+            tier, model, max_tokens, out_tok, finish_reason)
+
     content: Any = raw_text
     if response_format and response_format.get("type") == "json_object":
         content = _extract_json(raw_text, tier)
@@ -712,6 +852,7 @@ async def llm_call(
         "input_tokens":  in_tok,
         "output_tokens": out_tok,
         "latency_ms":    elapsed_ms,
+        "finish_reason": finish_reason,
     }
 
 
@@ -739,12 +880,21 @@ async def async_llm_call_json(
     Retry strategy (model-agnostic — works with any decent model):
       1. Network retry: transient timeout / connection errors are retried up to
          _NETWORK_MAX_RETRIES times with exponential back-off (5s, 15s).
-      2. First call uses response_format=json_object when supported.
-      3. If response is prose, a repair call sends the failed output back to
+      2. First call uses response_format=json_object when supported, dispatched
+         at ``_json_budget()`` — never below the reasoning-token floor (F12).
+      3. TRUNCATION escalation. If the completion was cut off by the token cap
+         (``finish_reason='length'``/``max_tokens'``/``done_reason='length'``),
+         the BUDGET was the failure, not the model. Re-issue the SAME request
+         with a wider budget; a repair prompt would be pointless here because
+         the model never got to finish the answer in the first place.
+      4. If the response is prose, a repair call sends the failed output back to
          the model verbatim and asks it to emit ONLY the JSON object it
          described.  This works regardless of schema, tier, or model family —
          the model already knows the answer; it just needs to re-format it.
-         Temperature=0.0 for deterministic extraction.
+         Temperature=0.0 for deterministic extraction. P2: the repair is granted
+         at least the budget the call it repairs had (``_repair_budget``).
+      5. If nothing usable comes back, the operator is TOLD (P1) and the caller
+         gets a ValueError naming the real cause.
     """
     # v0.9.1 hotfix (pre-existing): callers like extractor.py pass timeout=
     # but llm_call's signature doesn't accept it. Pop it out of kwargs and
@@ -760,21 +910,33 @@ async def async_llm_call_json(
     # than the call it is repairing.
     tier = _effective_tier(tier, stage, config)
 
+    # F12: the completion budget is owned by this function from here on — every
+    # attempt below goes through `budget`, so no path can dispatch a
+    # structured-output request under the floor or shrink it on a retry.
+    budget = _json_budget(kwargs.pop("max_tokens", None))
+    budgets_tried: List[int] = []
+    model_label = _model_for_tier(tier, config) if tier in (1, 2, 3) else f"tier{tier}"
+
+    async def _json_attempt(*, user_text: str, this_budget: int,
+                            temperature: Optional[float]) -> Dict[str, Any]:
+        budgets_tried.append(this_budget)
+        call_kwargs = dict(kwargs)
+        if temperature is not None:
+            call_kwargs["temperature"] = temperature
+        coro = llm_call(
+            tier=tier, system=system, user=user_text, config=config,
+            response_format={"type": "json_object"},
+            max_tokens=this_budget, **call_kwargs,
+        )
+        if timeout_s is not None:
+            return await asyncio.wait_for(coro, timeout=timeout_s)
+        return await coro
+
     result: Dict[str, Any] = {}
     for _attempt in range(_NETWORK_MAX_RETRIES + 1):
         try:
-            _coro = llm_call(
-                tier=tier,
-                system=system,
-                user=user,
-                config=config,
-                response_format={"type": "json_object"},
-                **kwargs,
-            )
-            if timeout_s is not None:
-                result = await asyncio.wait_for(_coro, timeout=timeout_s)
-            else:
-                result = await _coro
+            result = await _json_attempt(
+                user_text=user, this_budget=budget, temperature=None)
             break  # success — exit retry loop
         except Exception as exc:
             if _is_network_retriable(exc) and _attempt < _NETWORK_MAX_RETRIES:
@@ -791,12 +953,37 @@ async def async_llm_call_json(
     if isinstance(content, dict):
         return content
 
-    # First call produced prose — send the failed output back as context so
-    # the model knows exactly what it produced and what needs fixing.
+    truncated = _is_truncated(result.get("finish_reason"))
+
+    # Step 3 — TRUNCATION escalation. The answer was cut off mid-flight, so the
+    # model never disobeyed anything; it simply ran out of budget. Re-ask the
+    # ORIGINAL question with room to finish. Skipped when there is no headroom
+    # left to give, because re-issuing at the budget that already truncated is
+    # re-running a configuration proven insufficient.
+    if truncated:
+        wider = _escalated_budget(budget)
+        if wider > budget:
+            logger.warning(
+                "[LLM] tier=%d response TRUNCATED at max_tokens=%d — the budget "
+                "was the failure, not the model; retrying at max_tokens=%d",
+                tier, budget, wider)
+            budget = wider
+            result = await _json_attempt(
+                user_text=user, this_budget=budget, temperature=None)
+            content = result["content"]
+            if isinstance(content, dict):
+                logger.info(
+                    "[LLM] tier=%d JSON recovered after budget escalation to %d",
+                    tier, budget)
+                return content
+            truncated = _is_truncated(result.get("finish_reason"))
+
+    # Step 4 — prose repair: send the failed output back as context so the model
+    # knows exactly what it produced and what needs fixing.
     raw_first = str(content)
     logger.warning(
-        "[LLM] tier=%d first response was not JSON (len=%d), sending repair prompt",
-        tier, len(raw_first),
+        "[LLM] tier=%d first response was not JSON (len=%d, truncated=%s), sending repair prompt",
+        tier, len(raw_first), truncated,
     )
     repair_user = (
         f"Your previous response was not valid JSON. "
@@ -804,29 +991,41 @@ async def async_llm_call_json(
         f"Output ONLY the JSON object from your answer above. "
         f"Start with {{ and end with }}. No prose, no explanation."
     )
-    retry_kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
-    _retry_coro = llm_call(
-        tier=tier,
-        system=system,
-        user=repair_user,
-        config=config,
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        **retry_kwargs,
-    )
-    if timeout_s is not None:
-        retry_result = await asyncio.wait_for(_retry_coro, timeout=timeout_s)
-    else:
-        retry_result = await _retry_coro
+    # P2: never grant the repair less than the call it is repairing. The repair
+    # prompt is strictly harder (reproduce the answer AND obey a format rule)
+    # on a longer input, so a smaller budget could make a repair fail for a
+    # reason the original never faced. That is exactly what shipped before:
+    # original and repair both ran at max_tokens=400 and the repair burned all
+    # 400 on reasoning tokens, returning zero characters.
+    repair_tokens = _repair_budget(budget, truncated=truncated)
+    retry_result = await _json_attempt(
+        user_text=repair_user, this_budget=repair_tokens, temperature=0.0)
     content = retry_result["content"]
     if isinstance(content, dict):
         logger.info("[LLM] tier=%d JSON repair succeeded", tier)
         return content
 
-    raise ValueError(
-        f"LLM (tier={tier}) did not return valid JSON after repair. "
-        f"Raw response (first 500 chars): {str(content)[:500]!r}"
+    truncated = truncated or _is_truncated(retry_result.get("finish_reason"))
+
+    # Step 5 — P1: nothing usable. The operator hears about it; a warning in a
+    # log file only a developer reads is how an advertised feature ends up
+    # silently producing nothing while the task still reports SUCCESS.
+    _emit_structured_output_failure(
+        tier=tier, model=str(retry_result.get("model") or model_label),
+        truncated=truncated, budgets=budgets_tried,
+        attempts=len(budgets_tried), raw_preview=str(content),
     )
+    cause = (
+        "the response was TRUNCATED by the completion budget "
+        f"(tried max_tokens={budgets_tried}); raise max_tokens or use a model "
+        "that spends fewer reasoning tokens"
+        if truncated else
+        "the model did not return parseable JSON even after a repair prompt"
+    )
+    raise ValueError(_ascii(
+        f"LLM (tier={tier}) did not return valid JSON after repair: {cause}. "
+        f"Raw response (first 500 chars): {str(content)[:500]!r}"
+    ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

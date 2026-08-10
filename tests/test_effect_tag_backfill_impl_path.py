@@ -11,7 +11,7 @@ time (``tool_sandbox.execute_tool``: ``vault_root.parent / implementation_path``
 yielding ``<vault>/tools/implementations/vault/tools/implementations/<name>.py``
 — a path that never exists. The read is wrapped defensively, so the failure was
 SILENT: every tool was stamped ``effect_tags: []`` while the pass reported
-``stamped=41, errors=[]``.
+``stamped=41, errors=[]`` (now ``classified=41``).
 
 That empty stamp is not inert. The backfill's own MONOTONIC money-move floor
 (``any_money_move_signal``) only runs inside ``if source:`` — so the same

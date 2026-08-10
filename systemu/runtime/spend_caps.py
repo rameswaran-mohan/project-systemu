@@ -280,4 +280,4 @@ def halt_if_capped(execution_id: Optional[str], *,
     if not st.breached:
         return None
     return ((st.reason or "Spend cap reached.")
-            + " Raise the cap (`sharing-on spend-caps set …`) and re-run to continue.")
+            + " Raise the cap (`systemu spend-caps set …`) and re-run to continue.")

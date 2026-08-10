@@ -21,6 +21,7 @@ import hashlib
 import logging
 from typing import Any, Dict, List
 
+from systemu.runtime import optional_deps as _od
 from systemu.runtime import table_store as ts
 from systemu.runtime.table_store import TableItem
 
@@ -83,7 +84,24 @@ def _project_tools(vault) -> List[TableItem]:
             key = ts.ref_key("tool", {"tool_id": tid, "name": name})
             enabled = bool(t.get("enabled"))
             dry = str(t.get("dry_run_status") or "")
-            if enabled:
+            detail = str(t.get("description") or "")[:200]
+            # F24: this page's entire job is telling the operator what systemu
+            # can actually USE, and it was calling an enabled tool "ready" on a
+            # machine where its optional dependency group is not installed —
+            # the same lie the Build page was telling, one page over. The
+            # verdict is CONSUMED from the one mint (DEC-43), never re-probed,
+            # and it outranks `enabled`, which is a fact about the record.
+            unavailable_reason = _od.unavailable_reason(t.get("dependencies") or [])
+            if unavailable_reason:
+                # NOT "broken" — nothing is broken, it was never installed, and
+                # this word is what decides whether the operator reaches for the
+                # forge or for pip. The card colours it as a problem and offers
+                # the "Fix in Build" deep-link either way.
+                status = "unavailable"
+                # the WHY rides on the card: a red dot with no sentence sends
+                # the operator to another page to find out what to run.
+                detail = (detail + "  " + unavailable_reason).strip()
+            elif enabled:
                 status = "ready"
             elif dry == "failed" or t.get("forge_rejected"):
                 status = "broken"
@@ -91,7 +109,7 @@ def _project_tools(vault) -> List[TableItem]:
                 status = "declared"
             out.append(TableItem(
                 id=_id_for(key), kind="tool", name=str(name),
-                detail=str(t.get("description") or "")[:200],
+                detail=detail,
                 status=status, provenance="migrated",
                 # The TAINT axis (§5.10.b "who vouches for this content"), NOT an
                 # authorship record — so it is UNCONDITIONAL. It was derived from
@@ -110,7 +128,9 @@ def _project_tools(vault) -> List[TableItem]:
                 # `vault._tool_header` emits the key and
                 # `vault_migrator.converge_index_effect_tags` projects each body's
                 # tags onto its header every boot. Empty is UNKNOWN, not "no
-                # effects" — see `capability_index.IndexRow.effect_tags`.
+                # effects" — a tool PROVED effect-free carries the positive
+                # `["no_effect"]` instead (F14). See
+                # `capability_index.IndexRow.effect_tags`.
                 usage={"effect_tags": list(t.get("effect_tags") or [])},
             ))
         except Exception:

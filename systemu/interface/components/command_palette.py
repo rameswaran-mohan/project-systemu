@@ -107,7 +107,18 @@ def prefill_target(text: str) -> str:
 
 # ── the projections ─────────────────────────────────────────────────────────
 
-def _tool_entry(name: str, detail: str) -> PaletteEntry:
+def _optional_deps():
+    from systemu.runtime import optional_deps
+    return optional_deps
+
+
+def _tool_entry(name: str, detail: str, *, unavailable_reason: str = "") -> PaletteEntry:
+    """One Tools row. ``unavailable_reason`` is the MINTED sentence from
+    ``optional_deps`` (never re-derived here), and it LEADS the detail: a
+    palette row is read in a glance, and the part that decides whether the
+    operator should press Enter has to be the part they see first."""
+    if unavailable_reason:
+        detail = f"{unavailable_reason} — {detail}" if detail else unavailable_reason
     return PaletteEntry(
         group="Tools",
         label=name,
@@ -148,8 +159,15 @@ def _tool_entries(vault) -> List[PaletteEntry]:
             if not name:
                 continue
             slots = getattr(row, "slots", None) or []
-            out.append(_tool_entry(name, ", ".join(str(s) for s in slots)
-                                   or (getattr(row, "detail", "") or "")))
+            out.append(_tool_entry(
+                name,
+                ", ".join(str(s) for s in slots)
+                or (getattr(row, "detail", "") or ""),
+                # F24: the index row ALREADY carries the verdict; the palette
+                # was discarding it and offering `run: web_act` as an
+                # unqualified capability on a machine that cannot run it.
+                unavailable_reason=str(getattr(row, "unavailable_reason", "") or ""),
+            ))
     except Exception:
         logger.debug("[Palette] capability index unavailable", exc_info=True)
 
@@ -165,11 +183,18 @@ def _tool_entries(vault) -> List[PaletteEntry]:
             if not row.get("enabled", False):
                 continue
             detail = str(row.get("description", "") or "")[:120]
+            deps = row.get("dependencies") or []
         else:
             if not getattr(row, "enabled", False):
                 continue
             detail = str(getattr(row, "description", "") or "")[:120]
-        out.append(_tool_entry(str(name), detail))
+            deps = getattr(row, "dependencies", None) or []
+        # The FALLBACK path must not be the honest-listing hole: it fires
+        # whenever the capability index is empty, which is exactly a fresh
+        # install — the machine most likely to be missing an extra.
+        out.append(_tool_entry(
+            str(name), detail,
+            unavailable_reason=_optional_deps().unavailable_reason(deps)))
     return out
 
 

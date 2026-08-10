@@ -55,18 +55,31 @@ class IndexRow(BaseModel):
     # `vault_migrator.converge_index_effect_tags` to project body -> header on
     # every boot. Any one missing and this list is structurally always empty.
     #
-    # `[]` IS NOT EVIDENCE OF "NO EFFECTS". It conflates at least: classified-and-
-    # genuinely-none; never classified (the backfill is version-gated and file-
-    # layout-only, so a sqlite catalog is uniformly empty); and classification
-    # ATTEMPTED AND FAILED (a body whose implementation cannot be read, or whose
-    # implementation_path points outside vault/tools/implementations/ -- counted as
-    # `skipped_impl_path` -- is stamped `[]` while the runtime still EXECUTES it).
-    # `Tool.effect_tags` is a plain List[str] with no tri-state and the sqlite row
-    # converter collapses a pre-0011 SQL NULL to `[]`, so the information needed to
-    # tell these apart is gone upstream of this projection; an Optional tri-state
-    # here would look like a resolved ambiguity while `[]` still meant both "no
-    # effects" and "the classifier failed", which is the more dangerous half.
-    # The in-repo precedent for consuming it safely is
+    # `[]` IS NOT EVIDENCE OF "NO EFFECTS", and F14 narrowed what it CAN mean.
+    #
+    # It used to conflate three states: classified-and-genuinely-none; never
+    # classified (the backfill is version-gated and file-layout-only, so a sqlite
+    # catalog is uniformly empty); and classification ATTEMPTED AND FAILED (a body
+    # whose implementation cannot be read, or whose implementation_path points
+    # outside vault/tools/implementations/ -- counted as `skipped_impl_path` -- is
+    # stamped `[]` while the runtime still EXECUTES it).
+    #
+    # F14 SPLIT THE FIRST ONE OUT, and did it WITHOUT a tri-state: a body proved
+    # effect-free by `effect_tags.classify_source`'s purity witness carries the
+    # positive value `["no_effect"]`, which rides this same plain List[str] through
+    # every reader unchanged. So `[]` now means only "not classified" -- never
+    # classified, or classification attempted and failed -- and both of those are
+    # UNDETERMINABLE and fail closed at `action_governance._effective_tags`
+    # (empty => UNKNOWN) and `requirement_binder._effect_tags_are_dangerous`.
+    #
+    # An Optional tri-state was rejected here and still is: it would have looked
+    # like a resolved ambiguity at this projection while `[]` upstream still meant
+    # both things. The resolution had to happen where the classification is MADE,
+    # and that is where it happened.
+    #
+    # `no_effect` is EXCLUSIVE (see `effect_tags.normalize_tagset`) -- a row
+    # carrying it alongside a real class would be a self-contradicting record.
+    # The in-repo precedent for consuming an EMPTY list safely is unchanged:
     # `tool_sandbox._derive_effect_tags_from_source` ("Empty is not evidence of
     # 'no effects'"): treat empty as UNDETERMINABLE and re-derive from the body.
     #
@@ -80,6 +93,23 @@ class IndexRow(BaseModel):
     origin: str = "builtin"                # builtin | forged | mcp:<server>
     parent_id: Optional[str] = None
     superseded_by: Optional[str] = None
+
+    # ── F21: optional-dependency availability ────────────────────────────────
+    # `requires_packages` is the tool's declared pip manifest, copied from the
+    # header. It is a STATIC fact about the tool, so persisting it is safe.
+    requires_packages: List[str] = Field(default_factory=list)
+    # `available` / `unavailable_reason` are NOT. They are a claim about THIS
+    # MACHINE RIGHT NOW, and the index is a derived cache that outlives the
+    # state it was derived from: reconcile while playwright is installed, the
+    # operator uninstalls the extra, and a persisted `available: true` would
+    # keep asserting a capability that is gone — the DEC-32 staleness trap in
+    # miniature. So both are RECOMPUTED from the live environment by
+    # `_apply_availability`, which runs on BOTH construction paths
+    # (`derive_index` and `load_index`) and overwrites whatever was on disk.
+    # They are still serialised, because a reader of the raw JSON that saw no
+    # availability field at all would have to invent one.
+    available: bool = True
+    unavailable_reason: str = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -201,6 +231,35 @@ def _origin_for(tool: Any) -> str:
     return "forged" if bool(_field(tool, "forged_by_systemu", False)) else "builtin"
 
 
+def _apply_availability(rows: List[IndexRow]) -> List[IndexRow]:
+    """F21 — stamp the LIVE optional-dependency verdict onto every row.
+
+    Called on BOTH index construction paths so a reader can never receive a row
+    whose availability was decided by a previous process. Mutates in place and
+    returns the same list (callers chain it).
+
+    NEVER-SUBTRACT (CAP-4 / §5.10.d): an unavailable tool stays in the index and
+    stays rankable. Hiding it would make "systemu has no tool for that" the
+    answer to "your browser extra is not installed" — a smaller world reported
+    as a complete one, which is the failure this index exists to prevent. The
+    row is listed, flagged, and carries the remedy.
+    """
+    from systemu.runtime import optional_deps as _od
+    for row in rows:
+        try:
+            reason = _od.unavailable_reason(row.requires_packages)
+        except Exception:
+            # Fail CLOSED on a probe failure: an availability we could not
+            # establish is not an availability. A tool wrongly shown as
+            # unavailable wastes a `pip install`; one wrongly shown as ready
+            # is the defect class this whole packet is about.
+            reason = ("UNAVAILABLE - could not verify this tool's optional "
+                      "dependencies on this machine.")
+        row.available = not reason
+        row.unavailable_reason = reason
+    return rows
+
+
 def derive_index(vault) -> List[IndexRow]:
     """Compute the current index rows from the live stores. Deterministic +
     idempotent; ordered by tool_id so the persisted file is stable."""
@@ -229,6 +288,13 @@ def derive_index(vault) -> List[IndexRow]:
                 usage=_usage_for(vault, name),
                 status=str(_field(t, "status", "ready") or "ready"),
                 origin=_origin_for(t),
+                # F21: the tool's declared pip manifest, the same list
+                # `dependency_installer.ensure_satisfied` is handed at call
+                # time. Reading it from the header keeps the LISTING verdict
+                # and the INVOCATION verdict derived from one input, so they
+                # cannot disagree about why a tool did not run.
+                requires_packages=[str(d) for d in
+                                   (_field(t, "dependencies", []) or [])],
             )
         except Exception:
             continue
@@ -284,7 +350,7 @@ def derive_index(vault) -> List[IndexRow]:
         except Exception:
             continue
 
-    return [rows[k] for k in sorted(rows)]
+    return _apply_availability([rows[k] for k in sorted(rows)])
 
 
 def _index_path(vault) -> Path:
@@ -335,7 +401,10 @@ def load_index(vault) -> List[IndexRow]:
                 out.append(IndexRow(**entry))
             except Exception:
                 continue
-        return out
+        # F21: the persisted availability verdict is DISCARDED and re-derived.
+        # This is the whole reason `requires_packages` is a separate field from
+        # `available`: the manifest is durable, the verdict is not.
+        return _apply_availability(out)
     except Exception:
         return []
 
@@ -487,5 +556,11 @@ def find_tools(vault, query: str, limit: Optional[int] = None,
     ranked = rank(rows, query)
     if limit is not None:
         ranked = ranked[:max(0, int(limit))]
+    # F21: `available` + `unavailable_reason` ride out with every row. A caller
+    # that renders this dict cannot show a tool as ready without ignoring a key
+    # that is always present — which is the point: the honest state is not
+    # opt-in.
     return [{"tool_id": r.tool_id, "name": r.name, "slots": r.slots,
-             "origin": r.origin, "detail": r.detail} for r in ranked]
+             "origin": r.origin, "detail": r.detail,
+             "available": r.available,
+             "unavailable_reason": r.unavailable_reason} for r in ranked]

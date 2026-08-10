@@ -14,6 +14,7 @@ from pathlib import Path
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState, THEME
+from systemu.runtime import provider_status as _ps
 
 
 def build_settings_page() -> None:
@@ -105,49 +106,10 @@ def build_settings_page() -> None:
             _brain_advisory()
             tier1.on("change", lambda _: _brain_advisory.refresh())
 
-        # ── Provider credentials (W14) — read-only status, .env-sourced ────
+        # ── Provider credentials (W14; F8 rebuild) ─────────────────────────
         _section_header("Provider credentials")
         with ui.column().classes("s-card").style("gap: 8px; padding: 20px;"):
-            ui.label(
-                "Credentials are loaded from .env and never typed in the "
-                "browser. Set the env var, then restart the daemon. A red ✗ "
-                "on a provider you've selected above is why a tier would fail."
-            ).classes("s-muted")
-            # provider -> (config attr, env var name)
-            _CRED_ROWS = [
-                ("OpenRouter", "openrouter_api_key", "OPENROUTER_API_KEY"),
-                ("Google", "google_api_key", "GOOGLE_API_KEY"),
-                ("Anthropic", "anthropic_api_key", "ANTHROPIC_API_KEY"),
-                ("OpenAI", "openai_api_key", "OPENAI_API_KEY"),
-                ("Ollama URL", "ollama_url", "OLLAMA_URL"),
-            ]
-            for label, attr, env in _CRED_ROWS:
-                val = (getattr(config, attr, "") or "").strip()
-                mark = "✓ Set" if val else f"✗ Not set — add {env} to .env"
-                cls = "s-pill--success" if val else "s-pill--warn"
-                with ui.row().classes("w-full items-center").style("gap: 10px;"):
-                    ui.label(label).classes("s-cell").style("min-width: 120px;")
-                    ui.label(mark).classes(f"s-pill {cls}")
-
-            # W14 S8: red-flag the sharp edge — a provider SELECTED for a tier
-            # whose credential is empty will 401 at runtime (explicit override
-            # never reroutes). Surface it loudly here so it's fixed in .env.
-            _prov_to_attr = {
-                "openrouter": "openrouter_api_key", "google": "google_api_key",
-                "anthropic": "anthropic_api_key", "openai": "openai_api_key",
-                "ollama": "ollama_url",
-            }
-            _selected = {(getattr(config, f"tier{i}_provider", "") or "").lower()
-                         for i in (1, 2, 3)} - {"", "auto"}
-            _missing = sorted(
-                p for p in _selected
-                if not (getattr(config, _prov_to_attr.get(p, ""), "") or "").strip())
-            if _missing:
-                ui.label(
-                    "Selected for a tier but no credential set: "
-                    + ", ".join(_missing)
-                    + ". Those tiers will fail until you add the key(s) to .env."
-                ).classes("s-banner s-banner--danger w-full")
+            provider_credentials_card(config)
 
         # ── Behaviour ──────────────────────────────────────────────────────
         _section_header("Behaviour")
@@ -238,8 +200,10 @@ def build_settings_page() -> None:
             f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
             f"border-radius: 12px; padding: 20px; gap: 10px;"
         ):
-            key_status = "✓ Set" if config.openrouter_api_key else "✗ Not set — add OPENROUTER_API_KEY to .env"
-            key_color  = THEME["success"] if config.openrouter_api_key else THEME["danger"]
+            # F8 / GATE-7a corollary: this section and the credentials table
+            # above disclose the SAME fact. Both consume the one mint, so they
+            # cannot contradict each other.
+            key_status, key_color = openrouter_key_status(config)
             ui.label(key_status).style(f"font-size: 14px; color: {key_color}; font-weight: 600;")
             ui.label("API key is loaded from the .env file. Editing is not supported live for security — update the .env file and restart.").style(
                 f"font-size: 12px; color: {THEME['text_muted']};"
@@ -500,6 +464,138 @@ def build_settings_page() -> None:
         )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Provider credentials (W14 · F8 rebuild)
+# ─────────────────────────────────────────────────────────────────────────────
+#  This card used to decide every row with `bool(getattr(config, attr))`. For
+#  the four key-based providers the string IS the credential; for OLLAMA — the
+#  one keyless provider — the attribute is a base URL that Config defaults to
+#  http://localhost:11434 unconditionally, so the row was green on every
+#  machine ever built, including one with no Ollama installed.
+#
+#  Every verdict now comes from `systemu.runtime.provider_status`, the single
+#  place the per-provider satisfaction rule is declared (DEC-40 liveness
+#  witness / DEC-43 (ii) no proxy / DEC-43 (i) no second copy of the recipe).
+#  Presentation-only maps live here; they are keyed by STATE, not by provider.
+
+_STATE_MARK = {
+    _ps.STATE_SET:         "✓ Set",
+    _ps.STATE_MISSING:     "✗ Not set",
+    _ps.STATE_REACHABLE:   "✓ Reachable",
+    _ps.STATE_UNREACHABLE: "✗ Not reachable",
+    _ps.STATE_UNKNOWN:     "? Unknown",
+}
+_STATE_PILL = {
+    _ps.STATE_SET:         "s-pill--success",
+    _ps.STATE_MISSING:     "s-pill--warn",
+    _ps.STATE_REACHABLE:   "s-pill--success",
+    _ps.STATE_UNREACHABLE: "s-pill--warn",
+    _ps.STATE_UNKNOWN:     "s-pill--muted",
+}
+
+#: How long after the page paints the reachability probe runs. The probe is
+#: bounded but NOT instant — a dual-stack `localhost` with nothing listening
+#: costs ~2 s on Windows — so it never runs on the render path.
+_PROBE_DELAY_S = 0.1
+
+
+def _unobserved(_url, _timeout):
+    """The first paint's stand-in probe: it observes nothing, so a keyless
+    provider starts UNSATISFIED and can only ever be upgraded by a real
+    answer. Nothing is ever green before it has been witnessed."""
+    return (_ps.STATE_UNKNOWN, "checking…")
+
+
+def openrouter_key_status(config):
+    """(text, colour) for the legacy "OpenRouter API Key" section.
+
+    GATE-7a corollary: settings.py discloses "is OpenRouter configured?" on
+    two surfaces. Both consume the one mint, so they cannot disagree.
+    """
+    st = _ps.provider_status(_ps.SPEC_BY_PROVIDER["openrouter"], config)
+    if st.satisfied:
+        return ("✓ Set", THEME["success"])
+    return (f"✗ {st.detail}", THEME["danger"])
+
+
+def provider_credentials_card(config) -> None:
+    """Render the Provider-credentials section. Caller wraps the header.
+
+    Two paints. The first is synchronous and shows key-based providers
+    immediately (no I/O) with keyless ones as "checking…". The second is
+    driven by a `ui.timer` that runs the probes in a worker thread and
+    refreshes — so a slow or black-holed endpoint can never block the page,
+    and a probe failure resolves to an honest state instead of raising into
+    the render.
+    """
+    ui.label(
+        "Credentials are loaded from .env and never typed in the browser. "
+        "Set the env var, then restart the daemon. Ollama takes no key, so "
+        "its row reports whether it actually ANSWERS — a URL alone proves "
+        "nothing. A ✗ on a provider you've selected above is why a tier "
+        "would fail."
+    ).classes("s-muted")
+
+    def _statuses(probe=None) -> dict:
+        """Mint, but a render may never raise — not even if the mint does."""
+        try:
+            return _ps.all_provider_statuses(config, probe=probe)
+        except Exception:
+            return {s.provider: _ps.ProviderStatus(
+                        s.provider, s.display, s.env, s.rule,
+                        _ps.STATE_UNKNOWN, "status could not be determined")
+                    for s in _ps.PROVIDER_SPECS}
+
+    held = {"statuses": _statuses(probe=_unobserved), "observed": False}
+
+    @ui.refreshable
+    def _rows() -> None:
+        statuses = held["statuses"]
+        for spec in _ps.PROVIDER_SPECS:
+            st = statuses[spec.provider]
+            with ui.row().classes("w-full items-center").style("gap: 10px;"):
+                ui.label(st.display).classes("s-cell").style("min-width: 120px;")
+                ui.label(_STATE_MARK.get(st.state, "? Unknown")).classes(
+                    "s-pill " + _STATE_PILL.get(st.state, "s-pill--muted"))
+                ui.label(st.detail).classes("s-muted")
+
+        # W14 S8: red-flag the sharp edge — a provider SELECTED for a tier that
+        # is not usable fails at call time (an explicit override never
+        # reroutes). Held back until the probes have actually run, so the
+        # banner is never a claim about a verdict we have not made yet.
+        if not held["observed"]:
+            return
+        unusable = _ps.unusable_selected(
+            statuses,
+            [getattr(config, f"tier{i}_provider", "") for i in (1, 2, 3)])
+        if unusable:
+            ui.label(
+                "Selected for a tier but not usable: "
+                + "; ".join(f"{u.display} — {u.detail}" for u in unusable)
+                + ". Those tiers will fail until this is fixed."
+            ).classes("s-banner s-banner--danger w-full")
+
+    _rows()
+
+    async def _observe() -> None:
+        """Replace the placeholders with OBSERVED verdicts, off the loop."""
+        import asyncio
+        try:
+            fresh = await asyncio.to_thread(_statuses)
+        except Exception:
+            return  # never let a probe failure reach the render
+        held["statuses"], held["observed"] = fresh, True
+        try:
+            _rows.refresh()
+        except Exception:
+            pass
+
+    try:
+        ui.timer(_PROBE_DELAY_S, _observe, once=True)
+    except Exception:  # pragma: no cover - no client context (e.g. a unit call)
+        pass
+
+
 def connection_rows(vault) -> list:
     """Rows for tools that declare credential requirements (v0.8.18).
 
@@ -625,10 +721,11 @@ def _connection_card(row: dict) -> None:
                 )
 
 
-_PROVIDER_OPTIONS = {
-    "": "Auto", "openrouter": "OpenRouter", "google": "Google",
-    "anthropic": "Anthropic", "openai": "OpenAI", "ollama": "Ollama",
-}
+# F8 / DEC-43 (i): the tier dropdown, the credentials table and the
+# "OpenRouter API Key" section all read the SAME table. This module no longer
+# holds a provider list, an attribute map or an env-var map of its own.
+_PROVIDER_OPTIONS = {"": "Auto"}
+_PROVIDER_OPTIONS.update({s.provider: s.display for s in _ps.PROVIDER_SPECS})
 
 
 def _provider_select(label: str, current_value: str):
@@ -1099,7 +1196,7 @@ def stuck_settings_card() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Compliance export — R-P3b (MASTER-SPEC Part II §6)
+#  Compliance export — R-P3b
 # ─────────────────────────────────────────────────────────────────────────────
 #  Reaches runtime.ledger's frozen, byte-stable exporters, which had no caller at
 #  all before this card. Two-step by design: an export is a file leaving the

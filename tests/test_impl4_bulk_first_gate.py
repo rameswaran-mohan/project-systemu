@@ -1,6 +1,6 @@
 """IMPL-4 — the one-time bulk FIRST-GATE review card, and the DENY band it may never sweep.
 
-Spec (MASTER-SPEC §5.7, "First-gate migration UX (IMPL-4, v2.1)"):
+Spec ("First-gate migration UX (IMPL-4, v2.1)"):
 
     When the live gate first ships (S1b), backfilled legacy tools carrying net/UNKNOWN
     tags get a **one-time bulk review card** (batch classify / Always-allow /
@@ -74,6 +74,30 @@ def _entry(name, tags, *, tool_id="t1", signature=None):
                        signature=signature or f"sig::{name}")
 
 
+@pytest.fixture
+def suppose_the_effect_is_batch_approvable(monkeypatch):
+    """Isolate the BAND conjunct from the F9 EFFECT-ALLOWLIST conjunct.
+
+    Batch eligibility now needs BOTH: the REQUIRE_APPROVAL band (this file's subject —
+    "would this tool gate at all, and is it DENY?") and a batch-approvable effect class
+    (``tests/test_f9_batch_approval_effects.py``'s subject — "may this effect class be
+    granted blanket, unattended, argument-free permission?").
+
+    The two conjuncts are currently DISJOINT at migration time by construction: the only
+    thing that puts a parameter-less action in the REQUIRE_APPROVAL band is
+    ``action_governance._APPROVAL_TAGS``, and ``effect_tags.BATCH_APPROVABLE`` is pinned
+    disjoint from it. So no real entry satisfies both today — which is the CORRECT F9
+    outcome (nothing in this catalog is safe to blanket-allow), but it would silently
+    reduce every band pin below to a vacuous assertion about an empty set.
+
+    This fixture stubs the effect half satisfied so the band half stays under test. It
+    never weakens the shipped rule: the F9 file owns that half, including the record-side
+    proof that a shell tool handed in as eligible is still refused.
+    """
+    from systemu.runtime import first_gate_review as fgr
+    monkeypatch.setattr(fgr, "batch_exclusion_reason", lambda _e: "", raising=True)
+
+
 # ── A. the partition: which band may be swept ────────────────────────────────
 
 def test_a_deny_band_tool_is_excluded_from_the_bulk_action():
@@ -90,13 +114,30 @@ def test_a_deny_band_tool_is_excluded_from_the_bulk_action():
     assert e in part.excluded
 
 
-def test_a_require_approval_tool_is_eligible():
-    """The carve-out must be surgical: the ordinary band still batches."""
+def test_a_require_approval_tool_is_eligible(suppose_the_effect_is_batch_approvable):
+    """The DENY carve-out must be surgical: the ordinary band still batches.
+
+    F9 added a SECOND conjunct (the effect allowlist) which an empty-tag tool fails on
+    its own account — see ``test_an_unclassified_tool_is_excluded_but_for_its_OWN_reason``
+    below. The fixture holds that half satisfied so this stays a pin on the BAND.
+    """
     from systemu.runtime.first_gate_review import partition_entries
     e = _entry("process_data", [])          # unclassifiable source => empty tags
     assert e.verdict == "require_approval"
     part = partition_entries([e])
     assert e in part.eligible and e not in part.excluded
+
+
+def test_an_unclassified_tool_is_excluded_but_for_its_OWN_reason():
+    """Without the fixture, the same entry is excluded — and NOT because of the DENY
+    floor. Keeping the two reasons distinct is what stops a later "simplification" from
+    collapsing them and re-opening one."""
+    from systemu.runtime.first_gate_review import (batch_exclusion_reason,
+                                                   partition_entries)
+    e = _entry("process_data", [])
+    assert e.verdict == "require_approval", "still not DENY-band"
+    assert e in partition_entries([e]).excluded
+    assert "classif" in batch_exclusion_reason(e).lower()
 
 
 def test_an_allow_band_tool_is_frictionless_not_swept():
@@ -178,7 +219,8 @@ def test_deny_is_matched_case_insensitively():
 
 # ── B. the RECORD side ───────────────────────────────────────────────────────
 
-def test_bulk_allow_records_a_standing_allow_only_for_eligible_entries():
+def test_bulk_allow_records_a_standing_allow_only_for_eligible_entries(
+        suppose_the_effect_is_batch_approvable):
     from systemu.runtime.first_gate_review import apply_bulk_always_allow
 
     ok = _entry("process_data", [], signature="sig-ok")
@@ -321,7 +363,8 @@ def test_an_unrecognised_choice_records_nothing():
 
 # ── C. the CONSUME side — the half that actually expresses the band ──────────
 
-def test_a_bulk_minted_standing_allow_cannot_satisfy_a_later_DENY_call(monkeypatch):
+def test_a_bulk_minted_standing_allow_cannot_satisfy_a_later_DENY_call(
+        monkeypatch, suppose_the_effect_is_batch_approvable):
     """THE regression pin.
 
     Sweep a legitimately-eligible tool into a bulk Always-allow at migration time, then
@@ -355,7 +398,8 @@ def test_a_bulk_minted_standing_allow_cannot_satisfy_a_later_DENY_call(monkeypat
         "an unclassifiable destructive call with no card")
 
 
-def test_the_same_swept_allow_still_covers_the_benign_call(monkeypatch):
+def test_the_same_swept_allow_still_covers_the_benign_call(
+        monkeypatch, suppose_the_effect_is_batch_approvable):
     """The carve-out must be surgical, or the feature is useless: the whole point of the
     sweep is that ORDINARY calls stop prompting."""
     from systemu.runtime.first_gate_review import apply_bulk_always_allow
@@ -571,20 +615,32 @@ def test_eligibility_does_not_key_on_tag_EMPTINESS(tmp_path):
 
     The seeded inventory's tags changed underneath this feature (a backfill fix moved 17
     tools from empty to real tags like ``shell_exec`` / ``local_delete`` / ``net_read``).
-    Nothing here may depend on emptiness: the band comes from ``evaluate_action`` over
+    Nothing here may depend on emptiness: the outcome comes from the governor over
     whatever tags are present. Empty is merely one input that happens to score UNKNOWN.
+
+    F9 REWROTE THE EXPECTED ANSWER, and this assertion was the defect in test form. It
+    read "shell_exec and local_delete are approval-band effects" and concluded they were
+    batch-eligible. Approval-band is exactly what makes them UN-batchable: the operator
+    must see the call. They are still not DENY — the two exclusions are distinct — but
+    they are excluded, each naming its own effect.
     """
-    from systemu.runtime.first_gate_review import partition_entries
+    from systemu.runtime.first_gate_review import (batch_exclusion_reason,
+                                                   partition_entries)
 
     shell = _entry("run_script", ["shell_exec"], signature="s1")
     delete = _entry("cleanup", ["local_delete"], signature="s2")
     read = _entry("fetch_page", ["net_read"], signature="s3")
 
     part = partition_entries([shell, delete, read])
-    # shell_exec and local_delete are approval-band effects; net_read is frictionless
-    assert shell in part.eligible and delete in part.eligible
-    assert read in part.frictionless
-    assert part.excluded == (), "none of these is UNKNOWN, so none may be DENY-band"
+    assert part.eligible == (), "no one-click standing allow for a shell or a delete"
+    assert shell in part.excluded and delete in part.excluded
+    assert read in part.frictionless, "net_read never gates, so there is nothing to batch"
+
+    # NOT the DENY floor — the band and the batch rule are separate facts, and the card
+    # must not tell the operator to 'reclassify' a tool that is perfectly well classified
+    assert shell.verdict == "require_approval" and delete.verdict == "require_approval"
+    assert "shell execution" in batch_exclusion_reason(shell)
+    assert "deletion" in batch_exclusion_reason(delete)
 
 
 def test_the_collected_signature_matches_what_the_live_gate_computes(tmp_path):
@@ -619,7 +675,8 @@ def _bulk_context(entries):
             "bulk_entries": [e.model_dump(mode="json") for e in entries]}
 
 
-def test_resolve_gate_sweeps_only_the_eligible_band_end_to_end(monkeypatch):
+def test_resolve_gate_sweeps_only_the_eligible_band_end_to_end(
+        monkeypatch, suppose_the_effect_is_batch_approvable):
     """Through the REAL dispatcher, not the helper: a bulk card carrying both bands in
     its stored context must write a standing allow for the approvable tool only."""
     from systemu.interface.command.inbox import resolve_gate
@@ -761,7 +818,7 @@ def test_the_card_does_not_offer_a_bulk_allow_when_every_tool_is_deny_band():
     assert OPT_BULK_ALLOW not in d.options
 
 
-def test_no_offered_option_is_inert():
+def test_no_offered_option_is_inert(suppose_the_effect_is_batch_approvable):
     """Every option on this card must DO something when resolved.
 
     An option that cannot act is the shape of the IMPL-2 adversarial finding ("Approve
@@ -814,7 +871,8 @@ def test_no_batch_classify_option_is_offered():
         "no bulk classification action may be offered on this card")
 
 
-def test_the_label_taken_OFF_THE_CARD_is_the_one_the_executor_acts_on():
+def test_the_label_taken_OFF_THE_CARD_is_the_one_the_executor_acts_on(
+        suppose_the_effect_is_batch_approvable):
     """Pins the card and the executor together across the decision store.
 
     ``OperatorDecisionQueue.resolve`` raises unless the choice is IN ``options``, so the
@@ -855,7 +913,8 @@ def test_the_card_names_the_excluded_deny_tools_and_their_remedy():
     assert "reclassif" in (d.inspect + d.what_approve_does).lower()
 
 
-def test_the_card_says_how_many_are_swept_and_how_many_are_not():
+def test_the_card_says_how_many_are_swept_and_how_many_are_not(
+        suppose_the_effect_is_batch_approvable):
     from systemu.interface.command.gate import GateDescriptor
     from systemu.runtime.first_gate_review import partition_entries
 
@@ -866,7 +925,8 @@ def test_the_card_says_how_many_are_swept_and_how_many_are_not():
     assert "2" in d.what_approve_does and "1" in d.what_approve_does
 
 
-def test_a_large_inventory_produces_a_BOUNDED_card():
+def test_a_large_inventory_produces_a_BOUNDED_card(
+        suppose_the_effect_is_batch_approvable):
     """A vault with hundreds of forged tools must not render an unbounded card.
 
     The card lists tools by name, so its size scales with the inventory. This payload is
@@ -896,7 +956,8 @@ def test_a_large_inventory_produces_a_BOUNDED_card():
     assert listed <= MAX_LISTED_PER_BAND
 
 
-def test_truncation_never_hides_a_DENY_band_tool_when_the_band_is_small():
+def test_truncation_never_hides_a_DENY_band_tool_when_the_band_is_small(
+        suppose_the_effect_is_batch_approvable):
     """The excluded band is the safety-critical half of the card. A handful of DENY-band
     tools must ALL be named even when the eligible band is huge and gets clipped."""
     from systemu.interface.command.gate import GateDescriptor
@@ -936,7 +997,8 @@ def test_the_bulk_gate_is_on_the_bypass_floor():
     assert BULK_GATE_TYPE in FLOOR_GATE_TYPES
 
 
-def test_a_bypass_policy_still_ASKS_for_the_bulk_card():
+def test_a_bypass_policy_still_ASKS_for_the_bulk_card(
+        suppose_the_effect_is_batch_approvable):
     """Behavioural, not just set-membership.
 
     The hazard is concrete: ``_synthetic_approved`` born-resolves an auto-granted gate

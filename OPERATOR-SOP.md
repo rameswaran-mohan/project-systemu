@@ -65,7 +65,7 @@ Settings → Help → Replay the tour.)
 | A run sits "unassigned" | Check the Inbox — a "New Shadow Recommended" question is waiting |
 | Results missing | Status button → the task row shows the produced file paths and the output folder |
 | Slow model stalls get cancelled | Raise `SYSTEMU_STUCK_THRESHOLD_S` (default 300) in `.env` for slow/preview models |
-| "N daemon processes are running" banner | Run `sharing_on daemon stop --all`, then start one daemon |
+| "N daemon processes are running" banner | Run `systemu daemon stop --all`, then start one daemon |
 
 ## Safety model (the short version)
 

@@ -100,7 +100,7 @@ says so in prose, and every category records ``last_ran_at``. The semantics are
 DISCLOSED on the original card, never implied.
 
 Of M3's named surface this slice ships the MECHANISM for see / pause / revoke — three
-tested library functions — and NO OPERATOR SURFACE for any of them. ``sharing-on world``
+tested library functions — and NO OPERATOR SURFACE for any of them. ``sharing_on world``
 renders the "see" half (:func:`ambient_census.census_status`) and is the only census
 code an operator can reach; because no operator-created grant can exist, it renders nothing
 on a fresh install (a planted consent file would make it render). There is no pause

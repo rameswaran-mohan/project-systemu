@@ -26,6 +26,8 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+from systemu.runtime import optional_deps as _od
+
 logger = logging.getLogger(__name__)
 
 # Skills with effectiveness_score below this are treated as deprecated
@@ -98,11 +100,25 @@ def tool_row_model(header: dict, *, vault=None) -> dict:
       * ``show_toggle``       — the Gate-3 enable/disable switch only renders
         for reviewed tools.
       * ``deps``              — declared dependencies for the inline cell (3d).
+      * ``available`` / ``unavailable_reason`` — F24.  The vault ``status``
+        describes the RECORD ("deployed"); it says nothing about whether the
+        tool can run on THIS machine.  A tool whose optional dependency group
+        is absent used to paint a green DEPLOYED pill here while
+        ``systemu tools list`` said UNAVAILABLE at the same moment against the
+        same vault — the dashboard is the primary UI, so the dashboard was the
+        one lying.  The verdict is MINTED once by ``optional_deps`` (DEC-43) and
+        merely consumed here; never re-probed, never cached, never re-derived
+        from pyproject or a trial import.
     """
     status = (header.get("status") or "").lower()
     enabled = bool(header.get("enabled", False))
     dry_run_status = header.get("dry_run_status") or "not_run"
     reviewed = status in ("forged", "deployed", "tested", "upgraded")
+    # Resolved deps, not the raw header: `tool_row_deps` falls back to the vault
+    # record when the header omits them, and the availability verdict must ride
+    # the SAME list the Deps cell shows or the two cells can disagree.
+    deps = tool_row_deps(header, vault=vault)
+    unavailable_reason = _od.unavailable_reason(deps)
     return {
         "id": header.get("id"),
         "name": header.get("name", header.get("id", "")),
@@ -116,7 +132,9 @@ def tool_row_model(header: dict, *, vault=None) -> dict:
         "actions": _row_actions_for(header),
         "show_toggle": reviewed,
         "show_enable": reviewed and not enabled and dry_run_status == "passed",
-        "deps": tool_row_deps(header, vault=vault),
+        "deps": deps,
+        "available": not unavailable_reason,
+        "unavailable_reason": unavailable_reason,
     }
 
 
@@ -198,14 +216,33 @@ def render_tool_row(tool: dict, vault, *, editable: bool = True) -> None:
 
         # Status badge — FORGED+enabled shows the green "enabled" pill.
         # An "agent-built" pill (Plan 0) marks tools the runtime forged itself.
+        #
+        # F24: availability OUTRANKS the record status. `deployed` is a fact
+        # about the vault row; "can this run here" is a fact about the machine,
+        # and the machine wins. Same wording and same minted sentence as
+        # `tools list`, so the two surfaces cannot drift apart again.
         with ui.element("td").classes("s-cell").style("padding: 12px 16px;"):
+            reason = m["unavailable_reason"]
             with ui.row().classes("items-center").style("gap: 6px;"):
-                if status == "forged" and enabled:
+                if reason:
+                    ui.html('<span class="s-pill s-pill--danger">UNAVAILABLE</span>')
+                    # the record status still shown, demoted — the operator can
+                    # see the row IS deployed and still cannot run it.
+                    ui.label(status or "?").classes("s-muted").style("font-size: 11px;")
+                elif status == "forged" and enabled:
                     ui.html(status_badge_html("enabled"))
                 else:
                     ui.html(status_badge_html(status or "?"))
                 if m["forged_by_systemu"]:
                     ui.html('<span class="s-pill s-pill--accent">agent-built</span>')
+            if reason:
+                # ui.label, NEVER ui.html: the remedy carries `"` and `[...]`.
+                # optional_deps already documents the Rich-markup hazard (Rich
+                # ate `[browser]` and printed a command that installs nothing);
+                # the HTML mirror image is an attribute break-out. A label sets
+                # text, so there is no markup for it to escape from.
+                ui.label(reason).classes("s-text-warn").style(
+                    "font-size: 11px; line-height: 1.4; white-space: normal;")
 
         # Enabled toggle (Gate 3) — only for reviewed tools, only when editable.
         with ui.element("td").classes("s-cell").style("padding: 12px 16px;"):

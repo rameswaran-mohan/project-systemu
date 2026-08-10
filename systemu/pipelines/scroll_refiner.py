@@ -605,7 +605,7 @@ def refine_scroll(
     else:
         logger.info(
             "[Scroll] '%s' awaiting approval — open the Scrolls page in the "
-            "dashboard (or run `sharing_on scrolls approve %s`).",
+            "dashboard (or run `systemu scrolls approve %s`).",
             scroll.name, scroll.id,
         )
         log_event(

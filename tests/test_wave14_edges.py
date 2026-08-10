@@ -26,7 +26,26 @@ def test_anthropic_available_helper_is_bool():
 
 
 def test_settings_red_flags_selected_provider_without_key():
+    """F8 reworded this banner: "no credential set" was wrong for Ollama, the
+    one KEYLESS provider — it has no credential to be missing, so the banner
+    now says "not usable" and is decided by the single satisfaction mint. The
+    behaviour this test names is asserted directly instead of grepped, since
+    the grep is what let the Ollama row stay green for so long."""
+    from sharing_on.config import Config
+    from systemu.runtime.provider_status import (all_provider_statuses,
+                                                 unusable_selected)
+
     src = inspect.getsource(__import__("systemu.interface.pages.settings",
                                        fromlist=["x"]))
-    assert "Selected for a tier but no credential set" in src
+    assert "Selected for a tier but not usable" in src
     assert "s-banner--danger" in src
+
+    cfg = Config(openrouter_api_key="", google_api_key="",
+                 anthropic_api_key="", openai_api_key="",
+                 tier2_provider="anthropic")
+    quiet = lambda _u, _t: ("unknown", "not probed")  # noqa: E731
+    flagged = unusable_selected(all_provider_statuses(cfg, probe=quiet),
+                                [cfg.tier1_provider, cfg.tier2_provider,
+                                 cfg.tier3_provider])
+    assert [f.provider for f in flagged] == ["anthropic"], flagged
+    assert "ANTHROPIC_API_KEY" in flagged[0].detail

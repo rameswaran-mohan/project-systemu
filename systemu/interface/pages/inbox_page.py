@@ -47,9 +47,18 @@ def _reclassify_choices() -> List[str]:
     ``unknown`` is excluded: it is precisely the conjunct the DENY band keys on, so
     "reclassify as unknown" would classify nothing. The store refuses it on write
     too; this keeps it off the menu in the first place.
+
+    F14 — ``no_effect`` is excluded for the OPPOSITE reason. It is not an opinion
+    about a tool, it is a MACHINE-CHECKED property: ``effect_tags.classify_source``
+    mints it only after proving the body has no sink, no impure builtin, no dynamic
+    access and no import that could do anything. Offering it here would let a typed
+    confirmation manufacture the very witness the completeness fence relies on — and
+    since it is in ``BATCH_APPROVABLE``, one hand-assignment would carry a DENY-band
+    tool all the way to blanket, unattended, argument-free approval.
     """
     from systemu.runtime.effect_tags import EffectTag
-    return [t.value for t in EffectTag if t is not EffectTag.UNKNOWN]
+    _NOT_ASSIGNABLE = {EffectTag.UNKNOWN, EffectTag.NO_EFFECT}
+    return [t.value for t in EffectTag if t not in _NOT_ASSIGNABLE]
 
 
 def _validate_reclassify(selected: str, typed: str):

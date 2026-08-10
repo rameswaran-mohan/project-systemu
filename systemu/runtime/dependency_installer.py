@@ -260,6 +260,13 @@ class InstallStatus(str, Enum):
     BLOCKED_DISABLED          = "blocked_disabled"
     BLOCKED_PENDING_APPROVAL  = "blocked_pending_approval"
     FAILED                    = "failed"
+    # F21: the package is one of OURS, deliberately left out of the default
+    # install and shipped by a registered pip extra. A DISTINCT status, not a
+    # reuse of BLOCKED_PENDING_APPROVAL, because the remedy is completely
+    # different: nobody needs to approve anything, the operator needs to run
+    # one `pip install systemu[...]`. Collapsing the two would put a
+    # third-party approval card in front of a first-party install line.
+    BLOCKED_MISSING_EXTRA     = "blocked_missing_extra"
 
 
 @dataclass
@@ -327,6 +334,44 @@ def ensure_satisfied(
     if not pkgs:
         return InstallResult(ok=True, status=InstallStatus.SATISFIED)
 
+    # ── F21: a FIRST-PARTY optional group short-circuits every mode ──────────
+    # `playwright` and `nicegui` are not third-party packages a forged tool
+    # asked for; they are systemu's own, moved out of the default install to
+    # cut it from 126 MB / 122 wheels. Three reasons this runs BEFORE the mode
+    # switch rather than inside one branch of it:
+    #
+    #   * PROMPT would have queued an operator approval card for a package the
+    #     operator cannot meaningfully reason about, whose real remedy
+    #     (`pip install systemu[browser]`) the card never mentions;
+    #   * ALWAYS (the docker modes) would silently pip-install a 38 MB browser
+    #     engine in the middle of somebody's task;
+    #   * OFF would say "bake it into the base image" without naming the extra
+    #     that does exactly that.
+    #
+    # In all four the honest answer is identical and is not a decision about
+    # trust: the capability was never installed, and here is the one line that
+    # installs it. Modes still govern THIRD-PARTY packages exactly as before —
+    # `missing_groups` returns nothing for those, so this branch is skipped.
+    try:
+        from systemu.runtime import optional_deps as _od
+        _missing_groups = _od.missing_groups(pkgs)
+    except Exception:          # pragma: no cover - registry import must never
+        _missing_groups = ()   # take down a tool call; fall through as before
+    if _missing_groups:
+        reason = _od.unavailable_reason(pkgs)
+        logger.info(
+            "[DepInstaller] Tool '%s' needs optional group(s) %s which are not "
+            "installed — remedy: %s",
+            tool_name, ",".join(g.extra for g in _missing_groups),
+            _od.install_command(pkgs),
+        )
+        return InstallResult(
+            ok=False,
+            status=InstallStatus.BLOCKED_MISSING_EXTRA,
+            pending_approval=[],          # nothing to approve — nothing is pending
+            error=f"Tool '{tool_name}' cannot run. {reason}",
+        )
+
     if mode is InstallMode.OFF:
         logger.info(
             "[DepInstaller] Install mode=OFF — refusing to install %s for tool '%s'",
@@ -362,7 +407,7 @@ def ensure_satisfied(
                 error=(
                     f"Tool '{tool_name}' needs operator approval to install: "
                     f"{', '.join(to_consider)}. "
-                    f"Run: sharing_on tools deps approve <package>"
+                    f"Run: systemu tools deps approve <package>"
                 ),
             )
 
@@ -420,7 +465,7 @@ def ensure_satisfied(
                 error=(
                     f"Tool '{tool_name}' needs operator approval to install: "
                     f"{', '.join(unapproved)}. "
-                    f"Run: sharing_on tools deps approve <package>"
+                    f"Run: systemu tools deps approve <package>"
                 ),
             )
         to_install = approved

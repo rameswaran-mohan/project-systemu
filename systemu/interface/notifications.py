@@ -563,6 +563,26 @@ def request_choice(questions, *, dedup_key, extra_context=None,
     raise PendingChoiceRequest(decision_id=decision_id, dedup_key=dedup_key, options=labels)
 
 
+def headless_declared() -> bool:
+    """True when the operator *explicitly declared* this run non-interactive.
+
+    The ONE place that knows the env-var names (F3):
+      • ``SYSTEMU_NON_INTERACTIVE=true`` — the operator's documented switch;
+      • ``SYSTEMU_HEADLESS=1``           — legacy/daemon-set marker.
+
+    Distinct from :func:`is_headless`, which additionally treats "no stdin
+    TTY" as headless. The distinction matters for commands that may pick
+    *defaults on the operator's behalf*: a missing TTY is an accident of the
+    environment (a pipe, a test runner, a CI shell) and must not silently
+    authorise choosing values for someone, whereas these env vars are a
+    deliberate "decide for me" from the operator.
+    """
+    import os
+    if (os.environ.get("SYSTEMU_NON_INTERACTIVE") or "").lower() == "true":
+        return True
+    return os.environ.get("SYSTEMU_HEADLESS") == "1"
+
+
 def is_headless() -> bool:
     """True when this process cannot (or must not) prompt on stdin.
 
@@ -581,10 +601,8 @@ def is_headless() -> bool:
     cp1252 PowerShell as headless here would silently auto-deny destructive
     prompts for every default-console Windows user.
     """
-    import sys, os
-    if (os.environ.get("SYSTEMU_NON_INTERACTIVE") or "").lower() == "true":
-        return True
-    if os.environ.get("SYSTEMU_HEADLESS") == "1":
+    import sys
+    if headless_declared():
         return True
     return not sys.stdin.isatty()
 

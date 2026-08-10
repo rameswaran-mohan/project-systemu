@@ -833,15 +833,27 @@ def test_a_deny_card_floors_remote_resolution():
 
 # ── Step 5: the Inbox reclassify panel (pure helpers) ───────────────────────
 
-def test_reclassify_choices_are_the_real_effect_tags_minus_unknown():
+def test_reclassify_choices_are_the_real_effect_tags_minus_the_non_assignable():
+    """Two values are withheld, for OPPOSITE reasons.
+
+    ``unknown`` is the conjunct the DENY band keys on, so assigning it classifies
+    nothing.  ``no_effect`` (F14) is a MACHINE-CHECKED witness minted only by
+    ``classify_source``'s purity proof — and it is in ``BATCH_APPROVABLE``, so
+    offering it here would let one typed confirmation carry a DENY-band tool to
+    blanket, unattended, argument-free approval by asserting a property nobody
+    verified.  Everything the governor can actually be told about a tool stays on
+    the menu, including the new capture/actuation classes.
+    """
     from systemu.interface.pages.inbox_page import _reclassify_choices
     from systemu.runtime.effect_tags import EffectTag
     choices = _reclassify_choices()
     assert choices, "the operator must have something to assign"
-    assert EffectTag.UNKNOWN.value not in choices
-    assert set(choices) == {t.value for t in EffectTag if t is not EffectTag.UNKNOWN}
+    withheld = {EffectTag.UNKNOWN.value, EffectTag.NO_EFFECT.value}
+    assert set(choices) & withheld == set()
+    assert set(choices) == {t.value for t in EffectTag} - withheld
     # they are the REAL values the store + governor accept, not display labels
     assert "money_move" in choices and "local_write" in choices
+    assert "screen_capture" in choices and "input_synthesis" in choices
 
 
 def test_reclassify_validation_requires_an_exact_typed_match():

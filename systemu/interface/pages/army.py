@@ -88,6 +88,21 @@ def _render_execute_jobs_panel() -> None:
     jm = JobManager.get()
     vm = _build_execute_jobs_panel_view_model(jm)
 
+    # F10: these three counters are scoped to Execute jobs started FROM THE
+    # DASHBOARD. A task run via `chat submit` never enters JobManager, so
+    # "Completed (0)" here sat beside the same run showing COMPLETED on Work and
+    # read as a contradiction. The scope used to live only in this function's
+    # docstring — say it on screen.
+    # F30: the project's style primitives, not inline .style(). The first cut
+    # hand-rolled both lines and pushed tests/test_ui_style_no_new_violations.py
+    # from its baselined 76 to 78 -- a lint whose whole job is to stop exactly
+    # this drift. `s-section-head` and `s-muted` are what every other section
+    # here uses, so this also inherits the theme instead of re-deriving it.
+    ui.label("Recent Execute Jobs").classes("s-section-head")
+    ui.label(
+        "Runs you started from the dashboard — CLI and scheduled runs appear under Work."
+    ).classes("s-muted")
+
     with ui.row().style("gap: 12px; width: 100%; margin-bottom: 16px;"):
         for label, key, color in (
             ("Queued", "queued", THEME["warning"]),

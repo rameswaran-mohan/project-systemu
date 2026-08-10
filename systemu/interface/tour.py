@@ -89,13 +89,20 @@ def is_tour_pending(vault) -> bool:
         return False
 
 
-def mark_tour_completed(vault, *, ended_early: bool = False) -> None:
-    """Record completion (the W11.3 ``tour_completed`` check reads this)."""
+def mark_tour_completed(vault, *, ended_early: bool = False,
+                        note: str = "") -> None:
+    """Record completion (the W11.3 ``tour_completed`` check reads this).
+
+    ``note`` overrides the recorded wording so a caller that is not the browser
+    card can say what actually happened — the headless
+    ``sharing_on onboarding complete-tour`` records that the tour was waived on
+    a machine with no browser rather than claiming the operator watched it.
+    """
     from systemu.runtime.first_run import TOUR_FACT_TAG
     from systemu.runtime.user_profile import add_fact
-    note = ("guided tour ended early by operator" if ended_early
-            else "guided tour completed")
-    add_fact(vault, note, source="onboarding", tags=[TOUR_FACT_TAG, "onboarding"])
+    text = note.strip() or ("guided tour ended early by operator" if ended_early
+                            else "guided tour completed")
+    add_fact(vault, text, source="onboarding", tags=[TOUR_FACT_TAG, "onboarding"])
 
 
 def _active_step_index() -> Optional[int]:

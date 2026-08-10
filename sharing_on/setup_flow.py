@@ -15,9 +15,17 @@ time `daemon start` finds no key) walks the operator through:
      model-id corrections ship in releases and apply automatically.
   3. Output folder — where produced files land.
 
-stdlib + python-dotenv only (no systemu import) so the dependency direction
-stays sharing_on ← systemu, and install.py can reuse it too. Every external
+stdlib + python-dotenv at MODULE level (no top-level systemu import) so
+install.py can reuse this before the package is importable. Every external
 input (getpass / input / validator) is injectable for keyless tests.
+
+F19 EXCEPTION, and why it is not a layering violation: ``provider_available``
+consumes ``systemu.runtime.provider_status``, THE ONE MINT of "is this provider
+usable" (DEC-43). The import is LAZY, inside the function, so module import is
+unchanged and install.py's reuse is unaffected — and ``sharing_on/__init__.py``
+already imports ``systemu`` at its top, so the two packages have shipped
+together all along. The alternative was a SEVENTH private copy of the
+satisfaction recipe, which is the defect F19 exists to close.
 """
 from __future__ import annotations
 
@@ -121,18 +129,64 @@ def write_env_vars(updates: Dict[str, str], *, env_path: Path) -> Path:
     return env_path
 
 
-def key_present(env_path: Optional[Path] = None) -> bool:
-    """True when an OpenRouter key is reachable from the process env or .env."""
-    if (os.environ.get("OPENROUTER_API_KEY") or "").strip():
-        return True
+def _config_for_mint(env_path: Optional[Path] = None):
+    """The config view the mint scores: the process environment (``sharing_on
+    .config`` has already applied dotenv at import), OVERLAID with whatever a
+    named .env holds RIGHT NOW.
+
+    The re-read is load-bearing, not belt-and-braces: ``daemon start`` runs the
+    setup wizard and then asks again, and the wizard's answer is a file the
+    process env has never seen.
+    """
+    from sharing_on.config import Config
+    from systemu.runtime import provider_status as _ps
+    cfg = Config.from_env()
     p = Path(env_path) if env_path else (Path.cwd() / ".env")
     try:
         if p.exists():
-            return bool(_parse_env(
-                p.read_text(encoding="utf-8-sig")).get("OPENROUTER_API_KEY", "").strip())
+            parsed = _parse_env(p.read_text(encoding="utf-8-sig"))
+            for spec in _ps.PROVIDER_SPECS:
+                val = (parsed.get(spec.env) or "").strip()
+                if val:
+                    setattr(cfg, spec.attr, val)
     except Exception:
         pass
-    return False
+    return cfg
+
+
+def provider_available(env_path: Optional[Path] = None, *, config=None,
+                       probe=None) -> bool:
+    """Is ANY provider usable on this machine? Consumes THE ONE MINT.
+
+    F19 / DEC-43. This used to be ``key_present``: an OpenRouter-only, env-plus-
+    .env recipe that was one of SIX different copies in the tree. A machine with
+    a Google key, or with Ollama actually running, was told it had nothing — and
+    ``daemon start`` refused to boot it.
+
+    The refusal for a machine with NOTHING configured is unchanged and correct;
+    what changes is which machines count as "nothing" and what the operator is
+    then told (see ``cli_commands._no_provider_message``, which names all five).
+
+    The keyless witness is spent here: this runs once, at daemon start, on a
+    path that is already spawning a process and waiting for a socket.
+    """
+    from systemu.runtime import provider_status as _ps
+    cfg = config if config is not None else _config_for_mint(env_path)
+    return _ps.any_satisfied(_ps.all_provider_statuses(cfg, probe=probe))
+
+
+def key_present(env_path: Optional[Path] = None) -> bool:
+    """Back-compat name for :func:`provider_available` — RETAINED DELIBERATELY.
+
+    ``daemon start``'s admission gate is pinned by name in
+    ``tests/test_wave13_setup_flow.py`` (source-level: the callback must call
+    ``key_present()``) and is monkeypatched as ``setup_flow.key_present`` by
+    ``tests/test_daemon_readiness_witness.py`` and
+    ``tests/test_daemon_build_skew_witness.py``. Renaming the predicate would
+    hollow out three fences to cosmetic effect, so the NAME stays and the
+    MEANING is the minted one: any provider, not one key.
+    """
+    return provider_available(env_path)
 
 
 # W14: each provider stores its credential under its own env var (one key
@@ -342,7 +396,7 @@ def run_setup(
         for _ in range(3):
             entered = (getpass_fn("  Paste your key (blank to skip): ") or "").strip()
             if not entered:
-                messages.append("No key set — set it later with `sharing_on setup`.")
+                messages.append("No key set — set it later with `systemu setup`.")
                 break
             if validate:
                 ok, why = validate_fn(entered)

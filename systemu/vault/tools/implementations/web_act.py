@@ -40,6 +40,14 @@ def run(**kwargs) -> dict:
         finally:
             ctx.close()
     except Exception as exc:
+        # F21: the [browser] extra is not installed — a capability the operator
+        # has not installed, not a transient failure. Typed so the runtime does
+        # not retry, with the remedy already in the message.
+        from systemu.runtime.optional_deps import OptionalDependencyMissing
+        if isinstance(exc, OptionalDependencyMissing):
+            return {"success": False, "result": "", "steps": [], "error": str(exc),
+                    "error_type": "capability_unavailable",
+                    "missing_packages": list(exc.packages), "retryable": False}
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             return {"success": False, "result": "", "steps": [], "error": "browser not ready (chromium installing)",
                     "error_type": "missing_dependency", "missing_packages": ["playwright-chromium"]}

@@ -303,11 +303,21 @@ class GateDescriptor(BaseModel):
     def from_first_gate_bulk(cls, partition, *, version: str) -> "GateDescriptor":
         """IMPL-4: the one-time bulk FIRST-GATE review card for backfilled tools.
 
-        The card PARTITIONS BY BAND, and the partition is the safety property — not a
-        presentation choice. Only ``REQUIRE_APPROVAL``-band tools are offered for the
-        batch Always-allow; DENY-band tools (UNKNOWN ∩ high-severity) are LISTED, named,
-        and pointed at the IMPL-2 reclassify remedy, but they are never part of the
-        affirmative action.
+        The partition is the safety property — not a presentation choice. A tool reaches
+        the batch only if it BOTH gates (REQUIRE_APPROVAL band) and carries an effect
+        class the ``effect_tags.BATCH_APPROVABLE`` allowlist permits to be granted
+        blanket, unattended, argument-free permission. Everything else is LISTED, named,
+        given its exclusion REASON, and pointed at the individual-approval remedy — but
+        is never part of the affirmative action.
+
+        F9 — WHY THE CARD'S COPY IS GENERATED, NOT WRITTEN. This card used to promise
+        "an unclassifiable high-severity effect can never be batch-approved" while
+        offering ``run_command`` and ``file_delete`` in the batch and reporting "0
+        excluded". The sentence was true (nothing had reached the DENY floor) and the
+        card was a lie. Every claim about the rule now comes from
+        ``first_gate_review.batch_rule_sentence()``, which is derived from the allowlist,
+        and every excluded tool prints ``batch_exclusion_reason``'s answer — the same
+        function that made the decision. Text cannot drift from the set.
 
         When NOTHING is eligible the affirmative option is not rendered at all. An
         offered-but-inert option is precisely the shape of the IMPL-2 adversarial
@@ -319,7 +329,9 @@ class GateDescriptor(BaseModel):
         descriptor here. Risk stays "high" — one click can bless an entire inventory.
         """
         from systemu.runtime.first_gate_review import (
-            BULK_DEDUP_PREFIX, MAX_LISTED_PER_BAND, OPT_BULK_ALLOW, OPT_LEAVE_GATED)
+            BULK_DEDUP_PREFIX, MAX_CARD_CHARS, MAX_LISTED_PER_BAND, MAX_REASON_CHARS,
+            OPT_BULK_ALLOW, OPT_LEAVE_GATED, batch_exclusion_reason,
+            batch_rule_sentence)
 
         eligible = list(getattr(partition, "eligible", ()) or ())
         excluded = list(getattr(partition, "excluded", ()) or ())
@@ -340,49 +352,92 @@ class GateDescriptor(BaseModel):
         if eligible:
             options.append(OPT_BULK_ALLOW)
 
-        def _line(e) -> str:
+        def _line(e, *, with_reason: bool = False) -> str:
             tags = ", ".join(e.effect_tags) or "unclassified"
-            return f"  {e.name} — {tags}"
+            if not with_reason:
+                return f"  {e.name} — {tags}"
+            # The reason comes from the SAME predicate that excluded the tool, so the
+            # card can never name a rule the code did not apply. "0 excluded" with no
+            # reasons is what made the old promise unfalsifiable on screen. Bounded like
+            # every other variable-length field on this card; the effect class leads the
+            # string, so a clip never removes the part that names WHY.
+            why = batch_exclusion_reason(e)
+            if len(why) > MAX_REASON_CHARS:
+                why = why[:MAX_REASON_CHARS - 1].rstrip() + "…"
+            return f"  {e.name} — {tags}  [excluded: {why}]"
 
-        def _listing(entries) -> list:
-            """Name up to MAX_LISTED_PER_BAND tools, then DISCLOSE the remainder.
+        def _listing(entries, *, with_reason: bool = False,
+                     limit: int = MAX_LISTED_PER_BAND) -> list:
+            """Name up to ``limit`` tools, then DISCLOSE the remainder.
 
             Display-only: the counts above and below stay exact, and nothing about the
             partition or the recorded allow-set depends on this. Truncation is never
             silent — an operator who cannot see that the list was clipped would read a
             short list as the whole inventory.
             """
-            out = [_line(e) for e in entries[:MAX_LISTED_PER_BAND]]
-            rest = len(entries) - MAX_LISTED_PER_BAND
+            out = [_line(e, with_reason=with_reason) for e in entries[:limit]]
+            rest = len(entries) - limit
             if rest > 0:
                 out.append(f"  …and {rest} more (open the Inbox to review the full list)")
             return out
 
-        lines = [f"{len(eligible)} tool(s) can be approved as a batch:"]
-        lines += _listing(eligible) or ["  (none)"]
-        if excluded:
-            lines += [
-                "",
-                f"{len(excluded)} tool(s) are EXCLUDED from the batch — their effect "
-                "could not be classified and they carry a high-severity signal:",
-            ]
-            lines += _listing(excluded)
-            lines += [
-                "",
-                "These cannot be bulk-approved. Each one is resolved individually the "
-                "first time it runs, by reclassifying its effect under typed "
-                "confirmation.",
-            ]
+        rule = batch_rule_sentence()
 
-        what = (
-            f"'{OPT_BULK_ALLOW}' remembers {len(eligible)} tool(s) so they stop "
-            f"prompting mid-task. It does NOT cover the {len(excluded)} excluded "
-            "tool(s): an unclassifiable high-severity effect can never be batch-"
-            "approved, and each still needs an individual reclassification. "
-            "Approval binds to each tool's exact body + effect set, so re-forging one "
-            "re-gates it — and a remembered tool is still gated on any call whose "
-            "arguments score higher than what was reviewed here."
-        )
+        def _render(limit: int) -> list:
+            out = [rule, ""]
+            out += [f"{len(eligible)} tool(s) can be approved as a batch:"]
+            out += _listing(eligible, limit=limit) or ["  (none)"]
+            if excluded:
+                out += [
+                    "",
+                    f"{len(excluded)} tool(s) are EXCLUDED from the batch, each with "
+                    "its reason:",
+                ]
+                out += _listing(excluded, with_reason=True, limit=limit)
+                out += [
+                    "",
+                    "These cannot be bulk-approved. Each is decided individually the "
+                    "first time it runs, on a card showing the actual arguments — and "
+                    "an effect that could not be classified is reclassified there "
+                    "under typed confirmation.",
+                ]
+            return out
+
+        # F17 — WHICH PART YIELDS WHEN THE CARD IS TOO BIG. ``rule`` is the CONSENT
+        # RECORD: it states the rule actually applied and attributes every dated
+        # operator ruling, and it grows by one clause each time a ruling is made. The
+        # listing is display-only and discloses its own truncation. So the listing
+        # yields to the renderer's clip and the record never does — otherwise the third
+        # ruling would silently push the attribution past `live_events_pane
+        # .clip_detail` (R-UX2) and the operator would read a consent record the
+        # renderer had cut, with nothing on screen saying so.
+        lines = _render(MAX_LISTED_PER_BAND)
+        _limit = MAX_LISTED_PER_BAND
+        while _limit > 0 and len("\n".join(lines)) > MAX_CARD_CHARS:
+            _limit = max(0, _limit - 4)
+            lines = _render(_limit)
+
+        # The "what Approve does" line must describe THE CARD IN FRONT OF THE OPERATOR.
+        # When nothing qualifies there is no affirmative option (see `options` above), so
+        # quoting one here would explain a button that is not on the card — the same
+        # promise/reality gap, one surface over. Observed live: with 0 eligible the line
+        # opened "'Always allow the approvable ones' remembers 0 tool(s)" beside an
+        # options list of exactly ['Leave gated'].
+        if eligible:
+            what = (
+                f"'{OPT_BULK_ALLOW}' remembers {len(eligible)} tool(s) so they stop "
+                f"prompting mid-task. It does NOT cover the {len(excluded)} excluded "
+                f"tool(s). {rule} "
+                "Approval binds to each tool's exact body + effect set, so re-forging "
+                "one re-gates it — and a remembered tool is still gated on any call "
+                "whose arguments score higher than what was reviewed here.")
+        else:
+            what = (
+                f"There is nothing to batch-approve: none of these {len(excluded)} "
+                f"tool(s) qualifies, so no batch option is offered. {rule} "
+                f"'{OPT_LEAVE_GATED}' just acknowledges this list — every one of these "
+                "tools still works, and asks you the first time it runs, on a card "
+                "showing the actual arguments.")
 
         return cls(
             title=f"Review {len(eligible) + len(excluded)} tool(s) before the "

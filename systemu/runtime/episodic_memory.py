@@ -22,23 +22,51 @@ _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "summarize_s
 
 
 def _has_llm_provider(config) -> bool:
-    """True iff at least one LLM provider key is configured.
+    """True iff at least one LLM provider is usable. Consumes THE ONE MINT.
 
-    Mirrors ``open_world_planner._has_llm_provider`` (replicated here rather than
-    imported to keep this module free of a runtime-package import at load time).
-    When NO provider key is set the Tier-1 summarize call below cannot succeed —
+    When NO provider is usable the Tier-1 summarize call below cannot succeed —
     it can only 401 or, keyless/offline, stall through the router's retry ladder
     (``_API_TIMEOUT_SECONDS`` × ``_NETWORK_MAX_RETRIES``, ~380s) before failing.
     ``capture`` already degrades to ``None`` on that failure, so short-circuiting
-    here is behavior-equivalent — just fast. Never raises (a missing attr → unset)."""
-    for attr in ("openrouter_api_key", "google_api_key",
-                 "anthropic_api_key", "openai_api_key"):
-        try:
-            if (getattr(config, attr, "") or "").strip():
-                return True
-        except Exception:
-            continue
-    return False
+    here is behavior-equivalent — just fast. Never raises.
+
+    F19 / DEC-43 form (i). This used to ENUMERATE FOUR CONFIG ATTRIBUTE NAMES,
+    duplicated verbatim in ``open_world_planner`` — which is exactly why a grep
+    for the env var could never find every re-derivation site. It also silently
+    excluded the keyless provider, so an Ollama-only install had cross-session
+    recall switched off with nothing said.
+
+    ``any_provider_usable`` spends the loopback witness ONLY when a tier
+    explicitly selects the keyless provider. That matters here: this runs at the
+    end of every capture, and an unconditional probe would put ~1-2 s of network
+    I/O on a path that has none today."""
+    from systemu.runtime import provider_status as _ps
+    return _ps.any_provider_usable(config)
+
+
+def _warn_operator_degraded(*, session_id: str, reason: str) -> None:
+    """F12 / P1 — cross-session recall is an ADVERTISED capability. When a run
+    produces no summary, the task still reports SUCCESS, so a ``logger.warning``
+    leaves the operator believing a feature ran that did not (DEC-34: a false
+    assertion of capability). Name the feature, not just "an LLM call failed" —
+    the router's own notice cannot tell the operator WHICH capability went dark.
+    Best-effort: never break the end-of-run path."""
+    logger.warning("[Episodic] summarize failed for %s: %s", session_id, reason)
+    try:
+        from systemu.interface.notifications import log_event
+        # ASCII-only (DEC-32c) — this crosses into event_log.jsonl, the
+        # dashboard panes and a Windows console.
+        msg = (
+            "Cross-session recall did not record this session: no episodic "
+            f"summary was stored, so future sessions cannot recall it. Reason: {reason}"
+        ).encode("ascii", "backslashreplace").decode("ascii")
+        log_event(
+            "WARNING", "memory", msg,
+            {"kind": "episodic_degraded", "session_id": session_id,
+             "reason": reason[:500]},
+        )
+    except Exception:
+        logger.error("[Episodic] degraded notice failed to emit for %s", session_id)
 
 
 def _load_system_prompt() -> str:
@@ -111,11 +139,13 @@ def capture(
             temperature=0.2,
         )
     except Exception as exc:
-        logger.warning("[Episodic] summarize failed for %s: %s", session_id, exc)
+        _warn_operator_degraded(session_id=session_id, reason=str(exc))
         return None
 
     if not isinstance(result, dict):
-        logger.warning("[Episodic] summarize returned non-dict: %r", type(result))
+        _warn_operator_degraded(
+            session_id=session_id,
+            reason=f"the summarizer returned {type(result).__name__}, not a JSON object")
         return None
 
     max_chars = int(getattr(config, "episodic_summary_max_chars", 800))

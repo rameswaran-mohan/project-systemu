@@ -106,7 +106,7 @@ def _handle_pending_decision_or_run(ctx, work):
             f"   Options:       {', '.join(pd.options)}\n"
             f"\n"
             f"   Resolve via dashboard at /insights → Pending Actions tab,\n"
-            f"   or:  [bold]sharing_on decisions resolve {pd.decision_id} --choice <option>[/bold]\n"
+            f"   or:  [bold]systemu decisions resolve {pd.decision_id} --choice <option>[/bold]\n"
             f"\n"
             f"   Re-run this command after resolving to pick up the operator's choice."
         )
@@ -404,6 +404,22 @@ def tools_list(ctx, status: Optional[str]):
         console.print("[dim]No tools found.[/dim]")
         return
 
+    # F21: the vault status ("deployed") describes the RECORD; it says nothing
+    # about whether the tool can run on this machine. A tool whose optional
+    # dependency group is not installed used to render "deployed" here and then
+    # fail at call time — a capability that looks present and silently does
+    # nothing. The Status column now reports the effective state, and the
+    # remedy is printed in the row rather than being something the operator has
+    # to go and find.
+    # DEFECT CAUGHT BY THE F21 FENCE, worth naming: the remedy contains
+    # `systemu[browser]`, and Rich parses `[browser]` as a style tag and DELETES
+    # it. The operator was shown "pip install systemu" — a command that runs
+    # cleanly and installs nothing. Every remedy string that reaches a Rich
+    # console must be escaped; `click.echo` paths (run_find_tools) must not be.
+    from rich.markup import escape as _esc
+
+    from systemu.runtime import optional_deps as _od
+
     table = Table(title="🔧 Tool Registry", show_lines=True)
     table.add_column("ID",     style="cyan",   no_wrap=True)
     table.add_column("Name",   style="bold")
@@ -411,15 +427,39 @@ def tools_list(ctx, status: Optional[str]):
     table.add_column("Status", style="yellow")
     table.add_column("Description")
 
+    unavailable = 0
+    remedies: list = []
     for t in tools:
-        table.add_row(
-            t["id"], t["name"], t.get("tool_type", "—"),
-            t["status"],
-            (t.get("description", "") or "")[:60] + "…"
-                if len(t.get("description", "")) > 60
-                else t.get("description", "—"),
-        )
+        desc = (t.get("description", "") or "")
+        desc = (desc[:60] + "…") if len(desc) > 60 else (desc or "—")
+        reason = _od.unavailable_reason(t.get("dependencies") or [])
+        if reason:
+            unavailable += 1
+            cmd = _od.install_command(t.get("dependencies") or [])
+            if cmd and cmd not in remedies:
+                remedies.append(cmd)
+            status_cell = f"[red]UNAVAILABLE[/red]\n[dim]{t['status']}[/dim]"
+            desc = f"{_esc(desc)}\n[yellow]{_esc(reason)}[/yellow]"
+        else:
+            status_cell = t["status"]
+        table.add_row(t["id"], t["name"], t.get("tool_type", "—"),
+                      status_cell, desc)
     console.print(table)
+    if unavailable:
+        # F24: the remedy is repeated OUTSIDE the table. Inside it, Rich sizes
+        # the Description column to the terminal and ELLIPSISES the overflow —
+        # at 80 columns the operator was shown `pip install "systemu[brow…`.
+        # The footer's own sentence ("listed above with the exact install
+        # command") was therefore false on a default-width terminal, which is
+        # the DEC-34 defect of asserting something the code does not do. A
+        # bare `click.echo` line has no column to be truncated by.
+        console.print(
+            f"[yellow]▲ {unavailable} tool(s) are UNAVAILABLE — an optional "
+            f"dependency group is not installed. Run `systemu doctor` for the "
+            f"whole picture.[/yellow]"
+        )
+        for cmd in remedies:
+            click.echo(f"  {cmd}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -545,10 +585,54 @@ def skills_list(ctx, category: Optional[str]):
 #  settings command
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _settings_show_body(ctx):
-    """Render the read-only settings panel. Shared by `settings show` and the
-    bare-`settings` back-compat fallback (Phase 2 Task 7)."""
-    config, vault = _get_vault_and_config(ctx)
+def _no_provider_message(config, *, probe=None) -> str:
+    """The headless refusal, naming EVERY provider the operator could configure.
+
+    F19: this said "No OPENROUTER_API_KEY configured", which hid four other ways
+    to proceed — including one that needs no credential at all. Generated from
+    ``PROVIDER_SPECS`` via ``provider_status.configure_hint``, so a sixth
+    provider appears here with nobody editing a sentence. ASCII (DEC-32c).
+    """
+    from systemu.runtime import provider_status as _ps
+    statuses = _ps.all_provider_statuses(
+        config, probe=probe, cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
+    return ("No LLM provider is usable, so the daemon would boot dead. "
+            + _ps.configure_hint(statuses)
+            + " Then run `systemu setup`, or start the daemon again.")
+
+
+#: Presentation only, keyed by STATE — never by provider. Mirrors the dashboard
+#: Settings card (``interface/pages/settings.py``) so the two surfaces cannot
+#: describe the same minted state in different words.
+_PROVIDER_MARK = {
+    "set":         ("[green]OK[/green]",  "Set"),
+    "missing":     ("[red]--[/red]",      "Not set"),
+    "reachable":   ("[green]OK[/green]",  "Reachable"),
+    "unreachable": ("[red]--[/red]",      "Not reachable"),
+    "unknown":     ("[dim]?[/dim]",       "Unknown"),
+}
+
+
+def _render_settings_panel(config, *, statuses) -> None:
+    """Paint the read-only settings panel from ALREADY-MINTED verdicts.
+
+    F19 — WHY THE VERDICTS ARRIVE AS AN ARGUMENT. This panel used to decide the
+    one row it showed with ``config.openrouter_api_key``, so on the same machine
+    and the same minute the dashboard reported five providers (with Ollama
+    probed and REACHABLE) and this reported "OpenRouter / API key set: No". Two
+    operator-facing surfaces, one fact, two answers — DEC-43. The minting is the
+    caller's job so this function stays pure and the probe stays visible at the
+    call site, where its cost is paid.
+    """
+    from systemu.runtime import provider_status as _ps
+
+    rows = []
+    for spec in _ps.PROVIDER_SPECS:
+        st = statuses.get(spec.provider)
+        if st is None:
+            continue
+        mark, word = _PROVIDER_MARK.get(st.state, ("[dim]?[/dim]", "Unknown"))
+        rows.append(f"  {st.display:<11} {mark} {word:<14} [dim]{st.detail}[/dim]")
 
     console.print(Panel(
         f"[bold]LLM Tiers[/bold]\n"
@@ -558,11 +642,32 @@ def _settings_show_body(ctx):
         f"[bold]Behaviour[/bold]\n"
         f"  Non-interactive mode:       [yellow]{config.non_interactive}[/yellow]\n"
         f"  Vault directory:            [dim]{config.vault_dir}[/dim]\n\n"
-        f"[bold]OpenRouter[/bold]\n"
-        f"  API key set:                 {'[green]Yes[/green]' if config.openrouter_api_key else '[red]No — set OPENROUTER_API_KEY in .env[/red]'}",
+        f"[bold]Providers[/bold]  [dim](credentials live in .env and are never "
+        f"printed; Ollama takes no key, so its row reports whether it actually "
+        f"ANSWERS)[/dim]\n"
+        + "\n".join(rows),
         title="⚙️  Systemu Settings",
         border_style="blue",
     ))
+
+
+def _settings_show_body(ctx):
+    """Render the read-only settings panel. Shared by `settings show` and the
+    bare-`settings` back-compat fallback (Phase 2 Task 7).
+
+    The keyless provider's liveness witness is spent HERE, synchronously, and it
+    is bounded: ``provider_status.DEFAULT_PROBE_TIMEOUT`` per address. Measured
+    on the shipped default ``http://localhost:11434``: ~1.1 s with Ollama
+    running, ~2.0 s with nothing listening (dual-stack, ``::1`` dropped then
+    IPv4). ``settings show`` is an inspection command whose whole job is to
+    report this, so the wait buys the answer; the 20 s memo means a second
+    command in the same process is free. A command that CANNOT afford it passes
+    ``probe=provider_status.unprobed`` and gets an honest "not probed".
+    """
+    from systemu.runtime import provider_status as _ps
+    config, vault = _get_vault_and_config(ctx)
+    _render_settings_panel(config, statuses=_ps.all_provider_statuses(
+        config, cache_ttl_s=_ps.PROBE_CACHE_TTL_S))
 
 
 @click.group("settings", invoke_without_command=True)
@@ -822,7 +927,7 @@ def tools_deps_list(show_pending: bool):
             )
         console.print(table)
         console.print(
-            "\n[dim]Approve with:[/dim] sharing_on tools deps approve <package>"
+            "\n[dim]Approve with:[/dim] systemu tools deps approve <package>"
         )
     else:
         console.print("[dim]No pending dependencies.[/dim]")
@@ -1261,49 +1366,128 @@ def daemon_group():
     """Control the Systemu background daemon (scheduler + web dashboard)."""
 
 
+def _print_daemon_build(build_match, build_note: str) -> None:
+    """F13 — disclose WHICH systemu build the daemon is executing.
+
+    Every surface that says the daemon is up says this too. ``build_match`` is
+    tri-state and UNVERIFIED (``None``) is rendered as its own state, never as
+    agreement: a daemon that recorded no build is an older/other build, which is
+    the skew itself. A mismatch is LOUD but never fatal — a user mid-upgrade
+    must still be able to reach ``daemon stop``.
+    """
+    if not build_note:
+        return
+    if build_match is False:
+        console.print(f"  [red]⚠ {build_note}[/red]")
+    elif build_match is True:
+        console.print(f"  [dim]{build_note}[/dim]")
+    else:
+        console.print(f"  [yellow]⚠ {build_note}[/yellow]")
+
+
 @daemon_group.command("start")
 @click.option("--port", default=8765, show_default=True, help="Port for the web dashboard.")
 @click.option("--foreground", is_flag=True, help="Run in foreground (blocking).")
+@click.option("--wait", "wait_s", type=float, default=None,
+              help="Seconds to wait for the daemon to actually accept connections "
+                   "before giving up (default 60, or SYSTEMU_DAEMON_START_TIMEOUT).")
 @click.pass_context
-def daemon_start(ctx, port: int, foreground: bool):
-    """Start the Systemu background daemon."""
+def daemon_start(ctx, port: int, foreground: bool, wait_s):
+    """Start the Systemu background daemon.
+
+    DEC-41: the spawn is a CLAIM, not a witness. This command does not report
+    success — and does not exit 0 — until a real connection to the dashboard
+    port has been observed to succeed. The wait is BOUNDED; a daemon that never
+    becomes ready is reported honestly with a nonzero exit instead of hanging.
+    """
     config, vault = _get_vault_and_config(ctx)
     from systemu.scheduler.daemon import start_daemon
 
-    # First-run guard: no API key → run setup now (interactive TTY) or point
-    # at it (headless). Booting without a key only yields a dead dashboard
-    # that fails every task — exactly the pip-install pitfall this closes.
+    # ── F21: the [dashboard] group gate, BEFORE anything is spawned ─────────
+    # `daemon start`'s readiness witness IS the dashboard socket (DEC-41: the
+    # spawn is a claim, and `await_readiness` polls for a real connection on
+    # `port`). Without nicegui nothing ever binds that port, so the command
+    # would spawn a daemon, poll for the full 60s timeout, and then report
+    # "timed out — nothing is accepting on 127.0.0.1:8765" — true, but a whole
+    # minute spent to arrive at a diagnosis that names no cause and no cure.
+    #
+    # Refused here instead, in under a second, with the command that fixes it.
+    # This does not remove a capability: there has never been a headless daemon
+    # mode (the task API registers its routes on the NiceGUI app too), so the
+    # alternative was not "keep working" but "invent an unwitnessed mode",
+    # which is exactly what DEC-41 forbids.
+    from systemu.runtime import optional_deps as _od
+    if _od.missing_groups(("nicegui",)):
+        from rich.markup import escape as _esc
+        console.print(
+            f"[red]✗ Cannot start the daemon: the web dashboard is not "
+            f"installed.[/red]\n"
+            f"  {_esc(_od.unavailable_reason(('nicegui',)))}\n"
+            f"[dim]  `daemon start` reports success only when a real connection "
+            f"to the dashboard port succeeds, so without it there is nothing to "
+            f"witness. Everything else — recording, analysis, tools, the whole "
+            f"CLI — works on the default install.[/dim]"
+        )
+        ctx.exit(1)           # DEC-41: not started != success
+
+    # First-run guard: NO provider usable → run setup now (interactive TTY) or
+    # point at it (headless). Booting with nothing configured only yields a dead
+    # dashboard that fails every task — exactly the pip-install pitfall this
+    # closes, and the refusal stays.
+    #
+    # F19 — WHAT CHANGED IS *WHICH* MACHINES COUNT AS "NOTHING". `key_present`
+    # now consumes `provider_status` (see its docstring for why the NAME stays),
+    # so a machine with only a Google/Anthropic/OpenAI key, or with Ollama
+    # actually answering, BOOTS. It used to be turned away and told to go and
+    # get an OpenRouter key. A machine with nothing is still refused, and is now
+    # told about all five ways to fix it instead of one.
     import sys as _sys
 
     from sharing_on.setup_flow import key_present, run_setup
     if not key_present():
         if _sys.stdin.isatty():
-            console.print("[yellow]No API key configured yet — let's set it "
-                          "up before starting.[/yellow]")
+            console.print("[yellow]No LLM provider is usable yet — let's set "
+                          "one up before starting.[/yellow]")
             run_setup(interactive=True, print_fn=lambda s: console.print(s))
             if not key_present():
-                console.print("[yellow]Still no key — start aborted. Run "
-                              "[bold]sharing_on setup[/bold] when ready.[/yellow]")
-                return
+                console.print("[yellow]Still no usable provider — start "
+                              "aborted. Run [bold]systemu setup[/bold] when "
+                              "ready.[/yellow]")
+                ctx.exit(1)   # DEC-41: aborted != success
             # Reload config so the freshly-written key/preset take effect.
             config, vault = _get_vault_and_config(ctx)
         else:
-            console.print("[red]No OPENROUTER_API_KEY configured. Run "
-                          "[bold]sharing_on setup[/bold] (or set it in .env) "
-                          "before starting the daemon.[/red]")
-            return
+            console.print(f"[red]{_no_provider_message(config)}[/red]")
+            ctx.exit(1)       # DEC-41: aborted != success
 
     console.print(f"\n[cyan]⚡ Starting Systemu daemon on port {port} ...[/cyan]")
-    start_daemon(
+    verdict = start_daemon(
         vault_dir=config.vault_dir,
         config=config,
         vault=vault,
         port=port,
         foreground=foreground,
+        wait_timeout_s=wait_s,
     )
-    if not foreground:
-        console.print("[green]✓ Daemon started in background.[/green]")
-        console.print("  Use [bold]sharing_on daemon status[/bold] to check.")
+    if foreground:
+        return
+
+    # DEC-41 / DEC-43: the claim below is gated on the MINTED witness, never on
+    # the fact that Popen returned. `daemon status` consumes the same mint, so
+    # the two surfaces cannot contradict each other.
+    if verdict is not None and verdict.ready:
+        console.print("[green]✓ Daemon ready.[/green]")
+        console.print(f"  Accepting connections on {verdict.url}")
+        _print_daemon_build(verdict.build_match, verdict.build_note)
+        console.print("  Use [bold]systemu daemon status[/bold] to check.")
+        return
+
+    console.print("[red]✗ Daemon did not become ready.[/red]")
+    reason = verdict.reason if verdict is not None else "no readiness verdict was produced"
+    console.print(f"  {reason}")
+    console.print(f"  Log: {Path(config.vault_dir) / 'daemon.log'}")
+    console.print("  Stop the stuck process with: [bold]systemu daemon stop[/bold]")
+    ctx.exit(1)
 
 
 @daemon_group.command("stop")
@@ -1352,22 +1536,46 @@ def daemon_stop(ctx, stop_all: bool):
 
 
 @daemon_group.command("status")
+@click.option("--port", default=None, type=int,
+              help="Port to witness. Defaults to the port the running daemon recorded.")
 @click.pass_context
-def daemon_status(ctx):
-    """Show the Systemu daemon status."""
+def daemon_status(ctx, port):
+    """Show the Systemu daemon status.
+
+    DEC-43: the verdict is the SAME mint `daemon start` waits on — a real
+    connection to the dashboard port. A live PID is not a listening socket, so
+    a daemon that is still migrating is reported as STARTING, not as running.
+    """
     config, _ = _get_vault_and_config(ctx)
     from systemu.scheduler.daemon import get_status
 
-    status = get_status(config.vault_dir)
-    if status["running"]:
+    status = get_status(config.vault_dir, port=port)
+    # F13: WHICH build is part of the report whether or not there is a problem —
+    # "Ready" alone is exactly the surface that let a stale daemon pass for
+    # twenty minutes. A skew recolours the panel but never changes the exit code.
+    _bmatch = status["build_match"]
+    _bnote = status["build_note"]
+    if status["ready"]:
         console.print(Panel(
-            f"[green]● Running[/green]  (PID {status['pid']})",
-            title="⚡ Systemu Daemon", border_style="green"
+            f"[green]● Ready[/green]  (PID {status['pid']})\n"
+            f"{status['url']}",
+            title="⚡ Systemu Daemon",
+            border_style=("red" if _bmatch is False else "green"),
         ))
+        _print_daemon_build(_bmatch, _bnote)
+    elif status["process_alive"]:
+        console.print(Panel(
+            f"[yellow]◐ Starting[/yellow]  (PID {status['pid']})\n"
+            f"{status['reason']}\n"
+            "Nothing can reach the dashboard yet.",
+            title="⚡ Systemu Daemon", border_style="yellow"
+        ))
+        _print_daemon_build(_bmatch, _bnote)
     else:
         console.print(Panel(
             "[dim]○ Not running[/dim]\n"
-            "Start with: [bold]sharing_on daemon start[/bold]",
+            f"{status['reason']}\n"
+            "Start with: [bold]systemu daemon start[/bold]",
             title="⚡ Systemu Daemon", border_style="dim"
         ))
 
@@ -1381,8 +1589,31 @@ def daemon_status(ctx):
 #  renders the ONE deterministic platform capability profile. Exits NONZERO
 #  when a real (blocking) problem is present.
 
+def _doctor_daemon_build_text(build: dict) -> str:
+    """F13 — the "Daemon build" cell. UNVERIFIED is its own answer, never blank
+    and never mistakable for agreement."""
+    if type(build) is not dict:
+        return "unknown"
+    if not build.get("observed") and build.get("match") is None:
+        return "— (no daemon observed)"
+    if build.get("match") is False:
+        return (f"MISMATCH — daemon {build.get('daemon_version')} from "
+                f"{build.get('daemon_path')}")
+    if build.get("match") is True:
+        return f"{build.get('daemon_version')} (same build as this CLI)"
+    return "UNVERIFIED — the daemon did not record which build it loaded"
+
+
 def _render_doctor_report(report: dict) -> None:
     """Paint the self-diagnosis report (never prints a secret VALUE)."""
+    # F28: hoisted to the TOP of the function. It used to be imported inside the
+    # `if og:` block near the end, which covered the Optional-groups table only —
+    # so the Diagnosis table 80 lines above, the first thing an operator reads,
+    # printed `pip install "systemu"` with the extra eaten by Rich markup while
+    # the table below it printed the same remedy correctly. Every cell carrying
+    # operator text in this function needs it.
+    from rich.markup import escape as _esc
+
     prof = report["profile"]
 
     # -- headline status --------------------------------------------------
@@ -1402,7 +1633,12 @@ def _render_doctor_report(report: dict) -> None:
         tbl.add_column("Fix")
         for p in report["problems"]:
             mark = "[red]✗[/red]" if p["blocking"] else "[yellow]▲[/yellow]"
-            tbl.add_row(mark, p["message"], p.get("cta", ""))
+            # F28: ESCAPE. Square brackets are Rich markup, so an unescaped
+            # remedy lost its extra: this table printed `pip install "systemu"`
+            # while the Optional-groups table below (which does escape) printed
+            # `pip install "systemu[browser]"`. The headline fix an operator
+            # reads first was a command that installs nothing.
+            tbl.add_row(mark, _esc(p["message"]), _esc(p.get("cta", "")))
         console.print(tbl)
 
     # -- live status ------------------------------------------------------
@@ -1418,13 +1654,43 @@ def _render_doctor_report(report: dict) -> None:
     status.add_column("Check")
     status.add_column("Value")
     status.add_row("LLM provider", prov_txt)
+    status.add_row("Providers usable",
+                   ", ".join(p["display"] for p in report.get("providers", ())
+                             if p.get("satisfied")) or "none")
     status.add_row("Keyring backend", kr_txt)
     status.add_row("Daemon", dae_txt)
-    status.add_row("systemu version", report["versions"].get("systemu", "?"))
+    # F13 / GATE-7a: a bare "systemu version" row sitting next to "Daemon:
+    # running" reads as the DAEMON's version — and for twenty minutes of a real
+    # session it was not. Both builds are named, and each says whose it is.
+    status.add_row("systemu version (this CLI)",
+                   report["versions"].get("systemu", "?"))
+    _build = report["daemon"].get("build") or {}
+    status.add_row("systemu path (this CLI)", _build.get("cli_path") or "?")
+    status.add_row("Daemon build", _doctor_daemon_build_text(_build))
     status.add_row("python version", report["versions"].get("python", "?"))
     if report.get("last_error"):
         status.add_row("Last error", str(report["last_error"]))
     console.print(status)
+
+    # -- F19: every provider, from the same mint the dashboard reads -------
+    # `doctor` used to report a single "LLM provider: not configured" row
+    # derived from OPENROUTER_API_KEY, on a machine where the dashboard was
+    # simultaneously reporting a reachable Ollama. Same fact, two surfaces, two
+    # answers. Presentation is keyed by STATE, never by provider.
+    provs = report.get("providers") or ()
+    if provs:
+        pt = Table(show_header=True, header_style="bold",
+                   title="Providers (credentials are never printed)")
+        pt.add_column("Provider")
+        pt.add_column("Status")
+        pt.add_column("Detail")
+        for p in provs:
+            mark, word = _PROVIDER_MARK.get(p["state"], ("[dim]?[/dim]", "Unknown"))
+            # F28: the provider detail carries remedies too ("add GOOGLE_API_KEY
+            # to .env", "run `systemu setup ...`") and a future one could carry an
+            # extra. `mark` is OUR OWN markup and stays unescaped deliberately.
+            pt.add_row(_esc(p["display"]), f"{mark} {word}", _esc(p["detail"]))
+        console.print(pt)
 
     # -- the platform capability profile (the ONE cross-OS map) -----------
     cap = Table(show_header=True, header_style="bold", title="Platform capability profile")
@@ -1437,6 +1703,29 @@ def _render_doctor_report(report: dict) -> None:
     cap.add_row("Forged-network jail", prof["forged_net_jail"])
     cap.add_row("Provider configured", "yes" if prof["provider_configured"] else "no")
     console.print(cap)
+
+    # -- F21 optional capability groups -----------------------------------
+    # Rendered UNCONDITIONALLY, installed or not. A table that only appears
+    # when something is missing teaches operators nothing about what exists,
+    # and a "missing" row is only legible next to the rows that are present.
+    og = report.get("optional_groups") or ()
+    if og:
+        # `_esc` is hoisted to the top of this function (F28) — the remedy
+        # contains `systemu[dashboard]` and Rich would parse `[dashboard]` as a
+        # style tag and drop it, printing a `pip install systemu` that installs
+        # nothing. Same trap as `tools list`.
+        ot = Table(show_header=True, header_style="bold",
+                   title="Optional capability groups")
+        ot.add_column("Capability")
+        ot.add_column("State")
+        ot.add_column("Covers")
+        ot.add_column("Install")
+        for g in og:
+            state = ("[green]installed[/green]" if g["installed"]
+                     else "[red]UNAVAILABLE[/red]")
+            ot.add_row(_esc(g["label"]), state, _esc(g["covers"]),
+                       _esc(g["remedy"]) or "—")
+        console.print(ot)
 
     # -- DEP-10 host-capability honesty rows ------------------------------
     hc = Table(show_header=True, header_style="bold",
@@ -1988,34 +2277,100 @@ def user_group():
     and the freeform fact log systemu uses to personalize tasks."""
 
 
-@user_group.command("init")
-@click.pass_context
-def user_init(ctx):
-    """First-run wizard: capture name, location, timezone, output dir."""
+def _profile_defaults() -> dict:
+    """The values the wizard offers — also what headless mode falls back to.
+
+    ONE source for both paths (F3): a headless install must not silently get a
+    different profile shape from a TTY install.
+    """
     import getpass
-    from systemu.core.models import UserProfile
-    _cfg, vault = _get_vault_and_config(ctx)
-    existing = vault.get_user_profile()
-    if existing is not None:
-        click.echo("A user profile already exists. Use `sharing_on user show` to view "
-                   "or `sharing_on user set <field> <value>` to update.")
-        return
-    default_name = getpass.getuser()
-    name = click.prompt("Your name", default=default_name)
-    location = click.prompt("Where are you? (e.g. 'Bangalore, India')")
+    try:
+        default_name = getpass.getuser()
+    except Exception:
+        default_name = "operator"
     try:
         from time import tzname
         default_tz = tzname[0] or "UTC"
     except Exception:
         default_tz = "UTC"
-    tz = click.prompt("Your timezone (IANA, e.g. 'Asia/Kolkata')", default=default_tz)
-    default_out = str(Path.home() / "systemu-output")
-    out = click.prompt("Default output directory", default=default_out)
-    prof = UserProfile(name=name, location_text=location, timezone=tz,
-                       default_output_dir=out)
+    return {
+        "name": default_name,
+        "location_text": "",
+        "timezone": default_tz,
+        "default_output_dir": str(Path.home() / "systemu-output"),
+    }
+
+
+_HEADLESS_INIT_HINT = (
+    "`user init` needs a terminal to ask its four questions, and this process "
+    "has no usable stdin (Docker / CI / a service).\n"
+    "Run it non-interactively instead — no TTY required:\n"
+    "  systemu user init --non-interactive "
+    "[--name NAME] [--location TEXT] [--timezone IANA] [--output-dir PATH]\n"
+    "Anything you omit takes the same default the wizard would have offered. "
+    "`systemu user set <field> <value>` also creates the profile."
+)
+
+
+@user_group.command("init")
+@click.option("--name", default=None, help="Your name (skips that question).")
+@click.option("--location", default=None,
+              help="Where you are, e.g. 'Bangalore, India' (skips that question).")
+@click.option("--timezone", "timezone_", default=None,
+              help="IANA timezone, e.g. 'Asia/Kolkata' (skips that question).")
+@click.option("--output-dir", default=None,
+              help="Default output directory (skips that question).")
+@click.option("--non-interactive", "-y", is_flag=True, default=False,
+              help="Never prompt: take the defaults for anything not passed. "
+                   "The headless (Docker/CI/no-TTY) path.")
+@click.pass_context
+def user_init(ctx, name, location, timezone_, output_dir, non_interactive):
+    """First-run wizard: capture name, location, timezone, output dir.
+
+    With a terminal this is the same four-question wizard it has always been.
+    With ``--non-interactive`` (or any of the value flags, or
+    SYSTEMU_NON_INTERACTIVE=true / SYSTEMU_HEADLESS=1) it never prompts, so a
+    headless box can complete setup from argv alone.
+    """
+    from systemu.core.models import UserProfile
+    from systemu.interface.notifications import headless_declared
+    _cfg, vault = _get_vault_and_config(ctx)
+    existing = vault.get_user_profile()
+    if existing is not None:
+        click.echo("A user profile already exists. Use `systemu user show` to view "
+                   "or `systemu user set <field> <value>` to update.")
+        return
+
+    d = _profile_defaults()
+    given = {"name": name, "location_text": location,
+             "timezone": timezone_, "default_output_dir": output_dir}
+    # Non-interactive when the operator asked for it, supplied any value, or
+    # declared this run non-interactive via the documented env switches.
+    quiet = non_interactive or headless_declared() or any(
+        v is not None for v in given.values())
+
+    if quiet:
+        values = {k: (v if v is not None else d[k]) for k, v in given.items()}
+    else:
+        # Byte-identical wizard for a promptable operator. A closed/EOF stdin
+        # used to surface as a bare "Aborted!" with no way forward — F3.
+        try:
+            values = {
+                "name": click.prompt("Your name", default=d["name"]),
+                "location_text": click.prompt("Where are you? (e.g. 'Bangalore, India')"),
+                "timezone": click.prompt("Your timezone (IANA, e.g. 'Asia/Kolkata')",
+                                         default=d["timezone"]),
+                "default_output_dir": click.prompt("Default output directory",
+                                                   default=d["default_output_dir"]),
+            }
+        except (click.Abort, EOFError):
+            click.echo("")
+            raise click.ClickException(_HEADLESS_INIT_HINT)
+
+    prof = UserProfile(**values)
     vault.save_user_profile(prof)
     click.echo(f"✓ Profile saved to {Path(vault.root) / 'user_profile.json'}")
-    click.echo("\nNext: `sharing_on chat submit \"...\"` — systemu now knows you.")
+    click.echo("\nNext: `systemu chat submit \"...\"` — systemu now knows you.")
 
 
 @user_group.command("show")
@@ -2025,7 +2380,7 @@ def user_show(ctx):
     _cfg, vault = _get_vault_and_config(ctx)
     prof = vault.get_user_profile()
     if prof is None:
-        click.echo("No profile set. Run `sharing_on user init` to create one.")
+        click.echo("No profile set. Run `systemu user init` to create one.")
         return
     click.echo("─ User profile ───────────────────────────")
     click.echo(f"  name:              {prof.name}")
@@ -2037,7 +2392,7 @@ def user_show(ctx):
     for f in facts[-5:]:
         click.echo(f"  [{f.id}] ({f.source}) {f.fact}")
     if len(facts) > 5:
-        click.echo(f"  ... ({len(facts) - 5} more — `sharing_on user facts list` for all)")
+        click.echo(f"  ... ({len(facts) - 5} more — `systemu user facts list` for all)")
 
 
 @user_group.command("set")
@@ -2046,12 +2401,26 @@ def user_show(ctx):
 @click.argument("value")
 @click.pass_context
 def user_set(ctx, field: str, value: str):
-    """Update one typed field on the profile."""
+    """Update one typed field on the profile — creating it if there is none.
+
+    F3: this used to refuse with "No profile set. Run `sharing_on user init`
+    first", which on a box with no TTY was a dead end (init could only prompt).
+    That sentence is QUOTED, not an instruction — F23 left the old program name
+    in it deliberately, because rewriting a quotation makes it a misquotation.
+    A `set` on a missing profile now creates one from the wizard's own
+    defaults with this field applied.
+    """
+    from systemu.core.models import UserProfile
     _cfg, vault = _get_vault_and_config(ctx)
     prof = vault.get_user_profile()
     if prof is None:
-        click.echo("No profile set. Run `sharing_on user init` first.")
-        ctx.exit(1)
+        values = _profile_defaults()
+        values[field] = value
+        vault.save_user_profile(UserProfile(**values))
+        click.echo(f"✓ created a profile (defaults for the other fields — "
+                   f"`systemu user show` to review)")
+        click.echo(f"✓ {field} = {value}")
+        return
     updated = prof.model_copy(update={field: value})
     vault.save_user_profile(updated)
     click.echo(f"✓ {field} = {value}")
@@ -2123,6 +2492,80 @@ def user_wipe(ctx, confirm: bool):
     from systemu.runtime.user_profile import wipe
     wipe(vault)
     click.echo("✓ user profile and facts wiped")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F3: onboarding from argv — no TTY, no browser
+#
+# The dashboard is gated on `first_run.setup_status`. Every one of those gates
+# used to be reachable only through a terminal prompt or a click in the web UI,
+# which deadlocked Docker / CI / any headless server: you could not set a
+# profile without `user init`, could not run `user init` without a TTY, could
+# not finish the tour without the dashboard, and could not reach the dashboard
+# without finishing onboarding. This group is the argv-only way out, and
+# `status` prints the declared remedy for every gate that is still unmet.
+#
+# Output is deliberately ASCII: this is verdict-carrying text an operator reads
+# over ssh / in a container log, where the console is often cp1252.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@click.group("onboarding")
+def onboarding_group():
+    """Complete and inspect first-run setup without a terminal or a browser."""
+
+
+@onboarding_group.command("status")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Machine-readable output for scripts and container probes.")
+@click.pass_context
+def onboarding_status(ctx, as_json: bool):
+    """Print every setup gate. Exits non-zero until the install is ready."""
+    import json as _json
+    from systemu.runtime.first_run import setup_status
+    cfg, vault = _get_vault_and_config(ctx)
+    checks = setup_status(cfg, vault)
+    ready = all(c["ok"] for c in checks if c["required"])
+
+    if as_json:
+        click.echo(_json.dumps({"ready": ready, "checks": checks}, indent=2,
+                               default=str))
+    else:
+        click.echo("- systemu onboarding ----------------------------------")
+        for c in checks:
+            mark = "[ok]" if c["ok"] else ("[--]" if c["required"] else "[..]")
+            req = "" if c["required"] else "  (optional)"
+            click.echo(f"  {mark} {c['label']}{req}")
+            if c["detail"]:
+                click.echo(f"         {c['detail']}")
+            if not c["ok"]:
+                hint = (c.get("headless") or {}).get("hint")
+                if hint:
+                    click.echo(f"         headless fix: {hint}")
+        click.echo("")
+        click.echo("READY" if ready else
+                   "NOT READY - the [--] gates above still block the dashboard.")
+    ctx.exit(0 if ready else 1)
+
+
+@onboarding_group.command("complete-tour")
+@click.pass_context
+def onboarding_complete_tour(ctx):
+    """Satisfy the guided-tour gate without a browser (idempotent).
+
+    The tour is a browser affordance; a headless install has no browser to run
+    it in, so recording that it does not apply is the honest resolution. The
+    recorded fact says exactly that rather than claiming it was watched.
+    """
+    from systemu.interface.tour import mark_tour_completed
+    from systemu.runtime.first_run import tour_completed
+    _cfg, vault = _get_vault_and_config(ctx)
+    if tour_completed(vault):
+        click.echo("Guided tour already recorded as finished - nothing to do.")
+        return
+    mark_tour_completed(
+        vault,
+        note="guided tour waived from the CLI (headless install - no browser)")
+    click.echo("OK: guided tour gate satisfied (waived, headless).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2360,6 +2803,11 @@ def run_find_tools(vault, query: str, limit: int = 15) -> int:
     for r in rows:
         slot = ", ".join(r.get("slots") or []) or "-"
         click.echo(f"  {str(r.get('name', '')):<28} [{slot}]  ({r.get('origin', '')})")
+        # F21: a tool whose optional dependency is absent is LISTED (never
+        # subtract) but never listed as if it would run. The remedy is printed
+        # on the row, not left for the operator to find in `doctor`.
+        if not r.get("available", True):
+            click.echo(f"      {r.get('unavailable_reason', '')}")
     return 0
 
 

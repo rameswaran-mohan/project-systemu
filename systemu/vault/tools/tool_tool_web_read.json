@@ -32,9 +32,7 @@
     }
   },
   "implementation_notes": "T0: httpx fetch + pure-Python readability via systemu.runtime.web.fetch_core. If the page looks like a JS/SPA shell, escalate to systemu.runtime.web.browser_pool.BrowserPool.render_html. Returns missing_packages=['playwright-chromium'] while chromium is still installing.",
-  "dependencies": [
-    "playwright"
-  ],
+  "dependencies": [],
   "implementation_path": "vault/tools/implementations/web_read.py",
   "tool_md_path": "systemu\\vault\\tools\\tool_tool_web_read\\TOOL.md",
   "status": "deployed",

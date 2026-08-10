@@ -89,7 +89,7 @@ _EFFECT_TAGS_SEED_FILENAME = ".effect_tags_seed"
 # re-derives every body under the current rules and then re-converges the
 # headers. Bump it whenever the derivation changes in a way that makes an
 # ALREADY-WRITTEN stamp wrong — a stamp that is merely absent is repaired by the
-# `unclassified_bodies` self-heal in `run` instead, which needs no bump at all.
+# `bodies_missing_tag_key` self-heal in `run` instead, which needs no bump at all.
 #
 # g2: the UNKNOWN floor in `backfill_effect_tags`. Bodies stamped by g1 under
 #     `declared if declared else scanned` (and by the intermediate union-only
@@ -224,7 +224,7 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None,
       * after its seed loop, which OVERWRITES tool bodies with the package's
         (which carry no ``effect_tags``) — the wipe would otherwise persist until
         the next version bump;
-      * when ``converge_index_effect_tags`` reports ``unclassified_bodies`` — a
+      * when ``converge_index_effect_tags`` reports ``bodies_missing_tag_key`` — a
         body that lost the key on some EARLIER boot, under a build that had
         neither repair. That is the state a vault damaged by the pre-fix migrator
         is left in, and no version-gated pass can reach it.
@@ -270,11 +270,15 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None,
             log.error("[EffectTagBackfill] cannot read tool index: %s", exc)
             return {"skipped": True, "reason": f"index unreadable: {exc}"}
 
-        from systemu.runtime.effect_tags import classify_source, EffectTag
+        from systemu.runtime.effect_tags import (classify_source, EffectTag,
+                                                 normalize_tagset)
         from systemu.runtime import effect_signals
 
         impl_dir = vault_dir / "tools" / "implementations"
-        stamped = 0
+        bodies_written = 0
+        classified = 0
+        unclassified = 0
+        unclassified_names: list = []
         skipped_impl_path = 0
         errors: list = []
         for entry in entries:
@@ -428,7 +432,13 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None,
                     # deleting either does not.
                     if effect_signals.any_money_move_signal(source):
                         tagset.add(EffectTag.MONEY_MOVE.value)
-                    tags = sorted(tagset)
+                    # F14 — NO_EFFECT is EXCLUSIVE. `classify_source` only ever emits
+                    # it alone, but the union above can pair it with a declaration, and
+                    # `['no_effect','net_mutate']` is a record that says two opposite
+                    # things. `normalize_tagset` drops the verified-none witness
+                    # whenever any real class is present — never the reverse, so the
+                    # escalate-only direction survives.
+                    tags = normalize_tagset(tagset)
                 else:
                     tags = []
             except Exception as exc:  # noqa: BLE001
@@ -438,7 +448,19 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None,
             body["effect_tags"] = tags
             try:
                 _write_text_atomic(body_path, json.dumps(body, indent=2) + "\n")
-                stamped += 1
+                bodies_written += 1
+                # THE COUNTER THAT MATTERS. `stamped` (this counter's old name)
+                # counted bodies WRITTEN — including every one written with `[]` —
+                # and an operator read "stamped=41" as "41 tools are classified"
+                # while 24 of them had ended with an EMPTY tag set. A tool is
+                # CLASSIFIED iff its effects were actually determined: real classes,
+                # or the `no_effect` witness. Empty is UNCLASSIFIED and is counted
+                # as such, by that name.
+                if tags:
+                    classified += 1
+                else:
+                    unclassified += 1
+                    unclassified_names.append(str(name or tid))
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"write {tid}: {exc}")
 
@@ -447,10 +469,29 @@ def backfill_effect_tags(vault_dir, *, version: str | None = None, logger_=None,
         except Exception as exc:  # noqa: BLE001
             errors.append(f"marker: {exc}")
 
+        # THE OPERATOR-FACING LINE. It leads with `classified`, and `bodies_written`
+        # says what it counts, because the previous line — `stamped=41 ... errors=0`
+        # — was read as a clean bill of health on a pass that had left 24 of those
+        # 41 tools with an empty tag set. A counter on a safety surface must mean
+        # what a reader will take it to mean (DEC-27: completeness WITNESSED, never
+        # inferred).
         log.info(
-            "[EffectTagBackfill] marker=%s stamped=%d skipped_impl_path=%d errors=%d",
-            marker_value, stamped, skipped_impl_path, len(errors))
-        return {"fast_path": False, "effect_tags_seed": marker_value, "stamped": stamped,
+            "[EffectTagBackfill] marker=%s classified=%d unclassified=%d "
+            "bodies_written=%d skipped_impl_path=%d errors=%d",
+            marker_value, classified, unclassified, bodies_written,
+            skipped_impl_path, len(errors))
+        if unclassified:
+            # NAME them. An unclassified tool still EXECUTES; the operator cannot act
+            # on a bare count. Bounded so a large vault cannot flood the log.
+            shown = sorted(unclassified_names)[:20]
+            log.warning(
+                "[EffectTagBackfill] %d tool(s) could NOT be classified and are "
+                "UNKNOWN at every gate: %s%s", unclassified, ", ".join(shown),
+                "" if unclassified <= len(shown) else f" (+{unclassified - len(shown)} more)")
+        return {"fast_path": False, "effect_tags_seed": marker_value,
+                "bodies_written": bodies_written, "classified": classified,
+                "unclassified": unclassified,
+                "unclassified_names": sorted(unclassified_names),
                 "skipped_impl_path": skipped_impl_path, "errors": errors}
     except Exception as exc:  # noqa: BLE001 — never break boot
         log.error("[EffectTagBackfill] unexpected failure (non-fatal): %s", exc)
@@ -511,7 +552,7 @@ def converge_index_effect_tags(vault_dir, *, logger_=None) -> Dict[str, Any]:
     A body that cannot be READ is different — that is missing evidence, not
     evidence of absence — so it is skipped and counted rather than cleared.
 
-    ``unclassified_bodies`` — WHY A PURE MIRROR CANNOT REPAIR A DAMAGED VAULT.
+    ``bodies_missing_tag_key`` — WHY A PURE MIRROR CANNOT REPAIR A DAMAGED VAULT.
     Mirroring an absent body field is fail-closed but it is NOT a repair: the
     header ends up as unclassified as the body, and the tool stays UNKNOWN at
     every gate forever. That is precisely the state the pre-fix migrator left
@@ -529,7 +570,10 @@ def converge_index_effect_tags(vault_dir, *, logger_=None) -> Dict[str, Any]:
     returning before the post-loop ``force=True`` re-derive.
 
     So this pass COUNTS the bodies it cannot classify and returns the count.
-    ``run`` reads it and orders one forced re-derive. The counting is deliberately
+    ``run`` reads it and orders one forced re-derive. The SIBLING counter
+    ``bodies_with_empty_tags`` is the honest UNCLASSIFIED total (key present and
+    empty counts too) and is REPORTED, never acted on — see ``run``. The counting
+    is deliberately
     kept here (this pass already reads every body, so it costs nothing) while the
     DECISION lives in ``run`` — this function still never derives and never
     writes a tag it did not read from a body. It converges in a single extra pass
@@ -560,7 +604,13 @@ def converge_index_effect_tags(vault_dir, *, logger_=None) -> Dict[str, Any]:
         converged = 0
         cleared = 0
         skipped_unreadable = 0
-        unclassified_bodies = 0
+        # F14 — TWO counters, because the old single `unclassified_bodies` answered a
+        # narrower question than its name. It counted bodies MISSING THE KEY, and on
+        # a real boot every body HAD the key, holding `[]`. So it logged
+        # `unclassified_bodies=0` on a vault where 24 of 41 tools were unclassified —
+        # true, and read by an operator as the exact opposite of the truth.
+        bodies_missing_tag_key = 0   # the repair TRIGGER: `run` forces a re-derive
+        bodies_with_empty_tags = 0   # the HONEST count of unclassified tools
 
         for entry in entries:
             if not isinstance(entry, dict):
@@ -587,14 +637,21 @@ def converge_index_effect_tags(vault_dir, *, logger_=None) -> Dict[str, Any]:
                     skipped_unreadable += 1
                     continue
                 tags = list(tags)
+                if not tags:
+                    # The key is PRESENT and EMPTY. That is an unclassified tool —
+                    # the state the old counter could not see — so it is counted
+                    # here even though there is nothing to mirror or repair.
+                    bodies_with_empty_tags += 1
                 if entry.get(_EFFECT_TAGS_FIELD) != tags:
                     entry[_EFFECT_TAGS_FIELD] = tags
                     converged += 1
             else:
-                # THE BODY IS UNCLASSIFIED, and this pass cannot fix that — it
-                # MIRRORS, it never derives. Report it so `run` can order a forced
-                # re-derive; see `unclassified_bodies` in the docstring.
-                unclassified_bodies += 1
+                # THE BODY IS UNCLASSIFIED **and has no key at all**, and this pass
+                # cannot fix that — it MIRRORS, it never derives. Report it so `run`
+                # can order a forced re-derive; see the docstring. A missing key is
+                # also an unclassified tool, so it counts toward BOTH.
+                bodies_missing_tag_key += 1
+                bodies_with_empty_tags += 1
                 if _EFFECT_TAGS_FIELD in entry:
                     # Body says "unclassified"; the header must not say otherwise.
                     del entry[_EFFECT_TAGS_FIELD]
@@ -607,14 +664,16 @@ def converge_index_effect_tags(vault_dir, *, logger_=None) -> Dict[str, Any]:
                 errors.append(f"index_write: {exc}")
                 converged = cleared = 0
 
-        if converged or cleared or unclassified_bodies or errors:
+        if converged or cleared or bodies_with_empty_tags or errors:
             log.info(
                 "[EffectTagIndexConverge] converged=%d cleared=%d "
-                "unclassified_bodies=%d skipped_unreadable=%d errors=%d",
-                converged, cleared, unclassified_bodies, skipped_unreadable,
-                len(errors))
+                "bodies_with_empty_tags=%d bodies_missing_tag_key=%d "
+                "skipped_unreadable=%d errors=%d",
+                converged, cleared, bodies_with_empty_tags,
+                bodies_missing_tag_key, skipped_unreadable, len(errors))
         return {"converged": converged, "cleared": cleared,
-                "unclassified_bodies": unclassified_bodies,
+                "bodies_missing_tag_key": bodies_missing_tag_key,
+                "bodies_with_empty_tags": bodies_with_empty_tags,
                 "skipped_unreadable": skipped_unreadable, "errors": errors}
     except Exception as exc:  # noqa: BLE001 — never break boot
         log.error("[EffectTagIndexConverge] unexpected failure (non-fatal): %s", exc)
@@ -1059,13 +1118,477 @@ def _preserve_before_overwrite(target: Path, backup_root: Path, relname: str) ->
     shutil.copy2(target, dest)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  F26 — MANIFEST CONVERGENCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MANIFEST_BASELINE_FILENAME = ".package_manifest_baseline.json"
+_MANIFEST_BOOTSTRAP_DIRNAME = "manifest-bootstrap"
+
+# THE FIELDS THE PACKAGE OWNS. Exactly the DESCRIPTIVE SPEC an author writes in the
+# shipped catalog — nothing that describes what this vault has DONE with the tool.
+#
+# Derived from the packaged bodies rather than from the `Tool` model: all 41 carry
+# the same 16 keys, and the other ten are identity (`id`, `name`), paths
+# (`implementation_path`, `tool_md_path`), lifecycle (`status`, `enabled`,
+# `version`) or provenance (`forged_by_systemu`, `created_at`, `updated_at`).
+#
+# WHAT IS DELIBERATELY NOT HERE, and why each one is somebody else's:
+#   enabled            Gate 3's input. `tool_registry.execute` refuses a disabled
+#                      tool; re-arming one is a revoked control, not a migration.
+#                      `_operator_disabled` already exists to protect it.
+#   status /
+#   dry_run_status /
+#   dry_run_evidence   Gate 3.5's verdict and the evidence behind it. Facts about
+#                      THIS vault's run of the tool.
+#   version /
+#   evolution_history /
+#   last_successful_params /
+#   forge_reattempts /
+#   forge_rejected     Per-vault evolution state.
+#   trusted_inprocess  W2.2 operator opt-in.
+#   effect_tags        Owned by `backfill_effect_tags`, which DERIVES it from the
+#                      tool's source. One writer. The packaged bodies do not even
+#                      carry the key, so "refreshing" it would mean clearing it.
+#   forged_by_systemu  Owned by `normalize_seed_forged_flags`. One writer.
+#   implementation_path / tool_md_path
+#                      Paths. `implementation_path` selects WHAT EXECUTES, and the
+#                      packaged value is a literal string from the build machine —
+#                      re-stamping it is a redirect, not a description.
+#   created_at / updated_at / id / name
+#                      Identity and provenance of the vault's own record; `name` is
+#                      this pass's match key.
+_PACKAGE_MANIFEST_FIELDS = (
+    "description",
+    "tool_type",
+    "parameters_schema",
+    "return_schema",
+    "implementation_notes",
+    "dependencies",
+)
+
+# WHY THE HEADER IS MIRRORED AT ALL. `vault._tool_header` derives every one of
+# these from the body, and `Vault.list_tools()` returns the HEADER list — so
+# `systemu tools list`, `capability_index.derive_index` and
+# `table_reconciler._project_tools` all read the header and NONE of them read the
+# body. A pass that fixed only bodies would be invisible to the exact surface that
+# reported F26. See `_header_mirror`.
+
+
+def _load_manifest_baseline(vault_dir: Path) -> Dict[str, Any]:
+    """Per tool name, a FINGERPRINT of what the package last wrote per field.
+
+    Never raises → ``{}`` on anything, which degrades to the bootstrap path (which
+    preserves before it writes), not to a wrong decision."""
+    try:
+        p = vault_dir / _MANIFEST_BASELINE_FILENAME
+        if not p.is_file():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 — a corrupt baseline is "no baseline"
+        return {}
+
+
+def _field_digest(value: Any) -> str:
+    """A stable fingerprint of one manifest field value, or ``""`` on failure.
+
+    DIGESTS, NOT VALUES — for CORRECTNESS, not size. This file exists ONLY to
+    answer "has this field moved since the package wrote it?". Storing the values
+    would put a second full copy of the shipped manifest inside the vault: DEC-43's
+    one-fact-N-copies shape, and a file a later reader could mistake for an
+    authority and read a tool's real description or schema out of. A digest cannot
+    be mistaken for one. (Size is NOT the argument and is nearly a wash — measured
+    on the real 41-tool catalog: 35.5 KB of values against 23.1 KB of digests.)
+
+    ``sort_keys`` so a schema dict that round-trips through JSON in a different
+    key order does not read as an operator edit. Returns ``""`` when the value
+    cannot be canonicalised at all; the caller treats that as "no evidence" and
+    leaves the field alone, which is the non-destructive direction.
+    """
+    try:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _header_mirror(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The header fields this pass owns, derived FROM THE REFRESHED BODY exactly the
+    way ``vault._tool_header`` derives them.
+
+    DERIVED, NOT COPIED FROM THE PACKAGED INDEX — three reasons, all measured:
+
+      1. ``_tool_header`` is the canonical producer and it reads the Tool, i.e. the
+         BODY. Copying the packaged header would install a value the next
+         ``vault.save_tool`` immediately overwrites, and this pass would put it back
+         on the following boot: a write loop, not a convergence.
+      2. THE SHIPPED CATALOG DOES NOT AGREE WITH ITSELF. ``web_search``'s packaged
+         header carries a SHORTER description than its packaged body. F25 pins
+         agreement for ``dependencies`` across the three copies; nothing pins it for
+         prose. Deriving from the body picks the one authority and heals the drift
+         instead of propagating whichever copy was consulted.
+      3. ``tool_type`` needs the model's own coercion. Bodies ship the synonym
+         ``"web"``; ``Tool.tool_type`` coerces it to ``api_call`` and ``_tool_header``
+         emits the coerced value. Writing the raw synonym would flip-flop against
+         every real save.
+
+    Returns ``(write, expected_summaries)`` — header keys to SET, and the freshly
+    derived schema summaries, which the caller uses only to decide whether a stored
+    summary has gone stale and must be DELETED. See the long note below.
+    """
+    out: Dict[str, Any] = {}
+    if "description" in body:
+        out["description"] = body["description"]
+    if "dependencies" in body:
+        out["dependencies"] = list(body.get("dependencies") or [])
+    if "tool_type" in body:
+        try:
+            from systemu.core.models import coerce_tool_type
+            out["tool_type"] = coerce_tool_type(body["tool_type"]).value
+        except Exception:  # noqa: BLE001 — no coercion available ⇒ leave it alone
+            pass
+    try:
+        from systemu.core.schema_utils import schema_param_names
+        out["parameter_names"] = schema_param_names(body.get("parameters_schema") or {})
+    except Exception:  # noqa: BLE001
+        pass
+
+    # THE TWO SCHEMA SUMMARIES ARE INVALIDATED, NOT REWRITTEN — and the difference
+    # is a regression this pass caused and had to back out of.
+    #
+    # A corrected `parameters_schema` leaves the header's summary describing the OLD
+    # schema, and `jobs._backfill_tool_headers_v061` cannot see that: its trigger is
+    # `if all("parameters_schema_summary" in t for t in tools_index): return`, i.e.
+    # it only ever repairs an ABSENT summary. So this pass has to act.
+    #
+    # It first WROTE the freshly-derived value, which is where it went wrong.
+    # Filling that key in on every seed header made the sweep's guard true, and the
+    # sweep is ALSO the only repair for the other three header fields the seed loop
+    # drops (`dry_run_status`, `version`, `implementation_path`). MEASURED: with the
+    # summaries written, `test_dropped_header_fields_self_heal_on_next_boot` failed
+    # with those three permanently missing. A fix that disarms somebody else's
+    # repair is not a fix.
+    #
+    # Deleting instead leaves `vault._tool_header` the SINGLE writer of every
+    # derived header field — no second derivation to drift, no flip-flop between
+    # boots — and ARMS the sweep rather than disarming it. Absent is also the safe
+    # side: the sweep's own trigger treats absent as "repair me", whereas a stale
+    # summary is silently wrong. The window is the same one an updated seed has
+    # always had.
+    #
+    # Deleted only when the stored value actually disagrees with the body, so a
+    # converged vault writes nothing and this cannot loop.
+    try:
+        from systemu.vault.vault import _summarise_schema
+        expected: Dict[str, Any] = {
+            "parameters_schema_summary": _summarise_schema(
+                body.get("parameters_schema") or {}),
+            "return_schema_summary": _summarise_schema(body.get("return_schema") or {}),
+        }
+    except Exception:  # noqa: BLE001 — no canonical summariser ⇒ prove nothing
+        expected = {}
+    return out, expected
+
+
+def converge_package_manifest(vault_dir, *, logger_=None) -> Dict[str, Any]:
+    """F26 — bring an EXISTING vault's SEED tool records back onto the shipped
+    catalog for the fields the PACKAGE owns, and leave everything the operator
+    owns exactly where it is.
+
+    THE DEFECT. ``run``'s seed loop decides everything from one comparison:
+    ``sha256(vault impl) == sha256(pkg impl)``. Correcting a manifest field alone —
+    a dependency list, a description, a parameter schema — leaves the ``.py``
+    byte-identical, so the tool lands in ``skipped_identical`` and its record is
+    never opened. Measured on the real catalog: a vault whose
+    ``tool_tool_web_read.json`` declared ``dependencies: ["playwright"]`` (wrong,
+    corrected in-package by F25) came out of ``run()`` with ``skipped_identical=41``
+    and the stale list intact, so ``systemu tools list`` kept reporting the tool
+    UNAVAILABLE and refusing it. That made the shipped starter catalog effectively
+    IMMUTABLE after first seed — a whole class of silent staleness, not one field.
+
+    WHY THIS RUNS AHEAD OF ``run``'s FAST PATH, like its three siblings. This
+    project's live-tryout rule folds fixes into the CURRENT version without a bump,
+    so ``installed == vault_seed`` on every already-booted vault and anything behind
+    that return never executes where the bug lives.
+
+    ─── WHAT IT REFUSES TO TOUCH ───────────────────────────────────────────────
+    A vault is USER DATA, so convergence is gated three ways and every refusal is
+    counted rather than silent:
+
+      * NAME NOT IN THE PACKAGE — an operator-forged tool. Never considered; this
+        pass only ever iterates the PACKAGE index.
+      * AMBIGUOUS NAME — ``vault._update_index`` upserts on ``id``, so two entries
+        may share a ``name`` (``governor._materialise_forge`` builds a Tool straight
+        from the LLM-supplied name with a fresh id). Picking a winner IS the bug
+        ``normalize_seed_forged_flags`` already had; refuse the whole name.
+      * IMPLEMENTATION NOT THE PACKAGE'S — ``sha256`` mismatch on the file that
+        actually EXECUTES (resolved by ``_resolve_vault_impl``, so a body declaring
+        a redirected path is judged on the redirect). The record then describes the
+        OPERATOR's code and the package has no standing to rewrite it. This also
+        covers ``tool_recalibrator``, which always writes new code to the impl path
+        BEFORE it edits description / schemas — so a recalibrated tool is excluded
+        by construction.
+
+    ``enabled`` is untouched by definition: it is not in ``_PACKAGE_MANIFEST_FIELDS``.
+    A disabled tool's manifest IS still repaired, deliberately — a disable is a
+    statement about RUNNING the tool, not about its description, and refusing to
+    repair it would leave a stale island the operator could never clear.
+
+    NO APPROVAL MOVES. ``command_approvals.tool_signature`` binds a blessing to
+    ``(name, sha1(implementation bytes), effect tags, host_class)``. This pass
+    changes none of those four: the implementation is byte-identical to the
+    package's by precondition, the name is the match key, and ``effect_tags``
+    belongs to ``backfill_effect_tags``. So a refresh can neither invalidate a
+    standing approval nor carry one onto new code — there is no new code.
+
+    ─── THE PART A SHA GUARD CANNOT DO ─────────────────────────────────────────
+    The sha proves the CODE is the package's. It does NOT prove the MANIFEST is:
+    ``interface/components/entity_edit.apply_tool_edit`` writes ``description`` /
+    ``implementation_notes`` / ``dependencies`` from the workshop dialog and never
+    touches the ``.py``. That edit is structurally invisible to a byte comparison of
+    the implementation.
+
+    So this pass FINGERPRINTS what the PACKAGE wrote, per tool per field, in
+    ``.package_manifest_baseline.json`` (digests, not values — see
+    ``_field_digest``). From then on the question is decidable per FIELD:
+
+        digest(vault value) == baseline   → nobody has touched it since the
+                                            package wrote it ⇒ refresh
+        digest(vault value) != baseline   → the OPERATOR changed it ⇒ leave it,
+                                            for ever, across every future
+                                            correction (``skipped_operator_edited``)
+
+    THE ONE BOOT THAT IS GENUINELY UNDECIDABLE is the first one, on a vault that
+    predates the baseline — which is every vault F26 exists for. There is no third
+    version to diff against, so the choice is between converging (the whole point)
+    and never converging (the bug). It converges, and copies the pre-refresh body
+    to ``<vault>/.pre-migration/manifest-bootstrap/`` first, so that single
+    ambiguous decision is RECOVERABLE instead of silent. Outside
+    ``tools/implementations/`` for the reason ``_preserve_before_overwrite``
+    documents: a preserved copy must never be reachable as an implementation.
+
+    EVERY COUNTER IS A COUNT OF WRITES THAT HAPPENED. ``manifest_fields_refreshed``
+    is incremented per (tool, field) pair whose value actually differed and only
+    after the write succeeded — never per record considered. That is the F14/F26
+    lesson: ``stamped=41`` and ``updated=41`` were both counts of work ATTEMPTED
+    being read as work DONE.
+
+    File layout only, like its siblings — ``storage.sqlite.vault._tool_header``
+    recomputes headers from the live row. NEVER raises; this is the boot path.
+    """
+    log = logger_ or logger
+    vault_dir = Path(vault_dir)
+    errors: list = []
+    result: Dict[str, Any] = {
+        "manifest_tools_refreshed": 0, "manifest_fields_refreshed": 0,
+        "manifest_headers_refreshed": 0, "manifest_skipped_operator_edited": 0,
+        "manifest_skipped_modified": 0, "manifest_skipped_ambiguous": 0,
+        "manifest_skipped_impl_path": 0, "manifest_preserved": 0, "errors": errors,
+    }
+
+    try:
+        try:
+            pkg_vault = _package_vault_root()
+            pkg_idx = json.loads(
+                (pkg_vault / "tools" / "index.json").read_text(encoding="utf-8")) or []
+        except Exception as exc:  # noqa: BLE001
+            result["skipped"] = f"package index unreadable: {exc}"
+            return result
+
+        vault_idx_path = vault_dir / "tools" / "index.json"
+        if not vault_idx_path.is_file():
+            result["skipped"] = "no vault tool index"
+            return result
+        try:
+            vault_idx = json.loads(vault_idx_path.read_text(encoding="utf-8")) or []
+        except Exception as exc:  # noqa: BLE001
+            result["skipped"] = f"vault index unreadable: {exc}"
+            return result
+        if not isinstance(vault_idx, list):
+            result["skipped"] = "vault index not a list"
+            return result
+
+        # Identity by NAME (the migrator's rule), but a name is NOT a key — collect
+        # every match and refuse the ambiguous ones. Same posture as
+        # `normalize_seed_forged_flags`.
+        vault_by_name: Dict[str, list] = {}
+        for e in vault_idx:
+            if isinstance(e, dict) and e.get("name"):
+                vault_by_name.setdefault(e["name"], []).append(e)
+
+        pkg_impl_dir = pkg_vault / "tools" / "implementations"
+        vault_impl_dir = vault_dir / "tools" / "implementations"
+        baseline = _load_manifest_baseline(vault_dir)
+        new_baseline: Dict[str, Any] = dict(baseline)
+        bootstrap_root = (vault_dir / _PRE_MIGRATION_DIRNAME
+                          / _MANIFEST_BOOTSTRAP_DIRNAME)
+        index_dirty = False
+
+        for pkg_entry in pkg_idx:
+            if not isinstance(pkg_entry, dict):
+                continue
+            name = pkg_entry.get("name")
+            pkg_tid = pkg_entry.get("id")
+            if not name or not pkg_tid:
+                continue
+            matches = vault_by_name.get(name) or []
+            if not matches:
+                continue                       # not installed in this vault
+            if len(matches) > 1:
+                result["manifest_skipped_ambiguous"] += 1
+                continue
+            vault_entry = matches[0]
+
+            try:
+                pkg_body_path = pkg_vault / "tools" / f"tool_{pkg_tid}.json"
+                if not pkg_body_path.is_file():
+                    continue
+                pkg_body = json.loads(pkg_body_path.read_text(encoding="utf-8"))
+                if not isinstance(pkg_body, dict):
+                    continue
+
+                vault_tid = vault_entry.get("id") or pkg_tid
+                body_path = vault_dir / "tools" / f"tool_{vault_tid}.json"
+                if not body_path.is_file():
+                    continue                   # no record here to converge
+                body = json.loads(body_path.read_text(encoding="utf-8"))
+                if not isinstance(body, dict):
+                    continue
+
+                # PROVENANCE. Hash what RUNS — a body declaring a redirected
+                # `implementation_path` is judged on the redirect, and anything
+                # landing outside `vault/tools/implementations/` is refused.
+                vault_impl = _resolve_vault_impl(
+                    vault_dir, vault_impl_dir, name, body.get(_IMPL_PATH_FIELD))
+                if vault_impl is None:
+                    result["manifest_skipped_impl_path"] += 1
+                    continue
+                pkg_impl = pkg_impl_dir / f"{name}.py"
+                if not (pkg_impl.is_file() and vault_impl.is_file()):
+                    continue                   # cannot prove provenance ⇒ leave alone
+                if _file_sha256(vault_impl) != _file_sha256(pkg_impl):
+                    result["manifest_skipped_modified"] += 1
+                    continue
+
+                prior = baseline.get(name) if isinstance(
+                    baseline.get(name), dict) else None
+                pkg_values = {f: pkg_body[f] for f in _PACKAGE_MANIFEST_FIELDS
+                              if f in pkg_body}
+
+                pending: Dict[str, Any] = {}
+                for field, pkg_val in pkg_values.items():
+                    cur = body.get(field)
+                    if cur == pkg_val:
+                        continue               # already converged; nothing to write
+                    if prior is not None and field in prior:
+                        cur_digest = _field_digest(cur)
+                        if not cur_digest or prior[field] != cur_digest:
+                            # Either the operator moved this field away from what
+                            # the package last wrote — it is theirs now, for ever —
+                            # or the value cannot be fingerprinted at all, which is
+                            # missing evidence and resolves the same way: no write.
+                            result["manifest_skipped_operator_edited"] += 1
+                            continue
+                    pending[field] = pkg_val
+
+                # The baseline fingerprints what the PACKAGE ships, whether or not
+                # this boot had to write anything — a field the operator has already
+                # matched by hand is still package-authored as far as the next
+                # correction is concerned.
+                new_baseline[name] = {f: _field_digest(v)
+                                      for f, v in pkg_values.items()}
+
+                if pending:
+                    if prior is None:
+                        # UNDECIDABLE BOOT — keep the pre-refresh record. Raises on
+                        # failure, which lands in the per-tool handler below and
+                        # SKIPS the write (fail-safe, same posture as
+                        # `_preserve_before_overwrite`'s existing callers).
+                        _preserve_before_overwrite(
+                            body_path, bootstrap_root, f"tools/tool_{vault_tid}.json")
+                        result["manifest_preserved"] += 1
+                    body.update(pending)
+                    _write_text_atomic(body_path, json.dumps(body, indent=2) + "\n")
+                    result["manifest_fields_refreshed"] += len(pending)
+                    result["manifest_tools_refreshed"] += 1
+
+                # The header is DERIVED from the body and is what every live reader
+                # actually reads. Mirror it whether or not the body moved: a vault
+                # can hold a converged body behind a stale header.
+                mirror, expected_summaries = _header_mirror(body)
+                changed_header = False
+                for k, v in mirror.items():
+                    if vault_entry.get(k) != v:
+                        vault_entry[k] = v
+                        changed_header = True
+                for k, v in expected_summaries.items():
+                    # Present AND wrong ⇒ drop it, so `_tool_header` (via
+                    # `jobs._backfill_tool_headers_v061`) re-derives it as the one
+                    # writer of derived header fields. Absent already means
+                    # "repair me" to that sweep, so leave an absent key alone.
+                    if k in vault_entry and vault_entry.get(k) != v:
+                        del vault_entry[k]
+                        changed_header = True
+                if changed_header:
+                    result["manifest_headers_refreshed"] += 1
+                    index_dirty = True
+            except Exception as exc:  # noqa: BLE001 — never raise per tool
+                errors.append(f"manifest {name}: {exc}")
+
+        if index_dirty:
+            try:
+                _write_text_atomic(vault_idx_path,
+                                   json.dumps(vault_idx, indent=2) + "\n")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"index_write: {exc}")
+                # The count has to follow the DISK. A header write that failed
+                # changed nothing, so reporting it would be the F26 lie again.
+                result["manifest_headers_refreshed"] = 0
+
+        if new_baseline != baseline:
+            try:
+                _write_text_atomic(vault_dir / _MANIFEST_BASELINE_FILENAME,
+                                   json.dumps(new_baseline, indent=2, sort_keys=True)
+                                   + "\n")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"baseline_write: {exc}")
+
+        if (result["manifest_fields_refreshed"] or result["manifest_headers_refreshed"]
+                or result["manifest_skipped_ambiguous"]
+                or result["manifest_skipped_impl_path"] or errors):
+            log.info(
+                "[ManifestConverge] tools_refreshed=%d fields_refreshed=%d "
+                "headers_refreshed=%d operator_edited=%d impl_modified=%d "
+                "ambiguous=%d impl_path=%d preserved=%d errors=%d",
+                result["manifest_tools_refreshed"],
+                result["manifest_fields_refreshed"],
+                result["manifest_headers_refreshed"],
+                result["manifest_skipped_operator_edited"],
+                result["manifest_skipped_modified"],
+                result["manifest_skipped_ambiguous"],
+                result["manifest_skipped_impl_path"],
+                result["manifest_preserved"], len(errors))
+        if result["manifest_preserved"]:
+            log.warning(
+                "[ManifestConverge] %d seed tool record(s) were refreshed from the "
+                "packaged catalog before any baseline existed; the pre-refresh "
+                "records are kept at %s", result["manifest_preserved"], bootstrap_root)
+        return result
+    except Exception as exc:  # noqa: BLE001 — never break boot
+        log.error("[ManifestConverge] unexpected failure (non-fatal): %s", exc)
+        errors.append(str(exc))
+        return result
+
+
 def _maybe_log_profile_notice(vault_dir) -> None:
     """v0.9.0 (Layer 1): if vault has no user_profile.json, log a one-line
     nudge so operators discover the wizard."""
     try:
         if not (Path(vault_dir) / "user_profile.json").exists():
             logger.info("[VaultMigrator] no user profile set yet — run "
-                        "`sharing_on user init` to personalize systemu.")
+                        "`systemu user init` to personalize systemu.")
     except Exception:
         pass
 
@@ -1094,6 +1617,14 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     # fix ships without a version bump, so an existing vault's .seed_version
     # already equals `installed` and anything behind that return would never run.
     forged_norm = normalize_seed_forged_flags(vault_dir, logger_=log)
+
+    # F26 — bring seed RECORDS back onto the shipped catalog for the fields the
+    # PACKAGE owns. Ahead of the fast path for the same reason as its three
+    # siblings, and for a reason specific to this defect: the seed loop below keys
+    # every decision on the IMPLEMENTATION's bytes, so a manifest-only correction
+    # is invisible to it even on a version bump (it lands in `skipped_identical`).
+    # Gated on provenance + a recorded baseline; see the docstring.
+    manifest = converge_package_manifest(vault_dir, logger_=log)
 
     # Project body tags onto the index headers the readers actually read. Runs on
     # EVERY boot, ahead of the fast path below, for the reason its two siblings
@@ -1126,21 +1657,39 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     # DAMAGE rather than on a version. `force=True` because the marker is current
     # by construction on every vault this fires for. One pass suffices: the
     # backfill writes the key onto EVERY body it processes, including ones it
-    # classifies to `[]`, so `unclassified_bodies` is 0 on the next boot and this
+    # classifies to `[]`, so `bodies_missing_tag_key` is 0 on the next boot and this
     # cannot loop. A vault with nothing to repair pays one dict lookup.
-    if converged.get("unclassified_bodies"):
+    #
+    # F14 — this reads `bodies_missing_tag_key`, NOT the sibling
+    # `bodies_with_empty_tags`. The trigger must stay keyed on the ABSENT key: an
+    # empty-but-present list is a legitimate steady state for a tool the classifier
+    # genuinely cannot resolve, and re-deriving on it every boot would re-run the
+    # whole backfill forever on any vault holding one such tool. (The two counters
+    # used to be one, under the name `unclassified_bodies`, which is exactly why the
+    # log said 0 while 24 tools were unclassified.)
+    if converged.get("bodies_missing_tag_key"):
         log.info("[VaultMigrator] %d tool bodies carry no effect_tags — "
                  "re-deriving (a previous boot wiped them)",
-                 converged["unclassified_bodies"])
+                 converged["bodies_missing_tag_key"])
         backfill_effect_tags(vault_dir, version=installed, logger_=log, force=True)
         converge_index_effect_tags(vault_dir, logger_=log)
 
     vault_seed = _read_seed_version(vault_dir)
 
+    def _with_manifest(summary: Dict[str, Any]) -> Dict[str, Any]:
+        """Carry the F26 counters onto every exit. The fast path is the ONLY exit a
+        real deployed vault takes under this project's no-bump release rule, so a
+        manifest number that appears solely on the seed-loop path reaches nobody."""
+        for k in ("manifest_tools_refreshed", "manifest_fields_refreshed",
+                  "manifest_headers_refreshed", "manifest_skipped_operator_edited",
+                  "manifest_skipped_modified", "manifest_preserved"):
+            summary[k] = manifest.get(k, 0)
+        return summary
+
     # Fast path
     if installed == vault_seed:
-        return {"fast_path": True, "seed_version": installed,
-                "forged_normalized": forged_norm.get("normalized", 0)}
+        return _with_manifest({"fast_path": True, "seed_version": installed,
+                               "forged_normalized": forged_norm.get("normalized", 0)})
 
     errors: list = []
 
@@ -1151,7 +1700,7 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     except Exception as exc:
         errors.append(f"package_index: {exc}")
         log.error("[VaultMigrator] cannot read package index: %s", exc)
-        return {"errors": errors, "added": 0, "updated": 0}
+        return _with_manifest({"errors": errors, "added": 0, "impl_replaced": 0})
 
     try:
         vault_idx_path = vault_dir / "tools" / "index.json"
@@ -1160,13 +1709,34 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     except Exception as exc:
         errors.append(f"vault_index: {exc}")
         log.error("[VaultMigrator] cannot read vault index: %s", exc)
-        return {"errors": errors, "added": 0, "updated": 0}
+        return _with_manifest({"errors": errors, "added": 0, "impl_replaced": 0})
 
     pkg_names = {e.get("name") for e in pkg_idx if e.get("name")}
     vault_by_name = {e.get("name"): e for e in vault_idx if e.get("name")}
 
     added: list = []
-    updated: list = []
+    # F26 — WHAT THIS LIST ACTUALLY HOLDS, and why it is no longer called
+    # `updated`. An entry lands here when the seed loop OVERWROTE the tool's
+    # IMPLEMENTATION FILE, i.e. `{name}.py` was missing or its bytes differed from
+    # the package's. It is a file-copy tally, not a record-change tally, and it was
+    # misread in exactly the way this project has now hit twice:
+    #
+    #   * It is BLIND to manifest-only drift. Correcting `dependencies` in the
+    #     shipped catalog leaves the .py byte-identical, so the tool goes to
+    #     `skipped_identical` and this number stays 0 while the record stays stale.
+    #     Nothing in the line tells the operator the catalog was NOT refreshed.
+    #   * When it IS non-zero it OVER-reports. A tool counts here because its .py
+    #     changed, even if the body JSON that got copied over the top was already
+    #     byte-identical — so `updated=41` was read as "41 records refreshed" on a
+    #     run where zero manifest fields moved.
+    #
+    # Renamed rather than redefined because the daemon logs the whole summary dict
+    # verbatim (`_v0822_run_vault_migrator`), so an `updated` key survives to the
+    # operator's console no matter what the log line says. Same defect shape as
+    # F14's `stamped=41`. `tests/test_f26_...::test_impl_counter_is_named_for_what_
+    # it_counts` pins the new name against the measured filesystem delta AND
+    # asserts `updated` never comes back.
+    impl_replaced: list = []
     skipped_forged = 0
     skipped_identical = 0
     preserved = 0
@@ -1285,7 +1855,7 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
                         if e.get("name") == name:
                             vault_idx[i] = _entry_keeping_disable(pkg_entry, disabled)
                             break
-                    updated.append(tid)
+                    impl_replaced.append(tid)
                     if disabled:
                         kept_disabled.append(name)
             except Exception as exc:
@@ -1295,7 +1865,7 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     skipped_forged = sum(1 for e in vault_idx if e.get("name") not in pkg_names)
 
     # Write back vault tools index if changed
-    if added or updated:
+    if added or impl_replaced:
         try:
             vault_idx_path.write_text(json.dumps(vault_idx, indent=2) + "\n", encoding="utf-8")
         except Exception as exc:
@@ -1320,9 +1890,26 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
     # classification describes source that is no longer there — carrying it would
     # be the same mistake `_entry_keeping_disable` avoids by refusing to carry the
     # schema summaries across.
-    if added or updated:
+    if added or impl_replaced:
         backfill_effect_tags(vault_dir, version=installed, logger_=log, force=True)
         converge_index_effect_tags(vault_dir, logger_=log)
+
+        # F26 — RE-RECORD THE MANIFEST BASELINE FOR WHAT THIS LOOP JUST REPLACED.
+        # The loop installs the PACKAGE's body verbatim, so those records are
+        # converged by definition; what they lack is a baseline saying so. Without
+        # this, a tool ADDED on this boot has no recorded package value until the
+        # NEXT boot, and an operator who edits its description in between would
+        # have that edit flattened by the first bootstrap refresh (correctly
+        # preserved, but flattened). Cheap: everything is already converged, so the
+        # pass writes no bodies — it only extends the baseline.
+        #
+        # Counters are SUMMED, not replaced: the disk delta for the whole `run` is
+        # the sum of both passes, and a counter that reported only the second one
+        # would under-report exactly the fields the first one fixed.
+        again = converge_package_manifest(vault_dir, logger_=log)
+        for _k, _v in again.items():
+            if isinstance(_v, int) and isinstance(manifest.get(_k), int):
+                manifest[_k] = manifest[_k] + _v
 
     # Wire Wild Card (ADD-only)
     wild_card_added = 0
@@ -1342,8 +1929,15 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
         "seed_version_from": vault_seed,
         "seed_version_to": installed,
         "added": len(added),
-        "updated": len(updated),
+        # NOT `updated` — see the long note where this list is declared. This is
+        # implementation FILES overwritten; the manifest numbers below are the ones
+        # that answer "was the catalog refreshed?".
+        "impl_replaced": len(impl_replaced),
         "skipped_forged": skipped_forged,
+        # Seeds whose IMPLEMENTATION matched the package's, so the seed loop copied
+        # nothing. Their RECORDS are still converged — by `converge_package_manifest`
+        # above, which is the whole F26 fix — so this is not "skipped the tool", it
+        # is "skipped the file copy".
         "skipped_identical": skipped_identical,
         "wild_card_added": wild_card_added,
         "forged_normalized": forged_norm.get("normalized", 0),
@@ -1365,11 +1959,26 @@ def run(vault_dir: Path, *, logger_=None) -> Dict[str, Any]:
         "kept_disabled_names": list(kept_disabled),
         "errors": errors,
     }
-    log.info("[VaultMigrator] %s → %s: added=%d updated=%d skipped=%d wild_card_added=%d "
+    _with_manifest(summary)
+    # THE OPERATOR-FACING LINE. Every name says what it counts and every number is
+    # pinned to the filesystem by `tests/test_f26_manifest_corrections_reach_the_
+    # vault.py`. The old line read
+    #     `0.0.0 → 0.10.23: added=0 updated=41 skipped=0 …`
+    # which an operator (and the next engineer) reads as "the catalog was
+    # refreshed" — on a run where not one manifest field had moved. `skipped=%d`
+    # is gone too: it summed `skipped_forged` (the operator's OWN tools, which are
+    # not "skipped" by anything, they are simply not the package's) with
+    # `skipped_identical` (seeds whose .py matched), so the one number answered two
+    # unrelated questions and neither of them the one being asked.
+    log.info("[VaultMigrator] %s → %s: added=%d impl_replaced=%d impl_identical=%d "
+             "manifest_tools_refreshed=%d manifest_fields_refreshed=%d "
+             "manifest_operator_owned=%d user_tools=%d wild_card_added=%d "
              "preserved=%d kept_disabled=%d errors=%d",
-             vault_seed, installed, len(added), len(updated),
-             skipped_forged + skipped_identical, wild_card_added, preserved,
-             len(kept_disabled), len(errors))
+             vault_seed, installed, len(added), len(impl_replaced),
+             skipped_identical, summary["manifest_tools_refreshed"],
+             summary["manifest_fields_refreshed"],
+             summary["manifest_skipped_operator_edited"], skipped_forged,
+             wild_card_added, preserved, len(kept_disabled), len(errors))
     if preserved:
         log.warning("[VaultMigrator] %d locally-modified vault file(s) were replaced by the "
                     "packaged version; the previous contents are preserved at %s",

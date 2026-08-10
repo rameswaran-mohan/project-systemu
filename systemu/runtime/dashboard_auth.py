@@ -22,6 +22,7 @@ Security notes:
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import ipaddress
@@ -29,10 +30,11 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +526,60 @@ def check_api_token(vault, presented: str) -> Optional[str]:
 # per-IP lockout
 # --------------------------------------------------------------------------- #
 
+@dataclass(frozen=True)
+class LockoutHealth:
+    """F7 (DEC-32) -- the fence as a VALUE that crosses the boundary.
+
+    ``enforced``  the failure counter is actually running.  This is the
+                  security property; it must never be False while auth is
+                  served, and with the in-memory fallback it never is.
+    ``durable``   the counter will survive a process restart.  False means the
+                  store cannot be persisted and the operator has to be told.
+    ``reason``    why persistence is failing, verbatim, for the operator.
+    ``path``      which store.
+    """
+    enforced: bool
+    durable: bool
+    reason: str = ""
+    path: str = ""
+
+
+#: F7 -- the fallback state, keyed by store PATH and shared across every
+#: ``LockoutStore`` instance in the process.  It MUST NOT live on the instance:
+#: ``pages/login.py`` constructs a fresh ``LockoutStore`` on every render of
+#: ``/login``, so a per-instance counter would be reset by simply reloading the
+#: page between guesses -- defeated by exactly the attack it defends against.
+_LOCKOUT_MIRRORS: Dict[str, Dict[str, Any]] = {}
+
+#: Stores that cannot persist.  A log line is not an operator surface -- the
+#: daemon log is where the old swallowed warning went to die --- so
+#: ``health_banner.build_health_state`` reads this and renders a DANGER issue.
+_LOCKOUT_DEGRADED: Dict[str, Dict[str, Any]] = {}
+
+#: guards both maps above
+_LOCKOUT_STATE_LOCK = threading.RLock()
+
+
+def lockout_degradations() -> Tuple[Dict[str, Any], ...]:
+    """Snapshot of every lockout store currently unable to persist.
+
+    Empty tuple == brute-force protection is fully durable.  Never raises.
+    """
+    with _LOCKOUT_STATE_LOCK:
+        return tuple(dict(v) for v in _LOCKOUT_DEGRADED.values())
+
+
+def reset_lockout_state() -> None:
+    """Drop the process-wide fallback counters and degradation registry.
+
+    Only for a fresh process / tests -- calling this while serving auth would
+    hand an attacker the reset the fallback exists to deny.
+    """
+    with _LOCKOUT_STATE_LOCK:
+        _LOCKOUT_MIRRORS.clear()
+        _LOCKOUT_DEGRADED.clear()
+
+
 class LockoutStore:
     """JSON-persisted failed-login lockout — per-IP AND global.
 
@@ -538,30 +594,134 @@ class LockoutStore:
     resets to a fresh window on the next failure, so the effective threshold
     stays N per window rather than collapsing to 1 after the first lockout.
 
-    All reads are defensive (corrupt/missing -> empty, never raises); writes are
-    atomic-ish (temp + replace).
+    Writes are atomic-ish (temp + replace).
+
+    F7 -- FAIL-CLOSED under a broken store.  Previously ``_save`` swallowed
+    every exception into a ``logger.warning`` and ``_load`` returned ``{}`` on
+    any error, so an unwritable or unreadable store FORGOT every failed login:
+    five failures in a row left ``is_locked()`` False and brute-force
+    protection silently disappeared. That is fail-OPEN, against DEC-32.
+
+    The store now keeps a process-local mirror of the counters. Every write
+    lands in the mirror BEFORE it is attempted on disk, and while the store is
+    degraded every read is served from the mirror, so the counter keeps
+    counting and the thresholds keep tripping for the life of the process. The
+    residual loss -- durability across a restart -- is not hidden: it is
+    published to :func:`lockout_degradations` and rendered by the dashboard
+    health banner as a DANGER issue.
+
+    Why not hard-deny instead?  Because a read-only vault or a full disk would
+    then lock the operator out of the one surface they would use to fix it,
+    turning a transient hiccup into a permanent self-lockout. Denying and
+    counting the failed attempt is the part brute-force actually cares about;
+    a correct passphrase is still honoured.
     """
 
     def __init__(self, path):
         self.path = Path(path)
+        #: identity of the SHARED fallback state. Deliberately not per-instance:
+        #: pages/login.py rebuilds this object on every /login render.
+        self._key = str(self.path)
+
+    # -- shared fallback state --------------------------------------------- #
+
+    @property
+    def _memory(self) -> dict:
+        """Last state this process produced for this path; strictly newer than
+        disk whenever the store is degraded. Seeded by the first healthy read."""
+        with _LOCKOUT_STATE_LOCK:
+            return copy.deepcopy(_LOCKOUT_MIRRORS.get(self._key, {}))
+
+    @_memory.setter
+    def _memory(self, data: dict) -> None:
+        with _LOCKOUT_STATE_LOCK:
+            _LOCKOUT_MIRRORS[self._key] = copy.deepcopy(data)
+
+    @property
+    def _degraded(self) -> str:
+        with _LOCKOUT_STATE_LOCK:
+            entry = _LOCKOUT_DEGRADED.get(self._key)
+            return str(entry["reason"]) if entry else ""
+
+    def _degrade(self, reason: str) -> None:
+        with _LOCKOUT_STATE_LOCK:
+            entry = _LOCKOUT_DEGRADED.get(self._key)
+            first = entry is None
+            if first:
+                entry = {"path": self._key, "reason": reason,
+                         "since": time.time(), "count": 0}
+                _LOCKOUT_DEGRADED[self._key] = entry
+            entry["reason"] = reason
+            entry["count"] = int(entry.get("count", 0)) + 1
+        if first:
+            # loud ONCE per transition: an ERROR per attempt would flood the log
+            # during the very brute-force this protects against, and the durable
+            # signal is the registry above, not the log.
+            logger.error(
+                "[DashboardAuth] lockout store %s cannot persist (%s). Brute-force "
+                "protection is now counting IN MEMORY ONLY and will reset if the "
+                "dashboard restarts. Fix the vault path/permissions/disk.",
+                self.path, reason,
+            )
+
+    def _recovered(self) -> None:
+        with _LOCKOUT_STATE_LOCK:
+            was = _LOCKOUT_DEGRADED.pop(self._key, None)
+        if was is not None:
+            logger.info("[DashboardAuth] lockout store %s is persisting again", self.path)
+
+    def health(self) -> LockoutHealth:
+        """The fence as a value (DEC-32): what is TRUE about this store now."""
+        reason = self._degraded
+        return LockoutHealth(
+            enforced=True,                       # the mirror always counts
+            durable=not reason,
+            reason=reason,
+            path=self._key,
+        )
+
+    # -- persistence -------------------------------------------------------- #
+
+    def _read_disk(self) -> Tuple[dict, bool]:
+        """``(data, readable)``. ``readable`` False means present-but-unusable
+        -- distinct from simply absent, which is a normal empty store."""
+        try:
+            if not self.path.exists():
+                return {}, True
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}, False
+            return data, True
+        except Exception as exc:
+            logger.warning("[DashboardAuth] unreadable lockout file %s: %s", self.path, exc)
+            return {}, False
 
     def _load(self) -> dict:
-        try:
-            if self.path.exists():
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                return data if isinstance(data, dict) else {}
-        except Exception as exc:
-            logger.warning("[DashboardAuth] corrupt lockout file %s: %s", self.path, exc)
-        return {}
+        data, readable = self._read_disk()
+        if not readable:
+            # Fail CLOSED: fall back to what this process already counted rather
+            # than to an empty dict that would forget every failure so far.
+            self._degrade(f"unreadable: {self.path}")
+            return copy.deepcopy(self._memory)
+        if self._degraded:
+            # Readable but not writable: disk is stale, the mirror is truth.
+            return copy.deepcopy(self._memory)
+        self._memory = copy.deepcopy(data)
+        return data
 
     def _save(self, data: dict) -> None:
+        # The mirror is updated FIRST and unconditionally: the counter must
+        # survive whatever the disk does.
+        self._memory = copy.deepcopy(data)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             tmp.write_text(json.dumps(data), encoding="utf-8")
             os.replace(tmp, self.path)
-        except Exception as exc:  # pragma: no cover - disk failure
-            logger.warning("[DashboardAuth] failed to write lockout file %s: %s", self.path, exc)
+        except Exception as exc:
+            self._degrade(f"{type(exc).__name__}: {exc}")
+        else:
+            self._recovered()
 
     @staticmethod
     def _entry_locked(entry: Any, now: float) -> bool:

@@ -86,6 +86,15 @@ def _dep_error_dict(exc: "ToolDependencyError") -> dict:
                            f"('{exc.missing}'). This is a systemu bug — report it."),
             "error_type": "internal_import_error",
         }
+    # F21: if the missing module belongs to one of systemu's OWN optional
+    # groups, `pip install <module>` is the wrong remedy even though it would
+    # technically work — it installs an unpinned copy outside the extra, so the
+    # operator's environment no longer matches any documented install and
+    # `doctor` still reports the group as absent. Name the extra instead.
+    from systemu.runtime import optional_deps as _od
+    if _od.group_for_package(exc.missing) is not None:
+        return _capability_unavailable_dict(
+            exc.tool_name, [exc.missing], _od.unavailable_reason([exc.missing]))
     return {
         "success":         False,
         "error":           (f"Tool '{exc.tool_name}' requires Python package "
@@ -95,6 +104,26 @@ def _dep_error_dict(exc: "ToolDependencyError") -> dict:
         "error_type":      "missing_dependency",
         "missing_packages": [exc.missing],
         "install_hint":    f"pip install {exc.missing}",
+    }
+
+
+def _capability_unavailable_dict(tool_name: str, packages: List[str],
+                                 reason: str) -> dict:
+    """F21 — the result dict for a tool whose OPTIONAL GROUP is not installed.
+
+    A distinct ``error_type`` from every other dependency outcome, because the
+    others are conditions the runtime might resolve (approve, install, retry)
+    and this one is a capability the operator chose not to install. Retrying is
+    pointless; the payload says so, and carries the one line that fixes it.
+    """
+    from systemu.runtime import optional_deps as _od
+    return {
+        "success":          False,
+        "error":            reason,
+        "error_type":       "capability_unavailable",
+        "missing_packages": list(packages),
+        "install_hint":     _od.install_command(packages),
+        "retryable":        False,
     }
 
 
@@ -144,7 +173,7 @@ def _install_pending_dict(tool_name: str, packages: List[str], reason: str) -> d
         "missing_packages": packages,
         "install_hint":    (
             "Operator approval required: "
-            + " && ".join(f"sharing_on tools deps approve {p}" for p in packages)
+            + " && ".join(f"systemu tools deps approve {p}" for p in packages)
         ),
     }
 
@@ -676,6 +705,13 @@ class ToolRegistry:
             return True
 
         # Map InstallStatus → structured error dict.
+        # F21 FIRST: a first-party optional group is not an install failure and
+        # not an approval request. Without this branch it fell through to
+        # `_install_failed_dict`, which appends `pip install playwright` — the
+        # remedy that bypasses the extra.
+        if result.status is InstallStatus.BLOCKED_MISSING_EXTRA:
+            return _capability_unavailable_dict(
+                tool.name, declared, result.error or "")
         if result.status is InstallStatus.BLOCKED_DISABLED:
             return _install_blocked_dict(tool.name, declared, result.error or "")
         if result.status is InstallStatus.BLOCKED_PENDING_APPROVAL:

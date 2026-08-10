@@ -134,19 +134,32 @@ def main():
 
 
 @click.group()
-@click.version_option(_sharing_on_version, prog_name="sharing_on")
+# NO prog_name= here, deliberately. The wheel installs TWO console scripts for
+# this one entry point (`systemu` and `sharing_on`, see pyproject
+# [project.scripts]); a hard-coded prog_name made `systemu --version` answer
+# "sharing_on, version …" — a program reporting a name the operator did not
+# type. Click defaults to the root context's info_name, i.e. the basename of
+# argv[0], so each name reports itself.
+@click.version_option(_sharing_on_version)
 @click.option("--debug", is_flag=True, help="Enable debug logging.")
 @click.pass_context
 def cli(ctx, debug: bool):
     """
-    sharing_on — Record computer activity and generate step-by-step instructions.
+    systemu — Record computer activity and generate step-by-step instructions.
 
     \b
     Quick start:
-      1. Copy .env.example to .env and add your OpenRouter API key
-      2. Run:  sharing_on record --name "My Task"
+      1. Run:  systemu setup      (stores your OpenRouter API key)
+      2. Run:  systemu record --name "My Task"
       3. Perform your task, then press Ctrl+C to stop
       4. Find your instructions.md in the captures/ directory
+
+    \b
+    TWO NAMES, ONE PROGRAM. `pip install systemu` puts BOTH `systemu` and
+    `sharing_on` on your PATH, pointing at this same entry point. The docs and
+    these messages lead with `systemu` because that is the name you installed;
+    `sharing_on` is the original capture-engine name and keeps working forever.
+    Anywhere you see one, the other does the same thing.
     """
     ctx.ensure_object(dict)
     level = logging.DEBUG if debug else logging.WARNING
@@ -258,9 +271,9 @@ def record(
 
     \b
     Examples:
-      sharing_on record --name "Set up Python project"
-      sharing_on record --name "Deploy app" --watch ./src --watch ./config
-      sharing_on record --name "Fix bug" --screenshot-interval 5
+      systemu record --name "Set up Python project"
+      systemu record --name "Deploy app" --watch ./src --watch ./config
+      systemu record --name "Fix bug" --screenshot-interval 5
     """
     # Load config from .env
     config = Config.from_env()
@@ -297,7 +310,7 @@ def record(
             for e in errors:
                 console.print(f"  ✗ {e}")
             console.print(
-                "\n[dim]Tip: Copy .env.example to .env and add your OpenRouter key.[/dim]"
+                "\n[dim]Tip: run `systemu setup` to store your OpenRouter key.[/dim]"
             )
             sys.exit(1)
 
@@ -361,7 +374,7 @@ def record(
     if no_analyze:
         console.print(
             f"\n[dim]Skipping analysis. "
-            f"Run [bold]sharing_on analyze {session.output_dir}[/bold] later.[/dim]"
+            f"Run [bold]systemu analyze {session.output_dir}[/bold] later.[/dim]"
         )
         return
 
@@ -622,7 +635,7 @@ def analyze(session_dir: str, model: str):
 
     \b
     Example:
-      sharing_on analyze ./captures/my_task_cap_20260418_140000/
+      systemu analyze ./captures/my_task_cap_20260418_140000/
     """
     import json
 
@@ -904,11 +917,21 @@ def setup(key, preset, output_dir, no_validate, tier1_provider, tier2_provider,
             tier_specs.append({"provider": prov, "model": model or "",
                                "credential": _cred_by_prov.get(prov) or ""})
 
-    interactive = (key is None and tier_specs is None and _sys.stdin.isatty())
-    if not interactive and key is None and tier_specs is None:
-        console.print("[yellow]Non-interactive and no --key / --tier*-provider "
-                      "given — nothing to configure. Pass flags, or run in a "
-                      "terminal.[/yellow]")
+    # F3: any explicit configuration flag means the operator already answered
+    # the wizard's questions — never prompt over it. `isatty()` alone is not a
+    # sufficient headless test: on Windows the NUL device reports as a TTY, so
+    # `stdin < /dev/null` still entered the provider wizard and died on EOF.
+    _explicit = (key is not None or tier_specs is not None
+                 or preset is not None or output_dir is not None)
+    interactive = (not _explicit) and _sys.stdin.isatty()
+    # --preset / --output-dir are configuration too. Bailing out unless a KEY
+    # was passed meant a headless box could not set the model preset or the
+    # output folder from argv at all, even though both are declared headless
+    # remedies in first_run.HEADLESS_REMEDIES.
+    if not interactive and not _explicit:
+        console.print("[yellow]Non-interactive and no --key / --preset / "
+                      "--output-dir / --tier*-provider given — nothing to "
+                      "configure. Pass flags, or run in a terminal.[/yellow]")
         return
     console.print("\n[cyan]⚡ Systemu setup[/cyan]")
     summary = run_setup(
@@ -922,10 +945,10 @@ def setup(key, preset, output_dir, no_validate, tier1_provider, tier2_provider,
     if summary["key_set"]:
         console.print(f"\n[green]✓ Configured.[/green] "
                       f"Wrote {summary['env_path']}. "
-                      f"Next: [bold]sharing_on daemon start[/bold]")
+                      f"Next: [bold]systemu daemon start[/bold]")
     else:
         console.print("\n[yellow]No API key set — Systemu can't run tasks "
-                      "until you add one (`sharing_on setup`).[/yellow]")
+                      "until you add one (`systemu setup`).[/yellow]")
 
 
 @cli.command()
@@ -946,8 +969,16 @@ def init(force: bool, no_seed: bool):
     from importlib import resources
     from datetime import datetime as _dt, timezone as _tz
 
-    cwd = Path.cwd()
-    target_root = cwd / "systemu" / "vault"
+    # F3: seed the vault the rest of the process actually reads. This used to
+    # be hardcoded to <cwd>/systemu/vault, so on any install that points
+    # SYSTEMU_VAULT_DIR elsewhere — every Docker deployment with a mounted
+    # volume — `init` reported "41 tools seeded" while the running system saw
+    # an empty catalog for ever. Identical behaviour when the env var is unset,
+    # because that is the Config default.
+    from sharing_on.config import Config as _Config
+    target_root = Path(_Config.from_env().vault_dir).expanduser()
+    if not target_root.is_absolute():
+        target_root = Path.cwd() / target_root
     target_root.mkdir(parents=True, exist_ok=True)
     console.print(f"[dim]Vault root: {target_root}[/dim]")
 
@@ -1104,6 +1135,44 @@ def _infer_scope(scope_id: str):
     return None
 
 
+#: F2 -- the vault surface ``RecoveryEngine`` needs to look a record up.  The
+#: file vault implements none of them (it has ``get_*``, which raises, not the
+#: ``find_*`` "None if absent" pair, and no ``skill_exists``), so scoped doctor
+#: is the one advertised command that cannot be served by the default backend.
+#: Probed, not assumed: if the file vault ever grows them, this stops refusing.
+_RECOVERY_VAULT_METHODS = (
+    "find_scroll", "find_activity", "find_activity_for_scroll",
+    "find_shadow", "find_tool", "skill_exists",
+)
+
+
+def _recovery_backend_remedy(scope_id: str, missing) -> str:
+    """The refusal an operator can ACT on.
+
+    Names what is wrong, which backend is active, and the literal command to
+    run -- for both shells -- plus the parts of ``doctor`` that DO work here.
+    A bare ``ERROR: SYSTEMU_DATABASE_URL not set`` (what this used to print)
+    told the operator nothing: not which variable value to use, not that the
+    default install has no database at all, not that plain ``doctor`` works.
+    """
+    backend = os.environ.get("SYSTEMU_STORAGE", "file")
+    return (
+        f"ERROR: `doctor {scope_id}` needs the SQL recovery store, but this install "
+        f"is running the {backend!r} storage backend, which cannot look up "
+        f"scr_/act_/sh_/tool_ records (no {', '.join(missing)}).\n"
+        f"\n"
+        f"Remedy -- re-run the same command against the sqlite backend:\n"
+        f"    bash/zsh:    SYSTEMU_STORAGE=sqlite systemu doctor {scope_id}\n"
+        f"    PowerShell:  $env:SYSTEMU_STORAGE='sqlite'; systemu doctor {scope_id}\n"
+        f"  (sqlite needs no extra config; it defaults to <vault>/../data/systemu.db. "
+        f"Set SYSTEMU_STORAGE=sqlite in your .env to make it permanent.)\n"
+        f"\n"
+        f"These work on this install as-is:\n"
+        f"    systemu doctor                    whole-system self-diagnosis\n"
+        f"    systemu doctor --set-passphrase   set the dashboard passphrase"
+    )
+
+
 def _read_set_passphrase(passphrase: Optional[str]) -> str:
     """Resolve the passphrase for ``doctor --set-passphrase``.
 
@@ -1230,9 +1299,9 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
 
     \b
     Examples:
-      sharing_on doctor scr_abc123
-      sharing_on doctor tool_xyz789
-      sharing_on doctor --set-passphrase
+      systemu doctor scr_abc123
+      systemu doctor tool_xyz789
+      systemu doctor --set-passphrase
     """
     import os
 
@@ -1254,12 +1323,7 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
         sys.exit(run_self_diagnosis())
 
     from systemu.recovery.engine import RecoveryEngine
-    from systemu.storage.sqlite.vault import SqliteVault
-
-    db_url = os.environ.get("SYSTEMU_DATABASE_URL")
-    if not db_url:
-        click.echo("ERROR: SYSTEMU_DATABASE_URL not set", err=True)
-        sys.exit(2)
+    from systemu.vault.factory import open_vault
 
     scope = _infer_scope(scope_id)
     if scope is None:
@@ -1270,7 +1334,29 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
         )
         sys.exit(2)
 
-    vault = SqliteVault(database_url=db_url)
+    # F31: consume the ONE MINT. `open_recovery_vault` decides which store answers
+    # a scoped-recovery lookup -- active backend first, SYSTEMU_DATABASE_URL only
+    # as the explicit fallback -- and returns nothing rather than a store that
+    # cannot serve. This callback therefore names no env var and constructs no
+    # backend, which is what lets test_f2_default_file_storage_cli keep a flat
+    # prohibition instead of an order-dependent rule a decoy call can satisfy.
+    from systemu.vault.factory import (RECOVERY_SOURCE_NOTES,
+                                       RECOVERY_VAULT_METHODS,
+                                       open_recovery_vault)
+
+    vault, _source = open_recovery_vault(Config.from_env())
+    if vault is None:
+        _probe = open_vault(Config.from_env())
+        _missing = [m for m in RECOVERY_VAULT_METHODS
+                    if not callable(getattr(_probe, m, None))]
+        click.echo(_recovery_backend_remedy(scope_id, _missing), err=True)
+        sys.exit(2)
+    # Say which store answered when it is not the active backend: the operator
+    # asked for it explicitly, but every other command still reads the active one
+    # and --apply WRITES to whichever served. Wording comes from the mint.
+    if _source in RECOVERY_SOURCE_NOTES:
+        click.echo(RECOVERY_SOURCE_NOTES[_source], err=True)
+
     eng = RecoveryEngine(vault=vault)
 
     finder = {
@@ -1333,18 +1419,16 @@ def find_tools_cmd(query, limit):
 
     \b
     Examples:
-      sharing_on find-tools create an issue
-      sharing_on find-tools send email
+      systemu find-tools create an issue
+      systemu find-tools send email
     """
-    import os
-    from systemu.storage.sqlite.vault import SqliteVault
+    # F2: same as `world` -- capability_index only reads `vault.list_tools()`
+    # and `vault.root`, both of which the default file vault has, so this goes
+    # through the shared factory instead of demanding a database URL.
+    from systemu.vault.factory import open_vault
     from systemu.interface.cli_commands import run_find_tools
 
-    db_url = os.environ.get("SYSTEMU_DATABASE_URL")
-    if not db_url:
-        click.echo("ERROR: SYSTEMU_DATABASE_URL not set", err=True)
-        sys.exit(2)
-    vault = SqliteVault(database_url=db_url)
+    vault = open_vault(Config.from_env())
     sys.exit(run_find_tools(vault, " ".join(query), limit))
 
 
@@ -1397,18 +1481,20 @@ def world_cmd(query, limit):
 
     \b
     Examples:
-      sharing_on world
-      sharing_on world github
+      systemu world
+      systemu world github
     """
-    import os
-    from systemu.storage.sqlite.vault import SqliteVault
+    # F2: resolve storage through the ONE authoritative factory, exactly like
+    # every other command (and like the in-agent world tool already did --
+    # systemu/runtime/tools/world_tools.py:_open_vault). The world model is a
+    # pure file store: FactStore writes <vault.root>/world_model/*.json and the
+    # only vault attribute it ever touches is `.root`, which BOTH backends
+    # expose. Demanding SYSTEMU_DATABASE_URL here made an advertised command
+    # dead on the default (file) install for no reason at all.
+    from systemu.vault.factory import open_vault
     from systemu.interface.cli_commands import run_world
 
-    db_url = os.environ.get("SYSTEMU_DATABASE_URL")
-    if not db_url:
-        click.echo("ERROR: SYSTEMU_DATABASE_URL not set", err=True)
-        sys.exit(2)
-    vault = SqliteVault(database_url=db_url)
+    vault = open_vault(Config.from_env())
     sys.exit(run_world(vault, " ".join(query or ()), limit))
 
 
@@ -1441,7 +1527,7 @@ def capture_export_skill(session: str, output: str, auto_approve: bool):
 
     \b
     Example:
-      sharing_on capture export-skill ./captures/email_digest_cap_… \\
+      systemu capture export-skill ./captures/email_digest_cap_… \\
                  --output ./my-skill
     """
     from systemu.pipelines.capture_to_skill import export_skill_from_capture
@@ -1551,6 +1637,7 @@ try:
         debug_group,
         decisions_group,
         user_group,
+        onboarding_group,
         session_cli,
         capability_cli,
         skill_cli,
@@ -1566,6 +1653,7 @@ try:
     cli.add_command(debug_group,     name="debug")
     cli.add_command(decisions_group, name="decisions")
     cli.add_command(user_group,      name="user")
+    cli.add_command(onboarding_group, name="onboarding")
     cli.add_command(session_cli,     name="session")
     cli.add_command(capability_cli,  name="capability")
     cli.add_command(skill_cli,       name="skill")

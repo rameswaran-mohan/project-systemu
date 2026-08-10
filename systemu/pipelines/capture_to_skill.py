@@ -70,7 +70,7 @@ def export_skill_from_capture(
         missing = [str(p.name) for p in (instructions, session_json) if not p.exists()]
         raise FileNotFoundError(
             f"capture session_dir {session_dir} missing {', '.join(missing)} — "
-            f"run `sharing_on analyze {session_dir}` first."
+            f"run `systemu analyze {session_dir}` first."
         )
 
     logger.info("[capture_to_skill] refining scroll for session %s", session_dir.name)

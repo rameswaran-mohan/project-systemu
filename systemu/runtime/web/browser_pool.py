@@ -9,9 +9,16 @@ import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from systemu.runtime.optional_deps import OptionalDependencyMissing, require
+
 logger = logging.getLogger(__name__)
 
 _MAX_CONTEXTS = int(os.environ.get("SYSTEMU_BROWSER_MAX_CONTEXTS", "3"))
+
+#: F21 — the packages this module cannot work without. `playwright` moved to
+#: the `[browser]` extra in v0.10.24; re-exported above so a tool body can
+#: `except OptionalDependencyMissing` without importing a second module.
+REQUIRES = ("playwright",)
 
 
 def _make_semaphore() -> threading.Semaphore:
@@ -70,6 +77,12 @@ class BrowserPool:
     def _ensure_browser(self):
         if self._browser is not None:
             return
+        # F21: BEFORE the import, not around it. A `ModuleNotFoundError: No
+        # module named 'playwright'` reaching an operator names a package they
+        # never chose and no command that fixes it; `require` raises the typed
+        # OptionalDependencyMissing whose message is the full remedy, including
+        # the `playwright install chromium` step the pip line alone does not do.
+        require(REQUIRES, what="Browser automation")
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=True)

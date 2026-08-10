@@ -187,10 +187,24 @@ def finalize_onboarding(vault, config, *, name: str, location: str = "",
     click finishes setup instead of bouncing off the onboarding gate (the
     starter used to bare-navigate to /chat, which the W11.4 gate redirected
     straight back to /welcome — the "just refreshes" bug)."""
+    # F19 / DEC-43: the "can this install run?" verdict comes from THE ONE MINT,
+    # never from one config attribute. An operator with a Google key, or with
+    # Ollama answering, used to be held here and told to add an OpenRouter key
+    # while the Settings page a click away reported those providers as fine.
+    # `_refresh_key_status` is still consulted first: it is a WRITER (it pulls a
+    # freshly-saved OpenRouter key out of .env into the live config), not a
+    # verdict, and the mint scores the config it just updated.
+    from systemu.runtime import provider_status as _ps
     refresh = refresh_key_fn if refresh_key_fn is not None else _refresh_key_status
-    if not getattr(config, "openrouter_api_key", "") and not refresh(config):
-        return (False, "Add your API key first (step 1) — Systemu can't run "
-                       "without it.")
+    refresh(config)
+    _view = _ps.env_overlay(config)
+    if not _ps.any_provider_usable(_view):
+        # Name the remedies, all of them — the old copy said "Add your API key
+        # first", which for a Google or Ollama operator was a dead end.
+        return (False, "Set up an LLM provider first (step 1) — Systemu can't "
+                       "run without one. "
+                       + _ps.configure_hint(_ps.all_provider_statuses(
+                           _view, probe=_ps.unprobed)))
     if not (name or "").strip():
         return (False, "Please tell me your name.")
     try:
@@ -240,25 +254,40 @@ def build_welcome_page() -> None:
 
             # ── 1. API key (status only — never typed here) ────────────────
             ui.label(f"1 · {onboarding_steps()[0]}").classes("s-section-head")
-            if getattr(config, "openrouter_api_key", ""):
-                ui.label("API key loaded — you're ready to run tasks.").classes("s-cell")
+            # F19: the STATUS disclosure consumes the mint, so this step and the
+            # Settings page cannot disagree about the same machine.
+            from systemu.runtime import provider_status as _ps
+            _pstat = _ps.all_provider_statuses(
+                _ps.env_overlay(config), probe=_ps.unprobed
+                if not _ps.selects_keyless(config) else None,
+                cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
+            _usable = _ps.satisfied_providers(_pstat)
+            if _usable:
+                ui.label(
+                    "Provider ready: " + ", ".join(u.display for u in _usable)
+                    + " — you're set to run tasks."
+                ).classes("s-cell")
             else:
                 ui.label(
-                    "No API key found — and Systemu can't think without one. "
-                    "Get a key at openrouter.ai/keys, add "
-                    "OPENROUTER_API_KEY=<your key> to the .env file next to "
-                    "the app, save, then click Re-check. Keys are never "
-                    "entered in the browser."
+                    "No LLM provider is usable yet — and Systemu can't think "
+                    "without one. " + _ps.configure_hint(_pstat)
+                    + " Get an OpenRouter key at openrouter.ai/keys. Edit the "
+                    ".env file next to the app, save, then click Re-check. "
+                    "Credentials are never entered in the browser."
                 ).classes("s-banner s-banner--warn w-full")
 
                 def _recheck(_=None) -> None:
                     # W11.4: no restart dance — reload .env in place.
-                    if _refresh_key_status(config):
-                        ui.notify("Key found — you're ready.", type="positive")
+                    _refresh_key_status(config)
+                    from systemu.runtime import provider_status as _rps
+                    _rps.clear_probe_cache()   # the operator just changed .env
+                    if _rps.any_provider_usable(_rps.env_overlay(config)):
+                        ui.notify("Provider found — you're ready.",
+                                  type="positive")
                         ui.navigate.to("/welcome")
                     else:
                         ui.notify(
-                            "Still no key in .env — save the file and try again.",
+                            "Still no usable provider — save .env and try again.",
                             type="warning")
 
                 button("Re-check", variant="primary", on_click=_recheck)

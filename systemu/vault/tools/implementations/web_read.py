@@ -4,7 +4,24 @@ from __future__ import annotations
 
 import os
 
-TOOL_META = {"name": "web_read", "tool_type": "web", "dependencies": ["playwright"]}
+# DEPENDENCIES: none, and that is a CORRECTION, not a relaxation.
+#
+# This manifest declared ["playwright"] and the declaration was wrong even
+# before v0.10.24 made playwright optional. `web_read`'s primary paths are the
+# Jina Reader and a raw GET (web_access.read_url) — pure HTTP, no browser.
+# Chromium is only the LAST-RESORT render escalation for JS/anti-bot pages,
+# and web_access._browser_render already treats its absence as a skipped tier.
+#
+# Leaving the declaration in place would have been actively harmful once
+# playwright left the core install: `dependency_installer.ensure_satisfied`
+# runs BEFORE the tool body, so a machine without the [browser] extra would
+# have refused to run web_read at all — a tool that works perfectly over HTTP
+# reported UNAVAILABLE and never invoked. A false unavailability is the same
+# defect as a false readiness, pointed the other way.
+#
+# web_act and web_screenshot DO still declare it: both go straight to
+# BrowserPool with no non-browser path.
+TOOL_META = {"name": "web_read", "tool_type": "web", "dependencies": []}
 
 # v0.9.8 Phase 1 Task 7: gate the keyless web_access stack on the env var so we
 # don't depend on a Config object. Default ON.
@@ -47,6 +64,17 @@ def run(**kwargs) -> dict:
         parsed = fetch_core.extract_readable(html, url)
         return {"success": True, "tier_used": "browser", **parsed, "error": None}
     except Exception as exc:
+        # F21: the render tier needs the [browser] extra even though the tool as
+        # a whole does not. Say WHICH tier was unavailable and how to get it —
+        # "all backends failed" would hide a one-command fix.
+        from systemu.runtime.optional_deps import OptionalDependencyMissing
+        if isinstance(exc, OptionalDependencyMissing):
+            return {"success": False, "title": "", "text": "", "links": [],
+                    "error": (f"The HTTP tiers could not read this page and the "
+                              f"JS-render tier is not installed. {exc}"),
+                    "error_type": "capability_unavailable",
+                    "missing_packages": list(exc.packages),
+                    "tier_used": "browser"}
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             return {"success": False, "title": "", "text": "", "links": [],
                     "error": "browser not ready yet (chromium installing)",

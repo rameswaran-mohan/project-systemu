@@ -32,6 +32,14 @@ Load-bearing rules (all under test in ``tests/test_action_governance.py``):
     `_LOCAL_TAGS` would not tighten anything — it would only manufacture phantom
     network/message tags from tool names.
 
+    **A third question the verdict does NOT answer (F9): may this effect class be
+    BATCH-approved?** REQUIRE_APPROVAL means "the operator sees this call, with its
+    arguments". A batch removes the card AND the arguments, permanently, so the
+    REQUIRE_APPROVAL band is not a safe batch — reading it as one is how
+    `run_command` and `file_delete` came to be offered under a single click on the
+    first-run review card. :func:`batch_approvable` answers that question against
+    the `effect_tags.BATCH_APPROVABLE` allowlist.
+
 This is the evaluator only. Wiring the live gates (`_maybe_gate_command`,
 `_gate_mcp_call`, the forged execute path) to delegate through it — and closing
 the `trusted_inprocess` bypass — is S1b.
@@ -79,6 +87,14 @@ NET_EFFECTS = frozenset({
     EffectTag.SEND_MESSAGE.value,
     EffectTag.MONEY_MOVE.value,
     EffectTag.OAUTH_CALL.value,
+    # F14 — driving a browser IS network egress, and saying so here is what keeps
+    # the pre-S2 hard-DENY firing on a FORGED tool that reaches the net through
+    # playwright/BrowserPool rather than through `requests`. It is deliberately
+    # recorded as egressing even though the operator ruling of 2026-08-07 also
+    # admits it to `effect_tags.BATCH_APPROVABLE`: those answer different
+    # questions, and falsifying this one to keep a set-disjointness assertion
+    # green would be the F9 defect in a new costume.
+    EffectTag.BROWSER_ACTUATE.value,
 })
 
 
@@ -238,11 +254,64 @@ _DELETE_VERBS = {"delete", "remove", "drop", "truncate", "wipe", "purge",
                  "destroy", "erase"}
 
 _LOCAL_TAGS = {EffectTag.LOCAL_READ.value, EffectTag.LOCAL_WRITE.value,
-               EffectTag.LOCAL_DELETE.value, EffectTag.SHELL_EXEC.value}
+               EffectTag.LOCAL_DELETE.value, EffectTag.SHELL_EXEC.value,
+               # F14: a body PROVED to have no effects must not acquire one from
+               # its name — the `send_summary_to_log` rule, at its limit. The
+               # capture/actuation classes are deliberately NOT here: they are not
+               # local, so the name verb map may still escalate them.
+               EffectTag.NO_EFFECT.value}
 _APPROVAL_TAGS = {EffectTag.NET_MUTATE.value, EffectTag.SEND_MESSAGE.value,
                   EffectTag.MONEY_MOVE.value,
                   EffectTag.LOCAL_DELETE.value, EffectTag.OAUTH_CALL.value,
-                  EffectTag.SHELL_EXEC.value}
+                  EffectTag.SHELL_EXEC.value,
+                  # F14 — "must the operator SEE this call?" Yes, for every one of
+                  # these: a screenshot and a clipboard read travel to the model
+                  # provider, synthetic input lands in whatever window has focus, a
+                  # browser action carries that browser's live session, and a toast
+                  # can impersonate a system dialog. The operator ruling of
+                  # 2026-08-07 lets FOUR of them be waived in one deliberate batch
+                  # (`effect_tags.OPERATOR_RULED_BATCH_APPROVABLE_2026_08_07`); it
+                  # does not make any individual call frictionless by default.
+                  EffectTag.SCREEN_CAPTURE.value, EffectTag.CLIPBOARD_READ.value,
+                  EffectTag.CLIPBOARD_WRITE.value, EffectTag.INPUT_SYNTHESIS.value,
+                  EffectTag.BROWSER_ACTUATE.value, EffectTag.DESKTOP_NOTIFY.value}
+
+# ── F14 — which tool-side classifications SUPPRESS the name verb-map ─────────
+#
+# The set `_effective_tags` actually consults. Its question is the one `_LOCAL_TAGS`
+# has always answered — "may the NAME verb-map escalate this tool?" — and the answer
+# is no whenever the tool-side tags ALREADY classify it, because the map is a
+# fallback for tools that are unclassified, not a second opinion about ones that are
+# not. That is the `send_summary_to_log` / `run_deploy_script` rule.
+#
+# WHY THE DESKTOP CAPTURE/ACTUATION CLASSES JOIN IT. Measured on the shipped catalog:
+# `type_text`, tagged `input_synthesis` from its `pynput` body, was scored
+# `{input_synthesis, send_message}` because the token "text" is in `_MESSAGE_VERBS`
+# ("text the customer"). That is a phantom effect — the tool sends no message — and
+# it excluded a tool the operator explicitly ruled batch-approvable, on a reason the
+# card would have printed as messaging. Same shape for `notify_desktop` and the
+# token "notify".
+#
+# WHY `browser_actuate` IS DELIBERATELY NOT HERE. The restriction to non-network
+# classes is the load-bearing half of the original rule. For a tool that reaches the
+# network, the structural scan can see THAT it egresses but not WHAT for, and the
+# name is the only signal separating a fetch from a payment from a message — so the
+# map must keep escalating it. `browser_actuate` is a network class (it is in
+# NET_EFFECTS), so `submit_expense_via_browser` still picks up NET_MUTATE and still
+# leaves the batch. The desktop classes carry no such ambiguity: there is no network
+# dimension for the name to disambiguate.
+#
+# The residual is the one `_LOCAL_TAGS` has always carried: a capture tool that ALSO
+# egresses is protected by the SCAN finding the egress sink (requests/urlopen/smtplib
+# /the curated `effect_signals` map), not by its name — pinned in
+# `test_a_capture_tool_that_also_egresses_is_caught_by_the_SCAN_not_the_name`.
+_NAME_ESCALATION_EXEMPT = _LOCAL_TAGS | {
+    EffectTag.SCREEN_CAPTURE.value,
+    EffectTag.CLIPBOARD_READ.value,
+    EffectTag.CLIPBOARD_WRITE.value,
+    EffectTag.INPUT_SYNTHESIS.value,
+    EffectTag.DESKTOP_NOTIFY.value,
+}
 
 
 def _tokens(name: str) -> Set[str]:
@@ -302,12 +371,14 @@ def _effective_tags(ctx: ActionContext) -> Set[str]:
 
     network = ctx.target_is_network and not ctx.operator_confirmed_read_only
 
-    # A tool whose tool-side classification is purely local (and not network /
-    # unknown) is NOT escalated by its NAME — this is what keeps a local
-    # `send_summary_to_log` from being mis-read as SEND_MESSAGE.
+    # A tool whose tool-side classification is already complete and carries no
+    # network dimension (see `_NAME_ESCALATION_EXEMPT`) is NOT escalated by its
+    # NAME — this is what keeps a local `send_summary_to_log` from being mis-read
+    # as SEND_MESSAGE, and `type_text` from being mis-read as one off the token
+    # "text".
     local_only = (
         EffectTag.UNKNOWN.value not in tags
-        and tags <= _LOCAL_TAGS
+        and tags <= _NAME_ESCALATION_EXEMPT
         and not network
     )
 
@@ -362,6 +433,105 @@ def effective_tags(ctx: ActionContext) -> Set[str]:
     invalidate every stored approval.
     """
     return _effective_tags(ctx)
+
+
+# Operator-facing phrases for the effect classes a batch may not contain. Used ONLY to
+# say WHY a tool was excluded; an unlisted class falls back to its own tag value, so a
+# new effect class still produces an honest reason instead of a blank one.
+_EXCLUSION_PHRASE = {
+    EffectTag.SHELL_EXEC.value: "shell execution",
+    EffectTag.LOCAL_DELETE.value: "deletion",
+    EffectTag.NET_READ.value: "network egress",
+    EffectTag.NET_MUTATE.value: "network mutation",
+    EffectTag.SEND_MESSAGE.value: "messaging",
+    EffectTag.MONEY_MOVE.value: "money movement",
+    EffectTag.OAUTH_CALL.value: "OAuth / credential use",
+    # F14 — the capture/actuation classes. Four of these are batch-approvable by
+    # the 2026-08-07 ruling and so never reach this map in practice; the two that
+    # are NOT (clipboard_write, desktop_notify) need an honest phrase, and all six
+    # can still be named when the batch is refused for a DIFFERENT reason.
+    EffectTag.SCREEN_CAPTURE.value: "screen capture",
+    EffectTag.CLIPBOARD_READ.value: "clipboard read",
+    EffectTag.CLIPBOARD_WRITE.value: "clipboard replacement",
+    EffectTag.INPUT_SYNTHESIS.value: "synthetic keyboard / mouse input",
+    EffectTag.BROWSER_ACTUATE.value: "browser actuation",
+    EffectTag.DESKTOP_NOTIFY.value: "desktop notification",
+}
+
+
+def batch_approvable(ctx: ActionContext) -> Tuple[bool, str]:
+    """F9 — may this action class receive a STANDING, UNATTENDED, BLANKET allow?
+
+    Returns ``(ok, reason)``. This is a STRICTLY NARROWER question than the verdict:
+    ``evaluate_action`` asks "must the operator see THIS call?", which a shell tool
+    answers with REQUIRE_APPROVAL — an approvable card, per call, with the arguments in
+    front of the operator. Batch approval removes both the card AND the arguments,
+    forever, so the REQUIRE_APPROVAL band is not a safe batch. It was being used as one:
+    the first-run review card offered `run_command` and `file_delete` in a single click.
+
+    Two rules, in this order:
+
+      1. an UNKNOWN effect is refused — we cannot grant blanket permission for something
+         we could not classify, and empty ``effect_tags`` (the commonest backfill
+         outcome, and what every desktop actuator in the seed catalog carries) reaches
+         here as UNKNOWN via ``_effective_tags``;
+      2. every remaining class must be in the ``BATCH_APPROVABLE`` ALLOWLIST.
+
+    Scored on :func:`effective_tags` — the ESCALATED set — NEVER on ``ctx.effect_tags``.
+    An untagged ``wire_payout`` declares nothing and scores ``money_move`` off the name
+    verb map; reading the declared set is how a money-move gate once reached one-tap
+    approval (``messaging.decision_bridge.classify_resolution``). A tool's own
+    declaration may add information here, never remove an escalation.
+    """
+    from systemu.runtime.effect_tags import (batch_approvable_tags, coerce as _coerce,
+                                             is_batch_approvable_tag)
+
+    tags = _effective_tags(ctx)
+    declared = {_coerce(t) for t in (ctx.effect_tags or ())}
+    declared.discard(EffectTag.UNKNOWN.value)
+
+    def _name(t: str) -> str:
+        """Name one offending class — and say whether the TOOL declared it.
+
+        A tag the scorer ADDED is a governor INFERENCE, not a statement by the tool, and
+        the card must not present the two as the same kind of fact. Unqualified, the
+        rendered line read ``file_list_dir — unclassified [excluded: network mutation]``:
+        self-contradictory on its face, and a false assertion about what that tool does
+        (the name verb map fires on the token "file"). A reason that overstates is the
+        same defect class as a promise that overstates — which is what F9 was.
+
+        Kept SHORT on purpose: this string is rendered once per excluded tool on a card
+        that is persisted in the decision context and drawn in the dashboard, where an
+        oversized detail block is clipped at 8000 chars (R-UX2). The full rule is stated
+        ONCE at the top of the card; these are labels, not explanations.
+        """
+        phrase = _EXCLUSION_PHRASE.get(t, "high-authority effect")
+        return f"{phrase} ({t})" if t in declared else (
+            f"{phrase} ({t} — name-inferred, not declared)")
+
+    outside = sorted(t for t in tags if not is_batch_approvable_tag(t))
+
+    if not declared:
+        # Lead with the honest headline: this tool told us NOTHING. Whatever the
+        # governor inferred is secondary and is labelled as an inference.
+        why = "declares no effects — nothing was classified"
+        inferred = [t for t in outside if t != EffectTag.UNKNOWN.value]
+        if inferred:
+            why += "; name suggests " + ", ".join(_name(t) for t in inferred)
+        return False, why
+
+    if EffectTag.UNKNOWN.value in tags:
+        return False, "carries an unclassified effect alongside its declared ones"
+    if outside:
+        return False, "; ".join(_name(t) for t in outside)
+    # NOT "reversible local effect" any more. That phrase was accurate while the
+    # allowlist held only `local_read`/`local_write`; after the 2026-08-07 ruling it
+    # would describe a screen capture and a browser action as reversible and local,
+    # which is neither true nor the basis on which they were admitted. The set is
+    # named instead of characterised, so the sentence cannot go stale the next time
+    # the set changes.
+    return True, ("fully classified, and every class is in the batch-approvable "
+                  "allowlist (" + ", ".join(batch_approvable_tags()) + ")")
 
 
 def _high_severity_signal(ctx: ActionContext, tags: Set[str]) -> bool:

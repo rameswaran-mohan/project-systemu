@@ -32,4 +32,4 @@
 # takes the fast path and NEVER receives seed changes.  It was pinned at
 # "0.9.59" across 22 releases (through 0.10.21) and that is exactly what
 # happened — proven by driving the real migrator against a real vault.
-__version__ = "0.10.22"
+__version__ = "0.10.23"

@@ -79,6 +79,14 @@ def _derive_effect_tags_from_source(impl_path) -> set:
     source is missing / unreadable / classifies to nothing, and the caller treats
     that as UNDETERMINABLE, so an empty return can never silently exempt.
 
+    F14 — an EMPTY return is now strictly narrower and strictly more meaningful. A
+    body the classifier can PROVE effect-free returns ``{"no_effect"}``, not
+    ``set()``, so the undeterminable case here really is undeterminable rather than
+    "undeterminable or trivially safe". ``no_effect`` is deliberately NOT in
+    ``_COMMAND_GATE_DELEGABLE_TAGS``: a pure Python function is not a shell command,
+    so it has no command-gate exemption to inherit, and the subset test below fails
+    for it exactly as it did when it scanned to nothing.
+
     ``.value``, NOT ``str()``. ``EffectTag`` is a ``(str, Enum)`` whose ``str()``
     renders ``"EffectTag.SHELL_EXEC"``, not ``"shell_exec"``. Comparing that form
     against ``_COMMAND_GATE_DELEGABLE_TAGS`` fails for EVERY tag, which would

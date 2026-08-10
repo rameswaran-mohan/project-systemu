@@ -39,7 +39,11 @@ def db(tmp_path):
 
 
 def _run(args, db_url):
-    env = {**os.environ, "SYSTEMU_DATABASE_URL": db_url}
+    # F2: see tests/test_cli_doctor.py -- scoped `doctor` selects its backend
+    # through open_vault now, which needs SYSTEMU_STORAGE as well as the URL.
+    env = {**os.environ,
+           "SYSTEMU_STORAGE": "sqlite",
+           "SYSTEMU_DATABASE_URL": db_url}
     return subprocess.run([sys.executable, "-m", "sharing_on", *args],
                           cwd=str(REPO), capture_output=True, text=True,
                           timeout=120, env=env)

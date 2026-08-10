@@ -43,7 +43,18 @@ def test_wrapper_prints_message_and_exits_75_on_pending():
     assert "dec_abc" in res.output
     assert "tool_forge:tool_x" in res.output
     assert "Skip" in res.output and "Forge" in res.output
-    assert "sharing_on decisions resolve dec_abc" in res.output
+    # F23: the program name is resolved, not spelled. The wheel installs TWO
+    # equal console scripts for one entry point, so pinning either literal made
+    # the coherence fix look like a regression -- while accepting a name pip
+    # never puts on PATH. `<installed program> decisions resolve dec_abc`.
+    import tomllib
+    from pathlib import Path
+    _scripts = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml")
+        .read_text(encoding="utf-8"))["project"]["scripts"]
+    assert any(f"{p} decisions resolve dec_abc" in res.output for p in _scripts), (
+        f"the remedy must name an installed console script {sorted(_scripts)}:\n"
+        f"{res.output}")
 
 
 def test_wrapper_lets_other_exceptions_propagate():

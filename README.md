@@ -219,21 +219,56 @@ is reproducible from [`cgb_eval/`](cgb_eval) and [`cgb_results/`](cgb_results) v
 ## Quick start
 
 ```bash
-pip install systemu
+pip install "systemu[dashboard]"
 ```
 
 In your chosen working directory:
 
 ```bash
-sharing_on init           # seeds the starter catalog (41 tools, idempotent)
-sharing_on setup          # pick your LLM provider + model preset, store keys securely
-sharing_on daemon start
+systemu init           # seeds the starter catalog (41 tools, idempotent)
+systemu setup          # pick your LLM provider + model preset, store keys securely
+systemu daemon start
 ```
 
-`sharing_on setup` walks you through choosing a provider (OpenRouter, Google,
+> Plain `pip install systemu` gives you the full CLI, the runtime, the vault and
+> all 41 starter tools — but not the web UI, and `daemon start` needs it (the
+> command reports success only once a real connection to the dashboard port
+> succeeds, so without it there is nothing to witness). It will tell you so and
+> name the command. See [Optional capability groups](#optional-capability-groups).
+
+> **Two names, one command.** The wheel installs `systemu` **and**
+> `sharing_on`; they are the same entry point, so every example below works
+> under either. `systemu` is the name this documentation leads with because it
+> is the one you just typed into `pip install`. `sharing_on` is the original
+> capture-engine name — it is permanent, not deprecated, and existing scripts
+> keep working unchanged.
+
+`systemu setup` walks you through choosing a provider (OpenRouter, Google,
 OpenAI, Anthropic, or a local Ollama) per tier and stores the keys in a local
 `.env` — entered hidden, never echoed, never typed into a browser. Skip it and
 `daemon start` runs the same flow on first launch.
+
+### Optional capability groups
+
+The default install is the CLI, the runtime, the vault and the 41-tool starter
+pack. Two heavier capabilities ship as extras, because most installs never use
+them and together they were 46% of the download:
+
+| Add | Command | Turns on |
+|---|---|---|
+| Web dashboard | `pip install "systemu[dashboard]"` | `systemu daemon start` and the UI on <http://localhost:8765> |
+| Browser automation | `pip install "systemu[browser]"` then `python -m playwright install chromium` | `web_act`, `web_screenshot`, and `web_read`'s JS-render tier |
+| Everything | `pip install "systemu[all]"` | both of the above |
+
+The bare `pip install systemu` is 92 packages / 65 MB instead of 122 / 126 MB.
+
+**Nothing silently half-works without them.** A tool whose group is missing is
+listed as **UNAVAILABLE** by `systemu tools list` and `systemu find-tools`,
+refuses at call time with the exact install command instead of an
+`ImportError`, and `systemu doctor` prints an *Optional capability groups*
+table with the state of each. `systemu daemon start` without `[dashboard]`
+refuses immediately and names the command, rather than printing a URL that
+nothing serves.
 
 Open <http://localhost:8765>. A short setup wizard and guided tour take it from
 there: confirm your models, say who you are, run a starter task — then hit

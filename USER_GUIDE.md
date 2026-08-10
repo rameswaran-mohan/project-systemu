@@ -95,9 +95,15 @@ python -m playwright install chromium
 ### 3.5 Verify
 
 ```bash
-sharing_on info
-sharing_on --version
+systemu info
+systemu --version
+sharing_on --version   # the same program under its original name
 ```
+
+> **Two names, one command.** The wheel installs both `systemu` and
+> `sharing_on` from a single entry point. This guide leads with `systemu`
+> (the name on the `pip install` line); `sharing_on` is permanent and every
+> existing script keeps working.
 
 ---
 
@@ -124,8 +130,8 @@ Open `.env` in any text editor and set your values.
 |:---------|:--------|:--------|
 | `SYSTEMU_TIER1_MODEL` | `gemini-3.1-flash-lite-preview` | Deep reasoning — scroll refinement, shadow decisions, evolution |
 | `SYSTEMU_TIER2_MODEL` | `gemini-3.1-flash-lite-preview` | Structured output / code — tool forge, execution planning |
-| `SYSTEMU_TIER3_MODEL` | `deepseek/deepseek-v4-flash` | Fast / cheap — event-to-instruction formatting |
-| `SHARING_ON_MODEL` | `deepseek/deepseek-v4-flash` | Model used during the Record → Analyze step |
+| `SYSTEMU_TIER3_MODEL` | `z-ai/glm-4.5-air:free` | Fast / cheap — event-to-instruction formatting |
+| `SHARING_ON_MODEL` | `z-ai/glm-4.5-air:free` | Model used during the Record → Analyze step |
 | `GOOGLE_API_KEY` | *(empty)* | Optional. If set, Tier 1 & 2 route to Google AI Studio instead of OpenRouter. |
 
 Model names follow the format `provider/model-name`, e.g. `openai/gpt-4o-mini`, `anthropic/claude-haiku-4-5`. Any model on OpenRouter works.
@@ -141,7 +147,7 @@ Model names follow the format `provider/model-name`, e.g. `openai/gpt-4o-mini`, 
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `SYSTEMU_NON_INTERACTIVE` | `false` | Auto-pick the safe-default choice in every approval prompt. Renamed from `SYSTEMU_AUTO_APPROVE_SCROLLS` in v0.6.1 (old name no longer recognised). Dev/CI only. |
+| `SYSTEMU_AUTO_APPROVE_SCROLLS` | `false` | Skip the human approval step for scrolls. Dev/CI only. |
 | `SYSTEMU_AUTO_FORGE_TOOLS` | `false` | Auto-enable generated tools without code review. **DANGEROUS — never use in production.** |
 | `SYSTEMU_VAULT_DIR` | `systemu/vault` | Path to vault storage root (relative to project root) |
 | `SYSTEMU_OUTPUT_DIR` | `~/Documents` | Where Shadow-generated output files are saved |
@@ -200,7 +206,7 @@ docker compose --profile docker-sandbox up systemu-docker
 ### 5.4 Stopping
 
 ```bash
-sharing_on daemon stop
+systemu daemon stop
 ```
 
 Or press `Ctrl+C` in the terminal running the daemon.
@@ -238,7 +244,7 @@ Or press `Ctrl+C` in the terminal running the daemon.
 ### 7.1 Basic
 
 ```bash
-sharing_on record --name "Deploy app to staging"
+systemu record --name "Deploy app to staging"
 ```
 
 Sharing-On captures mouse clicks, keyboard input, window focus changes, and browser navigation silently in the background. Press `Ctrl+C` when done. Analysis runs automatically.
@@ -260,17 +266,17 @@ Sharing-On captures mouse clicks, keyboard input, window focus changes, and brow
 
 ```bash
 # With file watching and screenshots
-sharing_on record \
+systemu record \
   --name "Configure nginx" \
   --watch ./config \
   --screenshots \
   --screenshot-interval 5
 
 # Capture only — skip LLM step
-sharing_on record --name "Quick capture" --no-analyze
+systemu record --name "Quick capture" --no-analyze
 
 # Re-analyze a session captured earlier
-sharing_on analyze ./captures/quick_capture_cap_20260509_140000/
+systemu analyze ./captures/quick_capture_cap_20260509_140000/
 ```
 
 ### 7.4 What Gets Saved
@@ -300,12 +306,12 @@ A Scroll is the structured, reusable SOP that Systemu creates from a recording.
 ### Commands
 
 ```bash
-sharing_on scrolls list
-sharing_on scrolls list --status pending_approval
-sharing_on scrolls show <scroll_id>
-sharing_on scrolls refine ./captures/my_session_cap_20260509/
-sharing_on scrolls refine ./captures/my_session_cap_20260509/ --auto   # skip approval gate
-sharing_on scrolls approve <scroll_id>
+systemu scrolls list
+systemu scrolls list --status pending_approval
+systemu scrolls show <scroll_id>
+systemu scrolls refine ./captures/my_session_cap_20260509/
+systemu scrolls refine ./captures/my_session_cap_20260509/ --auto   # skip approval gate
+systemu scrolls approve <scroll_id>
 ```
 
 ### Statuses
@@ -337,19 +343,19 @@ A Shadow is an autonomous agent persona that executes Scrolls on your behalf.
 ### Commands
 
 ```bash
-sharing_on army list
-sharing_on army list --status active
-sharing_on army show <shadow_id>
+systemu army list
+systemu army list --status active
+systemu army show <shadow_id>
 
-sharing_on army awaken \
+systemu army awaken \
   --name "CI/CD Specialist" \
   --creativity 60 \
   --professionalism 85 \
   --techie 80 \
   --thinking 70
 
-sharing_on army execute <shadow_id> <scroll_id>
-sharing_on army execute <shadow_id> <scroll_id> --dry-run   # plan only, no real actions
+systemu army execute <shadow_id> <scroll_id>
+systemu army execute <shadow_id> <scroll_id> --dry-run   # plan only, no real actions
 ```
 
 ### Statuses
@@ -370,10 +376,10 @@ Tools are callable capabilities generated by the tool forge from what a recordin
 ### Commands
 
 ```bash
-sharing_on tools list
-sharing_on tools list --status deployed
+systemu tools list
+systemu tools list --status deployed
 
-sharing_on tools forge \
+systemu tools forge \
   --name "Fetch Ethereum Gas Price" \
   --context "Use etherscan.io or Infura JSON-RPC to get current gas price in gwei"
 ```
@@ -424,8 +430,8 @@ An Activity bundles a Scroll with the Skills and Tools needed to execute it. It 
 Skills are abstract procedural proficiencies extracted from recordings. A Shadow must have the required skills to be assigned an Activity.
 
 ```bash
-sharing_on skills list
-sharing_on skills list --category "Web Automation"
+systemu skills list
+systemu skills list --category "Web Automation"
 ```
 
 ---
@@ -435,9 +441,9 @@ sharing_on skills list --category "Web Automation"
 The evolution engine proposes improvements to the vault — better scroll objectives, merged tools, skill upgrades.
 
 ```bash
-sharing_on evolve run            # propose new evolutions
-sharing_on evolve show-pending   # view pending evolutions
-sharing_on evolve apply <evolution_id>
+systemu evolve run            # propose new evolutions
+systemu evolve show-pending   # view pending evolutions
+systemu evolve apply <evolution_id>
 ```
 
 ---
@@ -447,18 +453,18 @@ sharing_on evolve apply <evolution_id>
 The daemon is the background service managing the event queue, scroll refinement, Shadow execution, and the web dashboard.
 
 ```bash
-sharing_on daemon start                  # background
-sharing_on daemon start --port 9000      # custom port
-sharing_on daemon start --foreground     # foreground (Docker / debugging)
-sharing_on daemon stop
-sharing_on daemon status
+systemu daemon start                  # background
+systemu daemon start --port 9000      # custom port
+systemu daemon start --foreground     # foreground (Docker / debugging)
+systemu daemon stop
+systemu daemon status
 ```
 
 Logs: `systemu/vault/daemon.log`
 
 ```bash
 # Show current config (API keys masked)
-sharing_on settings show
+systemu settings show
 ```
 
 ---
@@ -541,7 +547,7 @@ Results saved to `benchmark_results.json`. Measures:
 
 | Problem | Solution |
 |:--------|:--------|
-| `sharing_on` command not found | Run `pip install -e .` from project root with `.venv` activated |
+| `systemu` / `sharing_on` command not found | Run `pip install -e .` from project root with `.venv` activated. Both names come from the same wheel — if one is missing, so is the other |
 | `OPENROUTER_API_KEY not set` | Add key to `.env`. Must start with `sk-or-v1-` |
 | Dashboard not loading at `:8765` | `netstat -ano \| findstr :8765` (Windows) — another process may own the port |
 | Port 49494 already in use | Previous session didn't exit cleanly. `netstat -ano \| findstr :49494` then `taskkill /PID <pid> /F` |
@@ -550,7 +556,7 @@ Results saved to `benchmark_results.json`. Measures:
 | Playwright errors | `python -m playwright install chromium` |
 | Recording captures 0 events | On macOS: grant Accessibility + Input Monitoring in System Settings → Privacy |
 | LLM returns prose instead of JSON | The repair retry handles this automatically. If it persists, try a different `SYSTEMU_TIER1_MODEL` |
-| Scroll stuck at `pending_approval` | `sharing_on scrolls approve <id>` or set `SYSTEMU_NON_INTERACTIVE=true` in `.env` for dev use |
+| Scroll stuck at `pending_approval` | `systemu scrolls approve <id>` or set `SYSTEMU_AUTO_APPROVE_SCROLLS=true` in `.env` for dev use |
 
 ---
 
@@ -575,18 +581,18 @@ Open **http://localhost:8765** in your browser.
 
 **Step 4 — Record a task**
 ```bash
-sharing_on record --name "My First Task"
+systemu record --name "My First Task"
 ```
 Perform your task, then press `Ctrl+C`.
 
 **Step 5 — Approve the scroll**
 ```bash
-sharing_on scrolls list --status pending_approval
-sharing_on scrolls approve <scroll_id>
+systemu scrolls list --status pending_approval
+systemu scrolls approve <scroll_id>
 ```
 
 **Step 6 — (Optional) Awaken a Shadow and execute**
 ```bash
-sharing_on army awaken --name "My Shadow" --techie 70 --professionalism 80
-sharing_on army execute <shadow_id> <scroll_id>
+systemu army awaken --name "My Shadow" --techie 70 --professionalism 80
+systemu army execute <shadow_id> <scroll_id>
 ```

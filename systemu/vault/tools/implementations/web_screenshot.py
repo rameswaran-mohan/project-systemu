@@ -15,6 +15,15 @@ def run(**kwargs) -> dict:
         path = BrowserPool.get().screenshot(url, output_path)
         return {"success": True, "image_path": path, "tier_used": "browser", "error": None}
     except Exception as exc:
+        # F21: the [browser] extra is not installed. `str(exc)` is already the
+        # full remedy (optional_deps builds it), but the TYPE is what lets the
+        # runtime stop retrying — this is a capability the operator has not
+        # installed, not a transient failure.
+        from systemu.runtime.optional_deps import OptionalDependencyMissing
+        if isinstance(exc, OptionalDependencyMissing):
+            return {"success": False, "image_path": "", "error": str(exc),
+                    "error_type": "capability_unavailable",
+                    "missing_packages": list(exc.packages), "retryable": False}
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             return {"success": False, "image_path": "", "error": "browser not ready (chromium installing)",
                     "error_type": "missing_dependency", "missing_packages": ["playwright-chromium"]}

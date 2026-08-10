@@ -164,7 +164,7 @@ def consult_available(provider_configured: Optional[bool] = None) -> bool:
     """True when the guided consult may run at all.
 
     Reuses the shipped probe (``platform_profile._provider_configured``, what
-    `sharing-on doctor` and the health page already report) instead of a second
+    `sharing_on doctor` and the health page already report) instead of a second
     notion of "is there a model". Probe failure ⇒ False: leading the operator into
     a consult that cannot parse is worse than leading with the palette."""
     if provider_configured is None:

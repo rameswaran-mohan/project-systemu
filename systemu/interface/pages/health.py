@@ -169,6 +169,12 @@ def health_view(*, load: "dict | None" = None, **overrides) -> dict:
         "versions": report["versions"],
         "problems": report["problems"],
         "honesty_rows": prof["host_capabilities"],
+        # F21: the same rows `doctor` prints, from the same mint. A dashboard
+        # operator can be missing [browser] while [dashboard] is present, so
+        # "which of my capabilities are not installed" is a live question on
+        # this page too — and F19's lesson was that two surfaces answering the
+        # same question from two derivations eventually disagree.
+        "optional_groups": report["optional_groups"],
         "last_error": report.get("last_error"),
         "status_chip": chip,
         "load": snap,
@@ -183,6 +189,25 @@ def _provider_text(provider: dict) -> str:
     if provider["reachable"] is False:
         return "unreachable"
     return "configured"
+
+
+def _daemon_build_text(build: dict) -> str:
+    """F13 — WHICH systemu build the daemon is executing.
+
+    UNVERIFIED is its own answer. A daemon that recorded no build is an older or
+    other build, which is the skew itself — collapsing that into silence is what
+    let a stale daemon pass for twenty minutes.
+    """
+    if type(build) is not dict:
+        return "unknown"
+    if not build.get("observed") and build.get("match") is None:
+        return "— (no daemon observed)"
+    if build.get("match") is False:
+        return (f"MISMATCH — daemon {build.get('daemon_version')} from "
+                f"{build.get('daemon_path')}")
+    if build.get("match") is True:
+        return f"{build.get('daemon_version')} (same build as this process)"
+    return "UNVERIFIED — the daemon did not record which build it loaded"
 
 
 def _needs_you_section():
@@ -281,11 +306,19 @@ def build_health_page() -> None:
             daemon = view["daemon"]["running"]
             daemon_txt = ("running" if daemon else
                           ("not running" if daemon is False else "unknown"))
+            # F13 / GATE-7a: this page is served BY the daemon, so its bare
+            # "systemu version" row was the daemon's own — but the operator
+            # reads it as the answer to "which build is everything running?".
+            # Both builds are named, and each says whose it is.
+            _build = view["daemon"].get("build") or {}
             for label, value in (
                 ("LLM provider", _provider_text(view["provider"])),
                 ("Keyring backend", kr_txt),
                 ("Daemon", daemon_txt),
-                ("systemu version", view["versions"].get("systemu", "?")),
+                ("systemu version (this process)",
+                 view["versions"].get("systemu", "?")),
+                ("systemu path (this process)", _build.get("cli_path") or "?"),
+                ("Daemon build", _daemon_build_text(_build)),
                 ("python version", view["versions"].get("python", "?")),
             ):
                 with ui.row().classes("w-full items-center").style("gap: 12px;"):
@@ -309,6 +342,21 @@ def build_health_page() -> None:
                 with ui.row().classes("w-full items-center").style("gap: 12px;"):
                     ui.label(label).classes("s-muted").style("min-width: 160px;")
                     ui.label(str(value)).classes("s-cell")
+
+            # ── F21 optional capability groups ────────────────────────────
+            ui.label("Optional capability groups").classes("s-section-head")
+            ui.label(
+                "Shipped as pip extras to keep the default install small. A "
+                "group that is not installed makes its tools UNAVAILABLE — "
+                "never silently broken."
+            ).classes("s-muted")
+            for grp in view["optional_groups"]:
+                state = "installed" if grp["installed"] else "UNAVAILABLE"
+                detail = grp["covers"] if grp["installed"] else grp["remedy"]
+                with ui.row().classes("w-full items-center").style("gap: 12px;"):
+                    ui.label(grp["label"]).classes("s-cell").style("min-width: 200px;")
+                    ui.label(state).classes("s-muted").style("min-width: 96px;")
+                    ui.label(detail).classes("s-muted")
 
             # ── DEP-10 honesty rows ───────────────────────────────────────
             ui.label("Host capabilities").classes("s-section-head")

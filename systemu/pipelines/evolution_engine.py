@@ -262,13 +262,13 @@ def _notify_evolution(evolution: Evolution, config: Config, vault: Vault) -> Non
             else:
                 logger.warning(
                     "[Evolution] Auto-apply returned False for %s — operator "
-                    "can retry via `sharing_on evolve apply %s`",
+                    "can retry via `systemu evolve apply %s`",
                     evolution.id, evolution.id,
                 )
         except Exception:
             logger.exception(
                 "[Evolution] Auto-apply raised for %s — operator can retry "
-                "via `sharing_on evolve apply %s`",
+                "via `systemu evolve apply %s`",
                 evolution.id, evolution.id,
             )
     else:

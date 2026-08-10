@@ -230,7 +230,7 @@ class TestSameVersionBootNormalizes:
         # The run genuinely short-circuited — this is what proves the
         # normalization is placed BEFORE the fast-path return.
         assert out["fast_path"] is True
-        assert out.get("added") is None and out.get("updated") is None
+        assert out.get("added") is None and out.get("impl_replaced") is None
         assert _vault_tool(empty_vault, "fetch_html").forged_by_systemu is False
 
     def test_normalization_is_idempotent(self, empty_vault, pinned_version):
@@ -294,7 +294,7 @@ class TestShaGuardIsLoadBearing:
         out = vm.run(Path(empty_vault))
 
         assert out["fast_path"] is False
-        assert out["updated"] >= 1
+        assert out["impl_replaced"] >= 1
         assert _vault_tool(empty_vault, "fetch_html").forged_by_systemu is False
         assert vm._file_sha256(_vault_impl(empty_vault, "fetch_html")) == vm._file_sha256(
             _pkg_root() / "tools" / "implementations" / "fetch_html.py")

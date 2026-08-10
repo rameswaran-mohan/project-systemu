@@ -58,7 +58,7 @@ SCOPE — WHAT THIS SLICE DOES NOT DO (stated, not implied)
       - ``world_facts`` never carries a census row, so §5.11 AC5 clause 3 ("a
         census-discovered capability wins a plan without the operator naming it") is
         DEMONSTRATED BY TEST ONLY, never on a default install;
-      - the ``sharing-on world`` standing-scan block renders nothing, because
+      - the ``sharing_on world`` standing-scan block renders nothing, because
         :func:`census_status` returns ``[]``.
     THIS IS NOT "THE CENSUS NEVER RUNS." :func:`run_census` is wired into the survey seam
     (``shadow_runtime`` invokes it every survey) and reads ``census_consent.json``

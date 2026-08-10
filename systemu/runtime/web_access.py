@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "systemu/0.9 (+https://pypi.org/project/systemu)"
+USER_AGENT = "systemu/0.9.8 (+https://github.com/rameswaran-mohan/project-systemu)"
 OSM_ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
 _CTX = ssl.create_default_context()
 _OVERPASS_HOSTS = [
@@ -364,8 +364,16 @@ def _browser_render(url: str) -> Optional[str]:
     try:
         from systemu.runtime.browser_pool import BrowserPool  # type: ignore
         return BrowserPool.get().render_html(url)
-    except Exception:
-        logger.debug("[web_access] browser render unavailable", exc_info=True)
+    except Exception as exc:
+        # F21: distinguish "the render tier is NOT INSTALLED" from "the render
+        # tier tried and failed". Both return None (the caller falls back
+        # exactly as before), but only one has a one-command fix, and logging
+        # it at debug alongside genuine render errors buried it.
+        from systemu.runtime.optional_deps import OptionalDependencyMissing
+        if isinstance(exc, OptionalDependencyMissing):
+            logger.info("[web_access] JS-render tier skipped — %s", exc)
+        else:
+            logger.debug("[web_access] browser render unavailable", exc_info=True)
         return None
     finally:
         _BROWSER_SEM.release()

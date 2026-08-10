@@ -738,7 +738,15 @@ def _execute(
 # the effective tags are non-empty and a subset of SAFE_LOCAL. This matches the
 # live S1 gate's "empty ⇒ UNKNOWN ⇒ don't trust" principle — the dry-run must be
 # at least as safe as the gated live path.
-_SAFE_LOCAL_TAGS = {"local_read", "local_write", "local_delete"}
+#
+# F14: `no_effect` joins them. It is the STRONGEST member of this set, not a weaker
+# one — it is minted only by `classify_source`'s purity proof (no sink, no impure
+# builtin, no dynamic access, every import inert), so it is the one value here that
+# is a POSITIVE proof of non-egress rather than a classification of which egress.
+# Leaving it out would have quietly regressed the dry-run: a pure body used to scan
+# to `set()` and be skipped as undeterminable, and would now scan to `{no_effect}`
+# and be skipped as "not a subset of SAFE_LOCAL" — same skip, new wrong reason.
+_SAFE_LOCAL_TAGS = {"local_read", "local_write", "local_delete", "no_effect"}
 
 
 def _resolve_impl_path(tool: "Tool", config: "Config") -> Optional[Path]:

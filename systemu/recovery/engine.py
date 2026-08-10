@@ -36,18 +36,25 @@ class RecoveryEngine:
 
         actions: List[RecoveryAction] = []
 
+        # F6: `fix_command` is printed VERBATIM by `sharing_on doctor <id>` as
+        # "OR: <cmd>", so it has to be a command that exists.  `tools review`
+        # never has: there is no CLI spec/code-review surface at all, and these
+        # two kinds are deliberately absent from verbs.doctor_apply's
+        # _APPLYABLE set -- they route through the dashboard recovery gate.
+        # So the honest value is None (the shape FS_PERMISSION already uses):
+        # `fix_url` still carries the /recover link that DOES work.
         if tool.status == "proposed":
             actions.append(self._make(
                 "tool", tool_id, "GATE_1_PENDING",
                 f"Tool {tool.name} awaits Gate 1 (Spec Review).",
-                f"sharing_on tools review {tool_id}",
+                None,
                 "blocker",
             ))
         elif tool.status == "forged":
             actions.append(self._make(
                 "tool", tool_id, "GATE_2_PENDING",
                 f"Tool {tool.name} awaits Gate 2 (Code Review).",
-                f"sharing_on tools review {tool_id}",
+                None,
                 "blocker",
             ))
 
@@ -64,10 +71,13 @@ class RecoveryEngine:
                 pkg = classified.missing_package or (
                     (tool.dependencies or [None])[0] if getattr(tool, "dependencies", None) else None
                 ) or "a required package (see tool manifest)"
+                # F6: `tools install-deps` does not exist either.  DEP_PENDING
+                # IS in verbs.doctor_apply's _APPLYABLE set, so the command that
+                # genuinely performs this fix is doctor's own --apply.
                 actions.append(self._make(
                     "tool", tool_id, "DEP_PENDING",
                     f"Tool {tool.name} missing package: {pkg}",
-                    f"sharing_on tools install-deps {tool_id}",
+                    f"systemu doctor {tool_id} --apply",
                     "blocker",
                 ))
             elif classified.kind == "FS_PERMISSION":
@@ -97,7 +107,7 @@ class RecoveryEngine:
             actions.append(self._make(
                 "tool", tool_id, "GATE_3_DISABLED",
                 f"Tool {tool.name} is disabled (Gate 3). Enable to use.",
-                f"sharing_on tools enable {tool_id}",
+                f"systemu tools enable {tool_id}",
                 "blocker",
             ))
 

@@ -70,11 +70,14 @@ def _handle_forge_rejection(decision, vault) -> CommandResult:
 def _handle_bulk_first_gate_review(decision) -> CommandResult:
     """IMPL-4: apply a resolved bulk first-gate review.
 
-    The batch Always-allow records a STANDING allow for the REQUIRE_APPROVAL-band tools
-    only. Every entry is re-scored inside ``apply_bulk_decision`` from its raw signals —
-    the verdict stamped in the decision context is untrusted by the time it comes back
-    out of the store — so a DENY-band tool can never be swept in, whatever the stored
-    row says. Best-effort; never raises."""
+    The batch Always-allow records a STANDING allow only for a tool that BOTH gates
+    (REQUIRE_APPROVAL band) and carries a batch-approvable effect class
+    (``effect_tags.BATCH_APPROVABLE``). Every entry is re-scored inside
+    ``apply_bulk_decision`` from its raw signals — the verdict stamped in the decision
+    context is untrusted by the time it comes back out of the store, and a card posted by
+    an older build may still list a shell tool as eligible — so neither a DENY-band nor a
+    high-authority tool can be swept in, whatever the stored row says. Best-effort; never
+    raises."""
     from systemu.runtime.first_gate_review import (apply_bulk_decision,
                                                    entries_from_context)
     ctx = decision.context or {}
@@ -97,7 +100,7 @@ def _handle_bulk_first_gate_review(decision) -> CommandResult:
     return CommandResult(
         status=CommandStatus.OK,
         summary=(f"Remembered {len(written)} tool(s) from the first-gate review; "
-                 f"{excluded} still gated (an unclassifiable high-severity effect "
+                 f"{excluded} still gated (a high-authority or unclassified effect "
                  f"cannot be batch-approved)."))
 
 

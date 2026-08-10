@@ -44,14 +44,41 @@ jobs:
           # Skip the docker-enterprise extra on Windows/macOS — those legs
           # don't have a working postgres + redis client wheel path for
           # every Python version; the matrix cells only need the core deps.
+          #
+          # v0.10.24: [dev] is REQUIRED here, not a nicety. playwright and
+          # nicegui left the core install; ~600 test modules reach
+          # systemu/interface/pages/* (nicegui at module scope) and the web
+          # tests reach playwright, so a bare `pip install -e .` would collect
+          # -error rather than exercise the slimmer default. The default
+          # install is verified separately by the fresh-venv step below.
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            pip install -e ".[docker-enterprise]"
+            pip install -e ".[docker-enterprise,dev]"
           else
-            pip install -e .
+            pip install -e ".[dev]"
           fi
 
           echo "=== STEP 2/4: pip install test deps ==="
-          pip install pytest pytest-asyncio fakeredis pyyaml
+          pip install pyyaml
+
+          echo "=== STEP 2b/4: the DEFAULT install must work without extras ==="
+          # The property the v0.10.24 slimming created: `pip install systemu`
+          # ALONE must produce a working CLI under BOTH console-script names,
+          # with neither optional group present. Checked in a throwaway venv so
+          # it cannot be satisfied by the [dev] packages installed above.
+          # Linux only: the venv layout differs on Windows and one leg proving
+          # it is enough — the property is about the wheel, not the OS.
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            python -m venv "$RUNNER_TEMP/default-install-check"
+            DIC="$RUNNER_TEMP/default-install-check/bin"
+            "$DIC/python" -m pip install --quiet --upgrade pip
+            "$DIC/python" -m pip install --quiet .
+            "$DIC/python" -c "import importlib.util as u; \
+              assert u.find_spec('nicegui') is None, 'nicegui leaked into the default install'; \
+              assert u.find_spec('playwright') is None, 'playwright leaked into the default install'; \
+              print('default install is slim')"
+            "$DIC/systemu" --version
+            "$DIC/sharing_on" --version
+          fi
 
           echo "=== STEP 3/4: pip list ==="
           pip list
@@ -111,7 +138,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -e ".[docker-enterprise]"
+          # v0.10.24: [dev] carries the optional groups (playwright, nicegui)
+          # that left the core install; requirements.txt already pins them, but
+          # the extra keeps this leg honest if that lockfile is ever slimmed.
+          pip install -e ".[docker-enterprise,dev]"
           pip install pytest pytest-asyncio
 
       # Re-run the orphan + Supervisor e2e tests against REAL Redis to catch

@@ -75,7 +75,7 @@ class TestVaultMigratorAddNew:
         monkeypatch.setattr("systemu.runtime.vault_migrator._package_vault_root",
                             lambda: fake_pkg_vault)
         out = run(Path(tmp_vault.root))
-        assert out["added"] == 1 and out["updated"] == 0
+        assert out["added"] == 1 and out["impl_replaced"] == 0
         # files copied
         assert (Path(tmp_vault.root) / "tools" / "implementations" / "extract_records.py").exists()
         assert (Path(tmp_vault.root) / "tools" / "tool_tool_extract_records.json").exists()
@@ -103,7 +103,7 @@ class TestVaultMigratorUpdateByName:
         monkeypatch.setattr("systemu.runtime.vault_migrator._package_vault_root",
                             lambda: fake_pkg_vault)
         out = run(Path(tmp_vault.root))
-        assert out["updated"] == 1 and out["added"] == 0
+        assert out["impl_replaced"] == 1 and out["added"] == 0
         assert "OLD CONTENT" not in impl.read_text(encoding="utf-8")
         # auto-heal: index entry replaced with package authoritative version
         idx = json.loads((Path(tmp_vault.root) / "tools" / "index.json").read_text())

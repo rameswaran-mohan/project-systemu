@@ -116,10 +116,23 @@ def test_profile_keyring_backend_is_a_valid_enum_on_every_os():
 # ── provider_configured is driven by the environment (hermetic) ──────────────
 
 def test_provider_configured_reflects_env(monkeypatch):
+    """F19: `provider_configured` is now "is ANY provider usable", minted by
+    `systemu.runtime.provider_status` instead of read off one env var. The
+    property here is unchanged — the profile still reflects the environment —
+    but the environment now genuinely includes a keyless provider, so the other
+    four are cleared and Ollama is pointed at a dead port to keep this hermetic
+    on a developer machine running `ollama serve`.
+    """
+    from systemu.runtime import provider_status as ps
+    for var in ("GOOGLE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:1")   # nothing listens
+    ps.clear_probe_cache()
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-present")
     assert pp.platform_profile(platform_str="linux")["provider_configured"] is True
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert pp.platform_profile(platform_str="linux")["provider_configured"] is False
+    ps.clear_probe_cache()
 
 
 def test_arch_and_python_version_are_populated():

@@ -43,18 +43,19 @@ _MAX_PRECEDE = 8
 
 
 def _has_llm_provider(config) -> bool:
-    """True iff at least one LLM provider key is configured. When none is, the
-    open-world planner cannot make a call, so the stage short-circuits to the
-    static tree — no pointless 401, no network in an offline/keyless run. Never
-    raises (a missing attr → treated as unset)."""
-    for attr in ("openrouter_api_key", "google_api_key",
-                 "anthropic_api_key", "openai_api_key"):
-        try:
-            if (getattr(config, attr, "") or "").strip():
-                return True
-        except Exception:
-            continue
-    return False
+    """True iff at least one LLM provider is usable. Consumes THE ONE MINT.
+
+    When none is, the open-world planner cannot make a call, so the stage
+    short-circuits to the static tree — no pointless 401, no network in an
+    offline run. Never raises.
+
+    F19 / DEC-43 form (i): this used to enumerate four config ATTRIBUTE names,
+    a verbatim twin of ``episodic_memory._has_llm_provider``. Two copies of a
+    recipe are two chances to disagree, and neither knew about the keyless
+    provider. ``any_provider_usable`` spends the loopback witness only when a
+    tier explicitly selects that provider — this runs per planning pass."""
+    from systemu.runtime import provider_status as _ps
+    return _ps.any_provider_usable(config)
 
 
 def _resolve_planner_tier(config) -> int:

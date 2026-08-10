@@ -78,21 +78,78 @@ class TestPackContract:
         assert bad == []
 
     def test_every_pack_dep_ships_with_the_core_install(self):
-        """W12-B1 (R3/R5): a starter tool must never hit the dep-approval
-        flow on a fresh install — every pip dep the seed pack declares is a
-        core dependency of systemu itself. Platform-conditional deps
-        (pynput, win32-only) count as shipped."""
+        """W12-B1 (R3/R5): a starter tool must never hit the DEP-APPROVAL flow
+        on a fresh install.
+
+        v0.10.24 AMENDED THE CRITERION, and the amendment is narrower than it
+        looks. The old rule was "every declared dep is a core dependency",
+        which was the right rule while nothing was optional. `playwright` then
+        moved to the `[browser]` extra (38.2 MB of a 126.3 MB install, for
+        three tools most operators never call), so three seed tools legitimately
+        have a dep that is not core.
+
+        What is NOT relaxed is R3/R5 itself. The dep-approval flow is still
+        unreachable for a seed tool: `dependency_installer.ensure_satisfied`
+        short-circuits a registered optional group to BLOCKED_MISSING_EXTRA
+        BEFORE the PROMPT branch, so the operator is never asked to approve a
+        first-party package. What replaces "is core" is "is core OR is a
+        registered group with a live unavailability path", and the second
+        disjunct is fenced end-to-end in
+        tests/test_f21_optional_capability_honesty.py.
+
+        A dep that is NEITHER is the state this test exists to catch: it has no
+        remedy, no surface reports it, and the tool fails at call time. That is
+        still a hard failure here.
+
+        Parsed with tomllib. The previous string-split
+        (`split("dependencies = [")[1].split("]")[0]`) truncated the block at
+        the first `]` in a COMMENT and silently reported five shipped packages
+        as missing.
+        """
         import re
-        pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
-        deps_block = pyproject.split("dependencies = [", 1)[1].split("]", 1)[0]
-        shipped = {re.split(r"[<>=!~;\[]", line.strip().strip('",'))[0].lower()
-                   for line in deps_block.splitlines()
-                   if line.strip().startswith('"')}
-        declared = {d.lower() for t in _index()
+        import tomllib
+        from systemu.runtime import optional_deps as od
+
+        pyproject = tomllib.loads(
+            (REPO / "pyproject.toml").read_text(encoding="utf-8"))
+        core = {od.canonical(re.split(r"[<>=!~;\[ ]", s.strip())[0])
+                for s in pyproject["project"]["dependencies"]}
+        grouped = {od.canonical(p) for g in od.GROUPS for p in g.packages}
+        declared = {od.canonical(d) for t in _index()
                     for d in (t.get("dependencies") or [])}
-        missing = declared - shipped
-        assert missing == set(), \
-            f"pack deps not shipped with the core install: {sorted(missing)}"
+
+        # Premise guard: if the parse silently produced nothing, the assertion
+        # below would pass vacuously for every dep in the catalog.
+        assert len(core) > 20, f"core dependency parse returned {sorted(core)}"
+
+        uncovered = sorted(declared - core - grouped)
+        assert uncovered == [], (
+            f"pack deps that are neither a core install dependency nor a "
+            f"registered optional group: {uncovered} — a tool needing one of "
+            f"these has no honest unavailability path and no remedy to print"
+        )
+
+    def test_a_seed_dep_in_an_optional_group_never_reaches_dep_approval(self):
+        """The half of R3/R5 the amendment above relies on, driven live."""
+        from systemu.runtime import optional_deps as od
+        from systemu.runtime.dependency_installer import (
+            InstallMode, InstallStatus, ensure_satisfied,
+        )
+        grouped = [p for g in od.GROUPS for p in g.packages]
+        assert grouped, "no optional groups — nothing to check"
+        real = od.is_installed
+        od.is_installed = lambda pkg: (
+            False if od.canonical(pkg) in {od.canonical(p) for p in grouped}
+            else real(pkg))
+        try:
+            r = ensure_satisfied([grouped[0]], mode=InstallMode.PROMPT,
+                                 approvals=None, tool_name="web_read")
+        finally:
+            od.is_installed = real
+        assert r.status is InstallStatus.BLOCKED_MISSING_EXTRA, r.status
+        assert r.pending_approval == [], (
+            "a first-party optional package was queued for operator approval")
+        assert 'pip install "systemu[' in (r.error or ""), r.error
 
 
 # ── Execution layer — pure-local tools, real runner, outcome assertions ─────

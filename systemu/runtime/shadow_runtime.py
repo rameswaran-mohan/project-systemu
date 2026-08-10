@@ -1579,8 +1579,13 @@ def _trigger_episodic_capture(
 ) -> None:
     """v0.9.2 hook: summarize+persist the finished run.
 
-    Gated by config.summarize_after_run. Best-effort — failures degrade silently
-    so a flaky LLM never blocks the user's task from completing.
+    Gated by config.summarize_after_run. Best-effort — a flaky LLM never blocks
+    the user's task from completing — but NOT silent (F12/DEC-34): the run
+    reports SUCCESS either way, so an operator who was sold cross-session recall
+    has to be told when it did not record. Both failure modes route to the same
+    operator notice: ``capture`` returning None (it emits its own) and
+    ``capture`` RAISING (emitted here) — one gate widened without the other
+    would leave adjacent failures disagreeing about whether the feature ran.
     """
     if vault is None or config is None:
         return  # nothing to capture against (e.g. __new__-constructed ShadowRuntime)
@@ -1605,6 +1610,11 @@ def _trigger_episodic_capture(
             "[Runtime] episodic capture failed for session %s: %s",
             session_id, exc,
         )
+        try:
+            from systemu.runtime.episodic_memory import _warn_operator_degraded
+            _warn_operator_degraded(session_id=session_id, reason=str(exc))
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────

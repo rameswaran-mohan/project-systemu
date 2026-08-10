@@ -120,9 +120,27 @@ def test_unparseable_source_is_unknown_not_empty():
     assert tags == {EffectTag.UNKNOWN.value}
 
 
-def test_no_sinks_yields_empty_set():
-    # a genuinely inert helper legitimately has no effect tags
-    assert et.classify_source("def run(a, b):\n    return a + b") == set()
+def test_no_sinks_distinguishes_PROVED_inert_from_UNCLASSIFIED():
+    """F14 — the two facts that used to share the value ``set()``.
+
+    This assertion used to read ``classify_source("def run(a,b): return a+b") ==
+    set()`` with the comment "a genuinely inert helper legitimately has no effect
+    tags". Both halves were the defect: the helper IS inert, but so was the value
+    returned for `web_search`, which reaches the network through a helper module the
+    import-binding scan cannot follow. One value, two opposite meanings, and the gate
+    could only fail closed on both — which is why the first-run card offered 0 tools.
+
+    An inert body that can be PROVED inert now carries the positive NO_EFFECT
+    witness. A body whose effects merely could not be determined still yields
+    ``set()``, and the absence of a tag is still never "no effect".
+    """
+    # provably inert: no sinks, no imports at all
+    assert et.classify_source("def run(a, b):\n    return a + b") == {
+        EffectTag.NO_EFFECT}
+
+    # inert-LOOKING but unprovable: the sink is behind a module the scan cannot follow
+    assert et.classify_source(
+        "import helpers\ndef run(**kw):\n    return helpers.nuke(kw)") == set()
 
 
 # --------------------------------------------------------------------------- #

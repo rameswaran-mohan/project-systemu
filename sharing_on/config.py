@@ -36,8 +36,8 @@ if _ENV_FILE.exists():
     load_dotenv(_ENV_FILE, override=False, encoding="utf-8-sig")
 
 
-# The legacy env-var compatibility shim for the old project-prefixed names
-# was removed in v0.3 per the deprecation window declared in v0.2's
+# Legacy env-var compatibility shim for silentgrasper_* names was
+# removed in v0.3 per the deprecation window declared in v0.2's
 # MIGRATION.md.  Operators must use the SHARING_ON_* names directly.
 
 
@@ -290,7 +290,7 @@ class Config:
         default_factory=lambda: int(os.getenv("SYSTEMU_CURATOR_MIN_IDLE_MINUTES", "120"))  # 2 hours
     )
 
-    # v0.9.6 (Layer 7 — Proactive Surfacing): auto-skill-extraction pattern.
+    # v0.9.6 (Layer 7 — Proactive Surfacing): auto-skill-extraction (Odysseus).
     auto_skill_extract_enabled: bool = field(
         default_factory=lambda: os.getenv("SYSTEMU_AUTO_SKILL_EXTRACT_ENABLED", "true").lower() != "false"
     )
@@ -396,7 +396,7 @@ class Config:
     web_reader_backend: str = "auto"         # auto | jina | raw
     web_search_backend: str = "auto"         # auto | ddg | brave | tavily | searxng
     web_cache_ttl_seconds: int = 900
-    nominatim_user_agent: str = "systemu/0.9 (+https://pypi.org/project/systemu)"
+    nominatim_user_agent: str = "systemu/0.9.8 (+https://github.com/rameswaran-mohan/project-systemu)"
     brave_api_key: str = ""                  # optional — OFF by default
     tavily_api_key: str = ""                 # optional — OFF by default
     searxng_url: str = ""                     # optional self-host — OFF by default
@@ -476,7 +476,7 @@ class Config:
     # v0.9.8 (B6): default Tier-3. The verdict task (judge a StateDelta yes/no) does
     # NOT need deep reasoning, and Tier-1 reasoning models wrap output in prose so the
     # JSON parser fails (-> spurious soft-passes that disable the verifier). Tier-3
-    # follows "return strict JSON" reliably and is the cheapest tier.
+    # (z-ai/glm-4.5-air:free) follows "return strict JSON" reliably AND is free.
     audit_log_enabled: bool = field(
         default_factory=lambda: os.getenv("SYSTEMU_AUDIT_LOG_ENABLED", "true").lower() != "false"
     )  # global on/off for the action-audit log at vault/audit/actions.jsonl (NOT system logging)
@@ -588,7 +588,7 @@ class Config:
             web_cache_ttl_seconds=int(os.getenv("SYSTEMU_WEB_CACHE_TTL", "900")),
             nominatim_user_agent=os.getenv(
                 "SYSTEMU_NOMINATIM_UA",
-                "systemu/0.9 (+https://pypi.org/project/systemu)"),
+                "systemu/0.9.8 (+https://github.com/rameswaran-mohan/project-systemu)"),
             brave_api_key=os.getenv("SYSTEMU_BRAVE_API_KEY", ""),
             tavily_api_key=os.getenv("SYSTEMU_TAVILY_API_KEY", ""),
             searxng_url=os.getenv("SYSTEMU_SEARXNG_URL", ""),
@@ -666,11 +666,28 @@ class Config:
             )
 
     def validate(self) -> List[str]:
-        """Return a list of validation errors (empty = valid)."""
-        errors = []
-        if not self.openrouter_api_key:
-            errors.append(
-                "OPENROUTER_API_KEY not set. "
-                "Copy .env.example to .env and add your key."
-            )
+        """Return a list of validation errors (empty = valid).
+
+        F19 / DEC-43: this is rendered by ``sharing_on info`` as
+        "Configuration issues", and it used to say "OPENROUTER_API_KEY not set"
+        on a machine whose Google key or running Ollama the dashboard was
+        reporting as fine. The verdict now comes from
+        ``systemu.runtime.provider_status``, THE ONE MINT — the config object is
+        the LOADER of the environment, never the judge of it.
+
+        The keyless witness is spent here: ``info`` is an inspection command.
+        A mint that cannot be imported (install.py's pre-install reuse) leaves
+        validation silent rather than asserting a verdict it did not make.
+        """
+        errors: List[str] = []
+        try:
+            from systemu.runtime import provider_status as _ps
+        except Exception:  # pragma: no cover - systemu always ships alongside
+            return errors
+        statuses = _ps.all_provider_statuses(
+            self, cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
+        if not _ps.any_satisfied(statuses):
+            errors.append("No LLM provider is usable. "
+                          + _ps.configure_hint(statuses)
+                          + " Or run `systemu setup`.")
         return errors

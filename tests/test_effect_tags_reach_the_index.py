@@ -166,9 +166,10 @@ class TestTheMigrationBootDoesNotWipeTheClassification:
 
         summary = vm.run(vault)
 
-        assert summary.get("updated") == 1, (
+        assert summary.get("impl_replaced") == 1, (
             f"precondition: exactly the drifted tool takes the UPDATE branch; got "
-            f"{summary.get('updated')} updated / {summary.get('skipped_identical')} "
+            f"{summary.get('impl_replaced')} impl_replaced / "
+            f"{summary.get('skipped_identical')} "
             f"identical. Without an update there is no overwrite and nothing to wipe.")
         tid = _entry(vault, SHELL_TOOL)["id"]
         assert _body(vault, tid).get("effect_tags") == SHELL_TAGS, (
@@ -732,7 +733,7 @@ class TestADamagedVaultIsRepaired:
         assert after_first == SHELL_TAGS, "the repair was deferred to a later boot"
         assert (vault / "tools" / "index.json").read_bytes() == before
         assert (vault / "tools" / "index.json").stat().st_mtime_ns == mtime
-        assert vm.converge_index_effect_tags(vault).get("unclassified_bodies") == 0, (
+        assert vm.converge_index_effect_tags(vault).get("bodies_missing_tag_key") == 0, (
             "the trigger did not self-clear — this would re-derive on every boot")
 
     def test_converge_reports_the_bodies_it_cannot_classify(self, tmp_path):
@@ -740,21 +741,21 @@ class TestADamagedVaultIsRepaired:
         field; reporting it is how the decision reaches a caller that can."""
         vault = _build_vault(tmp_path, "0.0.1")
         vm.run(vault)
-        assert vm.converge_index_effect_tags(vault).get("unclassified_bodies") == 0
+        assert vm.converge_index_effect_tags(vault).get("bodies_missing_tag_key") == 0
 
         tid = _entry(vault, SHELL_TOOL)["id"]
         body = _body(vault, tid)
         del body["effect_tags"]
         _write_json(vault / "tools" / f"tool_{tid}.json", body)
 
-        assert vm.converge_index_effect_tags(vault).get("unclassified_bodies") == 1
+        assert vm.converge_index_effect_tags(vault).get("bodies_missing_tag_key") == 1
 
     def test_damage_at_the_CURRENT_generation_still_self_heals(self, tmp_path):
         """Isolates the DETECTOR from the generation bump.
 
         Here the marker already carries the current generation, so the generation
         mismatch cannot be what repairs this — only ``run`` acting on
-        ``unclassified_bodies`` can. This is the durable half: it repairs a wipe
+        ``bodies_missing_tag_key`` can. This is the durable half: it repairs a wipe
         that happens AFTER this release, with nobody remembering to bump anything.
         """
         vault = _build_vault(tmp_path, "0.0.1")
@@ -781,7 +782,7 @@ class TestTheDerivationGenerationReDerivesAnAlreadyStampedVault:
     A vault stamped by the pre-fix build under ``declared if declared else
     scanned`` carries a benign self-declared class on a body the scanner never
     classified. Nothing can detect that by inspection — a wrong value looks exactly
-    like a right one — so ``unclassified_bodies`` cannot see it and the marker
+    like a right one — so ``bodies_missing_tag_key`` cannot see it and the marker
     matches, which means the security fix above would never reach a single already
     deployed vault. Bumping ``_EFFECT_TAGS_GENERATION`` makes every existing marker
     mismatch exactly once.

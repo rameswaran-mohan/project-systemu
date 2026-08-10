@@ -6,8 +6,11 @@ modes that bit us in v0.8.0.1 UAT:
 
   - Multiple systemu daemon processes bound to port 8765 (port race wins
     the dashboard for a leftover daemon with stale config).
-  - OPENROUTER_API_KEY missing from the daemon's environment (LLM steps
-    silently fail with raw-event output).
+  - No LLM provider usable from the daemon's environment (LLM steps
+    silently fail with raw-event output). F19: this check consumes
+    ``systemu.runtime.provider_status``, THE ONE MINT, so the banner cannot
+    nag an operator whose Google key or running Ollama the Settings page is
+    simultaneously reporting as fine.
   - Vault directory read-only (writes silently fail, dashboard goes empty).
 
 Architecture: a pure-data helper ``build_health_state()`` that returns a
@@ -91,8 +94,43 @@ def _count_systemu_daemons(_now: Optional[float] = None) -> int:
     return count
 
 
-def _openrouter_key_present() -> bool:
-    return bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
+def _provider_statuses(config=None, probe=None) -> dict:
+    """Every provider's MINTED verdict (DEC-43), memoised for the render path.
+
+    F19: this was ``_openrouter_key_present()`` — ``bool(os.environ[
+    "OPENROUTER_API_KEY"])`` — so the banner nagged an operator who had a
+    perfectly good Google key, or a running Ollama, to add an OpenRouter one.
+    That is one of the SIX private copies of the satisfaction recipe F19 closed.
+
+    ``build_health_state`` runs on EVERY route render, and the keyless witness
+    costs ~1-2 s of loopback, so the mint's short-TTL memo is used here for the
+    same reason ``_count_systemu_daemons`` has one. A memo replays a verdict
+    that was genuinely observed; it never invents one, and an expired entry
+    re-probes rather than decaying to green.
+    """
+    from systemu.runtime import provider_status as _ps
+    try:
+        if config is None:
+            # Its OWN try: before F19 an AppState that is not up yet (early
+            # boot, a unit call) would abort the whole lookup and the banner
+            # would report "no provider" for a machine that plainly had one.
+            try:
+                from systemu.interface.dashboard_state import AppState
+                config = getattr(AppState.get(), "config", None)
+            except Exception:
+                config = None
+        if config is None:
+            from sharing_on.config import Config
+            config = Config.from_env()
+        # THE DAEMON'S ENVIRONMENT is what this banner is about, and the
+        # predicate it replaces read `os.environ` directly. `env_overlay` keeps
+        # that reach: a long-lived AppState config snapshot can be older than
+        # the .env the operator just edited, and the banner must not report a
+        # provider as absent because the snapshot predates it.
+        return _ps.all_provider_statuses(_ps.env_overlay(config), probe=probe,
+                                         cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
+    except Exception:
+        return {}
 
 
 def _vault_writable(vault_dir: Optional[Path]) -> bool:
@@ -107,6 +145,19 @@ def _vault_writable(vault_dir: Optional[Path]) -> bool:
         return False
 
 
+def _lockout_degraded() -> tuple:
+    """F7: lockout stores that cannot persist (dashboard_auth's registry).
+
+    Best-effort -- never raises. An empty tuple means brute-force protection is
+    fully durable.
+    """
+    try:
+        from systemu.runtime.dashboard_auth import lockout_degradations
+        return lockout_degradations()
+    except Exception:
+        return ()
+
+
 def _storage_degraded() -> Optional[dict]:
     """The storage-degradation marker set by AppState._degraded_fallback (W3.3),
     or None. Best-effort — never raises if AppState isn't ready."""
@@ -119,7 +170,8 @@ def _storage_degraded() -> Optional[dict]:
 
 # -- Pure-data state builder (testable) --------------------------------------
 
-def build_health_state(vault_dir: Optional[Path] = None) -> HealthState:
+def build_health_state(vault_dir: Optional[Path] = None, *, config=None,
+                       provider_probe=None) -> HealthState:
     """Compute the current health state.  No UI, no side-effects."""
     state = HealthState()
 
@@ -132,18 +184,20 @@ def build_health_state(vault_dir: Optional[Path] = None) -> HealthState:
                 "Whichever wins the port race will serve this dashboard, "
                 "and recordings or decisions may land in the wrong vault."
             ),
-            cta="sharing_on daemon stop --all",
+            cta="systemu daemon stop --all",
         ))
 
-    if not _openrouter_key_present():
+    from systemu.runtime import provider_status as _ps
+    _statuses = _provider_statuses(config, provider_probe)
+    if not _ps.any_satisfied(_statuses):
         state.issues.append(HealthIssue(
             severity="warning",
             message=(
-                "OPENROUTER_API_KEY is not set in the daemon's environment. "
+                "No LLM provider is usable from the daemon's environment. "
                 "LLM-driven steps (capture analysis, scroll refinement) will "
                 "fail silently and you'll only get raw captured events."
             ),
-            cta="Add OPENROUTER_API_KEY=... to .env and restart the daemon.",
+            cta=_ps.configure_hint(_statuses) + " Then restart the daemon.",
         ))
 
     if vault_dir is not None and not _vault_writable(vault_dir):
@@ -164,6 +218,24 @@ def build_health_state(vault_dir: Optional[Path] = None) -> HealthState:
                      f"({deg.get('reason', 'unknown')}) — running on the local file "
                      f"vault. Records written now will NOT be in your {req} store."),
             cta=f"Fix the {req} connection/config and restart the daemon.",
+        ))
+
+    # F7: a lockout store that cannot be written counts failed logins in memory
+    # only. Protection is still ENFORCED, but it resets on restart -- and the
+    # operator must learn that here, not from a buried warning in the daemon log
+    # (which is exactly where the old silent fail-open went).
+    for deg in _lockout_degraded():
+        state.issues.append(HealthIssue(
+            severity="danger",
+            message=(
+                "Dashboard brute-force protection is DEGRADED: the login lockout "
+                f"store {deg.get('path', '?')} cannot be written "
+                f"({deg.get('reason', 'unknown')}). Failed logins are still being "
+                "counted and lockouts still apply, but the counter is in memory "
+                "only and resets if the dashboard restarts."
+            ),
+            cta="Fix permissions/disk space on the vault secrets directory, "
+                "then restart the dashboard.",
         ))
 
     return state

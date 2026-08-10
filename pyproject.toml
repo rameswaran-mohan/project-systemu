@@ -13,7 +13,6 @@ name = "systemu"
 dynamic = ["version"]
 description = "Record computer activity and generate step-by-step instructions"
 readme = "README.md"
-license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     # --- Capture engine (sharing_on) ---
@@ -41,15 +40,25 @@ dependencies = [
     # should install the system package and grant their venv access to it
     # (or pip install python3-pyatspi-wrapper if a maintained wheel ever
     # appears on PyPI).
-    "playwright>=1.50.0",
+    #
+    # v0.10.24 — `playwright` MOVED to [browser] and `nicegui` MOVED to
+    # [dashboard].  They were the two largest wheels in the set (38.2 MB and
+    # 20.3 MB of a 126.3 MB / 122-package install) and neither is reachable
+    # from the CLI: every playwright import in the tree is inside a function
+    # (runtime/web/browser_pool.py, runtime/web/provision.py) and nicegui is
+    # only imported by systemu/interface/{pages,components}, which nothing
+    # outside dashboard.py imports.  Their absence is now a first-class
+    # UNAVAILABLE state carried by systemu/runtime/optional_deps.py to every
+    # surface that lists a capability — see
+    # tests/test_f21_optional_capability_honesty.py.  Do NOT move a further
+    # package out of this list without registering a group there; a dep that
+    # is neither core nor grouped has no honest unavailability path, and that
+    # fence will refuse it.
 
     # --- v0.7-a-fix2: runtime stack ---
     # These were previously only in requirements.txt (a Windows-frozen
-    # lockfile that CI no longer installs).  Dashboard + vault + queue +
-    # scheduler need them to import; tests that exercise the dashboard
-    # (e.g. tests/test_recovery_panel.py) fail with ModuleNotFoundError
-    # if they are missing.  Listed at the loosest version that works.
-    "nicegui>=2.0",        # dashboard UI (Phase A/B/C/D/F pages)
+    # lockfile that CI no longer installs).  Vault + queue + scheduler need
+    # them to import.  Listed at the loosest version that works.
     "sqlalchemy>=2.0",     # vault ORM
     "alembic>=1.13",       # vault migrations
     "huey>=2.5",           # task queue (SQLite + Redis broker)
@@ -85,6 +94,41 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# ── v0.10.24 OPTIONAL CAPABILITY GROUPS ──────────────────────────────────────
+# Every extra below is REGISTERED in systemu/runtime/optional_deps.py::GROUPS.
+# That registry is what turns "the package is absent" into an honest
+# UNAVAILABLE across the capability index, `tools list`, `find-tools`, tool
+# invocation and `doctor`, instead of a tool that looks ready and then dies.
+#
+# The two names must stay in lockstep: an extra with no group means an absent
+# package with no remedy path; a group with no extra means the product prints
+# a `pip install systemu[x]` line that pip accepts and silently no-ops.
+# tests/test_f21_optional_capability_honesty.py fences BOTH directions.
+browser   = ["playwright>=1.50.0"]   # web_read / web_act / web_screenshot
+                                     # + `python -m playwright install chromium`
+dashboard = ["nicegui>=2.0"]         # `systemu daemon start`, the web UI
+
+# Everything optional, one line.  Two extras is two chances to run only the
+# first, so operators who want the whole product get a single command.
+all = [
+    "playwright>=1.50.0",
+    "nicegui>=2.0",
+]
+
+# Contributor install.  README has told people to run `pip install -e ".[dev]"`
+# since v0.7 and there was no such extra — pip prints a warning and installs
+# nothing, so the documented contributor setup silently produced a tree that
+# could not run the dashboard tests.  It exists now, and it carries the
+# optional groups because ~600 test modules reach systemu/interface/pages/*
+# (nicegui at module scope) and tests/test_web_*.py reach playwright.
+dev = [
+    "playwright>=1.50.0",
+    "nicegui>=2.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "fakeredis>=2.20",
+]
+
 # Three install modes — pick one with: pip install -e ".[<mode>]"
 #   local            — native Python, SQLite vault + Huey-SQLite broker
 #   docker-local     — docker-compose, Postgres vault + Huey-SQLite broker
@@ -95,10 +139,6 @@ dependencies = [
 #   openai-native    — native OpenAI SDK (already in core deps)
 anthropic = ["anthropic>=0.40"]
 openai-native = []  # uses existing openai dep
-
-# Development / test extra — what CONTRIBUTING.md + the README "Development"
-# section assume for `pip install -e ".[dev]"` (run the pytest suite).
-dev = ["pytest>=7.0", "pytest-asyncio>=0.23"]
 
 # v0.7-f: first out-of-tree plugin — Browser-Use wraps Playwright
 # with an LLM-driven agent loop.
@@ -136,27 +176,40 @@ docker-enterprise = [
 # instead.  See README.md "Quick Start" for the install matrix.
 
 [project.scripts]
+# TWO NAMES, ONE ENTRY POINT — both are permanent, neither is deprecated.
+#
+# `systemu` is the name the docs lead with: it is the distribution the operator
+# just typed into `pip install`, the Python package that holds the runtime, and
+# the prefix on every SYSTEMU_* env var. Until v0.10.24 it was the ONE name the
+# wheel did NOT install, so `pip install systemu` handed you a command called
+# `sharing_on` that appears nowhere in the line you just ran — a discovery dead
+# end that had already confused the AUTHORS (three runtime messages told
+# operators to run `systemu doctor …`; F6 fixed the messages, this fixes the
+# missing half).
+#
+# `sharing_on` is the original capture-engine name and stays exactly as it is.
+# Existing installs, shell scripts, the Dockerfile, USER_GUIDE examples and
+# every operator's muscle memory depend on it; an alias earns nothing by
+# retiring the name it is aliasing.
+#
+# They MUST stay the same target — `tests/test_f6_command_names_are_invocable.py
+# ::test_both_documented_program_names_are_declared` pins that, because two
+# names pointing at two entry points is two programs with one manual.
 sharing_on = "sharing_on.cli:main"
+systemu = "sharing_on.cli:main"
 
 [tool.pytest.ini_options]
 markers = [
-    "real_keyring: exercises the REAL OS credential store (Windows Credential Manager / macOS Keychain / SecretService) instead of the fake keyring double — opt-in via SYSTEMU_RUN_REAL_KEYRING=1, off by default (machine-global state, not tmp_path-scoped)",
     "linux_only: tests that only run on Linux (playwright, posix-only paths)",
     "docker_required: tests that need a docker daemon",
     "e2e: end-to-end live tests (skipped by default)",
     "smoke: boot the real dashboard + exercise it on uvicorn's serving loop (opt-in pre-release gate)",
     "slow: long-running tests",
     "real_survey: exercises the REAL R-A9 situational-inventory survey (opts out of the conftest survey stub)",
+    "real_keyring: exercises the REAL OS credential store (Windows Credential Manager / macOS Keychain / SecretService) instead of the fake keyring double — opt-in via SYSTEMU_RUN_REAL_KEYRING=1, off by default (machine-global state, not tmp_path-scoped)",
     "full_budget: opts out of any conftest budget/iteration cap (needs the real ladder)",
     "source_sensitive: reads a function/class SOURCE via inspect.getsource — fragile if the file under test is edited mid-run; auto-applied by conftest. Run `pytest -m 'not source_sensitive'` for the EDIT-SAFE gate (GATE-TIER / DEC-14).",
 ]
-
-[tool.setuptools]
-# v0.8.10: ship non-Python data files (the vault seed + tool implementations)
-# inside the wheel.  Combined with the package-data globs below, this makes a
-# bare `pip install systemu` carry the curated tool pack + Wild Card shadow so
-# the daemon boots with a working capability set out of the box.
-include-package-data = true
 
 [tool.setuptools.dynamic]
 # `systemu/__init__.py` is a docstring plus a string literal, so setuptools
@@ -166,12 +219,19 @@ include-package-data = true
 # to importing it at build time.
 version = {attr = "systemu.__version__"}
 
+[tool.setuptools]
+# v0.8.10: ship non-Python data files (the vault seed + tool implementations)
+# inside the wheel.  Combined with the package-data globs below, this makes a
+# bare `pip install systemu` carry the curated tool pack + Wild Card shadow so
+# the daemon boots with a working capability set out of the box.
+include-package-data = true
+
 [tool.setuptools.packages.find]
 # Both top-level packages are part of the editable install:
 #   * sharing_on  — the capture engine (declared as the PyPI package above)
 #   * systemu     — the runtime, pipelines, interface, and starter vault
-# The legacy rename-compat shim was removed in v0.3 per the deprecation
-# window declared in v0.2's MIGRATION.md.
+# The `silentgrasper*` rename-compat shim was removed in v0.3 per the
+# deprecation window declared in v0.2's MIGRATION.md.
 include = ["sharing_on*", "systemu*"]
 
 [tool.setuptools.package-data]

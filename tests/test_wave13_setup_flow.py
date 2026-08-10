@@ -62,8 +62,21 @@ class TestEnvWrite:
             assert mode == 0o600, f"expected 0600, got {oct(mode)}"
 
     def test_key_present_reads_env_file(self, tmp_path, monkeypatch):
+        """F19: `key_present` now means "is ANY provider usable" and consumes
+        `systemu.runtime.provider_status`. The property THIS test pins is
+        unchanged — a named .env is re-read from disk on every call, which is
+        what lets `daemon start` ask again after running the setup wizard.
+
+        The two added monkeypatches make it hermetic rather than weaker: the
+        keyless provider is decided by a live probe, and a developer machine
+        with `ollama serve` running would otherwise answer True for reasons
+        that have nothing to do with the file under test.
+        """
         from sharing_on.setup_flow import key_present
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        for var in ("OPENROUTER_API_KEY", "GOOGLE_API_KEY",
+                    "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:1")  # nothing listens
         p = _env(tmp_path)
         assert key_present(env_path=p) is False
         p.write_text("OPENROUTER_API_KEY=sk-or-x\n", encoding="utf-8")

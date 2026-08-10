@@ -22,13 +22,34 @@ COMMON = ("pandas", "beautifulsoup4", "lxml", "geopy", "python-dateutil")
 
 class TestCommonPackagesBundled:
     def test_common_forge_deps_ship_with_install(self):
-        pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
-        deps_block = pyproject.split("dependencies = [", 1)[1].split("]", 1)[0]
-        shipped = {re.split(r"[<>=!~;\[]", line.strip().strip('",'))[0].lower()
-                   for line in deps_block.splitlines()
-                   if line.strip().startswith('"')}
+        """The curated forge packages must be in the CORE install, not an extra.
+
+        F30: parsed with ``tomllib``, not by slicing the file. The old form was
+            pyproject.split("dependencies = [", 1)[1].split("]", 1)[0]
+        which truncates at the FIRST ``]`` after the marker. That happened to
+        work until optional-dependency groups and bracketed comments moved where
+        the first ``]`` lands, at which point the slice stopped covering the tail
+        of the list and the test reported five shipped packages as missing --
+        pandas, beautifulsoup4, lxml, geopy, python-dateutil -- none of which had
+        gone anywhere. A test that reads its own input wrongly does not just cry
+        wolf; in the other direction it would have missed a real removal.
+
+        (The same idiom was already found and replaced in
+        tests/test_starter_pack_conformance.py; this was the second copy.)
+        """
+        import tomllib
+
+        data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+        shipped = {
+            re.split(r"[<>=!~;\[ ]", spec.strip())[0].lower()
+            for spec in data["project"]["dependencies"]
+        }
         missing = [p for p in COMMON if p not in shipped]
-        assert missing == [], f"common forge deps not bundled: {missing}"
+        assert missing == [], (
+            f"common forge deps not bundled in [project.dependencies]: {missing}. "
+            f"These must ship with the core install so the forge never stops for a "
+            f"dep-approval prompt on first use."
+        )
 
 
 class TestQuickLaneDepGate:

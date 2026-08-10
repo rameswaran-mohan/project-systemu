@@ -3,7 +3,7 @@
 The FIRST wiring of the slice-1 substrate into the live run: after the §5.1
 situational-inventory survey builds its report, this WRITE-ONLY populator projects
 each entry into the durable ``FactStore``, so the world model is non-empty from the
-operator's actual setup (visible via ``sharing-on world`` / ``world.query``).
+operator's actual setup (visible via ``sharing_on world`` / ``world.query``).
 
 STRICTLY ADDITIVE + STORE-WRITE-ONLY — the slice-2a boundary:
   * it NEVER mutates the report or ``context._situation_report`` — the open-world

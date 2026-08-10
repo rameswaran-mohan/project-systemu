@@ -40,9 +40,7 @@
     "parameter_names": [
       "url"
     ],
-    "dependencies": [
-      "playwright"
-    ],
+    "dependencies": [],
     "status": "deployed",
     "enabled": true,
     "forged_by_systemu": false,

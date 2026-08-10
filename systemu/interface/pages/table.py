@@ -47,9 +47,14 @@ _ZONE_ORDER: List[tuple] = [
 _OTHER = "Other"
 
 # status -> Quasar color token (no raw hex; re-theming lives in design tokens).
+# F24: an UNRECOGNISED status falls through `.get(...)` to grey — i.e. renders
+# as unremarkable inventory. So a status the projector can emit and this map
+# does not carry is a silent downgrade, not a missing colour.
 _STATUS_COLOR = {
     "ready": "positive", "configuring": "warning", "stale": "negative",
     "broken": "negative", "declared": "grey", "suggested": "info",
+    # the optional-dependency group is not installed on this machine
+    "unavailable": "negative",
 }
 
 # a compact per-kind summary label
@@ -156,10 +161,16 @@ _REPAIR_ROUTE = {
 }
 
 
+#: statuses that mean "this needs the operator before it will work". F24 added
+#: `unavailable`: an absent optional dependency group is a repairable state and
+#: the Build page now carries the exact `pip install` line for it.
+_NEEDS_REPAIR = ("broken", "stale", "unavailable")
+
+
 def repair_route(kind: str, status: str) -> tuple:
     """(label, route) for a broken/stale card's primary Fix action, or ('', '')
     when the status is healthy or the kind has no management surface."""
-    if status not in ("broken", "stale"):
+    if status not in _NEEDS_REPAIR:
         return ("", "")
     route_label = _REPAIR_ROUTE.get(kind)
     if not route_label:

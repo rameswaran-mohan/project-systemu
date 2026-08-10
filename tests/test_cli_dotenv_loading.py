@@ -4,6 +4,34 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_env_after_dotenv_load():
+    """Undo what ``load_dotenv`` writes into ``os.environ``.
+
+    F30. These tests exist to prove that a ``.env`` in the CWD is loaded, so by
+    construction they cause ``load_dotenv`` to inject real values into the
+    process environment. ``monkeypatch`` cannot undo that: it restores only what
+    IT set, and ``load_dotenv`` writes behind its back. So this file leaked
+    ``OPENROUTER_API_KEY=test-cwd-marker`` into every test that ran after it.
+
+    That leak silently broke three provider tests 60 files later -- they assert
+    on "a machine with nothing configured" and the machine was no longer bare.
+    The failure only appears in a full-suite run, which is exactly the kind of
+    defect a targeted re-run cannot see.
+
+    Scoped to this file deliberately: a suite-wide autouse environment reset
+    would be a product-behaviour stub of the kind DEC-44 bans. The leak is
+    created here, so it is cleaned up here.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        for k in set(os.environ) - set(snapshot):
+            del os.environ[k]
+        os.environ.update(snapshot)
+
+
 def _isolated_cwd_env(tmp_path, monkeypatch, **env_vars):
     """Helper: write .env in tmp_path, chdir there, clear conflicting env."""
     env_path = tmp_path / ".env"

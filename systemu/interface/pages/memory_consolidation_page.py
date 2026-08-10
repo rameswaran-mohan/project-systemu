@@ -124,8 +124,12 @@ def _render_scheduler_card(vault) -> None:
             )
 
         with ui.row().style("gap: 36px; flex-wrap: wrap;"):
-            _sched_stat("Next run",      next_run)
-            _sched_stat("Last run",       last_run)
+            # F11: these two are the SCHEDULER's own metadata. The table below
+            # shows LAST CONSOLIDATED per shadow, parsed from ELDER_MEMORY.md —
+            # a different fact. Unqualified "Last run: never" sitting above
+            # "LAST CONSOLIDATED 2026-08-06 21:10" read as a contradiction.
+            _sched_stat("Next sweep",      next_run)
+            _sched_stat("Last sweep",      last_run)
             _sched_stat(
                 "Buffer threshold",
                 f"{BUFFER_THRESHOLD} lessons",
