@@ -268,3 +268,178 @@ def test_the_card_composes_the_engine_and_offers_both_actions():
     # ...and "No thanks" declines it permanently, then re-renders without it.
     assert "decline(" in src
     assert ".refresh()" in src
+
+
+# ===========================================================================
+#  Capability Wishlist v1, Task 3 - the fulfilment nudge
+#
+#  APPEND-ONLY: everything above this line is the pre-wishlist contract and
+#  stays verbatim.  A wish nudge is one more derivation in the SAME engine, so
+#  it inherits one-at-a-time and decline-forever for free; what needs its own
+#  pins is the PRECEDENCE it takes and the honesty wall in front of it.
+#
+#  PRECEDENCE AS IMPLEMENTED: the wish nudge is derived AFTER both starter
+#  proposals.  A cold install is told to record something first; only once
+#  `first_shadow` is satisfied or declined can a wish surface.  (`first_forge`
+#  cannot compete: it requires an EMPTY toolbox, and a fulfilled wish requires
+#  a deployed tool in it.)
+# ===========================================================================
+
+
+def _deployed(name, description):
+    return {"id": name, "name": name, "description": description,
+            "status": "deployed", "enabled": True}
+
+
+_INVOICE_TOOL = _deployed("invoice_reminder",
+                          "Email a reminder for an unpaid invoice.")
+_INVOICE_WISH = "send my weekly invoice reminders by email"
+
+
+def _lived_in(tmp_path, **kw):
+    """A vault past the starter proposals: it has recorded something."""
+    return _Vault(tmp_path, shadows=[{"id": "s1"}], **kw)
+
+
+class TestWishFulfilment:
+    def test_a_shipped_tool_that_matches_a_wish_becomes_the_proposal(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[_INVOICE_TOOL])
+        fid = add_wish(v, _INVOICE_WISH)
+
+        key, text, route = derive_proposal(v)
+        assert key == f"wish:{fid}"
+        assert route == "/tools"
+        assert _INVOICE_WISH in text
+        assert "invoice_reminder" in text
+        assert text.isascii()
+
+    def test_the_wish_nudge_ranks_below_the_two_starter_proposals(self, tmp_path):
+        """The precedence pin.  On a cold install the starter proposal wins even
+        though the wish is fulfillable; declining it lets the wish through."""
+        from systemu.interface.wishes import add_wish
+
+        v = _Vault(tmp_path, tools=[_INVOICE_TOOL])          # no shadows yet
+        add_wish(v, _INVOICE_WISH)
+
+        assert derive_proposal(v)[0] == "first_shadow"
+        decline(v, "first_shadow")
+        assert derive_proposal(v)[0].startswith("wish:")
+
+    def test_a_wish_nothing_matches_leaves_the_prior_answer_untouched(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[_INVOICE_TOOL])
+        add_wish(v, "walk my dog on tuesdays")
+        assert derive_proposal(v) is None
+
+        cold = _Vault(tmp_path / "cold")
+        add_wish(cold, "walk my dog on tuesdays")
+        assert derive_proposal(cold)[0] == "first_shadow"
+
+        forging = _Vault(tmp_path / "forging", shadows=[{"id": "s1"}])
+        add_wish(forging, "walk my dog on tuesdays")
+        assert derive_proposal(forging)[0] == "first_forge"
+
+    def test_the_newest_matching_wish_is_the_one_offered(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[
+            _INVOICE_TOOL,
+            _deployed("receipt_filer", "File a receipt into the right folder."),
+        ])
+        add_wish(v, _INVOICE_WISH)
+        newest = add_wish(v, "file my receipt scans into the right folder")
+
+        assert derive_proposal(v)[0] == f"wish:{newest}"
+
+    def test_a_declined_wish_never_returns_but_a_new_wish_is_a_new_key(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[_INVOICE_TOOL])
+        first = add_wish(v, _INVOICE_WISH)
+        decline(v, f"wish:{first}")
+        assert derive_proposal(v) is None
+
+        second = add_wish(v, "email me an invoice reminder every friday")
+        assert derive_proposal(v)[0] == f"wish:{second}"
+
+    def test_a_dismissed_wish_is_never_offered(self, tmp_path):
+        from systemu.interface.wishes import add_wish, dismiss_wish
+
+        v = _lived_in(tmp_path, tools=[_INVOICE_TOOL])
+        fid = add_wish(v, _INVOICE_WISH)
+        assert dismiss_wish(v, fid) is True
+        assert derive_proposal(v) is None
+
+    def test_a_broken_vault_with_wishes_still_yields_none(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        add_wish(_Vault(tmp_path), _INVOICE_WISH)
+        assert derive_proposal(_Exploding(tmp_path)) is None
+
+
+class TestWishHonestyWall:
+    """"The toolbox can now do this" may only be said about a tool that can
+    actually run today.  A forged-but-undeployed or disabled tool is a plan."""
+
+    def test_a_tool_that_is_not_deployed_cannot_fulfil_a_wish(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        for status in ("proposed", "forged", "tested"):
+            v = _lived_in(tmp_path / status, tools=[
+                dict(_INVOICE_TOOL, status=status)])
+            add_wish(v, _INVOICE_WISH)
+            assert derive_proposal(v) is None, status
+
+    def test_a_disabled_tool_cannot_fulfil_a_wish(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[dict(_INVOICE_TOOL, enabled=False)])
+        add_wish(v, _INVOICE_WISH)
+        assert derive_proposal(v) is None
+
+    def test_a_nameless_tool_is_never_named(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[dict(_INVOICE_TOOL, name="")])
+        add_wish(v, _INVOICE_WISH)
+        assert derive_proposal(v) is None
+
+    def test_the_wish_route_is_a_page_the_dashboard_registers(self, tmp_path):
+        from systemu.interface import dashboard
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[_INVOICE_TOOL])
+        add_wish(v, _INVOICE_WISH)
+        route = derive_proposal(v)[2]
+        assert f'@ui.page("{route}")' in inspect.getsource(dashboard)
+
+    def test_a_long_wish_is_quoted_with_a_visible_ellipsis(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        long_wish = ("send my weekly invoice reminders by email " + "x" * 300)
+        v = _lived_in(tmp_path, tools=[_INVOICE_TOOL])
+        add_wish(v, long_wish)
+        _key, text, _route = derive_proposal(v)
+        assert "..." in text
+        assert "x" * 300 not in text
+        assert len(text) < 300
+
+
+class TestWishPurity:
+    def test_deriving_a_wish_proposal_writes_nothing_new(self, tmp_path):
+        from systemu.interface.wishes import add_wish
+
+        v = _lived_in(tmp_path, tools=[_INVOICE_TOOL])
+        add_wish(v, _INVOICE_WISH)
+        before = sorted(p.name for p in Path(tmp_path).iterdir())
+        derive_proposal(v)
+        derive_proposal(v)
+        assert sorted(p.name for p in Path(tmp_path).iterdir()) == before
+
+    def test_the_engine_still_never_reaches_for_the_onthetable_store(self):
+        src = inspect.getsource(proposals)
+        for forbidden in ("table_store", "table_reconciler", "TableItem"):
+            assert forbidden not in src

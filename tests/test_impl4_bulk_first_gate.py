@@ -462,7 +462,17 @@ def _drive_tool_gate(monkeypatch, *, store, tool_name, effect_tags, parameters,
     return None
 
 
-# ── C2. the migration moment: posted ONCE, at boot ──────────────────────────
+# -- C2. the migration moment: posted ONCE, at the FIRST TASK SUBMISSION -----
+#
+# TIMING RULING (operator, 2026-08-12). This card used to post at DAEMON BOOT. A fresh
+# operator therefore met a HIGH-risk "Review N tool(s) before the action gate turns on"
+# demand at minute zero, before they had run anything - asked to consent to an inventory
+# they had no reason to have an opinion about yet. The card now posts at the first TASK
+# SUBMISSION, which is the first moment the operator has any stake in the answer.
+#
+# ONLY THE TIMING MOVED. The marker+version semantics, the partition, the BATCH_APPROVABLE
+# fence, the card's bytes, the executor and the inbox dispatch are all unchanged - pinned
+# below and in section C2b.
 
 def _vault_with_tools(tmp_path, tools):
     """Build a minimal post-backfill vault: tools/index.json + tool_<id>.json bodies."""
@@ -479,8 +489,8 @@ def _vault_with_tools(tmp_path, tools):
 
 
 def test_the_review_card_is_posted_once_per_version(tmp_path, monkeypatch):
-    """One-time, by construction. A card re-posted every boot is the very gate-fatigue
-    IMPL-4 exists to prevent."""
+    """One-time, by construction. A card re-posted on every submission is the very
+    gate-fatigue IMPL-4 exists to prevent."""
     from systemu.runtime import first_gate_review as fgr
     import systemu.interface.command.inbox as _inbox_mod
 
@@ -501,10 +511,10 @@ def test_the_review_card_is_posted_once_per_version(tmp_path, monkeypatch):
         vault=object(), vault_dir=vault_dir, version="0.9.58") == "dec-1"
     assert len(posted) == 1
 
-    # second boot, same version — no rescan, no second card
+    # second submission, same version - no rescan, no second card
     assert fgr.maybe_post_first_gate_review(
         vault=object(), vault_dir=vault_dir, version="0.9.58") == ""
-    assert len(posted) == 1, "the card must not re-post on every boot"
+    assert len(posted) == 1, "the card must not re-post on every submission"
 
     # a version bump re-runs the backfill, so a fresh card is correct
     assert fgr.maybe_post_first_gate_review(
@@ -512,7 +522,7 @@ def test_the_review_card_is_posted_once_per_version(tmp_path, monkeypatch):
     assert len(posted) == 2
 
 
-def test_a_failed_post_is_retried_on_the_next_boot(tmp_path, monkeypatch):
+def test_a_failed_post_is_retried_on_the_next_submission(tmp_path, monkeypatch):
     """The marker records that the operator was ASKED. Stamping it when the post failed
     would silently swallow the migration review entirely."""
     from systemu.runtime import first_gate_review as fgr
@@ -539,31 +549,535 @@ def test_a_failed_post_is_retried_on_the_next_boot(tmp_path, monkeypatch):
         vault=object(), vault_dir=vault_dir, version="0.9.58") == "dec-1"
 
 
-def test_the_daemon_posts_the_review_at_the_migration_moment(tmp_path, monkeypatch):
-    """The boot hook must actually be WIRED.
+# -- CRITERION 1: nothing is enqueued before the first task submission --------
 
-    Found by mutation testing: deleting the daemon's call left every other pin green —
-    the whole feature was reachable only from a test. A migration surface nobody invokes
-    at the migration moment is not built.
+def test_daemon_boot_enqueues_nothing(tmp_path, monkeypatch):
+    """CRITERION 1 (the timing ruling), stated as the BEHAVIOUR the operator sees.
+
+    Not "the daemon does not call ``maybe_post_first_gate_review``" - that is a
+    convention the checked party can decline by reaching the queue another way. This
+    drives the real boot helper against a real-shaped vault with a spy InboxQueue and
+    asserts the INBOX IS UNTOUCHED. Whatever route boot might take, it lands here.
+
+    The old pin asserted the exact opposite ("the daemon must post the first-gate review
+    after the backfill"). Its mutation-testing lesson - a surface nobody invokes is not
+    built - is not lost: it moves to the two lane pins below, which is where the call now
+    has to be.
     """
     from systemu.scheduler import daemon as _daemon
     import systemu.runtime.vault_migrator as _vm
-    import systemu.runtime.first_gate_review as fgr
+    import systemu.interface.command.inbox as _inbox_mod
 
-    called = {}
+    posted = []
 
+    class _Inbox:
+        def __init__(self, _vault):
+            pass
+
+        def enqueue(self, descriptor, **kw):
+            posted.append(descriptor)
+            return "dec-1"
+
+    monkeypatch.setattr(_inbox_mod, "InboxQueue", _Inbox, raising=False)
     monkeypatch.setattr(_vm, "run", lambda *a, **k: {"fast_path": True}, raising=False)
-    monkeypatch.setattr(fgr, "maybe_post_first_gate_review",
-                        lambda **kw: called.update(kw) or "dec-1", raising=False)
+
+    vault_dir = _vault_with_tools(tmp_path, [("t1", "process_data", []),
+                                             ("t2", "run_command", ["shell_exec"])])
 
     class _Vault:
-        root = str(tmp_path)
+        root = str(vault_dir)
 
     _daemon._v0822_run_vault_migrator(_Vault())
 
-    assert called, "the daemon must post the first-gate review after the backfill"
-    assert str(called["vault_dir"]) == str(tmp_path)
-    assert called["version"], "the card must be version-stamped (one card per version)"
+    assert posted == [], (
+        "daemon boot enqueued an approval card. A fresh operator must not be handed a "
+        f"HIGH-risk consent demand at minute zero: {[d.title for d in posted]}")
+    assert not (vault_dir / ".first_gate_review").exists(), (
+        "boot stamped the one-time marker without ever asking - the first task "
+        "submission would then find the offer already spent")
+
+
+def test_the_quick_lane_posts_the_review_at_the_first_task_submission(monkeypatch):
+    """CRITERION 1, quick lane. ``submit_quick_task`` is the quick lane's intake point
+    (``interface/pages/chat_page.py:421`` and ``pipelines/direct_task.py:708`)."""
+    import systemu.pipelines.quick_task as qt
+    from systemu.runtime import first_gate_review as fgr
+
+    seen = []
+    monkeypatch.setattr(fgr, "maybe_post_on_task_submission",
+                        lambda vault: seen.append(vault) or "dec-1", raising=False)
+    monkeypatch.setattr(qt, "run_quick_task",
+                        lambda *a, **k: qt.QuickResult(status="success", answer_md="ok"))
+
+    class _V:
+        root = "vault"
+
+        def append_chat_history(self, e):
+            pass
+
+        def update_chat_history_entry(self, ts, f):
+            pass
+
+    v = _V()
+    qt.submit_quick_task("hi", None, v)
+
+    assert seen and seen[0] is v, (
+        "the quick lane must offer the first-gate review at intake - otherwise the "
+        "card is reachable only from a test")
+
+
+def test_the_workflow_lane_posts_the_review_at_the_first_task_submission(monkeypatch):
+    """CRITERION 1, workflow lane. ``run_direct_task`` is the workflow lane's intake
+    point (``interface/pages/chat_page.py:425``, ``pipelines/direct_task.py:711``,
+    ``interface/cli_commands.py:1306``)."""
+    import systemu.pipelines.direct_task as dt
+    import systemu.pipelines.scroll_refiner as sr
+    import systemu.pipelines.activity_extractor as ae
+    import systemu.interface.notifications as notif
+    from systemu.runtime import first_gate_review as fgr
+
+    seen = []
+    monkeypatch.setattr(fgr, "maybe_post_on_task_submission",
+                        lambda vault: seen.append(vault) or "dec-1", raising=False)
+    monkeypatch.setattr(notif, "set_vault", lambda *a, **k: None)
+    monkeypatch.setattr(ae, "init_pipeline", lambda *a, **k: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("stop the pipeline right after intake")
+
+    monkeypatch.setattr(sr, "refine_from_text", _boom)
+
+    class _V:
+        root = "vault"
+
+        def append_chat_history(self, e):
+            pass
+
+        def update_chat_history_entry(self, ts, f):
+            pass
+
+    v = _V()
+    assert dt.run_direct_task("x", None, v) is None
+
+    assert seen and seen[0] is v, (
+        "the workflow lane must offer the first-gate review at intake")
+
+
+def test_the_task_intake_hook_keeps_the_marker_and_version_semantics(tmp_path,
+                                                                     monkeypatch):
+    """CRITERION 1, "post at most once" - and an UPGRADE STILL RE-OFFERS.
+
+    The hook must reuse the existing marker, not invent a second one: a fresh
+    classification generation has to be re-offered, which is the whole reason the marker
+    carries the version.
+    """
+    from systemu.runtime import first_gate_review as fgr
+    import systemu.interface.command.inbox as _inbox_mod
+    import systemu.runtime.vault_migrator as _vm
+
+    posted = []
+
+    class _Inbox:
+        def __init__(self, _vault):
+            pass
+
+        def enqueue(self, descriptor, **kw):
+            posted.append(descriptor)
+            return "dec-1"
+
+    monkeypatch.setattr(_inbox_mod, "InboxQueue", _Inbox, raising=False)
+    vault_dir = _vault_with_tools(tmp_path, [("t1", "process_data", [])])
+
+    class _V:
+        root = str(vault_dir)
+
+    v = _V()
+    monkeypatch.setattr(_vm, "_installed_version", lambda: "0.9.58", raising=False)
+
+    assert fgr.maybe_post_on_task_submission(v) == "dec-1"
+    assert len(posted) == 1
+    # every later submission on this version is a marker read and nothing more
+    assert fgr.maybe_post_on_task_submission(v) == ""
+    assert fgr.maybe_post_on_task_submission(v) == ""
+    assert len(posted) == 1, "the card must not re-post on every task submission"
+    assert (vault_dir / ".first_gate_review").read_text(encoding="utf-8").strip() == "0.9.58"
+
+    # an upgrade re-runs the backfill, so a fresh offer is correct
+    monkeypatch.setattr(_vm, "_installed_version", lambda: "0.9.59", raising=False)
+    assert fgr.maybe_post_on_task_submission(v) == "dec-1"
+    assert len(posted) == 2
+
+
+def test_the_task_intake_hook_never_raises_into_the_lane():
+    """A consent nicety must never be able to fail a submission."""
+    from systemu.runtime import first_gate_review as fgr
+
+    class _Broken:
+        @property
+        def root(self):
+            raise RuntimeError("vault root exploded")
+
+    assert fgr.maybe_post_on_task_submission(_Broken()) == ""
+    assert fgr.maybe_post_on_task_submission(None) == ""
+    assert fgr.maybe_post_on_task_submission(object()) == ""
+
+
+# -- C2b. CRITERIA 2-4: the timing moved, the SCOPE did not ------------------
+
+def test_the_per_tool_first_use_card_is_the_same_mint(monkeypatch):
+    """CRITERION 2: the per-tool first-use gate is untouched - zero changes to gate.py.
+
+    Two halves, because either alone is declinable:
+      * BEHAVIOURAL - drive the real ``_maybe_gate_tool`` and read the descriptor it
+        mints back off the queue: same title, same dedup namespace, same options, same
+        fail-closed safe_default at index 0.
+      * STRUCTURAL - ``gate.py`` must not have learned anything about task intake. If a
+        future edit routes the bulk card's timing through the descriptor module, this
+        trips.
+    """
+    from pathlib import Path
+    import systemu.interface.command.gate as _gate
+
+    d = _drive_tool_gate(monkeypatch, store=_Store(), tool_name="process_data",
+                         effect_tags=[], parameters={"path": "report.txt"},
+                         signature="sig-per-tool")
+    assert d is not None and d is not True, "the un-reviewed tool must gate on first use"
+    assert d.title == "Run tool: process_data"
+    assert d.dedup == "tool:sig-per-tool", (
+        "the per-tool card must still dedup on tool:<signature> - that key IS the "
+        "'ask the first time it runs' contract")
+    assert list(d.options) == ["Deny", "Approve once", "Always allow"]
+    assert d.safe_default == "Deny" == d.options[0]
+    assert "args: path='report.txt'" in d.inspect, (
+        "the per-tool card still shows the ACTUAL arguments - that is what makes it the "
+        "right place to decide, and the reason the bulk card need not come first")
+
+    src = Path(_gate.__file__).read_text(encoding="utf-8")
+    for forbidden in ("maybe_post_on_task_submission", "post_review_on_demand",
+                      "submit_quick_task", "run_direct_task"):
+        assert forbidden not in src, (
+            f"gate.py learned about task intake ({forbidden!r}). The descriptor module "
+            "mints cards; it must never decide WHEN one is posted")
+
+
+#: CRITERION 3 - the bulk card's bytes, frozen the moment before the timing moved.
+#: Rendered from a fixed partition by ``_bulk_card_blob`` below. A change to the lead,
+#: the consent record, the rule sentence, the partition copy, the options or the dedup
+#: moves this hash. It is SUPPOSED to be annoying: the ruling moved the timing and
+#: NOTHING else, and a later dated ruling that legitimately extends the consent record
+#: must be a deliberate, visible re-freeze - never a side effect.
+_BULK_CARD_SHA_REAL = "741a2859e187dd1a92d6ce8aa3683f055898ba4b5408dbdaa8455789f76cc508"
+_BULK_CARD_SHA_WITH_ELIGIBLE = (
+    "0c431080457622e0ea785b9ee2b3346b10b32dc9c63c227b97f14429ad5ff543")
+
+
+def _bulk_card_entries():
+    from systemu.runtime.first_gate_review import build_entry
+    return [
+        build_entry(tool_id="t1", name="process_data", effect_tags=[],
+                    signature="sig-a"),
+        build_entry(tool_id="t2", name="run_command", effect_tags=["shell_exec"],
+                    signature="sig-b"),
+        build_entry(tool_id="t3", name="ledger_sync",
+                    effect_tags=["money_move", "zzz_unmapped"], signature="sig-c"),
+    ]
+
+
+def _bulk_card_blob(partition):
+    import hashlib
+    import json
+    from systemu.interface.command.gate import GateDescriptor
+
+    d = GateDescriptor.from_first_gate_bulk(partition, version="9.9.9")
+    blob = json.dumps({"title": d.title, "risk": d.risk, "options": list(d.options),
+                       "safe_default": d.safe_default, "inspect": d.inspect,
+                       "what_approve_does": d.what_approve_does, "dedup": d.dedup},
+                      sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest(), d
+
+
+def test_the_bulk_card_content_is_byte_identical_after_the_timing_move():
+    """CRITERION 3: consent record, partition and options are BYTE-IDENTICAL.
+
+    The operator ruled that the timing moves and the scope does not. "Scope" on a
+    consent surface is the exact text the operator consents to, so the pin is the exact
+    text - hashed over the whole descriptor, not spot-checked over the phrases someone
+    remembered to assert.
+    """
+    from systemu.runtime.first_gate_review import partition_entries
+
+    partition = partition_entries(_bulk_card_entries())
+    assert (len(partition.eligible), len(partition.excluded),
+            len(partition.frictionless)) == (0, 3, 0), (
+        "the partition itself moved - re-derive the golden deliberately, do not "
+        "re-freeze it to make this pass")
+
+    got, d = _bulk_card_blob(partition)
+    assert got == _BULK_CARD_SHA_REAL, (
+        "the bulk card's content changed. Only the TIMING was ruled; the card the "
+        f"operator consents to did not move.\n--- title ---\n{d.title}\n"
+        f"--- options ---\n{list(d.options)}\n--- inspect ---\n{d.inspect}\n"
+        f"--- what_approve_does ---\n{d.what_approve_does}\n--- dedup ---\n{d.dedup}")
+
+
+def test_the_bulk_card_with_an_affirmative_option_is_byte_identical(
+        suppose_the_effect_is_batch_approvable):
+    """CRITERION 3, the branch that actually offers the sweep.
+
+    The real catalog has nothing batch-approvable today (correctly), so the golden above
+    only exercises the 0-eligible rendering. This freezes the other branch - the one
+    carrying the affirmative option's copy and the "what Approve does" promise.
+    """
+    from systemu.runtime.first_gate_review import partition_entries
+
+    partition = partition_entries(_bulk_card_entries())
+    assert (len(partition.eligible), len(partition.excluded)) == (2, 1)
+
+    got, d = _bulk_card_blob(partition)
+    assert got == _BULK_CARD_SHA_WITH_ELIGIBLE, (
+        "the bulk card's affirmative branch changed.\n--- options ---\n"
+        f"{list(d.options)}\n--- inspect ---\n{d.inspect}\n"
+        f"--- what_approve_does ---\n{d.what_approve_does}")
+
+
+def test_the_batch_approvable_fence_is_unmoved():
+    """CRITERION 3: the fence itself. Widening BATCH_APPROVABLE is how a timing change
+    turns into a scope change without anyone editing a card."""
+    from systemu.runtime import effect_tags as _et
+
+    assert sorted(_et.batch_approvable_tags()) == [
+        "browser_actuate", "clipboard_read", "input_synthesis", "local_read",
+        "local_write", "net_read", "no_effect", "screen_capture",
+    ], ("the batch-approvable allowlist moved. The timing ruling does not authorise "
+        "widening what a single click can bless")
+
+
+def test_the_executor_and_the_inbox_dispatch_are_unmoved(monkeypatch):
+    """CRITERION 3: ``apply_bulk_decision`` and the inbox ``tool_bulk`` handling.
+
+    Same affirmative label, same fail-closed default for everything else, and the inbox
+    still routes ``tool_bulk`` to the bulk executor rather than NOOPing it.
+    """
+    from systemu.runtime.first_gate_review import (BULK_GATE_TYPE, OPT_BULK_ALLOW,
+                                                   OPT_LEAVE_GATED,
+                                                   apply_bulk_decision)
+    from systemu.interface.command import inbox as _inbox
+
+    entry = _entry("process_data", [], signature="sig-x")
+    monkeypatch.setattr("systemu.runtime.first_gate_review.batch_exclusion_reason",
+                        lambda _e: "", raising=True)
+
+    store = _Store()
+    assert apply_bulk_decision([entry], choice=OPT_BULK_ALLOW, store=store) == ["sig-x"]
+    assert apply_bulk_decision([entry], choice=OPT_LEAVE_GATED, store=_Store()) == []
+    assert apply_bulk_decision([entry], choice="Always allow", store=_Store()) == []
+    assert apply_bulk_decision([entry], choice=None, store=_Store()) == []
+
+    assert BULK_GATE_TYPE == "tool_bulk"
+    src = __import__("inspect").getsource(_inbox.resolve_gate)
+    assert "BULK_GATE_TYPE" in src and "_handle_bulk_first_gate_review" in src, (
+        "the inbox stopped dispatching the bulk card to its executor - the card would "
+        "resolve to a NOOP and the operator's choice would be silently discarded")
+
+
+def test_re_gate_semantics_are_unchanged_by_the_timing_move(
+        monkeypatch, suppose_the_effect_is_batch_approvable):
+    """CRITERION 4: a swept allow still binds to the exact body + effect set, and still
+    yields to a higher-scoring call.
+
+    Both halves in one place because the timing move is exactly the kind of change that
+    could have been implemented by widening the allow (post later, remember harder).
+    """
+    from systemu.runtime.first_gate_review import apply_bulk_always_allow
+
+    store = _Store()
+    apply_bulk_always_allow([_entry("process_data", [], signature="sig-v1")],
+                            store=store)
+    assert store.standing == ["sig-v1"]
+
+    # RE-FORGE: a new body means a new signature, and the swept allow does not reach it
+    posted = _drive_tool_gate(monkeypatch, store=store, tool_name="process_data",
+                              effect_tags=[], parameters={"path": "report.txt"},
+                              signature="sig-v2-reforged")
+    assert posted is not None, "a re-forged body ran under the OLD body's swept allow"
+
+    # HIGHER-SCORING ARGUMENTS: same signature, destructive param => still gates
+    posted = _drive_tool_gate(monkeypatch, store=store, tool_name="process_data",
+                              effect_tags=[], parameters={"cmd": "rm -rf /data"},
+                              signature="sig-v1")
+    assert posted is not None, (
+        "a swept allow satisfied a call whose arguments score DENY")
+
+    # and the benign call on the reviewed signature still runs unprompted
+    assert _drive_tool_gate(monkeypatch, store=store, tool_name="process_data",
+                            effect_tags=[], parameters={"path": "report.txt"},
+                            signature="sig-v1") is None
+
+
+# -- C2c. the affordance: "Review all tools" on the Build page ---------------
+
+def test_the_on_demand_review_ignores_the_marker(tmp_path, monkeypatch):
+    """An EXPLICIT operator request always gets the card.
+
+    The marker exists to stop an UNASKED-FOR card from repeating. It has no business
+    refusing a card the operator just asked for - and it is not stamped either, so the
+    one-time offer the operator has not yet answered is not silently spent.
+    """
+    from systemu.runtime import first_gate_review as fgr
+    import systemu.interface.command.inbox as _inbox_mod
+    import systemu.runtime.vault_migrator as _vm
+
+    posted = []
+
+    class _Inbox:
+        def __init__(self, _vault):
+            pass
+
+        def enqueue(self, descriptor, **kw):
+            posted.append(descriptor)
+            return "dec-1"
+
+    monkeypatch.setattr(_inbox_mod, "InboxQueue", _Inbox, raising=False)
+    monkeypatch.setattr(_vm, "_installed_version", lambda: "0.9.58", raising=False)
+    vault_dir = _vault_with_tools(tmp_path, [("t1", "process_data", [])])
+
+    class _V:
+        root = str(vault_dir)
+
+    v = _V()
+    # spend the one-time offer first
+    assert fgr.maybe_post_on_task_submission(v) == "dec-1"
+    assert fgr.maybe_post_on_task_submission(v) == "", "precondition: marker is stamped"
+
+    assert fgr.post_review_on_demand(v) == "dec-1", (
+        "the operator asked for the review and the marker refused it")
+    assert len(posted) == 2
+
+    # asking does not consume anything: the marker is untouched, and the card carries
+    # the SAME dedup key, so the Inbox collapses the duplicate rather than stacking it
+    assert (vault_dir / ".first_gate_review").read_text(
+        encoding="utf-8").strip() == "0.9.58"
+    assert posted[0].dedup == posted[1].dedup == "tool_bulk:0.9.58"
+
+
+def test_the_on_demand_review_posts_the_same_card_and_never_raises(tmp_path,
+                                                                   monkeypatch):
+    """Same mint, same gate type, same floor-gate policy - one card, two triggers."""
+    from systemu.runtime import first_gate_review as fgr
+    import systemu.interface.command.inbox as _inbox_mod
+    import systemu.runtime.vault_migrator as _vm
+
+    seen = {}
+
+    class _Inbox:
+        def __init__(self, _vault):
+            pass
+
+        def enqueue(self, descriptor, *, gate_type, policy=None, context_extras=None):
+            seen["descriptor"] = descriptor
+            seen["gate_type"] = gate_type
+            seen["policy"] = policy
+            seen["ctx"] = context_extras
+            return "dec-1"
+
+    monkeypatch.setattr(_inbox_mod, "InboxQueue", _Inbox, raising=False)
+    monkeypatch.setattr(_vm, "_installed_version", lambda: "0.9.58", raising=False)
+    vault_dir = _vault_with_tools(tmp_path, [("t1", "run_command", ["shell_exec"])])
+
+    class _V:
+        root = str(vault_dir)
+
+    assert fgr.post_review_on_demand(_V()) == "dec-1"
+    assert seen["gate_type"] == "tool_bulk"
+    assert seen["policy"] is None, "the on-demand card must still be a FLOOR gate"
+    assert seen["descriptor"].risk == "high"
+    assert seen["descriptor"].safe_default == seen["descriptor"].options[0]
+    assert seen["ctx"]["first_gate_version"] == "0.9.58"
+
+    class _Broken:
+        @property
+        def root(self):
+            raise RuntimeError("no vault")
+
+    assert fgr.post_review_on_demand(_Broken()) == ""
+    assert fgr.post_review_on_demand(None) == ""
+
+
+def test_the_build_page_offers_the_on_demand_review():
+    """The affordance must be WIRED, not merely available.
+
+    This is the mutation-testing lesson the old daemon pin carried: a surface reachable
+    only from a test is not built. The Build page is where an operator goes to look at
+    their tools, so it is where "review them all" belongs.
+
+    Pinned by AST, not by substring. The first draft of this test asserted
+    ``"Review all tools" in src`` and stayed GREEN when the button was deleted - the
+    label still appeared in the handler's docstring and in the explanation line beneath
+    it. A pin a mutation walks past is a false assertion of enforcement (DEC-34), so this
+    one requires the actual ``ui.button(<label>, on_click=<handler>)`` node inside
+    ``build_tools_page``.
+    """
+    import ast
+    from pathlib import Path
+    import systemu.interface.pages.tools as _tools_page
+
+    assert callable(getattr(_tools_page, "_request_tool_review", None)), (
+        "the handler must be a module-level function so it is testable without a "
+        "NiceGUI slot stack")
+
+    tree = ast.parse(Path(_tools_page.__file__).read_text(encoding="utf-8"))
+    page = next((f for f in ast.walk(tree)
+                 if isinstance(f, ast.FunctionDef) and f.name == "build_tools_page"),
+                None)
+    assert page is not None, "build_tools_page vanished"
+
+    wired = []
+    for node in ast.walk(page):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "button"):
+            continue
+        label = node.args[0].value if (
+            node.args and isinstance(node.args[0], ast.Constant)) else None
+        handler = next((kw.value.id for kw in node.keywords
+                        if kw.arg == "on_click" and isinstance(kw.value, ast.Name)), None)
+        if handler == "_request_tool_review":
+            wired.append(label)
+
+    assert wired == ["Review all tools"], (
+        "the Build page must render exactly one button wired to _request_tool_review, "
+        f"labelled honestly in the operator's words; found: {wired}")
+
+
+def test_the_build_page_action_reports_both_outcomes(monkeypatch):
+    """It must say what happened - including the honest "nothing to review" answer.
+
+    A button that silently does nothing when the inventory is already clean reads as
+    broken, and an operator who cannot tell the difference between "no card needed" and
+    "the post failed" has been told nothing.
+    """
+    import systemu.interface.pages.tools as _tools_page
+    from systemu.runtime import first_gate_review as fgr
+
+    notes = []
+    monkeypatch.setattr(_tools_page.ui, "notify",
+                        lambda msg, **kw: notes.append((msg, kw.get("type"))))
+
+    class _State:
+        vault = object()
+
+    monkeypatch.setattr(_tools_page.AppState, "get", staticmethod(lambda: _State()))
+
+    monkeypatch.setattr(fgr, "post_review_on_demand", lambda _v: "dec-1", raising=False)
+    _tools_page._request_tool_review()
+    assert notes and notes[-1][1] == "positive"
+    assert "Inbox" in notes[-1][0], "tell the operator WHERE the card went"
+
+    notes.clear()
+    monkeypatch.setattr(fgr, "post_review_on_demand", lambda _v: "", raising=False)
+    _tools_page._request_tool_review()
+    assert notes and notes[-1][1] != "positive", (
+        "no card posted must not be reported as success")
 
 
 def test_the_body_hash_anchors_a_relative_impl_path_the_way_THE_GATE_does(tmp_path):

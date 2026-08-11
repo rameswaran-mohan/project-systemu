@@ -840,19 +840,20 @@ def _v0822_run_vault_migrator(vault, *, logger_=None) -> None:
     except Exception:
         log.exception("[Daemon] v0.8.22 vault migrator crashed — continuing boot")
 
-    # IMPL-4: the migration MOMENT. The backfill above has just stamped an effect
-    # classification onto every legacy tool; without this the first post-ship session is
-    # an ambush of mid-run gate modals, one per tool. Post the one-time bulk review card
-    # so the operator reviews the inventory up front instead. Own version marker, so it
-    # is a cheap no-op on every boot after. Never raises.
-    try:
-        from systemu.runtime.first_gate_review import maybe_post_first_gate_review
-        from systemu.runtime.vault_migrator import _installed_version
-        from pathlib import Path
-        maybe_post_first_gate_review(vault=vault, vault_dir=Path(vault.root),
-                                     version=_installed_version())
-    except Exception:
-        log.exception("[Daemon] first-gate review card failed — continuing boot")
+    # IMPL-4 USED TO POST THE BULK FIRST-GATE REVIEW CARD HERE. It does not any more,
+    # and re-adding it is a regression - pinned by
+    # `tests/test_impl4_bulk_first_gate.py::test_daemon_boot_enqueues_nothing`.
+    #
+    # Operator ruling, 2026-08-12: boot is the wrong moment. The backfill above really
+    # does classify the whole inventory here, but posting the review here meant a fresh
+    # operator met a HIGH-risk consent demand at minute zero, before submitting anything.
+    # The card now posts at the first TASK SUBMISSION
+    # (`first_gate_review.maybe_post_on_task_submission`, called from both chat lanes),
+    # and the Build page can request it on demand.
+    #
+    # Nothing runs ungated in the meantime: the per-tool first-use gate is the floor, and
+    # it asks on a card showing the actual arguments. The bulk card is convenience over
+    # that floor, never the floor itself.
 
 
 def _advise_if_vault_empty(vault, *, logger_=None) -> bool:

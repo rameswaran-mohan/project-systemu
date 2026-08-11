@@ -941,6 +941,14 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
     """
     from datetime import datetime
 
+    # IMPL-4 (operator ruling 2026-08-12): the QUICK LANE's task-intake chokepoint. The
+    # one-time bulk tool-review card posts HERE - at the first task submission - not at
+    # daemon boot, so a fresh operator is not handed a HIGH-risk consent demand before
+    # they have run anything. Marker-gated, so this is a marker read on every submission
+    # after the first, and it never raises.
+    from systemu.runtime.first_gate_review import maybe_post_on_task_submission
+    maybe_post_on_task_submission(vault)
+
     ts = chat_ts or datetime.now().isoformat(timespec="seconds")
     try:
         vault.append_chat_history({

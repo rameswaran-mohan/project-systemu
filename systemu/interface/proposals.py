@@ -54,6 +54,47 @@ def derive_proposal(vault) -> Optional[Tuple[str, str, str]]:
                     "Your workflows so far used only built-in abilities. Ask for "
                     "something I can't do yet and watch me build the tool.",
                     "/chat")
+        found = _wish_fulfilled(vault, tools, declined)
+        if found is not None:
+            return found
     except Exception:
         pass
+    return None
+
+
+def _wish_fulfilled(vault, tools, declined) -> Optional[Tuple[str, str, str]]:
+    """The capability-wishlist nudge: the newest open wish a SHIPPED tool now
+    covers.  Derived, like everything else here - a wish is a user fact and this
+    only reads it.
+
+    PRECEDENCE: last, after both starter proposals.  A cold install should be
+    told to record something before it is told a wish came true, and the
+    first-forge nudge cannot compete anyway - it requires an EMPTY toolbox while
+    a fulfilled wish requires a deployed tool in it.
+
+    THE HONESTY WALL is `ready_tools` plus the name check below: this may only
+    name a tool that exists, is deployed-or-upgraded, is enabled, and has a name
+    to print.  Anything else would be promising a build, and v1 builds nothing
+    from a wish.
+    """
+    from systemu.interface.wishes import (
+        match_wish, open_wishes, ready_tools, short_wish,
+    )
+    ready = ready_tools(tools)
+    if not ready:
+        return None
+    for fact_id, text in open_wishes(vault):
+        key = f"wish:{fact_id}"
+        if key in declined:
+            continue
+        hit = match_wish(text, ready)
+        if not hit:
+            continue
+        name = str(hit.get("name") or "").strip()
+        if not name:
+            continue
+        return (key,
+                f"You wished: '{short_wish(text)}'. The toolbox can now do "
+                f"this - {name} is ready.",
+                "/tools")
     return None

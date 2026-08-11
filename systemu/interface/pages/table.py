@@ -23,9 +23,24 @@ from typing import Any, Dict, List
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState
+from systemu.interface.wishes import add_wish, dismiss_wish, open_wishes
 from systemu.runtime import table_consult as tc
 from systemu.runtime import table_store as ts
 from systemu.runtime.table_provenance import provenance_banner
+
+# --- Capability wishlist (P2 v1) copy -----------------------------------------
+# A wish is an operator-authored user FACT, rendered beside the board and never
+# projected into it. Writing one down starts NO build: v1 captures the wish and
+# tells the operator later, when a matching capability actually exists. The copy
+# below is worded to promise exactly that and nothing more.
+WISHLIST_TITLE = "Wishlist"
+WISHLIST_BLURB = ("What you wish Systemu could do. Nothing is built from this "
+                  "yet - when a matching ability shows up, Systemu will say so.")
+WISHLIST_PROMPT = "What do you wish Systemu could do?"
+WISHLIST_EMPTY = ("Nothing wished yet - write down what you want Systemu to "
+                  "learn to do, and it will tell you when it can.")
+WISHLIST_SAVED = "Added to your wishlist."
+WISHLIST_BLANK = "Write down what you wish Systemu could do first."
 
 #: R-B4 — the banner tone → the token class that renders it. Token classes only
 #: (the `.style()` linter rejects a raw colour where a class exists).
@@ -701,4 +716,49 @@ def build_table_page() -> None:
                     for it in sort_for_display(zitems):
                         _render_card(it, on_pin=_on_pin, on_remove=_on_remove)
 
+    # --- the capability wishlist (P2 v1) --------------------------------------
+    # Sits UNDER the board because it is the mirror image of it: the board is
+    # what systemu has, the wishlist is what the operator wants it to have. It
+    # is a fact reader with two operator-driven writes; it never calls a
+    # table-store writer, so the projected inventory keeps its single writer.
+    def _on_add_wish(field: Any) -> None:
+        if add_wish(vault, getattr(field, "value", "") or "") is None:
+            ui.notify(WISHLIST_BLANK, type="warning")
+            return
+        try:
+            field.value = ""
+        except Exception:
+            pass
+        ui.notify(WISHLIST_SAVED, type="positive")
+        _wishlist.refresh()
+
+    def _on_dismiss_wish(fact_id: str) -> None:
+        dismiss_wish(vault, fact_id)
+        _wishlist.refresh()
+
+    @ui.refreshable
+    def _wishlist() -> None:
+        wishes = open_wishes(vault)
+        with ui.column().classes("s-card q-pa-sm q-mt-md w-full").style("gap: 6px;"):
+            ui.label(WISHLIST_TITLE).classes("s-section-head")
+            ui.label(WISHLIST_BLURB).classes("s-muted").style("font-size: 12px;")
+            with ui.row().classes("items-center no-wrap w-full").style("gap: 8px;"):
+                _wish_in = ui.input(placeholder=WISHLIST_PROMPT) \
+                    .props("dense outlined").classes("col")
+                _wish_in.on("keydown.enter", lambda _e=None, f=_wish_in: _on_add_wish(f))
+                ui.button("Add", on_click=lambda _e=None, f=_wish_in: _on_add_wish(f)) \
+                    .props("dense color=primary")
+            if not wishes:
+                ui.label(WISHLIST_EMPTY).classes("s-muted").style("font-size: 12px;")
+                return
+            for _fid, _text in wishes:
+                with ui.row().classes(
+                        "items-center no-wrap w-full justify-between").style("gap: 8px;"):
+                    ui.label(_text).classes("ellipsis")
+                    ui.button(icon="close",
+                              on_click=lambda _e=None, i=_fid: _on_dismiss_wish(i)) \
+                        .props("flat dense round size=sm color=grey") \
+                        .tooltip("Remove from your wishlist")
+
     _board()
+    _wishlist()

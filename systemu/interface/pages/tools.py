@@ -60,6 +60,34 @@ def _dispatch_dryrun(tool_id: str) -> None:
         ui.notify(f"Failed to dispatch dry-run: {result.summary}", type="negative")
 
 
+def _request_tool_review(_=None) -> None:
+    """Build page [Review all tools] -> post the IMPL-4 bulk review card on demand.
+
+    The card normally posts once, at the first task submission (operator ruling
+    2026-08-12; it used to post at daemon boot). This is the operator ASKING for it, so
+    it ignores the one-time marker - and does not spend it either, since browsing the
+    review is not answering it. A repeat ask collapses onto the same Inbox row via the
+    unchanged ``tool_bulk:<version>`` dedup key rather than stacking cards.
+
+    Module-level (not a closure inside ``build_tools_page``) so the outcome reporting is
+    testable without a NiceGUI slot stack.
+    """
+    from systemu.runtime.first_gate_review import post_review_on_demand
+    vault = getattr(AppState.get(), "vault", None)
+    decision_id = post_review_on_demand(vault)
+    if decision_id:
+        ui.notify("Tool review posted - open the Inbox to decide.", type="positive")
+    else:
+        # Honest, and it really is two different answers. "Nothing to review" is the
+        # normal outcome on a clean inventory; a failure is logged by the poster. Saying
+        # "posted" here would send the operator to an empty Inbox.
+        ui.notify(
+            "Nothing to review right now - every tool is either already reviewed or "
+            "runs without asking.",
+            type="info",
+        )
+
+
 def _dispatch_enable(tool_id: str) -> None:
     """Dashboard [Enable] button → stream `tools enable <id>` through dispatch().
 
@@ -202,9 +230,22 @@ def build_tools_page(forge_tool_id: str | None = None) -> None:
                      "no": "Agent-built: no"},
                     value="all", on_change=_on_tool_forged_by,
                 ).props('label="Agent-built"').classes("s-input")
+            ui.button("Review all tools", on_click=_request_tool_review).props(
+                "outline dense no-caps color=primary"
+            ).tooltip("Posts one Inbox card covering every tool in this list")
             ui.button("+ New Tool", on_click=_show_forge_dialog).style(
                 f"background: {THEME['primary']}; color: white; border-radius: 8px;"
             )
+
+    # The one-line explanation for the action above. Honest about the SHAPE of the
+    # offer: the batch only ever covers the tools that qualify for it, and everything
+    # else keeps asking with its arguments on screen. Promising more here is the F9
+    # promise/reality gap one surface over.
+    ui.label(
+        "Review all tools posts a single card listing every tool, so you can approve "
+        "the ones that qualify in one go. The rest keep asking the first time they "
+        "run, with their arguments in front of you."
+    ).classes("s-muted").style("margin: -8px 0 20px 0;")
 
     # Tool-dependency approval card (v0.3.4).  Appears above the registry
     # table so the operator sees pending pip-install requests before

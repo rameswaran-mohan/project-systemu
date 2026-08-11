@@ -2,12 +2,13 @@
 
 `systemu/__init__.py:__version__` and `pyproject.toml:[project].version` were two
 independent literals.  They drifted by 22 releases — the dunder sat at "0.9.59"
-while pyproject shipped "0.10.21" — and that dunder is not cosmetic.  Four boot
-paths gate on it via a per-version marker file:
+while pyproject shipped "0.10.21" — and that dunder is not cosmetic.  Four
+paths gate on it via a per-version marker file (three at boot, one at first
+task submission since the JIT review-timing change):
 
   * `vault_migrator.run`                          → `.seed_version`
   * `vault_migrator.backfill_effect_tags`         → `.effect_tags_seed`
-  * `first_gate_review.maybe_post_first_gate_review`
+  * `first_gate_review.maybe_post_on_task_submission`
   * `tool_reconciler.recover_stale_dry_run_failures`
 
 Each compares the marker to `systemu.__version__` and returns early on equality.

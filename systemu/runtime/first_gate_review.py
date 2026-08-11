@@ -529,20 +529,24 @@ _REVIEW_MARKER_FILENAME = ".first_gate_review"
 
 
 def maybe_post_first_gate_review(*, vault, vault_dir, version: str) -> str:
-    """Boot hook: post the one-time bulk review card, once per version.
+    """Post the one-time bulk review card, once per version.
+
+    THE MARKER LOGIC ONLY - it does not decide WHEN. Its caller is
+    :func:`maybe_post_on_task_submission`; it is deliberately not called at boot (see
+    that function for the 2026-08-12 timing ruling).
 
     Version-gated on its OWN marker (``.first_gate_review``), mirroring the
     ``.effect_tags_seed`` pattern ``backfill_effect_tags`` uses — so the card follows the
     backfill that produced it, and a version bump that re-classifies the inventory posts
-    a fresh review. Without the marker this would re-hash every tool body on every boot
+    a fresh review. Without the marker this would re-hash every tool body on every call
     just to have the dedup key collapse the card.
 
     The marker is stamped only when the operator has genuinely been ASKED — i.e. a card
     was posted, or there was nothing to review. A FAILED post leaves it unstamped so the
-    next boot retries; stamping there would silently swallow the migration review, which
-    is the one thing this surface exists to guarantee.
+    next submission retries; stamping there would silently swallow the migration review,
+    which is the one thing this surface exists to guarantee.
 
-    Never raises: a migration-moment nicety must not break boot.
+    Never raises: a consent nicety must not break the path it rides on.
     """
     from pathlib import Path
 
@@ -572,6 +576,96 @@ def maybe_post_first_gate_review(*, vault, vault_dir, version: str) -> str:
         return decision_id
     except Exception:  # noqa: BLE001
         logger.warning("[FirstGateReview] first-gate review pass failed (non-fatal)",
+                       exc_info=True)
+        return ""
+
+
+def _resolve_vault_dir(vault):
+    """The directory this surface scans, taken off the vault. ``None`` when there isn't
+    one. Never raises: the callers are on the task-submission path."""
+    from pathlib import Path
+
+    try:
+        root = getattr(vault, "root", None)
+        return Path(root) if root else None
+    except Exception:  # noqa: BLE001
+        logger.debug("[FirstGateReview] could not resolve the vault root", exc_info=True)
+        return None
+
+
+def maybe_post_on_task_submission(vault) -> str:
+    """TASK-INTAKE hook: post the one-time bulk review card at the FIRST submission.
+
+    -- WHY THIS IS NOT A BOOT HOOK (operator ruling, 2026-08-12) ----------------
+
+    This card used to post from ``daemon._v0822_run_vault_migrator``, i.e. at daemon
+    BOOT. That put a HIGH-risk "Review N tool(s) before the action gate turns on" demand
+    in front of a brand-new operator at minute zero - before they had submitted anything,
+    about an inventory they had no reason to have an opinion on yet. Consent asked before
+    the operator has a stake in the answer is consent asked badly: the only rational
+    responses are "Leave gated" (so the card was noise) or a reflexive click through a
+    surface whose whole purpose is that it is NOT clicked through.
+
+    The per-tool first-use gate already covers the interim: an un-reviewed tool asks the
+    first time it runs, on a card showing the ACTUAL arguments (``GateDescriptor``'s
+    ``dedup="tool:<sig>"`` mint). So nothing runs ungated while this card waits - the
+    bulk card is an anti-fatigue CONVENIENCE over that floor, never the floor itself.
+    Moving it later cannot widen anything.
+
+    ONLY THE TIMING MOVED. Same marker, same version semantics, same partition, same
+    ``BATCH_APPROVABLE`` fence, same card bytes, same executor. The call is a marker read
+    on every submission after the first, and the full scan happens at most once per
+    version - exactly the cost profile the boot hook had, relocated.
+
+    NO IN-PROCESS SHORT-CIRCUIT. Caching "already attempted" per process would be
+    cheaper, and it would silently defeat the retry the marker exists to provide: a post
+    that FAILS does not stamp the marker precisely so the next attempt re-offers. The
+    only submission that pays the full scan is one that follows a failure.
+
+    Never raises - a consent nicety must never be able to fail a task submission.
+    """
+    vault_dir = _resolve_vault_dir(vault)
+    if vault_dir is None:
+        return ""
+    try:
+        from systemu.runtime.vault_migrator import _installed_version
+        return maybe_post_first_gate_review(vault=vault, vault_dir=vault_dir,
+                                            version=_installed_version())
+    except Exception:  # noqa: BLE001
+        logger.warning("[FirstGateReview] task-intake review pass failed (non-fatal)",
+                       exc_info=True)
+        return ""
+
+
+def post_review_on_demand(vault) -> str:
+    """The Build page's "Review all tools" action. Returns the decision id, or "".
+
+    IGNORES the marker, and deliberately does not stamp it. Two different questions:
+
+      * the MARKER answers "have we offered this unasked-for card yet?" - it exists to
+        stop an uninvited card from repeating. It has no business refusing a card the
+        operator just asked for.
+      * not stamping keeps the two paths independent. An operator who browses the review
+        from the Build page has not answered the one-time offer, so spending it here
+        would remove a card they never resolved.
+
+    Duplicates are handled where duplicates belong - the dedup key is
+    ``tool_bulk:<version>``, unchanged, so a second ask collapses onto the same inbox row
+    instead of stacking. Same ``post_bulk_review_card`` mint as the intake path: one card,
+    two triggers, and no second definition of what the operator is consenting to.
+
+    Never raises.
+    """
+    vault_dir = _resolve_vault_dir(vault)
+    if vault_dir is None:
+        return ""
+    try:
+        from systemu.runtime.vault_migrator import _installed_version
+        version = _installed_version()
+        return post_bulk_review_card(collect_backfilled_entries(vault_dir),
+                                     vault=vault, version=version)
+    except Exception:  # noqa: BLE001
+        logger.warning("[FirstGateReview] on-demand review pass failed (non-fatal)",
                        exc_info=True)
         return ""
 

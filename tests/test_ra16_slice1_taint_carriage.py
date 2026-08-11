@@ -498,6 +498,26 @@ _OPERATOR_SURFACES = {
     #     same class as ``mark_skipped`` / ``mark_tour_completed``.
     ("systemu/interface/pages/settings.py", "set_persona"),
     ("systemu/interface/proposals.py", "decline"),
+    # Capability wishlist v1 (2026-08-11):
+    #   wishes.add_wish - the SAME shape as ``cli_commands.user_remember``: the
+    #     operator types the sentence and it is stored VERBATIM behind a ``wish:``
+    #     prefix. Nothing extracts from it, no LLM reads it, and no page/task
+    #     content reaches this call - the sole caller is the Table page's wishlist
+    #     input, whose value is the operator's own keystrokes. Operator-AUTHORED,
+    #     not merely operator-DELIVERED.
+    #     The residual worth naming, because an operator CAN paste into any text
+    #     box: a pasted sentence would become a ``wish``-tagged fact that
+    #     ``requirement_binder._bind_profile`` can select on a tag/key-token hit.
+    #     That bind resolves NO value (it names the fact id and leaves extraction
+    #     to the operator - see the "NO resolved value" note there), so there is
+    #     nothing for pasted text to silently BECOME. This is the identical
+    #     residual ``user_remember`` already carries, not a new one.
+    #     NOTE ``wishes.dismiss_wish`` is deliberately NOT listed: it supersedes
+    #     via ``forget_fact`` and writes no fact at all, so an entry for it would
+    #     be STALE by ``test_writer_allowlist_has_no_stale_entries``. That absence
+    #     is pinned as a property, not left to be read as a decision, by
+    #     ``test_wish_dismissal_writes_no_fact_at_all`` at the foot of this file.
+    ("systemu/interface/wishes.py", "add_wish"),
 }
 
 
@@ -638,3 +658,59 @@ def test_direct_add_fact_callers_are_fully_enumerated():
         "new direct add_fact caller(s) — if this is a forwarding wrapper, add it to "
         f"_FORWARDERS so its own callers get inventoried too: {sorted(unknown)}"
     )
+
+
+# --- The wishlist surfaces (capability wishlist v1) ---------------------------
+#
+# ``wishes.add_wish`` is enumerated in ``_OPERATOR_SURFACES`` above. Its sibling
+# ``wishes.dismiss_wish`` is NOT, and that absence is load-bearing rather than an
+# oversight: dismissal SUPERSEDES an existing fact (``forget_fact``) and writes no
+# fact at all, so it is not a fact-write call site and an allowlist entry for it
+# would be STALE - ``test_writer_allowlist_has_no_stale_entries`` rejects it.
+#
+# An absence cannot be read as a decision, though, so this pins the PROPERTY that
+# makes it correct. Change ``dismiss_wish`` into a writer (a tombstone fact, an
+# "operator dismissed X" audit fact) and this goes red pointing at the enumeration
+# the change would need - instead of the write sliding in on the grandfathered
+# ``operator`` default with nothing to catch it.
+
+_WISH_MODEL = "systemu/interface/wishes.py"
+
+
+@pytest.mark.source_sensitive
+def test_wish_dismissal_writes_no_fact_at_all():
+    """The reason ``wishes.dismiss_wish`` is off the allowlist, enforced."""
+    src = (_repo_root() / _WISH_MODEL).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    target = next((n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and n.name == "dismiss_wish"), None)
+    assert target is not None, f"{_WISH_MODEL} no longer defines dismiss_wish()"
+
+    writes = set()
+    for n in ast.walk(target):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        callee = (f.attr if isinstance(f, ast.Attribute)
+                  else f.id if isinstance(f, ast.Name) else None)
+        if callee in _FACT_WRITE_NAMES:
+            writes.add(callee)
+    assert not writes, (
+        f"dismiss_wish() now calls {sorted(writes)} - it has become a fact WRITER. "
+        f"Add ('{_WISH_MODEL}', 'dismiss_wish') to _OPERATOR_SURFACES with a "
+        "justification (or stamp origin_class explicitly); until then the write "
+        "would inherit the grandfathered `operator` origin silently."
+    )
+
+
+@pytest.mark.source_sensitive
+def test_the_wish_capture_surface_stays_enumerated():
+    """The positive half: ``add_wish`` is the wishlist's ONLY fact writer, and it
+    is on the allowlist. If the capture path is renamed or split in two, the new
+    writer must be enumerated in the same change rather than inheriting the
+    default in silence."""
+    wish_writers = {encl for rel, _ln, _c, encl, _s in _fact_write_call_sites()
+                    if rel == _WISH_MODEL}
+    assert wish_writers == {"add_wish"}, sorted(wish_writers)
+    assert (_WISH_MODEL, "add_wish") in _OPERATOR_SURFACES

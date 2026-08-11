@@ -317,6 +317,16 @@ def run_direct_task(
     """
     from systemu.interface.notifications import set_vault
     from systemu.pipelines.activity_extractor import init_pipeline
+
+    # IMPL-4 (operator ruling 2026-08-12): the WORKFLOW LANE's task-intake chokepoint.
+    # Twin of the call at the top of ``quick_task.submit_quick_task`` - the one-time bulk
+    # tool-review card posts at the first TASK SUBMISSION, not at daemon boot. Placed
+    # before Stage 1 so it does not depend on the scroll refining successfully; the
+    # submission is what the operator did, and it is what earns them the card.
+    # Marker-gated and never raises.
+    from systemu.runtime.first_gate_review import maybe_post_on_task_submission
+    maybe_post_on_task_submission(vault)
+
     set_vault(vault)
     init_pipeline(config, vault)
 
