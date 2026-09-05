@@ -303,7 +303,8 @@ def test_every_consent_mutation_holds_the_rmw_lock(tmp_path, monkeypatch):
 # ══ AC5 clause 3 — a census capability wins a plan, unnamed by the operator ══
 
 @pytest.mark.asyncio
-@pytest.mark.real_survey
+# DEC-44: the `real_survey` marker was dropped here - the conftest survey stub is
+# opt-in now, so the REAL survey this test needs is simply the default.
 async def test_a_census_fact_reaches_the_planner_prompt_without_the_operator_naming_it(
         tmp_path, monkeypatch):
     """The payoff, end-to-end through the REAL survey and the REAL planner render.
@@ -342,7 +343,8 @@ async def test_a_census_fact_reaches_the_planner_prompt_without_the_operator_nam
 
 
 @pytest.mark.asyncio
-@pytest.mark.real_survey
+# DEC-44: the `real_survey` marker was dropped here - the conftest survey stub is
+# opt-in now, so the REAL survey this test needs is simply the default.
 async def test_with_no_consent_the_planner_prompt_is_unchanged(tmp_path, monkeypatch):
     """Zero-census operation stays fully functional (WM-7) — and, more precisely, is
     INDISTINGUISHABLE. The same run without a grant must render no census row at all."""

@@ -4,8 +4,17 @@ Runs a passive self-check on every dashboard page render and surfaces
 operator-actionable warnings.  Designed to catch the four silent-failure
 modes that bit us in v0.8.0.1 UAT:
 
-  - Multiple systemu daemon processes bound to port 8765 (port race wins
+  - Multiple systemu daemon processes bound to THE SAME port (port race wins
     the dashboard for a leftover daemon with stale config).
+
+    v0.10.26: that check fired on a machine-wide COUNT, so two daemons on
+    DIFFERENT ports -- the operator's on 8765, an isolated test daemon on 8901,
+    each with its own vault root -- were reported as a port race whose
+    "recordings or decisions may land in the wrong vault", with `stop --all` as
+    the remedy. The count was true; the diagnosis was not, and the remedy would
+    have stopped the healthy daemon too. Detection stays machine-wide; the
+    DIAGNOSIS is now port-aware, and fail-closed: the softer WARNING is
+    reachable only when every sibling's port is KNOWN and all are DISTINCT.
   - No LLM provider usable from the daemon's environment (LLM steps
     silently fail with raw-event output). F19: this check consumes
     ``systemu.runtime.provider_status``, THE ONE MINT, so the banner cannot
@@ -19,11 +28,12 @@ dataclass (testable without NiceGUI) plus a thin renderer
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +43,23 @@ class HealthIssue:
     severity: str          # "warning" | "danger"
     message:  str          # short human description
     cta:      Optional[str] = None  # one-line remediation
+
+
+@dataclass(frozen=True)
+class DaemonProcess:
+    """What we could establish about ONE running systemu daemon.
+
+    Every field is optional because every field comes from a best-effort probe
+    of somebody else's process. ``port is None`` is a first-class answer -- it
+    means "we could not determine it", which the banner treats as the dangerous
+    case rather than assuming the default.
+    """
+
+    pid:     Optional[int] = None
+    port:    Optional[int] = None
+    vault:   Optional[str] = None
+    cwd:     Optional[str] = None   # the folder `systemu daemon stop` must run in
+    is_self: bool = False           # this process: the one serving this page
 
 
 @dataclass
@@ -54,26 +81,204 @@ class HealthState:
 
 # -- Probes (each best-effort, never raises) ---------------------------------
 
-def _scan_daemon_count() -> int:
-    """The raw psutil scan — best-effort, 0 on error. SLOW on Windows
-    (cmdline for every process ≈ 1 s); only ever call via the cache below."""
+#: The marker that identifies a systemu daemon in a process command line.
+_DAEMON_CMDLINE_MARKER = "systemu.scheduler.daemon"
+
+
+def _port_from_text(text) -> Optional[int]:
+    """A port as an int, or None when the text does not spell one.
+
+    DEC-36: the concrete type is pinned in THIS frame before anything is done
+    with it. The value arrives from another process's command line or from a
+    file on disk, so ``int(text)`` on trust is how a nonsense port becomes a
+    confident claim.
+    """
+    if type(text) is not str:
+        return None
+    stripped = text.strip()
+    if not stripped.isdigit():
+        return None
+    try:
+        value = int(stripped)
+    except ValueError:
+        return None
+    return value if 0 < value <= 65535 else None
+
+
+def parse_daemon_argv(cmdline) -> Tuple[Optional[int], Optional[str]]:
+    """``(port, vault_root)`` as a daemon was LAUNCHED, or None for either.
+
+    ``start_daemon`` spawns ``python -m systemu.scheduler.daemon --vault-dir X
+    --port N`` and the child's own argparse makes ``--vault-dir`` required, so a
+    daemon started the supported way carries both facts in its own argv -- which
+    is readable for every process on the machine, not just ours.
+
+    It NEVER guesses. A missing or unparseable ``--port`` comes back None, and
+    the banner treats that as the dangerous case. Falling back to
+    ``DEFAULT_DASHBOARD_PORT`` here would manufacture the very collision this
+    function exists to rule out.
+    """
+    if type(cmdline) is not list and type(cmdline) is not tuple:
+        return None, None
+    args = [a for a in cmdline if type(a) is str]
+    port: Optional[int] = None
+    vault: Optional[str] = None
+    for idx, arg in enumerate(args):
+        following = args[idx + 1] if idx + 1 < len(args) else None
+        if arg == "--port":
+            port = _port_from_text(following)
+        elif arg.startswith("--port="):
+            port = _port_from_text(arg[len("--port="):])
+        elif arg == "--vault-dir":
+            vault = following if type(following) is str and following else None
+        elif arg.startswith("--vault-dir="):
+            tail = arg[len("--vault-dir="):]
+            vault = tail if tail else None
+    return port, vault
+
+
+def _runtime_sidecar_name() -> str:
+    """The daemon runtime sidecar's filename, from the module that writes it."""
+    try:
+        from systemu.scheduler.daemon import _RUNTIME_FILE_NAME
+        if type(_RUNTIME_FILE_NAME) is str and _RUNTIME_FILE_NAME:
+            return _RUNTIME_FILE_NAME
+    except Exception:
+        pass
+    return ".systemu_daemon.json"
+
+
+def _sidecar_candidates(vault: Optional[str], cwd: Optional[str]) -> list:
+    """Where a daemon's runtime sidecar would live, given what we know of it."""
+    name = _runtime_sidecar_name()
+    out = []
+    try:
+        if type(vault) is str and vault:
+            # daemon._runtime_file_path: the sidecar sits beside the vault dir
+            out.append(Path(vault).parent / name)
+        if type(cwd) is str and cwd:
+            # the default layout: <operating home>/systemu/vault
+            from systemu.runtime.vault_root import DEFAULT_RELATIVE_VAULT
+            out.append((Path(cwd) / DEFAULT_RELATIVE_VAULT).parent / name)
+    except Exception:
+        return out
+    return out
+
+
+def _recorded_port(vault: Optional[str], cwd: Optional[str],
+                   pid: Optional[int]) -> Optional[int]:
+    """A daemon's port from its OWN runtime sidecar, or None.
+
+    Accepted only when the sidecar's recorded pid IS the process we are asking
+    about. A sidecar is a file any process may have left in any shape, and a
+    stale one from a dead daemon that used the same vault would otherwise lend
+    its port to a live stranger -- inventing a collision, or hiding one.
+    """
+    if type(pid) is not int:
+        return None
+    for candidate in _sidecar_candidates(vault, cwd):
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if type(data) is not dict:
+            continue
+        recorded_pid = data.get("pid")
+        if type(recorded_pid) is not int or recorded_pid != pid:
+            continue
+        recorded_port = data.get("port")
+        if type(recorded_port) is int and 0 < recorded_port <= 65535:
+            return recorded_port
+    return None
+
+
+def _scan_daemon_processes() -> tuple:
+    """The raw psutil scan — best-effort, empty on error. SLOW on Windows
+    (cmdline for every process ≈ 1 s); only ever call via the cache below.
+
+    Returns one :class:`DaemonProcess` per daemon found, carrying whatever of
+    (port, vault, cwd) that daemon's own launch line or sidecar could establish.
+    """
     try:
         import psutil
-        count = 0
-        for proc in psutil.process_iter(["cmdline"]):
-            try:
-                cmdline = " ".join(proc.info.get("cmdline") or [])
-                if "systemu.scheduler.daemon" in cmdline:
-                    count += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return count
     except Exception:
-        return 0
+        return ()
+    self_pid = os.getpid()
+    found = []
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                info = proc.info if type(proc.info) is dict else {}
+                cmdline = info.get("cmdline")
+                if type(cmdline) is not list:
+                    continue
+                joined = " ".join(a for a in cmdline if type(a) is str)
+                if _DAEMON_CMDLINE_MARKER not in joined:
+                    continue
+                raw_pid = info.get("pid")
+                pid = raw_pid if type(raw_pid) is int else None
+                port, vault = parse_daemon_argv(cmdline)
+                try:
+                    cwd = proc.cwd()
+                except Exception:
+                    cwd = None
+                if type(cwd) is not str or not cwd:
+                    cwd = None
+                if port is None:
+                    port = _recorded_port(vault, cwd, pid)
+                found.append(DaemonProcess(
+                    pid=pid, port=port, vault=vault, cwd=cwd,
+                    # build_health_state runs inside the daemon thread that is
+                    # serving this very page (daemon.py -> run_dashboard_thread),
+                    # so our own pid names the daemon the operator must KEEP.
+                    is_self=(pid is not None and pid == self_pid),
+                ))
+            except Exception:
+                continue
+    except Exception:
+        return ()
+    return tuple(found)
+
+
+def _scan_daemon_count() -> int:
+    """How many daemons are running. Kept as its own seam: machine-wide
+    detection is what the banner has always rested on, and it is UNCHANGED.
+
+    Derived from the same records the diagnosis uses so one psutil pass answers
+    both -- and so the count and the records can never disagree about a daemon
+    that started or died between two scans.
+    """
+    return len(_daemon_processes())
 
 
 _PROBE_TTL_S = 20.0
 _daemon_probe_cache = {"ts": -1e9, "count": 0}
+_daemon_procs_cache: dict = {"ts": -1e9, "procs": ()}
+
+
+def _daemon_processes(_now: Optional[float] = None) -> tuple:
+    """The per-daemon records, TTL-cached alongside the count (W12-B5).
+
+    Production reaches the psutil scan ONCE per TTL: ``_count_systemu_daemons``
+    misses first, its ``_scan_daemon_count`` fills this cache on the way
+    through, and ``build_health_state``'s call below is then a cache hit.
+
+    Never raises. A probe that blew up returns no records, which the model reads
+    as "ports unknowable" and answers with the stronger warning.
+    """
+    import time
+    now = time.monotonic() if _now is None else _now
+    if now - _daemon_procs_cache["ts"] < _PROBE_TTL_S:
+        return _daemon_procs_cache["procs"]
+    try:
+        procs = _scan_daemon_processes()
+    except Exception:
+        procs = ()
+    if type(procs) is not tuple:
+        procs = tuple(procs or ())
+    _daemon_procs_cache["ts"] = now
+    _daemon_procs_cache["procs"] = procs
+    return procs
 
 
 def _count_systemu_daemons(_now: Optional[float] = None) -> int:
@@ -168,6 +373,95 @@ def _storage_degraded() -> Optional[dict]:
         return None
 
 
+# -- The multi-daemon diagnosis (pure: records in, one issue out) ------------
+
+#: The DANGER copy, unchanged since v0.8.0.2. Correct whenever the daemons
+#: really are contending for one socket, and kept VERBATIM for that case.
+_PORT_RACE_MESSAGE_TAIL = (
+    "Whichever wins the port race will serve this dashboard, "
+    "and recordings or decisions may land in the wrong vault."
+)
+_PORT_RACE_CTA = "systemu daemon stop --all"
+
+
+def _known_port(value) -> Optional[int]:
+    """``value`` as a real port, or None. ``type(x) is int`` in this frame:
+    ``True`` is an int subclass and ``"8765"`` is a plausible-looking string,
+    and either one silently becoming a port is how an unknown gets counted as
+    a known one."""
+    if type(value) is not int:
+        return None
+    return value if 0 < value <= 65535 else None
+
+
+def daemon_conflict_issue(daemon_count,
+                          daemons: Sequence["DaemonProcess"] = ()) -> Optional[HealthIssue]:
+    """THE MODEL: N daemons plus what we know about them -> one banner issue.
+
+    Pure. No probing, no I/O, no clock -- every shape is decided from the
+    arguments, which is why all three of them are tested without a daemon.
+
+    FAIL-CLOSED (DEC-27: completeness is witnessed, never inferred). The softer
+    WARNING requires a COMPLETE and DISTINCT set of ports: one record per
+    counted process, every port known, no two the same. Anything else -- a
+    shared port, a port we could not read, a process the records do not account
+    for -- keeps the port-race DANGER and its ``stop --all`` remedy. The banner
+    is never allowed to talk itself down from a fact it could not establish.
+    """
+    try:
+        count = int(daemon_count)
+    except (TypeError, ValueError):
+        return None
+    if count <= 1:
+        return None
+
+    records = tuple(d for d in daemons if type(d) is DaemonProcess)
+    ports = [_known_port(d.port) for d in records]
+    complete = len(records) == count and all(p is not None for p in ports)
+    distinct = complete and len(set(ports)) == len(ports)
+
+    if not distinct:
+        return HealthIssue(
+            severity="danger",
+            message=("{} systemu daemon processes are running. ".format(count)
+                     + _PORT_RACE_MESSAGE_TAIL),
+            cta=_PORT_RACE_CTA,
+        )
+
+    ordered = sorted(records, key=lambda d: _known_port(d.port) or 0)
+    listing = "; ".join(
+        "port {} - vault {}".format(
+            _known_port(d.port),
+            d.vault if type(d.vault) is str and d.vault else "(not recorded)")
+        for d in ordered)
+
+    # The daemon serving THIS page is the one to keep; the remedy must aim at
+    # the others. When no record matched us, we do not guess -- every daemon is
+    # offered and the operator picks.
+    others = [d for d in ordered if d.is_self is not True] or list(ordered)
+    targets = "; ".join(
+        ("cd {} && systemu daemon stop".format(d.cwd)
+         if type(d.cwd) is str and d.cwd else
+         "from the working folder of the daemon on port {}, run: "
+         "systemu daemon stop".format(_known_port(d.port)))
+        for d in others)
+
+    return HealthIssue(
+        severity="warning",
+        message=(
+            "{count} systemu daemon processes are running, on different ports: "
+            "{listing}. They are not racing for one port: this dashboard is "
+            "served by the daemon on the port in your browser address bar, and "
+            "what you do here is recorded in that daemon's vault."
+        ).format(count=count, listing=listing),
+        cta=(
+            "Stop the one you did not mean to leave running, from its OWN "
+            "working folder: {targets}. Do not use stop --all - it would also "
+            "stop the daemon serving this dashboard."
+        ).format(targets=targets),
+    )
+
+
 # -- Pure-data state builder (testable) --------------------------------------
 
 def build_health_state(vault_dir: Optional[Path] = None, *, config=None,
@@ -175,17 +469,14 @@ def build_health_state(vault_dir: Optional[Path] = None, *, config=None,
     """Compute the current health state.  No UI, no side-effects."""
     state = HealthState()
 
+    # Detection is machine-wide (the count); the DIAGNOSIS is port-aware. The
+    # model decides which of the two messages is honest for this machine --
+    # this frame must not re-derive it (DEC-43: one mint per fact).
     daemon_count = _count_systemu_daemons()
     if daemon_count > 1:
-        state.issues.append(HealthIssue(
-            severity="danger",
-            message=(
-                f"{daemon_count} systemu daemon processes are running. "
-                "Whichever wins the port race will serve this dashboard, "
-                "and recordings or decisions may land in the wrong vault."
-            ),
-            cta="systemu daemon stop --all",
-        ))
+        conflict = daemon_conflict_issue(daemon_count, _daemon_processes())
+        if conflict is not None:
+            state.issues.append(conflict)
 
     from systemu.runtime import provider_status as _ps
     _statuses = _provider_statuses(config, provider_probe)

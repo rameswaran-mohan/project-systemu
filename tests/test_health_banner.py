@@ -27,6 +27,21 @@ def _no_ambient_provider(monkeypatch):
     ps.clear_probe_cache()
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_daemon_records(monkeypatch):
+    """Same hermeticity, for the multi-daemon diagnosis.
+
+    v0.10.26 made that diagnosis port-aware, so the banner now reads per-process
+    records as well as the count these tests patch. A developer box that really
+    is running daemons must not be able to change what they assert -- and with
+    no records for a patched count of 3, the fail-closed path is the DANGER case
+    they have always pinned.
+    """
+    from systemu.interface.components import health_banner as hb
+    monkeypatch.setattr(hb, "_daemon_processes", lambda *a, **k: ())
+    yield
+
+
 def test_healthy_state_when_one_daemon_and_key_set(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     with patch(

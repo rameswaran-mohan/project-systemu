@@ -132,9 +132,17 @@ def test_poll_command_choice_is_still_the_blocking_shape_this_note_describes():
     assert sleeps, "no longer a sleep-poll — re-read the premise"
 
 
+@pytest.mark.slow_gate_polls
 def test_the_gate_poll_fails_closed_on_timeout(monkeypatch):
     """Unchanged behaviour, pinned because it is what makes the block-poll safe
-    to leave alone: no operator answer ⇒ None ⇒ the caller denies."""
+    to leave alone: no operator answer ⇒ None ⇒ the caller denies.
+
+    DEC-44: this test's SUBJECT *is* the timeout path, so it opts out of the
+    conftest clamp (which now raises on an unresolved gate rather than handing
+    back the ``None`` the product reads as Deny). It bounds itself with
+    ``timeout=0.05`` and drives the REAL ``_poll_command_choice``, which is the
+    only way this assertion means what it says.
+    """
     import systemu.approval.decision_queue as dq
 
     class _NeverResolves:

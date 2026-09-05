@@ -90,9 +90,11 @@ class TestCredentialStore:
                 "is machine-global rather than tmp_path-scoped. This repo "
                 "routinely runs several agents concurrently on one machine, "
                 "so a shared literal key collides across runs. Set "
-                "SYSTEMU_RUN_REAL_KEYRING=1 to opt in (mirrors the "
-                "@pytest.mark.real_llm / SYSTEMU_RUN_REAL_LLM convention in "
-                "CONTRIBUTING.md).",
+                "SYSTEMU_RUN_REAL_KEYRING=1 to opt in. (This marker+env-var "
+                "pair is THE opt-in convention CONTRIBUTING.md points new "
+                "real-dependency tests at; it used to cite a real_llm twin "
+                "that was documented but never declared or used, removed as "
+                "a phantom under DEC-44.)",
     )
     def test_keyring_roundtrip_real_os_store(self, tmp_path):
         """Integration check that CredentialStore's real keyring path

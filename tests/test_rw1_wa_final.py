@@ -324,7 +324,8 @@ def test_a_fence_escape_in_a_stored_value_is_neutralised():
 # ══ GAP 3 — the report READS the store (the inversion) ═══════════════════════
 
 @pytest.mark.asyncio
-@pytest.mark.real_survey
+# DEC-44: the `real_survey` marker was dropped here - the conftest survey stub is
+# opt-in now, so the REAL survey this test needs is simply the default.
 async def test_the_survey_composes_a_goal_conditioned_ranked_view(tmp_path):
     """The inversion, driven through the REAL ``survey_situation``. Before this the
     report only ever FED the store."""

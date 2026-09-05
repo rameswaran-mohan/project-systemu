@@ -102,7 +102,9 @@ the change**.  Run the suite locally before opening a PR:
 pytest tests/ -q
 ```
 
-The full suite takes ~30 s on a modern laptop.  CI runs the same suite
+The full suite takes roughly 20 minutes on a modern laptop (measured
+18m33s at v0.10.25, ~8,900 tests); use a `-k` selection while iterating
+and save the full run for pre-merge gates.  CI runs the same suite
 plus an integration tier against real Postgres + Redis — see
 the live workflow at [`.github/workflows/test.yml`](.github/workflows/test.yml).
 
@@ -110,15 +112,31 @@ When you add a new tool, scroll, or skill: prefer adding a focused
 unit test plus, where it makes sense, an end-to-end test that runs the
 whole pipeline against your new artefact.
 
-### Real-LLM tests
+### LLM tests
 
-Most tests mock the LLM router.  The `tests/e2e/` tier contains a
-few tests that hit real Postgres + Redis but still stub the LLM —
-they verify queue + storage behaviour, not model behaviour.  Tests
-that talk to a real LLM live behind the `@pytest.mark.real_llm`
-marker and are off by default; gate them on an env var
-(`SYSTEMU_RUN_REAL_LLM=1`) so contributors without an API key still
-get a green local run.
+**No test in this repo talks to a real LLM.**  Every test mocks the
+router.  The `tests/e2e/` tier hits real Postgres + Redis (gated on
+docker / `SYSTEMU_DATABASE_URL`) but still stubs the model -- it
+verifies queue + storage behaviour, not model behaviour.
+
+Two safety nets keep it that way, and both are worth knowing about:
+
+* `tests/conftest.py::_fast_fail_llm_router` is autouse and clamps the
+  router's network ladder (`_API_TIMEOUT_SECONDS`, `_NETWORK_MAX_RETRIES`,
+  `_NETWORK_BACKOFF_S`) to ~2 s.  Without it, one call that escapes its
+  mock stalls the suite for ~380 s.  It changes only how long a call
+  waits, never what it returns, so it cannot turn a red test green.
+* Every in-tree caller of `llm_call_json` degrades on a failed call
+  (planner -> static tree, episodic -> `None`, verifiers -> soft-pass), so
+  an escaped call surfaces as degraded behaviour rather than a hang.
+
+If you ever do add a live-model test, copy the `real_keyring` pattern
+below verbatim: declare the marker in `pyproject.toml` **and** guard the
+test with a `skipif` on its env var.  A marker that is documented but
+never declared and never used is worse than no marker -- it reads as
+coverage that does not exist.  (An earlier `@pytest.mark.real_llm` /
+`SYSTEMU_RUN_REAL_LLM` convention was documented here and implemented
+nowhere; it was removed rather than built, because nothing needed it.)
 
 ### Real-keyring tests
 

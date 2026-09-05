@@ -11,35 +11,104 @@ an effectful / UNKNOWN-tagged tool through the **quick lane** posts a
 In a test where no operator ever resolves the card, that stalls the whole suite for
 minutes *per test* (this is exactly the ``_poll_command_choice`` block-poll the roadmap
 flags for R-UX2). The autouse fixture below bounds those two block-polls to a couple of
-seconds in tests, so an **unresolved** gate fails fast (``None`` ⇒ Deny / decline)
-instead of hanging.
+seconds in tests, so an **unresolved** gate fails fast instead of hanging.
 
-This does NOT weaken any gate: the gate still fires, and a test that legitimately
-exercises the gate by **pre-resolving** the decision is unaffected — the resolved choice
-is returned on the first poll iteration, well within the bound. A test that specifically
-needs the multi-second wait can monkeypatch these back.
+DEC-44 HONESTY FIX - the clamp used to hand the caller the timeout's ``None``, which
+the product reads as **Deny / decline**. That silently manufactured a *product verdict*
+(deny-on-timeout) inside every test that simply forgot to resolve its gate, and no test
+asserted it. The bound stays (an unbounded suite hangs), but the clamped wrapper now
+**raises AssertionError** instead of returning ``None``: a gate the test never resolved
+is a broken test, not a Deny.
+
+Escape hatches, both explicit and in the test's own source:
+
+* pre-resolve the decision (``OperatorDecisionQueue.resolve``) - the resolved choice is
+  returned on the first poll iteration, well within the bound. Use
+  ``resolve_gate_as_denied`` below to assert a *chosen* Deny (never a defaulted one).
+* ``@pytest.mark.slow_gate_polls`` - opt out of the clamp entirely and get the REAL
+  block-poll with its real timeout semantics (for tests whose SUBJECT is the timeout
+  path itself). Such a test must pass its own short ``timeout=``; nothing bounds it.
+
+This does NOT weaken any gate: the gate still fires either way.
 """
 import pytest
 
 _TEST_POLL_TIMEOUT_S = 2.0
 
 
+def resolve_gate_as_denied(vault, dedup_key: str, *, title: str = "gate"):
+    """Post + resolve a command gate as an EXPLICIT operator Deny (DEC-44).
+
+    A test that wants to assert the deny path must *choose* Deny, not inherit it
+    from an unresolved poll timing out. Returns the decision id.
+    """
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+
+    q = OperatorDecisionQueue(vault)
+    dec_id = q.post(
+        title=title, body="Resolved as Deny by the test.",
+        options=["Deny", "Approve once", "Always allow"],
+        dedup_key=dedup_key,
+    )
+    q.resolve(dec_id, choice="Deny")
+    return dec_id
+
+
+def _gate_was_answered(vault, dedup_key) -> bool:
+    """True when the operator actually RESOLVED this decision.
+
+    Distinguishes ``_ask_operator_inline``'s several ``None`` returns: a resolved
+    empty/whitespace answer is a genuine *decline* (leave it alone), while an
+    unresolved wait that ran out is the dishonest case DEC-44 targets. A timed-out
+    ask is EXPIRED (``expire_by_dedup_key``), never resolved, so this stays False.
+    Unreadable queue -> False, i.e. fail LOUD rather than restore the silent decline.
+    """
+    try:
+        from systemu.approval.decision_queue import OperatorDecisionQueue
+        return OperatorDecisionQueue(vault).get_resolved_choice(dedup_key) is not None
+    except Exception:
+        return False
+
+
 @pytest.fixture(autouse=True)
-def _bound_gate_block_polls(monkeypatch):
+def _bound_gate_block_polls(request, monkeypatch):
     import systemu.pipelines.quick_task as qt
+
+    if request.node.get_closest_marker("slow_gate_polls"):
+        # DEC-44: this test's SUBJECT is the real block-poll timeout. No clamp,
+        # no raise-on-None -- it gets the untouched product functions.
+        yield
+        return
 
     _orig_poll = qt._poll_command_choice
     _orig_ask = qt._ask_operator_inline
 
     def _fast_poll(vault, dedup_key, timeout=None):
         bound = _TEST_POLL_TIMEOUT_S if timeout is None else min(timeout, _TEST_POLL_TIMEOUT_S)
-        return _orig_poll(vault, dedup_key, timeout=bound)
+        choice = _orig_poll(vault, dedup_key, timeout=bound)
+        if choice is None:
+            raise AssertionError(
+                f"gate {dedup_key!r} unresolved after clamped {bound}s - resolve or "
+                "extend it in the test (conftest.resolve_gate_as_denied for an "
+                "explicit Deny, or @pytest.mark.slow_gate_polls for the real timeout)"
+            )
+        return choice
 
     def _fast_ask(vault, question, *, dedup_key, cancel_event=None, timeout=600.0):
-        return _orig_ask(
+        bound = min(timeout, _TEST_POLL_TIMEOUT_S)
+        answer = _orig_ask(
             vault, question, dedup_key=dedup_key, cancel_event=cancel_event,
-            timeout=min(timeout, _TEST_POLL_TIMEOUT_S),
+            timeout=bound,
         )
+        if answer is None:
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            if not cancelled and not _gate_was_answered(vault, dedup_key):
+                raise AssertionError(
+                    f"gate {dedup_key!r} unresolved after clamped {bound}s - resolve "
+                    "or extend it in the test (resolve the decision, or "
+                    "@pytest.mark.slow_gate_polls for the real timeout)"
+                )
+        return answer
 
     monkeypatch.setattr(qt, "_poll_command_choice", _fast_poll)
     monkeypatch.setattr(qt, "_ask_operator_inline", _fast_ask)
@@ -61,6 +130,14 @@ def _bound_gate_block_polls(monkeypatch):
 #  failed/timed-out call (planner → static tree, episodic → None, verifiers →
 #  soft-pass/None). A test that legitimately needs the real timeout can
 #  monkeypatch these three names back.
+#
+#  DEC-44 HYGIENE CARVE-OUT - this one STAYS autouse, deliberately. DEC-44 is
+#  about autouse fixtures that replace PRODUCT BEHAVIOUR with a double, so a
+#  green test proves the double rather than the product. This fixture replaces
+#  no behaviour and no code path: it sets three timing/retry SCALARS. Every
+#  outcome it can produce (success, failure, timeout) is one the unclamped
+#  router also produces -- it only changes how long the suite waits to get
+#  there. Nothing here can turn a red test green.
 # ─────────────────────────────────────────────────────────────────────────────
 @pytest.fixture(autouse=True)
 def _fast_fail_llm_router(monkeypatch):
@@ -92,24 +169,25 @@ def _fast_fail_llm_router(monkeypatch):
 #  so ``context._situation_report`` stays truthy/valid and the downstream R-A10
 #  planner gate (which only checks truthiness) is unaffected.
 #
-#  CRITICAL scoping — do NOT stub for the survey's OWN tests, which exercise the
-#  REAL survey: early-return (no patch) when the test node carries
-#  ``@pytest.mark.real_survey`` OR its file basename starts with ``test_ra9_``.
-#  Those tests hit the real survey_situation directly (not via execute()), so the
-#  module-attr patch would not even reach them — but we belt-and-suspenders skip
-#  the patch entirely so nothing masks a regression there.
+#  DEC-44 - THIS IS NOW OPT-IN. It used to be autouse with two escapes (the
+#  ``real_survey`` marker and a ``test_ra9_`` FILENAME prefix), which meant the
+#  default for the whole suite was: execute()'s pre-planner survey does not run.
+#  Any behaviour that depends on a real survey -- and any regression in it --
+#  was invisible to ~every execute()-driving test, and no reader of those tests
+#  could tell. The real survey is the DEFAULT again. A test that genuinely wants
+#  the double (unit isolation, a hot loop where the survey is pure cost) asks
+#  for it by name and says why:
+#
+#      @pytest.mark.stub_survey  # <one-line justification>
+#
+#  The ``real_survey`` marker and the ``test_ra9_`` filename escape are GONE:
+#  real is no longer the exception, so there is nothing to opt out of. A
+#  filename prefix was never a sound scoping rule anyway -- it silently
+#  un-stubbed any new file that happened to be named that way, and silently
+#  stubbed any survey test that was not.
 # ─────────────────────────────────────────────────────────────────────────────
-@pytest.fixture(autouse=True)
-def _stub_situation_survey(request, monkeypatch):
-    import os
-
-    node_path = str(getattr(request.node, "fspath", "") or "")
-    basename = os.path.basename(node_path)
-    if request.node.get_closest_marker("real_survey") or basename.startswith("test_ra9_"):
-        # The survey's own tests exercise the REAL survey_situation — never stub.
-        yield
-        return
-
+@pytest.fixture
+def _stub_situation_survey(monkeypatch):
     import systemu.runtime.situational_inventory as _si
 
     async def _instant_empty_survey(scroll, *, vault, cache=None):
@@ -121,6 +199,21 @@ def _stub_situation_survey(request, monkeypatch):
 
     monkeypatch.setattr(_si, "survey_situation", _instant_empty_survey, raising=False)
     yield
+
+
+def _wire_stub_survey_marker(item):
+    """Make ``@pytest.mark.stub_survey`` pull in the (non-autouse) stub fixture.
+
+    The fixture itself carries no ``autouse``: a test that does not ask for the
+    double gets the real ``survey_situation``, full stop (DEC-44). This is the
+    single place the marker turns into a fixture request.
+    """
+    if item.get_closest_marker("stub_survey") is None:
+        return
+    names = getattr(item, "fixturenames", None)
+    if names is None or "_stub_situation_survey" in names:
+        return
+    names.append("_stub_situation_survey")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,3 +256,9 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(pytest.mark.source_sensitive)
         except Exception:
             continue
+
+    # DEC-44 survey opt-in. NOT wrapped in try/except: a failure to wire is a
+    # conftest bug and must be loud. (Its only failure direction is safe anyway
+    # -- an unwired test gets the REAL survey.)
+    for item in items:
+        _wire_stub_survey_marker(item)

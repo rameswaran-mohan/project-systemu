@@ -205,9 +205,9 @@ markers = [
     "e2e: end-to-end live tests (skipped by default)",
     "smoke: boot the real dashboard + exercise it on uvicorn's serving loop (opt-in pre-release gate)",
     "slow: long-running tests",
-    "real_survey: exercises the REAL R-A9 situational-inventory survey (opts out of the conftest survey stub)",
+    "stub_survey: replaces the R-A9 situational-inventory survey with conftest's instant-empty double. OPT-IN (DEC-44): the real survey is the default, so every use needs a one-line justification comment. Replaces the old `real_survey` marker, which existed only because the stub used to be autouse",
     "real_keyring: exercises the REAL OS credential store (Windows Credential Manager / macOS Keychain / SecretService) instead of the fake keyring double — opt-in via SYSTEMU_RUN_REAL_KEYRING=1, off by default (machine-global state, not tmp_path-scoped)",
-    "full_budget: opts out of any conftest budget/iteration cap (needs the real ladder)",
+    "slow_gate_polls: opts out of the conftest quick-lane gate block-poll clamp - the test's SUBJECT is the real _poll_command_choice / _ask_operator_inline timeout, so it gets the untouched product functions and must bound itself (DEC-44)",
     "source_sensitive: reads a function/class SOURCE via inspect.getsource — fragile if the file under test is edited mid-run; auto-applied by conftest. Run `pytest -m 'not source_sensitive'` for the EDIT-SAFE gate (GATE-TIER / DEC-14).",
 ]
 
