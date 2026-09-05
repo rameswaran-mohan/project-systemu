@@ -77,12 +77,15 @@ def _resolve_memory_dir(database_url: str, memory_dir: Optional[Path] = None) ->
     Resolution order:
       1. Explicit ``memory_dir`` parameter (operator override) — wins.
       2. ``sqlite:///...`` URL → ``<db_dir>/memory`` (next to the db file).
-      3. ``postgresql://...`` URL → ``$SYSTEMU_VAULT_DIR/memory``.
-         The vault dir is volume-mounted in docker modes (``vault_data:/data/vault``)
-         so memory survives container restarts.  Before v0.6.6 this fell into
-         the ``else`` branch and defaulted to ``/tmp/systemu_memory`` — the
-         container's writable layer, lost on every ``docker compose down -v``
-         or image rebuild.  See ``captures/E2E_VERDICT_DOCKER.md`` finding D.
+      3. ``postgresql://...`` URL → ``$SYSTEMU_VAULT_DIR/memory``, resolved
+         through the vault-root mint; ``/data/vault/memory`` when that env var
+         is absent.  A postgres URL IS how this site detects the container
+         shape: the vault dir is volume-mounted in docker modes
+         (``vault_data:/data/vault``) so memory survives container restarts.
+         Before v0.6.6 this fell into the ``else`` branch and defaulted to
+         ``/tmp/systemu_memory`` — the container's writable layer, lost on every
+         ``docker compose down -v`` or image rebuild.  See
+         ``captures/E2E_VERDICT_DOCKER.md`` finding D.
       4. Anything else (truly unrecognized scheme) → ``/tmp/systemu_memory``
          with a warning.  Was the v0.6.5 default for all non-SQLite URLs;
          narrowed in v0.6.6 to genuine anomalies worth logging.
@@ -92,7 +95,31 @@ def _resolve_memory_dir(database_url: str, memory_dir: Optional[Path] = None) ->
     if database_url.startswith("sqlite:///"):
         return Path(database_url[len("sqlite:///"):]).parent / "memory"
     if database_url.startswith(("postgresql://", "postgres://")):
-        vault_dir = os.environ.get("SYSTEMU_VAULT_DIR", "/data/vault")
+        # Deferred import: `systemu.storage` must not take a module-scope
+        # dependency on `systemu.runtime` (runtime consumes storage, not the
+        # other way round), and this keeps the function self-contained the way
+        # v0.6.6-d extracted it to be.
+        from systemu.runtime.vault_root import resolve_vault_root
+
+        # The ENV value goes through THE ONE MINT so a relative
+        # SYSTEMU_VAULT_DIR is absolutised against the OPERATING HOME once,
+        # instead of being re-resolved against each reader's cwd. The
+        # env-ABSENT answer is UNCHANGED and must stay so: `/data/vault` is the
+        # docker bind point, and falling back to the mint's own cwd-derived
+        # default (`<home>/systemu/vault`) would put container memory back on
+        # the volatile writable layer that v0.6.6-d fixed.
+        #
+        # `source == "env"` is exactly "the env var is set to a non-blank
+        # value" -- the same predicate the old `os.environ.get(...)` default
+        # expressed, read off the verdict rather than restated. (The one
+        # behaviour change is degenerate: SYSTEMU_VAULT_DIR="" used to yield the
+        # relative `memory`, and now yields the container default.)
+        #
+        # The `refused` bit is not consulted here for the same reason as in
+        # `sharing_on.config._resolve_vault_dir`: this is a consumer of the
+        # root, not the boundary that decides to boot.
+        verdict = resolve_vault_root()
+        vault_dir = verdict.root if verdict.source == "env" else "/data/vault"
         return Path(vault_dir) / "memory"
     logger.warning(
         "[SqliteVault] memory_dir not set for unrecognized URL scheme — using /tmp/systemu_memory"

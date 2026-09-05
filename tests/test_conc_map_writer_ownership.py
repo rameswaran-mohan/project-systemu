@@ -262,6 +262,30 @@ WRITER_OWNERSHIP = {
                  "coverage, which is the one error that turns a live fact into "
                  "'may be gone' — hence the pin."),
     },
+    "2a growth snapshot (<root>/growth_snapshot.json)": {
+        # Guard on the RENDER-PATH ENTRY POINT, not on the private
+        # `_write_growth_snapshot`: that writer is only ever called from inside its own
+        # def file, which this scan excludes, so a guard keyed on it would pass
+        # vacuously on zero hits. Who may TRIGGER a write is the question that matters
+        # (same reasoning as the census-consent entry, which guards on construction).
+        # The complementary half - that nothing reaches the writer AROUND this entry
+        # point - is pinned by tests/test_home_growth_delta.py::
+        # test_the_private_writer_has_no_caller_outside_its_module.
+        "call": "growth_delta_line(",
+        "allowed": {"interface/pages/console.py"},   # Home's growth card, sole trigger
+        "def": "interface/growth_snapshot.py",
+        "conc_map_row": '**2a growth snapshot** `<root>/growth_snapshot.json`',
+        "note": ("P2/2a weekly capability snapshot behind Home's 'This week: +N tools' "
+                 "line. Written from the HOME RENDER path at most once per 7 days, "
+                 "atomically (tmp + os.replace). Two Home renders in two tabs are two "
+                 "request threads and both can find the week due, but the payload is "
+                 "DERIVED (a fresh growth_counts read + the stamping time) rather than "
+                 "an accumulating RMW, so a lost update costs a duplicated week "
+                 "boundary and never a count. A SECOND trigger would break that: it "
+                 "would stamp a week from counts the operator's Home never showed, and "
+                 "every later delta would be measured against it. Any further writer "
+                 "needs a DEC-10 review + this allowlist update."),
+    },
     "U-12-Outbox (<root>/Outbox/<yyyy-mm-dd>-<slug>/)": {
         "call": "write_outbox_for_run(",
         "allowed": {
@@ -276,6 +300,28 @@ WRITER_OWNERSHIP = {
                  "invariant is what makes a third caller dangerous: it could drop "
                  "artifacts into a folder another writer is about to seal with "
                  ".done, which is exactly the torn-read `.done` exists to prevent."),
+    },
+    "P2d-first-run-funnel (<root>/funnel.json)": {
+        "call": "mark_milestone(",
+        "allowed": {
+            "interface/pages/welcome.py",   # welcome_rendered + setup_finished
+            "pipelines/quick_task.py",      # first_task_submitted + succeeded
+            "pipelines/direct_task.py",     # first_task_submitted + succeeded
+            "interface/wishes.py",          # first_wish
+            "interface/dashboard.py",       # first_recording (the record dialog)
+        },
+        "def": "runtime/funnel.py",
+        "conc_map_row": '**P2d first-run funnel** `<root>/funnel.json`',
+        "note": ("P2d local first-run counters. LOCAL ONLY - the module imports no "
+                 "network module and a source-purity scan in tests/test_p2d_funnel.py "
+                 "fails if one ever appears, because the Insights page prints "
+                 "'Nothing is sent anywhere.' verbatim. Unlocked RMW is deliberate: "
+                 "the store is FIRST-WRITE-WINS over a CLOSED six-name vocabulary, so "
+                 "a write only ADDS an absent key and a lost update costs one table "
+                 "cell reading 'not yet' until that call site runs again. A NEW writer "
+                 "is the thing to review: it would mean a seventh moment is being "
+                 "counted, and this store's whole privacy argument rests on the "
+                 "vocabulary being closed and enumerable in the CONC-MAP row."),
     },
 }
 
@@ -360,6 +406,8 @@ _ATOMIC_WRITE_STORES = {
     "runtime/outbox.py",              # _write_atomic (receipt/.done/FAILED note)
     "runtime/world_model.py",         # _write_atomic (facts/negatives/surveys)
     "runtime/census_consent.py",      # R-W2 per-category census consent (_write)
+    "interface/growth_snapshot.py",   # P2/2a weekly growth snapshot (_write_growth_snapshot)
+    "runtime/funnel.py",              # P2d first-run counters (_write_atomic)
 }
 
 

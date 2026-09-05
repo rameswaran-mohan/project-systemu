@@ -949,6 +949,12 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
     from systemu.runtime.first_gate_review import maybe_post_on_task_submission
     maybe_post_on_task_submission(vault)
 
+    # P2d: local first-run funnel (one JSON sidecar in the vault; no network).
+    # Beside the JIT hook because this is the same chokepoint - the moment the
+    # operator submitted. First-write-wins and never raises.
+    from systemu.runtime.funnel import mark_milestone
+    mark_milestone(vault, "first_task_submitted")
+
     ts = chat_ts or datetime.now().isoformat(timespec="seconds")
     try:
         vault.append_chat_history({
@@ -1017,4 +1023,12 @@ def submit_quick_task(prompt: str, config, vault, *, chat_ts: Optional[str] = No
             execution_id=getattr(result, "execution_id", None))
     except Exception:
         logger.debug("[QuickTask] outbox hook skipped", exc_info=True)
+
+    # P2d: the QUICK lane's success terminal. Wired for the same reason the
+    # Outbox hook above is: this is the DEFAULT lane, so stamping only the
+    # workflow lane would leave a successful operator reading "not yet" on the
+    # Insights journey table forever. First-write-wins; never raises.
+    if getattr(result, "status", "") == "success":
+        from systemu.runtime.funnel import mark_milestone
+        mark_milestone(vault, "first_task_succeeded")
     return result

@@ -126,6 +126,46 @@ def answer_ack_model(vault, request_id: str) -> dict:
     }
 
 
+def build_first_run_journey_card() -> None:
+    """P2d - the read-only "Your first-run journey" table.
+
+    Six local counters, rendered from ``runtime.funnel`` and nothing else. The
+    privacy sentence is the module's OWN constant, not a re-typed copy on this
+    page: a sentence and the code it describes must be one artefact, or they
+    drift and the page starts making a claim the code stopped honouring.
+
+    Collapsed by default. It is a first-run surface, so it must not push the
+    Insights tabs down the page for the rest of the install's life.
+    """
+    from systemu.interface.dashboard_state import AppState
+    from systemu.runtime.funnel import (
+        JOURNEY_TITLE, PRIVACY_NOTE, journey_rows,
+    )
+
+    try:
+        vault = AppState.get().vault
+    except Exception:  # noqa: BLE001
+        logger.debug("[Insights] no vault for the first-run journey", exc_info=True)
+        vault = None
+
+    rows = journey_rows(vault)
+    with ui.expansion(JOURNEY_TITLE).classes("w-full"):
+        with ui.element("table").classes("s-table"):
+            with ui.element("thead"):
+                with ui.element("tr"):
+                    for col in ("Step", "First happened"):
+                        with ui.element("th"):
+                            ui.label(col)
+            with ui.element("tbody"):
+                for label, when in rows:
+                    with ui.element("tr"):
+                        with ui.element("td"):
+                            ui.label(label).classes("s-cell")
+                        with ui.element("td"):
+                            ui.label(when).classes("s-cell")
+        ui.label(PRIVACY_NOTE).classes("s-muted")
+
+
 def build_insights_page(default_tab: str = "memory") -> None:
     """Render the Insights page with three tabs (Memory / Flywheel / Events).
 
@@ -148,6 +188,10 @@ def build_insights_page(default_tab: str = "memory") -> None:
     ui.label(lore_sublabel("insights")).style(
         f"color: {THEME['text_muted']}; font-size: 14px; margin-bottom: 20px;"
     )
+
+    # P2d: the local first-run journey. Above the tabs (it is about the whole
+    # install, not one panel) and collapsed, so it costs one line of chrome.
+    build_first_run_journey_card()
 
     # ── Tabs header ─────────────────────────────────────────────────────────
     with ui.tabs().style(

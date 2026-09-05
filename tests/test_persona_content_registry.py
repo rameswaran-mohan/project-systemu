@@ -35,13 +35,28 @@ def test_current_persona_reads_newest_persona_fact(tmp_path):
     assert current_persona(v) == "Personal"          # newest wins
 
 
+def all_skin_copy() -> str:
+    """Every operator-visible string in every skin, lowercased.
+
+    The honesty wall below reads THIS - so a new copy field is only covered
+    once it is folded in here. tests/test_p2e_page_micro_tours.py pins that
+    the page-hint copy really is inside the blob, so the coverage cannot
+    silently regress when a field is added.
+    """
+    from systemu.interface import persona_content as pc
+    parts = []
+    for s in list(pc.PERSONA_CONTENT.values()) + [pc.DEFAULT_SKIN]:
+        parts.extend(s.starters)
+        parts.extend([s.dare_line, s.empty_work, s.empty_shadows, s.preset_hint])
+        for steps in s.page_hints.values():
+            for step in steps:
+                parts.extend([step.get("title", ""), step.get("body", "")])
+    return " ".join(parts).lower()
+
+
 def test_no_skin_promises_unwired_capability():
     # Honesty wall: banned phrases that would advertise what is not built.
-    from systemu.interface import persona_content as pc
     banned = ("share with your team", "multi-user", "coming soon", "will be able to")
-    blob = " ".join(
-        " ".join(s.starters) + s.dare_line + s.empty_work + s.empty_shadows
-        for s in list(pc.PERSONA_CONTENT.values()) + [pc.DEFAULT_SKIN]
-    ).lower()
+    blob = all_skin_copy()
     for phrase in banned:
         assert phrase not in blob

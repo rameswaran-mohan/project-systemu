@@ -19,6 +19,12 @@ class PersonaSkin:
     empty_shadows: str
     tour_order: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5])
     preset_hint: str = ""          # one line under the preset select
+    #: Phase 2e - per-route micro-tour hints, ``{"/work": [{title, body}, ...]}``.
+    #: Keys are ``tour.PAGE_TOUR_ROUTES``; 1-2 steps each; empty means the "?"
+    #: pill simply does not appear on that page for this persona. A skin that
+    #: omits a route inherits DEFAULT_SKIN's hints for it (see
+    #: ``tour.page_tour_steps``), so emphasis is additive, never subtractive.
+    page_hints: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
 
 
 #: The dare prompt is deliberately a capability the stock toolbox lacks, so it
@@ -28,6 +34,46 @@ DARE_PROMPT = ("Create a QR code image named table_link.png that encodes the "
 
 _NEWS = ("Search the web for today's top 3 news headlines about AI assistants "
          "and summarize them")
+
+#: The baseline micro-tour hints every persona inherits unless its own skin
+#: overrides the route. Each sentence describes a control that is on the page
+#: TODAY - the /tools wording is lifted from that page's own explanatory line
+#: so the two surfaces cannot drift into promising different things.
+_DEFAULT_PAGE_HINTS: Dict[str, List[Dict[str, str]]] = {
+    "/work": [
+        {
+            "title": "Every job it has learned, in one list",
+            "body": ("Each captured or submitted task becomes a row: the "
+                     "title opens the full run stage by stage, the pill "
+                     "shows how far it got, and the search box plus the "
+                     "status filter cut a long list down."),
+        },
+        {
+            "title": "Run it again - or approve it first",
+            "body": ("A workflow that has reached the end - finished, failed "
+                     "or cancelled - shows Run again, and one click "
+                     "re-submits the same job. One that is waiting on you "
+                     "shows Review & Approve instead, so nothing repeats "
+                     "itself without your go-ahead."),
+        },
+    ],
+    "/tools": [
+        {
+            "title": "What is in the toolbox right now",
+            "body": ("The table lists every tool with its status, whether it "
+                     "is enabled, whether it runs dry, and how often it has "
+                     "succeeded. Filter by status, or by Agent-built to see "
+                     "only the ones Systemu wrote for itself."),
+        },
+        {
+            "title": "Approve a batch, or one tool at a time",
+            "body": ("Review all tools posts a single Inbox card listing "
+                     "every tool, so you can approve the ones that qualify "
+                     "in one go. The rest keep asking the first time they "
+                     "run, with their arguments in front of you."),
+        },
+    ],
+}
 
 DEFAULT_SKIN = PersonaSkin(
     starters=[
@@ -41,6 +87,7 @@ DEFAULT_SKIN = PersonaSkin(
     # em-dash is deliberate copy fidelity, not a stray character.
     empty_work="No workflows yet —",
     empty_shadows="No shadows yet — process a scroll to create your first shadow.",
+    page_hints=_DEFAULT_PAGE_HINTS,
 )
 
 PERSONA_CONTENT: Dict[str, PersonaSkin] = {
@@ -54,6 +101,26 @@ PERSONA_CONTENT: Dict[str, PersonaSkin] = {
         empty_work="Nothing here yet - your first task is one sentence away in Chat.",
         empty_shadows="No shadows yet. Record yourself doing any chore once - it becomes a repeat button.",
         tour_order=[0, 1, 4, 2, 3, 5],   # Build (forge) early: the explorer's aha
+        # The forge angle: Personal's aha is watching a missing tool get built,
+        # so /tools gets the two gates instead of the inventory table.
+        page_hints={
+            "/tools": [
+                {
+                    "title": "Ask for the tool you do not have",
+                    "body": ("+ New Tool is the forge. Describe what you wish "
+                             "existed and Gate 1 shows you the written "
+                             "specification first - you read what it intends "
+                             "to build before any code is generated."),
+                },
+                {
+                    "title": "You read the code before it joins the toolbox",
+                    "body": ("Gate 2 shows the generated code itself. Approve "
+                             "& Sign Off, Edit Code, Refine Spec or Reject - "
+                             "nothing becomes a usable tool until you approve "
+                             "it."),
+                },
+            ],
+        },
     ),
     "Freelance": PersonaSkin(
         starters=[
@@ -98,6 +165,27 @@ PERSONA_CONTENT: Dict[str, PersonaSkin] = {
         empty_work="Running and finished work appears here - every action gated, every step visible.",
         empty_shadows="Shadows are workflows learned from your screen. Recording stays off until you start it.",
         tour_order=[0, 3, 1, 2, 4, 5],   # Inbox (control) early: the trust aha
+        # The audit angle: /inbox already leads this persona's main tour, so
+        # the micro-tour goes to Insights - the after-the-fact record.
+        page_hints={
+            "/insights": [
+                {
+                    "title": "The record of what actually ran",
+                    "body": ("The Manual Logs tab is a timestamped table - "
+                             "time, level, category, message - newest first, "
+                             "refreshing every two seconds. Filter it by "
+                             "text, by level, or by whether an entry came "
+                             "from Systemu or from a manual run."),
+                },
+                {
+                    "title": "Every tab has its own address",
+                    "body": ("Memory, Flywheel and Manual Logs each answer to "
+                             "a link: /insights?tab=events opens this log "
+                             "directly, so a bookmark or a pasted URL lands "
+                             "on the same view."),
+                },
+            ],
+        },
     ),
 }
 

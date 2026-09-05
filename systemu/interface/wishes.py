@@ -9,10 +9,11 @@ the existing append-only fact store.  There is deliberately NO new store:
     so a dismissed wish is still in the log, just no longer open.
 
 Matching a wish to a shipped capability is deterministic keyword overlap - at
-least ``MATCH_MIN_WORDS`` significant words (len > 3, lowercased, stopword-
-stripped) appearing in a tool's name+description.  Honest and dumb beats clever
-and wrong: an LLM matcher would need its own ruled criteria, and a wrong "you
-wished for this" is worse than no nudge at all.  v1 has no LLM in this path.
+least ``MATCH_MIN_WORDS`` significant words (len > 3 or listed in
+``_SHORT_SIGNIFICANT``, lowercased, stopword-stripped) appearing in a tool's
+name+description.  Honest and dumb beats clever and wrong: an LLM matcher would
+need its own ruled criteria, and a wrong "you wished for this" is worse than no
+nudge at all.  v1 has no LLM in this path.
 
 THE HONESTY WALL: `ready_tools` is the fence in front of every nudge.  Only a
 tool that is DEPLOYED (or UPGRADED) and enabled can be named as a fulfilled
@@ -49,7 +50,25 @@ DISMISS_REASON = "wish_dismissed"
 MATCH_MIN_WORDS = 2
 
 #: a word shorter than this contributes nothing (len > 3, i.e. 4+ characters)
+#: unless it is listed in `_SHORT_SIGNIFICANT` below
 _MIN_WORD_LEN = 4
+
+#: short words that DO carry capability signal despite the length floor - a
+#: CLOSED set of format and protocol vocabulary, and closed on purpose.
+#:
+#: The floor is a noise filter, and lowering it globally would have loosened
+#: every match this module makes; an enumerated exception loosens nothing,
+#: which is what keeps the honesty wall standing.  These twelve are the words
+#: an operator uses to say what they actually want, and they are the most
+#: discriminating word in the sentence when they appear.
+#:
+#: The live case: "write a csv file for my expenses" lost "csv" to the floor,
+#: which flattened `file_write` and `write_csv_file` into a 2-2 tie and left
+#: the answer to whichever the tool index listed first.
+_SHORT_SIGNIFICANT = frozenset({
+    "csv", "pdf", "zip", "png", "jpg", "gif", "svg", "xml", "sql", "api",
+    "url", "ocr",
+})
 
 #: tool statuses that mean "this exists and can run today"
 _READY_STATUSES = frozenset({"deployed", "upgraded"})
@@ -88,6 +107,10 @@ def add_wish(vault, text: Optional[str]) -> Optional[str]:
         from systemu.runtime.user_profile import add_fact
         uf = add_fact(vault, f"{WISH_PREFIX} {body}",
                       source=WISH_SOURCE, tags=[WISH_TAG])
+        # P2d: local first-run funnel. Stamped AFTER the wish is actually saved,
+        # so the counter can never claim a wish the store refused. Never raises.
+        from systemu.runtime.funnel import mark_milestone
+        mark_milestone(vault, "first_wish")
         return uf.id
     except Exception:
         logger.warning("[Wishes] could not record a wish", exc_info=True)
@@ -156,11 +179,14 @@ def short_wish(text: Optional[str], limit: int = QUOTE_LIMIT) -> str:
 
 
 def significant_words(text: Optional[str]) -> List[str]:
-    """The words a match may be built from: lowercased, 4+ characters, not a
-    stopword, de-duplicated with first-seen order preserved."""
+    """The words a match may be built from: lowercased, 4+ characters OR a
+    listed short high-signal token, not a stopword, de-duplicated with
+    first-seen order preserved."""
     seen: List[str] = []
     for w in _WORD_RE.findall((text or "").lower()):
-        if len(w) < _MIN_WORD_LEN or w in _STOPWORDS or w in seen:
+        if w in _STOPWORDS or w in seen:
+            continue
+        if len(w) < _MIN_WORD_LEN and w not in _SHORT_SIGNIFICANT:
             continue
         seen.append(w)
     return seen
@@ -198,19 +224,32 @@ def match_wish(wish_text: Optional[str],
 
     Substring containment, not stemming: "invoice" matches "invoices" and does
     not match "invoic".  That bluntness is the point - the threshold, not the
-    cleverness, is what keeps a false "you wished for this" out.  Ties resolve
-    to the earliest tool in the list, so the result is deterministic for a
-    given index order.
+    cleverness, is what keeps a false "you wished for this" out.
+
+    RANKING is (hit count DESC, tool name ASC).  Position in the index is never
+    the tie-break: the index is assembled from a listing and carries no
+    ordering contract, so a position-decided winner could name one tool today
+    and a different, equally-scoring one tomorrow for the same wish.  The live
+    case was "write a csv file for my expenses", where `file_write` and
+    `write_csv_file` both score 2 ("write", "file") and only their order
+    decided it.  The count stays the FIRST key, so the name tie-break can never
+    outrank a genuinely better overlap.
     """
     words = significant_words(wish_text)
     if len(words) < MATCH_MIN_WORDS:
         return None
     best: Optional[Dict[str, Any]] = None
-    best_score = 0
+    best_key: Optional[Tuple[int, str]] = None
     for t in (tools or []):
         if not isinstance(t, dict):
             continue
         score = _overlap(words, t)
-        if score >= MATCH_MIN_WORDS and score > best_score:
-            best, best_score = t, score
+        if score < MATCH_MIN_WORDS:
+            continue
+        # Negated score so a plain ascending compare reads "more hits first";
+        # the name is coerced because the index may carry none at all, and a
+        # ranking that raised would take down the page it renders on.
+        key = (-score, str(t.get("name") or ""))
+        if best_key is None or key < best_key:
+            best, best_key = t, key
     return best

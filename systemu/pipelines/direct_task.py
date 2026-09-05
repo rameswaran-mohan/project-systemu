@@ -327,6 +327,12 @@ def run_direct_task(
     from systemu.runtime.first_gate_review import maybe_post_on_task_submission
     maybe_post_on_task_submission(vault)
 
+    # P2d: local first-run funnel (one JSON sidecar in the vault; no network).
+    # Beside the JIT hook because this is the same chokepoint - the moment the
+    # operator submitted. First-write-wins and never raises.
+    from systemu.runtime.funnel import mark_milestone
+    mark_milestone(vault, "first_task_submitted")
+
     set_vault(vault)
     init_pipeline(config, vault)
 
@@ -594,6 +600,12 @@ def run_direct_task(
     if result.get("status") == "success":
         from systemu.runtime.activity_completion import mark_activity_completed
         mark_activity_completed(vault, activity.id)
+        # P2d: the WORKFLOW lane's success terminal - the same `status ==
+        # "success"` witness the terminal-state writer above consumes, so the
+        # journey table and the activity's own state cannot disagree about
+        # whether a first task succeeded. First-write-wins; never raises.
+        from systemu.runtime.funnel import mark_milestone
+        mark_milestone(vault, "first_task_succeeded")
 
     _maybe_trigger_fact_extraction(vault, config, ts)
 

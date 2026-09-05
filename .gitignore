@@ -82,6 +82,11 @@ htmlcov/
 *.xml
 # Stray dirs created when a test passes a MagicMock() as a vault root path.
 MagicMock/
+# Same class: tests/test_impl4_bulk_first_gate.py stubs a vault with the RELATIVE
+# root "vault", so any writer on the task-intake path (P2d funnel.json) lands a
+# file in the repo root. Test residue, never product state - the real vault is
+# systemu/vault/ (or SYSTEMU_VAULT_DIR), and nothing under /vault is tracked.
+/vault/
 
 # ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/

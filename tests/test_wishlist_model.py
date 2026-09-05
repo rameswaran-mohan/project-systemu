@@ -250,3 +250,125 @@ def test_the_model_never_reaches_for_the_onthetable_store():
 
 def test_the_match_threshold_is_stated_not_implied():
     assert wishes.MATCH_MIN_WORDS == 2
+
+
+# ---------------------------------------------------------------------------
+#  The BEST match, deterministically - whatever order the index arrived in
+# ---------------------------------------------------------------------------
+
+
+#: The live wish that exposed the defect.  Its significant words are
+#: ("write", "csv", "file", "expenses") - "csv" is three characters and clears
+#: the length floor only because it is listed in `_SHORT_SIGNIFICANT`, and it
+#: is the single most discriminating word the operator typed.
+_CSV_WISH = "write a csv file for my expenses"
+
+
+class TestTheBestMatchIsDeterministic:
+    """Live defect: this wish named `file_write` over `write_csv_file`.  Two
+    things were wrong.  The wish's sharpest word, "csv", was thrown away by the
+    length floor, so the pair scored 2 all square; and the square was then
+    settled by whichever tool the index happened to list first.  A tool index
+    is assembled from a listing and carries no ordering contract, so a
+    position-decided winner can change between two renders of the same wish.
+    Count the format vocabulary; rank by hit count; break a tie by tool name,
+    never by position.
+    """
+
+    def test_the_csv_wish_resolves_to_the_csv_writer_in_both_orders(self):
+        file_write = _deployed(
+            "file_write", "Write text content to a file at a given path.")
+        write_csv_file = _deployed(
+            "write_csv_file", "Create a CSV spreadsheet from rows of data.")
+        # 3 hits ("write", "csv", "file") against 2: dropping "csv" was what
+        # flattened these two into a tie and handed the answer to list order.
+        assert (match_wish(_CSV_WISH, [file_write, write_csv_file])
+                is write_csv_file)
+        assert (match_wish(_CSV_WISH, [write_csv_file, file_write])
+                is write_csv_file)
+
+    def test_more_hits_beat_an_alphabetically_earlier_name(self):
+        file_write = _deployed(
+            "file_write", "Write text content to a file at a given path.")
+        write_csv_file = _deployed(
+            "write_csv_file",
+            "Write rows of data to a CSV file, such as an expenses ledger.")
+        # 3 hits ("write", "file", "expenses") against 2.  The count is the
+        # first key, so the name tie-break may never outrank a better overlap
+        # even though "file_write" sorts earlier.
+        assert (match_wish(_CSV_WISH, [file_write, write_csv_file])
+                is write_csv_file)
+        assert (match_wish(_CSV_WISH, [write_csv_file, file_write])
+                is write_csv_file)
+
+    def test_a_missing_or_unstringy_name_ranks_instead_of_raising(self):
+        # The tie-break reads a field the index may simply not carry.  A
+        # wishlist that raised would take down the page it renders on.
+        nameless = {"description": "Write rows to a file of expenses.",
+                    "status": "deployed", "enabled": True}
+        numbered = {"name": 7, "description": "Write a file of expenses.",
+                    "status": "deployed", "enabled": True}
+        named = _deployed("zzz_last", "Write a file of expenses.")
+        picked = match_wish(_CSV_WISH, [named, nameless, numbered])
+        assert picked is nameless          # "" sorts before "7" and "zzz_last"
+        assert match_wish(_CSV_WISH, [nameless, numbered, named]) is nameless
+
+    def test_a_genuine_tie_is_broken_by_name_not_by_index_order(self):
+        """The tie-break itself, held on words the short-token list does not
+        reach - so no later edit to that list can quietly stop this from being
+        a tie and leave the guarantee untested."""
+        wish = "summarize my quarterly board minutes"
+        digest = _deployed("board_minutes_digest",
+                           "Digest a meeting into a short recap.")
+        summarize = _deployed("minutes_summarize",
+                              "Summarize a set of meeting notes.")
+        # Each lands exactly two of ("summarize", "quarterly", "board",
+        # "minutes"); the name, not the position, settles it.
+        assert match_wish(wish, [digest, summarize]) is digest
+        assert match_wish(wish, [summarize, digest]) is digest
+
+
+# ---------------------------------------------------------------------------
+#  The short high-signal tokens - a CLOSED exception, not a lower floor
+# ---------------------------------------------------------------------------
+
+
+class TestShortSignificantTokens:
+    """The length floor exists to keep noise out, and lowering it globally
+    would have loosened every match on the page.  The exception is enumerated
+    instead: a closed set of format and protocol vocabulary, which is exactly
+    the three-letter word an operator uses to say what they actually want.
+    """
+
+    def test_the_list_is_closed_and_stated(self):
+        # Pinned by value: growing it is a deliberate edit with a test change,
+        # never a quiet widening of what counts as a capability word.
+        assert wishes._SHORT_SIGNIFICANT == frozenset({
+            "csv", "pdf", "zip", "png", "jpg", "gif", "svg", "xml", "sql",
+            "api", "url", "ocr",
+        })
+        assert type(wishes._SHORT_SIGNIFICANT) is frozenset
+
+    def test_every_listed_token_actually_needs_the_exception(self):
+        """A member long enough to clear the floor on its own, or one that the
+        stopword filter would drop anyway, would be dead weight pretending to
+        be a rule."""
+        for tok in wishes._SHORT_SIGNIFICANT:
+            assert tok == tok.lower(), tok
+            assert len(tok) < wishes._MIN_WORD_LEN, tok
+            assert tok not in wishes._STOPWORDS, tok
+
+    def test_every_listed_token_counts_as_significant(self):
+        for tok in wishes._SHORT_SIGNIFICANT:
+            assert tok in wishes.significant_words(f"export a {tok} report"), tok
+
+    def test_an_unlisted_three_letter_word_still_counts_for_nothing(self):
+        # "the", "tax", "box", "bob" are all three letters and none are listed.
+        assert wishes.significant_words("send the tax box to bob") == ["send"]
+
+    def test_the_exception_does_not_lower_the_two_word_threshold(self):
+        # One significant word is one significant word, whatever its length:
+        # a lone format token is still a near miss, not a "you wished for this".
+        tool = _deployed("pdf_merge", "Merge several PDF documents into one.")
+        assert match_wish("a pdf", [tool]) is None
+        assert match_wish("merge a pdf", [tool]) is tool

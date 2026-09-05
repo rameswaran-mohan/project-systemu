@@ -23,7 +23,11 @@ from typing import Any, Dict, List
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState
+from systemu.interface.proposals import derive_scan_proposals
 from systemu.interface.wishes import add_wish, dismiss_wish, open_wishes
+from systemu.interface.world_scan import (
+    count_rows, refusal_message, scan_folder, summary_line,
+)
 from systemu.runtime import table_consult as tc
 from systemu.runtime import table_store as ts
 from systemu.runtime.table_provenance import provenance_banner
@@ -41,6 +45,31 @@ WISHLIST_EMPTY = ("Nothing wished yet - write down what you want Systemu to "
                   "learn to do, and it will tell you when it can.")
 WISHLIST_SAVED = "Added to your wishlist."
 WISHLIST_BLANK = "Write down what you wish Systemu could do first."
+
+# --- P2c "Scan a folder" copy -------------------------------------------------
+# CONSENT-FIRST: nothing is scanned until the operator types a path and presses
+# the button. The blurb below is the whole privacy contract of this card, and
+# both of its sentences are properties of `interface/world_scan.py` that its
+# source-purity tests enforce - the module contains no call that could read a
+# file body and no network reach of any kind. If either sentence is edited, the
+# code beside it has to change first.
+SCAN_TITLE = "Scan a folder"
+SCAN_BLURB = ("Reads file names and extensions only - never file contents. "
+              "Nothing leaves this machine.")
+SCAN_PROMPT = "Full path to a folder on this machine"
+SCAN_BUTTON = "Scan"
+SCAN_TRANSIENT = ("This result is not saved - it disappears when you leave "
+                  "the page.")
+SCAN_EMPTY = "Nothing with a file extension in that folder."
+SCAN_NO_OFFERS = ("No starter fits this folder yet - Systemu only offers one "
+                  "when it recognises the file kinds AND already has the "
+                  "ability to do the job.")
+SCAN_OPEN_LABEL = "Try this in Chat"
+SCAN_DISMISS_TIP = "Hide this suggestion"
+
+#: how many extension badges the card shows before it stops - the row is a
+#: glance, not the whole listing (which is why `summary_line` carries the totals)
+_SCAN_ROW_CAP = 8
 
 #: R-B4 — the banner tone → the token class that renders it. Token classes only
 #: (the `.style()` linter rejects a raw colour where a class exists).
@@ -312,7 +341,13 @@ def build_table_page() -> None:
     # per-page UI state: the live search query, a pending-undo (ref_key, name), and
     # the set of zone labels the operator collapsed (persisted so a board refresh —
     # from a search keystroke / pin / remove / undo-timer — doesn't re-expand them).
-    view: Dict[str, Any] = {"query": "", "undo": None, "seq": 0, "collapsed": set()}
+    # `scan` holds the newest ScanResult (or None) and `scan_hidden` the keys of
+    # proposals dismissed from it. BOTH die with this page render: a scan is
+    # session-transient (never persisted), so there is nothing durable for a
+    # decline to attach to and the decline-forever machinery Home's proposals
+    # use deliberately does not apply here.
+    view: Dict[str, Any] = {"query": "", "undo": None, "seq": 0, "collapsed": set(),
+                            "scan": None, "scan_hidden": set()}
 
     def _clear_undo(seq: int) -> None:
         if view["undo"] is not None and view["seq"] == seq:
@@ -716,6 +751,97 @@ def build_table_page() -> None:
                     for it in sort_for_display(zitems):
                         _render_card(it, on_pin=_on_pin, on_remove=_on_remove)
 
+    # --- P2c "Scan a folder" --------------------------------------------------
+    # A read-only, consent-first look at ONE folder the operator names. It reads
+    # names and extensions, one folder deep, and derives up to three starter
+    # offers from the counts. Everything it produces lives in `view` for this
+    # render only: no sidecar, no user fact, and never a table-store write - the
+    # reconciler stays the sole writer of the projected inventory (DEC-10).
+    def _on_scan(field: Any) -> None:
+        result = scan_folder(getattr(field, "value", "") or "")
+        view["scan"] = result
+        view["scan_hidden"] = set()
+        if not getattr(result, "ok", False):
+            ui.notify(refusal_message(result), type="warning")
+        _scan.refresh()
+
+    def _on_dismiss_scan(key: str) -> None:
+        # A transient hide, not a decline: the scan behind it is not stored, so
+        # remembering this choice would outlive the thing it was about.
+        view["scan_hidden"].add(key)
+        _scan.refresh()
+
+    @ui.refreshable
+    def _scan() -> None:
+        """The RESULT region only.
+
+        The path box and the Scan button live outside this refreshable on
+        purpose: a refresh rebuilds everything it owns, so an input inside it
+        would be wiped (and would steal focus) every time a result landed -
+        the same reason the consult's rename handler refuses to refresh while
+        the operator is typing.
+        """
+        result = view["scan"]
+        if result is None:
+            return
+        if not getattr(result, "ok", False):
+            # the refusal is a VALUE the scan returned (DEC-32); it renders here
+            # as well as in the toast, so it survives the toast timing out and
+            # can never be mistaken for "that folder was empty".
+            ui.label(refusal_message(result)).classes("s-text-warn") \
+                .style("font-size: 12px;")
+            return
+
+        ui.label(summary_line(result)).classes("s-muted").style("font-size: 12px;")
+        ui.label(SCAN_TRANSIENT).classes("s-muted").style("font-size: 12px;")
+        rows = count_rows(result)
+        if not rows:
+            ui.label(SCAN_EMPTY).classes("s-muted").style("font-size: 12px;")
+        else:
+            with ui.row().classes("items-center wrap").style("gap: 6px;"):
+                for _ext, _n in rows[:_SCAN_ROW_CAP]:
+                    ui.badge(f"{_ext} {_n}").props("outline color=grey")
+
+        # The honesty wall runs INSIDE `derive_scan_proposals`, over the real
+        # tool index: a starter is offered only when the seed tool that would
+        # produce its artifact is deployed and enabled on this install.
+        try:
+            _tools = (vault.list_tools() or []) if vault is not None else []
+        except Exception:
+            _tools = []
+        offers = [p for p in derive_scan_proposals(result, _tools)
+                  if p[0] not in view["scan_hidden"]]
+        if not offers:
+            ui.label(SCAN_NO_OFFERS).classes("s-muted").style("font-size: 12px;")
+            return
+        for _key, _text, _route in offers:
+            with ui.row().classes(
+                    "items-center no-wrap w-full justify-between").style("gap: 8px;"):
+                ui.label(_text).classes("ellipsis")
+                with ui.row().classes("items-center no-wrap").style("gap: 4px;"):
+                    ui.button(SCAN_OPEN_LABEL,
+                              on_click=lambda _e=None, r=_route: ui.navigate.to(r)) \
+                        .props("flat dense size=sm color=primary")
+                    ui.button(icon="close",
+                              on_click=lambda _e=None, k=_key: _on_dismiss_scan(k)) \
+                        .props("flat dense round size=sm color=grey") \
+                        .tooltip(SCAN_DISMISS_TIP)
+
+    def _scan_card() -> None:
+        """The whole card, built ONCE. Consent-first: the path box starts empty
+        and nothing is looked at until the operator presses Scan."""
+        with ui.column().classes("s-card q-pa-sm q-mt-md w-full").style("gap: 6px;"):
+            ui.label(SCAN_TITLE).classes("s-section-head")
+            ui.label(SCAN_BLURB).classes("s-muted").style("font-size: 12px;")
+            with ui.row().classes("items-center no-wrap w-full").style("gap: 8px;"):
+                _path_in = ui.input(placeholder=SCAN_PROMPT) \
+                    .props("dense outlined").classes("col")
+                _path_in.on("keydown.enter", lambda _e=None, f=_path_in: _on_scan(f))
+                ui.button(SCAN_BUTTON,
+                          on_click=lambda _e=None, f=_path_in: _on_scan(f)) \
+                    .props("dense color=primary")
+            _scan()
+
     # --- the capability wishlist (P2 v1) --------------------------------------
     # Sits UNDER the board because it is the mirror image of it: the board is
     # what systemu has, the wishlist is what the operator wants it to have. It
@@ -761,4 +887,5 @@ def build_table_page() -> None:
                         .tooltip("Remove from your wishlist")
 
     _board()
+    _scan_card()
     _wishlist()

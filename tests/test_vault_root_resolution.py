@@ -34,6 +34,20 @@ WITNESS
     Remove the fence call site in `start_daemon` or in the daemon `__main__`
     block, or let the child be handed a relative vault dir again, and a named
     test here goes red.
+
+SECTION G -- THE DOWNSTREAM CONSUMERS (phase 1b)
+    Three sites carried the raw pre-fix pattern
+    `os.getenv("SYSTEMU_VAULT_DIR", "systemu/vault")` and kept a RELATIVE base:
+    the credential store, the memory-backend factory and the sqlite vault's
+    memory-dir resolver.  They were safe only BY INHERITANCE -- the daemon
+    pins an absolute `SYSTEMU_VAULT_DIR` into its child's environment, so the
+    relative branch was never taken in the one process that mattered.  That is
+    a property of the caller, not of the site: any process that reaches these
+    sites with a relative value (a directly launched dashboard, a bare
+    `python -c`, a test) re-derives the vault against its OWN cwd, which is the
+    original defect wearing a different hat.  Section G pins the derivation to
+    the mint at each site, so the safety is by construction rather than by
+    inheritance.
 """
 from __future__ import annotations
 
@@ -346,3 +360,151 @@ def test_daemon_start_surfaces_the_refusal_and_exits_nonzero(monkeypatch, tmp_pa
 
     assert result.exit_code == daemon_mod.VAULT_ROOT_REFUSED_EXIT, result.output
     assert "REFUSED" in result.output, result.output
+
+
+# =============================================================================
+#  G -- THE DOWNSTREAM CONSUMERS: safety by construction, not by inheritance
+# =============================================================================
+
+@pytest.fixture()
+def foreign_home(tmp_path, monkeypatch):
+    """A process standing in a directory it did not choose, handed a RELATIVE
+    `SYSTEMU_VAULT_DIR`.
+
+    This is the shape the three phase-1b sites were only accidentally safe
+    from: the daemon happens to pin an ABSOLUTE value into its child's
+    environment, so the relative branch is unreachable from that one caller.
+    Nothing at the site enforced it.
+    """
+    home = tmp_path / "foreign_home"
+    home.mkdir()
+    monkeypatch.chdir(home)
+    monkeypatch.setenv(VAULT_DIR_ENV, "relative_vault")
+    return home
+
+
+def _mint_root() -> str:
+    """The one answer every site must agree with, taken from the mint itself
+    rather than restated -- a site that agrees with a COPY of the rule has not
+    consumed the rule."""
+    return resolve_vault_root().root
+
+
+# -- G1: systemu/runtime/credentials/store.py -------------------------------
+
+def test_the_credential_store_base_is_the_mint_answer(foreign_home):
+    from systemu.runtime.credentials.store import CredentialStore
+
+    base = CredentialStore()._base
+
+    assert Path(base).is_absolute(), (
+        f"CredentialStore kept a RELATIVE base ({str(base)!r}) -- it is "
+        "re-resolved against whatever cwd the reading process happens to have")
+    assert _same(base, _mint_root()), f"{str(base)!r} != mint {_mint_root()!r}"
+    assert not _under(base, PKG), (
+        f"the credential store resolved INTO the systemu package: {str(base)!r}")
+
+
+def test_the_credential_store_base_does_not_move_when_the_process_chdirs(
+        foreign_home, tmp_path, monkeypatch):
+    """THE DEFECT ITSELF: one string, two cwds, two directories.  A base that
+    is still relative names a DIFFERENT directory the moment anything moves --
+    and `.credentials.json` is a secret at rest, so the wrong answer here
+    scatters credentials into whatever directory the process wandered into."""
+    from systemu.runtime.credentials.store import CredentialStore
+
+    store = CredentialStore()
+    elsewhere = tmp_path / "somewhere_else"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert _same(store._file.parent, foreign_home / "relative_vault"), store._file
+    assert not _under(store._file, elsewhere), (
+        f"the credential file followed the process to {str(elsewhere)!r} -- "
+        "the base was never absolutised")
+
+
+# -- G2: systemu/runtime/memory_backends/__init__.py ------------------------
+
+def test_the_filesystem_memory_backend_root_is_the_mint_answer(
+        foreign_home, monkeypatch):
+    from systemu.runtime.memory_backends import get_backend
+
+    monkeypatch.delenv("SYSTEMU_MEMORY_BACKEND", raising=False)
+    root = get_backend(None)._root
+
+    assert Path(root).is_absolute(), (
+        f"the memory backend kept a RELATIVE root ({str(root)!r})")
+    assert _same(root, Path(_mint_root()) / "memory"), str(root)
+    assert not _under(root, PKG), (
+        f"shadow memory resolved INTO the systemu package: {str(root)!r}")
+
+
+def test_the_memory_backend_root_does_not_move_when_the_process_chdirs(
+        foreign_home, tmp_path, monkeypatch):
+    from systemu.runtime.memory_backends import get_backend
+
+    monkeypatch.delenv("SYSTEMU_MEMORY_BACKEND", raising=False)
+    backend = get_backend(None)
+    elsewhere = tmp_path / "elsewhere_memory"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert _same(backend._root, foreign_home / "relative_vault" / "memory")
+    assert not _under(backend._root, elsewhere), (
+        "the shadow memory root followed the process -- a resumed shadow reads "
+        "an EMPTY buffer and silently loses its accumulated lessons")
+
+
+# -- G3: systemu/storage/sqlite/vault.py ------------------------------------
+
+def test_the_sqlite_postgres_memory_dir_is_the_mint_answer(foreign_home):
+    from systemu.storage.sqlite.vault import _resolve_memory_dir
+
+    got = _resolve_memory_dir("postgresql://u:p@h:5432/db", None)
+
+    assert got.is_absolute(), f"a RELATIVE memory dir ({str(got)!r})"
+    assert _same(got, Path(_mint_root()) / "memory"), str(got)
+    assert not _under(got, PKG), str(got)
+
+
+def test_the_sqlite_memory_dir_does_not_move_when_the_process_chdirs(
+        foreign_home, tmp_path, monkeypatch):
+    from systemu.storage.sqlite.vault import _resolve_memory_dir
+
+    got = _resolve_memory_dir("postgres://u:p@h:5432/db", None)
+    elsewhere = tmp_path / "elsewhere_sqlite"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert _same(got, foreign_home / "relative_vault" / "memory"), str(got)
+    assert not _under(got, elsewhere), str(got)
+
+
+# -- G4: THE CONTAINER PIN -- the docker default must not move --------------
+
+def test_the_docker_default_memory_dir_is_byte_identical_when_the_env_is_absent(
+        tmp_path, monkeypatch):
+    """CONTAINER BEHAVIOUR PIN.
+
+    In the docker images the vault is bind-mounted at `/data/vault` and
+    `SYSTEMU_VAULT_DIR` is NOT set; a `postgresql://` URL is how this site
+    detects that shape (see `_resolve_memory_dir`'s docstring, resolution rule
+    3, and `captures/E2E_VERDICT_DOCKER.md` finding D).  Routing the ENV
+    through the mint changes the env-PRESENT answer only: with the env absent
+    the answer must stay exactly `/data/vault/memory`, and in particular must
+    NOT become the mint's cwd-relative `<home>/systemu/vault` default -- that
+    would put container memory back on the volatile writable layer that
+    v0.6.6-d fixed.
+    """
+    from systemu.storage.sqlite.vault import _resolve_memory_dir
+
+    monkeypatch.chdir(tmp_path)                       # cwd must not leak in
+    monkeypatch.delenv(VAULT_DIR_ENV, raising=False)
+
+    got = _resolve_memory_dir("postgresql://u:p@h:5432/db", None)
+
+    assert str(got) == str(Path("/data/vault") / "memory"), str(got)
+    assert not _same(got, Path(tmp_path) / DEFAULT_RELATIVE_VAULT / "memory"), (
+        "the container default was replaced by the mint's cwd-derived default "
+        "-- memory moves to the container's volatile layer, lost on rebuild")

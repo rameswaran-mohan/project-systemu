@@ -7,6 +7,13 @@ import os
 from pathlib import Path
 from typing import Optional
 
+# THE ONE MINT for "which directory is the operating vault" (see that module's
+# docstring). Module scope is safe here: `vault_root` imports only the standard
+# library at import time and `systemu.runtime.__init__` is a bare docstring, so
+# this adds neither a cycle nor a hot-path cost to the resolver that constructs
+# a store per harness credential lookup.
+from systemu.runtime.vault_root import resolve_vault_root
+
 logger = logging.getLogger(__name__)
 _SERVICE = "systemu"
 
@@ -50,7 +57,25 @@ class CredentialStore:
     """keyring-backed secret store; falls back to a 0600 JSON file under the vault dir."""
 
     def __init__(self, base_dir=None):
-        self._base = Path(base_dir or os.getenv("SYSTEMU_VAULT_DIR", "systemu/vault"))
+        # The base is ONE absolute path minted from the operating home, never a
+        # second reading of SYSTEMU_VAULT_DIR. The old default was the RELATIVE
+        # string "systemu/vault", so `.credentials.json` -- a secret at rest --
+        # landed wherever the reading process happened to be standing. That was
+        # safe only BY INHERITANCE (the daemon pins an absolute value into its
+        # child's env); nothing here enforced it, and the callers that pass no
+        # base_dir (CredentialResolver, the dashboard settings page) do not all
+        # descend from that daemon.
+        #
+        # The `refused` bit is deliberately NOT consulted here, exactly as in
+        # `sharing_on.config._resolve_vault_dir`: this is a consumer of the
+        # root, not the boundary that decides to boot. The refusal is a VALUE
+        # adjudicated at the boot boundary (`start_daemon` /
+        # `resolve_child_vault_dir`); re-raising it here would be a raise with
+        # catching frames above it, which DEC-32 says is no fence at all.
+        #
+        # `or` short-circuits, so callers that already hold an absolute
+        # `vault.root` do not pay for the mint call.
+        self._base = Path(base_dir or resolve_vault_root().root)
         self._keyring = self._init_keyring()
 
     def _init_keyring(self):

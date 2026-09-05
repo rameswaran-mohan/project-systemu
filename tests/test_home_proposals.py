@@ -443,3 +443,231 @@ class TestWishPurity:
         src = inspect.getsource(proposals)
         for forbidden in ("table_store", "table_reconciler", "TableItem"):
             assert forbidden not in src
+
+
+# ===========================================================================
+#  2b - the first-run replay nudge
+#
+#  APPEND-ONLY: everything above this line is the pre-2b contract and stays
+#  verbatim.  The replay nudge is one more derivation in the SAME engine, so it
+#  inherits one-at-a-time and decline-forever for free and adds NO rendering
+#  machinery and NO writer; what needs its own pins is the condition (exactly
+#  ONE finished workflow), the data source (work.py's own loader, never a second
+#  private notion of "finished"), and the PRECEDENCE it takes - last.
+#
+#  The autouse fixture below is the one thing that reaches backwards: the new
+#  candidate reads work.py's row loader, and `WorkflowTracker` is a process
+#  singleton, so without it an unrelated earlier test could seed a workflow and
+#  make the assertions above depend on suite ordering.  It stubs the ambient
+#  loader to empty (the same guard, for the same reason, as
+#  tests/test_home_growth_card.py::_no_ambient_workflows); no assertion above is
+#  touched, and each test below installs its own rows.
+# ===========================================================================
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_workflows(monkeypatch):
+    from systemu.interface.pages import work
+    monkeypatch.setattr(work, "_load_rows", lambda: [], raising=True)
+
+
+_REPLAY_TEXT = ("Your first task finished. See exactly what it did - "
+                "every stage, tool and gate.")
+
+
+def _install_rows(monkeypatch, *rows):
+    """Install `rows` as what work.py's list would render, for one test."""
+    from systemu.interface.pages import work
+    monkeypatch.setattr(work, "_load_rows", lambda: list(rows))
+
+
+def _row(status, wid="wf_1"):
+    return {"workflow_id": wid, "title": "Tidy my receipts", "status": status}
+
+
+def _real_completed_row():
+    """A row built by work.py's OWN model from the status the workflow lane
+    actually writes - not a literal guessed in a test."""
+    from systemu.core.models import ActivityStatus
+    from systemu.interface.pages.work import work_row_model
+    from systemu.runtime.workflow_tracker import WorkflowSnapshot
+
+    return work_row_model(WorkflowSnapshot(
+        workflow_id="wf_real", title="Tidy my receipts", stage="done",
+        status=ActivityStatus.COMPLETED.value,
+    ))
+
+
+class TestFirstRunReplay:
+    def test_one_finished_task_offers_the_replay(self, tmp_path, monkeypatch):
+        _install_rows(monkeypatch, _row("completed"))
+        v = _lived_in(tmp_path, tools=[{"id": "t1"}])   # past both starters
+        key, text, route = derive_proposal(v)
+        assert key == "first_run_replay"
+        assert route == "/work"
+        assert text == _REPLAY_TEXT
+        assert text.isascii()
+
+    def test_the_status_it_looks_for_is_the_one_the_lanes_really_write(
+        self, tmp_path, monkeypatch
+    ):
+        """Grounded in production, not in a literal: the row comes from
+        work.work_row_model over ActivityStatus.COMPLETED (the workflow lane),
+        and "success" is what pipelines/quick_task.py stamps on the quick lane."""
+        from systemu.core.models import ActivityStatus
+        assert ActivityStatus.COMPLETED.value == "completed"
+
+        _install_rows(monkeypatch, _real_completed_row())
+        v = _lived_in(tmp_path, tools=[{"id": "t1"}])
+        assert derive_proposal(v)[0] == "first_run_replay"
+
+        _install_rows(monkeypatch, _row("success"))
+        quick = _lived_in(tmp_path / "quick", tools=[{"id": "t1"}])
+        assert derive_proposal(quick)[0] == "first_run_replay"
+
+    def test_no_task_yet_is_not_a_finished_one(self, tmp_path):
+        assert derive_proposal(_lived_in(tmp_path, tools=[{"id": "t1"}])) is None
+
+    def test_a_task_still_running_has_not_finished(self, tmp_path, monkeypatch):
+        for status in ("running", "queued", "pending_approval", "waiting_on_tools"):
+            _install_rows(monkeypatch, _row(status))
+            assert derive_proposal(
+                _lived_in(tmp_path / status, tools=[{"id": "t1"}])) is None, status
+
+    def test_a_failed_first_task_is_never_called_finished(self, tmp_path, monkeypatch):
+        for status in ("failed", "extraction_failed", "cancelled", "partial"):
+            _install_rows(monkeypatch, _row(status))
+            assert derive_proposal(
+                _lived_in(tmp_path / status, tools=[{"id": "t1"}])) is None, status
+
+    def test_the_second_finished_task_is_past_the_first_run(self, tmp_path, monkeypatch):
+        _install_rows(monkeypatch, _row("completed", "wf_1"), _row("success", "wf_2"))
+        assert derive_proposal(_lived_in(tmp_path, tools=[{"id": "t1"}])) is None
+
+    def test_one_finished_among_several_in_flight_still_counts(self, tmp_path, monkeypatch):
+        """"Your first task finished" is a claim about FINISHED runs; a second
+        run still executing has not finished."""
+        _install_rows(monkeypatch, _row("completed", "wf_1"), _row("running", "wf_2"))
+        assert derive_proposal(
+            _lived_in(tmp_path, tools=[{"id": "t1"}]))[0] == "first_run_replay"
+
+    def test_a_declined_replay_never_returns(self, tmp_path, monkeypatch):
+        _install_rows(monkeypatch, _row("completed"))
+        v = _lived_in(tmp_path, tools=[{"id": "t1"}])
+        assert derive_proposal(v)[0] == "first_run_replay"
+        decline(v, "first_run_replay")
+        assert derive_proposal(v) is None
+
+    def test_a_broken_loader_costs_the_nudge_not_the_page(self, tmp_path, monkeypatch):
+        from systemu.interface.pages import work
+
+        def _boom():
+            raise RuntimeError("tracker down")
+
+        monkeypatch.setattr(work, "_load_rows", _boom)
+        assert derive_proposal(_lived_in(tmp_path, tools=[{"id": "t1"}])) is None
+
+        monkeypatch.setattr(work, "_load_rows", lambda: [None, {"status": None}])
+        assert derive_proposal(_lived_in(tmp_path / "b", tools=[{"id": "t1"}])) is None
+
+    def test_it_reads_the_same_loader_the_work_page_renders_from(self, tmp_path, monkeypatch):
+        """Reachability pin: patching work._load_rows must change the answer - a
+        second private notion of "has a task finished" would ignore this."""
+        from systemu.interface.pages import work
+        v = _lived_in(tmp_path, tools=[{"id": "t1"}])
+        monkeypatch.setattr(work, "_load_rows", lambda: [])
+        assert derive_proposal(v) is None
+        monkeypatch.setattr(work, "_load_rows", lambda: [_row("completed")])
+        assert derive_proposal(v)[0] == "first_run_replay"
+
+
+class TestReplayPrecedence:
+    def test_the_full_precedence_order_end_to_end(self, tmp_path, monkeypatch):
+        """ONE test, ONE vault root, the whole ladder: first_shadow ->
+        first_forge -> wish -> first_run_replay -> nothing.  Every rung is
+        satisfiable at the moment it is asserted, so this pins ORDER rather than
+        mere availability."""
+        from systemu.interface.wishes import add_wish
+
+        _install_rows(monkeypatch, _row("completed"))   # replay live throughout
+        root = tmp_path / "ladder"
+        fid = add_wish(_Vault(root), _INVOICE_WISH)
+
+        cold = _Vault(root)                             # no shadows, no tools
+        assert derive_proposal(cold)[0] == "first_shadow"
+        decline(cold, "first_shadow")
+
+        forging = _Vault(root, shadows=[{"id": "s1"}])  # shadows, still no tools
+        assert derive_proposal(forging)[0] == "first_forge"
+        decline(forging, "first_forge")
+
+        lived = _Vault(root, shadows=[{"id": "s1"}], tools=[_INVOICE_TOOL])
+        assert derive_proposal(lived)[0] == "wish:%s" % fid
+        decline(lived, "wish:%s" % fid)
+
+        assert derive_proposal(lived)[0] == "first_run_replay"
+        decline(lived, "first_run_replay")
+        assert derive_proposal(lived) is None
+
+    def test_a_cold_install_is_told_to_record_before_it_is_told_to_replay(
+        self, tmp_path, monkeypatch
+    ):
+        _install_rows(monkeypatch, _row("completed"))
+        assert derive_proposal(_Vault(tmp_path))[0] == "first_shadow"
+
+
+class TestReplayPurity:
+    def test_the_replay_route_is_a_page_the_dashboard_registers(self, tmp_path, monkeypatch):
+        from systemu.interface import dashboard
+        _install_rows(monkeypatch, _row("completed"))
+        route = derive_proposal(_lived_in(tmp_path, tools=[{"id": "t1"}]))[2]
+        assert '@ui.page("%s")' % route in inspect.getsource(dashboard)
+
+    def test_deriving_the_replay_writes_nothing(self, tmp_path, monkeypatch):
+        _install_rows(monkeypatch, _row("completed"))
+        v = _lived_in(tmp_path, tools=[{"id": "t1"}])
+        before = sorted(p.name for p in Path(tmp_path).iterdir())
+        derive_proposal(v)
+        derive_proposal(v)
+        assert sorted(p.name for p in Path(tmp_path).iterdir()) == before
+
+    def test_the_replay_adds_no_rendering_machinery(self):
+        """2b is a proposal, not a page: the card that already exists renders
+        it, and knows nothing about this key."""
+        src = inspect.getsource(console._build_proposal_card)
+        assert "first_run_replay" not in src
+        assert "derive_proposal(" in src
+
+    def test_the_engine_is_still_not_a_writer(self):
+        """The property is 'derivation never writes a store', so the pin is on
+        IMPORTS and CALLS, not on raw source bytes.  The original substring scan
+        over ``getsource`` reddened on the world-scan rules' pure DATA (a tool
+        NAMED ``write_csv_file`` in a ``requires=`` honesty-wall field) while a
+        writer smuggled through ``getattr`` would have passed it -- checking
+        cheaper than the meaning, in both directions.  The behavioural half
+        (``test_derivation_writes_nothing_to_the_vault`` above) stays the
+        primary witness; this is the structural companion."""
+        import ast as _ast
+        tree = _ast.parse(inspect.getsource(proposals))
+        imported = []
+        called = []
+        for node in _ast.walk(tree):
+            if type(node) is _ast.Import:
+                imported += [a.name for a in node.names]
+            elif type(node) is _ast.ImportFrom:
+                imported.append(node.module or "")
+                imported += [a.name for a in node.names]
+            elif type(node) is _ast.Call:
+                f = node.func
+                if type(f) is _ast.Name:
+                    called.append(f.id)
+                elif type(f) is _ast.Attribute:
+                    called.append(f.attr)
+        for banned_import in ("table_store", "table_reconciler"):
+            assert not any(banned_import in name for name in imported), (
+                f"proposals.py imports {banned_import!r} - the engine must "
+                f"never reach a table writer")
+        assert "TableItem" not in imported and "TableItem" not in called
+        for name in called:
+            assert not name.startswith(("save_", "write_")), (
+                f"proposals.py CALLS {name!r} - derivation must never write")

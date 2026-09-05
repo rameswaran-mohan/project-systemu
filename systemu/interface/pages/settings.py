@@ -129,10 +129,15 @@ def build_settings_page() -> None:
                 if notice:
                     ui.notify(notice, type="info")
 
+            # `s-input-full` is the page idiom for an input that owns its row
+            # (tokens.py: width 100%) - the same pair the onboarding wizard's
+            # twin of this select carries. Without it the dropdown rendered at
+            # its intrinsic width, so the longest persona name was clipped
+            # while the card around it stayed full width.
             persona_select = ui.select(
                 personas(), label="How you use Systemu",
                 value=persona_now, on_change=_on_persona_change,
-            ).classes("s-input")
+            ).classes("s-input s-input-full")
             ui.label(
                 "Changes which starter tasks, empty-state hints and tour order "
                 "you see. Every feature stays available whichever you pick."
@@ -210,6 +215,14 @@ def build_settings_page() -> None:
         _section_header("Compliance export")
         with ui.column().classes("s-card").style("gap: 14px; padding: 20px;"):
             compliance_export_card()
+
+        # -- What Systemu can touch (Phase 2f) ------------------------------
+        # Read-only. Its own section on purpose: every line is a MINT read,
+        # nothing here writes or decides anything, and the clause set is
+        # assembled by the pure model in systemu/interface/trust_card.py.
+        _section_header("What Systemu can touch")
+        with ui.column().classes("s-card").style("gap: 12px; padding: 20px;"):
+            world_trust_card(state.vault, config)
 
         # ── Vault ──────────────────────────────────────────────────────────
         _section_header("Storage")
@@ -633,6 +646,47 @@ def provider_credentials_card(config) -> None:
         ui.timer(_PROBE_DELAY_S, _observe, once=True)
     except Exception:  # pragma: no cover - no client context (e.g. a unit call)
         pass
+
+
+# -----------------------------------------------------------------------------
+#  "What Systemu can touch" (Phase 2f)
+# -----------------------------------------------------------------------------
+#  Layout only. Every clause is minted by `systemu.interface.trust_card`, which
+#  is pure and unit-tested; this function must never derive a fact of its own.
+#
+#  There is NO "what leaves this machine" sentence on this card. The proposed
+#  wording ("...Nothing else is sent anywhere.") is contradicted by the tree -
+#  web_access relays fetches AND search queries through the third party
+#  r.jina.ai, and those tools ship seeded and enabled - so the card links to
+#  /privacy, which renders `runtime.privacy.privacy_report()`, the mint that
+#  already states the real egress picture. See trust_card.py's docstring for
+#  the file:line evidence.
+
+def world_trust_card(vault, config) -> None:
+    """Render the read-only trust card. Never raises into the page."""
+    from systemu.interface.trust_card import trust_card_model
+
+    model = trust_card_model(vault, config)
+
+    ui.label(
+        "Read-only. Each line is read from the same source the rest of Systemu "
+        "decides with - none of it is an estimate. A fact that could not be "
+        "read is left out rather than guessed."
+    ).classes("s-muted")
+
+    for clause in model["clauses"]:
+        with ui.row().classes("w-full items-start").style("gap: 12px;"):
+            ui.label(clause["label"]).classes("s-cell").style(
+                "min-width: 170px;")
+            with ui.column().style("gap: 2px;"):
+                ui.label(clause["value"]).classes(
+                    "s-pill s-pill--warn" if clause.get("refused") is True
+                    else "s-cell")
+                if clause["detail"]:
+                    ui.label(clause["detail"]).classes("s-muted")
+
+    ui.link("What leaves this machine ->", model["privacy_route"]).classes(
+        "s-muted")
 
 
 def connection_rows(vault) -> list:

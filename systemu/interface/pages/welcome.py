@@ -357,7 +357,7 @@ def finalize_onboarding(vault, config, *, name: str, location: str = "",
     if not _ps.any_provider_usable(_view):
         # Name the remedies, all of them — the old copy said "Add your API key
         # first", which for a Google or Ollama operator was a dead end.
-        return (False, "Set up an LLM provider first (step 1) — Systemu can't "
+        return (False, "Set up an LLM provider first (step 1) - Systemu can't "
                        "run without one. "
                        + _ps.configure_hint(_ps.all_provider_statuses(
                            _view, probe=_ps.unprobed)))
@@ -382,6 +382,11 @@ def finalize_onboarding(vault, config, *, name: str, location: str = "",
     except Exception as exc:
         logger.exception("[Welcome] onboarding save failed")
         return (False, f"Could not save: {exc}")
+    # P2d: local first-run funnel. Inside the SUCCESS branch only - a run that
+    # bounced off the provider gate or the name gate above returned already, so
+    # "Finished setup" can never be stamped for a setup that did not finish.
+    from systemu.runtime.funnel import mark_milestone
+    mark_milestone(vault, "setup_finished")
     return (True, "")
 
 
@@ -396,6 +401,12 @@ def build_welcome_page() -> None:
     state = AppState.get()
     vault = state.vault
     config = state.config
+
+    # P2d: local first-run funnel - the first step of the journey table on
+    # /insights. One small JSON sidecar in the vault, no network, never raises;
+    # first-write-wins, so a returning visitor does not move the date.
+    from systemu.runtime.funnel import mark_milestone
+    mark_milestone(vault, "welcome_rendered")
 
     # W11.4: while the gate holds (fresh install, key/profile missing) the
     # wizard is mandatory — no skip is offered. Voluntary visitors keep it.

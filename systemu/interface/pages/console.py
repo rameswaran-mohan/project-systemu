@@ -440,18 +440,28 @@ def _build_growth_card(vault) -> None:
     quest list is three concrete next steps whose done-ness is checked against
     the same sources the matching pages render from.  The quest section retires
     itself once all three are done - the odometer stays.
+
+    2a: the odometer says what the install HOLDS; ``growth_delta_line`` says what
+    it GAINED, against a weekly snapshot this render path is the sole writer of
+    (``interface/growth_snapshot.py`` - see docs/CONC-MAP.md).  It returns "" for
+    a first render, an unreadable snapshot, or a week with no growth, and the
+    line is then omitted entirely rather than rendered as "+0".
     """
     from nicegui import ui
     from systemu.interface.design.primitives import card
+    from systemu.interface.growth_snapshot import growth_delta_line
 
     counts = growth_counts(vault)
     line = _odometer_line(counts, forged_tool_count(vault))
     quests = quest_states(vault)
+    week_line = growth_delta_line(vault, counts)
 
     with card(classes="w-full q-mb-md"):
         with ui.row().classes("w-full items-center justify-between q-mb-sm"):
             ui.label("Your Systemu grows").classes("s-cell s-cell--bold")
             ui.label(line).classes("s-pill s-pill--muted s-mono")
+        if week_line:
+            ui.label(week_line).classes("s-muted q-mb-sm")
         if not all(done for _, done in quests):
             ui.label("Getting started").classes("s-muted q-mb-sm")
             for label, done in quests:

@@ -945,7 +945,6 @@ class TestOutboxContract:
 
     @pytest.mark.parametrize("basename", [
         "file.sk-abcdefghijklmnopqrstuvwxyz012345",
-        "payload.exe",
         "script.sh",
         "noextension",
         "data.tar.rar",                        # 2 dots, NOT a recognised tar compound
@@ -955,16 +954,30 @@ class TestOutboxContract:
         "archive.rar",
         ".gitignore",                            # pathlib: no suffix at all
     ])
-    def test_every_non_allowlisted_suffix_renders_only_the_fixed_constant(
+    def test_every_unknown_suffix_renders_only_the_fixed_constant(
             self, tmp_path, basename):
         """DEC-34c round 6, AC-1, the general pin behind the JWT case above:
-        whatever an unrecognised suffix actually LOOKS like — long, short,
-        metacharacter-bearing, secret-shaped or not — the type line can
-        only ever render one of two things: a matching allowlist member, or
-        this fixed literal. The assertion is identical for all ten
-        fixtures precisely because the code path no longer looks at shape
-        at all; nothing here depends on which of these happens to pattern-
-        match a known secret shape."""
+        whatever an UNKNOWN suffix actually LOOKS like - long, short,
+        metacharacter-bearing, secret-shaped or not - the type line renders
+        this fixed literal and nothing else. The assertion is identical for
+        all nine fixtures precisely because the code path no longer looks at
+        shape at all; nothing here depends on which of these happens to
+        pattern-match a known secret shape.
+
+        **Phase 1d correction, stated rather than quietly absorbed.** Round
+        6's version of this docstring claimed the line "can only ever render
+        one of two things", and carried ``payload.exe`` as a tenth fixture.
+        Both are superseded: there are now THREE outcomes - an admitted
+        :data:`_ARTIFACT_EXTENSIONS` member, a
+        :data:`_WITHHELD_EXTENSION_LABELS` label plus its rename remedy, or
+        this literal - and ``.exe`` is a member of that second closed table,
+        so ``payload.exe`` moved to
+        ``test_each_known_excluded_suffix_resolves_to_its_own_label``, which
+        pins it harder (the rendered bytes must equal the TABLE's value, and
+        the copy must still land bare). What this pin actually guards is
+        unchanged and undiluted: a suffix NEITHER table knows renders
+        nothing derived from the untrusted name. Its name changed with its
+        claim so a reader cannot mistake the old scope for the new one."""
         import re
         from systemu.runtime import outbox
 
@@ -977,6 +990,197 @@ class TestOutboxContract:
         html = (run_dir / "receipt.html").read_text(encoding="utf-8")
         rows = re.findall(r"original type: <code>([^<]*)</code>", html)
         assert rows == ["(type not preserved)"], (rows, html, basename)
+
+    # -- Phase 1d - a KNOWN-but-excluded suffix is named (from a closed table)
+    # and carries its rename remedy; an UNKNOWN one still says nothing -------
+    # (ASCII divider, unlike the sections above: DEC-32c - pytest's own
+    # captured failure output mangles non-ASCII, and these lines surface in
+    # a traceback verbatim.)
+
+    @staticmethod
+    def _type_line_texts(receipt_html):
+        """The visible text of every "original type: ..." line, tags stripped.
+
+        The round 6/7 pins above use a narrower regex that only sees the
+        FIRST ``<code>`` element's contents; the Phase 1d line has two, plus
+        prose between them, so these tests read the whole line."""
+        import re as _re
+        spans = _re.findall(r"original type: (.*?)</span>", receipt_html)
+        return [_re.sub(r"<[^>]+>", "", s) for s in spans]
+
+    def test_receipt_names_a_known_excluded_type_and_the_rename_remedy(
+            self, tmp_path):
+        """Phase 1d, the defect. A ``.pdf`` still lands SUFFIXLESS (the
+        DEC-34c round 7 fence does not move one byte), but the receipt no
+        longer strands the operator with an unopenable ``artifact-1`` and no
+        stated remedy: it names the type from a closed, code-defined table
+        and says exactly how to open it deliberately, naming the ACTUAL
+        landed file."""
+        from systemu.runtime import outbox
+
+        art = tmp_path / "Q3-report.pdf"
+        art.write_text("body", encoding="utf-8")
+        run_dir = Path(outbox.write_outbox(
+            tmp_path, task_id="t", prompt="p", status="success",
+            files_produced=[str(art)]))
+
+        # the fence is unmoved: the copy on disk is still bare
+        copied = [p for p in run_dir.iterdir() if p.name.startswith("artifact-")]
+        assert len(copied) == 1, [p.name for p in run_dir.iterdir()]
+        assert copied[0].name == "artifact-1", copied[0].name
+        assert copied[0].suffix == "", copied[0].name
+
+        receipt = (run_dir / "receipt.html").read_text(encoding="utf-8")
+        assert self._type_line_texts(receipt) == [
+            ".pdf - suffix withheld: a double-click could run this file "
+            "type's own scripts; rename to artifact-1.pdf to open it "
+            "deliberately"
+        ], (self._type_line_texts(receipt), receipt)
+
+    def test_the_rename_remedy_names_the_row_s_own_landed_file_not_a_guess(
+            self, tmp_path):
+        """The remedy is only actionable if it names the file the operator is
+        actually looking at. With two artifacts in one folder the second row
+        must say ``artifact-2.pdf``, not ``artifact-1.pdf``."""
+        from systemu.runtime import outbox
+
+        first = tmp_path / "chart.png"
+        first.write_text("bytes", encoding="utf-8")
+        second = tmp_path / "report.pdf"
+        second.write_text("bytes", encoding="utf-8")
+        run_dir = Path(outbox.write_outbox(
+            tmp_path, task_id="t", prompt="p", status="success",
+            files_produced=[str(first), str(second)]))
+
+        lines = self._type_line_texts(
+            (run_dir / "receipt.html").read_text(encoding="utf-8"))
+        assert len(lines) == 2, lines
+        assert lines[0] == ".png", lines
+        assert "rename to artifact-2.pdf to open it deliberately" in lines[1], lines
+        assert "artifact-1" not in lines[1], lines
+
+    def test_an_excluded_suffix_the_table_does_not_know_stays_unnamed(
+            self, tmp_path):
+        """The closed-enum property is the whole point: a suffix that is
+        excluded AND absent from :data:`_WITHHELD_EXTENSION_LABELS` keeps the
+        round 6 constant verbatim, and no byte of it reaches the receipt.
+        Unknown stays unnamed - the table can only ever ADD text that is
+        already a literal in this repo's source."""
+        from systemu.runtime import outbox
+
+        art = tmp_path / "plugh.xyzzy"
+        art.write_text("body", encoding="utf-8")
+        run_dir = Path(outbox.write_outbox(
+            tmp_path, task_id="t", prompt="p", status="success",
+            files_produced=[str(art)]))
+
+        copied = [p for p in run_dir.iterdir() if p.name.startswith("artifact-")]
+        assert copied[0].name == "artifact-1", copied[0].name
+        assert copied[0].suffix == "", copied[0].name
+
+        receipt = (run_dir / "receipt.html").read_text(encoding="utf-8")
+        lines = self._type_line_texts(receipt)
+        assert lines == ["(type not preserved)"], (lines, receipt)
+        # the TYPE line specifically carries no byte of the unknown suffix -
+        # unlike the "copied from" line, which legitimately shows an
+        # ordinary, non-secret basename whole (see ``_esc_path``)
+        assert "xyzzy" not in lines[0].lower(), lines
+        assert "suffix withheld" not in receipt, receipt
+
+    @pytest.mark.parametrize("suffix", [
+        # the five MEASURED script-executing suffixes (rounds 5/6/7)
+        ".pdf", ".html", ".htm", ".svg", ".xml",
+        # the set b7500a14's own commit message names as landing bare
+        ".exe", ".hta", ".chm", ".reg",
+    ])
+    def test_each_known_excluded_suffix_resolves_to_its_own_label(
+            self, tmp_path, suffix):
+        """Every member of the closed table resolves end to end, through the
+        REAL ``write_outbox`` entry point - and, in the same breath, still
+        lands bare. Adding a member to the LABEL table must never admit it to
+        the EXTENSION table by accident."""
+        from systemu.runtime import outbox
+        from systemu.runtime.outbox import (_ARTIFACT_EXTENSIONS,
+                                            _artifact_extension)
+
+        assert suffix not in _ARTIFACT_EXTENSIONS, suffix
+        assert _artifact_extension(Path("a" + suffix)) == "", suffix
+
+        art = tmp_path / ("deliverable" + suffix)
+        art.write_text("body", encoding="utf-8")
+        run_dir = Path(outbox.write_outbox(
+            tmp_path, task_id="t", prompt="p", status="success",
+            files_produced=[str(art)]))
+
+        copied = [p for p in run_dir.iterdir() if p.name.startswith("artifact-")]
+        assert copied[0].name == "artifact-1", copied[0].name
+        assert copied[0].suffix == "", copied[0].name
+
+        lines = self._type_line_texts(
+            (run_dir / "receipt.html").read_text(encoding="utf-8"))
+        assert lines == [
+            f"{suffix} - suffix withheld: a double-click could run this file "
+            f"type's own scripts; rename to artifact-1{suffix} to open it "
+            f"deliberately"
+        ], (lines, suffix)
+
+    def test_the_rendered_label_comes_from_the_table_not_the_source_name(
+            self, tmp_path):
+        """DEC-31, restated for this line: the bytes rendered are the TABLE's
+        value, never a slice of the untrusted name. An UPPERCASE source
+        renders the table's own lowercase spelling - if any byte of the
+        source's suffix were passed through, the casing bit would survive."""
+        from systemu.runtime import outbox
+        from systemu.runtime.outbox import _WITHHELD_EXTENSION_LABELS
+
+        art = tmp_path / "REPORT.PDF"
+        art.write_text("body", encoding="utf-8")
+        run_dir = Path(outbox.write_outbox(
+            tmp_path, task_id="t", prompt="p", status="success",
+            files_produced=[str(art)]))
+
+        receipt = (run_dir / "receipt.html").read_text(encoding="utf-8")
+        lines = self._type_line_texts(receipt)
+        # scoped to the TYPE line: the "copied from" line above it
+        # legitimately shows the original ``REPORT.PDF`` whole, casing and
+        # all (an ordinary, non-secret basename is not redacted - see
+        # ``_esc_path``). It is THIS line that must carry no source byte.
+        assert ".PDF" not in lines[0], lines
+        assert lines[0].startswith(_WITHHELD_EXTENSION_LABELS[".pdf"] + " - "), lines
+        assert lines[0].startswith(".pdf - "), lines
+        assert lines[0].endswith("rename to artifact-1.pdf to open it "
+                                 "deliberately"), lines
+
+    def test_the_label_table_is_closed_disjoint_and_ascii(self):
+        """The three properties that make this table safe to render, checked
+        directly rather than asserted in a comment: every key is a lowercase
+        dotted ASCII suffix, every VALUE is ASCII (DEC-32c: this text reaches
+        a verdict-carrying surface), and no member is admitted by
+        :data:`_ARTIFACT_EXTENSIONS` - a labelled suffix is by definition one
+        that does NOT land."""
+        from systemu.runtime.outbox import (_ALL_ADMITTED_EXTENSIONS,
+                                            _WITHHELD_EXTENSION_LABELS)
+
+        assert _WITHHELD_EXTENSION_LABELS, "the table must not be empty"
+        for key, label in _WITHHELD_EXTENSION_LABELS.items():
+            assert type(key) is str and type(label) is str, (key, label)
+            assert key == key.lower() and key.startswith("."), key
+            assert key not in _ALL_ADMITTED_EXTENSIONS, key
+            label.encode("ascii")          # raises if a non-ASCII byte crept in
+            key.encode("ascii")
+
+    def test_the_label_table_is_reachable_from_the_receipt_renderer(self):
+        """Reachability, not just behaviour: the table is read by
+        ``_receipt_type_label``, and ``render_receipt`` calls that function.
+        Delete either link and this pin goes red by NAME, alongside the
+        end-to-end pins above."""
+        import inspect
+        from systemu.runtime import outbox
+
+        label_src = inspect.getsource(outbox._receipt_type_label)
+        assert "_WITHHELD_EXTENSION_LABELS" in label_src, label_src
+        render_src = inspect.getsource(outbox.render_receipt)
+        assert "_receipt_type_label(" in render_src, render_src
 
     def test_windows_reserved_device_names_are_guarded(self):
         from systemu.runtime.outbox import TrustedIdentity, safe_component

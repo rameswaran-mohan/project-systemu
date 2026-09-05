@@ -94,9 +94,17 @@ either the matching :data:`_ARTIFACT_EXTENSIONS`/
 never a transformation of the untrusted name) or one fixed "not preserved"
 literal (:func:`_receipt_type_label`). Round 5's stated goal for this line
 — "an excluded type is never stranded with no way to learn what it was" —
-is retired rather than re-attempted: every way tried to keep it depends on
-redacting something DERIVED from untrusted text, which is the mechanism
-that just leaked. Comments only: a stock Windows install also runs
+was retired rather than re-attempted, on the reasoning that every way tried
+to keep it depends on redacting something DERIVED from untrusted text,
+which is the mechanism that just leaked. **Phase 1d narrows that.** A
+SECOND closed, code-defined table (:data:`_WITHHELD_EXTENSION_LABELS`)
+names the excluded suffixes it knows, and states the rename that opens the
+landed file deliberately - the untrusted suffix is used only as a
+membership key, so the rendered bytes are the table's own literals and the
+round 5 mechanism is not re-introduced. A suffix neither table knows still
+renders the fixed literal, unnamed. Nothing about what LANDS changed: a
+labelled ``.pdf`` is still copied to a bare ``artifact-<n>``.
+Comments only: a stock Windows install also runs
 ``.xml`` through a script-capable browser exactly like the three round 5
 removed — removed here too — and the per-extension table's own comment
 block had, by round 5's last commit, started asserting properties ("no
@@ -768,24 +776,37 @@ def render_receipt(*, task_id: str, prompt: str, status: str, summary: str,
     segment, taken alone) defeat the shape-based redactor that correctly
     caught the intact original two lines above it in the same receipt; see
     :func:`_receipt_type_label`'s docstring for the measured leak and the
-    fix. The line now renders :func:`_receipt_type_label`'s result: either
-    the matching :data:`_ARTIFACT_EXTENSIONS`/
-    :data:`_COMPOUND_ARTIFACT_EXTENSIONS` member — a fixed, code-defined
-    enum, never a transformation of ``original`` — or the single fixed
-    literal :data:`_TYPE_NOT_PRESERVED`, unconditionally, for every row,
-    admitted or excluded alike. Round 5's stated goal for an EXCLUDED type
-    ("state its real extension so the operator can rename it") is retired
-    rather than re-attempted — every way tried to keep it still redacts
-    something derived from untrusted text, the exact mechanism that leaked.
+    fix. The line now renders :func:`_receipt_type_label`'s result, which is
+    always drawn from one of three code-defined sources and never from a
+    transformation of ``original``: the matching
+    :data:`_ARTIFACT_EXTENSIONS`/:data:`_COMPOUND_ARTIFACT_EXTENSIONS`
+    member, or - Phase 1d - the matching :data:`_WITHHELD_EXTENSION_LABELS`
+    label plus its fixed rename remedy, or the fixed literal
+    :data:`_TYPE_NOT_PRESERVED` when neither table knows the suffix.
+
+    Phase 1d correction: round 6 wrote here that the "not preserved" literal
+    renders "unconditionally, for every row, admitted or excluded alike",
+    and retired round 5's goal for an EXCLUDED type ("state its real
+    extension so the operator can rename it") as unreachable. Both
+    statements are now narrower. The goal is met for the suffixes a second
+    CLOSED table names, without re-introducing round 5's mechanism: the
+    untrusted suffix is a membership key, the rendered bytes are the table's
+    own values, and a suffix neither table knows still renders the fixed
+    literal and nothing else. See :func:`_receipt_type_label`.
+
+    A withheld row's line therefore contains TWO ``<code>`` spans (the type,
+    and the name to rename the landed file to) rather than one - a reader
+    matching this markup with a regex that assumes a single span will see
+    only the type half.
     """
     rows: List[str] = []
     for name, original in artifacts or ():
-        type_html = _receipt_type_label(original)
+        type_html = _receipt_type_label(original, name)
         rows.append(
             f"<li><code>{_esc(name)}</code>"
             f"<br><span class='sub' style='margin:0'>copied from {_esc_path(original)}</span>"
             f"<br><span class='sub' style='margin:0'>original type: "
-            f"<code>{type_html}</code></span></li>"
+            f"{type_html}</span></li>"
         )
     art_html = ("<ul>" + "".join(rows) + "</ul>") if rows else \
         "<p class='sub' style='margin:0'>No files were produced.</p>"
@@ -935,8 +956,69 @@ def _artifact_extension(src: Path) -> str:
 #: alternative (show the real, excluded suffix, redacted) was refuted.
 _TYPE_NOT_PRESERVED = "(type not preserved)"
 
+#: Phase 1d. A SECOND closed, code-defined table - the ONLY suffixes for
+#: which the receipt may name a type the on-disk copy does not carry.
+#:
+#: **What this does NOT do.** It does not admit anything. The landing fence
+#: is :data:`_ARTIFACT_EXTENSIONS` alone, via :func:`_artifact_extension`, and
+#: nothing here is consulted on the copy path (:func:`_copy_artifacts`) - a
+#: member of this table still lands with NO suffix, byte-identical to before
+#: this table existed, and ``test_each_known_excluded_suffix_resolves_to_its_
+#: own_label`` re-asserts both halves of that for every member. The two tables
+#: are disjoint by construction and pinned disjoint by
+#: ``test_the_label_table_is_closed_disjoint_and_ascii``.
+#:
+#: **Why it is safe to render (DEC-31).** The round 5 defect this module's
+#: docstring narrates was rendering a SLICE of the untrusted source name
+#: (:func:`_display_suffix`'s result, redacted after the slice - the exact
+#: ordering DEC-31 forbids), which let a JWT's own signature segment through
+#: verbatim. This table never renders a slice. The source's suffix is
+#: lower-cased by :func:`_display_suffix` and then used ONLY as a dict
+#: MEMBERSHIP KEY over this closed key set; the bytes that reach the receipt
+#: are the matched entry's VALUE - a hardcoded ASCII literal in this file -
+#: never a transformation of ``original``. A miss renders
+#: :data:`_TYPE_NOT_PRESERVED`, unchanged from round 6: an unknown suffix
+#: stays unnamed, which is the whole point of the enum being CLOSED.
+#:
+#: **Membership, and how to widen it.** The five suffixes each MEASURED to
+#: run their own script on a plain Windows double-click and removed from the
+#: landing table for it (rounds 5/6/7 - see :data:`_ARTIFACT_EXTENSIONS`'s
+#: docstring for each measurement), plus the four ``b7500a14``'s own commit
+#: message names as landing bare. ``.xlsm``/``.docm`` were considered and
+#: deliberately left OUT this pass: a shipped round 6 pin
+#: (``test_receipt_hides_the_extension_for_an_EXCLUDED_type_rather_than_risk_
+#: a_leak``) names ``.xlsm`` as THE worked example of the honest
+#: "not preserved" line, and moving it is a separate decision, not a
+#: side effect of this one. Widen deliberately, per-type - never by
+#: unioning a survey (the same discipline :data:`_ARTIFACT_EXTENSIONS`
+#: states for itself).
+_WITHHELD_EXTENSION_LABELS = {
+    # measured script-executing suffixes, removed from the landing table
+    ".pdf": ".pdf",
+    ".html": ".html",
+    ".htm": ".htm",
+    ".svg": ".svg",
+    ".xml": ".xml",
+    # named in b7500a14's commit message as landing with no suffix at all
+    ".exe": ".exe",
+    ".hta": ".hta",
+    ".chm": ".chm",
+    ".reg": ".reg",
+}
 
-def _receipt_type_label(original: Any) -> str:
+#: The fixed prose either side of a withheld type's own label. ASCII only -
+#: DEC-32c: this text reaches a verdict-carrying, subprocess-capturable
+#: surface, so no em dash, no typographic quote. Split out as constants so
+#: the rendered sentence is assembled from literals plus exactly two
+#: substitutions, both of which are themselves code-derived (the table's
+#: value, and the ``artifact-<n>`` name this module built from a loop
+#: ordinal via :class:`TrustedIdentity`).
+_WITHHELD_REASON = ("suffix withheld: a double-click could run this file "
+                    "type's own scripts")
+_WITHHELD_REMEDY_TAIL = " to open it deliberately"
+
+
+def _receipt_type_label(original: Any, landed_name: Any = "") -> str:
     """The receipt's "original type" text for ONE artifact row — DEC-34c
     round 6, AC-1.
 
@@ -970,21 +1052,43 @@ def _receipt_type_label(original: Any) -> str:
     string-equal only because :func:`_artifact_extension` lower-cased and
     then matched against the table, so the rendered byte comes from the
     table, never from a transformation of ``original``. No match —
-    unrecognised suffix, or none at all — renders :data:`_TYPE_NOT_PRESERVED`,
-    one fixed literal, regardless of what the untrusted suffix actually was.
-    Deliberately NOT routed through :func:`_esc`/:func:`redact`: those
+    unrecognised suffix, or none at all - falls to the second closed table,
+    :data:`_WITHHELD_EXTENSION_LABELS` (Phase 1d, below), and on a miss
+    THERE renders :data:`_TYPE_NOT_PRESERVED`, one fixed literal, regardless
+    of what the untrusted suffix actually was. Both tables are consulted by
+    MEMBERSHIP and render only their own VALUES, so the DEC-31 property is
+    identical for both: no rendered byte is a slice or a transformation of
+    ``original``. Deliberately NOT routed through :func:`_esc`/:func:`redact`: those
     defend untrusted CONTENT, and by this point ``ext`` is never that — it
     is a lookup result over a closed set, not a transformation of
     ``original``, so there is nothing left for a content-based fence to
     usefully check.
 
-    **Accepted trade, stated plainly rather than hidden.** An EXCLUDED
-    type is no longer individually named on this line — round 5's stated
-    purpose for it ("an excluded type is never stranded with no way to
-    learn what it was") is retired, not re-attempted: every way tried to
-    keep that property still means redacting something DERIVED from
-    untrusted text, which is the exact mechanism that just leaked. The
-    operator instead learns, honestly, that the type was not preserved.
+    **Round 6's accepted trade, and how Phase 1d narrows it.** Round 6 wrote
+    here that an EXCLUDED type "is no longer individually named on this
+    line", because "every way tried to keep that property still means
+    redacting something DERIVED from untrusted text, which is the exact
+    mechanism that just leaked." The premise was too strong, and this
+    paragraph is corrected rather than left standing: naming the type does
+    not require rendering anything derived from the name IF the rendered
+    bytes come from a CLOSED, code-defined table and the untrusted suffix is
+    used only as a membership key into it - structurally the same move
+    :func:`_artifact_extension` already makes for the admitted case, one
+    line up. :data:`_WITHHELD_EXTENSION_LABELS` is that table. For a suffix
+    it knows, this line now renders the table's own literal plus a fixed
+    remedy sentence naming the row's LANDED file - the operator is no
+    longer left with an unopenable ``artifact-1`` and no stated way to open
+    it. For a suffix it does NOT know, round 6's behaviour is unchanged,
+    byte for byte: :data:`_TYPE_NOT_PRESERVED`, and nothing else. Unknown
+    stays unnamed; that is what makes the enum closed rather than a filter.
+
+    **What did NOT change: the landing fence.** This function is a RENDERING
+    decision only. :func:`_artifact_extension` still decides the copy's own
+    suffix from :data:`_ARTIFACT_EXTENSIONS` alone, and every member of the
+    label table is still absent from it - a labelled ``.pdf`` lands as bare
+    ``artifact-1``, exactly as it did before this table existed. Naming a
+    type on the receipt and admitting it to disk are different acts; only
+    the first moved.
 
     **The limit, stated exactly (DEC-34c round 7, AC-2).** Earlier text
     here suggested the operator could fall back on the "copied from"
@@ -1006,12 +1110,46 @@ def _receipt_type_label(original: Any) -> str:
     retired round-5 goal in its starker form: say plainly that the
     fallback hint is unavailable in exactly the case an operator would
     have wanted it, rather than leave a reader assuming one always
-    exists.
+    exists. Phase 1d narrows this limit to exactly the UNKNOWN-suffix case:
+    a credential-shaped basename carrying a suffix the label table DOES
+    know still collapses its "copied from" half to :data:`_REDACTED`, but
+    the type line now names the type and the remedy from the table, so the
+    row is no longer hint-free. For a suffix the table does not know -
+    which is what ``.secretfmt`` in that pin is - the paragraph above
+    still holds verbatim.
+
+    ``landed_name`` is the row's own name in the Outbox folder. It is
+    ``artifact-<ordinal>`` plus an admitted suffix, built by
+    :func:`_copy_artifacts` from a loop position through
+    :class:`TrustedIdentity` - no byte of it comes from the source - and it
+    is only interpolated on the withheld branch, where that suffix is
+    empty by construction. It is still routed through :func:`_esc`
+    (redact THEN escape, never a slice) rather than trusted on that
+    reasoning alone.
+
+    Returns the receipt's type-line MARKUP (the text after
+    ``"original type: "``), not a bare label: the withheld branch needs two
+    ``<code>`` spans with prose between them.
     """
     ext = _artifact_extension(Path(str(original)))
-    if not ext:
-        return _TYPE_NOT_PRESERVED
-    return html.escape(ext, quote=True)
+    if ext:
+        return f"<code>{html.escape(ext, quote=True)}</code>"
+
+    # DEC-31: the source's suffix is used ONLY as a membership key into the
+    # closed table; every rendered byte below is that table's own VALUE (or
+    # a literal defined in this file), never a slice of ``original``.
+    # DEC-36's terminating rule - pin the concrete type in this frame before
+    # operating on the value - so a non-``str`` can never reach the lookup
+    # and dispatch its own ``__hash__``/``__eq__`` into a spurious match.
+    raw = _display_suffix(original)
+    label = _WITHHELD_EXTENSION_LABELS.get(raw) if type(raw) is str else None
+    if type(label) is not str:
+        return f"<code>{_TYPE_NOT_PRESERVED}</code>"
+
+    label_html = html.escape(label, quote=True)
+    return (f"<code>{label_html}</code> - {_WITHHELD_REASON}; rename to "
+            f"<code>{_esc(landed_name)}{label_html}</code>"
+            f"{_WITHHELD_REMEDY_TAIL}")
 
 
 def _claim_name(taken: set, name: str) -> str:

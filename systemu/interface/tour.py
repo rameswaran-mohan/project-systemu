@@ -63,6 +63,17 @@ TOUR_STEPS: List[Dict[str, str]] = [
 ]
 
 
+#: Phase 2e - the routes that may carry an OPTIONAL per-page micro-tour
+#: (``?ptour=N``). "/" is deliberately absent: Home belongs to the main tour,
+#: and a second card there would compete with it.
+PAGE_TOUR_ROUTES = ("/work", "/tools", "/table", "/shadows", "/insights")
+
+#: The floating card chrome, shared by the main tour card and the page-tour
+#: card so a micro-tour is visually the same object the operator already met.
+_CARD_STYLE = ("position: fixed; bottom: 24px; right: 24px; z-index: 5000; "
+               "max-width: 380px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);")
+
+
 def tour_step(index: int) -> Optional[Dict[str, str]]:
     """Bounds-safe step lookup (None past either end)."""
     if 0 <= index < len(TOUR_STEPS):
@@ -89,22 +100,90 @@ def tour_steps_for(persona: Optional[str]) -> List[Dict[str, str]]:
     return list(TOUR_STEPS)
 
 
-def _persona_steps() -> List[Dict[str, str]]:
-    """Resolve the operator's persona ONCE per render, then order the steps.
+def _current_persona_name() -> Optional[str]:
+    """The operator's stored persona, or None. Never raises.
 
     Defensive by construction: no app state, no vault, or a vault that throws
-    all land on the default order: the tour must render regardless.
+    all resolve to None, which every caller reads as "use the default skin".
     """
     try:
         from systemu.interface.dashboard_state import AppState
         from systemu.interface.persona_content import current_persona
         vault = AppState.get().vault
         if vault is None:
-            return list(TOUR_STEPS)
-        return tour_steps_for(current_persona(vault))
+            return None
+        return current_persona(vault)
     except Exception:
         logger.debug("[Tour] persona resolution failed", exc_info=True)
-        return list(TOUR_STEPS)
+        return None
+
+
+def _persona_steps() -> List[Dict[str, str]]:
+    """Resolve the operator's persona ONCE per render, then order the steps.
+
+    Defensive by construction: no app state, no vault, or a vault that throws
+    all land on the default order: the tour must render regardless.
+    """
+    return tour_steps_for(_current_persona_name())
+
+
+def _bare_route(route) -> str:
+    """The path half of a route string ('' for anything that is not a str).
+
+    The layout hands us its own page path, but a caller that passes the live
+    URL must not be punished for the query string it is asking about.
+    """
+    if type(route) is not str:
+        return ""
+    return route.split("?", 1)[0]
+
+
+def page_tour_steps(route, persona) -> List[Dict[str, str]]:
+    """The 1-2 micro-tour hints for one route, in this persona's wording.
+
+    Resolution order: the persona's own hints for the route, then
+    ``DEFAULT_SKIN``'s, then ``[]``. A skin that omits a route INHERITS the
+    default wording rather than losing the hint - emphasis is additive here,
+    exactly as ``tour_steps_for`` refuses to let an order drop a room. Pure,
+    bounds-safe and never raises: an unknown or hostile route is simply ``[]``,
+    which every caller reads as "no pill, no card".
+    """
+    bare = _bare_route(route)
+    if bare not in PAGE_TOUR_ROUTES:
+        return []
+    try:
+        from systemu.interface import persona_content
+        default_skin = persona_content.DEFAULT_SKIN
+    except Exception:                                    # pragma: no cover
+        logger.debug("[Tour] persona content unavailable", exc_info=True)
+        return []
+    candidates = []
+    try:
+        candidates.append(persona_content.skin_for(persona))
+    except Exception:
+        logger.debug("[Tour] persona skin lookup failed", exc_info=True)
+    candidates.append(default_skin)
+    for skin in candidates:
+        hints = getattr(skin, "page_hints", None)
+        if type(hints) is not dict:
+            continue
+        steps = hints.get(bare)
+        if type(steps) is list and steps:
+            return list(steps)                # a copy: callers cannot edit data
+    return []
+
+
+def page_tour_pill_model(route, persona) -> Dict[str, object]:
+    """Pure: does this page offer a micro-tour, and where does the pill point?
+
+    ``{"visible": bool, "target": str}``. Invisible is the honest default - no
+    hints for this persona on this route means no pill at all, and Home never
+    gets one because it is not a page-tour route. Never raises.
+    """
+    bare = _bare_route(route)
+    if not page_tour_steps(bare, persona):
+        return {"visible": False, "target": ""}
+    return {"visible": True, "target": f"{bare}?ptour=0"}
 
 
 def is_tour_pending(vault) -> bool:
@@ -142,14 +221,43 @@ def mark_tour_completed(vault, *, ended_early: bool = False,
     add_fact(vault, text, source="onboarding", tags=[TOUR_FACT_TAG, "onboarding"])
 
 
-def _active_step_index() -> Optional[int]:
-    """The ?tour=N param of the current page request, else None. Never raises."""
+def parse_step_param(raw) -> Optional[int]:
+    """Pure: a query-string step index, or None for anything that is not one.
+
+    Bounds-safety at the boundary. Only a plain run of ASCII digits parses:
+    negatives, floats, exponents, padding, non-ASCII digit forms and
+    non-strings are all None, so a hand-edited URL can never index backwards
+    into a step list or hand ``int()`` something it will choke on.
+    """
+    if type(raw) is not str:
+        return None
+    if not (raw.isascii() and raw.isdigit()):
+        return None
+    return int(raw)
+
+
+def _query_step_index(name: str) -> Optional[int]:
+    """The named step param of the current page request, else None.
+
+    Never raises: outside a live request (tests, headless callers) there is no
+    query string, so there is no index - which is what keeps both tours from
+    firing on their own.
+    """
     try:
         from nicegui import ui
-        raw = ui.context.client.request.query_params.get("tour")
-        return int(raw) if raw is not None and str(raw).isdigit() else None
+        return parse_step_param(ui.context.client.request.query_params.get(name))
     except Exception:
         return None
+
+
+def _active_step_index() -> Optional[int]:
+    """The ?tour=N param of the current page request, else None. Never raises."""
+    return _query_step_index("tour")
+
+
+def _active_page_step_index() -> Optional[int]:
+    """The ?ptour=N param of the current page request, else None. Never raises."""
+    return _query_step_index("ptour")
 
 
 def maybe_render_tour(current_path: str) -> None:
@@ -167,6 +275,28 @@ def maybe_render_tour(current_path: str) -> None:
     if not 0 <= idx < len(steps):
         return
     render_tour_card(idx, steps=steps)
+
+
+def maybe_render_page_tour(current_path: str) -> None:
+    """Render the per-page hint card when ``?ptour=N`` is active.
+
+    Called from ``_build_layout`` beside the main tour card. It NEVER auto-
+    fires: with no ``?ptour`` in the query string this returns before it even
+    looks a hint up, so an ordinary page load renders exactly what it rendered
+    before this feature existed. Only the header "?" pill puts the param in the
+    URL. Out-of-range indices render nothing - a stale link is harmless.
+    """
+    idx = _active_page_step_index()
+    if idx is None:
+        return
+    try:
+        persona = _current_persona_name()
+    except Exception:                       # a hostile resolver is not a crash
+        persona = None
+    steps = page_tour_steps(current_path, persona)
+    if not 0 <= idx < len(steps):
+        return
+    render_page_tour_card(idx, _bare_route(current_path), steps)
 
 
 def render_tour_card(idx: int,
@@ -199,10 +329,7 @@ def render_tour_card(idx: int,
             except Exception:
                 logger.debug("[Tour] completion fact failed", exc_info=True)
 
-    with ui.element("div").classes("s-card").style(
-        "position: fixed; bottom: 24px; right: 24px; z-index: 5000; "
-        "max-width: 380px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);"
-    ):
+    with ui.element("div").classes("s-card").style(_CARD_STYLE):
         ui.label(f"Tour · step {idx + 1} of {total}").classes("s-muted").style(
             "font-size: 11px;")
         ui.label(step["title"]).classes("s-section-head")
@@ -234,6 +361,42 @@ def render_tour_card(idx: int,
             button("End tour", variant="ghost", on_click=_end)
 
 
+def render_page_tour_card(idx: int, route: str,
+                          steps: List[Dict[str, str]]) -> None:
+    """The floating hint card for the page the operator is already on.
+
+    Same chrome as the main tour card (``_CARD_STYLE``), different KIND of
+    object. A page tour is deliberately STATELESS: it records no completion
+    fact and reads none. There is nothing to remember, so there is nothing to
+    un-remember - it is a replayable throwaway the operator re-opens from the
+    "?" pill whenever they want it, and "Done" simply drops the ``?ptour``
+    param and leaves them standing on the page.
+    """
+    from nicegui import ui
+    from systemu.interface.design.primitives import button
+
+    step = steps[idx]
+    total = len(steps)
+
+    with ui.element("div").classes("s-card").style(_CARD_STYLE):
+        ui.label(f"On this page - tip {idx + 1} of {total}").classes(
+            "s-muted").style("font-size: 11px;")
+        ui.label(step["title"]).classes("s-section-head")
+        ui.label(step["body"]).classes("s-cell").style("white-space: normal;")
+        with ui.row().classes("w-full q-gutter-sm").style("margin-top: 8px;"):
+            if idx > 0:
+                button("Back", variant="ghost",
+                       on_click=lambda _=None, i=idx - 1: ui.navigate.to(
+                           f"{route}?ptour={i}"))
+            if idx + 1 < total:
+                button("Next", variant="primary",
+                       on_click=lambda _=None, i=idx + 1: ui.navigate.to(
+                           f"{route}?ptour={i}"))
+            # No completion fact on ANY exit path - see the docstring.
+            button("Done", variant="ghost",
+                   on_click=lambda _=None: ui.navigate.to(route))
+
+
 def render_tour_pill(vault) -> None:
     """Header pill that keeps an unfinished tour visible until completed."""
     from nicegui import ui
@@ -241,3 +404,20 @@ def render_tour_pill(vault) -> None:
         return
     ui.link("Take the tour", "/?tour=0").classes("s-pill s-pill--info").style(
         "text-decoration: none; cursor: pointer;")
+
+
+def render_page_tour_pill(current_path: str) -> None:
+    """Header "?" pill: this page has hints, and they are one click away.
+
+    Renders ONLY where ``page_tour_pill_model`` says there is something to
+    show, so a page with no hints for this operator's persona is untouched.
+    Visibility is decided by that pure model, never re-derived here.
+    """
+    from nicegui import ui
+    model = page_tour_pill_model(current_path, _current_persona_name())
+    if not model["visible"]:
+        return
+    pill = ui.link("?", str(model["target"])).classes("s-pill").style(
+        "text-decoration: none; cursor: pointer; font-weight: 700;")
+    with pill:
+        ui.tooltip("Quick tips for this page")

@@ -536,6 +536,13 @@ def _build_layout(page_title: str, current_path: str):
                         dispatch("record", args,
                                  cwd=cwd, stream=True, job_type="capture",
                                  dedup_key=f"record:{task_name}")
+                        # P2d: local first-run funnel. THE capture-start site -
+                        # Home's "Record" tile stashes this very handler, so
+                        # every UI recording passes here. Stamped where the
+                        # "Recording started!" claim is made, so the counter and
+                        # the notification agree. Never raises.
+                        from systemu.runtime.funnel import mark_milestone
+                        mark_milestone(AppState.get().vault, "first_recording")
                         ui.notify("Recording started!", type="positive")
                         dlg.close()
                         
@@ -604,6 +611,17 @@ def _build_layout(page_title: str, current_path: str):
                         render_tour_pill(_ny_vault)
                     except Exception:
                         logger.debug("[Dashboard] tour pill failed", exc_info=True)
+
+                    # Phase 2e: the per-page "?" pill. Appears ONLY on routes
+                    # that carry micro-tour hints for this operator's persona
+                    # (never on Home - the main tour owns that room), and it is
+                    # the only thing that ever puts ?ptour in the URL.
+                    try:
+                        from systemu.interface.tour import render_page_tour_pill
+                        render_page_tour_pill(current_path)
+                    except Exception:
+                        logger.debug("[Dashboard] page tour pill failed",
+                                     exc_info=True)
 
                     _ny_model = needs_you_badge_model(_ny_vault)
                     needs_you_badge = ui.link(
@@ -707,6 +725,15 @@ def _build_layout(page_title: str, current_path: str):
                 maybe_render_tour(current_path)
             except Exception:
                 logger.debug("[Dashboard] tour card failed", exc_info=True)
+
+            # Phase 2e: the per-page micro-tour card (?ptour=N). Never auto-
+            # fires - no param, no card - and records no completion fact:
+            # page tours are replayable throwaways, not onboarding state.
+            try:
+                from systemu.interface.tour import maybe_render_page_tour
+                maybe_render_page_tour(current_path)
+            except Exception:
+                logger.debug("[Dashboard] page tour card failed", exc_info=True)
 
             # Page content is rendered here by the caller
             content_area = ui.column().classes("w-full")
