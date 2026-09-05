@@ -1,5 +1,5 @@
 """R-A14a slice 4 — the §12A G-DEMO v0 acceptance fixture ("receipts, not
-self-report"). MASTER-SPEC §12A, MASTER-PLAN R-A15 / PLAN-5.
+self-report"). Covers the §12A acceptance requirement; roadmap items R-A15 / PLAN-5.
 
 WHY THIS FIXTURE EXISTS (the anti-dormancy tripwire)
 ────────────────────────────────────────────────────

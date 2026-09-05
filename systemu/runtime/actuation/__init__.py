@@ -1,4 +1,4 @@
-"""R-A14a — the interface-blind actuation layer (MASTER-SPEC §8).
+"""R-A14a — the interface-blind actuation layer (spec §8).
 
 ``ActuationModality`` is the one socket every actuation tier (http_api / mcp /
 automation / cli / data_layer / uia / vision) implements, so the S1-S5 safety net
@@ -16,7 +16,7 @@ from systemu.runtime.actuation.modality import (
 )
 from systemu.runtime.actuation.mcp_modality import McpActuationModality
 
-# ── R-A14a §15.1(b) / DEC-1 — the ActuationModality SELECTOR (MASTER-SPEC §8.3) ─
+# ── R-A14a §15.1(b) / DEC-1 — the ActuationModality SELECTOR (spec §8.3) ─
 # Pre-S2 there is NO OS-kernel egress jail, so ONLY the tier-2 `mcp`
 # (operator-connected, in-daemon, token-parent-side) rung is admissible. A
 # forged-tool actuation rung (tier-1) and a registry-install rung are NOT offered

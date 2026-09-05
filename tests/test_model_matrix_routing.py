@@ -120,7 +120,8 @@ def _selected_model(cfg, wire, **call_kwargs) -> str:
 # --------------------------------------------------------------------------
 
 def test_every_registered_stage_resolves_to_a_valid_tier():
-    """MASTER-SPEC 15.4: 'a test asserts each registered stage resolves'."""
+    """The spec requirement, verbatim: 'a test asserts each registered stage
+    resolves'."""
     cfg = _cfg()
     assert mm.registered_stages(), "matrix must not be empty"
     for stage in mm.registered_stages():
@@ -740,7 +741,8 @@ def test_locality_does_not_influence_model_selection(wire):
     """A local_capable stage still routes to the configured CLOUD model.
 
     This pins the deferral: if someone later makes locality route, this test
-    fails and forces the PCM spec-pass conversation MASTER-SPEC 15.4 requires.
+    fails and forces the PCM spec-pass conversation the spec requires before
+    locality may route.
     """
     cfg = _cfg(parser_tier="tier1")
     assert mm.locality_of_stage("desk_extraction") == "local_capable"

@@ -1,4 +1,4 @@
-"""R-A14a slice 1 — the ActuationModality Protocol contract (MASTER-SPEC §8.2).
+"""R-A14a slice 1 — the ActuationModality Protocol contract (spec §8.2).
 
 One interface-blind actuation socket. This slice defines the Protocol + the small
 Action / ActionResult dataclasses. The tests assert the SHAPE: a conforming impl

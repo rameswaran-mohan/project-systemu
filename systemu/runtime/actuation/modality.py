@@ -1,4 +1,4 @@
-"""R-A14a slice 1 — the ``ActuationModality`` contract (MASTER-SPEC §8.2).
+"""R-A14a slice 1 — the ``ActuationModality`` contract (spec §8.2).
 
 One **interface-blind actuation socket**: every actuation modality (``http_api`` /
 ``mcp`` / ``automation`` / ``cli`` / ``data_layer`` / ``uia`` / ``vision``, §8.3)

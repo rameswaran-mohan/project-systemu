@@ -1,7 +1,9 @@
 # MODEL-MATRIX
 
 **Decisions:** DEC-12 (the matrix + router enforcement), DEC-20a (the `locality` column).
-**Spec:** MASTER-SPEC §15.4.
+**Spec requirement:** every registered stage must resolve to a valid tier (a test asserts
+it), and Privacy-Complete Mode stays FLAGGED, NOT COMMITTED until its own spec pass lands
+— see "The `locality` column does not route anything" below.
 **Code:** [`sharing_on/model_matrix.py`](../sharing_on/model_matrix.py) is the executable
 half of this document. [`systemu/core/llm_router.py`](../systemu/core/llm_router.py)
 enforces it. If this file and that module ever disagree, the module is right and this
@@ -108,7 +110,7 @@ DEC-20a added `locality` per stage: `cloud_required | cloud_default | local_capa
 which stages a local backend could serve first, so that Privacy-Complete Mode (PCM) can
 be built later without re-auditing every call site.
 
-Making locality route models **would be** PCM, and MASTER-SPEC §15.4 marks PCM
+Making locality route models **would be** PCM, and PCM is marked
 "FLAGGED, NOT COMMITTED" — gated behind its own spec pass plus per-stage fixture
 evidence, a Horizon-3 candidate. So the column stays declarative until that gate opens.
 Query it with `locality_of_stage(stage)` / `stages_by_locality(...)`.

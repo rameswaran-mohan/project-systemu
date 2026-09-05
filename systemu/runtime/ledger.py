@@ -1,4 +1,4 @@
-"""R-P3b — the action ledger (MASTER-SPEC §6): an inspectable, exportable,
+"""R-P3b — the action ledger (spec §6): an inspectable, exportable,
 append-ordered PROJECTION over already-persisted sources (RUL-7 — NO new durable
 writer). This module holds the projection PRIMITIVES + exporters; the vault
 projection (``iter_rows``/``project``) is Part 2.

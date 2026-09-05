@@ -1,4 +1,4 @@
-"""R-A14a slice 2 — the ``mcp`` ActuationModality (MASTER-SPEC §8.2 / §8.3 tier 2).
+"""R-A14a slice 2 — the ``mcp`` ActuationModality (spec §8.2 / §8.3 tier 2).
 
 Wraps the EXISTING gated MCP chokepoint (``runtime.mcp.dispatch.call_mcp_tool``) as
 an :class:`ActuationModality`, so an MCP mutation is:

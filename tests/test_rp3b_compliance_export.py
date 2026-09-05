@@ -1,4 +1,4 @@
-"""R-P3b — the compliance export, wired from Settings (MASTER-SPEC Part II §6).
+"""R-P3b — the compliance export, wired from Settings (spec Part II §6).
 
 ``ledger.export_csv``/``export_jsonl`` were finished, frozen and tested with ZERO
 callers. These pins cover the wiring, and they drive the REAL path: a real

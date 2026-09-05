@@ -5,7 +5,7 @@ run with UNRESTRICTED egress — the exact hole S2 closes. Until S2 ships, the f
 rule (§5.7 / IMPL-13: enforcer-down ⇒ forged-network DENY) must be PROVABLE, not assumed.
 
 This file is a RELEASE GATE for R-A14a AND EVERY RELEASE UNTIL S2 SHIPS. It fails if any
-forged/registry actuation path becomes reachable. The triple (MASTER-SPEC §15.1):
+forged/registry actuation path becomes reachable. The triple (spec §15.1):
 
   (a) DIRECT EXECUTION of a forged, net-effect, untrusted tool REFUSES with an
       ``egress_enforcer_unavailable``-class BLOCKED — never launched-then-denied.

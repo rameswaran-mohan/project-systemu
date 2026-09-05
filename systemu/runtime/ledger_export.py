@@ -1,4 +1,4 @@
-"""R-P3b — the operator-facing compliance export (MASTER-SPEC Part II §6).
+"""R-P3b — the operator-facing compliance export (spec Part II §6).
 
 ``runtime/ledger.py`` holds a finished, frozen, byte-stable pair of exporters
 (:func:`ledger.export_csv` / :func:`ledger.export_jsonl`) that, until this module,

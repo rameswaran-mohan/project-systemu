@@ -16,8 +16,8 @@ Two vocabularies live here and they are NOT the same thing:
   declaration of which stages a local backend *could* serve first. It is a
   DECLARATION, not a routing input: nothing in this module or in ``llm_router``
   reads ``locality`` to pick a model. Making it route would be Privacy-Complete
-  Mode, which MASTER-SPEC §15.4 marks "FLAGGED, NOT COMMITTED" behind its own
-  spec pass. See ``locality_of_stage`` and the doc for the full reasoning.
+  Mode, which is marked "FLAGGED, NOT COMMITTED" behind its own spec pass. See
+  ``locality_of_stage`` and the doc for the full reasoning.
 
 Note the deliberate asymmetry with ``model_presets.locality_of``: that function
 classifies a MODEL ID; ``locality_of_stage`` here classifies a STAGE. They share
@@ -219,8 +219,7 @@ def locality_of_stage(stage: str) -> str:
     design. It exists so a future Privacy-Complete Mode can be built without
     re-auditing every call site, and so the privacy page can render the current
     reality. If you are reaching for this to pick a model, stop — that is PCM,
-    and MASTER-SPEC §15.4 gates it behind its own spec pass plus per-stage
-    fixture evidence.
+    and it is gated behind its own spec pass plus per-stage fixture evidence.
     """
     return require_stage(stage).locality
 
