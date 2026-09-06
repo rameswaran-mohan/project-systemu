@@ -94,6 +94,33 @@ def _capture_grounding(tool: Tool, scroll: Optional["Scroll"]) -> None:
         logger.debug("[Forge] grounding capture failed for '%s'", tool.name, exc_info=True)
 
 
+def _dedup_advisory_line(vault, tool) -> str:
+    """R-CAP1 / CAP-6 - the same-slot near-duplicate advisory for ``tool``.
+
+    One plain heads-up line when an existing tool already occupies this tool's
+    capability slot, so the operator can extend instead of keeping a duplicate.
+    Empty string when the slot is free (the common small-catalog case), which is
+    what keeps every caller's output byte-identical when there is nothing to say.
+
+    ADVISORY ONLY - this INFORMS the forge, it is never an admission gate: a
+    collision does not stop a forge, and neither does a failure to compute this
+    line (both ``slot_collisions`` and ``forge_dedup_advisory`` are already
+    never-raise; this catch is the belt for anything upstream of them, e.g. an
+    import failure). Swallowing a courtesy line's failure is tolerable; swallowing
+    it INVISIBLY is not, hence the debug record.
+    """
+    try:
+        from systemu.runtime import capability_index as _capidx
+        return _capidx.forge_dedup_advisory(
+            tool.name, _capidx.slot_collisions(vault, tool.name, exclude_id=tool.id))
+    except Exception:
+        logger.debug(
+            "[Forge] same-slot dedup advisory unavailable for '%s' - forge continues",
+            getattr(tool, "name", "?"), exc_info=True,
+        )
+        return ""
+
+
 def forge_proposed_tools(
     activity: Activity,
     config: Config,
@@ -195,6 +222,13 @@ def save_approved_code(
             f"Refusing to write tool with unsafe name: {tool.name!r}"
         )
 
+    # R-CAP1 / CAP-6: this is the FOURTH forge path and the only one that does not
+    # route through _generate_and_save_code (the Gate-2 dialog persists code the
+    # operator already read), so it needs the same-slot advisory computed here or
+    # it stays the one forge surface silent about a near-duplicate. Derived before
+    # the write, so it describes the catalog as it stood pre-creation.
+    dedup_line = _dedup_advisory_line(vault, tool)
+
     impl_dir  = Path(config.vault_dir) / "tools" / "implementations"
     impl_dir.mkdir(parents=True, exist_ok=True)
     impl_path = impl_dir / f"{tool.name}.py"
@@ -207,10 +241,15 @@ def save_approved_code(
     vault.save_tool(tool)
 
     logger.info("[Forge] Tool '%s' approved & saved → %s (enabled=False)", tool.name, impl_path)
+    approved_event_context: Dict[str, Any] = {
+        "tool_id": tool.id, "impl_path": str(impl_path)}
+    if dedup_line:
+        approved_event_context["dedup_advisory"] = dedup_line
     log_event(
         "SUCCESS", "tool",
-        f"Tool '{tool.name}' approved by user → FORGED (disabled until toggled ON)",
-        {"tool_id": tool.id, "impl_path": str(impl_path)},
+        f"Tool '{tool.name}' approved by user → FORGED (disabled until toggled ON)"
+        + (f" | {dedup_line}" if dedup_line else ""),
+        approved_event_context,
     )
 
     # v0.5.0-a: dry-run gate.  Tool stays disabled either way (operator must
@@ -426,13 +465,11 @@ def forge_tool(
     # occupies this proposed tool's capability slot, surface it so the operator can
     # extend instead of forging a duplicate. INFORMS the gate, never blocks (and a
     # failure to compute it never affects the forge) — CAP-6 "never blocks alone".
-    _dedup_line = ""
-    try:
-        from systemu.runtime import capability_index as _capidx
-        _dedup_line = _capidx.forge_dedup_advisory(
-            tool.name, _capidx.slot_collisions(vault, tool.name, exclude_id=tool.id))
-    except Exception:
-        _dedup_line = ""
+    # The SAME line is threaded into _generate_and_save_code below, so the line the
+    # operator approved against is byte-for-byte the line recorded on the forge
+    # event - a second derive could disagree with the first (the catalog can move
+    # between the gate and the LLM round-trip).
+    _dedup_line = _dedup_advisory_line(vault, tool)
 
     # ── User confirmation gate (CLI path) ─────────────────────────────────
     choice = notify_user(
@@ -457,7 +494,8 @@ def forge_tool(
         logger.info("[Forge] User skipped forging '%s'", tool.name)
         return None
 
-    return _generate_and_save_code(tool, scroll, config, vault)
+    return _generate_and_save_code(tool, scroll, config, vault,
+                                   dedup_line=_dedup_line)
 
 
 def check_run_conformance(implementation: str, declared_param_names) -> Optional[str]:
@@ -538,6 +576,7 @@ def _generate_and_save_code(
     vault: Vault,
     *,
     prior_failure: Optional[str] = None,
+    dedup_line: Optional[str] = None,
 ) -> Optional[Tool]:
     """Core code-generation step. Shared by forge_tool() and forge_tool_from_spec().
 
@@ -545,10 +584,27 @@ def _generate_and_save_code(
     course-correction from a failed dry-run), it is threaded into the code prompt
     as ``previous_attempt_error`` so the code-writer fixes the specific failing
     call — overriding the tool's own (possibly wrong) implementation_notes.
+
+    R-CAP1 / CAP-6 (Phase 4 slice A3): the same-slot near-duplicate advisory is
+    computed HERE, because this is the one function EVERY forge path shares. It
+    used to live in ``forge_tool`` alone, which only the CLI reaches - so the
+    Governor/daemon provisioner, the dashboard /tools forge gate, the self-heal
+    reforge and the validator auto-forge bridge all forged duplicates silently.
+    ``dedup_line`` lets a caller that already computed the line for its own
+    pre-forge gate (the CLI) hand the SAME line down instead of re-deriving it;
+    every other caller passes nothing and it is derived here. It rides out on the
+    forge-success ``log_event`` this function already emits - the channel those
+    paths already report through - and is ABSENT (byte-identical output) when
+    there is no collision. Never blocks: see ``_dedup_advisory_line``.
     """
     from systemu.interface.notifications import log_event, notify_user
 
     logger.info("[Forge] Generating implementation for '%s' ...", tool.name)
+
+    # Derived BEFORE the LLM round-trip so the advisory describes the catalog as
+    # it stood when this forge was admitted, not after it.
+    if dedup_line is None:
+        dedup_line = _dedup_advisory_line(vault, tool)
 
     code_payload: Dict[str, Any] = {
         "tool_spec":      tool.model_dump(mode="json"),
@@ -660,9 +716,17 @@ def _generate_and_save_code(
     vault.save_tool(tool)
 
     logger.info("[Forge] Tool '%s' forged → %s", tool.name, impl_path)
+    # CAP-6 surfacing: the advisory ANNOTATES the record this path already emits.
+    # Absent when the slot was free, so a no-collision forge logs byte-for-byte
+    # what it always logged.
+    forge_event_context: Dict[str, Any] = {
+        "tool_id": tool.id, "impl_path": str(impl_path)}
+    if dedup_line:
+        forge_event_context["dedup_advisory"] = dedup_line
     log_event("SUCCESS", "tool",
-              f"Tool '{tool.name}' forged successfully → {impl_path.name}",
-              {"tool_id": tool.id, "impl_path": str(impl_path)})
+              f"Tool '{tool.name}' forged successfully → {impl_path.name}"
+              + (f" | {dedup_line}" if dedup_line else ""),
+              forge_event_context)
     return tool
 
 

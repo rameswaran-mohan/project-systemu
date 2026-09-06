@@ -46,31 +46,59 @@ the honest taint is the untrusted one. This costs nothing (the read path clamps 
 SCOPE — WHAT THIS SLICE DOES NOT DO (stated, not implied)
 ---------------------------------------------------------
 
-  * **NO OPERATOR-FACING GRANT SURFACE IS BUILT.** This is the gap that matters most, and
-    an earlier revision of this section omitted it while enumerating printers. Nothing in
-    the product calls :func:`grant_category`, :func:`revoke_category`,
-    ``CensusConsentStore.set_paused`` or ``census_consent.consent_card``: no CLI command,
-    no dashboard control, no registered tool, no elicitation surface. So no OPERATOR can
-    consent. On a FRESH install — one with no ``census_consent.json`` in the vault:
+  * **THE OPERATOR GRANT SURFACE IS BUILT FOR ONE OF THREE CATEGORIES.** State this per
+    category, never as one sentence: an earlier revision of this section said flatly "NO
+    OPERATOR-FACING GRANT SURFACE IS BUILT", which was true when written and became false
+    for ``cloud_sync_roots`` in P4-B2 while staying true for the other two. A blanket
+    claim in either direction is wrong for two thirds of the categories.
+
+    ``cloud_sync_roots`` -- REACHABLE. ``systemu census status | grant | revoke | pause |
+    resume`` (``sharing_on/cli.py`` -> :func:`cli_commands.run_census_status` and its four
+    siblings) reach :func:`grant_category`, :func:`revoke_category`,
+    :func:`pause_category` and ``census_consent.consent_card``. ``grant`` renders the real
+    card field by field (including under ``--yes``) and defaults to N. An operator on a
+    default install CAN consent, and once they do §5.11 AC5 clause 3 -- "a
+    census-discovered capability wins a plan without the operator naming it" -- happens on
+    a real install, not only under test. Pinned end to end, through the real CLI and the
+    REAL probe, by ``test_the_default_install_path_grants_scans_and_revokes_end_to_end``
+    in ``tests/test_rw2_ambient_census.py``: grant -> scan -> fact in the store -> fact in
+    ``world_facts`` -> fact in the fenced planner prompt -> revoke -> the next run skips
+    AND the fact is gone from all three surfaces.
+
+    ``installed_apps`` and ``path_clis`` -- NOT REACHABLE, and the "no operator can
+    consent" paragraph still holds for them verbatim. Every CLI verb REFUSES them by name
+    (never a silent no-op, which would read as a granted capability that is quietly dead),
+    ``consent_card`` reports ``revocation_surface_shipped: False``, and no dashboard
+    control, registered tool or elicitation surface can create a grant for them. The scope
+    is :data:`census_consent.SURFACED_CATEGORIES`, which is the single source of truth the
+    card and the CLI both derive from.
+
+    On a FRESH install -- one with no ``census_consent.json`` in the vault -- nothing has
+    changed, because the surface creates a grant only when the operator runs it:
       - ``is_active`` is False for every category, so no probe is reached;
       - :func:`run_census` runs on each survey and returns
         ``{'scanned': [], 'skipped': {<all three>: 'not_consented'}, 'facts_written': 0}``;
-      - ``world_facts`` never carries a census row, so §5.11 AC5 clause 3 ("a
-        census-discovered capability wins a plan without the operator naming it") is
-        DEMONSTRATED BY TEST ONLY, never on a default install;
+      - ``world_facts`` carries no census row, so AC5 clause 3 does not fire until the
+        operator grants;
       - the ``sharing_on world`` standing-scan block renders nothing, because
         :func:`census_status` returns ``[]``.
     THIS IS NOT "THE CENSUS NEVER RUNS." :func:`run_census` is wired into the survey seam
     (``shadow_runtime`` invokes it every survey) and reads ``census_consent.json``
-    directly, so every clause above is conditional on that file being absent or ungranted.
-    A writer that plants a well-formed consent file makes all four false on the next run —
-    the census scans this machine and the facts reach the planner prompt (see
-    ``CensusConsentStore._load`` for the integrity gap, which is LIVE, not latent). What
-    ships here is the machinery, its live consumer, and its consent model, reviewed ahead
-    of the OPERATOR surface. ``test_no_production_grant_surface_exists`` pins the SOURCE
-    property (no shipped file references the grant symbols) so the wiring commit cannot
-    land without re-reading the disclosures this module and :mod:`census_consent` carry;
-    it does not, and cannot, pin that no consent file exists on disk.
+    directly, so every clause above is conditional on that file being absent or ungranted --
+    now genuinely a question of what the operator chose, rather than of what was
+    unbuildable.
+    That file is AUTHENTICATED -- see ``CensusConsentStore._load``: it carries an
+    HMAC-SHA256 keyed by a secret derived from this vault, so planting a well-formed
+    consent file does not manufacture a grant, and the unsigned ``version: 1`` format is
+    never grandfathered.
+    ``test_the_census_grant_surface_is_confined_to_its_declared_region`` (which REPLACED
+    ``test_no_production_grant_surface_exists``, whose own failure message named the
+    narrowing as the procedure) pins the SOURCE property: the grant symbols -- including
+    the ``run_census_*`` entry points, which are themselves grant-creating -- appear only
+    in the two declared surface files and only below each file's declared region marker.
+    A WIDENING to a third category or a third file cannot land without re-reading the
+    disclosures this module and :mod:`census_consent` carry, which its failure message
+    enumerates. It does not, and cannot, pin what is on a given disk.
 
 WM-7 names six categories; this slice ships THREE probes, and every probe it ships is
 read-only by CONSTRUCTION rather than by assumption. The other three, and one half of a
@@ -557,15 +585,24 @@ def census_status(vault) -> List[dict]:
 def grant_category(vault, category: str) -> dict:
     """Consent to ``category`` and return the card the operator agreed to.
 
-    NO PRODUCTION CALLER — see the SCOPE section. This is the function an operator grant
-    surface would call; until one exists it is reached only from tests, so no OPERATOR can
-    create a grant. That is NOT the same as the census being inert: :func:`run_census` is
-    wired live and reads the consent file directly, so a planted ``census_consent.json``
-    already turns the census on. Whoever wires the operator surface must ship a revoke
-    surface in the same change (:func:`revoke_category`), must re-read the disclosures on
-    the card it returns, and must resolve the consent-file integrity gap documented on
-    ``CensusConsentStore._load`` — that gap is LIVE now (a forged file MANUFACTURES a
-    "yes"), and a legitimate grant surface only adds a second thing to forge.
+    LIVE PRODUCTION CALLER, FOR ONE CATEGORY -- see the SCOPE section.
+    ``cli_commands.run_census_grant`` (behind ``systemu census grant``) calls this after
+    rendering the card this function returns, and refuses any category outside
+    :data:`census_consent.SURFACED_CATEGORIES` before reaching it. So an operator CAN
+    create a grant for ``cloud_sync_roots``; for ``installed_apps`` and ``path_clis`` this
+    is still reached only from tests.
+
+    The category check lives in the CLI rather than here on purpose: this is the library
+    verb, and a future surface (a dashboard control, an elicitation) must be able to widen
+    the scope by editing ``SURFACED_CATEGORIES`` and its own refusal, not by editing the
+    store. Whoever does that must ship revoke (:func:`revoke_category`) and pause
+    (:func:`pause_category`) for the new category in the SAME change, and must re-read the
+    disclosures on the card this returns --
+    ``test_the_census_grant_surface_is_confined_to_its_declared_region`` enumerates them
+    and will fail until the widening is deliberate.
+
+    The consent file is AUTHENTICATED (``CensusConsentStore._load``), so a planted file
+    cannot turn the census on; only this path can.
 
     Raises :class:`UnknownCensusCategory` for an unknown category — grant is the
     direction that AUTHORISES a scan, so it fails loudly.
@@ -573,13 +610,34 @@ def grant_category(vault, category: str) -> dict:
     return CensusConsentStore(vault.root).grant(category)
 
 
+def pause_category(vault, category: str, paused: bool) -> bool:
+    """Pause (or resume) scanning for a granted category. Returns True iff it is granted.
+
+    The M3 "pause" verb, shipped to the operator alongside grant and revoke
+    (``systemu census pause`` / ``systemu census resume``). Exposed HERE rather than
+    letting the CLI construct
+    a :class:`census_consent.CensusConsentStore` for the same reason
+    :func:`census_status` exposes the read: obtaining a MUTABLE HANDLE on consent stays
+    confined to this module, which is what keeps the CONC-MAP writer-ownership guard on
+    ``CensusConsentStore(`` meaningful. An operator surface needs the VERB, not the
+    handle.
+
+    Facts are KEPT. A pause is not a withdrawal of consent, so purging them would make it
+    indistinguishable from :func:`revoke_category` — and the difference between the two is
+    the entire reason both are offered.
+    """
+    return CensusConsentStore(vault.root).set_paused(category, bool(paused))
+
+
 def revoke_category(vault, category: str) -> dict:
     """Revoke ``category`` AND purge the facts it produced (WM-7's revocation clause).
 
-    NO PRODUCTION CALLER — see the SCOPE section. This is the entry point a revoke
-    surface would call; there is no CLI command, dashboard control or tool behind it
-    today, so "revocable" describes a tested mechanism, not something an operator can
-    currently do.
+    LIVE PRODUCTION CALLER, FOR ONE CATEGORY -- see the SCOPE section.
+    ``cli_commands.run_census_revoke`` (behind ``systemu census revoke``) calls this, so
+    for ``cloud_sync_roots`` "revocable" describes something an OPERATOR can do, not only
+    a tested mechanism -- which is why ``consent_card`` reports
+    ``revocation_surface_shipped: True`` for it and False for the other two, where this
+    remains reachable from tests alone.
 
     It is THE revoke entry point in the sense that it is the only one that does BOTH
     halves: doing one alone would leave either a scanner with no consent or a store
@@ -610,4 +668,5 @@ __all__ = [
     "UnknownCensusCategory", "CATEGORIES",
     "probe_installed_apps", "probe_path_clis", "probe_cloud_sync_roots",
     "run_census", "census_status", "grant_category", "revoke_category",
+    "pause_category",
 ]

@@ -113,6 +113,26 @@ WRITER_OWNERSHIP = {
                  "requirement_snapshot() and record_ask_avoidable(). Any further "
                  "writer needs a DEC-10 review."),
     },
+    "R-QL1 quick-lane ask corpus (<root>/audit/quick_lane_asks.jsonl)": {
+        "call": "record_quick_lane_ask(",
+        "allowed": {"pipelines/quick_task.py"},   # the ASK_USER branch of the quick lane
+        "def": "runtime/replay_metrics.py",
+        "conc_map_row": '**R-QL1 quick-lane ask corpus** `audit/quick_lane_asks.jsonl`',
+        "note": ("R-QL1 — DEC-7's ONLY evidence source for the quick lane's "
+                 "_ASK_USER_CAP. APPEND-only, observability-only (the CALL SITE "
+                 "swallows every exception with one logger.debug, so the run's result "
+                 "is byte-identical with the recorder raising). Appends are SERIALIZED "
+                 "(process lock + best-effort OS file lock, then one os.write to an "
+                 "O_APPEND fd) so concurrent quick-lane runs interleave whole lines AND "
+                 "lose none. DELIBERATELY a THIRD file: folding rows into "
+                 "ask_corpus.jsonl would have avoidable_ask_report's no-attempt proxy "
+                 "score them into a SHIPPED metric's numerator, and into "
+                 "ask_avoidable.jsonl would put schema-path-less free-text asks into an "
+                 "answer-linked corpus keyed by schema_path — either is a DEC-7 "
+                 "violation by ruling. Records REFS ONLY (keyed HMAC of the question; "
+                 "no vault key => no row) and excludes secret-class asks by a DOUBLE "
+                 "guard. Any further writer needs a DEC-10 review."),
+    },
     "CapabilitySlots index (<root>/capabilities/capability_index.json)": {
         "call": "reconcile_index(",
         "allowed": {"scheduler/daemon.py"},          # the sole 60s capability reconciler job
@@ -228,17 +248,28 @@ WRITER_OWNERSHIP = {
         # excluded from the scan — that guard would pass vacuously on zero hits. Who can
         # obtain a mutable handle is the question that actually matters here.
         "call": "CensusConsentStore(",
-        "allowed": {"runtime/ambient_census.py"},   # the sole holder today
+        "allowed": {"runtime/ambient_census.py"},   # still the sole holder
         "def": "runtime/census_consent.py",
         "conc_map_row": '**R-W2 census consent** `census_consent.json`',
         "note": ("R-W2 §5.11.c WM-7 per-category census consent. The store is its own "
                  "sole writer: grant/revoke/set_paused come from the operator surface, "
-                 "mark_ran from run_census on the shadow exec thread. LOCK+A — "
-                 "_CONSENT_LOCK wraps the whole read-modify-write because every mutator "
-                 "rewrites the file from its own load, so unlocked, a mark_ran that "
-                 "loads before a revoke and writes after it RESURRECTS the revoked grant "
-                 "(verified reproducible during R-W2) and thereby defeats run_census's "
-                 "pre-write consent re-check. Any further writer needs a DEC-10 review."),
+                 "mark_ran from run_census on the shadow exec thread. P4-B2 made that "
+                 "operator surface REAL (`systemu census grant|revoke|pause|resume`), so "
+                 "the operator-vs-run race is now reachable rather than hypothetical — "
+                 "but the ALLOWLIST is deliberately unchanged: the CLI reaches the "
+                 "mutators through ambient_census.grant_category / revoke_category / "
+                 "pause_category and never constructs a store, so the mutable handle "
+                 "stays confined to one file. Keep it that way; a surface that "
+                 "constructs its own handle is how this guard stops meaning anything. "
+                 "LOCK+A — _CONSENT_LOCK wraps the whole read-modify-write because every "
+                 "mutator rewrites the file from its own load, so unlocked, a mark_ran "
+                 "that loads before a revoke and writes after it RESURRECTS the revoked "
+                 "grant (verified reproducible during R-W2) and thereby defeats "
+                 "run_census's pre-write consent re-check. The file is AUTHENTICATED "
+                 "(HMAC over the canonical body, per-vault key from "
+                 "dashboard_auth.session_secret); an unsigned v1 file reads as "
+                 "UNCONSENTED and is never grandfathered, and _write refuses to write a "
+                 "file it cannot sign. Any further writer needs a DEC-10 review."),
     },
     "World-model negatives (<root>/world_model/negatives.json)": {
         "call": "put_negative(",
@@ -300,6 +331,57 @@ WRITER_OWNERSHIP = {
                  "invariant is what makes a third caller dangerous: it could drop "
                  "artifacts into a folder another writer is about to seal with "
                  ".done, which is exactly the torn-read `.done` exists to prevent."),
+    },
+    "GrantedRoots (<vault>/granted_roots.json)": {
+        # Guard on HANDLE ACQUISITION, not on `revoke(` -- the census-consent reasoning,
+        # for a sharper reason here. `revoke(` is a substring this scan would find in
+        # `interface/cli_commands.py` ALREADY (the unrelated `tools deps revoke` at
+        # :966) and in `runtime/ambient_census.py`, so a guard keyed on it would report
+        # this file as a writer whether or not the roots revoke exists -- passing
+        # vacuously in BOTH directions (DEC-32: a pin asserting a value the failure path
+        # also produces is not a pin). `GrantedRootsStore(` appears in cli_commands.py
+        # exactly once, at the roots group's store helper, so the "missing" half of the
+        # assertion below is a genuine reachability pin on the new writer.
+        #
+        # A handle is the right unit anyway: `grant` and `revoke` live on the same
+        # object, so obtaining one IS obtaining write authority. The three other holders
+        # are declared here with what they are allowed to do, and the read-only two must
+        # stay read-only (pinned separately by the READ-path tests in tests/test_ra9_roots.py
+        # and tests/test_ra10_binder.py).
+        "call": "GrantedRootsStore(",
+        "allowed": {
+            # R-A4: BOTH operator-reachable writers -- `systemu roots grant <path>`
+            # (consent-gated) and `systemu roots revoke <path>`, the only callers of
+            # `.grant`/`.revoke` outside the replay fixture.
+            "interface/cli_commands.py",
+            # the sole `.grant` caller: the R-A13.5 replay-fixture materializer, which
+            # builds a scenario's roots inside its own throwaway vault.
+            "runtime/resolver_replay.py",
+            # READ-ONLY holders.
+            "runtime/situational_inventory.py",   # build_roots -- the S3 root survey
+            "runtime/requirement_binder.py",      # resolver source #1 confinement re-gate
+        },
+        "def": "runtime/granted_roots.py",
+        "conc_map_row": '**GrantedRoots** `granted_roots.json`',
+        "note": ("G2 / spec UNIFIED-v2 sec 5.4 + sec 13, HIGH-3 -- the filesystem "
+                 "confinement set. Until R-A4 this store had NO live writer at all: "
+                 "the CONC-MAP row read '(no live writer today; read-only)' and an "
+                 "operator whose folder had been granted could not take it back. "
+                 "TWO writers now, both operator-typed CLI commands in their own "
+                 "processes: `roots grant` (consent-gated, defaults to NO) and "
+                 "`roots revoke`. B1a's row predicted the risk would go MED at the "
+                 "second writer; B1b shipped that writer WITH the lock instead, so "
+                 "the prediction is closed rather than realised. Both mutators hold "
+                 "`granted_roots._exclusive` across the whole load-modify-replace "
+                 "(process lock + best-effort OS lock on a SIDECAR .lock file -- it "
+                 "cannot sit on granted_roots.json, which os.replace swaps out from "
+                 "under any handle). The direction that makes the lock load-bearing "
+                 "is REVOKE: a removal lost to a race leaves GRANTED a folder the "
+                 "operator withdrew, and no re-run repairs it because they already "
+                 "believe it is gone. A BACKGROUND or UI writer still needs a DEC-10 "
+                 "review -- it makes concurrent writes routine rather than a human in "
+                 "two shells, and a grant no operator typed is a consent question the "
+                 "lock does not answer."),
     },
     "P2d-first-run-funnel (<root>/funnel.json)": {
         "call": "mark_milestone(",
@@ -408,6 +490,7 @@ _ATOMIC_WRITE_STORES = {
     "runtime/census_consent.py",      # R-W2 per-category census consent (_write)
     "interface/growth_snapshot.py",   # P2/2a weekly growth snapshot (_write_growth_snapshot)
     "runtime/funnel.py",              # P2d first-run counters (_write_atomic)
+    "runtime/granted_roots.py",       # G2 confinement set (_write: mkstemp + os.replace)
 }
 
 

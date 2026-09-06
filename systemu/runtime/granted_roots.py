@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List
 
@@ -88,6 +90,91 @@ def _is_within(canon_candidate: str, canon_root: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# the write lock (B1b)
+# --------------------------------------------------------------------------- #
+#
+# `grant` and `revoke` are both load-modify-REPLACE over the whole file. With no
+# live writer that was academic. With TWO operator-typed CLI verbs it is not: two
+# writers that each load before either saves silently drop one side's rows, and on
+# the revoke side that means a folder the operator withdrew is STILL GRANTED --- a
+# permission outliving the decision to end it, with nothing to notice it happened.
+#
+# Same two-layer shape the ask-corpus appender uses (`replay_metrics._append_line`):
+# a process-wide lock for writers inside one process, plus a best-effort OS file
+# lock so separate CLI processes are covered too. Best-effort is deliberate ---
+# a platform without either still gets the in-process guarantee rather than an
+# exception, which is the same posture the corpus writer takes.
+
+#: Serializes writers inside THIS process.
+#: NOT reentrant, and must not become so by accident: `_exclusive` also takes an OS
+#: lock on a second fd, which a nested acquire would block on regardless of what the
+#: Python-level lock allowed. Nothing under `_exclusive` may call `grant`/`revoke`.
+_ROOTS_WRITE_LOCK = threading.Lock()
+
+
+def _lock_whole_file(fd) -> bool:
+    """Best-effort EXCLUSIVE advisory lock on ``fd``. False if unavailable."""
+    try:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return True
+    except Exception:
+        pass
+    try:
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)   # byte 0 used purely as a mutex
+        return True
+    except Exception:
+        return False
+
+
+def _unlock_whole_file(fd) -> None:
+    try:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    except Exception:
+        pass
+    try:
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _exclusive(base: Path):
+    """Hold the store's write lock for a whole load-modify-replace under ``base``.
+
+    The lock lives in a SIDECAR file, never on `granted_roots.json` itself, and
+    that is forced by the write being tmp-file + ``os.replace``: the inode a writer
+    locked is not the one that ends up in place, so the next writer would lock a
+    different file and the exclusion would be imaginary. On Windows it would be
+    worse than imaginary --- an open handle on the destination makes ``os.replace``
+    fail outright, turning the lock into the bug.
+
+    Releases on every path, including the no-op revoke that changes nothing: a
+    stranded lock would hang the next write rather than corrupt it, which is
+    harder to attribute, not easier.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    lock_path = base / "granted_roots.lock"
+    with _ROOTS_WRITE_LOCK:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            locked = _lock_whole_file(fd)
+            try:
+                yield
+            finally:
+                if locked:
+                    _unlock_whole_file(fd)
+        finally:
+            os.close(fd)
+
+
+# --------------------------------------------------------------------------- #
 # the store
 # --------------------------------------------------------------------------- #
 
@@ -138,18 +225,28 @@ class GrantedRootsStore:
             raise
 
     def grant(self, path: str) -> str:
-        """Grant a directory. Idempotent; returns the CANONICAL root recorded."""
+        """Grant a directory. Idempotent; returns the CANONICAL root recorded.
+
+        The load and the save are ONE critical section: a membership test taken
+        outside the lock is a decision made on a state another writer is already
+        replacing."""
         canon = canonicalize(path)
-        roots = self.list_roots()
-        if canon not in roots:
-            self._write(roots + [canon])
+        with _exclusive(self._base):
+            roots = self.list_roots()
+            if canon not in roots:
+                self._write(roots + [canon])
         return canon
 
     def revoke(self, path: str) -> bool:
-        """Remove a grant. Returns True iff it was present."""
+        """Remove a grant. Returns True iff it was present.
+
+        Locked for the same reason as `grant`, with more at stake: a removal lost
+        to a concurrent write leaves the folder GRANTED after the operator asked
+        for it back."""
         canon = canonicalize(path)
-        roots = self.list_roots()
-        if canon in roots:
-            self._write([r for r in roots if r != canon])
-            return True
+        with _exclusive(self._base):
+            roots = self.list_roots()
+            if canon in roots:
+                self._write([r for r in roots if r != canon])
+                return True
         return False

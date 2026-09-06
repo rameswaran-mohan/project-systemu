@@ -307,9 +307,29 @@ class GateDescriptor(BaseModel):
                 "real effect class under typed confirmation, and a fresh approval card "
                 "is posted on that classification.")
         else:
+            # IMPL-1 HONESTY: name ONLY what the signature this card is about
+            # actually binds. This line used to promise "+ host class". That is
+            # true of ``command_approvals.tool_signature`` -- it takes a
+            # host_class and re-gates on a changed one -- but it is false of THIS
+            # SYSTEM: no host resolver exists yet, so ``_maybe_gate_tool``
+            # (tool_sandbox.py) passes host_class="" unconditionally behind a
+            # comment saying the host signal is DEFERRED, and first_gate_review
+            # mirrors it. So a host-parameterized tool blessed while it talked to
+            # one host stays blessed against EVERY host, and the card was
+            # promising a fence the store does not have.
+            #
+            # The re-forge clause IS true today: body_hash is the sha1 of the
+            # implementation bytes, so a re-forged body yields a different
+            # signature and gates again. It also matches the sibling bulk
+            # first-gate card below, which already words it that way.
+            #
+            # Do NOT re-add the host-class clause until a resolver actually
+            # populates it. tests/test_impl1_host_class_claim.py witnesses that
+            # condition from the live gate and documents how to flip the pin.
             what = (
                 f"Runs the {tool_name!r} tool ({tags}). 'Always allow' remembers "
-                "this exact tool body + effect set + host class.")
+                "this exact tool body + effect set, so re-forging this tool "
+                "re-gates it.")
         return cls(
             title=f"Run tool: {tool_name}",
             risk=risk,

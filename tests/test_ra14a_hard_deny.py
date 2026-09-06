@@ -219,6 +219,180 @@ class TestActuationSelectorNoForgedRung:
         assert all(m.name == "mcp" for m in mods)
 
 
+# ---- (b) reachability -- the selector is LOAD-BEARING on the live MCP path ----
+#
+# The clause-(b) assertions above are a RELEASE GATE, but until this slice they
+# asserted against a function with ZERO production callers: nothing consulted
+# admissible_modality_names, so "the selector never offers a forged rung" guarded
+# a set no actuation ever read. The gated MCP chokepoint
+# (dispatch.call_mcp_tool -- the ONE path every MCP actuation takes: the full-loop
+# mcp_call_tool handler, the namespaced mcp__* registry handler, the quick lane,
+# and McpActuationModality.execute) now consults it as L0, BEFORE the L2 allowlist.
+#
+# Today the selector always contains "mcp", so LIVE BEHAVIOR IS UNCHANGED -- the
+# happy path still succeeds and the consult is a pure read.
+
+class _DispatchVault:
+    """Minimal vault stand-in: connections.py only reads ``.root``."""
+
+    def __init__(self, root):
+        self.root = str(root)
+
+
+class _DispatchCfg:
+    """Minimal config stand-in (dispatch reads nothing off it here)."""
+
+    check_fn_cache_ttl_seconds = 30
+
+
+def _enable_pinned_readonly(vault, server, tool):
+    """Enable AND pin a read-only MCP tool so the dispatch happy path reaches the
+    transport with no L3 gate (tier R + classification_trusted)."""
+    from systemu.runtime.mcp import connections as conn
+    conn.set_tool_enabled(vault, server, tool, True, description="d", schema={},
+                          annotations={"readOnlyHint": True})
+    conn.set_tool_hash(vault, server, tool, "deadbeef")
+
+
+def _stub_mcp_transport(monkeypatch, hit):
+    """Count transport touches; keep the rug-pull re-hash hermetic (no sockets)."""
+    import systemu.runtime.mcp.client as mcp_client
+
+    def _call(**kw):
+        hit["transport"] += 1
+        return {"success": True, "response": "ok"}
+
+    monkeypatch.setattr(mcp_client, "mcp_call_tool", _call)
+    monkeypatch.setattr(mcp_client, "mcp_list_tools",
+                        lambda **kw: {"success": False, "tools": []})
+
+
+class TestSelectorIsConsultedByTheMcpDispatchPath:
+    def test_dispatch_consults_the_selector_on_the_happy_path(self, tmp_path,
+                                                              monkeypatch):
+        """REACHABILITY PIN (mutation-checked): delete the L0 consult in
+        ``dispatch.call_mcp_tool`` and this test goes RED. The call still
+        SUCCEEDS -- today's admissible set contains "mcp"."""
+        import systemu.runtime.actuation as actuation
+        from systemu.runtime.mcp import dispatch
+
+        seen = {"n": 0}
+        real = actuation.admissible_modality_names
+
+        def _spy():
+            seen["n"] += 1
+            return real()
+
+        monkeypatch.setattr(actuation, "admissible_modality_names", _spy)
+        monkeypatch.setenv("SYSTEMU_MCP_SERVER_URLS", "")
+        hit = {"transport": 0}
+        _stub_mcp_transport(monkeypatch, hit)
+
+        v = _DispatchVault(tmp_path)
+        _enable_pinned_readonly(v, "http://h", "read_inbox")
+        out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
+                                     config=_DispatchCfg(), session_id="run_A")
+
+        assert seen["n"] >= 1, (
+            "the live MCP dispatch path must CONSULT admissible_modality_names -- "
+            "without a production caller the clause-(b) release gate above guards "
+            "nothing")
+        assert out["success"] is True, (
+            "the consult is a pure read: with 'mcp' admissible the happy path is "
+            f"unchanged; got {out}")
+        assert hit["transport"] == 1, "the transport must still run when admissible"
+
+    def test_dispatch_refuses_when_the_mcp_rung_is_not_admissible(self, tmp_path,
+                                                                  monkeypatch):
+        """With "mcp" absent from the admissible set, an MCP actuation is REFUSED
+        with an honest, matchable reason -- BEFORE the L2 allowlist, so it never
+        posts an approval card and never touches the transport (the same
+        never-launched-then-denied shape as the (a)/(c) refusals). The tool here is
+        ENABLED and PINNED (it would otherwise succeed), so the refusal provably
+        comes from the selector consult, not from L2."""
+        import systemu.runtime.actuation as actuation
+        from systemu.runtime.mcp import dispatch
+
+        monkeypatch.setattr(actuation, "admissible_modality_names",
+                            lambda: frozenset())
+        monkeypatch.setenv("SYSTEMU_MCP_SERVER_URLS", "")
+        hit = {"transport": 0}
+        _stub_mcp_transport(monkeypatch, hit)
+
+        posted = {"enqueue": 0}
+
+        class _FakeInbox:
+            def __init__(self, vault):
+                pass
+
+            def enqueue(self, *a, **k):
+                posted["enqueue"] += 1
+                return "dec_x"
+
+        monkeypatch.setattr("systemu.interface.command.inbox.InboxQueue", _FakeInbox)
+
+        v = _DispatchVault(tmp_path)
+        _enable_pinned_readonly(v, "http://h", "read_inbox")
+        out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
+                                     config=_DispatchCfg(), session_id="run_A")
+
+        assert out["success"] is False
+        assert out.get("error_type") == "modality_not_admissible"
+        assert "modality_not_admissible" in (out.get("error") or "")
+        assert "not enabled" not in (out.get("error") or "").lower(), (
+            "the refusal must be the SELECTOR refusal, not the L2 allowlist one")
+        assert hit["transport"] == 0, "an inadmissible rung must NOT be actuated"
+        assert posted["enqueue"] == 0, (
+            "an inadmissible rung is a refusal, never an approvable card")
+
+    def test_dispatch_fails_closed_when_the_selector_is_unresolvable(
+            self, tmp_path, monkeypatch):
+        """DEC-32: the fence is the VALUE the consult returns. A selector that
+        RAISES cannot read as 'admissible' -- an unresolvable selector refuses."""
+        import systemu.runtime.actuation as actuation
+        from systemu.runtime.mcp import dispatch
+
+        def _boom():
+            raise RuntimeError("selector unavailable")
+
+        monkeypatch.setattr(actuation, "admissible_modality_names", _boom)
+        monkeypatch.setenv("SYSTEMU_MCP_SERVER_URLS", "")
+        hit = {"transport": 0}
+        _stub_mcp_transport(monkeypatch, hit)
+
+        v = _DispatchVault(tmp_path)
+        _enable_pinned_readonly(v, "http://h", "read_inbox")
+        out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
+                                     config=_DispatchCfg(), session_id="run_A")
+
+        assert out["success"] is False
+        assert out.get("error_type") == "modality_not_admissible"
+        assert hit["transport"] == 0
+
+    def test_modality_execute_inherits_the_consult(self, tmp_path, monkeypatch):
+        """McpActuationModality.execute routes through the SAME chokepoint, so the
+        modality cannot actuate a rung its own selector does not offer."""
+        import systemu.runtime.actuation as actuation
+        from systemu.runtime.actuation.mcp_modality import McpActuationModality
+        from systemu.runtime.actuation.modality import Action
+
+        monkeypatch.setattr(actuation, "admissible_modality_names",
+                            lambda: frozenset())
+        monkeypatch.setenv("SYSTEMU_MCP_SERVER_URLS", "")
+        hit = {"transport": 0}
+        _stub_mcp_transport(monkeypatch, hit)
+
+        v = _DispatchVault(tmp_path)
+        _enable_pinned_readonly(v, "http://h", "read_inbox")
+        m = McpActuationModality(runtime=None, vault=v, config=_DispatchCfg())
+        res = m.execute(Action(modality="mcp", target="http://h",
+                               name="read_inbox", params={}))
+
+        assert res.success is False
+        assert "modality_not_admissible" in (res.error or "")
+        assert hit["transport"] == 0
+
+
 # ── (c) — a registry/untrusted stdio MCP-server LAUNCH is refused pre-jail ─────
 
 class TestRegistryStdioLaunchRefused:

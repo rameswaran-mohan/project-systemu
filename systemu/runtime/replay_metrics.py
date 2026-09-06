@@ -1373,3 +1373,242 @@ def format_avoidable_forge(report: Dict[str, Any]) -> List[str]:
     if not (r.get("avoidable")):
         lines.append("  · none — no forged tool duplicates an existing slot.")
     return lines
+
+
+# ── R-QL1 — the QUICK-LANE ask recorder (§10, DEC-7's ONLY evidence source) ───
+#
+# WHY A THIRD CORPUS, and why reusing either of the two above is a DEC-7 violation
+# BY RULING rather than a matter of taste.
+#
+# DEC-7's amended criterion is about the QUICK lane's operator-question cap
+# (``pipelines/quick_task.py::_ASK_USER_CAP``): how often does that cap actually bind,
+# and how much of the ask traffic under it is the model RE-ASKING the same question.
+# Nothing in this tree could answer it — the cap fired, terminated the run, and left no
+# trace at all. The R-A13.5 deep-lane replay can never decide it either: it reads a
+# corpus the quick lane does not write.
+#
+#   * ``ask_corpus.jsonl`` — every row is scored by :func:`avoidable_ask_report`'s
+#     no-attempt proxy, and its attempt fields DEFAULT TO ZERO when absent. A quick-lane
+#     row folded in there would be counted, silently, in the NUMERATOR of a shipped
+#     DEC-7 input. (This is the same argument the answer-linked section above makes for
+#     its own separation; it applies here with the same force.)
+#   * ``ask_avoidable.jsonl`` — ANSWER-LINKED observations keyed by a
+#     ``Requirement.schema_path``. A quick-lane ASK_USER is free text with no schema and
+#     no requirement identity, so every row would be shapeless in that file's classifier.
+#
+# Hence: its own file, its own writer, its own CONC-MAP row.
+#
+# ══ SECRETS ══ Same discipline as ``ask_avoidable.jsonl`` — this is a PLAINTEXT
+# append-only audit artefact and the operator's question is operator content. FOUR
+# binding properties, each pinned by its own test:
+#   (a) the question TEXT is never written. Only :func:`value_ref`'s keyed,
+#       NON-REVERSIBLE HMAC ref (the same ``_ref_key`` derivation the answer-linked
+#       corpus uses — one key scheme, not two). NO VAULT KEY ⇒ NO ROW, silently: an
+#       unkeyed digest is brute-forceable in under a second on a short question, and
+#       observability may never break the run that made the ask.
+#   (b) a credential/secret-class ask is excluded UNCONDITIONALLY, by a DOUBLE guard
+#       whose halves are INDEPENDENT — the caller's own classification of the ask
+#       (``secret_class``) AND this recorder's re-check of the text it is handed.
+#       Either half alone refuses. The second half exists because of DEC-34: the
+#       verifier may not depend on an input the verified party controls.
+#   (c) its own corpus file, never ``ask_corpus.jsonl``.
+#   (d) the CALL SITE swallows every exception with one ``logger.debug``. This function
+#       is deliberately allowed to RAISE — a bug here must be visible to a unit test,
+#       not silently absorbed at the point where it would also hide a failed secret
+#       guard — and the run's result is byte-identical with it raising (pinned by test).
+
+#: DEC-7's measurement window. BOTH floors bind. 30 asks from 3 runs is one operator's
+#: afternoon, not a population; and a rate quoted off a handful of asks is the kind of
+#: fabricated headline the inventory-hit surface already ruled against ("NOT MEASURED,
+#: this is NOT 0%"). Below either floor the report renders NO percentage at all.
+QUICK_LANE_MIN_ASKS = 30
+QUICK_LANE_MIN_RUNS = 10
+
+#: Stamped on every row. Not decoration: it is what keeps a hand-appended or mis-routed
+#: row out of a DEC-7 denominator.
+QUICK_LANE = "quick"
+
+
+def _quick_lane_ask_path(vault) -> Path:
+    return Path(_vault_root(vault)) / "audit" / "quick_lane_asks.jsonl"
+
+
+def _secret_probe_name(text: Any) -> str:
+    """Free-text question → the FIELD-NAME shape ``is_secret_field`` is written against.
+
+    NOT a new rule — an adapter. ``elicitation._SECRET_NAME_TOKENS`` are underscore-form
+    substrings (``api_key``, ``client_secret``, ``private_key``), matched against a field
+    NAME. Handed "What is your API key?" verbatim they see ``api key`` and miss, so the
+    shipped predicate would be reused in name only. Folding every non-alphanumeric run
+    to ``_`` makes the free text comparable to the names the predicate already judges.
+
+    The fold is deliberately blunt and its errors are one-directional: ``shipping``
+    contains ``pin``, ``author`` contains ``auth``, so a benign question can read as
+    secret and DROP an observability row. That is the safe direction — a lost row costs
+    a slightly smaller DEC-7 sample; a missed one is a shipped data leak."""
+    return re.sub(r"[^a-z0-9]+", "_", str(text or "").lower())
+
+
+def is_secret_ask_text(text: Any) -> bool:
+    """Guard (b), recorder half — the INDEPENDENT secret check on the question text.
+
+    Asks the codebase's canonical secret marker, :func:`elicitation.is_secret_field` —
+    the same predicate :func:`_is_secret_path` consults and the same one that routes a
+    secret field URL-mode instead of into a form. A bespoke regex here would be a
+    second, weaker rule that drifts from the one the product actually enforces.
+
+    Import or predicate failure ⇒ treat as secret (fail-closed), exactly as
+    :func:`_is_secret_path` does."""
+    try:
+        from systemu.runtime.elicitation import is_secret_field
+    except Exception:
+        return True
+    try:
+        return bool(is_secret_field({"name": _secret_probe_name(text)}))
+    except Exception:
+        return True
+
+
+def record_quick_lane_ask(vault, *, run_id: Any, ask_ordinal: Any, cap_hit: Any,
+                          re_ask: Any, outcome: Any, question_text: Any,
+                          secret_class: Any = False) -> None:
+    """Append ONE row per QUICK-LANE operator ask to ``audit/quick_lane_asks.jsonl``.
+
+    OBSERVABILITY-ONLY and append-only. It is the ONLY evidence source DEC-7's amended
+    quick-lane-cap criterion can read; see the section header above for why neither
+    deep-lane corpus can stand in for it.
+
+    ``cap_hit`` marks the ask the cap REFUSED (the one that terminated the run) and
+    nothing else. ``re_ask`` marks a question already asked in THIS run. ``outcome`` is
+    the terminal the ask reached (``answered`` / ``declined`` / ``cancelled`` /
+    ``cap_terminated``).
+
+    THIS FUNCTION MAY RAISE — by design. The swallow lives at the call site (one
+    ``logger.debug``), so a bug here is visible to a unit test instead of being absorbed
+    at the very point that would also hide a failed secret guard. The run's result is
+    byte-identical with it raising."""
+    # Guard (b) half 1 — the CALLER's classification of its own ask. Checked by
+    # IDENTITY, not truthiness: only a literal ``False`` reads as "not a secret", so a
+    # mis-typed or attacker-shaped marker (0, None, "no", a dict) refuses rather than
+    # being coerced into a permission. DEC-36's terminating rule — the concrete value is
+    # pinned in this frame before any operation on it.
+    if secret_class is not False:
+        return
+    # Guard (b) half 2 — INDEPENDENT of what the caller just claimed (DEC-34: the
+    # verifier may not consult an input the verified party controls). Either half alone
+    # refuses; deleting one leaves the other's test red.
+    if is_secret_ask_text(question_text):
+        return
+    # Guard (a) — the text NEVER enters the file. ``value_ref`` returns None both when
+    # there is no value AND when no per-vault key can be derived; both are fail-closed
+    # here (no ref ⇒ no row), never an unkeyed digest and never the raw text.
+    ref = value_ref(question_text, vault)
+    if not _is_value_ref(ref):
+        return
+    rec = {
+        "lane": QUICK_LANE,
+        "run_id": str(run_id or ""),
+        "ask_ordinal": int(ask_ordinal or 0),
+        "cap_hit": cap_hit is True,
+        "re_ask": re_ask is True,
+        "outcome": str(outcome or ""),
+        "question_ref": ref,
+    }
+    _append_line(_quick_lane_ask_path(vault), rec)
+
+
+def load_quick_lane_asks(vault) -> List[Dict[str, Any]]:
+    """Every recorded quick-lane ask. Defensive: an absent/broken file or a malformed
+    line is skipped, and so is any row not stamped ``lane="quick"`` — a corpus a DEC-7
+    number is read off may not accept a row that never said which lane it came from."""
+    try:
+        p = _quick_lane_ask_path(vault)
+        if not p.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict) and obj.get("lane") == QUICK_LANE:
+                out.append(obj)
+        return out
+    except Exception:
+        return []
+
+
+def quick_lane_ask_report(vault) -> Dict[str, Any]:
+    """The two DEC-7 quick-lane numbers, with their measurement window attached.
+
+    ``cap_hit_rate`` and ``re_ask_fraction`` are ``None`` — not ``0.0`` — until BOTH
+    floors are met. Carrying a zero below the floor is how "nothing to read" becomes a
+    quotable "0%": a future renderer would have no way to tell them apart. Never
+    raises."""
+    rows = load_quick_lane_asks(vault)
+    total = len(rows)
+    cap_hits = sum(1 for r in rows if r.get("cap_hit") is True)
+    re_asks = sum(1 for r in rows if r.get("re_ask") is True)
+    runs = len({str(r.get("run_id") or "") for r in rows if str(r.get("run_id") or "")})
+    measured = total >= QUICK_LANE_MIN_ASKS and runs >= QUICK_LANE_MIN_RUNS
+    return {
+        "lane": QUICK_LANE,
+        "total_asks": total,
+        "distinct_runs": runs,
+        "cap_hit_count": cap_hits,
+        "re_ask_count": re_asks,
+        "measured": measured,
+        "min_asks": QUICK_LANE_MIN_ASKS,
+        "min_runs": QUICK_LANE_MIN_RUNS,
+        "cap_hit_rate": (cap_hits / total) if measured else None,
+        "re_ask_fraction": (re_asks / total) if measured else None,
+    }
+
+
+def format_quick_lane_ask(report: Dict[str, Any]) -> List[str]:
+    """R-QL1 render. Below DEC-7's window this prints NOT MEASURED and NO percentage,
+    stating both the count it has and the floor it needs — the same rule (and the same
+    wording) the inventory-hit and resolver-replay surfaces already carry."""
+    r = report or {}
+    total = int(r.get("total_asks", 0) or 0)
+    runs = int(r.get("distinct_runs", 0) or 0)
+    min_asks = int(r.get("min_asks") or QUICK_LANE_MIN_ASKS)
+    min_runs = int(r.get("min_runs") or QUICK_LANE_MIN_RUNS)
+    window = (f"DEC-7's measurement window opens at N={min_asks} asks across "
+              f">={min_runs} distinct runs")
+    if not r.get("measured"):
+        if total == 0:
+            head = f"Quick-lane asks: NOT MEASURED (0 recorded asks; {window})"
+        else:
+            head = (f"Quick-lane asks: NOT MEASURED ({total} recorded ask(s) across "
+                    f"{runs} distinct run(s), below the floor; {window})")
+        return [
+            "",
+            head,
+            "  (NO RATE is rendered here, and this is NOT a zero. The quick lane's",
+            "   operator-question cap is what DEC-7 adjudicates, and one row per ask is",
+            "   its only evidence; a rate quoted below the window would be noise with a",
+            "   percent sign on it.)",
+        ]
+    n = int(r.get("cap_hit_count", 0) or 0)
+    m = int(r.get("re_ask_count", 0) or 0)
+    cap_rate = float(r.get("cap_hit_rate") or 0.0)
+    re_rate = float(r.get("re_ask_fraction") or 0.0)
+    return [
+        "",
+        # ASCII-ONLY, deliberately (DEC-32c: verdict-carrying output is ASCII-only).
+        # The slice spec wrote this separator as a middle dot to match the sibling
+        # blocks above; rendered through click.echo on a cp437 console it came back as
+        # a replacement character, i.e. the one line an operator is meant to QUOTE was
+        # the one that corrupted. A pipe carries the same meaning and cannot.
+        f"Quick-lane asks: cap_hit_rate {cap_rate * 100:.0f}% ({n}/{total}) | "
+        f"re_ask_fraction {re_rate * 100:.0f}% ({m}/{total})",
+        f"  (over {runs} distinct quick-lane run(s), at or above DEC-7's window of",
+        f"   {min_asks} asks across >={min_runs} runs. cap_hit = the ask the",
+        "   _ASK_USER_CAP refused, i.e. the one that terminated the run; re_ask = a",
+        "   question already asked in the same run. Questions are held as keyed",
+        "   non-reversible refs; credential/secret-class asks are never recorded.)",
+    ]

@@ -1499,6 +1499,92 @@ def world_cmd(query, limit):
 
 
 # ---------------------------------------------------------------------------
+# R-W2 CENSUS CONSENT SURFACE :: REGION START
+# ---------------------------------------------------------------------------
+# `systemu census ...` -- the operator's consent controls for the WM-7 ambient census
+# (spec 5.11.c), which reads the OPERATOR'S OWN MACHINE. Thin click wrappers only: every
+# decision (which categories are grantable, what the card says, when to refuse) lives in
+# systemu/interface/cli_commands.py's matching region, so the surface has ONE definition
+# and the guard in tests/test_rw2_ambient_census.py can read all of it in one place.
+#
+# grant / revoke / pause+resume ship TOGETHER. A standing permission to enumerate the
+# operator's machine with no way to withdraw it is not a consent control.
+
+
+def _census_vault():
+    """The same one authoritative factory `world` uses (F2). The census is a pure file
+    store under <vault.root>, and both backends expose `.root`."""
+    from systemu.vault.factory import open_vault
+    return open_vault(Config.from_env())
+
+
+@cli.group(name="census")
+def census_group():
+    """Control what systemu is allowed to notice about THIS MACHINE (R-W2, 5.11.c).
+
+    Separate from everything else systemu inventories: the census looks at your
+    computer -- your installed apps, your cloud-sync folders -- rather than at what
+    you have plugged into systemu. Nothing is scanned until you grant a category,
+    and a grant is a STANDING permission you can pause or revoke at any time.
+
+    \b
+      systemu census status
+      systemu census grant cloud_sync_roots
+      systemu census pause cloud_sync_roots
+      systemu census revoke cloud_sync_roots
+    """
+
+
+@census_group.command(name="status")
+def census_status_cmd():
+    """Show every category, whether it is granted, and when it last ran."""
+    from systemu.interface.cli_commands import run_census_status
+    sys.exit(run_census_status(_census_vault()))
+
+
+@census_group.command(name="grant")
+@click.argument("category")
+@click.option("--yes", "assume_yes", is_flag=True, default=False,
+              help="Consent without a prompt (scripts, CI, Docker). The full "
+                   "disclosure is still printed -- --yes means you have read it.")
+def census_grant_cmd(category, assume_yes):
+    """Consent to CATEGORY: print the full disclosure, then ask.
+
+    Defaults to NO. What the category finds is included in the planning prompt
+    systemu sends to its model provider, and the scan REPEATS on later runs --
+    both are stated on the card before you are asked.
+    """
+    from systemu.interface.cli_commands import run_census_grant
+    sys.exit(run_census_grant(_census_vault(), category, assume_yes=assume_yes))
+
+
+@census_group.command(name="revoke")
+@click.argument("category")
+def census_revoke_cmd(category):
+    """Withdraw consent for CATEGORY and DELETE the facts it produced."""
+    from systemu.interface.cli_commands import run_census_revoke
+    sys.exit(run_census_revoke(_census_vault(), category))
+
+
+@census_group.command(name="pause")
+@click.argument("category")
+def census_pause_cmd(category):
+    """Stop scanning CATEGORY, but keep what it already found."""
+    from systemu.interface.cli_commands import run_census_pause
+    sys.exit(run_census_pause(_census_vault(), category))
+
+
+@census_group.command(name="resume")
+@click.argument("category")
+def census_resume_cmd(category):
+    """Start scanning CATEGORY again after a pause."""
+    from systemu.interface.cli_commands import run_census_resume
+    sys.exit(run_census_resume(_census_vault(), category))
+
+# R-W2 CENSUS CONSENT SURFACE :: REGION END
+
+
+# ---------------------------------------------------------------------------
 # capture command group (v0.7.1)
 # ---------------------------------------------------------------------------
 # Capture-side commands operating on a recorded session directory.  The
@@ -1633,6 +1719,7 @@ try:
         settings_cmd,
         evolve_group,
         daemon_group,
+        roots_group,
         chat_group,
         debug_group,
         decisions_group,
@@ -1654,6 +1741,10 @@ try:
     cli.add_command(settings_cmd,    name="settings")
     cli.add_command(evolve_group,    name="evolve")
     cli.add_command(daemon_group,    name="daemon")
+    # R-A4: the granted-roots store's first operator-reachable writer. Top-level
+    # because "which folders can this thing read?" is a question the operator
+    # asks about the product, not about a subsystem of it.
+    cli.add_command(roots_group,     name="roots")
     cli.add_command(chat_group,      name="chat")
     cli.add_command(debug_group,     name="debug")
     cli.add_command(decisions_group, name="decisions")

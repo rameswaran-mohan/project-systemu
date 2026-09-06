@@ -1595,6 +1595,216 @@ def daemon_status(ctx, port):
 
 
 # -----------------------------------------------------------------------------
+#  Phase 4 / R-A4 -- granted roots (the REVOKE half)
+# -----------------------------------------------------------------------------
+#  `systemu/runtime/granted_roots.py` is the filesystem confinement set: the
+#  folders Systemu is allowed to look inside. Its READ side has been wired into
+#  production since G2 --- `situational_inventory.build_roots` surveys every
+#  granted root, and `requirement_binder` re-gates resolver source #1 through
+#  `is_within_granted`. Its WRITE side had no operator surface at all, so a
+#  grant could be made but never taken back.
+#
+#  This group is that missing half, and ONLY that half. Output is line-oriented
+#  (click.echo, unwrapped) rather than a rich table on purpose: these lines carry
+#  absolute paths, and a path wrapped at column 80 is not a path.
+
+@click.group("roots")
+def roots_group():
+    """Grant, list and revoke the folders Systemu is allowed to look inside.
+
+    A granted root is a directory Systemu may survey and read files from; every
+    path it resolves is checked against this set after canonicalization, so a
+    folder that is not in it is out of reach even when named absolutely.
+
+    A grant is EXPLICIT OPERATOR CONSENT and is never automatic: nothing in
+    Systemu can add a root on its own, no task can widen its own reach mid-run,
+    and `roots grant` tells you exactly what it means before it asks. Consent
+    given here is not permanent either --- `roots revoke` ends it, and the next
+    survey stops reading.
+    """
+
+
+def _granted_roots_store(ctx):
+    """The one GrantedRootsStore this CLI touches, on the live vault root.
+
+    The same base_dir `situational_inventory` and `requirement_binder` construct
+    theirs from --- that agreement is what makes a revoke here visible to the
+    survey there, and it is pinned end to end in tests/test_p4_roots_cli_revoke.py.
+    """
+    _config, vault = _get_vault_and_config(ctx)
+    from systemu.runtime.granted_roots import GrantedRootsStore
+    return GrantedRootsStore(base_dir=vault.root)
+
+
+@roots_group.command("list")
+@click.pass_context
+def roots_list(ctx):
+    """Show every folder currently granted, one canonical path per line."""
+    store = _granted_roots_store(ctx)
+    roots = store.list_roots()
+
+    if not roots:
+        click.echo("No folders are granted.")
+        click.echo(
+            "Systemu can only look inside folders you have granted it, and nothing "
+            "grants one on its own. Grant one with: systemu roots grant <path> "
+            "- it states exactly what granting means and asks you to confirm first."
+        )
+        return
+
+    click.echo(f"{len(roots)} granted folder(s):")
+    for root in roots:
+        click.echo(f"  {root}")
+    # Honest about what is NOT here: the store persists a bare path set
+    # ({"version": 1, "roots": [...]}), so there is no per-grant time to show.
+    # The file's mtime would be the time of the last WRITE --- most likely a
+    # revoke of some other root --- which is a plausible-looking wrong answer.
+    click.echo("")
+    click.echo("Paths are shown canonicalized (symlinks and .. resolved), as stored.")
+    click.echo("The store records the path only - no grant timestamp is kept.")
+    click.echo("Revoke one with: systemu roots revoke <path>")
+
+
+def _print_grant_consent(canon: str) -> None:
+    """State LITERALLY what granting this folder does, before anything is written.
+
+    Written to be true rather than reassuring. The survey reads metadata, not file
+    contents, so this says metadata --- but it does not stop there, because a file
+    NAME is content: `resignation-letter-final.docx` tells the story before
+    anything is opened, and those names travel into prompts sent to a third party.
+    Saying "Systemu will index this folder" would be accurate and would hide
+    exactly the part a person would want to weigh.
+    """
+    click.echo(f"About to grant: {canon}")
+    click.echo("")
+    click.echo("What granting this folder means, literally:")
+    click.echo(
+        "  - The situational inventory will SURVEY it: the names, sizes and "
+        "modification times of the files inside, and the shape of the directory "
+        "tree. It reads file metadata this way, not file contents, and the scan "
+        "is bounded to the most recently changed files rather than the whole tree."
+    )
+    click.echo(
+        "  - Those file names and that structure can be placed INSIDE PROMPTS "
+        "SENT TO YOUR MODEL PROVIDER. A file name is content: it can disclose a "
+        "diagnosis, an employer, a lawyer or a plan before any file is opened."
+    )
+    click.echo(
+        "  - Paths inside this folder become resolvable by the agent, so a task "
+        "can reach a file here that it could not reach before."
+    )
+    click.echo(
+        "  - This is the whole folder, including everything added to it later."
+    )
+    click.echo("")
+
+
+@roots_group.command("grant")
+@click.argument("path")
+@click.option("--yes", "-y", "assume_yes", is_flag=True,
+              help="Confirm without prompting (for scripts). Still prints what is "
+                   "being agreed to.")
+@click.pass_context
+def roots_grant(ctx, path: str, assume_yes: bool):
+    """Grant Systemu access to a folder, after telling you what that means.
+
+    Prints the consequences, then asks. The default is NO: a bare Enter, an
+    answer of `n`, or a stdin nobody can answer all leave the store untouched
+    and exit nonzero. `--yes` is the deliberate script path.
+
+    The argument is canonicalized by the STORE'S OWN `canonicalize`, the same
+    function `roots revoke` and the confinement check use, so the root recorded
+    is the root those two will later compare against.
+
+    Refuses a path that is not an existing directory --- before asking for
+    consent, because there is nothing to consent to. Recording a "root" the
+    survey can never walk would leave a grant that reads as live and grants
+    reach to nothing.
+    """
+    from systemu.runtime.granted_roots import canonicalize
+
+    store = _granted_roots_store(ctx)
+    canon = canonicalize(path)
+
+    # --- refuse before asking, before consent is even mentioned ---
+    if not os.path.exists(canon):
+        click.echo(f"Refused: that path does not exist: {canon}")
+        click.echo("Nothing was granted.")
+        ctx.exit(1)
+    if not os.path.isdir(canon):
+        click.echo(f"Refused: that path is not a directory: {canon}")
+        click.echo("A grant names a folder, not a file. Nothing was granted.")
+        ctx.exit(1)
+
+    # --- already granted: nothing changes, so nothing to consent to ---
+    # Re-asking here would teach the operator to type `y` at a prompt that means
+    # nothing, which is how a consent prompt stops being read.
+    if canon in store.list_roots():
+        click.echo(f"Already granted: {canon}")
+        click.echo("Nothing changed. Revoke it with: systemu roots revoke <path>")
+        return
+
+    _print_grant_consent(canon)
+
+    if not assume_yes:
+        try:
+            agreed = click.confirm("Grant access to this folder?", default=False)
+        except click.Abort:
+            # stdin reached EOF: a cron job, a CI runner, a pipe from /dev/null.
+            # Falling through to the N default would be safe by accident and would
+            # tell the caller nothing about how to proceed on purpose.
+            click.echo("")
+            click.echo("Refused: nothing on stdin could answer that question.")
+            click.echo("Re-run with --yes to confirm without a prompt.")
+            ctx.exit(1)
+        if not agreed:
+            click.echo("Refused: not granted. Nothing was changed.")
+            ctx.exit(1)
+
+    store.grant(path)
+    click.echo(f"Granted: {canon}")
+    click.echo("Revoke it at any time with: systemu roots revoke <path>")
+
+
+@roots_group.command("revoke")
+@click.argument("path")
+@click.pass_context
+def roots_revoke(ctx, path: str):
+    """Revoke a granted folder, so Systemu stops reading inside it.
+
+    Exit code 0 if a grant was removed, 1 if the path was not a granted root ---
+    so a script can tell a revoke that worked from one that silently missed.
+
+    The argument is canonicalized by the STORE'S OWN `canonicalize` and by
+    nothing else: symlinks, junctions and `..` are resolved, and on Windows the
+    case and any 8.3 alias are folded, exactly as they were when the grant was
+    recorded. A second normalization here would be free to disagree with the
+    store's, and the failure it produces is the quiet one --- this command
+    reporting a revoke that never happened.
+
+    Note this takes a GRANTED ROOT, not any path inside one. A file within a
+    granted folder is reachable BECAUSE of that folder's grant; revoking the
+    enclosing folder on the strength of a file named inside it would withdraw
+    more than was asked, so that is reported as "not granted" instead.
+    """
+    from systemu.runtime.granted_roots import canonicalize
+
+    store = _granted_roots_store(ctx)
+    # Display form only; `revoke` re-derives it from the same function, so the
+    # store stays the single authority on what this path IS.
+    canon = canonicalize(path)
+
+    if store.revoke(path):
+        click.echo(f"Revoked: {canon}")
+        click.echo("The next survey will stop reading inside it.")
+        return
+
+    click.echo(f"Not granted: {canon}")
+    click.echo("Nothing was changed. Run `systemu roots list` to see what is granted.")
+    ctx.exit(1)
+
+
+# -----------------------------------------------------------------------------
 #  `systemu start` -- the one-command golden path
 # -----------------------------------------------------------------------------
 #  One command for a first run: start the daemon, then put the operator in
@@ -2051,12 +2261,75 @@ def debug_avoidable_forge(ctx):
         click.echo(line)
 
 
+def _persisted_requirement_rows(data_dir=None):
+    """R-B5 / T5 (spec section 10) -- every persisted RequirementReport's requirements,
+    flattened into ONE list for the inventory-hit metric.
+
+    WHERE THE INPUT COMES FROM. A run's ``RequirementReport`` survives the run in
+    exactly one place: ``ExecutionSnapshot.requirement_report``
+    (``systemu/runtime/execution_snapshot.py``:102, serialised at :272), on disk at
+    ``<data_dir>/audit/exec_<execution_id>/resume_snapshot.json`` (:54). Everywhere
+    else it is held only on ``context._requirement_report`` for the life of the
+    process (``shadow_runtime.py``:1545), so there is nothing else durable to read.
+    The directory scan mirrors the one existing precedent for finding runs this way,
+    ``scheduler/jobs.py``:806 (``_scan_wait_execution_ids``); ``data_dir`` defaults to
+    ``"data"`` exactly as ``write_snapshot`` does (execution_snapshot.py:135), so the
+    reader and the writer resolve the same directory without a second derivation.
+
+    THE POPULATION IS SPARSE, AND THAT IS A PROPERTY OF THE INPUT, NOT A BUG HERE: a
+    snapshot is written when a run suspends and DELETED when the resume consumes it
+    (``delete_snapshot``, :230). The metric therefore reads the runs that persisted a
+    report, never "all runs ever". The caller renders NOT MEASURED -- never 0% -- when
+    the set is empty, because an unmeasured population is a different claim from a
+    measured zero.
+
+    READ-ONLY, and deliberately NOT via ``read_snapshot``: that entry point migrates
+    and may raise ``SnapshotRefused`` on a newer schema (DEC-9), which is correct for
+    a RESUME (it must not re-execute effects against a shape it cannot read) and wrong
+    for a printout, which may never adjudicate a run. Anything unreadable is skipped;
+    nothing here raises and nothing here writes.
+
+    The flatten is ``table_payoff._requirements`` -- the metric's OWN projection,
+    imported rather than re-implemented. Re-reading ``per_objective`` locally would be
+    a second copy of the projection that module documents as single-owner (see its
+    note on the deleted ``_is_ask`` mirror): it would drift silently, and the count
+    would keep rendering while measuring something else.
+    """
+    from systemu.runtime import table_payoff
+
+    base = Path(data_dir) if data_dir is not None else Path("data")
+    rows = []
+    try:
+        audit = base / "audit"
+        if not audit.is_dir():
+            return rows
+        exec_dirs = sorted(audit.glob("exec_*"))
+    except Exception:
+        return rows
+
+    for exec_dir in exec_dirs:
+        try:
+            snap = exec_dir / "resume_snapshot.json"
+            if not snap.is_file():
+                continue
+            data = json.loads(snap.read_text(encoding="utf-8"))
+        except Exception:
+            continue                       # corrupt / unreadable => not counted
+        if not isinstance(data, dict):
+            continue
+        report = data.get("requirement_report")
+        if not isinstance(report, dict):
+            continue
+        rows.extend(table_payoff._requirements(report))
+    return rows
+
+
 @debug_group.command("avoidable-ask")
 @click.pass_context
 def debug_avoidable_ask(ctx):
     """§10 / §5.9 — the avoidable-ask signals over the accreted ask corpora.
 
-    Deterministic (never an LLM judge), READ-ONLY. Two signals, LABELLED APART:
+    Deterministic (never an LLM judge), READ-ONLY. Three signals, LABELLED APART:
 
     \b
       * R-A13.5 DIRECTIONAL proxy — harness asks made with no recorded resolution
@@ -2068,10 +2341,72 @@ def debug_avoidable_ask(ctx):
         content_derived confirm) is DEFINITIVE, not a proxy; missing-answered is
         reported separately as a candidate only. Includes the §5.9 ask->resolve
         conversion trend. Credential asks are excluded by design.
+      * R-B5 / T5 section-10 INVENTORY-HIT -- the other end of the same question: how
+        often the inventory (and the operator's table) turned a from-scratch
+        ``missing`` gap into a pre-filled one-click confirm. Section 5.10.e AC7:
+        ``silent`` and ``prefilled_confirm`` are reported SEPARATELY, never summed.
+        Read over the RequirementReports persisted in the execution snapshots
+        (``data/audit/exec_*/resume_snapshot.json``) -- a run that never suspended
+        left none, so an empty set reports NOT MEASURED and never 0%.
+      * R-QL1 QUICK-LANE ask signal -- the only one of the four that is about the
+        QUICK lane, and therefore DEC-7's only evidence source: one row per
+        ``ASK_USER``, so ``cap_hit_rate`` (how often ``_ASK_USER_CAP`` actually
+        terminated a run) and ``re_ask_fraction`` (how much of the traffic under it
+        was the model re-asking) become measurable. The three signals above are
+        deep-lane and can never decide it. Questions are held as keyed
+        non-reversible refs and secret-class asks are never recorded. Below DEC-7's
+        window (30 asks across >=10 distinct runs) this reports NOT MEASURED and
+        never 0%.
     """
-    from systemu.runtime.replay_metrics import avoidable_ask_report, format_avoidable_ask
+    from systemu.runtime.replay_metrics import (
+        avoidable_ask_report, format_avoidable_ask, format_quick_lane_ask,
+        quick_lane_ask_report)
+    from systemu.runtime.table_payoff import format_inventory_hit, inventory_hit_report
     _, vault = _get_vault_and_config(ctx)
     for line in format_avoidable_ask(avoidable_ask_report(vault)):
+        click.echo(line)
+
+    # R-B5 / T5 (section 10, section 5.10.e AC7) -- the inventory-hit payoff, printed
+    # beside the avoidable-ask lines because the two answer the same operator question
+    # from opposite ends: how often did it ask, and how often did the inventory spare
+    # the ask. AC7 is a SPLIT, not a total -- format_inventory_hit renders `silent` and
+    # `prefilled_confirm` as separate counts, and they must never be summed here or a
+    # collapse in one would hide behind the other.
+    #
+    # READ-ONLY by construction: this reads inventory_hit_report / format_inventory_hit
+    # only. The section 5.10.c chips are NOT rendered here -- answered_from_table WRITES
+    # the novelty ledger, so a printout that called it would burn an item's novelty
+    # every time an operator asked for metrics.
+    rows = _persisted_requirement_rows()
+    click.echo("")
+    if not rows:
+        # An unmeasured population is a different claim from a measured zero; the
+        # zeros the formatter would print here would read as "the table never paid
+        # off". Same rule (and wording) as resolver_replay's "this is NOT 0%".
+        click.echo("Inventory-hit: NOT MEASURED -- no run has persisted a "
+                   "RequirementReport yet; NO RATE (this is NOT 0%)")
+        click.echo("  (the per-run report is cached in the execution snapshot at "
+                   "data/audit/exec_*/resume_snapshot.json, written when a run")
+        click.echo("   suspends and consumed when it resumes.)")
+    else:
+        for line in format_inventory_hit(inventory_hit_report(rows)):
+            click.echo(line)
+
+    # R-QL1 (DEC-7) -- the QUICK-LANE ask surface. DEC-7's amended criterion is about
+    # the quick lane's operator-question cap, and BOTH blocks above are deep-lane: they
+    # read corpora the quick lane does not write, so neither can ever decide it. Until
+    # this shipped, nothing recorded a quick-lane ask at all.
+    #
+    # Rendered HERE rather than behind its own command because an operator asking "why
+    # does it keep asking me?" must see both lanes in one place -- and because a
+    # separate command is a surface nobody runs.
+    #
+    # NEVER a fabricated 0%: below DEC-7's measurement window (30 asks across >=10
+    # distinct runs) the block prints NOT MEASURED with the count it has and the floor
+    # it needs, and no percentage at all. Same rule as the inventory-hit block above.
+    # READ-ONLY, like the rest of this command -- a printout may not accrete the corpus
+    # it reports on.
+    for line in format_quick_lane_ask(quick_lane_ask_report(vault)):
         click.echo(line)
 
 
@@ -3003,11 +3338,12 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
     # before the empty-store early-return, because "granted but has found nothing yet"
     # is exactly the state most worth showing and the state that return would hide.
     #
-    # Renders nothing on a FRESH install (no census_consent.json in the vault): no grant
-    # surface ships, so no operator can consent and census_status is []. It is NOT dead,
-    # though — run_census is wired live and reads the consent file directly, so a planted
-    # consent file makes this block render. Kept, and kept correct, because the operator
-    # grant surface will turn it on without revisiting this file.
+    # Renders nothing on a FRESH install: no grant exists until the operator creates one
+    # with `systemu census grant`, so census_status is []. It is reachable now — this is
+    # the "you are already being watched" reminder on a command the operator runs for
+    # other reasons, which is why it stays here rather than living only under
+    # `census status` (a standing permission you have to go looking for is not one the
+    # operator can be said to be aware of).
     try:
         from systemu.runtime.ambient_census import census_status
         _grants = census_status(vault)
@@ -3020,15 +3356,18 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
             click.echo(f"  {g['category']:<18} "
                        f"{'PAUSED ' if g['paused'] else 'active '}"
                        f" last ran: {g['last_ran_at'] or 'never'}")
-        # Says what is TRUE, not what would be reassuring. The previous wording — "these
-        # re-run until revoked" — offered a control that does not exist in this build,
-        # which is the shape R-W2 was held for. Revocation is real and does delete the
-        # derived facts; what is missing is any command that calls it, so BOTH halves
-        # are stated rather than the comfortable one alone.
+        # Says what is TRUE, not what would be reassuring. An earlier wording — "these
+        # re-run until revoked" — offered a control that did not exist in that build,
+        # which is the shape R-W2 was held for. P4-B2 shipped the controls, so the line
+        # NAMES them: an operator reading "revoking deletes the facts" must be able to
+        # act on it in the same breath, or it is still a promise rather than a control.
         click.echo("  These re-run on later runs. What they find is included in the "
                    "planning prompt sent to systemu's model provider.")
-        click.echo("  Revoking a category also DELETES the facts it produced — but this "
-                   "build ships no command to grant, pause or revoke one.")
+        click.echo("  Revoking a category also DELETES the facts it produced:")
+        click.echo("    systemu census revoke <category>   (or `pause` to stop scanning "
+                   "but keep what it found)")
+        click.echo("    systemu census status              (what is watched, and what "
+                   "this build can grant)")
 
     q = (query or "").strip()
     if q:
@@ -3078,3 +3417,267 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
         for n in negatives:
             click.echo(f"  {n.scope}  (probed: {', '.join(n.probes) or '-'})")
     return 0
+
+
+# ===========================================================================
+# R-W2 CENSUS CONSENT SURFACE :: REGION START
+# ===========================================================================
+# The WM-7 ambient census (spec 5.11.c) reads the OPERATOR'S OWN MACHINE, which is a
+# privacy boundary nothing else in the inventory crosses. Everything below is the
+# operator's consent surface for it: `systemu census status|grant|revoke|pause|resume`.
+#
+# THIS IS THE ONLY PLACE IN systemu/ THAT MAY CREATE OR WITHDRAW A CENSUS GRANT.
+# `tests/test_rw2_ambient_census.py::test_the_census_grant_surface_is_confined_to_its_
+# declared_region` scans the shipped tree for the census consent symbols and fails on any
+# reference outside this region (and outside the matching region in sharing_on/cli.py).
+# That guard is the reason the whole surface can be read in one sitting; its failure
+# message lists what a widening must re-audit first. Do not scatter census calls above
+# this line, and do not exempt a new file without doing that work.
+#
+# SCOPE (P4-B2): ONE category ships end to end -- `cloud_sync_roots`, the lowest privacy
+# surface of the three. `census_consent.SURFACED_CATEGORIES` is the single source of
+# truth; the consent card derives its `revocation_surface_shipped` flag and its
+# revocation prose from the same constant, so this surface cannot claim a control it does
+# not offer, nor deny one it does. All four mutating verbs are restricted to that set:
+# there is nothing legitimate to revoke for a category no surface can grant, because the
+# consent file is authenticated and a planted one grants nothing.
+
+#: Exit codes, so a script can tell the three "did not grant" outcomes apart. A single
+#: non-zero would make "the operator said no" indistinguishable from "this build cannot
+#: ask you" -- and a wrapper that retries on the second must not retry on the first.
+CENSUS_EXIT_OK = 0
+CENSUS_EXIT_DECLINED = 1          # the operator answered no
+CENSUS_EXIT_NO_TERMINAL = 2       # nothing to ask on, and --yes was not passed
+CENSUS_EXIT_BAD_CATEGORY = 3      # unknown, or not grantable from this build
+
+
+def _census_stdin_is_a_terminal() -> bool:
+    """Whether there is a human to ask. Its own function so the grant path has ONE
+    definition of "can I prompt", and so tests can drive both sides of it without
+    replacing sys.stdin. Never raises: a stdin that cannot answer isatty() is not a
+    terminal, which sends the caller down the refuse-and-name-the-flag path."""
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def _echo_consent_card(card: dict) -> None:
+    """Render the FULL consent card the operator is being asked to agree to.
+
+    Renders the card's OWN text, field by field, rather than a summary written here. A
+    renderer that prints only `collects`/`excludes` drops the two disclosures that matter
+    most -- that this is a STANDING permission, and that what it finds is sent to the
+    model provider -- and those were false in this file's history in the permissive
+    direction. Pinned by
+    test_the_grant_command_shows_the_real_card_including_the_transmission_notice, which
+    asserts every field of the real card appears in this output.
+    """
+    click.echo("")
+    click.echo(f"  {card['title']}  ({card['category']})")
+    click.echo("  " + "-" * 68)
+    click.echo("  WHAT IT COLLECTS:")
+    for item in card["collects"]:
+        click.echo(f"    - {item}")
+    click.echo("  WHAT IT DOES NOT TOUCH:")
+    for item in card["excludes"]:
+        click.echo(f"    - {item}")
+    click.echo(f"  HOW:   {card['how']}")
+    click.echo(f"  WHY:   {card['why']}")
+    if card.get("sensitivity_notice"):
+        click.echo(f"  NOTE:  {card['sensitivity_notice']}")
+    click.echo(f"  STORED AT: {card['stored_at']}")
+    click.echo(f"  LEAVES THIS MACHINE: {'YES' if card['leaves_this_machine'] else 'no'}")
+    click.echo(f"    {card['transmission_notice']}")
+    click.echo(f"  STANDING PERMISSION: {'YES' if card['standing_scan'] else 'no'}")
+    click.echo(f"    {card['standing_scan_notice']}")
+    click.echo(f"  REVOKING: {card['revocation_notice']}")
+    click.echo("")
+
+
+def _census_category_or_error(category: str, *, must_be_grantable: bool):
+    """``(category, None)`` if usable here, else ``(None, exit_code)`` after saying why.
+
+    REFUSES rather than no-ops, in both directions. A typo'd category that "succeeded"
+    would read to the operator as a granted capability that is quietly dead; a
+    not-yet-shipped category that silently did nothing would be the same lie with better
+    manners.
+    """
+    from systemu.runtime.census_consent import CATEGORIES, SURFACED_CATEGORIES
+    cat = str(category or "").strip()
+    if cat not in CATEGORIES:
+        click.echo(f"Unknown census category: {cat!r}")
+        click.echo(f"  known categories: {', '.join(sorted(CATEGORIES))}")
+        return None, CENSUS_EXIT_BAD_CATEGORY
+    if must_be_grantable and cat not in SURFACED_CATEGORIES:
+        click.echo(f"'{cat}' is not yet grantable from this build.")
+        click.echo(f"  This build ships the full consent surface for: "
+                   f"{', '.join(sorted(SURFACED_CATEGORIES))}.")
+        click.echo("  The machinery for the others exists but has no operator controls "
+                   "yet, and systemu will not take a standing permission it cannot "
+                   "offer you a way to withdraw.")
+        return None, CENSUS_EXIT_BAD_CATEGORY
+    return cat, None
+
+
+def run_census_status(vault) -> int:
+    """`systemu census status` -- the M3 "see" half, over EVERY category.
+
+    Lists all three declared categories, not only the granted ones: showing only grants
+    would make an unconsented install look like the feature does not exist, and the
+    operator cannot decide about something they cannot see. Read-only -- it never creates
+    consent state, and on a fresh install it writes nothing at all.
+    """
+    from systemu.runtime.ambient_census import census_status
+    from systemu.runtime.census_consent import CATEGORIES, SURFACED_CATEGORIES
+    try:
+        granted = {row["category"]: row for row in census_status(vault)}
+    except Exception:
+        granted = {}
+    click.echo("Ambient census -- what systemu may look at on this machine "
+               "(nothing, until you say so):")
+    for cat in sorted(CATEGORIES):
+        row = granted.get(cat)
+        if row is None:
+            state = "not granted"
+        elif row["paused"]:
+            state = f"GRANTED but PAUSED  (last ran: {row['last_ran_at'] or 'never'})"
+        else:
+            state = (f"GRANTED, active     (granted: {row['granted_at'] or '?'}, "
+                     f"last ran: {row['last_ran_at'] or 'never'})")
+        click.echo(f"  {cat:<18} {CATEGORIES[cat]['title']}")
+        click.echo(f"  {'':<18}   {state}"
+                   + ("" if cat in SURFACED_CATEGORIES
+                      else "  [not yet grantable from this build]"))
+    click.echo("")
+    click.echo("A grant is a STANDING permission: the category is re-checked on later "
+               "runs until you revoke it,")
+    click.echo("and what it finds is included in the planning prompt systemu sends to "
+               "its model provider.")
+    click.echo(f"  systemu census grant <category>     "
+               f"(available: {', '.join(sorted(SURFACED_CATEGORIES))})")
+    # Spelled out rather than `pause|resume`: test_f6_command_names_are_invocable checks
+    # every command string in shipped source against the real click tree, and a pipe
+    # shorthand names no subcommand an operator can actually type.
+    click.echo("  systemu census pause <category>    (stop scanning, keep what it found)")
+    click.echo("  systemu census resume <category>")
+    click.echo("  systemu census revoke <category>    (also DELETES the facts it "
+               "produced)")
+    return CENSUS_EXIT_OK
+
+
+def run_census_grant(vault, category: str, assume_yes: bool = False) -> int:
+    """`systemu census grant <category>` -- show the real card, then ask.
+
+    THE CARD IS ALWAYS PRINTED, including under ``--yes``. ``--yes`` means "I have read
+    this and I agree" for a script or a headless box; it does not mean "do not tell me".
+    Suppressing the disclosure for the non-interactive path would make the transmission
+    notice conditional on having a terminal, which is not a property consent should have.
+
+    Default N. With no terminal and no ``--yes`` this REFUSES and names ``--yes``: a
+    prompt into a closed stdin surfaces as a bare abort with no way forward (the F3 shape
+    this CLI has been bitten by before), and defaulting to yes in a headless context would
+    take a standing permission nobody granted.
+    """
+    from systemu.runtime.ambient_census import grant_category
+    from systemu.runtime.census_consent import consent_card
+    cat, err = _census_category_or_error(category, must_be_grantable=True)
+    if err is not None:
+        return err
+
+    card = consent_card(cat)
+    click.echo("systemu is asking to look at ONE thing on this machine, from now on.")
+    _echo_consent_card(card)
+
+    if not assume_yes:
+        if not _census_stdin_is_a_terminal():
+            click.echo("Refusing to record consent: there is no terminal to ask on "
+                       "(Docker / CI / a service).")
+            click.echo(f"  Re-run with --yes once you have read the above: "
+                       f"systemu census grant {cat} --yes")
+            click.echo("  Nothing was recorded and nothing will be scanned.")
+            return CENSUS_EXIT_NO_TERMINAL
+        if not click.confirm(f"Grant this standing permission for '{cat}'?",
+                             default=False):
+            click.echo("Not granted. Nothing was recorded and nothing will be scanned.")
+            return CENSUS_EXIT_DECLINED
+
+    try:
+        grant_category(vault, cat)
+    except Exception as exc:
+        # The store REFUSES to write a consent file it cannot sign, so a failure here
+        # means no grant exists -- say so rather than leaving the operator believing a
+        # "yes" was recorded.
+        click.echo(f"Could not record consent for '{cat}': {exc}")
+        click.echo("  Nothing was recorded and nothing will be scanned.")
+        return CENSUS_EXIT_BAD_CATEGORY
+    click.echo(f"Granted: '{cat}'. It will be scanned on the next run, and re-checked on "
+               f"later runs.")
+    click.echo(f"  Stop it any time:  systemu census revoke {cat}   "
+               f"(this also deletes what it found)")
+    return CENSUS_EXIT_OK
+
+
+def run_census_revoke(vault, category: str) -> int:
+    """`systemu census revoke <category>` -- withdraw consent AND delete the facts.
+
+    Calls ``ambient_census.revoke_category``, the one entry point that does BOTH halves:
+    withdrawing consent alone would leave the store asserting what the operator just
+    withdrew, and purging alone would leave a scanner that re-populates it on the next
+    run. No confirmation prompt -- revoke is the safe direction, and a control you have
+    to argue with is one operators stop reaching for.
+    """
+    from systemu.runtime.ambient_census import revoke_category
+    cat, err = _census_category_or_error(category, must_be_grantable=True)
+    if err is not None:
+        return err
+    out = revoke_category(vault, cat)
+    if out.get("revoked"):
+        click.echo(f"Revoked: '{cat}'. It will not be scanned again.")
+    else:
+        click.echo(f"'{cat}' was not granted; nothing to withdraw.")
+    removed = int(out.get("facts_removed") or 0)
+    detached = int(out.get("facts_detached") or 0)
+    click.echo(f"  Facts deleted: {removed}"
+               + (f" (and {detached} kept because another source also asserts them, with "
+                  f"the census evidence removed)" if detached else ""))
+    return CENSUS_EXIT_OK
+
+
+def _census_set_paused(vault, category: str, paused: bool) -> int:
+    # Through `ambient_census.pause_category`, NOT by constructing a CensusConsentStore
+    # here. Obtaining a mutable handle on consent stays confined to that module, which is
+    # what keeps the CONC-MAP writer-ownership guard on `CensusConsentStore(` tight: this
+    # surface needs the VERB, not the handle.
+    from systemu.runtime.ambient_census import pause_category
+    cat, err = _census_category_or_error(category, must_be_grantable=True)
+    if err is not None:
+        return err
+    if not pause_category(vault, cat, paused):
+        click.echo(f"'{cat}' is not granted, so there is nothing to "
+                   f"{'pause' if paused else 'resume'}.")
+        click.echo(f"  systemu census grant {cat}")
+        return CENSUS_EXIT_BAD_CATEGORY
+    if paused:
+        click.echo(f"Paused: '{cat}' will not be scanned until you resume it.")
+        click.echo(f"  What it already found is KEPT. To delete that too: "
+                   f"systemu census revoke {cat}")
+    else:
+        click.echo(f"Resumed: '{cat}' will be scanned again on the next run.")
+    return CENSUS_EXIT_OK
+
+
+def run_census_pause(vault, category: str) -> int:
+    """`systemu census pause <category>` -- stop scanning, KEEP the facts.
+
+    The one difference from revoke, and the reason both exist: a pause is not a
+    withdrawal of consent, so purging the facts would make it indistinguishable.
+    """
+    return _census_set_paused(vault, category, True)
+
+
+def run_census_resume(vault, category: str) -> int:
+    """`systemu census resume <category>` -- undo a pause."""
+    return _census_set_paused(vault, category, False)
+
+# R-W2 CENSUS CONSENT SURFACE :: REGION END

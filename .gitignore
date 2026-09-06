@@ -17,12 +17,56 @@ data/
 
 # Vault runtime data — keep starter configs (tools/, shadow_army/, skills/)
 # but exclude personal sessions, activity logs, and memory blobs
+#
+# systemu/vault/ is the PACKAGED SEED. A running systemu writes its own state
+# into whatever vault it resolves, and two roads lead that state here: a
+# misresolved daemon root (tests/test_vault_root_resolution.py) and a test or
+# smoke run pointed at the checkout. Either way the file lands in `git status`
+# and a wildcard `git add` ships it — which is exactly how a per-vault session
+# secret and a signed census-consent file reached commit 32d3f3d9 (P4-B2).
+# The FENCE is tests/test_packaged_vault_carries_no_runtime_state.py, which
+# asserts on `git ls-files`; the entries below are the ergonomic backstop that
+# keeps the noise out of `git status` in the first place. Keep the two in sync.
 systemu/vault/activities/
 systemu/vault/executions/
 systemu/vault/evolutions/
 systemu/vault/notifications/
 systemu/vault/elder/
 systemu/vault/scrolls/*.json
+# Runtime state directories — nothing under these is ever seed content.
+systemu/vault/secrets/
+systemu/vault/world_model/
+systemu/vault/capabilities/
+systemu/vault/table/
+systemu/vault/metrics/
+systemu/vault/audit/
+systemu/vault/messaging/
+# Runtime side-stores, by name (the CONC-MAP per-store rows).
+systemu/vault/census_consent.json
+systemu/vault/funnel.json
+systemu/vault/growth_snapshot.json
+systemu/vault/granted_roots.json
+systemu/vault/items.json
+systemu/vault/affinity_log.json
+systemu/vault/rejection_store.json
+systemu/vault/tool_metrics.json
+systemu/vault/command_approvals.json
+systemu/vault/dep_approvals.json
+systemu/vault/dashboard_auth.json
+systemu/vault/user_profile.json
+systemu/vault/user_facts.jsonl
+systemu/vault/manual_events.jsonl
+systemu/vault/supervisor_queue.json
+systemu/vault/memory_consolidation_meta.json
+systemu/vault/.credentials.json
+# Vault-root incident droppings (a daemon that resolved into the package tree).
+systemu/vault/.systemu_daemon.json
+systemu/vault/.effect_tags_seed
+systemu/vault/.first_gate_review
+systemu/vault/.package_manifest_baseline.json
+# Lock files are per-process liveness, never shipped content.
+systemu/vault/*.lock
+systemu/vault/**/*.lock
 systemu/vault/shadow_army/shadow_shadow_*/
 # Runtime shadows are ignored; the ONE seeded Wild Card is the sole exception
 # so the fresh seed ships exactly one shadow. Do NOT un-ignore other shadow dirs.

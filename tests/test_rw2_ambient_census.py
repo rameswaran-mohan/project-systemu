@@ -300,6 +300,214 @@ def test_every_consent_mutation_holds_the_rmw_lock(tmp_path, monkeypatch):
         "grant / set_paused / mark_ran / revoke must each hold the consent lock"
 
 
+# ══ the consent file is AUTHENTICATED — a planted file cannot manufacture a "yes" ══
+#
+# Re-audit item 3 of the (now replaced) grant-surface pin. Before the census consent
+# surface shipped, `_load` trusted unsigned JSON: anything that could place one file in
+# the vault manufactured a grant for EVERY category, and `run_census` already had a live
+# production caller, so the forged grant scanned the machine and routed the results into
+# the planner prompt on the next survey. The grant surface did not create that exposure;
+# it added a legitimate "yes" on top of it. The authenticator closes it.
+#
+# EVERY test below carries its POSITIVE CONTROL in the same test. "is_active is False"
+# is also what a completely broken consent store produces, so an assertion that only
+# shows the rejected case cannot distinguish "the MAC refused this" from "nothing works"
+# (DEC-32: a pin asserting a value the failure path also produces is not a pin).
+
+
+def _write_raw_consent(base, obj) -> None:
+    """Place a hand-built consent file — the forger's capability, exactly."""
+    import json as _json
+    Path(base).mkdir(parents=True, exist_ok=True)
+    (Path(base) / "census_consent.json").write_text(
+        _json.dumps(obj, indent=2), encoding="utf-8")
+
+
+def _read_raw_consent(base):
+    import json as _json
+    return _json.loads((Path(base) / "census_consent.json").read_text(encoding="utf-8"))
+
+
+def _write_signed_consent(base, grants) -> None:
+    """A consent file with a VALID MAC for ``base``'s own key, carrying exactly ``grants``.
+
+    Signs with the production helpers rather than reimplementing them, so a test that
+    wants to probe a layer ABOVE the authenticator (row shape, category vocabulary) can
+    hand it a genuinely-signed file instead of accidentally measuring the MAC."""
+    ordered = {k: grants[k] for k in sorted(grants)}
+    key = cc._consent_key(Path(base))
+    _write_raw_consent(base, {
+        "version": cc.CONSENT_FORMAT_VERSION, "grants": ordered,
+        "mac": cc._consent_mac(key, cc.CONSENT_FORMAT_VERSION, ordered)})
+
+
+def test_an_unsigned_consent_file_grants_nothing_and_scans_nothing(tmp_path, monkeypatch):
+    """THE FORGED-GRANT PIN. A well-formed, plausible, UNSIGNED consent file — the exact
+    artifact a hand edit, a restored backup or a file-write-capable tool could drop in —
+    must authorise nothing, and must not reach a probe.
+
+    The positive control runs the SAME probe object against the SAME vault and changes
+    only HOW the grant got there (real API vs. planted file), so the empty `calls` in the
+    first phase cannot be explained by a broken probe, store or fact builder."""
+    calls: list = []
+    _use_spy(monkeypatch, "cloud_sync_roots", ["C:/Users/x/OneDrive"], calls)
+    v = _vault(tmp_path)
+
+    _write_raw_consent(tmp_path, {"version": 1, "grants": {
+        "cloud_sync_roots": {"granted_at": "2026-01-01T00:00:00+00:00"},
+        "installed_apps": {"granted_at": "2026-01-01T00:00:00+00:00"},
+        "path_clis": {"granted_at": "2026-01-01T00:00:00+00:00"}}})
+    store = cc.CensusConsentStore(tmp_path)
+    assert store.list_grants() == [], "an unsigned file must read as NO grants at all"
+    for cat in cc.CATEGORIES:
+        assert store.is_active(cat) is False, cat
+    forged = ac.run_census(v)
+    assert calls == [], "a planted consent file must never reach a probe"
+    assert forged["facts_written"] == 0
+    assert set(forged["skipped"].values()) == {"not_consented"}
+
+    # POSITIVE CONTROL — the only change is that consent is created through the API.
+    ac.grant_category(v, "cloud_sync_roots")
+    granted = ac.run_census(v)
+    assert calls, "positive control: a genuine grant must reach the same probe"
+    assert granted["scanned"] == ["cloud_sync_roots"]
+
+
+def test_the_pre_authenticator_format_is_never_grandfathered(tmp_path):
+    """MIGRATION RULE, pinned. The unsigned v1 file is the format that shipped, so a real
+    vault can hold one. It reads as UNCONSENTED — it is not upgraded in place, not
+    trusted "because it was already there", and not re-signed on read. Re-granting is the
+    only way back, which is correct: the operator's answer is what a grant records, and
+    nothing on disk can prove the v1 file ever carried one."""
+    real = cc.CensusConsentStore(tmp_path)
+    real.grant("cloud_sync_roots")
+    signed = _read_raw_consent(tmp_path)
+    assert signed["version"] == cc.CONSENT_FORMAT_VERSION >= 2
+    assert real.is_active("cloud_sync_roots") is True          # control: this works
+
+    # Downgrade it to the exact pre-authenticator shape, keeping the same grant row.
+    _write_raw_consent(tmp_path, {"version": 1, "grants": signed["grants"]})
+    assert cc.CensusConsentStore(tmp_path).is_active("cloud_sync_roots") is False
+    # ...and reading it did NOT quietly rewrite/upgrade the file.
+    assert _read_raw_consent(tmp_path)["version"] == 1
+
+
+def test_tampering_with_a_signed_file_invalidates_every_grant(tmp_path):
+    """The MAC covers the whole grants object, so an attacker cannot ADD a category to a
+    file the operator legitimately signed, nor un-pause one, nor backdate one. The
+    failure is whole-file (all grants drop), which is the fail-closed direction: a
+    partially-trusted consent file is not a thing this store will produce."""
+    store = cc.CensusConsentStore(tmp_path)
+    store.grant("cloud_sync_roots")
+    assert store.is_active("cloud_sync_roots") is True          # control
+
+    signed = _read_raw_consent(tmp_path)
+    # The realistic attack: keep the operator's real grant + its real MAC, bolt on the
+    # category they never consented to.
+    signed["grants"]["installed_apps"] = dict(signed["grants"]["cloud_sync_roots"])
+    _write_raw_consent(tmp_path, signed)
+    after = cc.CensusConsentStore(tmp_path)
+    assert after.is_active("installed_apps") is False, "an added category must not stick"
+    assert after.is_active("cloud_sync_roots") is False, (
+        "a tampered file must not keep authorising the untouched rows either — the MAC "
+        "covers the whole grants object, so 'partly valid' is not a state")
+
+
+def test_an_unkeyed_digest_is_not_accepted_as_the_mac(tmp_path):
+    """The authenticator must be KEYED. An unkeyed hash reads as integrity while
+    providing none: the forger computes it as easily as the store does, so a file signed
+    with `sha256(canonical_body)` would be a complete bypass. This drives the actual
+    forgery."""
+    import hashlib as _h
+    store = cc.CensusConsentStore(tmp_path)
+    store.grant("cloud_sync_roots")
+    assert store.is_active("cloud_sync_roots") is True          # control
+
+    grants = {"installed_apps": {"granted_at": "2026-01-01T00:00:00+00:00",
+                                 "paused": False}}
+    body = cc._canonical_body(cc.CONSENT_FORMAT_VERSION, grants)
+    for forged_mac in (_h.sha256(body).hexdigest(),
+                       _h.sha256(cc._CONSENT_MAC_PREFIX + body).hexdigest()):
+        _write_raw_consent(tmp_path, {"version": cc.CONSENT_FORMAT_VERSION,
+                                      "grants": grants, "mac": forged_mac})
+        assert cc.CensusConsentStore(tmp_path).is_active("installed_apps") is False, (
+            "an unkeyed digest over the canonical body was accepted as the MAC — the "
+            "authenticator is not keyed and every grant is forgeable")
+
+
+def test_a_consent_file_signed_for_another_vault_is_rejected(tmp_path):
+    """The key is PER-VAULT (derived from that vault's own persisted secret), so a
+    consent file lifted from one vault does not authorise a scan in another. Copying a
+    genuinely-signed file is the forgery a global key would not stop."""
+    a, b = tmp_path / "vault_a", tmp_path / "vault_b"
+    cc.CensusConsentStore(a).grant("cloud_sync_roots")
+    assert cc.CensusConsentStore(a).is_active("cloud_sync_roots") is True   # control
+    cc.CensusConsentStore(b).grant("path_clis")                # give B its own key+file
+    assert cc.CensusConsentStore(b).is_active("path_clis") is True          # control
+
+    _write_raw_consent(b, _read_raw_consent(a))                # lift A's signed file
+    moved = cc.CensusConsentStore(b)
+    assert moved.is_active("cloud_sync_roots") is False, (
+        "a consent file signed by another vault's key was honoured — the MAC key is not "
+        "per-vault, so one leaked/known key forges consent everywhere")
+    assert moved.list_grants() == []
+
+
+def test_no_vault_key_means_no_grants(tmp_path, monkeypatch):
+    """FAIL-CLOSED on the key itself. If the per-vault secret cannot be obtained, there
+    is no way to tell a genuine consent file from a planted one — so nothing is
+    consented and nothing scans. (The alternative, trusting the file when the key is
+    missing, is a bypass anyone can trigger by deleting one file.)"""
+    from systemu.runtime import dashboard_auth
+    calls: list = []
+    _use_spy(monkeypatch, "cloud_sync_roots", ["C:/Users/x/OneDrive"], calls)
+    v = _vault(tmp_path)
+    ac.grant_category(v, "cloud_sync_roots")
+    assert ac.run_census(v)["scanned"] == ["cloud_sync_roots"]   # control
+    assert len(calls) == 1
+
+    monkeypatch.setattr(dashboard_auth, "session_secret", lambda _v: "")
+    assert cc.CensusConsentStore(tmp_path).is_active("cloud_sync_roots") is False
+    assert cc.CensusConsentStore(tmp_path).list_grants() == []
+    blind = ac.run_census(v, min_interval_seconds=0)
+    assert len(calls) == 1, "with no key, a previously-granted category must not scan"
+    assert blind["skipped"]["cloud_sync_roots"] == "not_consented"
+
+
+def test_the_mac_comparison_is_constant_time(tmp_path, monkeypatch):
+    """DEC-34: never compare an authenticator with a polymorphic operator against an
+    attacker-controlled operand. Asserted on the CALL, not on the source text — a source
+    grep passes on a `compare_digest` that is imported and never used."""
+    store = cc.CensusConsentStore(tmp_path)
+    store.grant("cloud_sync_roots")
+    seen: list = []
+    real = cc.hmac.compare_digest
+
+    def _spy(a, b):
+        seen.append((type(a), type(b)))
+        return real(a, b)
+
+    monkeypatch.setattr(cc.hmac, "compare_digest", _spy)
+    assert cc.CensusConsentStore(tmp_path).is_active("cloud_sync_roots") is True
+    assert seen, "the consent MAC was verified without hmac.compare_digest"
+    assert all(t is bytes for pair in seen for t in pair), (
+        f"compare_digest must be handed BYTES on both sides (it raises on a non-ASCII "
+        f"str, and a file-controlled operand can carry one); got {seen}")
+
+
+def test_a_fresh_install_read_does_not_mint_a_vault_secret(tmp_path):
+    """`run_census` runs on EVERY survey, and on a fresh install there is no consent
+    file. The absent-file read must short-circuit before the key is derived: deriving it
+    would make a read-only privacy check get-or-CREATE a persisted vault secret on every
+    default install, which is a side effect the census has no business having."""
+    v = _vault(tmp_path)
+    assert ac.run_census(v)["facts_written"] == 0
+    assert ac.census_status(v) == []
+    assert sorted(p.name for p in tmp_path.iterdir()) == [], (
+        "reading an absent consent file touched the vault — nothing at all should be "
+        "created by a census run on a fresh install")
+
+
 # ══ AC5 clause 3 — a census capability wins a plan, unnamed by the operator ══
 
 @pytest.mark.asyncio
@@ -484,37 +692,45 @@ def test_a_broken_consent_file_grants_nothing(tmp_path, monkeypatch):
 
 
 def test_a_grant_row_without_a_parseable_granted_at_is_not_active(tmp_path, monkeypatch):
-    """UNMEASURED-CASE rejection (NOT integrity). A row with no parseable ``granted_at`` is
-    not evidence of consent, so it must not read as the "scan now" signal — a bare
-    ``{"grants": {"path_clis": {}}}`` used to authorise a scan. This also pins the LIMIT of
-    the tightening: a hand-written row WITH a plausible timestamp still passes, because
-    nothing here authenticates the writer (the integrity gap ``_load`` documents stays
-    open — see ``test_no_production_grant_surface_exists`` and that docstring)."""
+    """UNMEASURED-CASE rejection, a layer ABOVE the MAC. A row with no parseable
+    ``granted_at`` is not evidence of consent, so it must not read as the "scan now"
+    signal — a bare ``{"grants": {"path_clis": {}}}`` used to authorise a scan.
+
+    Every phase writes a CORRECTLY SIGNED file, so what is measured here is
+    :meth:`is_active`'s shape check and not the authenticator: a malformed row must be
+    refused even when it carries a valid MAC (which it can, since systemu's own writer
+    signs whatever it is handed). Phase (4) then pins that the two layers are
+    independent — a well-formed row with NO valid signature is still inactive, so the
+    tightening did not quietly get absorbed into the MAC check."""
     calls: list = []
     _use_spy(monkeypatch, "path_clis", ["gh"], calls)
     store = cc.CensusConsentStore(tmp_path)
     v = _vault(tmp_path)
 
     # (1) a bare row — no granted_at — does NOT authorise a scan.
-    (tmp_path / "census_consent.json").write_text(
-        '{"version": 1, "grants": {"path_clis": {}}}', encoding="utf-8")
+    _write_signed_consent(tmp_path, {"path_clis": {}})
     assert store.is_active("path_clis") is False
     assert ac.run_census(v)["facts_written"] == 0
     assert calls == [], "a row with no granted_at must not reach the probe"
 
     # (2) an unparseable granted_at is rejected too.
-    (tmp_path / "census_consent.json").write_text(
-        '{"version": 1, "grants": {"path_clis": {"granted_at": "not-a-timestamp"}}}',
-        encoding="utf-8")
+    _write_signed_consent(tmp_path, {"path_clis": {"granted_at": "not-a-timestamp"}})
     assert store.is_active("path_clis") is False
 
-    # (3) a WELL-FORMED granted_at IS active — the point is malformed-input rejection, not
-    # authentication, so a plausible (even hand-forged) timestamp passes.
+    # (3) a WELL-FORMED, SIGNED granted_at IS active — the positive control that makes
+    # (1) and (2) mean "the shape was refused" rather than "nothing works here".
+    _write_signed_consent(
+        tmp_path, {"path_clis": {"granted_at": "2026-07-21T10:00:00+00:00"}})
+    assert store.is_active("path_clis") is True
+    assert ac.run_census(v, min_interval_seconds=0)["facts_written"] == 1
+
+    # (4) the SAME well-formed row, unsigned, is inactive: two independent gates.
     (tmp_path / "census_consent.json").write_text(
         '{"version": 1, "grants": {"path_clis": {"granted_at": "2026-07-21T10:00:00+00:00"}}}',
         encoding="utf-8")
-    assert store.is_active("path_clis") is True
-    assert ac.run_census(v, min_interval_seconds=0)["facts_written"] == 1
+    assert store.is_active("path_clis") is False, (
+        "a well-formed but UNSIGNED grant row authorised a scan — the authenticator is "
+        "not gating, only the shape check is")
 
 
 def test_an_unreadable_consent_file_shows_nothing_and_scans_nothing(tmp_path, monkeypatch):
@@ -825,81 +1041,151 @@ def test_the_shipped_file_scan_actually_finds_files():
     assert "from systemu.runtime.ambient_census import run_census" in joined
 
 
-def test_no_production_grant_surface_exists():
-    """NO SHIPPED FILE CAN CREATE A CENSUS GRANT — a SOURCE property, and all this pins.
+#: The marker each surface file carries immediately before its census code. The scan
+#: below anchors on it, so "the census consent surface lives in ONE declared region of
+#: each file" is a checkable property rather than a convention.
+_CENSUS_REGION_MARKER = "R-W2 CENSUS CONSENT SURFACE :: REGION START"
 
-    This is a grep over shipped source: no file outside the two census modules references
-    the grant symbols, so no OPERATOR-reachable code path can call ``grant``. That is the
-    real, checkable claim. It is NOT "the census is inert at runtime": ``run_census`` is
-    wired into the survey seam and reads ``census_consent.json`` directly, so a consent
-    file planted in the vault turns the census on regardless of what any source scan says.
-    This test cannot see that file and does not try to — runtime inertness is a property
-    of the disk, which no source scan can pin.
+#: The ONLY shipped files that may reference the census grant/consent symbols, and the
+#: role each plays. Anything else is a widening.
+_CENSUS_SURFACE_FILES = {
+    "systemu/interface/cli_commands.py": "the run_census_* command implementations",
+    "sharing_on/cli.py": "the `systemu census` click group that calls them",
+}
 
-    What the shipped docstrings must therefore say (and, after the truthfulness pass, do):
-    no operator grant SURFACE ships, so on a fresh install the census writes nothing — NOT
-    that it can never run.
+#: EVERY needle is matched BARE, without a trailing paren — including the function names.
+#: A call-shaped needle (`grant_category(`) misses a re-export: a shipped file doing
+#: `from systemu.runtime.ambient_census import grant_category` (that module is excluded
+#: from the scan, so the definition does not save us) then calling it — under its own name
+#: or an alias — is a real grant surface a `grant_category(`-only scan does not see. The
+#: import line always NAMES the symbol, so a bare match catches it. Verified that these
+#: names are census-unique in the shipped tree, so a bare match cannot cry wolf.
+#:
+#: The `run_census_*` names are needles TOO, and that is not belt-and-braces: they are
+#: themselves grant-creating entry points now, so a dashboard route doing
+#: `from systemu.interface.cli_commands import run_census_grant` would create operator
+#: consent from a surface nobody reviewed while every underlying symbol stayed confined.
+#: Scanning only the library layer would have missed exactly that.
+#:
+#: NOT included: `census_status` / `run_census_status` (read-only display — a guard that
+#: cries wolf on a legitimate display surface gets deleted rather than heeded) and a
+#: generic `.grant(`, which matched `Governor(config).grant(` in scheduler/jobs.py.
+_CENSUS_GRANT_NEEDLES = ("grant_category", "revoke_category", "pause_category",
+                         "consent_card", "set_paused",
+                         "CensusConsentStore", "census_consent",
+                         "run_census_grant", "run_census_revoke",
+                         "run_census_pause", "run_census_resume")
 
-    WHEN THIS TEST FAILS, IT IS DOING ITS JOB. It means someone wired a grant surface, and
-    the disclosures the failure message lists just became operator-visible. Do not delete
-    it, and do not exempt the new file, without doing the work the failure message lists.
 
-    Why a source scan rather than a behavioural one: the property is "no shipped code path
-    can reach ``grant``", and a behavioural test can only demonstrate that the paths it
-    happens to drive do not."""
-    # EVERY needle is matched BARE, without a trailing paren — including the four function
-    # names. A call-shaped needle (`grant_category(`) misses a re-export: a shipped file
-    # doing `from systemu.runtime.ambient_census import grant_category` (that module is
-    # excluded from the scan, so the definition does not save us) then calling it — under
-    # its own name or an alias — is a real grant surface a `grant_category(`-only scan does
-    # not see, because the re-export is from `ambient_census`, not from `census_consent`.
-    # The import line always NAMES the symbol, so a bare match catches it. Verified that
-    # these four names, `CensusConsentStore`, and `census_consent` are census-unique in the
-    # shipped tree, so a bare match cannot cry wolf.
-    #
-    # A generic `.grant(` was deliberately NOT included. It matched
-    # `Governor(config).grant(` in scheduler/jobs.py — an unrelated subsystem — and a
-    # guard that cries wolf on the first unrelated file gets deleted rather than heeded.
-    # `grant_category` and friends are specific enough to avoid that.
-    needles = ("grant_category", "revoke_category", "consent_card", "set_paused",
-               "CensusConsentStore", "census_consent")
-    offenders = {}
+def test_the_census_grant_surface_is_confined_to_its_declared_region():
+    """THE NARROWED GRANT-SURFACE SCAN — successor to
+    ``test_no_production_grant_surface_exists``, which asserted that NO shipped file could
+    create a census grant. That is no longer true and must not be: P4-B2 shipped the
+    operator surface for ``cloud_sync_roots``, so §5.11 AC5 clause 3 is finally reachable
+    on a default install instead of by test only. The predecessor's own failure message
+    named this narrowing as the procedure, and its five re-audits were carried out in the
+    same change (see the module docstrings, the card, and ``run_world``).
+
+    WHAT THIS STILL PINS, and why it is worth as much as its predecessor: the surface is
+    confined to TWO files and, within each, to ONE declared region. So the property
+    "there is exactly one place an operator's census consent can be created, and you can
+    read all of it at once" survives. A grant path sprouting in a dashboard route, a
+    registered tool, an elicitation handler, or halfway up ``cli_commands.py`` fails here.
+
+    It remains a SOURCE property. It cannot pin that no consent file exists on a given
+    disk — nothing can — but that matters far less now: since the authenticator landed,
+    a file planted in the vault does not grant anything (see
+    ``test_an_unsigned_consent_file_grants_nothing_and_scans_nothing``).
+
+    WHEN THIS TEST FAILS, IT IS DOING ITS JOB. Read the failure message before exempting
+    anything."""
+    needles = _CENSUS_GRANT_NEEDLES
+    outside_files = {}          # a file that may not reference the census at all
+    outside_region = {}         # an allowed file, referencing it OUTSIDE its region
     for rel, text in _shipped_python_files():
         # The two census modules DEFINE these; the guard is about EXTERNAL callers.
         if rel in ("systemu/runtime/ambient_census.py",
                    "systemu/runtime/census_consent.py"):
             continue
-        for line in text.splitlines():
+        lines = text.splitlines()
+        allowed = rel in _CENSUS_SURFACE_FILES
+        # A missing marker makes `region_at` len(lines), so EVERY reference reads as
+        # out-of-region and the test fails loudly. Silently treating "no marker" as
+        # "no constraint" is how a region guard becomes decorative.
+        region_at = next((i for i, ln in enumerate(lines)
+                          if _CENSUS_REGION_MARKER in ln), len(lines))
+        for i, line in enumerate(lines):
             s = line.lstrip()
-            if s.startswith("#"):
+            if s.startswith("#") and _CENSUS_REGION_MARKER not in line:
                 continue                    # a comment mention is not a call
             for needle in needles:
-                if needle in line:
-                    offenders.setdefault(rel, set()).add(needle)
-    assert not offenders, (
-        "\nA CENSUS CONSENT SURFACE APPEARED — the R-W2 disclosures are now stale.\n"
-        f"  {({k: sorted(v) for k, v in offenders.items()})}\n"
-        "\nBefore this lands, re-audit ALL of the following. They were written for a\n"
-        "feature that could not run, and they are now operator-visible:\n"
+                if needle not in line:
+                    continue
+                if not allowed:
+                    outside_files.setdefault(rel, set()).add(needle)
+                elif i < region_at:
+                    outside_region.setdefault(rel, set()).add(f"L{i + 1}:{needle}")
+    assert not outside_files and not outside_region, (
+        "\nTHE CENSUS CONSENT SURFACE ESCAPED ITS DECLARED REGION.\n"
+        f"  files that may not touch it at all: "
+        f"{({k: sorted(v) for k, v in outside_files.items()})}\n"
+        f"  allowed files, but ABOVE the region marker: "
+        f"{({k: sorted(v) for k, v in outside_region.items()})}\n"
+        f"\nThe surface is confined to, and only to:\n"
+        + "".join(f"  - {f}  ({why})\n" for f, why in sorted(_CENSUS_SURFACE_FILES.items()))
+        + f"  ...each below a line containing {_CENSUS_REGION_MARKER!r}.\n"
+        "\nIf you are WIDENING it (a dashboard control, a registered tool, an\n"
+        "elicitation surface, a second category), re-audit ALL of the following first —\n"
+        "these are the five the predecessor pin named, kept because a widening makes each\n"
+        "operator-visible again on a path nobody has read:\n"
         "  1. consent_card's `transmission_notice` / `leaves_this_machine`. Census facts\n"
         "     go into the planner prompt and are therefore sent to the model provider.\n"
         "     An earlier revision told the operator 'nothing is transmitted'. Confirm\n"
-        "     the wording still matches the real render path before an operator reads it.\n"
-        "  2. `revocation_surface_shipped: False` on the card, and the module docstring's\n"
-        "     statement that no pause/revoke surface exists. If you shipped grant WITHOUT\n"
-        "     revoke and pause, stop: a standing permission to enumerate the operator's\n"
-        "     machine with no way to withdraw it is not a consent control.\n"
-        "  3. CensusConsentStore._load has NO INTEGRITY CHECK. Consent is unsigned JSON,\n"
-        "     so anything that can write one file into the vault can manufacture a grant\n"
-        "     for every category. This is LIVE NOW, not latent: run_census has a production\n"
-        "     caller (shadow_runtime) and reads this file directly, so a forged file scans\n"
-        "     and transmits today. A grant surface only adds a legitimate 'yes' to forge on\n"
-        "     top of that — it does not create the exposure.\n"
-        "  4. The SCOPE section in ambient_census and the 'no grant surface' block in\n"
-        "     census_consent both state this gap as current fact. Update them.\n"
-        "  5. cli_commands.run_world tells the operator this build has no way to grant,\n"
-        "     pause or revoke a category. That line becomes false.\n"
+        "     the wording still matches the real render path on YOUR new surface — a\n"
+        "     renderer that shows only `collects` drops the whole disclosure.\n"
+        "  2. `revocation_surface_shipped` is per-category and true ONLY for the\n"
+        "     categories in census_consent.SURFACED_CATEGORIES. If you shipped grant for\n"
+        "     a new category WITHOUT revoke and pause, stop: a standing permission to\n"
+        "     enumerate the operator's machine with no way to withdraw it is not a\n"
+        "     consent control.\n"
+        "  3. The consent file's integrity. It is authenticated now (HMAC over the\n"
+        "     canonical body, per-vault key, unsigned v1 never grandfathered) -- do not\n"
+        "     add a second writer that bypasses CensusConsentStore._write, and do not\n"
+        "     add a read path that accepts an unverified file.\n"
+        "  4. The SCOPE section in ambient_census and the surface block in\n"
+        "     census_consent state exactly which categories an operator can reach.\n"
+        "     A new surface makes both stale.\n"
+        "  5. cli_commands.run_world tells the operator which controls exist. It names\n"
+        "     the CLI commands today; a second surface makes that half the story.\n"
     )
+
+
+def test_the_region_guard_is_not_vacuous():
+    """The scan above is only meaningful if the marker it anchors on really is in both
+    files and really does sit ABOVE the census code. Pinned directly, because a typo'd
+    marker would make ``region_at`` fall back to end-of-file and turn every reference into
+    a failure — loud — while a marker accidentally placed at line 1 would make the region
+    check pass for the whole file, which is SILENT."""
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    for rel in _CENSUS_SURFACE_FILES:
+        lines = (repo / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        marks = [i for i, ln in enumerate(lines) if _CENSUS_REGION_MARKER in ln]
+        assert len(marks) == 1, f"{rel}: expected exactly 1 region marker, got {len(marks)}"
+        assert marks[0] > 0.5 * len(lines), (
+            f"{rel}: the census region marker is at line {marks[0] + 1} of {len(lines)} — "
+            f"a marker near the top of the file makes the region check cover everything "
+            f"and pin nothing. The census surface belongs in its own block at the end.")
+        # Comment lines are skipped here for the SAME reason the scan skips them: a
+        # comment mention is not a call. Without this, a stray "census_consent.json"
+        # in an unrelated docstring block would satisfy the vacuity check while the
+        # region held no actual surface.
+        hits = [i for i, ln in enumerate(lines)
+                if not ln.lstrip().startswith("#")
+                and any(n in ln for n in _CENSUS_GRANT_NEEDLES)]
+        assert hits and min(hits) > marks[0], (
+            f"{rel}: the region check would pass vacuously — no grant reference below the "
+            f"marker means the scan is not measuring this file's surface at all")
 
 
 def test_the_census_does_not_sweep_up_a_credential_env_value(tmp_path, monkeypatch):
@@ -1006,11 +1292,18 @@ def test_the_consent_card_discloses_that_facts_leave_the_machine():
             f"{category}: `stored_at` claims nothing is transmitted, but census facts "
             f"are rendered into the planner prompt and sent to the model provider.")
         assert "model provider" in card["transmission_notice"].lower(), category
-        # The card must not promise a control this build does not have.
-        assert card["revocation_surface_shipped"] is False, (
-            f"{category}: the card says a revocation surface ships. If that is now true, "
-            f"test_no_production_grant_surface_exists should already have failed — and "
-            f"every disclosure it names needs re-reading.")
+        # The card must not promise a control this build does not have, NOR deny one it
+        # does. Per-category since P4-B2: `cloud_sync_roots` ships grant/revoke/pause, the
+        # other two do not. A blanket True would be the overclaim R-W2 was held for; a
+        # blanket False would make the shipped card contradict the CLI the operator just
+        # used. The flag must track census_consent.SURFACED_CATEGORIES exactly.
+        assert card["revocation_surface_shipped"] is (
+            category in cc.SURFACED_CATEGORIES), (
+            f"{category}: `revocation_surface_shipped` disagrees with "
+            f"SURFACED_CATEGORIES={cc.SURFACED_CATEGORIES!r}. If you shipped or withdrew "
+            f"an operator surface, every disclosure named in "
+            f"test_the_census_grant_surface_is_confined_to_its_declared_region needs "
+            f"re-reading.")
 
 
 def test_the_standing_scan_block_survives_the_query_early_return(tmp_path, capsys):
@@ -1038,3 +1331,270 @@ def test_the_standing_scan_block_survives_the_query_early_return(tmp_path, capsy
     assert run_world(SimpleNamespace(root=tmp_path)) == 0
     bare = capsys.readouterr().out
     assert "installed_apps" in bare, "the bare form lost the disclosure"
+
+
+# ══ P4-B2 — THE OPERATOR SURFACE (`systemu census ...`) ══════════════════════
+#
+# One category ships end to end: `cloud_sync_roots`, the lowest-privacy of the three.
+# All three verbs land together, because a standing permission to enumerate the
+# operator's machine with no way to withdraw it is not a consent control (the predecessor
+# pin's re-audit item 2, which forbade shipping grant alone).
+
+
+def _cloud_machine(tmp_path, monkeypatch):
+    """A machine shape with ONE detectable cloud-sync root, faked at the probe's
+    FILESYSTEM/ENV inputs rather than by stubbing the probe.
+
+    That distinction is the whole point of the AC5 pin below: a stubbed probe would
+    demonstrate the plumbing while leaving "does the real, shipped probe run when the
+    operator consents through the real, shipped CLI" untested — which is exactly the
+    half-built shape this slice exists to close. Returns the root the probe must find."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _isolate_cloud_env(monkeypatch, home)          # clear the developer's real machine
+    root = tmp_path / "cloud" / "OneDrive"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("OneDrive", str(root))
+    return root
+
+
+def test_the_default_install_path_grants_scans_and_revokes_end_to_end(tmp_path, monkeypatch):
+    """§5.11 AC5 CLAUSE 3, DEMONSTRATED ON THE DEFAULT INSTALL PATH FOR THE FIRST TIME.
+
+    Until this slice, every AC5 demonstration reached ``grant_category`` from a test. No
+    operator could, so the whole payoff — "a census-discovered capability is available to
+    a plan without the operator naming it" — was a property of the test suite rather than
+    of the product. This drives the REAL CLI entry points against the REAL probe:
+
+        real `census grant`  ->  run_census (the same call shadow_runtime makes)
+        ->  a fact in the store  ->  the fact in `world_facts`  ->  the planner prompt
+        ->  real `census revoke`  ->  the next run SKIPS the category
+        ->  and the fact is GONE from the store, the view, and the prompt.
+
+    NOTHING about the consent is faked: the grant is created by the shipped command and
+    lands in a signed consent file. Only the machine's cloud-sync shape is arranged."""
+    from systemu.interface.cli_commands import run_census_grant, run_census_revoke
+
+    root = _cloud_machine(tmp_path, monkeypatch)
+    vault_dir = tmp_path / "vault"
+    v = _vault(vault_dir)
+
+    # --- precondition: unconsented, the real probe is never reached ---------------
+    assert ac.run_census(v)["skipped"]["cloud_sync_roots"] == "not_consented"
+    assert FactStore(v).all_facts() == []
+
+    # --- grant, through the shipped command ---------------------------------------
+    assert run_census_grant(v, "cloud_sync_roots", assume_yes=True) == 0
+    assert cc.CensusConsentStore(vault_dir).is_active("cloud_sync_roots") is True
+
+    summary = ac.run_census(v)
+    assert summary["scanned"] == ["cloud_sync_roots"], summary
+    assert [(f.kind, f.value) for f in FactStore(v).all_facts()] == \
+        [("cloud_sync_root", str(root))], "the REAL probe must find the arranged root"
+
+    # --- the payoff: it reaches world_facts, and from there the planner prompt -----
+    view = si.compose_world_view(si.SituationReport(), v,
+                                 "put my quarterly notes somewhere synced")
+    assert [(r["kind"], r["value"]) for r in view.world_facts] == \
+        [("cloud_sync_root", str(root))]
+    # The renderer emits JSON, so a Windows path arrives with its separators escaped.
+    # Compare against the JSON-escaped form rather than loosening the assertion to a
+    # substring like "OneDrive" — the value that must cross the boundary is the whole
+    # path, and that is what the transmission disclosure is about.
+    import json as _json
+    on_the_wire = _json.dumps(str(root))[1:-1]
+    rendered = si.render_situation_for_prompt(view.model_dump())
+    assert on_the_wire in rendered, "a consented census fact must reach the planner prompt"
+    assert "untrusted_inventory_data" in rendered, "...and arrive FENCED (WM-15)"
+
+    # --- revoke, through the shipped command ---------------------------------------
+    assert run_census_revoke(v, "cloud_sync_roots") == 0
+    assert cc.CensusConsentStore(vault_dir).is_granted("cloud_sync_roots") is False
+
+    after = ac.run_census(v, min_interval_seconds=0)
+    assert after["skipped"]["cloud_sync_roots"] == "not_consented", \
+        "revocation must stop FUTURE scans, not just this one"
+    assert after["facts_written"] == 0
+
+    # The spec asks that revocation reach the DERIVED FACTS. This codebase implements the
+    # strongest form of that: `revoke_category` PURGES them via the provenance ref
+    # (`FactStore.purge_source_ref`), so there is no stale row left to read. Asserted at
+    # all three surfaces the fact previously reached, because "gone from the store" and
+    # "gone from what the model is told" are different claims.
+    assert FactStore(v).all_facts() == []
+    revoked_view = si.compose_world_view(si.SituationReport(), v,
+                                         "put my quarterly notes somewhere synced")
+    assert revoked_view.world_facts == []
+    assert on_the_wire not in si.render_situation_for_prompt(revoked_view.model_dump())
+
+
+def test_the_grant_command_shows_the_real_card_including_the_transmission_notice(
+        tmp_path, monkeypatch, capsys):
+    """RE-AUDIT ITEM 1, enforced on the surface that renders it. The card is the operator's
+    only chance to learn that consenting sends these values to the model provider, and a
+    renderer that prints only ``collects``/``excludes`` silently drops that.
+
+    Asserted against ``consent_card``'s OWN text rather than a hand-copied string, so the
+    disclosure and the thing that renders it cannot drift apart."""
+    from systemu.interface.cli_commands import run_census_grant
+
+    _cloud_machine(tmp_path, monkeypatch)
+    card = cc.consent_card("cloud_sync_roots")
+    assert run_census_grant(_vault(tmp_path / "v"), "cloud_sync_roots",
+                            assume_yes=True) == 0
+    out = capsys.readouterr().out
+
+    for field in ("transmission_notice", "standing_scan_notice", "revocation_notice",
+                  "why", "how", "stored_at", "title"):
+        assert card[field] in out, f"the grant surface did not render the card's {field}"
+    for item in card["collects"] + card["excludes"]:
+        assert item in out, f"the grant surface dropped a disclosure item: {item!r}"
+    # The two claims most easily lost in a summary render.
+    assert "model provider" in out.lower()
+    assert "standing" in out.lower()
+
+
+def test_grant_defaults_to_no_and_records_nothing_when_declined(tmp_path, monkeypatch):
+    """Typed y/N with default N. A consent prompt whose default is "yes" is not consent,
+    and a decline must leave NOTHING behind — no consent file, no scan."""
+    from systemu.interface import cli_commands as cli
+
+    _cloud_machine(tmp_path, monkeypatch)
+    vault_dir = tmp_path / "v"
+    v = _vault(vault_dir)
+    seen: list = []
+
+    def _fake_confirm(text, **kw):
+        seen.append(kw.get("default"))
+        return False
+
+    monkeypatch.setattr(cli, "_census_stdin_is_a_terminal", lambda: True)
+    monkeypatch.setattr(cli.click, "confirm", _fake_confirm)
+    assert cli.run_census_grant(v, "cloud_sync_roots") != 0
+    assert seen == [False], "the confirm must default to N"
+    assert not (vault_dir / "census_consent.json").exists()
+    assert ac.run_census(v)["facts_written"] == 0
+
+    # POSITIVE CONTROL — the same call, answered yes, does grant. Without this, the
+    # assertions above are satisfied by a command that never works at all.
+    monkeypatch.setattr(cli.click, "confirm", lambda text, **kw: True)
+    assert cli.run_census_grant(v, "cloud_sync_roots") == 0
+    assert cc.CensusConsentStore(vault_dir).is_active("cloud_sync_roots") is True
+
+
+def test_grant_refuses_without_a_terminal_and_names_the_flag(tmp_path, monkeypatch, capsys):
+    """Non-TTY (Docker / CI / a service) must REFUSE rather than prompt into a closed
+    stdin — and must name ``--yes``, because a refusal with no way forward is the F3 shape
+    this codebase has already been bitten by. ``--yes`` is the operator asserting they read
+    the disclosure; it is not a way to skip printing it."""
+    from systemu.interface import cli_commands as cli
+
+    _cloud_machine(tmp_path, monkeypatch)
+    vault_dir = tmp_path / "v"
+    monkeypatch.setattr(cli, "_census_stdin_is_a_terminal", lambda: False)
+
+    def _must_not_prompt(*a, **kw):                     # pragma: no cover - the assertion
+        raise AssertionError("prompted with no terminal instead of refusing")
+
+    monkeypatch.setattr(cli.click, "confirm", _must_not_prompt)
+    assert cli.run_census_grant(_vault(vault_dir), "cloud_sync_roots") != 0
+    out = capsys.readouterr().out
+    assert "--yes" in out, "the refusal must name the flag that unblocks it"
+    assert not (vault_dir / "census_consent.json").exists()
+    # ...and the disclosure was still shown, so the operator can read what --yes means.
+    assert cc.consent_card("cloud_sync_roots")["transmission_notice"] in out
+
+
+def test_only_the_shipped_category_is_grantable(tmp_path, monkeypatch, capsys):
+    """This slice ships ONE category end to end. The other two must be refused HONESTLY —
+    named as not-yet-grantable-from-this-build — rather than silently accepted, silently
+    ignored, or presented as if they were on offer."""
+    from systemu.interface import cli_commands as cli
+
+    _cloud_machine(tmp_path, monkeypatch)
+    vault_dir = tmp_path / "v"
+    v = _vault(vault_dir)
+    monkeypatch.setattr(cli, "_census_stdin_is_a_terminal", lambda: True)
+    monkeypatch.setattr(cli.click, "confirm", lambda text, **kw: True)
+
+    assert set(cc.SURFACED_CATEGORIES) == {"cloud_sync_roots"}
+    for category in set(cc.CATEGORIES) - set(cc.SURFACED_CATEGORIES):
+        assert cli.run_census_grant(v, category) != 0, category
+        out = capsys.readouterr().out.lower()
+        assert "not yet grantable" in out, category
+        assert cc.CensusConsentStore(vault_dir).is_granted(category) is False
+
+    # An unknown category is refused too — loudly, never as a silent no-op that would
+    # read to the operator as a granted capability that is quietly dead.
+    assert cli.run_census_grant(v, "printers") != 0
+    assert "printers" in capsys.readouterr().out
+
+
+def test_pause_and_resume_stop_and_restart_scanning_without_losing_the_facts(
+        tmp_path, monkeypatch):
+    """Pause is the third verb, and it must differ from revoke in exactly one way: the
+    facts stay. Driven through the shipped commands against the real probe."""
+    from systemu.interface.cli_commands import (run_census_grant, run_census_pause,
+                                                run_census_resume)
+
+    root = _cloud_machine(tmp_path, monkeypatch)
+    vault_dir = tmp_path / "vault"
+    v = _vault(vault_dir)
+    assert run_census_grant(v, "cloud_sync_roots", assume_yes=True) == 0
+    assert ac.run_census(v)["scanned"] == ["cloud_sync_roots"]
+    assert len(FactStore(v).all_facts()) == 1
+
+    assert run_census_pause(v, "cloud_sync_roots") == 0
+    paused = ac.run_census(v, min_interval_seconds=0)
+    assert paused["skipped"]["cloud_sync_roots"] == "not_consented"
+    assert [f.value for f in FactStore(v).all_facts()] == [str(root)], \
+        "pause is not revoke — the facts stay"
+    assert cc.CensusConsentStore(vault_dir).is_granted("cloud_sync_roots") is True
+
+    assert run_census_resume(v, "cloud_sync_roots") == 0
+    assert ac.run_census(v, min_interval_seconds=0)["scanned"] == ["cloud_sync_roots"]
+
+
+def test_census_status_lists_every_category_and_its_reachability(tmp_path, monkeypatch,
+                                                                 capsys):
+    """``census status`` is the "see" half of M3 and the only place an operator learns what
+    this build can and cannot do. It must show all three categories — not just granted
+    ones, which would make an unconsented install look like the feature does not exist —
+    and it must say plainly which are grantable from this build."""
+    from systemu.interface.cli_commands import run_census_grant, run_census_status
+
+    _cloud_machine(tmp_path, monkeypatch)
+    v = _vault(tmp_path / "v")
+    assert run_census_status(v) == 0
+    fresh = capsys.readouterr().out
+    for category in cc.CATEGORIES:
+        assert category in fresh, category
+    assert "not yet grantable" in fresh.lower()
+    assert "not granted" in fresh.lower()
+
+    assert run_census_grant(v, "cloud_sync_roots", assume_yes=True) == 0
+    capsys.readouterr()
+    assert run_census_status(v) == 0
+    after = capsys.readouterr().out
+    assert "cloud_sync_roots" in after and "granted" in after.lower()
+
+
+def test_the_shipped_category_card_no_longer_disclaims_its_own_controls():
+    """RE-AUDIT ITEM 2. ``revocation_surface_shipped`` is per-category now: true for the
+    category whose controls actually ship, false for the two whose do not. Both halves
+    are asserted — a blanket flip to True would be the same overclaim R-W2 was held for,
+    and leaving it False for the shipped category would understate a control the operator
+    has (and the prose would then contradict the CLI they just used)."""
+    shipped = cc.consent_card("cloud_sync_roots")
+    assert shipped["revocation_surface_shipped"] is True
+    assert shipped["revocable"] is True
+    blob = (shipped["revocation_notice"] + shipped["standing_scan_notice"]).lower()
+    assert "no command" not in blob and "not built" not in blob, (
+        f"the shipped category's card still tells the operator the controls do not "
+        f"exist: {blob!r}")
+    assert "census revoke" in blob, "the card must name the command that withdraws it"
+
+    for category in set(cc.CATEGORIES) - set(cc.SURFACED_CATEGORIES):
+        card = cc.consent_card(category)
+        assert card["revocation_surface_shipped"] is False, category
+        assert card["revocable"] is True, category      # the mechanism exists either way

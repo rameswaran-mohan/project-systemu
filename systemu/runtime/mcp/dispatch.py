@@ -56,6 +56,48 @@ _INJECTION_MARKERS = (
 )
 
 
+# ---- L0: the ACTUATION-RUNG admissibility consult (R-A14a, spec 15.1(b)) ----
+# The name of the rung THIS module actuates. A literal, not a value read off the
+# thing being checked (DEC-34: the verifier never consults an input the verified
+# party controls).
+_MCP_MODALITY_NAME = "mcp"
+
+# The honest, matchable refusal reason -- same shape as action_governance's
+# ``egress_enforcer_unavailable``-class BLOCKED: a refusal, never an approvable card.
+MODALITY_NOT_ADMISSIBLE = (
+    "modality_not_admissible: the `mcp` actuation rung is not in the admissible "
+    "set for this build, so no MCP effect may be actuated. The admissible rungs "
+    "are the single truth in systemu.runtime.actuation.admissible_modality_names "
+    "(DEC-1 / spec 15.1(b)) -- refusing rather than actuating a rung the "
+    "build does not offer."
+)
+
+
+def _mcp_modality_admissible() -> bool:
+    """L0 -- is the ``mcp`` actuation rung ADMISSIBLE in this build?
+
+    Consults the ONE selector (``actuation.admissible_modality_names``) that the
+    DEC-1 / 15.1(b) release gate asserts against, so that gate now guards a set
+    production really reads (before this it had zero production callers). Today
+    the selector always contains ``"mcp"``, so this is a pure read and the live
+    path is unchanged; it becomes load-bearing the moment the admissible set
+    changes -- and a future forged/registry rung cannot actuate here at all,
+    because this module only ever actuates the ``mcp`` rung.
+
+    Fail-closed: an unresolvable or erroring selector yields False (refuse). The
+    fence is the VALUE returned here (DEC-32) -- never an exception a frame
+    between this check and the decision could swallow.
+    """
+    try:
+        from systemu.runtime.actuation import admissible_modality_names
+        names = frozenset(admissible_modality_names())
+    except Exception:
+        logger.debug("[McpDispatch] modality selector unresolvable -- refuse "
+                     "(fail-closed)", exc_info=True)
+        return False
+    return _MCP_MODALITY_NAME in names
+
+
 def _env_autotrust_enabled() -> bool:
     """SYSTEMU_MCP_ENV_AUTOTRUST default ON (spec §11).
 
@@ -337,6 +379,18 @@ def call_mcp_tool(server: str, name: str, params: Optional[Dict[str, Any]] = Non
     # SAME server string — a whitespaced LLM-supplied server can't desync them.
     server = (server or "").strip().rstrip("/")
     params = params or {}
+
+    # L0 -- actuation-rung admissibility (R-A14a / DEC-1). Before ANY MCP effect is
+    # actuated, ask the selector whether the `mcp` rung is admissible at all. This
+    # is a BUILD-level question, strictly prior to the per-tool allowlist/gate, so
+    # it is checked FIRST: an inadmissible rung then never reads the allowlist,
+    # never posts an approval card, and never touches the transport -- the same
+    # never-launched-then-denied shape as the 15.1(a)/(c) refusals. With today's
+    # registry the set always contains "mcp", so this changes no live behavior.
+    if not _mcp_modality_admissible():
+        return {"success": False,
+                "error": MODALITY_NOT_ADMISSIBLE,
+                "error_type": "modality_not_admissible"}
 
     # L2 — allowlist (defense-in-depth; never trust availability alone).
     # H2 env-grandfather: an env-declared server is server-level trusted when

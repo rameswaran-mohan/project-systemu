@@ -395,6 +395,10 @@ def run_quick_task(
     tool_calls = 0
     malformed_streak = 0
     ask_count = 0                    # v0.9.43: operator questions asked this run
+    # R-QL1: questions already put to the operator THIS run — the re-ask signal
+    # DEC-7 needs. In-memory only for the life of the loop; never persisted, and the
+    # recorder writes a keyed ref, never these strings.
+    ask_seen: set = set()
     fail_streaks: Dict[str, int] = {}
     failed_sigs: set = set()         # (tool|params) calls that already failed
     tool_errors: Dict[str, str] = {}  # last error text per tool (honest fail msg)
@@ -431,6 +435,40 @@ def run_quick_task(
         return result
 
     synth = synthesize or _default_synthesize
+
+    def _record_ql_ask(ordinal: int, question: str, *, cap_hit: bool,
+                       outcome: str) -> None:
+        """R-QL1 — record ONE quick-lane operator ask. OBSERVABILITY-ONLY.
+
+        DEC-7's amended criterion is about THIS cap (``_ASK_USER_CAP``), and until this
+        hook existed nothing recorded a quick-lane ask at all: the cap fired, ended the
+        run, and left no evidence. The deep-lane corpora cannot stand in for it — see
+        the section header on ``replay_metrics.record_quick_lane_ask`` for why folding
+        rows into either one corrupts a shipped metric.
+
+        EVERYTHING is inside one try/except with a single ``logger.debug``: this hook
+        must be unable to change the run that made the ask, and the returned
+        ``QuickResult`` is field-for-field identical with the recorder raising (pinned
+        by test). The question text stays in this frame — the recorder writes a keyed,
+        non-reversible ref — and a secret-class ask is refused twice over.
+        """
+        try:
+            from systemu.runtime.replay_metrics import (
+                is_secret_ask_text, record_quick_lane_ask)
+            text = str(question or "")
+            # Guard (b) half 1, the CALLER's own classification. A quick-lane ASK_USER
+            # carries free text and no schema, so the question IS the ask's whole
+            # classification surface; classify it with the codebase's canonical secret
+            # marker rather than a bespoke rule. The recorder re-checks independently.
+            secret_class = bool(is_secret_ask_text(text))
+            re_ask = text in ask_seen
+            ask_seen.add(text)
+            record_quick_lane_ask(
+                vault, run_id=execution_id, ask_ordinal=ordinal, cap_hit=cap_hit,
+                re_ask=re_ask, outcome=outcome, question_text=text,
+                secret_class=secret_class)
+        except Exception:
+            logger.debug("[QuickTask] quick-lane ask not recorded", exc_info=True)
 
     def _terminate(reason: str, iters: int) -> QuickResult:
         """Machine-owned exit: salvage an honest partial from gathered data,
@@ -513,6 +551,11 @@ def run_quick_task(
                     answer_md=question))
             ask_count += 1
             if ask_count > _ASK_USER_CAP:
+                # R-QL1: the ask the cap REFUSED. Recorded before the terminal, because
+                # this is the only ask that never reaches the operator and it is
+                # precisely the one DEC-7's cap_hit_rate counts.
+                _record_ql_ask(ask_count, question, cap_hit=True,
+                               outcome="cap_terminated")
                 return _terminate(
                     f"asked the operator {ask_count} questions without reaching "
                     f"an answer", iteration)
@@ -525,13 +568,22 @@ def run_quick_task(
             if not answer:
                 # declined / cancelled / timed out -> honest terminal
                 if cancel_event is not None and cancel_event.is_set():
+                    _record_ql_ask(ask_count, question, cap_hit=False,
+                                   outcome="cancelled")
                     return _finish(QuickResult(
                         status="cancelled", error="cancelled by operator",
                         iterations=iteration))
+                _record_ql_ask(ask_count, question, cap_hit=False,
+                               outcome="declined")
                 return _finish(QuickResult(
                     status="needs_input", iterations=iteration,
                     question=question or "(no question given)",
                     answer_md=question))
+            # R-QL1: one row per ask, written where the ask's OUTCOME is known. The
+            # headless branch above (no chat_surface) is deliberately NOT recorded: it
+            # never increments ask_count, so the cap can never bind on it, and rows the
+            # cap cannot reach would dilute cap_hit_rate's denominator.
+            _record_ql_ask(ask_count, question, cap_hit=False, outcome="answered")
             history.append({
                 "role": "tool_result", "tool": "ask_user", "success": True,
                 "parsed": {
