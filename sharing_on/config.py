@@ -36,7 +36,7 @@ if _ENV_FILE.exists():
     load_dotenv(_ENV_FILE, override=False, encoding="utf-8-sig")
 
 
-# Legacy env-var compatibility shim for silentgrasper_* names was
+# The legacy env-var compatibility shim for pre-rename variable names was
 # removed in v0.3 per the deprecation window declared in v0.2's
 # MIGRATION.md.  Operators must use the SHARING_ON_* names directly.
 
@@ -312,7 +312,7 @@ class Config:
         default_factory=lambda: int(os.getenv("SYSTEMU_CURATOR_MIN_IDLE_MINUTES", "120"))  # 2 hours
     )
 
-    # v0.9.6 (Layer 7 — Proactive Surfacing): auto-skill-extraction (Odysseus).
+    # v0.9.6 (Layer 7 — Proactive Surfacing): the auto-skill-extraction pattern.
     auto_skill_extract_enabled: bool = field(
         default_factory=lambda: os.getenv("SYSTEMU_AUTO_SKILL_EXTRACT_ENABLED", "true").lower() != "false"
     )
