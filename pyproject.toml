@@ -230,7 +230,7 @@ include-package-data = true
 # Both top-level packages are part of the editable install:
 #   * sharing_on  — the capture engine (declared as the PyPI package above)
 #   * systemu     — the runtime, pipelines, interface, and starter vault
-# The `silentgrasper*` rename-compat shim was removed in v0.3 per the
+# The pre-rename compat shim was removed in v0.3 per the
 # deprecation window declared in v0.2's MIGRATION.md.
 include = ["sharing_on*", "systemu*"]
 
