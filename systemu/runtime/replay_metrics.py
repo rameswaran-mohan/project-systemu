@@ -1155,11 +1155,26 @@ def format_avoidable_ask(report: Dict[str, Any]) -> List[str]:
     total = int(r.get("total_asks", 0) or 0)
     n = int(r.get("no_attempt_count", 0) or 0)
     rate = float(r.get("rate", 0.0) or 0.0)
+    # D2: an EMPTY DENOMINATOR HAS NO RATE. `0/0 = 0%` on an avoidable-ask metric
+    # reads as the best possible score -- a quotable headline invented out of a corpus
+    # with nothing in it. The two blocks below this one (inventory-hit, quick-lane)
+    # have always said NOT MEASURED here; this one used to disagree with them about
+    # the same emptiness, in the flattering direction. Same words, so the reader
+    # learns the distinction once.
+    head = (f"No-prior-attempt asks: {n}/{total} = {rate * 100:.0f}%" if total
+            else "No-prior-attempt asks: NOT MEASURED (no ask has been recorded "
+                 "yet); NO RATE (this is NOT 0%)")
     lines = [
-        f"No-prior-attempt asks: {n}/{total} = {rate * 100:.0f}%",
-        "  (asks made with no recorded tool-resolution attempt and no blocking signal —",
-        "   a deterministic DIRECTIONAL signal (non-definitive proxy) for the §10",
-        "   avoidable-ask rate; a DEC-7 input. The definitive rate needs a resolver-replay",
+        head,
+        # D11: operator-facing text names no spec section, roadmap item or
+        # decision id -- none of them are lookup-able outside this repository's own
+        # build documents, so an operator who searches for one finds nothing.
+        # ASCII-only for the same reason the quick-lane block below is (DEC-32c):
+        # an em dash through click.echo on a cp437 console comes back as a
+        # replacement character, and this is text an operator is meant to quote.
+        "  (asks made with no recorded tool-resolution attempt and no blocking",
+        "   signal -- a deterministic DIRECTIONAL signal, a non-definitive proxy",
+        "   for the avoidable-ask rate. The definitive rate needs a resolver-replay",
         "   over each ask's inventory snapshot.)",
     ]
     al = r.get("answer_linked")
@@ -1184,32 +1199,38 @@ def format_answer_linked_ask(report: Dict[str, Any]) -> List[str]:
     trend = r.get("trend") or {}
     lines = [
         "",
-        f"Answer-linked asks (§5.9, R-A16): {total} answered input/decision/capability "
+        f"Answer-linked asks: {total} answered input/decision/capability "
         f"ask(s) recorded  [credential asks are excluded by design]",
-        f"  · DEFINITIVE avoidable (resolvable-confirmed): {dfn}/{total} "
-        f"= {drate * 100:.0f}%",
-        "      (the binder HELD the value and asked only for the T_high / content_derived",
-        "       confirm; the operator changed nothing => avoidable BY CONSTRUCTION,",
-        "       no replay needed. near-miss score = the bind confidence.)",
-        f"  · Necessary (resolvable-overridden): {ovr} — the binder's candidate was WRONG;",
+        # D2: same rule as the no-prior-attempt head above -- no denominator, no
+        # rate. This one is the DEFINITIVE signal, so a fabricated 0% here is the
+        # most quotable number the whole report can produce.
+        (f"  | DEFINITIVE avoidable (resolvable-confirmed): {dfn}/{total} "
+         f"= {drate * 100:.0f}%" if total else
+         "  | DEFINITIVE avoidable (resolvable-confirmed): NOT MEASURED "
+         "(no answered ask has been recorded yet); NO RATE (this is NOT 0%)"),
+        "      (the binder HELD the value and asked only because of the confirm",
+        "       threshold or a content_derived taint; the operator changed nothing,",
+        "       so the ask was avoidable BY CONSTRUCTION and no replay is needed.",
+        "       near-miss score = the bind confidence.)",
+        f"  | Necessary (resolvable-overridden): {ovr} -- the binder's candidate was WRONG;",
         "      asking was correct. Never counted as avoidable.",
-        f"  · Candidate only (missing-answered): {mis} — NOT definitive. Whether the",
+        f"  | Candidate only (missing-answered): {mis} -- NOT definitive. Whether the",
         "      resolver could have produced these needs a resolver-replay over each ask's",
         "      inventory snapshot (out of scope here; documented refinement).",
     ]
     if int(conv.get("eligible", 0) or 0):
         lines.append(
-            f"  · ask->resolve conversion: {int(conv.get('converted', 0) or 0)}"
+            f"  | ask->resolve conversion: {int(conv.get('converted', 0) or 0)}"
             f"/{int(conv.get('eligible', 0) or 0)} repeat-asked requirement(s) became"
             f" resolvable = {float(conv.get('rate', 0.0) or 0.0) * 100:.0f}%"
             f"  ({int(conv.get('repeat_asks', 0) or 0)} re-ask(s) over"
             f" {int(conv.get('groups', 0) or 0)} requirement(s))")
     else:
-        lines.append("  · ask->resolve conversion: no repeat-asked requirement yet "
+        lines.append("  | ask->resolve conversion: no repeat-asked requirement yet "
                      "(needs the same requirement asked twice).")
     if total >= 2:
         lines.append(
-            f"  · trend (definitive rate, first half -> second half): "
+            f"  | trend (definitive rate, first half -> second half): "
             f"{float(trend.get('first_half_definitive_rate', 0.0) or 0.0) * 100:.0f}% -> "
             f"{float(trend.get('second_half_definitive_rate', 0.0) or 0.0) * 100:.0f}%")
     by_class = r.get("by_class") or {}
@@ -1228,14 +1249,14 @@ def _format_learned_synonyms(ls: Any) -> List[str]:
     ls = ls if isinstance(ls, dict) else {}
     n = int(ls.get("tokens", 0) or 0)
     cap = int(ls.get("cap", 0) or 0)
-    lines = [f"  · learned synonyms (§5.9 slice 4): {n}/{cap} token(s) "
-             f"— extend the static reference_synonyms map, union-only"]
+    lines = [f"  | learned synonyms: {n}/{cap} token(s) "
+             f"-- learned from your answers, added to the built-in synonym map"]
     entries = ls.get("entries") if isinstance(ls.get("entries"), dict) else {}
     for tok in sorted(entries):
         exts = entries.get(tok) or []
         lines.append(f"      {tok} -> {', '.join(str(e) for e in exts)}")
     if not entries:
-        lines.append("      (none learned yet — needs an answered file-reference ask)")
+        lines.append("      (none learned yet -- needs an answered file-reference ask)")
     return lines
 
 
@@ -1245,16 +1266,16 @@ def _format_threshold_sensitive(ts: Any) -> List[str]:
     ts = ts if isinstance(ts, dict) else {}
     n = int(ts.get("eligible_total", 0) or 0)
     t_high = float(ts.get("t_high", 0.80) or 0.80)
-    lines = [f"  · confidence-gated confirms (would a learned T_high delta help?): "
-             f"{n}  [T_high={t_high:.2f}, static]"]
+    lines = [f"  | confidence-gated confirms (would a learned threshold help?): "
+             f"{n}  [confirm threshold {t_high:.2f}, static]"]
     by_class = ts.get("by_class") if isinstance(ts.get("by_class"), dict) else {}
     for cls in sorted(by_class):
         lines.append(f"      [{cls}] {int(by_class[cls] or 0)}")
     if not n:
         lines.append("      0 = no ask here was gated by CONFIDENCE; every one was")
         lines.append("      gated by content_derived TAINT, which no threshold may")
-        lines.append("      silence (IMPL-5). A per-class threshold delta would be")
-        lines.append("      dead machinery today — see _threshold_sensitive_counts.")
+        lines.append("      silence, by design. A per-class threshold delta would")
+        lines.append("      be dead machinery today.")
     return lines
 
 
@@ -1577,7 +1598,9 @@ def format_quick_lane_ask(report: Dict[str, Any]) -> List[str]:
     runs = int(r.get("distinct_runs", 0) or 0)
     min_asks = int(r.get("min_asks") or QUICK_LANE_MIN_ASKS)
     min_runs = int(r.get("min_runs") or QUICK_LANE_MIN_RUNS)
-    window = (f"DEC-7's measurement window opens at N={min_asks} asks across "
+    # D11: the window is a property of the MEASUREMENT, not of the decision record
+    # that set it -- an operator cannot look up a decision id.
+    window = (f"the measurement window opens at N={min_asks} asks across "
               f">={min_runs} distinct runs")
     if not r.get("measured"):
         if total == 0:
@@ -1589,7 +1612,7 @@ def format_quick_lane_ask(report: Dict[str, Any]) -> List[str]:
             "",
             head,
             "  (NO RATE is rendered here, and this is NOT a zero. The quick lane's",
-            "   operator-question cap is what DEC-7 adjudicates, and one row per ask is",
+            "   operator-question cap is what this measures, and one row per ask is",
             "   its only evidence; a rate quoted below the window would be noise with a",
             "   percent sign on it.)",
         ]
@@ -1606,9 +1629,10 @@ def format_quick_lane_ask(report: Dict[str, Any]) -> List[str]:
         # the one that corrupted. A pipe carries the same meaning and cannot.
         f"Quick-lane asks: cap_hit_rate {cap_rate * 100:.0f}% ({n}/{total}) | "
         f"re_ask_fraction {re_rate * 100:.0f}% ({m}/{total})",
-        f"  (over {runs} distinct quick-lane run(s), at or above DEC-7's window of",
-        f"   {min_asks} asks across >={min_runs} runs. cap_hit = the ask the",
-        "   _ASK_USER_CAP refused, i.e. the one that terminated the run; re_ask = a",
+        f"  (over {runs} distinct quick-lane run(s), at or above the measurement",
+        f"   window of {min_asks} asks across >={min_runs} runs. cap_hit = the ask",
+        "   the quick lane's ask cap refused, i.e. the one that terminated the",
+        "   run; re_ask = a",
         "   question already asked in the same run. Questions are held as keyed",
         "   non-reversible refs; credential/secret-class asks are never recorded.)",
     ]

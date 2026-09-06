@@ -37,6 +37,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import print as rprint
 
+# D12: THE consent rule for every command that creates a standing permission --
+# whether there is a human to ask, what counts as a yes, and which exit code
+# says so. `roots grant` and the census grant both sit on it; before they did,
+# one of them took a `y` off a pipe as informed consent and the other refused.
+# Each command still owns its own disclosure and refusal COPY.
+from systemu.interface import consent_prompt
+
 console = Console()
 
 
@@ -1420,10 +1427,23 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
     from systemu.runtime import optional_deps as _od
     if _od.missing_groups(("nicegui",)):
         from rich.markup import escape as _esc
+        _lead, _cmd, _then = _od.unavailable_reason_parts(("nicegui",))
         console.print(
             f"[red]✗ Cannot start the daemon: the web dashboard is not "
             f"installed.[/red]\n"
-            f"  {_esc(_od.unavailable_reason(('nicegui',)))}\n"
+            f"  {_esc(_lead.rstrip())}"
+        )
+        # F29/D9: THE COMMAND GOES OUT UNWRAPPED, ON ITS OWN LINE. Rich breaks a
+        # paragraph at the terminal width wherever the break lands, and at 80
+        # columns this remedy came out as `Install it \n with: pip install
+        # "systemu[dashboard]"`. A command split across a line break cannot be
+        # copied, and the half that survives a copy (`pip`) runs and does nothing.
+        # `click.echo` does not wrap -- the same reason the `roots` group is
+        # line-oriented, where the thing that must not be broken is a path.
+        click.echo(f"    {_cmd}")
+        if _then:
+            console.print(f"  {_esc(_then.strip())}")
+        console.print(
             f"[dim]  `daemon start` reports success only when a real connection "
             f"to the dashboard port succeeds, so without it there is nothing to "
             f"witness. Everything else — recording, analysis, tools, the whole "
@@ -1708,9 +1728,18 @@ def _print_grant_consent(canon: str) -> None:
 def roots_grant(ctx, path: str, assume_yes: bool):
     """Grant Systemu access to a folder, after telling you what that means.
 
-    Prints the consequences, then asks. The default is NO: a bare Enter, an
-    answer of `n`, or a stdin nobody can answer all leave the store untouched
-    and exit nonzero. `--yes` is the deliberate script path.
+    Prints the consequences, then asks. The default is NO.
+
+    \b
+    Exit codes:
+      0  granted
+      1  you were asked and declined (a bare Enter counts as no)
+      2  there was no terminal to ask on -- nothing was granted; re-run with
+         --yes once you have read what is printed above the question
+
+    `--yes` is the deliberate script path: it means you have read the
+    disclosure, which is printed either way. A `y` arriving on a pipe is not
+    consent and is refused with exit 2 -- the same rule `census grant` uses.
 
     The argument is canonicalized by the STORE'S OWN `canonicalize`, the same
     function `roots revoke` and the confinement check use, so the root recorded
@@ -1746,20 +1775,26 @@ def roots_grant(ctx, path: str, assume_yes: bool):
 
     _print_grant_consent(canon)
 
-    if not assume_yes:
-        try:
-            agreed = click.confirm("Grant access to this folder?", default=False)
-        except click.Abort:
-            # stdin reached EOF: a cron job, a CI runner, a pipe from /dev/null.
-            # Falling through to the N default would be safe by accident and would
-            # tell the caller nothing about how to proceed on purpose.
-            click.echo("")
-            click.echo("Refused: nothing on stdin could answer that question.")
-            click.echo("Re-run with --yes to confirm without a prompt.")
-            ctx.exit(1)
-        if not agreed:
-            click.echo("Refused: not granted. Nothing was changed.")
-            ctx.exit(1)
+    # D12: THE shared consent rule, not a second private copy of it. This
+    # command used to accept a piped `y` as consent and exit 1 on EOF, while
+    # `census grant` -- the other standing-permission surface, same shape --
+    # required a terminal and exited 2. The census rule is the one that
+    # survived: a byte off a pipe is not a person who read the paragraph above.
+    answer = consent_prompt.ask_for_consent(
+        "Grant access to this folder?", assume_yes=assume_yes)
+    if answer == consent_prompt.CONSENT_NO_TERMINAL:
+        # A prompt into a stdin nobody can answer surfaces as a bare abort with
+        # no way forward, so the refusal names the flag that unblocks it.
+        click.echo("")
+        click.echo("Refused: there is no terminal to ask on "
+                   "(Docker / CI / a service).")
+        click.echo(f"Re-run with --yes once you have read the above: "
+                   f"systemu roots grant {canon} --yes")
+        click.echo("Nothing was granted.")
+        ctx.exit(consent_prompt.CONSENT_NO_TERMINAL)
+    if answer != consent_prompt.CONSENT_GRANTED:
+        click.echo("Refused: not granted. Nothing was changed.")
+        ctx.exit(consent_prompt.CONSENT_DECLINED)
 
     store.grant(path)
     click.echo(f"Granted: {canon}")
@@ -2273,8 +2308,9 @@ def _persisted_requirement_rows(data_dir=None):
     process (``shadow_runtime.py``:1545), so there is nothing else durable to read.
     The directory scan mirrors the one existing precedent for finding runs this way,
     ``scheduler/jobs.py``:806 (``_scan_wait_execution_ids``); ``data_dir`` defaults to
-    ``"data"`` exactly as ``write_snapshot`` does (execution_snapshot.py:135), so the
-    reader and the writer resolve the same directory without a second derivation.
+    ``execution_snapshot.audit_data_root()``, the SAME mint ``write_snapshot`` defaults
+    to, so the reader and the writer resolve the same directory without a second
+    derivation -- and without either of them resolving it against its own cwd.
 
     THE POPULATION IS SPARSE, AND THAT IS A PROPERTY OF THE INPUT, NOT A BUG HERE: a
     snapshot is written when a run suspends and DELETED when the resume consumes it
@@ -2296,8 +2332,9 @@ def _persisted_requirement_rows(data_dir=None):
     would keep rendering while measuring something else.
     """
     from systemu.runtime import table_payoff
+    from systemu.runtime.execution_snapshot import audit_data_root
 
-    base = Path(data_dir) if data_dir is not None else Path("data")
+    base = audit_data_root(data_dir)
     rows = []
     try:
         audit = base / "audit"
@@ -2327,36 +2364,41 @@ def _persisted_requirement_rows(data_dir=None):
 @debug_group.command("avoidable-ask")
 @click.pass_context
 def debug_avoidable_ask(ctx):
-    """§10 / §5.9 — the avoidable-ask signals over the accreted ask corpora.
+    """Why did it ask? Four signals over the asks this vault has recorded.
 
-    Deterministic (never an LLM judge), READ-ONLY. Three signals, LABELLED APART:
+    Deterministic (never a model judgement) and READ-ONLY -- running this
+    command records nothing and changes nothing. Each signal is a different kind
+    of evidence and they are LABELLED APART rather than blended: a proxy and a
+    definitive count averaged together is neither.
+
+    A signal with nothing behind it reports NOT MEASURED and NO RATE. That is
+    not a zero, and it is never rendered as one.
 
     \b
-      * R-A13.5 DIRECTIONAL proxy — harness asks made with no recorded resolution
-        attempt (zero tool-attempts + no blocking signal); a DEC-7 input, accreted at
-        the ASK point.
-      * R-A16 / G-LEARN §5.9 ANSWER-LINKED signal — accreted at the ANSWER point, so
-        each event knows what the operator actually chose. Its resolvable-confirmed
-        sub-case (the binder HELD the value and asked only for the T_high /
-        content_derived confirm) is DEFINITIVE, not a proxy; missing-answered is
-        reported separately as a candidate only. Includes the §5.9 ask->resolve
-        conversion trend. Credential asks are excluded by design.
-      * R-B5 / T5 section-10 INVENTORY-HIT -- the other end of the same question: how
-        often the inventory (and the operator's table) turned a from-scratch
-        ``missing`` gap into a pre-filled one-click confirm. Section 5.10.e AC7:
-        ``silent`` and ``prefilled_confirm`` are reported SEPARATELY, never summed.
-        Read over the RequirementReports persisted in the execution snapshots
-        (``data/audit/exec_*/resume_snapshot.json``) -- a run that never suspended
-        left none, so an empty set reports NOT MEASURED and never 0%.
-      * R-QL1 QUICK-LANE ask signal -- the only one of the four that is about the
-        QUICK lane, and therefore DEC-7's only evidence source: one row per
-        ``ASK_USER``, so ``cap_hit_rate`` (how often ``_ASK_USER_CAP`` actually
-        terminated a run) and ``re_ask_fraction`` (how much of the traffic under it
-        was the model re-asking) become measurable. The three signals above are
-        deep-lane and can never decide it. Questions are held as keyed
-        non-reversible refs and secret-class asks are never recorded. Below DEC-7's
-        window (30 asks across >=10 distinct runs) this reports NOT MEASURED and
-        never 0%.
+      * NO-PRIOR-ATTEMPT asks -- a DIRECTIONAL proxy, counted when the ask was
+        made: it asked you without any recorded attempt to resolve the answer
+        first. Two-sided (it misses an avoidable ask that logged a failed
+        attempt, and counts a necessary ask that had nothing to try), so it
+        points a direction and does not settle anything.
+      * ANSWER-LINKED asks -- counted when you ANSWER, so each row knows what
+        you chose. Its resolvable-confirmed case is DEFINITIVE rather than a
+        proxy: it already held that value and asked only to have it confirmed,
+        and you changed nothing. Reported apart from the cases it could NOT have
+        produced. Includes the ask-to-resolve trend. Credential asks are never
+        recorded.
+      * INVENTORY-HIT -- the same question from the other end: how often what it
+        already knew (including your own table) turned a from-scratch gap into a
+        pre-filled one-click confirm. The silent binds and the pre-filled
+        confirms are separate counts and are never summed. Read from the
+        requirement reports left behind in execution snapshots
+        (``data/audit/exec_*/resume_snapshot.json``), so a vault whose runs
+        never suspended has none, and the unmeasured line names the directory it
+        searched.
+      * QUICK-LANE asks -- the only one of the four about the quick lane, which
+        writes none of the corpora above. One row per question, so how often the
+        lane's own question cap ended a run, and how much of that traffic was
+        it asking you the same thing twice, become visible. Questions are held
+        as non-reversible references and secret-class asks are never recorded.
     """
     from systemu.runtime.replay_metrics import (
         avoidable_ask_report, format_avoidable_ask, format_quick_lane_ask,
@@ -2377,16 +2419,26 @@ def debug_avoidable_ask(ctx):
     # only. The section 5.10.c chips are NOT rendered here -- answered_from_table WRITES
     # the novelty ledger, so a printout that called it would burn an item's novelty
     # every time an operator asked for metrics.
+    from systemu.runtime.execution_snapshot import audit_data_root
+    _audit_dir = audit_data_root() / "audit"
     rows = _persisted_requirement_rows()
     click.echo("")
     if not rows:
         # An unmeasured population is a different claim from a measured zero; the
         # zeros the formatter would print here would read as "the table never paid
         # off". Same rule (and wording) as resolver_replay's "this is NOT 0%".
-        click.echo("Inventory-hit: NOT MEASURED -- no run has persisted a "
-                   "RequirementReport yet; NO RATE (this is NOT 0%)")
-        click.echo("  (the per-run report is cached in the execution snapshot at "
-                   "data/audit/exec_*/resume_snapshot.json, written when a run")
+        #
+        # AND IT NAMES THE DIRECTORY IT SEARCHED. The sentence used to read "no run
+        # has persisted a RequirementReport yet" -- a claim about every run on the
+        # machine, printed on a machine that held one, because the search root came
+        # off the operator's cwd. An unmeasured verdict is only honest when the
+        # reader can see WHERE it looked and check.
+        click.echo("Inventory-hit: NOT MEASURED -- no persisted RequirementReport "
+                   "was found; NO RATE (this is NOT 0%)")
+        click.echo(f"  (searched: {_audit_dir}{os.sep}exec_*"
+                   f"{os.sep}resume_snapshot.json)")
+        click.echo("  (the per-run report is cached in the execution snapshot there, "
+                   "written when a run")
         click.echo("   suspends and consumed when it resumes.)")
     else:
         for line in format_inventory_hit(inventory_hit_report(rows)):
@@ -3445,21 +3497,28 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
 #: Exit codes, so a script can tell the three "did not grant" outcomes apart. A single
 #: non-zero would make "the operator said no" indistinguishable from "this build cannot
 #: ask you" -- and a wrapper that retries on the second must not retry on the first.
-CENSUS_EXIT_OK = 0
-CENSUS_EXIT_DECLINED = 1          # the operator answered no
-CENSUS_EXIT_NO_TERMINAL = 2       # nothing to ask on, and --yes was not passed
+#: ALIASES of the shared consent outcomes (D12), not a second numbering. This
+#: surface's rule is now the rule BOTH standing-permission commands obey, so the
+#: three codes are declared once and named here for the scripts already reading
+#: them.
+CENSUS_EXIT_OK = consent_prompt.CONSENT_GRANTED
+CENSUS_EXIT_DECLINED = consent_prompt.CONSENT_DECLINED
+CENSUS_EXIT_NO_TERMINAL = consent_prompt.CONSENT_NO_TERMINAL
 CENSUS_EXIT_BAD_CATEGORY = 3      # unknown, or not grantable from this build
 
 
 def _census_stdin_is_a_terminal() -> bool:
-    """Whether there is a human to ask. Its own function so the grant path has ONE
-    definition of "can I prompt", and so tests can drive both sides of it without
-    replacing sys.stdin. Never raises: a stdin that cannot answer isatty() is not a
-    terminal, which sends the caller down the refuse-and-name-the-flag path."""
-    try:
-        return bool(sys.stdin.isatty())
-    except Exception:
-        return False
+    """Whether there is a human to ask -- a DELEGATE to the shared predicate.
+
+    D12: the definition moved to ``interface/consent_prompt.stdin_is_a_terminal``
+    when `roots grant` came onto this same rule. Two copies of "can I prompt" is
+    how the two surfaces came to answer a pipe differently in the first place.
+
+    The name is kept because it is this surface's injection seam and the tests
+    that drive both sides of it patch here. It must stay a DELEGATE: an answer of
+    its own would re-create the split it now exists to close.
+    """
+    return consent_prompt.stdin_is_a_terminal()
 
 
 def _echo_consent_card(card: dict) -> None:
@@ -3589,18 +3648,25 @@ def run_census_grant(vault, category: str, assume_yes: bool = False) -> int:
     click.echo("systemu is asking to look at ONE thing on this machine, from now on.")
     _echo_consent_card(card)
 
-    if not assume_yes:
-        if not _census_stdin_is_a_terminal():
-            click.echo("Refusing to record consent: there is no terminal to ask on "
-                       "(Docker / CI / a service).")
-            click.echo(f"  Re-run with --yes once you have read the above: "
-                       f"systemu census grant {cat} --yes")
-            click.echo("  Nothing was recorded and nothing will be scanned.")
-            return CENSUS_EXIT_NO_TERMINAL
-        if not click.confirm(f"Grant this standing permission for '{cat}'?",
-                             default=False):
-            click.echo("Not granted. Nothing was recorded and nothing will be scanned.")
-            return CENSUS_EXIT_DECLINED
+    # D12: the DECISION comes from the shared helper -- the same one `roots grant`
+    # now asks, so a pipe means the same thing on both surfaces. The COPY stays
+    # here, where it can name the category and what a scan transmits.
+    # `_census_stdin_is_a_terminal` is passed explicitly because it is this
+    # surface's long-standing injection seam; it delegates to the shared
+    # predicate, so patching either one steers this path.
+    answer = consent_prompt.ask_for_consent(
+        f"Grant this standing permission for '{cat}'?",
+        assume_yes=assume_yes, is_a_terminal=_census_stdin_is_a_terminal)
+    if answer == CENSUS_EXIT_NO_TERMINAL:
+        click.echo("Refusing to record consent: there is no terminal to ask on "
+                   "(Docker / CI / a service).")
+        click.echo(f"  Re-run with --yes once you have read the above: "
+                   f"systemu census grant {cat} --yes")
+        click.echo("  Nothing was recorded and nothing will be scanned.")
+        return CENSUS_EXIT_NO_TERMINAL
+    if answer != CENSUS_EXIT_OK:
+        click.echo("Not granted. Nothing was recorded and nothing will be scanned.")
+        return CENSUS_EXIT_DECLINED
 
     try:
         grant_category(vault, cat)

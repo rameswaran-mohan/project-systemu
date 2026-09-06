@@ -405,6 +405,68 @@ WRITER_OWNERSHIP = {
                  "counted, and this store's whole privacy argument rests on the "
                  "vocabulary being closed and enumerable in the CONC-MAP row."),
     },
+    "R-W2 census consent epoch (<vault>/secrets/census_consent.epoch)": {
+        # `"def": ""` ON PURPOSE -- the def file IS the writer (the same shape the
+        # messaging/resolve_audit.jsonl entry has). `_bump_consent_epoch` is defined in
+        # runtime/census_consent.py and called from `CensusConsentStore.revoke` in that
+        # same file, so excluding the def file the way every other entry does would scan
+        # to ZERO hits and the "unexpected writer" half would pass vacuously while the
+        # "missing declared writer" half failed. The `def`-line filter in _caller_files
+        # already drops the definition itself, so what is left is the CALL and only the
+        # call: verified by grep, `_bump_consent_epoch(` occurs exactly twice in
+        # systemu/ -- the def at census_consent.py:305 and the revoke call at :823.
+        #
+        # That makes this entry a REACHABILITY PIN, not merely an allowlist. Delete the
+        # bump from `revoke` -- which is precisely the mutation that hands the witnessed
+        # replay back -- and `missing` becomes non-empty here, so the guard goes red
+        # rather than staying green on a store nothing writes any more. Guarding on the
+        # BUMP rather than on a constructor is also the sharper question for this file:
+        # `_write_consent_epoch` merely stores an integer, while the bump is the one
+        # operation that strands every signature the operator currently holds.
+        #
+        # No _ATOMIC_WRITE_STORES entry is needed: that registry is keyed by FILE and
+        # runtime/census_consent.py is already in it, so `_write_consent_epoch`'s
+        # mkstemp + os.replace is covered by the row that is already there.
+        "call": "_bump_consent_epoch(",
+        "allowed": {"runtime/census_consent.py"},   # the consent store, and nothing else
+        "def": "",
+        "conc_map_row": '**R-W2 census consent epoch** `secrets/census_consent.epoch`',
+        "note": ("R-W2 section 5.11.c WM-7. The monotonic CONSENT GENERATION the consent "
+                 "MAC's key is derived from. WHY IT EXISTS: the key was per-VAULT only, "
+                 "so it answered 'was this signed by THIS vault?' and nothing else, and "
+                 "one genuinely-signed file stayed valid forever -- save "
+                 "census_consent.json, run `census revoke`, copy the saved bytes back, "
+                 "and `census status` reported GRANTED again while the next survey "
+                 "re-scanned the machine (witnessed e2e on v0.10.27; the operator's LAST "
+                 "ACT was a withdrawal). SINGLE WRITER by construction: the anchor is "
+                 "advanced ONLY by CensusConsentStore.revoke -- the operator's own "
+                 "`systemu census revoke` in its own CLI process, reached through "
+                 "ambient_census.revoke_category, so the mutable handle stays confined "
+                 "exactly as it is for the consent file itself. It is also CREATED, at "
+                 "generation 0 and never advanced, by _current_epoch_or_create on the "
+                 "SIGNING path only, so a fresh install anchors itself on its first "
+                 "grant and a read-only privacy check never mints the state it checks. "
+                 "LOCK+A -- the bump happens INSIDE the same _CONSENT_LOCK hold as the "
+                 "consent-file rewrite it belongs to, and that placement is load-bearing "
+                 "rather than tidy: outside the lock, a mark_ran that loaded before the "
+                 "bump and wrote after it would re-sign the revoked grant into the NEW "
+                 "generation, a resurrection the epoch cannot catch because the "
+                 "resurrected file would be genuinely current. The epoch is an input to "
+                 "the MAC KEY, not a field in the signed body: a plaintext field would "
+                 "need its own comparison, and a second layer that checks something "
+                 "CHEAPER than the MAC is worse than no second layer (DEC-34). A consent "
+                 "file with no readable anchor is UNCONSENTED, never grandfathered -- "
+                 "the same rule the unsigned version-1 format gets. NOT COVERED (typed P "
+                 "under DEC-36): restoring the anchor alongside the consent file, "
+                 "restoring secrets/dashboard_session.secret, or DELETING the anchor and "
+                 "waiting for a later operator-typed grant to re-create generation 0 -- "
+                 "all are writes to the KEY-DOMAIN files inside systemu's own trust "
+                 "domain, where a genuine signature can be minted directly. A FURTHER "
+                 "WRITER needs a DEC-10 review AND a consent review: advancing this "
+                 "counter invalidates every signature the operator currently holds, so "
+                 "anything but a withdrawal doing it silently revokes consent that "
+                 "nobody withdrew."),
+    },
 }
 
 

@@ -256,3 +256,151 @@ include = ["sharing_on*", "systemu*"]
     "interface/assets/*.png",
 ]
 "systemu.vault" = ["**/*.json", "**/*.md", "**/*.py"]
+
+[tool.setuptools.exclude-package-data]
+# THE WHEEL SHIPS THE SEED, NOT WHATEVER A RUN LEFT ON THE BUILDER'S DISK.
+#
+# The globs above read the FILESYSTEM, not the index, so they sweep in anything
+# sitting under `systemu/vault/` at build time -- including the runtime state a
+# local run or a test drops there.  `.gitignore` is no defence: an ignored file
+# is still a file on disk, and setuptools has never heard of git.  PyPI 0.10.25
+# shipped five such files (activities/, evolutions/, notifications/, elder/ and
+# a scrolls/*.json), which hands every installer a vault that is already "used"
+# and discloses whatever the builder's machine happened to be doing.
+#
+# setuptools applies these AFTER the include globs, per package, matching with
+# fnmatch against `<package src_dir>/<pattern>` -- where `*` also matches `/`.
+# The same file is reachable through TWO packages here (`systemu`, whose glob is
+# `vault/**/*.json`, and `systemu.vault`, whose glob is `**/*.json`), and a file
+# ships if EITHER package includes it, so every path is fenced under both.
+#
+# Deliberately narrow: nothing tracked lives under any of these, so the seed --
+# tools/, skills/, shadow_army/, decisions/, scrolls/.gitkeep -- is untouched.
+# `tests/test_wheel_excludes_runtime_state.py` pins both halves: no dropping
+# ships, AND every `git ls-files systemu/vault` path still does.
+#
+# THIS LIST MIRRORS `.gitignore`, ENTRY FOR ENTRY.
+# It used to hold six of the ~40 paths `.gitignore` names under `systemu/`, and
+# a wheel built on a machine that had ever run the daemon or the suite shipped
+# the rest: a build from a tree with a dropping at every ignored path swept 41
+# of them in, `vault/secrets/*` (the per-vault secret store) and
+# `vault/dashboard_auth.json` (the dashboard credential) among them.
+# `tests/test_wheel_excludes_all_ignored_vault_state.py` derives its planted set
+# from `.gitignore` itself and pins the mirror, so adding an ignore entry
+# without adding it here now reds a named test instead of shipping.
+#
+# The extensionless / dotfile entries below (`.effect_tags_seed`,
+# `*.lock`, ...) cannot leak TODAY -- no include glob matches them, and `glob`
+# skips names beginning with a dot. That is an accident of the include globs,
+# not a fence: widen one to `vault/**/*` and they become live. They are listed
+# so the fence does not depend on that accident.
+"systemu" = [
+    # Runtime state directories -- nothing under these is ever seed content.
+    "vault/activities/*",
+    "vault/executions/*",
+    "vault/evolutions/*",
+    "vault/notifications/*",
+    "vault/elder/*",
+    "vault/secrets/*",
+    "vault/world_model/*",
+    "vault/capabilities/*",
+    "vault/table/*",
+    "vault/metrics/*",
+    "vault/audit/*",
+    "vault/messaging/*",
+    "vault/scrolls/*.json",
+    # Runtime side-stores, by name (the per-store rows). These must be exact
+    # names: `*` matches `/` here, so `vault/*.json` would strip the whole seed.
+    "vault/census_consent.json",
+    "vault/funnel.json",
+    "vault/growth_snapshot.json",
+    "vault/granted_roots.json",
+    "vault/items.json",
+    "vault/affinity_log.json",
+    "vault/rejection_store.json",
+    "vault/tool_metrics.json",
+    "vault/command_approvals.json",
+    "vault/dep_approvals.json",
+    "vault/dashboard_auth.json",
+    "vault/user_profile.json",
+    "vault/user_facts.jsonl",
+    "vault/manual_events.jsonl",
+    "vault/supervisor_queue.json",
+    "vault/memory_consolidation_meta.json",
+    # Vault-root incident droppings (a daemon that resolved into the package
+    # tree) and the tool credential fallback store.
+    "vault/.credentials.json",
+    "vault/.systemu_daemon.json",
+    "vault/.effect_tags_seed",
+    "vault/.first_gate_review",
+    "vault/.package_manifest_baseline.json",
+    # Per-process liveness, never shipped content.
+    "vault/*.lock",
+    "vault/**/*.lock",
+    # Runtime shadows. `.gitignore` ignores `shadow_shadow_*/` and then
+    # UN-ignores the one seeded Wild Card; fnmatch has no negation, so the
+    # exception is spelled out as "any name that differs from `wildcard` at
+    # some position". Nine patterns, one per prefix length, and the last one
+    # catches `shadow_shadow_wildcard<more>` (a non-separator next character).
+    # `test_every_tracked_vault_file_still_ships` is what proves the real
+    # `shadow_shadow_wildcard/shadow.json` survives all nine.
+    "vault/shadow_army/shadow_shadow_[!w]*",
+    "vault/shadow_army/shadow_shadow_w[!i]*",
+    "vault/shadow_army/shadow_shadow_wi[!l]*",
+    "vault/shadow_army/shadow_shadow_wil[!d]*",
+    "vault/shadow_army/shadow_shadow_wild[!c]*",
+    "vault/shadow_army/shadow_shadow_wildc[!a]*",
+    "vault/shadow_army/shadow_shadow_wildca[!r]*",
+    "vault/shadow_army/shadow_shadow_wildcar[!d]*",
+    "vault/shadow_army/shadow_shadow_wildcard[!/]*",
+    # Outside the vault: the capture sessions and the runtime db/side-store dir.
+    "captures/*",
+    "data/*",
+]
+"systemu.vault" = [
+    "activities/*",
+    "executions/*",
+    "evolutions/*",
+    "notifications/*",
+    "elder/*",
+    "secrets/*",
+    "world_model/*",
+    "capabilities/*",
+    "table/*",
+    "metrics/*",
+    "audit/*",
+    "messaging/*",
+    "scrolls/*.json",
+    "census_consent.json",
+    "funnel.json",
+    "growth_snapshot.json",
+    "granted_roots.json",
+    "items.json",
+    "affinity_log.json",
+    "rejection_store.json",
+    "tool_metrics.json",
+    "command_approvals.json",
+    "dep_approvals.json",
+    "dashboard_auth.json",
+    "user_profile.json",
+    "user_facts.jsonl",
+    "manual_events.jsonl",
+    "supervisor_queue.json",
+    "memory_consolidation_meta.json",
+    ".credentials.json",
+    ".systemu_daemon.json",
+    ".effect_tags_seed",
+    ".first_gate_review",
+    ".package_manifest_baseline.json",
+    "*.lock",
+    "**/*.lock",
+    "shadow_army/shadow_shadow_[!w]*",
+    "shadow_army/shadow_shadow_w[!i]*",
+    "shadow_army/shadow_shadow_wi[!l]*",
+    "shadow_army/shadow_shadow_wil[!d]*",
+    "shadow_army/shadow_shadow_wild[!c]*",
+    "shadow_army/shadow_shadow_wildc[!a]*",
+    "shadow_army/shadow_shadow_wildca[!r]*",
+    "shadow_army/shadow_shadow_wildcar[!d]*",
+    "shadow_army/shadow_shadow_wildcard[!/]*",
+]

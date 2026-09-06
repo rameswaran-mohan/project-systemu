@@ -94,25 +94,36 @@ def _capture_grounding(tool: Tool, scroll: Optional["Scroll"]) -> None:
         logger.debug("[Forge] grounding capture failed for '%s'", tool.name, exc_info=True)
 
 
-def _dedup_advisory_line(vault, tool) -> str:
-    """R-CAP1 / CAP-6 - the same-slot near-duplicate advisory for ``tool``.
+def _dedup_advisory_line(vault, tool, *, description: str) -> str:
+    """R-CAP1 / CAP-6 - the near-duplicate advisory for ``tool``.
 
-    One plain heads-up line when an existing tool already occupies this tool's
-    capability slot, so the operator can extend instead of keeping a duplicate.
-    Empty string when the slot is free (the common small-catalog case), which is
-    what keeps every caller's output byte-identical when there is nothing to say.
+    One plain heads-up line when an existing tool already covers this tool's
+    capability, so the operator can extend instead of keeping a duplicate. Empty
+    string when nothing matches (the common small-catalog case), which is what
+    keeps every caller's output byte-identical when there is nothing to say.
+
+    ``description`` IS REQUIRED, and keyword-only so it cannot be supplied by
+    accident of argument order. The v0.10.27 slice wired this line into all five
+    forge paths but handed it only ``tool.name``, and a name-only detector was
+    witnessed to be nearly silent against the real 41-tool seed catalog: a
+    version suffix, a reordered token or a synonym verb all defeated it, and 23
+    of the 41 seeded tools had no derivable slot at all. ``near_duplicate_advisory``
+    now runs a token lens over name AND description, so a proposal whose name says
+    little ("helper_thing") but whose description says "fetch json from a url" is
+    still matched against ``fetch_json``. Defaulting the argument would have let a
+    call site quietly opt out of half the detector, so there is no default.
 
     ADVISORY ONLY - this INFORMS the forge, it is never an admission gate: a
-    collision does not stop a forge, and neither does a failure to compute this
-    line (both ``slot_collisions`` and ``forge_dedup_advisory`` are already
-    never-raise; this catch is the belt for anything upstream of them, e.g. an
-    import failure). Swallowing a courtesy line's failure is tolerable; swallowing
-    it INVISIBLY is not, hence the debug record.
+    match does not stop a forge, and neither does a failure to compute this line
+    (``slot_collisions``, ``near_duplicates`` and ``forge_dedup_advisory`` are all
+    already never-raise; this catch is the belt for anything upstream of them,
+    e.g. an import failure). Swallowing a courtesy line's failure is tolerable;
+    swallowing it INVISIBLY is not, hence the debug record.
     """
     try:
         from systemu.runtime import capability_index as _capidx
-        return _capidx.forge_dedup_advisory(
-            tool.name, _capidx.slot_collisions(vault, tool.name, exclude_id=tool.id))
+        return _capidx.near_duplicate_advisory(
+            vault, tool.name, description, exclude_id=tool.id)
     except Exception:
         logger.debug(
             "[Forge] same-slot dedup advisory unavailable for '%s' - forge continues",
@@ -227,7 +238,7 @@ def save_approved_code(
     # operator already read), so it needs the same-slot advisory computed here or
     # it stays the one forge surface silent about a near-duplicate. Derived before
     # the write, so it describes the catalog as it stood pre-creation.
-    dedup_line = _dedup_advisory_line(vault, tool)
+    dedup_line = _dedup_advisory_line(vault, tool, description=tool.description)
 
     impl_dir  = Path(config.vault_dir) / "tools" / "implementations"
     impl_dir.mkdir(parents=True, exist_ok=True)
@@ -469,7 +480,7 @@ def forge_tool(
     # operator approved against is byte-for-byte the line recorded on the forge
     # event - a second derive could disagree with the first (the catalog can move
     # between the gate and the LLM round-trip).
-    _dedup_line = _dedup_advisory_line(vault, tool)
+    _dedup_line = _dedup_advisory_line(vault, tool, description=tool.description)
 
     # ── User confirmation gate (CLI path) ─────────────────────────────────
     choice = notify_user(
@@ -604,7 +615,7 @@ def _generate_and_save_code(
     # Derived BEFORE the LLM round-trip so the advisory describes the catalog as
     # it stood when this forge was admitted, not after it.
     if dedup_line is None:
-        dedup_line = _dedup_advisory_line(vault, tool)
+        dedup_line = _dedup_advisory_line(vault, tool, description=tool.description)
 
     code_payload: Dict[str, Any] = {
         "tool_spec":      tool.model_dump(mode="json"),

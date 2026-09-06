@@ -63,9 +63,42 @@ exception — see its note.
                              account name — the one place the census records a
                              personally-identifying string, disclosed here.
 
+CONSENT IS BOUND TO A GENERATION, NOT ONLY TO A VAULT
+-----------------------------------------------------
+The per-vault MAC alone answered "was this file signed by THIS vault?" and nothing else,
+so one genuinely-signed file stayed valid forever. Witnessed end to end on v0.10.27:
+save ``census_consent.json``, run ``census revoke``, copy the saved bytes back, and
+``census status`` reports GRANTED again while the next survey re-scans the machine. The
+operator's LAST ACT was a withdrawal.
+
+The MAC key is therefore derived per (vault, EPOCH). The epoch is a monotonic integer in
+a census-owned sidecar — :func:`consent_epoch_file`, ``<vault>/secrets/census_consent.epoch``
+— that :meth:`CensusConsentStore.revoke` ADVANCES before it rewrites the file. Every
+signature issued before a withdrawal is stale from the instant the withdrawal lands, so a
+restored copy authenticates against a key that no longer exists. ``grant`` / ``set_paused``
+/ ``mark_ran`` never advance it: they record or suspend an answer rather than withdrawing
+one, and bumping there would invalidate the operator's OTHER live grants.
+
+A consent file with NO epoch sidecar is UNCONSENTED, never grandfathered — the same rule
+the unsigned ``version: 1`` format gets, and for the same reason: nothing on disk can
+prove which generation an unanchored file belongs to. The absent-sidecar case reads as
+"epoch 0" only where there is also no consent file, i.e. a fresh install, and even that
+is minted on the SIGNING path alone (reading a fresh vault still creates nothing).
+
+WHAT THAT DOES NOT CLAIM (typed P under DEC-36). Restoring BOTH the consent file and the
+epoch sidecar replays, and so does restoring ``dashboard_auth``'s session secret. Those
+are writes to the KEY-DOMAIN files themselves: in-process Python is one trust domain, and
+a party who can rewrite the key material can mint a genuine signature directly. DELETING
+the sidecar is the same class — it fails CLOSED at once (everything reads UNCONSENTED)
+but resets the counter, so a LATER operator-typed grant re-creates epoch 0 and a copy
+signed at epoch 0 verifies again. Stated rather than papered over. The claim this fence
+DOES make is the one the defect broke: a SINGLE restored consent file never revives a
+withdrawn consent.
+
 WHERE IT IS STORED, AND WHERE IT GOES
 -------------------------------------
 Consent: ``<vault>/census_consent.json`` (this module — sole writer).
+Consent generation: ``<vault>/secrets/census_consent.epoch`` (this module — sole writer).
 Derived facts: the R-W1 durable fact store (see :mod:`ambient_census`, which owns that
 side of the boundary — this module holds consent state and nothing else).
 Both are local files inside the operator's own vault.
@@ -162,13 +195,151 @@ CONSENT_FORMAT_VERSION = 2
 _CONSENT_KEY_INFO = b"systemu/census-consent/key/v1"
 _CONSENT_MAC_PREFIX = b"systemu/census-consent/mac/v1\x00"
 
+#: Binds the derived key to the consent GENERATION. Unambiguous by construction: the
+#: base info string contains no NUL and a decimal epoch contains no NUL, so no (info,
+#: epoch) pair can spell the same bytes as another.
+_CONSENT_KEY_EPOCH_TAG = b"\x00epoch="
+
+#: The consent-generation anchor. It lives under the vault's ``secrets/`` directory — not
+#: at the vault root next to the consent file — because that directory is already fenced
+#: as runtime state on every road out of the tree: ``.gitignore``'s
+#: ``systemu/vault/secrets/`` rule and
+#: ``tests/test_packaged_vault_carries_no_runtime_state.py``'s ``RUNTIME_STATE_DIRS``.
+#: An anchor that shipped in the wheel would be identical on every install, which is the
+#: same collapse of "per-vault" to "global" that a shipped session secret causes.
+_CONSENT_EPOCH_DIRNAME = "secrets"
+CONSENT_EPOCH_FILENAME = "census_consent.epoch"
+
+#: The anchor's whole vocabulary: one non-negative ASCII decimal integer. Deliberately
+#: NOT ``str.isdigit`` / bare ``int()`` — both accept non-ASCII decimal digits (and
+#: ``isdigit`` accepts superscripts), so "the file holds a number" and "the file holds
+#: the number I will re-serialise" would be different questions.
+_ASCII_DIGITS = frozenset("0123456789")
+
+#: Bounds the anchor read. A real epoch counts operator withdrawals; anything needing
+#: more than 18 digits is not one.
+_MAX_EPOCH_DIGITS = 18
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _consent_key(base_dir) -> bytes:
-    """The per-vault HMAC key for ``census_consent.json``.
+def consent_epoch_file(base_dir) -> Path:
+    """``<base_dir>/secrets/census_consent.epoch`` — the consent-generation anchor."""
+    return Path(base_dir) / _CONSENT_EPOCH_DIRNAME / CONSENT_EPOCH_FILENAME
+
+
+def read_consent_epoch(base_dir) -> Optional[int]:
+    """The current consent generation, or ``None``.
+
+    STRICT, and ``None`` is the fence value (DEC-32): absent, unreadable, empty, padded,
+    signed, fractional, non-ASCII, over-long or non-decimal all read as "no anchor",
+    which :meth:`CensusConsentStore._load` turns into UNCONSENTED whenever a consent file
+    is present. There is no "probably meant zero" branch — that branch is precisely the
+    grandfathering this anchor exists to refuse.
+
+    Creates NOTHING. ``run_census`` calls into the read path on every survey, so a
+    read-only privacy check must never mint the state it is checking (the same reason
+    :meth:`CensusConsentStore._load` short-circuits before key derivation).
+    """
+    try:
+        raw = consent_epoch_file(base_dir).read_text(encoding="ascii")
+    except Exception:
+        return None
+    # `type(x) is T` in the same frame before any operation on x (DEC-36): `raw` came
+    # off disk, and `.strip`/`in`/`<=` all dispatch on a hostile type.
+    if type(raw) is not str:
+        return None
+    text = raw.strip()
+    if not text or len(text) > _MAX_EPOCH_DIGITS:
+        return None
+    if not set(text) <= _ASCII_DIGITS:
+        return None
+    value = int(text)
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _write_consent_epoch(base_dir, epoch: int) -> None:
+    """Atomically replace the anchor with ``epoch`` (tmp + ``os.replace``).
+
+    ``mkstemp`` creates the temp file 0600 and ``os.replace`` carries that mode over, so
+    the anchor lands with the same permissions as everything else under ``secrets/``.
+    """
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError("the census consent epoch must be a non-negative int")
+    directory = Path(base_dir) / _CONSENT_EPOCH_DIRNAME
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix="census_consent.epoch.",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(str(epoch))
+        os.replace(tmp, str(consent_epoch_file(base_dir)))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _current_epoch_or_create(base_dir) -> int:
+    """The SIGNING path's view of the generation: get-or-create, starting at 0.
+
+    Only the signing path may create. A vault with no anchor and no consent file is a
+    fresh install, and generation 0 is its correct first answer. A vault with no anchor
+    and a consent file present is UNCONSENTED on read (see :meth:`CensusConsentStore._load`),
+    so the file this creation re-anchors is never the one already on disk — ``grant``
+    rewrites from its own (empty) load.
+    """
+    current = read_consent_epoch(base_dir)
+    if type(current) is int:
+        return current
+    _write_consent_epoch(base_dir, 0)
+    return 0
+
+
+def _bump_consent_epoch(base_dir) -> int:
+    """Advance the consent generation. THE WITHDRAWAL PRIMITIVE.
+
+    Sole caller: :meth:`CensusConsentStore.revoke`, under ``_CONSENT_LOCK``. Registered
+    in ``docs/CONC-MAP.md`` and pinned by ``tests/test_conc_map_writer_ownership.py`` on
+    THIS call — which makes that guard a reachability pin, not only an allowlist: delete
+    the bump from ``revoke`` and its "declared writer no longer calls this" half fails.
+
+    A second caller would be a DEC-10 review AND a consent question: advancing the
+    generation invalidates every signature the operator currently holds, so anything but
+    a withdrawal doing it silently revokes consent the operator never withdrew.
+    """
+    nxt = _current_epoch_or_create(base_dir) + 1
+    _write_consent_epoch(base_dir, nxt)
+    return nxt
+
+
+def _consent_key(base_dir, epoch=None) -> bytes:
+    """The per-vault, per-GENERATION HMAC key for ``census_consent.json``.
+
+    ``epoch`` is the consent generation the key belongs to, and the two call sites want
+    opposite things from it, so it is explicit rather than implied:
+
+      * ``None`` (the SIGNING path, :meth:`CensusConsentStore._write`) means "the current
+        generation, creating the anchor at 0 if this vault has none". A signer must be
+        able to anchor a fresh install.
+      * an int (the VERIFYING path, :meth:`CensusConsentStore._load`) is the generation
+        read STRICTLY off disk. The verifier never falls back to a default: a missing
+        anchor is refused BEFORE this function is reached, because a verifier that
+        assumed 0 would honour every signature ever issued by a vault whose anchor was
+        deleted.
+
+    Making the epoch part of the KEY rather than a field in the signed body is
+    deliberate. A plaintext ``epoch`` field would have to be compared separately, and a
+    second layer that checks something CHEAPER than the MAC is worse than no second layer
+    (DEC-34): it manufactures confidence while the MAC alone still decides. With the key
+    bound to the generation there is exactly ONE check, and a stale file fails it the same
+    way a tampered file does — whole-file, fail-closed, no partial trust.
 
     NOT a new secret scheme. It is DERIVED, by HMAC domain separation, from the per-vault
     secret this codebase already generates and persists — ``dashboard_auth.session_secret``
@@ -198,7 +369,14 @@ def _consent_key(base_dir) -> bytes:
     # A stand-in object with a __len__ and an __eq__ must not reach `encode`.
     if type(seed) is not str or len(seed) < 32:
         raise ValueError("no usable per-vault secret for the census consent MAC")
-    return hmac.new(seed.encode("utf-8"), _CONSENT_KEY_INFO, hashlib.sha256).digest()
+    # The seed is checked BEFORE the anchor is get-or-created, so a vault that cannot
+    # sign does not acquire an anchor as a side effect of trying.
+    if epoch is None:
+        epoch = _current_epoch_or_create(base_dir)
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError("no usable consent generation for the census consent MAC")
+    info = _CONSENT_KEY_INFO + _CONSENT_KEY_EPOCH_TAG + str(epoch).encode("ascii")
+    return hmac.new(seed.encode("utf-8"), info, hashlib.sha256).digest()
 
 
 def _canonical_body(version: int, grants) -> bytes:
@@ -449,9 +627,10 @@ class CensusConsentStore:
         for again. Reading a v1 file leaves it exactly as it was.
 
         FAIL-CLOSED IN EVERY DIRECTION: absent, unreadable, unparseable, wrong version,
-        wrong shape, missing MAC, wrong MAC, or NO DERIVABLE KEY all yield no grants and
-        never an exception. The failure mode of a damaged or unauthenticated consent file
-        is that the census does not run.
+        wrong shape, missing MAC, wrong MAC, MISSING OR MALFORMED GENERATION ANCHOR, a
+        MAC signed at an earlier generation, or NO DERIVABLE KEY all yield no grants and
+        never an exception. The failure mode of a damaged, unauthenticated or WITHDRAWN
+        consent file is that the census does not run.
 
         The absent-file check comes FIRST and short-circuits before any key derivation.
         ``session_secret`` is get-or-CREATE, so deriving the key on the fresh-install path
@@ -481,12 +660,21 @@ class CensusConsentStore:
         claimed = data.get("mac")
         if type(claimed) is not str:
             return {}
+        # THE GENERATION ANCHOR, read STRICTLY. A consent file with no readable anchor
+        # is UNCONSENTED — the same rule the unsigned v1 format gets, and refused for the
+        # same reason: nothing on disk can prove which generation an unanchored file
+        # belongs to, and "assume 0" would honour every signature a vault ever issued.
+        # Like the version above, this is NOT taken from the consent file: the verifier
+        # never derives its expectation from an input the verified party controls (DEC-34).
+        epoch = read_consent_epoch(self._base)
+        if type(epoch) is not int:
+            return {}
         try:
             # The VERSION fed to the MAC is the module constant, not the file's field.
             # They are equal by the check above; using the constant means the verifier
             # never derives its expectation from an input the verified party controls
             # (DEC-34).
-            expected = _consent_mac(_consent_key(self._base),
+            expected = _consent_mac(_consent_key(self._base, epoch),
                                     CONSENT_FORMAT_VERSION, grants)
             candidate = claimed.encode("ascii")
         except Exception:
@@ -555,6 +743,11 @@ class CensusConsentStore:
         cannot sign must never be written: it would read back as UNCONSENTED on the next
         load, so the operator would have answered "yes" to a control that silently threw
         the answer away. Raising instead makes the grant surface report the failure.
+
+        Signs at the CURRENT generation, get-or-creating the anchor at 0 on a vault that
+        has none (:func:`_current_epoch_or_create`). Every mutator rewrites the whole file
+        from its own load, so this is also what re-anchors the rows a ``revoke`` did not
+        withdraw: they are re-signed into the new generation the same call that bumped it.
         """
         key = _consent_key(self._base)
         self._base.mkdir(parents=True, exist_ok=True)
@@ -602,12 +795,32 @@ class CensusConsentStore:
         This removes the CONSENT only. Purging the facts the category produced is
         :func:`ambient_census.revoke_category`'s job — the one entry point that does
         both, and the one the operator surface should call.
+
+        ADVANCES THE CONSENT GENERATION (:func:`_bump_consent_epoch`) before rewriting
+        the file, which is what makes a withdrawal stick against a restored copy. Order
+        and placement are both load-bearing:
+
+          * bump BEFORE the rewrite, so :meth:`_write` signs the surviving rows with the
+            NEW key. Reversed, the rewrite would be signed into the generation it is about
+            to invalidate and the operator's other grants would all die with this one.
+          * bump INSIDE ``_CONSENT_LOCK``, alongside the read-modify-write it belongs to.
+            Outside it, a ``mark_ran`` that loaded before the bump and wrote after it
+            would re-sign the revoked grant into the new generation — a resurrection the
+            epoch cannot catch, because the resurrected file would be genuinely current.
+
+        If the rewrite then fails (an unsignable vault), the generation has already moved
+        and the file left on disk is stale: everything reads UNCONSENTED. That is the
+        fail-closed direction for a withdrawal.
+
+        A no-op revoke does NOT bump. There is no signature to stale out, and a counter
+        that moved on every call would turn a privacy file into a liveness signal.
         """
         with _CONSENT_LOCK:
             grants = self._load()
             if category not in grants:
                 return False
             grants.pop(category, None)
+            _bump_consent_epoch(self._base)
             self._write(grants)
         return True
 

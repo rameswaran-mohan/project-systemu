@@ -528,18 +528,174 @@ def slot_collisions(vault, name: str, *, exclude_id: Optional[str] = None,
         return []
 
 
+_ADVISORY_TAIL = "Consider extending one of those instead of forging a duplicate."
+
+
 def forge_dedup_advisory(name: str, collisions: List[Dict[str, Any]]) -> str:
     """One plain heads-up line for the forge confirmation if ``name`` collides with
     existing tools in its capability slot (CAP-6). Empty string if none — so the
-    caller adds nothing when the slot is free. Never a hard block."""
+    caller adds nothing when the slot is free. Never a hard block.
+
+    Signature is FROZEN at two positional arguments: the shipped all-paths
+    reachability pin spies on this function with a two-arg stub, and the wording
+    is byte-pinned by ``tests/test_p4_forge_advisory_all_paths.py``. The
+    token-similarity half is merged in by ``near_duplicate_advisory`` below
+    rather than by growing a parameter here."""
     cols = [c for c in (collisions or []) if isinstance(c, dict)]
     if not cols:
         return ""
     names = ", ".join(sorted({str(c.get("name", "")) for c in cols if c.get("name")})[:5])
     slots = ", ".join(sorted({s for c in cols for s in (c.get("slots") or [])}))
     return (f"Heads up: this shares the {slots or 'same'} capability with existing "
-            f"tool(s): {names}. Consider extending one of those instead of forging a "
-            f"duplicate.")
+            f"tool(s): {names}. {_ADVISORY_TAIL}")
+
+
+# --------------------------------------------------------------------------- #
+# CAP-6b — the SECOND near-duplicate lens, unioned with the slot lens
+#
+# WITNESSED DEFECT (v0.10.27 e2e, against the real 41-tool seed catalog): the
+# advisory was wired into all five forge paths but was in substance SILENT,
+# because ``slot_collisions`` is its only detector and a slot is derived from
+# name tokens alone (first token = verb, last token = target):
+#
+#     fetch_json_v2        -> read:v2   (a version suffix defeats it)
+#     fetch_json_from_url  -> read:url  (a trailing qualifier defeats it)
+#     json_fetch           -> no slot   (first token is not a verb)
+#     read_file            -> read:file, which download_file occupies — so the
+#                             operator was pointed at the WRONG neighbour while
+#                             file_read (create:read) went unmentioned
+#
+# and 23 of the 41 seeded tools carry NO slot at all, so nothing could ever be
+# flagged as their duplicate. The release promises "a near-duplicate of an
+# existing tool is named"; that promise needed a second lens to be true.
+#
+# UNION, NOT REPLACEMENT. The slot lens catches pairs whose surface words differ
+# (open_issue / create_issue); the token lens catches pairs whose words match but
+# whose slot does not. Both run; their results are merged and de-duplicated.
+#
+# STILL ADVISORY (CAP-6): this informs the forge gate and never blocks it.
+# --------------------------------------------------------------------------- #
+
+#: Jaccard floor for "these two names describe the same thing". A subset in
+#: either direction qualifies regardless (``fetch_json`` c= ``fetch_json_api``).
+_SIMILARITY_THRESHOLD = 0.5
+#: How many token-similarity neighbours an advisory names. The slot half has its
+#: own cap; this one keeps a broad name from listing half the catalog.
+_SIMILARITY_LIMIT = 3
+
+
+def near_duplicates(vault, name: str, description: str = "", *,
+                    exclude_id: Optional[str] = None,
+                    exclude_names: Optional[Any] = None,
+                    limit: int = _SIMILARITY_LIMIT,
+                    live: bool = True) -> List[Dict[str, Any]]:
+    """CAP-6b — existing tools that look like the SAME CAPABILITY as a proposed
+    ``name`` + ``description``, by normalized token overlap. Compact dicts, ranked
+    best-first, at most ``limit``. Never writes, never raises (advisory only).
+
+    A candidate must clear TWO bars, not one:
+
+    * the token sets are a subset in either direction, OR their Jaccard is at
+      least ``_SIMILARITY_THRESHOLD``; and
+    * the overlap contains at least one OBJECT token. Sharing only a folded verb
+      class is no evidence — ``fetch_html`` and ``clipboard_read`` are both
+      "read" and are not remotely the same tool. This bar is what keeps the
+      negative cases negative.
+
+    RANKING is a total, deterministic tuple ending in ``tool_id`` (replay-stable,
+    never storage-iteration order): a name that is the proposal modulo a version
+    suffix first, then Jaccard, then shared object count, then how much of the
+    EXISTING tool's description the proposal echoes, then name, then id.
+
+    The ``description`` is a real input on both sides, not decoration: it is the
+    only signal when a proposal's name is vague (``helper_thing`` described as
+    "fetch json from a url"), and it is the tie-break that orders two otherwise
+    indistinguishable neighbours. It is used for MATCHING here, never for
+    ranking a tool into a prompt — CAP-3's keyword-stuffing defense applies to
+    ``score_key``/``order_records``, which still ignore ``detail``. Stuffing a
+    description here can only make a forge MORE likely to be called a duplicate,
+    which costs an attacker rather than paying them.
+    """
+    try:
+        proposal = cs.similarity_tokens(name) | cs.similarity_tokens(description)
+        if not proposal:
+            return []
+        key = cs.stripped_name_key(name)
+        skip = {str(n) for n in (exclude_names or ())}
+        rows = derive_index(vault) if live else load_index(vault)
+        scored = []
+        for r in rows:
+            if exclude_id and r.tool_id == exclude_id:
+                continue
+            if r.name in skip:
+                continue
+            existing = cs.similarity_tokens(r.name)
+            if not existing:
+                continue
+            shared = proposal & existing
+            objects = [t for t in shared if cs.is_object_token(t)]
+            if not objects:
+                continue
+            jaccard = cs.token_jaccard(proposal, existing)
+            subset = existing <= proposal or proposal <= existing
+            if not (subset or jaccard >= _SIMILARITY_THRESHOLD):
+                continue
+            echo = len(proposal & cs.similarity_tokens(r.detail))
+            scored.append((
+                0 if cs.stripped_name_key(r.name) == key else 1,
+                -round(jaccard, 6), -len(objects), -echo, r.name, r.tool_id,
+                cs.order_shared_tokens(shared),
+            ))
+        scored.sort()
+        return [{"tool_id": s[5], "name": s[4], "shared": list(s[6]),
+                 "reason": ", ".join(s[6]), "score": round(-s[1], 6)}
+                for s in scored[:max(0, int(limit))]]
+    except Exception:
+        return []
+
+
+def _merge_dedup_advisory(slot_line: str,
+                          similar: List[Dict[str, Any]]) -> str:
+    """Fold the token-similarity neighbours into the slot-collision line.
+
+    BYTE-IDENTICAL FLOOR: with no token neighbours this returns ``slot_line``
+    untouched, so every wording the shipped paths already emit — including the
+    empty string for a free slot — is unchanged."""
+    rows = [s for s in (similar or []) if isinstance(s, dict) and s.get("name")]
+    if not rows:
+        return slot_line or ""
+    listed = "; ".join(
+        f"{s['name']} (shares: {s.get('reason') or 'the same words'})"
+        for s in rows)
+    if slot_line:
+        head = slot_line
+        if head.endswith(_ADVISORY_TAIL):
+            head = head[:-len(_ADVISORY_TAIL)].rstrip()
+        return (f"{head} It also looks like a near-duplicate of existing "
+                f"tool(s): {listed}. {_ADVISORY_TAIL}")
+    return ("Heads up: this looks like a near-duplicate of existing tool(s): "
+            f"{listed}. {_ADVISORY_TAIL}")
+
+
+def near_duplicate_advisory(vault, name: str, description: str = "", *,
+                            exclude_id: Optional[str] = None) -> str:
+    """THE forge-facing entry point: the UNION of both near-duplicate lenses as
+    one plain line, de-duplicated (a tool the slot lens already named is not
+    named again), empty when neither lens has anything to say.
+
+    Deliberately NOT wrapped in a try/except: ``slot_collisions`` and
+    ``near_duplicates`` are both never-raise, and the ONE caller
+    (``tool_forge._dedup_advisory_line``) already degrades to "" *and writes a
+    debug record*. Swallowing here instead would make that failure invisible,
+    which is the one thing a courtesy line is not allowed to do."""
+    collisions = slot_collisions(vault, name, exclude_id=exclude_id)
+    slot_line = forge_dedup_advisory(name, collisions)
+    already_named = {str((c or {}).get("name") or "")
+                     for c in (collisions or []) if isinstance(c, dict)}
+    similar = near_duplicates(vault, name, description,
+                              exclude_id=exclude_id,
+                              exclude_names=already_named)
+    return _merge_dedup_advisory(slot_line, similar)
 
 
 def find_tools(vault, query: str, limit: Optional[int] = None,

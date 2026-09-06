@@ -50,6 +50,88 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
 
+#: The audit tree's directory name, relative to the OPERATING HOME.
+DEFAULT_DATA_DIRNAME = "data"
+
+
+def _home_from_default_layout(root: Path) -> Optional[Path]:
+    """Invert the vault mint's DEFAULT layout: ``<home>/systemu/vault`` -> ``<home>``.
+
+    ``None`` when the minted root does not end in that layout (an absolute
+    ``SYSTEMU_VAULT_DIR``, a container mount): there is no home to recover from
+    such a root, and inventing one is how a resolver starts disagreeing with the
+    callers that pass their own ``data_dir``.
+    """
+    from systemu.runtime.vault_root import DEFAULT_RELATIVE_VAULT
+
+    suffix = Path(DEFAULT_RELATIVE_VAULT).parts
+    parts = root.parts
+    if len(parts) <= len(suffix):
+        return None
+    tail = tuple(os.path.normcase(p) for p in parts[-len(suffix):])
+    want = tuple(os.path.normcase(p) for p in suffix)
+    if tail != want:
+        return None
+    return Path(*parts[:-len(suffix)])
+
+
+def audit_data_root(explicit=None) -> Path:
+    """THE ONE resolver for the audit data root -- the ``<root>/audit/exec_*/`` tree.
+
+    WHY THIS EXISTS.  Both ends of the snapshot pathway used to spell the answer as
+    the relative string ``"data"``, which every process then resolved against its
+    OWN working directory.  The daemon child is spawned with ``cwd=operating_home``
+    (``scheduler/daemon.py``, the ``operating_home`` handed to ``Popen``), so it
+    wrote under the operator's home; ``systemu debug avoidable-ask`` read under
+    wherever the operator happened to be standing.  Same machine, same vault env,
+    same snapshot file on disk -- and the report answered "no run has persisted a
+    RequirementReport yet", which is a claim about EVERY run that ever executed,
+    produced by a purely local accident of the shell's cwd.
+
+    THE RULE.  The audit data root is ``<operating home>/data``, and the operating
+    home comes from the vault-root MINT (``vault_root.resolve_vault_root``) rather
+    than from a second derivation here.  Two ways, in order, both minted:
+
+      1. INVERT THE DEFAULT LAYOUT.  The mint's default root is
+         ``<home>/systemu/vault``, so stripping that suffix names the same home for
+         every process that shares ``SYSTEMU_VAULT_DIR`` -- whatever directory each
+         one was launched from.  This is the branch that fixes the defect: the
+         daemon parent pins that env var to the minted absolute root before the
+         spawn, so the operator's shell and the daemon child invert the same string.
+      2. OTHERWISE the mint's own ``home`` field, which is this process's operating
+         home.  A root that does not end in the default layout (an absolute
+         ``SYSTEMU_VAULT_DIR``, a container mount) carries no home to recover, and
+         this branch is byte-identical to the ``Path("data")`` it replaced.
+
+    WHAT BRANCH 2 DOES NOT DO, said plainly: it does not make an arbitrary absolute
+    vault root readable from another cwd.  Rooting the audit tree inside such a
+    vault WOULD -- and would also split it from the callers below that pass a
+    relative ``data_dir`` of their own (``scheduler/jobs.py`` passes
+    ``Path("data")``), which is the same class of defect with a new location.  So
+    the honest answer there is the unchanged one, and the operator surface that
+    renders an unmeasured verdict NAMES the directory it searched
+    (``interface/cli_commands.py``, ``debug_avoidable_ask``) so a mismatch is
+    visible rather than reported as a fact about the corpus.
+
+    NO FILE MOVES.  With no ``SYSTEMU_VAULT_DIR`` set the mint returns
+    ``<cwd>/systemu/vault``, branch 1 returns ``<cwd>``, and the result is
+    ``<cwd>/data`` -- the location every existing install already holds.
+
+    ``explicit`` always wins and is returned unchanged: the reconcilers already
+    pass the data dir they scan, and a resolver that overrode them would silently
+    split the audit tree in two.
+    """
+    if explicit is not None:
+        return Path(explicit)
+    from systemu.runtime.vault_root import resolve_vault_root
+
+    verdict = resolve_vault_root()
+    home = _home_from_default_layout(Path(verdict.root))
+    if home is None:
+        home = Path(verdict.home)
+    return home / DEFAULT_DATA_DIRNAME
+
+
 def _snapshot_path(data_dir: Path, execution_id: str) -> Path:
     return data_dir / "audit" / f"exec_{execution_id}" / "resume_snapshot.json"
 
@@ -132,7 +214,7 @@ def write_snapshot(
     data_dir: Optional[Path] = None,
 ) -> Optional[Path]:
     """Persist ``snapshot`` to disk; returns the file path on success."""
-    target = _snapshot_path(Path(data_dir or "data"), snapshot.execution_id)
+    target = _snapshot_path(audit_data_root(data_dir), snapshot.execution_id)
     snapshot.snapshotted_at = snapshot.snapshotted_at or _now_iso()
     snapshot.schema_version = CURRENT_SCHEMA_VERSION
     try:
@@ -162,7 +244,7 @@ def read_snapshot(
 ) -> Optional[ExecutionSnapshot]:
     """Load a snapshot for ``execution_id``.  Returns None on missing /
     unparseable file."""
-    target = _snapshot_path(Path(data_dir or "data"), execution_id)
+    target = _snapshot_path(audit_data_root(data_dir), execution_id)
     if not target.exists():
         return None
     try:
@@ -234,7 +316,7 @@ def delete_snapshot(
 ) -> bool:
     """Best-effort delete after the resume has consumed it.  Returns True
     if a file was removed."""
-    target = _snapshot_path(Path(data_dir or "data"), execution_id)
+    target = _snapshot_path(audit_data_root(data_dir), execution_id)
     if not target.exists():
         return False
     try:

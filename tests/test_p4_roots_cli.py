@@ -45,6 +45,22 @@ B1b -- THE GRANT HALF
     else's prompt log. So: the consent copy is printed BEFORE anything is written,
     the default is NO, an unanswerable stdin refuses instead of defaulting, and a
     path that is not an existing directory is refused before consent is even asked.
+
+D12 -- ONE CONSENT RULE, AND WHAT IT CHANGED HERE
+    `roots grant` and `census grant` both create a standing permission, and they
+    used to answer a pipe differently: this command took a piped `y` as consent
+    and exited 1 on EOF; the census required a terminal and exited 2. They now
+    share `systemu/interface/consent_prompt.py`, carrying the census rule --
+    no terminal REFUSES with exit 2 whatever is on stdin, a terminal answer of
+    `y` proceeds, anything else exits 1, and `--yes` proceeds with the
+    disclosure still printed.
+
+    Four tests here pinned the old rule and were rewritten with it (the
+    lifecycle, the two refusals, the unanswerable stdin). They answer consent at
+    the shared helper's seam via `_at_a_terminal` now; every other assertion in
+    them -- the on-disk store contents, the survey behaviour, the disclosure
+    copy -- is exactly as it was. The rule itself is pinned over BOTH commands in
+    tests/test_e2e27_d12_one_consent_prompt.py.
 """
 from __future__ import annotations
 
@@ -70,6 +86,23 @@ class _FakeVault:
 def _vault_at(monkeypatch, root):
     monkeypatch.setattr(cli_commands, "_get_vault_and_config",
                         lambda ctx: (object(), _FakeVault(root)))
+
+
+def _at_a_terminal(monkeypatch, present: bool = True):
+    """Say whether a human is present, at the shared consent helper's own seam.
+
+    D12: `roots grant` and `census grant` both create a standing permission and
+    now obey ONE rule -- no terminal means REFUSE (exit 2, naming `--yes`),
+    whatever is on stdin, because a `y` arriving on a pipe is not a person who
+    read the disclosure. Under `CliRunner`, `sys.stdin.isatty()` is always
+    False, so a consented run has to say so here.
+
+    The four tests below that used to answer consent by PIPING `y` (and to
+    expect exit 1 for an unanswerable stdin) were rewritten with that ruling;
+    every other assertion in them is untouched.
+    """
+    from systemu.interface import consent_prompt
+    monkeypatch.setattr(consent_prompt, "stdin_is_a_terminal", lambda: present)
 
 
 # --------------------------------------------------------------------------- #
@@ -116,12 +149,17 @@ def test_the_full_consent_lifecycle_through_the_real_consumer(tmp_path, monkeypa
     Nothing here touches the store's write methods directly: every state change
     goes through a command an operator can actually type, and every observation
     comes from the production read path.
+
+    D12 rewrite: the consent is still a typed `y`, but it is now answered AT A
+    TERMINAL, because a piped `y` is no longer consent on either standing-
+    permission command. The lifecycle being pinned is unchanged.
     """
     vault_root = tmp_path / "vault"
     granted = tmp_path / "Documents"
     granted.mkdir()
     (granted / "bills.pdf").write_text("x")
     _vault_at(monkeypatch, vault_root)
+    _at_a_terminal(monkeypatch)
     runner = CliRunner()
 
     # nothing is surveyed before the grant
@@ -166,46 +204,58 @@ def test_grant_prints_the_consent_copy_before_it_writes_anything(tmp_path, monke
 
 
 def test_grant_refused_at_the_prompt_does_not_grant_and_exits_nonzero(tmp_path, monkeypatch):
+    """D12 rewrite: the `n` is typed AT A TERMINAL now (a piped answer no longer
+    reaches the prompt at all). Exit 1 still means "you were asked and said no",
+    and it is now distinct from exit 2, "there was nobody to ask"."""
     vault_root = tmp_path / "vault"
     granted = tmp_path / "Documents"
     granted.mkdir()
     _vault_at(monkeypatch, vault_root)
+    _at_a_terminal(monkeypatch)
 
     res = CliRunner().invoke(
         cli_commands.roots_group, ["grant", str(granted)], input="n\n")
-    assert res.exit_code == 1, res.output   # 1 = refused; 2 would be a usage error
+    assert res.exit_code == 1, res.output   # 1 = declined; 2 = no terminal to ask on
     assert GrantedRootsStore(base_dir=vault_root).list_roots() == []
     assert build_roots(GrantedRootsStore(base_dir=vault_root)) == []
 
 
 def test_grant_defaults_to_no_on_a_bare_enter(tmp_path, monkeypatch):
     """y/N, not Y/n. Someone holding return through a series of prompts must not
-    hand over a folder by momentum."""
+    hand over a folder by momentum.
+
+    D12 rewrite: answered at a terminal, since that is the only place the prompt
+    is reached now."""
     vault_root = tmp_path / "vault"
     granted = tmp_path / "Documents"
     granted.mkdir()
     _vault_at(monkeypatch, vault_root)
+    _at_a_terminal(monkeypatch)
 
     res = CliRunner().invoke(
         cli_commands.roots_group, ["grant", str(granted)], input="\n")
-    assert res.exit_code == 1, res.output   # 1 = refused; 2 would be a usage error
+    assert res.exit_code == 1, res.output   # 1 = declined; 2 = no terminal to ask on
     assert GrantedRootsStore(base_dir=vault_root).list_roots() == []
 
 
 def test_grant_with_an_unanswerable_stdin_refuses_and_names_the_yes_flag(tmp_path, monkeypatch):
     """A non-interactive caller gets a REFUSAL naming `--yes`, never the default.
 
-    Empty stdin is the honest reproduction of "nobody can answer this": click's
-    prompt hits EOF exactly as it does under a cron job or a CI runner. Falling
-    through to the N default would be safe-by-accident; it would also tell the
-    script nothing about how to proceed deliberately."""
+    D12 rewrite: the refusal now carries exit 2, not 1, and it is decided by the
+    ABSENCE OF A TERMINAL rather than by waiting for click's prompt to hit EOF.
+    That is what makes it distinguishable from "the operator declined", which a
+    wrapper must not retry -- and it is the rule `census grant` already used, so
+    the two standing-permission commands finally answer a pipe the same way.
+    Falling through to the N default would be safe-by-accident; it would also
+    tell the script nothing about how to proceed deliberately."""
     vault_root = tmp_path / "vault"
     granted = tmp_path / "Documents"
     granted.mkdir()
     _vault_at(monkeypatch, vault_root)
+    _at_a_terminal(monkeypatch, False)
 
     res = CliRunner().invoke(cli_commands.roots_group, ["grant", str(granted)], input="")
-    assert res.exit_code == 1, res.output   # 1 = refused; 2 would be a usage error
+    assert res.exit_code == 2, res.output   # 2 = no terminal to ask on; 1 = declined
     assert "--yes" in res.output
     assert GrantedRootsStore(base_dir=vault_root).list_roots() == []
 

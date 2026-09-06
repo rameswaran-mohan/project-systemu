@@ -60,6 +60,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.markup import escape
 from rich import print as rprint
 
 from sharing_on import __version__ as _sharing_on_version
@@ -149,10 +150,14 @@ def cli(ctx, debug: bool):
 
     \b
     Quick start:
-      1. Run:  systemu setup      (stores your OpenRouter API key)
-      2. Run:  systemu record --name "My Task"
-      3. Perform your task, then press Ctrl+C to stop
-      4. Find your instructions.md in the captures/ directory
+      1. Run:  systemu start      (the whole first run in one command --
+               it sets up your provider if needed and opens the dashboard.
+               The dashboard ships as an extra: pip install "systemu[dashboard]")
+      2. Run:  systemu setup      (stores your OpenRouter API key, if you would
+               rather do that step on its own)
+      3. Run:  systemu record --name "My Task"
+      4. Perform your task, then press Ctrl+C to stop
+      5. Find your instructions.md in the captures/ directory
 
     \b
     TWO NAMES, ONE PROGRAM. `pip install systemu` puts BOTH `systemu` and
@@ -803,6 +808,71 @@ def analyze(session_dir: str, model: str):
 # info command
 # ---------------------------------------------------------------------------
 
+def _provider_attribution_lines(config, *, probe=None) -> List[str]:
+    """Who is usable, and what will REALLY serve the configured model. ASCII.
+
+    D8. ``info`` used to end with ``v Configuration OK  (model: <llm_model>)``:
+    a green verdict beside a model name with nothing tying the two together. On
+    the machine it was witnessed on, the tick belonged to Ollama (the only
+    satisfied provider) while the model named beside it was an OpenRouter
+    catalog id on a box with no OpenRouter key. Both halves were true; the line
+    they shared was not. ``_print_startup_banner`` printed the same bare id.
+
+    Every fact here is MINTED by ``systemu.runtime.provider_status`` -- which
+    provider is satisfied, which provider the router will really call for a
+    model id, and the remedy line. This function chooses words; it decides
+    nothing (F19 / DEC-43). A model-prefix guess written here would be a second
+    copy of the router's key-aware rule and would cry wolf on the machine where
+    OpenRouter legitimately serves a native id.
+
+    LINE 0 IS THE MODEL ATTRIBUTION and the rest is machine-wide context, so a
+    surface that already states the machine-wide half (``info``'s
+    "Configuration issues" block carries the mint's remedy already) can render
+    line 0 alone without repeating a 200-character hint.
+
+    Never raises: neither an inspection command nor the first screen of a
+    capture run is worth losing to a provider probe.
+    """
+    try:
+        from systemu.runtime import provider_status as _ps
+        statuses = _ps.all_provider_statuses(
+            config, probe=probe, cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
+        raw = getattr(config, "llm_model", "")
+        model = raw if type(raw) is str else ""
+        # "" from the mint means it could not score the id -- so this surface
+        # WITHHOLDS the claim rather than inventing one from the prefix.
+        routed = _ps.routed_provider(model, "", config)
+        st = statuses.get(routed)
+
+        lines = []
+        if st is None:
+            lines.append(f"{model or '(none configured)'} - no provider could "
+                         f"be attributed to this model id.")
+        elif st.satisfied:
+            lines.append(f"{model} - served by {st.display}.")
+        else:
+            lines.append(f"{model} - set for {st.display}, which is not usable "
+                         f"here ({st.detail}), so it will NOT serve this model.")
+
+        usable = [s.display for s in _ps.satisfied_providers(statuses)]
+        lines.append("Usable now: " + (", ".join(usable) if usable
+                                       else "nothing - "
+                                            + _ps.configure_hint(statuses)))
+
+        # The tiers a task actually runs on are a separate selection from
+        # `llm_model`; name only the providers the line above has not already.
+        extra = [s.display for s in _ps.unusable_selected(
+            statuses, _ps.routed_tier_providers(config))
+            if s.provider != routed]
+        if extra:
+            lines.append("Also named by a task tier and not usable: "
+                         + ", ".join(extra) + ".")
+        return [ln.encode("ascii", "backslashreplace").decode("ascii")
+                for ln in lines]
+    except Exception as exc:  # pragma: no cover - defensive
+        return [f"provider attribution unavailable ({type(exc).__name__})."]
+
+
 @cli.command()
 def info():
     """Show platform capabilities and configuration status."""
@@ -847,19 +917,32 @@ def info():
     else:
         console.print("[bold green]v All dependencies installed[/bold green]")
 
-    # Config check
-    config = Config.from_env()
-    errors = config.validate()
+    # Config check. The verdict is ATTRIBUTED (D8): a green tick names the
+    # provider it belongs to, and says so when the configured model belongs to
+    # a provider that is not usable here. Guarded end to end because this
+    # section now spends a provider probe, and an inspection command that dies
+    # halfway through tells the operator less than one that says "unavailable".
     console.print()
-    if errors:
-        console.print("[bold yellow]Configuration issues:[/bold yellow]")
-        for e in errors:
-            console.print(f"  ! {e}")
+    try:
+        config = Config.from_env()
+        errors = config.validate()
+        attribution = _provider_attribution_lines(config)
+    except Exception as exc:
+        console.print(f"[yellow]! Configuration status unavailable "
+                      f"({type(exc).__name__})[/yellow]")
     else:
-        console.print(
-            f"[bold green]v Configuration OK[/bold green]  "
-            f"[dim](model: {config.llm_model})[/dim]"
-        )
+        if errors:
+            console.print("[bold yellow]Configuration issues:[/bold yellow]")
+            for e in errors:
+                console.print(f"  ! {e}")
+            # Line 0 only: the block above already carries the mint's remedy,
+            # and printing it twice is a second UX defect, not a fix.
+            console.print(f"  [dim]Model: {escape(attribution[0])}[/dim]")
+        else:
+            console.print("[bold green]v Configuration OK[/bold green]")
+            console.print(f"  [dim]Model: {escape(attribution[0])}[/dim]")
+            for line in attribution[1:]:
+                console.print(f"  [dim]{escape(line)}[/dim]")
 
     console.print()
 
@@ -1518,9 +1601,13 @@ def _census_vault():
     return open_vault(Config.from_env())
 
 
+# D11: this group's help USED to open with "(R-W2, 5.11.c)". A click docstring IS
+# the --help an operator reads, and neither identifier means anything outside this
+# repository's build documents. They are named in the region header above, which is
+# where the next engineer looks; the help says what the command does.
 @cli.group(name="census")
 def census_group():
-    """Control what systemu is allowed to notice about THIS MACHINE (R-W2, 5.11.c).
+    """Control what systemu is allowed to notice about THIS MACHINE.
 
     Separate from everything else systemu inventories: the census looks at your
     computer -- your installed apps, your cloud-sync folders -- rather than at what
@@ -1553,6 +1640,16 @@ def census_grant_cmd(category, assume_yes):
     Defaults to NO. What the category finds is included in the planning prompt
     systemu sends to its model provider, and the scan REPEATS on later runs --
     both are stated on the card before you are asked.
+
+    \b
+    Exit codes:
+      0  granted
+      1  you were asked and declined (a bare Enter counts as no)
+      2  there was no terminal to ask on -- nothing was recorded; re-run with
+         --yes once you have read the disclosure
+
+    A `y` arriving on a pipe is not consent and is refused with exit 2. The
+    same rule governs `systemu roots grant`.
     """
     from systemu.interface.cli_commands import run_census_grant
     sys.exit(run_census_grant(_census_vault(), category, assume_yes=assume_yes))
@@ -1664,12 +1761,19 @@ def _print_startup_banner(name: str, platform, config: Config) -> None:
         if config.capture_screenshots
         else "off  [dim](use --screenshots to enable)[/dim]"
     )
+    # D8: the same attributed line `info` prints. A bare model id at the top of
+    # a run reads as "this is what will answer", which on a machine whose only
+    # usable provider is a different one is exactly what will not happen.
+    attribution = _provider_attribution_lines(config)
+    model_row = escape(attribution[0]) + "".join(
+        f"\n[dim]             {escape(line)}[/dim]" for line in attribution[1:])
+
     console.print()
     console.print(Panel.fit(
         f"[bold cyan]sharing_on[/bold cyan]  [dim]v{_sharing_on_version}[/dim]\n\n"
         f"[bold]Task:[/bold]        {name}\n"
         f"[bold]Platform:[/bold]    {platform.summary()}\n"
-        f"[bold]Model:[/bold]       {config.llm_model}\n"
+        f"[bold]Model:[/bold]       {model_row}\n"
         f"[bold]Watching:[/bold]    {', '.join(watch_dirs)}\n"
         f"[bold]Screenshots:[/bold] {screenshots_label}",
         border_style="cyan",
@@ -1710,49 +1814,128 @@ def _print_step_table(steps) -> None:
 # Import and register all Systemu CLI groups so they appear under
 # `sharing_on <group> <command>` without modifying any pipeline code.
 
-try:
-    from systemu.interface.cli_commands import (
-        scrolls_group,
-        army_group,
-        tools_group,
-        skills_group,
-        settings_cmd,
-        evolve_group,
-        daemon_group,
-        roots_group,
-        chat_group,
-        debug_group,
-        decisions_group,
-        user_group,
-        onboarding_group,
-        session_cli,
-        capability_cli,
-        skill_cli,
-        start_cmd,
-    )
+#: The module every systemu command group is imported from.
+_SYSTEMU_CLI_MODULE = "systemu.interface.cli_commands"
+
+#: (public name, attribute) in REGISTRATION ORDER, preserved from the single
+#: import block this table replaced. Each entry is registered ON ITS OWN: one
+#: broken group used to take all seventeen with it, in silence.
+_SYSTEMU_COMMAND_GROUPS = (
     # The one-command golden path: `start` runs `daemon start` and then opens
     # the dashboard on a WITNESSED-ready daemon. Top-level on purpose: it is
     # the first command a fresh install types.
-    cli.add_command(start_cmd,       name="start")
-    cli.add_command(scrolls_group,   name="scrolls")
-    cli.add_command(army_group,      name="army")
-    cli.add_command(tools_group,     name="tools")
-    cli.add_command(skills_group,    name="skills")
-    cli.add_command(settings_cmd,    name="settings")
-    cli.add_command(evolve_group,    name="evolve")
-    cli.add_command(daemon_group,    name="daemon")
+    ("start", "start_cmd"),
+    ("scrolls", "scrolls_group"),
+    ("army", "army_group"),
+    ("tools", "tools_group"),
+    ("skills", "skills_group"),
+    ("settings", "settings_cmd"),
+    ("evolve", "evolve_group"),
+    ("daemon", "daemon_group"),
     # R-A4: the granted-roots store's first operator-reachable writer. Top-level
     # because "which folders can this thing read?" is a question the operator
     # asks about the product, not about a subsystem of it.
-    cli.add_command(roots_group,     name="roots")
-    cli.add_command(chat_group,      name="chat")
-    cli.add_command(debug_group,     name="debug")
-    cli.add_command(decisions_group, name="decisions")
-    cli.add_command(user_group,      name="user")
-    cli.add_command(onboarding_group, name="onboarding")
-    cli.add_command(session_cli,     name="session")
-    cli.add_command(capability_cli,  name="capability")
-    cli.add_command(skill_cli,       name="skill")
-except ImportError:
-    # systemu package not yet installed — sharing_on still works standalone
-    pass
+    ("roots", "roots_group"),
+    ("chat", "chat_group"),
+    ("debug", "debug_group"),
+    ("decisions", "decisions_group"),
+    ("user", "user_group"),
+    ("onboarding", "onboarding_group"),
+    ("session", "session_cli"),
+    ("capability", "capability_cli"),
+    ("skill", "skill_cli"),
+)
+
+
+def _ascii_text(value) -> str:
+    """Text a cp1252 console can actually print (DEC-32c).
+
+    This line is emitted at import time, before any console setup: a message
+    the stream cannot encode would raise UnicodeEncodeError and take the WHOLE
+    CLI down instead of naming one broken group.
+    """
+    text = value if type(value) is str else str(value)
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def group_unavailable_line(name, error) -> str:
+    """The ONE line an operator gets when a command group cannot be loaded.
+
+    Identical at startup and at invocation on purpose -- a banner can be
+    scrolled past, a failed command cannot, and two wordings for one fact is
+    how an operator ends up believing they are different faults.
+    """
+    return "systemu: command group '{}' unavailable: {}".format(
+        _ascii_text(name), _ascii_text(error))
+
+
+def _load_group(module_path: str, attr: str):
+    """Import ONE command group.
+
+    Every group crosses this seam, so a test can fail exactly one of them
+    without touching the sixteen that work.
+    """
+    import importlib
+    return getattr(importlib.import_module(module_path), attr)
+
+
+def _unavailable_group_command(name: str, message: str) -> click.Command:
+    """A stand-in for a group that would not load.
+
+    Registering nothing is what produced the defect: `systemu roots list`
+    answered "No such command", which reads as "this product has no such
+    feature" rather than "this install is broken". The stand-in carries the
+    reason to the one place the operator is certain to look -- the command they
+    typed -- and exits non-zero so a script notices too.
+    """
+    @click.command(
+        name=name,
+        context_settings={"ignore_unknown_options": True,
+                          "allow_extra_args": True},
+        short_help="unavailable (this install failed to load it)",
+        help=message + "\n\nThis command group failed to import when the CLI "
+                       "started, so this is a placeholder standing in its "
+                       "place. Running it reports the error above and exits 1.",
+    )
+    @click.argument("args", nargs=-1, type=click.UNPROCESSED)
+    def _unavailable(args):
+        click.echo(message, err=True)
+        raise SystemExit(1)
+
+    return _unavailable
+
+
+def register_systemu_groups(target: click.Group, *, stream=None) -> list:
+    """Register every systemu command group on ``target``, one at a time.
+
+    Returns the names that failed (empty on a healthy install). A failure is
+    reported THREE ways, because the previous single silent `except ImportError:
+    pass` proved that one channel nobody reads is the same as none:
+      * one stderr line naming the group and the error,
+      * a placeholder command of that name that repeats it and exits 1,
+      * the returned list, for any caller that wants to act on it.
+
+    `AttributeError` is caught alongside `ImportError`: a module that imports
+    but has lost the symbol removes the group just as completely, and the
+    operator sees exactly the same missing command.
+    """
+    out = stream if stream is not None else sys.stderr
+    failed = []
+    for name, attr in _SYSTEMU_COMMAND_GROUPS:
+        try:
+            command = _load_group(_SYSTEMU_CLI_MODULE, attr)
+        except (ImportError, AttributeError) as exc:
+            line = group_unavailable_line(name, exc)
+            failed.append(name)
+            # A process with no stderr (pythonw) loses the startup line; the
+            # placeholder below is the fence it cannot lose.
+            if out is not None:
+                out.write(line + "\n")
+                out.flush()
+            target.add_command(_unavailable_group_command(name, line), name=name)
+            continue
+        target.add_command(command, name=name)
+    return failed
+
+
+register_systemu_groups(cli)

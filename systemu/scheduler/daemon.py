@@ -174,6 +174,19 @@ class DaemonReadiness:
     # nothing was spawned, nothing was written, and the remedy is different.
     refused: bool = False
 
+    # -- D6: WHICH socket, and WHOSE number it is ----------------------------
+    # `port` alone is not an honest answer. Four different facts can produce it
+    # (see PORT_SOURCE_*), and three of them are the operator's own choice while
+    # the fourth is a GUESS this process made. A stopped daemon deletes the
+    # record of the port it really served, so the very next `status` falls to
+    # the guess -- and printed it in exactly the same voice as a chosen number.
+    # The provenance rides out WITH the port so no surface can lose it.
+    port_source: str = ""
+    # The operating vault root this verdict is ABOUT, taken from the one mint
+    # (`systemu.runtime.vault_root.resolve_vault_root`). "Not running" is only
+    # meaningful once the operator knows which vault it is not running for.
+    vault_root: str = ""
+
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
@@ -322,28 +335,75 @@ def _pidfile_process(vault_dir: str) -> tuple[Optional[int], bool]:
     return None, False
 
 
+#: Where a witnessed port number came from. Three of these are the OPERATOR's
+#: number; ``PORT_SOURCE_DEFAULT`` is this process's guess, and the whole point
+#: of the distinction is that the two must never read alike (D6).
+PORT_SOURCE_EXPLICIT = "explicit"      # a --port on the command line
+PORT_SOURCE_RECORDED = "recorded"      # the port the daemon itself recorded
+PORT_SOURCE_ENV = "env"                # SYSTEMU_DASHBOARD_PORT
+PORT_SOURCE_DEFAULT = "default"        # DEFAULT_DASHBOARD_PORT -- a guess
+
+#: ASCII only (DEC-32c): a verdict string a cp1252 console cannot encode is a
+#: verdict the operator never gets to read.
+_PORT_SOURCE_PHRASES = {
+    PORT_SOURCE_EXPLICIT: "port {port} is the one you passed with --port",
+    PORT_SOURCE_RECORDED: "port {port} is the one this vault's daemon recorded",
+    PORT_SOURCE_ENV: "port {port} came from SYSTEMU_DASHBOARD_PORT",
+    PORT_SOURCE_DEFAULT: ("port {port} is the built-in default -- nothing here "
+                          "named a port, so this is a guess"),
+}
+
+#: The one thing the operator can do that this process cannot work out for
+#: itself: name the socket a daemon was actually started on.
+_PORT_REMEDY = "if the daemon was started on another port, pass --port <number>"
+
+
+def port_provenance_note(port: int, source: str) -> str:
+    """One ASCII clause saying WHERE the probed port number came from.
+
+    An unknown source is reported as unknown rather than silently rendered as a
+    chosen number -- the defect being closed is precisely a guess wearing the
+    voice of a choice.
+    """
+    template = _PORT_SOURCE_PHRASES.get(
+        source, "port {port} came from an unrecorded source")
+    return template.format(port=port)
+
+
+def vault_note(vault_root: str) -> str:
+    """One ASCII clause naming the operating vault a verdict is ABOUT."""
+    return "vault: {}".format(vault_root)
+
+
 def _resolve_readiness_port(vault_dir: str, port: Optional[int],
-                            recorded_state: Optional[dict] = None) -> int:
-    """Which socket to witness: explicit > recorded > env > default."""
+                            recorded_state: Optional[dict] = None
+                            ) -> tuple[int, str]:
+    """Which socket to witness, and WHOSE number it is.
+
+    Returns ``(port, source)``; ``source`` is one of the ``PORT_SOURCE_*``
+    constants. The precedence is unchanged -- explicit > recorded > env >
+    default -- but the answer no longer arrives stripped of the fact that makes
+    it readable.
+    """
     try:
         if port:
-            return int(port)
+            return int(port), PORT_SOURCE_EXPLICIT
     except (TypeError, ValueError):
         pass
     state = recorded_state if type(recorded_state) is dict else _read_runtime_state(vault_dir)
     recorded = state.get("port")
     try:
         if recorded:
-            return int(recorded)
+            return int(recorded), PORT_SOURCE_RECORDED
     except (TypeError, ValueError):
         pass
     try:
         env_port = (os.getenv("SYSTEMU_DASHBOARD_PORT") or "").strip()
         if env_port:
-            return int(env_port)
+            return int(env_port), PORT_SOURCE_ENV
     except (TypeError, ValueError):
         pass
-    return DEFAULT_DASHBOARD_PORT
+    return DEFAULT_DASHBOARD_PORT, PORT_SOURCE_DEFAULT
 
 
 def _connection_succeeds(host: str, port: int, timeout: float) -> bool:
@@ -427,7 +487,13 @@ def probe_readiness(vault_dir: str, *, port: Optional[int] = None,
     # number the not-ready reason has to name.
     recorded = _read_runtime_state(vault_dir)
     pid, alive = _pidfile_process(vault_dir)
-    resolved_port = _resolve_readiness_port(vault_dir, port, recorded)
+    resolved_port, port_source = _resolve_readiness_port(vault_dir, port, recorded)
+
+    # D6: WHICH vault this verdict is about, from THE mint. Reporting only --
+    # nothing here opens, creates or refuses anything, so a refused root still
+    # gets an honest "not running" answer naming the root that was refused.
+    from systemu.runtime.vault_root import resolve_vault_root as _resolve_vault_root
+    vault_root = _resolve_vault_root(explicit=vault_dir).root
 
     _rec_host = recorded.get("host")
     if type(_rec_host) is not str:
@@ -441,18 +507,27 @@ def probe_readiness(vault_dir: str, *, port: Optional[int] = None,
     connected = _connection_succeeds(resolved_host, resolved_port, timeout)
     ready = bool(connected and alive)
 
+    # D6: every branch names the port's PROVENANCE and the vault, so no reading
+    # of any status output can mistake a defaulted guess for the operator's own
+    # number, or a true answer about one vault for an answer about theirs.
+    provenance = port_provenance_note(resolved_port, port_source)
+    where = vault_note(vault_root)
+
     if ready:
-        reason = f"accepting connections on http://{resolved_host}:{resolved_port}"
+        reason = (f"accepting connections on http://{resolved_host}:{resolved_port}"
+                  f" ({provenance}); {where}")
     elif connected:
         reason = (f"something is accepting connections on "
                   f"{resolved_host}:{resolved_port} but no systemu daemon is "
-                  f"tracked for this vault")
+                  f"tracked for this vault ({provenance}); {where}")
     elif alive:
         reason = (f"process {pid} is alive but nothing is accepting connections "
-                  f"on {resolved_host}:{resolved_port} yet")
+                  f"on {resolved_host}:{resolved_port} yet ({provenance}); "
+                  f"{where}")
     else:
         reason = (f"no live daemon process and nothing is accepting connections "
-                  f"on {resolved_host}:{resolved_port}")
+                  f"on {resolved_host}:{resolved_port} ({provenance}); "
+                  f"{where}; {_PORT_REMEDY}")
 
     d_ver, d_path = _recorded_build(recorded)
     mine = _own_build()
@@ -465,6 +540,7 @@ def probe_readiness(vault_dir: str, *, port: Optional[int] = None,
         daemon_version=d_ver, daemon_path=d_path,
         cli_version=mine["version"], cli_path=mine["path"],
         build_match=match, build_note=note,
+        port_source=port_source, vault_root=vault_root,
     )
 
 
@@ -740,6 +816,19 @@ def start_daemon(
     #     must be the last word. A post-spawn parent write could race it.
     _write_runtime_state(vault_dir, pid=None, port=port, build=None)
 
+    # D10: the child this line is about will, on a fresh install, start pulling
+    # down Playwright's Chromium -- roughly 150 MB -- and its stdout is
+    # redirected into daemon.log, so the notice it prints for itself reaches no
+    # console. THIS is the copy the operator sees, and it goes out BEFORE the
+    # spawn: a download disclosed after it started is not disclosed. Best
+    # effort; the announcement must never be what stops a daemon from booting.
+    try:
+        from systemu.runtime.web import provision as _provision
+        _provision.announce_browser_autoinstall()
+    except Exception:
+        logger.debug("[Daemon] browser auto-install announcement failed",
+                     exc_info=True)
+
     proc = subprocess.Popen(
         cmd,
         stdout=log_file,
@@ -812,6 +901,11 @@ def get_status(vault_dir: str, *, port: Optional[int] = None,
         "port": v.port,
         "url": v.url,
         "reason": v.reason,
+        # D6 -- the port's provenance and the vault the verdict is about ride
+        # the projection too: a fact the mint carries but the dict drops is a
+        # fact no operator surface can reach.
+        "port_source": v.port_source,
+        "vault_root": v.vault_root,
         # F13 — WHICH build the daemon is executing rides the same projection,
         # so no consumer has to (or may) derive it a second way.
         "daemon_version": v.daemon_version,

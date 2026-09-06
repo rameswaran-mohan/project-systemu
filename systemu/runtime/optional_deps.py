@@ -177,24 +177,46 @@ def install_command(packages: Iterable[str]) -> str:
     return f'pip install "{DISTRIBUTION}[{",".join(extras)}]"'
 
 
+def unavailable_reason_parts(packages: Iterable[str]) -> Tuple[str, str, str]:
+    """The operator-facing sentence in THREE pieces: ``(lead, command, tail)``.
+
+    ``lead + command + tail`` IS :func:`unavailable_reason`, byte for byte, and
+    that is the point: the sentence is authored once, here, and a surface that
+    needs to lay the command out separately gets the same words rather than a
+    second wording of them.
+
+    F29: why a surface would need that. The whole refusal used to go through one
+    Rich ``console.print``, and Rich wraps a paragraph at the terminal width
+    wherever the break lands -- on an 80-column terminal the dashboard remedy came
+    out as ``Install it \\n with: pip install "systemu[dashboard]"``. A command
+    split across a line break is not a command: it cannot be copied, and the half
+    that survives a copy runs and does nothing. Same class as the wrapped absolute
+    paths the ``roots`` group is line-oriented to avoid.
+
+    ``("", "", "")`` when every group is present -- so the joined form is ``""``
+    and the "nothing is missing" answer stays falsy in both shapes.
+    """
+    groups = missing_groups(packages)
+    if not groups:
+        return ("", "", "")
+    absent = ", ".join(sorted({p for g in groups for p in g.packages}))
+    labels = " + ".join(g.label for g in groups)
+    lead = (f"UNAVAILABLE - {labels} is not installed ({absent}). "
+            f"Install it with: ")
+    steps = [g.post_install for g in groups if g.post_install]
+    tail = ("  Then: " + "; ".join(steps)) if steps else ""
+    return (lead, install_command(packages), tail)
+
+
 def unavailable_reason(packages: Iterable[str]) -> str:
     """The full operator-facing sentence, or '' when everything is present.
 
     This exact string is what every listing surface shows and what every
     refusal carries, so there is one wording to get right and one to fix.
+    A surface that must keep the remedy command off the wrap path asks for
+    :func:`unavailable_reason_parts` instead -- same words, laid out separately.
     """
-    groups = missing_groups(packages)
-    if not groups:
-        return ""
-    absent = ", ".join(sorted({p for g in groups for p in g.packages}))
-    cmd = install_command(packages)
-    labels = " + ".join(g.label for g in groups)
-    sentence = (f"UNAVAILABLE - {labels} is not installed ({absent}). "
-                f"Install it with: {cmd}")
-    steps = [g.post_install for g in groups if g.post_install]
-    if steps:
-        sentence += "  Then: " + "; ".join(steps)
-    return sentence
+    return "".join(unavailable_reason_parts(packages))
 
 
 def require(packages: Iterable[str], *, what: str = "") -> None:
