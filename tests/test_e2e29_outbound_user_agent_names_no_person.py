@@ -33,7 +33,22 @@ import pytest
 
 #: What every outbound identity is allowed to say.  The public index page, not
 #: a repository URL: a repository URL is where an account name lives.
-_EXPECTED_WEB_ACCESS_UA = "systemu/0.9.8 (+https://pypi.org/project/systemu)"
+#:
+#: P7 (v0.10.30): the version is no longer re-typed here.  It was the literal
+#: "0.9.8", frozen for twenty-two releases, and the equality below pinned the
+#: staleness in place -- a test that pins a stale fact is what keeps it stale.
+#: Derived from ``systemu.__version__`` for the same reason production now
+#: derives it (``systemu/runtime/user_agent.py``); the two other assertions in
+#: this file -- no source-forge host, and the exact shape -- are untouched, and
+#: the shape is now stated explicitly below rather than implied by one literal.
+def _expected_web_access_ua() -> str:
+    import systemu
+
+    return "systemu/{} (+https://pypi.org/project/systemu)".format(
+        systemu.__version__)
+
+
+_EXPECTED_WEB_ACCESS_UA = _expected_web_access_ua()
 
 #: Hosts whose URLs carry an account name as a path segment.  Naming one in an
 #: outbound identity is what disclosed the author.
@@ -121,3 +136,27 @@ def test_the_geocoder_user_agent_default_names_no_source_forge():
         assert "systemu" in ua, (
             "the geocoder identity (" + label + ") must still identify the "
             "application: " + repr(ua))
+
+
+def test_the_outbound_user_agent_shape_is_still_exactly_pinned():
+    """P7 APPENDED. ``_EXPECTED_WEB_ACCESS_UA`` used to be a literal, so the
+    STRING'S SHAPE -- product name, one version, one parenthesised public URL,
+    and nothing else -- was pinned by simply being written out. Now that the
+    version is derived, the shape is asserted in its own right, so the
+    derivation cannot widen what an outbound identity is allowed to contain.
+    """
+    import re
+
+    import systemu
+
+    match = re.fullmatch(
+        r"systemu/(?P<version>[0-9][0-9A-Za-z.\-+]*) "
+        r"\(\+https://pypi\.org/project/systemu\)",
+        _EXPECTED_WEB_ACCESS_UA)
+    assert match, (
+        "the outbound identity no longer has the pinned shape "
+        "'systemu/<version> (+<public index page>)': "
+        + repr(_EXPECTED_WEB_ACCESS_UA))
+    assert match.group("version") == systemu.__version__, (
+        "the version in the outbound identity is not this build's: "
+        + repr(_EXPECTED_WEB_ACCESS_UA))

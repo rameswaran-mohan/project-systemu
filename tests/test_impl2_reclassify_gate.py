@@ -778,7 +778,14 @@ def test_a_reclassified_deny_card_still_offers_no_standing_allow():
 def test_the_reclassify_option_label_is_the_shared_constant():
     # decision_queue.resolve validates choice-in-options, so the card label and the
     # UI's resolve choice must BYTE-match. One constant, imported by both.
-    assert RECLASSIFY_OPTION == "Reclassify effect…"
+    #
+    # P9(a) (v0.10.30): the trailing character was a real ellipsis (U+2026) and this
+    # equality pinned it there. It reaches a cp1252 console, where an unencodable
+    # character is a UnicodeEncodeError in place of the card (DEC-32c). ASCII now --
+    # three periods. The property this test is about (one constant, byte-matched by
+    # both surfaces) is unchanged, and the label's other surfaces are pinned by
+    # tests/test_dogfood28_p9a_reclassify_option_is_ascii_and_single_sourced.py.
+    assert RECLASSIFY_OPTION == "Reclassify effect..."
     d = GateDescriptor.from_tool(tool_name="t", sig="s", verdict="deny")
     assert d.options[-1] == RECLASSIFY_OPTION
 

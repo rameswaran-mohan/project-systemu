@@ -766,9 +766,22 @@ def test_the_per_tool_first_use_card_is_the_same_mint(monkeypatch):
 #: moves this hash. It is SUPPOSED to be annoying: the ruling moved the timing and
 #: NOTHING else, and a later dated ruling that legitimately extends the consent record
 #: must be a deliberate, visible re-freeze - never a side effect.
-_BULK_CARD_SHA_REAL = "741a2859e187dd1a92d6ce8aa3683f055898ba4b5408dbdaa8455789f76cc508"
+#:
+#: RE-FROZEN ONCE, v0.10.30 (P9b), deliberately and in its own commit:
+#:     _BULK_CARD_SHA_REAL           741a2859... -> bdfdd731...
+#:     _BULK_CARD_SHA_WITH_ELIGIBLE  0c431080... -> a402e069...
+#: The card is now ASCII. It is posted to a Windows daemon's cp1252 console,
+#: where an unencodable character is a UnicodeEncodeError in place of the card
+#: (DEC-32c) - i.e. the first security decision an operator ever sees rendering
+#: as a traceback. The ONLY change is em dash -> "--" (10 of them in the first
+#: golden, 9 in the second; no ellipsis is reachable on a 3-entry partition).
+#: WITNESSED, not asserted: applying that one substitution to the pre-change
+#: bytes reproduces these digests exactly, and the partition counts are
+#: unmoved. The consent record's WORDS, the partition, the options and the
+#: dedup are all untouched.
+_BULK_CARD_SHA_REAL = "bdfdd731edab5be8f8a483c06f1c04033c5ff1a4b101a6c0f6dc8e69be2e7b00"
 _BULK_CARD_SHA_WITH_ELIGIBLE = (
-    "0c431080457622e0ea785b9ee2b3346b10b32dc9c63c227b97f14429ad5ff543")
+    "a402e069a63dbf7cd13cc806eaa88d8c87a3791dfda33c6b1020b88c2fa266d7")
 
 
 def _bulk_card_entries():

@@ -32,9 +32,15 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+from systemu.runtime.user_agent import user_agent as _user_agent
+
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "systemu/0.9.8 (+https://pypi.org/project/systemu)"
+#: The identity on every outbound request this module makes.  DERIVED from
+#: ``systemu.__version__`` -- this used to be a literal frozen at 0.9.8, which
+#: told twenty-two releases' worth of third-party servers the wrong build was
+#: calling them.  See ``systemu/runtime/user_agent.py``.
+USER_AGENT = _user_agent()
 OSM_ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
 _CTX = ssl.create_default_context()
 _OVERPASS_HOSTS = [

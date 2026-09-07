@@ -227,8 +227,8 @@ def batch_rule_sentence() -> str:
     sentence = (
         f"Only a tool whose effects are fully classified AND limited to {allowed} can "
         "be batch-approved. Anything that runs a shell, deletes, sends, moves money, "
-        "uses a credential, reaches the network by any other route — or that could "
-        "not be classified at all — is EXCLUDED from the batch and stays gated until "
+        "uses a credential, reaches the network by any other route -- or that could "
+        "not be classified at all -- is EXCLUDED from the batch and stays gated until "
         "you approve it individually, with its arguments in front of you."
     )
     # F14 — DISCLOSE THE RULING ON THE CARD. Several of the allowlist's members are

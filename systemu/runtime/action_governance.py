@@ -507,14 +507,14 @@ def batch_approvable(ctx: ActionContext) -> Tuple[bool, str]:
         """
         phrase = _EXCLUSION_PHRASE.get(t, "high-authority effect")
         return f"{phrase} ({t})" if t in declared else (
-            f"{phrase} ({t} — name-inferred, not declared)")
+            f"{phrase} ({t} -- name-inferred, not declared)")
 
     outside = sorted(t for t in tags if not is_batch_approvable_tag(t))
 
     if not declared:
         # Lead with the honest headline: this tool told us NOTHING. Whatever the
         # governor inferred is secondary and is labelled as an inference.
-        why = "declares no effects — nothing was classified"
+        why = "declares no effects -- nothing was classified"
         inferred = [t for t in outside if t != EffectTag.UNKNOWN.value]
         if inferred:
             why += "; name suggests " + ", ".join(_name(t) for t in inferred)

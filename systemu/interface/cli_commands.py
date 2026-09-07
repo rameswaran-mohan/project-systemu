@@ -44,6 +44,12 @@ from rich import print as rprint
 # Each command still owns its own disclosure and refusal COPY.
 from systemu.interface import consent_prompt
 
+# P9(a): ONE source of truth for the reclassify option label. This module used
+# to re-type the literal in its refusal copy, and ``decision_queue.resolve``
+# byte-matches choice-in-options -- so a one-character drift between the two
+# would make the CLI name a button the card does not offer.
+from systemu.interface.command.gate import RECLASSIFY_OPTION
+
 console = Console()
 
 
@@ -1408,6 +1414,67 @@ def _print_daemon_build(build_match, build_note: str) -> None:
         click.secho(f"  !! {build_note}", fg="yellow")
 
 
+def _print_daemon_interpreter(interpreter_match, interpreter_note: str) -> None:
+    """D1 -- disclose WHICH Python the daemon is running under.
+
+    The sibling of ``_print_daemon_build`` and deliberately the same shape: the
+    build answers "is it the same code?", this answers "is it the same
+    interpreter?", and the two fail independently -- one virtual environment
+    can hold the code while another holds the packages a tool needs.
+
+    It also carries the fact that ends a particular night. An operator on
+    Windows sees TWO process rows with identical daemon argv (a venv installs
+    ``Scripts/python.exe`` as a launcher that runs the base interpreter with the
+    same arguments and waits on it), and with no surface naming an interpreter
+    the only available reading is "two daemons racing for my port". The note
+    names the other executable and says the pair is one daemon.
+
+    ``click.secho``, never ``console.print``: these lines carry absolute paths,
+    and Rich folds a paragraph at the console width wherever the break lands. A
+    path wrapped at column 80 can be neither pasted nor searched for, which is
+    the whole reason for naming two installations in the first place. The
+    marker is ASCII (DEC-32c). Tri-state, and UNVERIFIED is rendered as its own
+    state -- never as agreement.
+    """
+    if not interpreter_note:
+        return
+    if interpreter_match is False:
+        click.secho(f"  !! {interpreter_note}", fg="red")
+    elif interpreter_match is True:
+        click.secho(f"  {interpreter_note}", dim=True)
+    else:
+        click.secho(f"  !! {interpreter_note}", fg="yellow")
+
+
+def _print_start_failure(reason: str, log_path) -> None:
+    """P1 -- the FAILED readiness verdict, unwrapped, one line per path.
+
+    The third sibling of ``_print_daemon_build`` and ``_print_daemon_interpreter``
+    and, until now, the branch that had the rule applied to it least and needed
+    it most. Witnessed at 80 columns on a failed ``daemon start --wait 1``: the
+    minted reason folded into three fragments with the vault path broken across
+    two of them, and the ``Log:`` path broken across two more.
+
+    Both of those paths are things the operator is being SENT to look at -- the
+    vault the verdict is about, and the log that says why -- so the ruling the
+    ``roots`` group and ``_print_daemon_where`` already carry applies with full
+    force here: *a path wrapped at column 80 is not a path*, because it can be
+    neither pasted nor searched for. ``console.print`` folds a paragraph at the
+    console width by design; ``click.secho`` does not, keeps the colour, and
+    prints the text LITERALLY, so a Windows path containing ``[`` is no longer
+    eaten as Rich markup.
+
+    ASCII throughout (DEC-32c, D5): this is the failure screen, and a console
+    that cannot encode a verdict raises where the verdict should have been.
+    The ``ERROR`` prefix is unchanged -- e2e29 pins it.
+    """
+    click.secho("ERROR Daemon did not become ready.", fg="red")
+    click.secho("  {}".format(reason))
+    click.secho("  Log: {}".format(log_path))
+    click.secho("  Stop the stuck process with: "
+                + click.style("systemu daemon stop", bold=True))
+
+
 @daemon_group.command("start")
 @click.option("--port", default=8765, show_default=True, help="Port for the web dashboard.")
 @click.option("--foreground", is_flag=True, help="Run in foreground (blocking).")
@@ -1426,11 +1493,7 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
     The dashboard ships as an optional extra. Without it nothing binds the port,
     so this command refuses at once and prints the command that installs it.
     """
-    config, vault = _get_vault_and_config(ctx)
-    from systemu.scheduler import daemon as _daemon_mod
-    from systemu.scheduler.daemon import start_daemon
-
-    # ── F21: the [dashboard] group gate, BEFORE anything is spawned ─────────
+    # ── F21: the [dashboard] group gate, FIRST ── P6: A REFUSAL CREATES NOTHING
     # `daemon start`'s readiness witness IS the dashboard socket (DEC-41: the
     # spawn is a claim, and `await_readiness` polls for a real connection on
     # `port`). Without nicegui nothing ever binds that port, so the command
@@ -1469,6 +1532,17 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
             f"CLI -- works on the default install.[/dim]"
         )
         ctx.exit(1)           # DEC-41: not started != success
+
+    # P6: only NOW. `_get_vault_and_config` is `Config.from_env()` plus
+    # `open_vault(cfg)`, and opening the vault MINTS the whole layout -- so on
+    # a bare install the refusal above used to leave a vault tree in whatever
+    # directory the operator happened to run in. A refusal that WRITES is not
+    # a refusal (the same reading the vault-root fence has, DEC-32). The gate
+    # reads no config and needs no vault -- it asks one question of this
+    # interpreter -- so there was never a reason for it to run second.
+    config, vault = _get_vault_and_config(ctx)
+    from systemu.scheduler import daemon as _daemon_mod
+    from systemu.scheduler.daemon import start_daemon
 
     # First-run guard: NO provider usable → run setup now (interactive TTY) or
     # point at it (headless). Booting with nothing configured only yields a dead
@@ -1535,6 +1609,11 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
         console.print("[green]OK Daemon ready.[/green]")
         console.print(f"  Accepting connections on {verdict.url}")
         _print_daemon_build(verdict.build_match, verdict.build_note)
+        # D1: the ready line is what an operator reads at the exact moment the
+        # second process row appears, so the interpreter is named HERE and not
+        # only on a `daemon status` they have no reason to run yet.
+        _print_daemon_interpreter(verdict.interpreter_match,
+                                  verdict.interpreter_note)
         console.print("  Use [bold]systemu daemon status[/bold] to check.")
         # The MINTED verdict is handed back so a caller (`systemu start`) can
         # gate on the same witness instead of re-deriving one. Click ignores a
@@ -1542,11 +1621,8 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
         # an operator sees it changes here.
         return verdict
 
-    console.print("[red]ERROR Daemon did not become ready.[/red]")
     reason = verdict.reason if verdict is not None else "no readiness verdict was produced"
-    console.print(f"  {reason}")
-    console.print(f"  Log: {Path(config.vault_dir) / 'daemon.log'}")
-    console.print("  Stop the stuck process with: [bold]systemu daemon stop[/bold]")
+    _print_start_failure(reason, Path(config.vault_dir) / "daemon.log")
     ctx.exit(1)
 
 
@@ -1566,11 +1642,16 @@ def daemon_stop(ctx, stop_all: bool):
         # v0.8.0.2: kill every python process whose cmdline mentions our
         # daemon module.  This sidesteps the pidfile and catches orphans.
         import psutil
+
+        from systemu.scheduler.daemon import _DAEMON_CMDLINE_MARKER
         killed = []
         for proc in psutil.process_iter(["pid", "cmdline"]):
             try:
                 cmdline = " ".join(proc.info.get("cmdline") or [])
-                if "systemu.scheduler.daemon" in cmdline:
+                # P4: ONE marker for both stop paths (DEC-43). The default path
+                # below now makes this same check; two spellings of it could
+                # drift, and the sweep is the half that was already right.
+                if _DAEMON_CMDLINE_MARKER in cmdline:
                     proc.kill()
                     killed.append(proc.info["pid"])
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -1586,9 +1667,23 @@ def daemon_stop(ctx, stop_all: bool):
 
     # Default path: pidfile-based single-daemon stop (preserve original logic)
     config, _ = _get_vault_and_config(ctx)
-    from systemu.scheduler.daemon import stop_daemon
+    from systemu.scheduler.daemon import DaemonStopRefused, stop_daemon
 
-    stopped = stop_daemon(config.vault_dir)
+    # P4: the sweep above has always checked that a pid's command line names
+    # `systemu.scheduler.daemon` before killing it; the path an operator
+    # actually runs did not. A stale pidfile plus a reissued pid was a
+    # `TerminateProcess` on an unrelated process of theirs, reported as
+    # "OK Daemon stopped." `stop_daemon` now refuses instead -- and the refusal
+    # is caught HERE, at the call site, with no frame in between that could turn
+    # it back into a success. Printed unwrapped: it carries the pidfile path,
+    # and deleting that file is the remedy it names.
+    try:
+        stopped = stop_daemon(config.vault_dir)
+    except DaemonStopRefused as refusal:
+        click.secho("ERROR {}".format(refusal.message), fg="red")
+        ctx.exit(1)           # not stopped != success
+        return
+
     if stopped:
         console.print("[green]OK Daemon stopped.[/green]")
     else:
@@ -1643,6 +1738,11 @@ def daemon_status(ctx, port):
     # twenty minutes. A skew recolours the panel but never changes the exit code.
     _bmatch = status["build_match"]
     _bnote = status["build_note"]
+    # D1: WHICH interpreter, consumed from the SAME projection. `.get` rather
+    # than `[...]`: a status dict minted by an older daemon build carries no
+    # such key, and `daemon status` must still print.
+    _imatch = status.get("interpreter_match")
+    _inote = status.get("interpreter_note") or ""
     # D6: the exit code IS the verdict. Every branch below used to fall off the
     # end of the function and leave 0, so `systemu daemon status && open <url>`
     # opened a dashboard that was not there -- the one bit a script, a CI step
@@ -1650,6 +1750,13 @@ def daemon_status(ctx, port):
     # taken from the SAME branch that renders the panel, so the two can never
     # disagree; deriving it a second time from `status` would be the defect
     # class, not the fix.
+    # P8: the panel carries the VERDICT, the PID and the URL -- the facts that
+    # fit. The reason went in here too, and the mint ends every reason with the
+    # `vault: <path>` clause, so at 80 columns the panel folded an absolute path
+    # across three rows while the correct, unwrapped copy sat right below it.
+    # Two copies of a path, one of them broken, is worse than one: the broken
+    # one is the eye-catching one and gets read first. The reason now goes out
+    # BELOW the panel, on the same unwrapping writer.
     if status["ready"]:
         exit_code = _STATUS_EXIT_READY
         console.print(Panel(
@@ -1659,20 +1766,20 @@ def daemon_status(ctx, port):
             border_style=("red" if _bmatch is False else "green"),
         ))
         _print_daemon_build(_bmatch, _bnote)
+        _print_daemon_interpreter(_imatch, _inote)
     elif status["process_alive"]:
         exit_code = _STATUS_EXIT_STARTING
         console.print(Panel(
             f"[yellow]◐ Starting[/yellow]  (PID {status['pid']})\n"
-            f"{status['reason']}\n"
             "Nothing can reach the dashboard yet.",
             title="⚡ Systemu Daemon", border_style="yellow"
         ))
         _print_daemon_build(_bmatch, _bnote)
+        _print_daemon_interpreter(_imatch, _inote)
     else:
         exit_code = _STATUS_EXIT_NOT_RUNNING
         console.print(Panel(
             "[dim]○ Not running[/dim]\n"
-            f"{status['reason']}\n"
             "Start with: [bold]systemu daemon start[/bold]",
             title="⚡ Systemu Daemon", border_style="dim"
         ))
@@ -1682,6 +1789,7 @@ def daemon_status(ctx, port):
     # reachability pin in tests/test_e2e28_daemon_status_every_verdict_names_the
     # _vault.py watches. `.get` rather than `[...]`: a status dict from an older
     # daemon build is missing keys, and `daemon status` must still print.
+    _print_daemon_reason(status.get("reason"), status.get("vault_root"))
     _print_daemon_where(status.get("vault_root"), status.get("port_provenance"))
 
     # LAST, so a non-zero verdict never costs the operator the report: the
@@ -1689,6 +1797,51 @@ def daemon_status(ctx, port):
     # before the code is named. The code is an ADDITION to the report, not a
     # replacement for it.
     ctx.exit(exit_code)
+
+
+def _reason_outside_the_panel(reason, vault_root) -> str:
+    """The mint's reason, minus the vault clause the ``vault:`` line carries.
+
+    P8. The clause is removed by EXACT-STRING IDENTITY against
+    ``daemon.vault_note(vault_root)`` -- the same function that produced it, and
+    the same value the projection already carries -- never by parsing the
+    sentence for something that looks like a path. A sentence-parser here would
+    be a second, disagreeing derivation of a fact the mint already answered
+    (DEC-43), and it would be the one that silently stops matching when the
+    wording changes.
+
+    Nothing else is touched: what is left is the mint's own words, including the
+    ``--port`` remedy on the not-running verdict and "no systemu daemon is
+    tracked for this vault" on the connected-but-untracked one, which is the
+    only thing on screen that tells a foreign program on the socket from a
+    dashboard.
+
+    DEC-36: both arguments arrive from a projection an older daemon may have
+    minted without either key, so the concrete type is pinned in this frame.
+    """
+    from systemu.scheduler.daemon import vault_note
+
+    text = reason if type(reason) is str else ""
+    if type(vault_root) is str and vault_root:
+        clause = vault_note(vault_root)
+        for form in ("; " + clause, clause + "; ", clause):
+            if form in text:
+                text = text.replace(form, "", 1)
+                break
+    return text.strip()
+
+
+def _print_daemon_reason(reason, vault_root) -> None:
+    """WHY the verdict is what it is -- outside the panel, unwrapped.
+
+    ``click.echo``, never ``console.print``: this sentence carries a port, a
+    remedy and (on an older projection that keeps its vault clause) a path, and
+    Rich folds a paragraph at the console width wherever the break lands. It is
+    also printed LITERALLY, so a path containing ``[`` is not eaten as markup.
+    """
+    text = _reason_outside_the_panel(reason, vault_root)
+    if text:
+        click.echo(text)
 
 
 def _print_daemon_where(vault_root, port_provenance) -> None:
@@ -2823,7 +2976,7 @@ def decisions_mode(ctx, set_mode):
 
 
 def _reclassify_needs_the_inbox(choice: str) -> bool:
-    """True iff this choice is IMPL-2's "Reclassify effect…" remedy, which this CLI
+    """True iff this choice is IMPL-2's ``RECLASSIFY_OPTION`` remedy, which this CLI
     cannot deliver.
 
     Reclassifying is not a plain option pick: it assigns an effect class under a TYPED
@@ -2847,9 +3000,9 @@ def decisions_resolve(ctx, decision_id: str, choice: str):
         console.print(
             "[red]Not available here.[/red] Reclassifying an effect requires a typed "
             "confirmation of the class you are assigning, which this command cannot "
-            "collect — resolving it here would record nothing and re-refuse the "
+            "collect -- resolving it here would record nothing and re-refuse the "
             "action.\nOpen the dashboard [bold]Inbox[/bold] and use "
-            "'Reclassify effect…' on the card.")
+            "'" + RECLASSIFY_OPTION + "' on the card.")
         ctx.exit(2)
         return
     _, vault = _get_vault_and_config(ctx)
@@ -3710,6 +3863,10 @@ def run_census_status(vault) -> int:
     operator cannot decide about something they cannot see. Read-only -- it never creates
     consent state, and on a fresh install it writes nothing at all.
     """
+    from systemu.runtime.census_consent import census_status_refusal_line
+    _refused = census_status_refusal_line(vault.root)
+    if _refused:
+        click.echo(_refused)
     from systemu.runtime.ambient_census import census_status
     from systemu.runtime.census_consent import CATEGORIES, SURFACED_CATEGORIES
     try:

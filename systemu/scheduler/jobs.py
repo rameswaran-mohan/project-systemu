@@ -127,7 +127,15 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
             continue
         if dctx.get("resume_dispatched"):
             continue
-        if not dctx.get("chat_submission_id"):
+        # D3 (dogfood 0.10.28): a GATE needs nothing from the chat lane — it stamps
+        # its own resume coords at park time. See the matching note in
+        # ``resume_on_decision._dispatch_resume``, which this pre-filter mirrors
+        # clause for clause. It held the SAME chat-lane refusal, so a card resolved
+        # from the CLI on a forge/heal-lane run was skipped on every poll, forever.
+        # structured_question / attest keep the requirement: their answers ARE
+        # stashed into a chat-lane snapshot. A quick-lane gate is filtered by the
+        # coords check inside the dispatcher, not here.
+        if not is_gate and not dctx.get("chat_submission_id"):
             continue
         if not dctx.get("execution_id"):
             continue

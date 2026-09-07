@@ -1,4 +1,13 @@
-"""v0.8.22.1 (R5): resume a chat task when its stuck-loop decision is resolved.
+"""v0.8.22.1 (R5): resume a parked run when its operator decision is resolved.
+
+Three kinds of decision resume through here: a stuck-loop
+``structured_question``, an operator-attest card, and a command/tool approval
+GATE. The first two are chat-lane by construction — their answer is stashed into
+the parked CHAT run's snapshot. A gate is NOT: since v0.10.21 it stamps its own
+resume coords (execution_id + activity_id + shadow_id) into the decision context
+at park time, so a run dispatched by the forge heal sweep, the scheduler, or a
+recovery pass resumes on exactly the same rail (D3, dogfood 0.10.28 — before
+that fix a gate on such a run resolved into total silence).
 
 Two trigger paths feed the same dispatch:
 
@@ -13,15 +22,22 @@ Two trigger paths feed the same dispatch:
       so the CLI command ``sharing_on decisions resolve`` lives in a
       separate process and its publish never reaches the daemon
       subscriber. The reconciler walks the persisted decisions index
-      and re-dispatches any resolved structured_question decision that
-      hasn't been dispatched yet.
+      and re-dispatches any resolved decision of a resumable kind that
+      hasn't been dispatched yet. Its pre-filter mirrors the early
+      returns below and must be changed with them.
 
 Both paths funnel into :func:`_dispatch_resume`, which:
   * stashes the operator's answer into the parked run's execution
     snapshot (``__STUCK_ANSWER__::obj_<id>::<choice>`` sticky note,
-    consumed by ``shadow_runtime._apply_stuck_answer`` on resume),
+    consumed by ``shadow_runtime._apply_stuck_answer`` on resume) —
+    for a GATE there is no answer to stash: the approval is recorded to
+    the CommandApprovalStore and redeemed by the resumed tool call,
   * re-submits the activity with ``resume_from_execution_id`` so the
     runtime applies the answer at resume-start,
+  * writes an operator-visible EVENT for every terminal move of a gate
+    (resumed / denied / recorded-but-nothing-resumed), because a rail
+    that only whispers into the daemon log is indistinguishable on
+    screen from a rail that is dead,
   * and stamps ``decision.context["resume_dispatched"] = True`` on
     the persisted decision so we never double-dispatch (across
     restarts, across both paths).
@@ -42,6 +58,44 @@ logger = logging.getLogger(__name__)
 # decision.context["resume_dispatched"] is the cross-process /
 # cross-restart truth — checked in _dispatch_resume.
 _handled: set = set()
+
+
+def _gate_card_label(decision, dctx, gate_type: str) -> str:
+    """The operator-facing name of the gate card being resumed or denied.
+
+    Prefer the PERSISTED title — that is the string the operator actually
+    clicked ("Run tool: pdf_encrypt"). It is a value off disk, so its concrete
+    type is pinned in this frame before anything operates on it (DEC-36:
+    ``type(x) is T``, the only non-dispatching check). Falls back to a label
+    rebuilt from the stamped gate fields when a decision carries no title
+    (older rows, and the lightweight decision stand-ins some callers pass).
+    """
+    title = getattr(decision, "title", None)
+    if type(title) is str and title.strip():
+        return title.strip()
+    name = dctx.get("tool_name")
+    if type(name) is not str:
+        name = ""
+    if gate_type == "tool":
+        return f"Run tool: {name or 'unnamed tool'}"
+    return "Run command"
+
+
+def _emit_gate_event(level: str, message: str, context: Dict[str, Any]) -> None:
+    """Write an operator-visible event for a gate resolution.
+
+    D3 (dogfood 0.10.28): the resume rail spoke only to the daemon log, so from
+    the operator's seat an approval produced "Resolved: <card>" and then nothing
+    — indistinguishable from the broken case they actually hit. Every terminal
+    move of the rail now says what happened on a surface they can read.
+
+    Best-effort: an event-log hiccup must never break a resume.
+    """
+    try:
+        from systemu.interface.notifications import log_event
+        log_event(level, "activity", message, context)
+    except Exception:
+        logger.debug("[ResumeOnDecision] could not write gate event", exc_info=True)
 
 
 def _dispatch_resume(decision, *, vault, supervisor,
@@ -81,13 +135,51 @@ def _dispatch_resume(decision, *, vault, supervisor,
     is_attest = (dctx.get("kind_marker") == "operator_attest")
     if kind != "structured_question" and not is_gate and not is_attest:
         return False
-    if not dctx.get("chat_submission_id"):
+    # ── D3 (dogfood 0.10.28): a GATE does not need the chat lane ─────────────
+    # This guard is older than gate resume. It was written for a
+    # ``structured_question``, whose answer is stashed into the parked CHAT
+    # run's snapshot — no chat submission, nothing to stash into. A command/tool
+    # gate is a different animal: since v0.10.21 it stamps its OWN resume coords
+    # (execution_id + activity_id + shadow_id) into the decision context at park
+    # time, and ``supervisor.submit(..., chat_submission_id=None)`` is a
+    # perfectly good workflow-lane re-dispatch.
+    #
+    # So every run NOT dispatched from chat — the forge heal sweep
+    # (tool_service.heal_activities_for_tool -> decide_shadow -> submit with no
+    # chat_submission_id), a scheduled run, a recovery re-dispatch — parked on a
+    # gate and then RESOLVED INTO SILENCE: no bridge recorded, no re-dispatch, no
+    # event, and the reconciler skipped it forever on the same pre-filter. That is
+    # the operator's witnessed 15-minute hang on ``Run tool: pdf_encrypt``.
+    #
+    # An ATTEST card keeps the requirement: it stashes an __OPERATOR_ATTEST__
+    # sticky into the snapshot and is a chat-lane surface by construction.
+    #
+    # What keeps the QUICK LANE out is not this door but the coords check below.
+    # ``quick_task`` is not a ShadowRuntime run: it stamps an execution_id and
+    # nothing else, writes no snapshot, and resolves its own gates by
+    # block-polling the card and re-calling with ``resolved_dedup``. So it never
+    # HAS coords, from context or snapshot, and lands on the honest skip — inert
+    # on this rail exactly as ``_ask_operator_inline`` documents. The coords-less
+    # RESCUE is fenced to the chat lane for the same reason (see below).
+    if not is_gate and not dctx.get("chat_submission_id"):
         return False
     if dctx.get("resume_dispatched"):
         return False
     execution_id = dctx.get("execution_id")
     if not execution_id:
         logger.info("[ResumeOnDecision] decision %s has no execution_id — skipping", decision.id)
+        if is_gate:
+            # D3: the operator resolved a gate and nothing is going to happen.
+            # That is a legitimate outcome (the card carries no run to resume),
+            # but it must be READABLE — silence here is the exact shape of the
+            # bug this branch exists to fix.
+            _emit_gate_event(
+                "WARNING",
+                f"Recorded your answer on {_gate_card_label(decision, dctx, gate_type)}, "
+                f"but this card is not attached to a run that can be resumed - "
+                f"start the task again if you still want it.",
+                {"decision_id": decision.id, "gate_type": gate_type},
+            )
         return False
     choice = (decision.choice or "").strip().lower()
 
@@ -131,7 +223,18 @@ def _dispatch_resume(decision, *, vault, supervisor,
         # parked run may have done effectful work this build can't read. Do NOT record
         # the approval or stamp dispatched in that case — fall through to the honest
         # skip so nothing masks the refusal (mirrors the pre-v0.10.21 behaviour).
-        if is_gate and not snapshot_refused:
+        #
+        # D3 QUICK-LANE FENCE: the rescue is fenced to the CHAT lane, which is the
+        # only lane it was ever designed for and the only one where its claim is
+        # true. A coords-less gate with no chat_submission_id is a QUICK-LANE card
+        # (``quick_task`` stamps an execution_id and nothing else, writes no
+        # snapshot, and resolves the card by block-polling it). Letting the rescue
+        # fire there would persist a standing allow that lane never asked this rail
+        # to write, and would tell the operator "nothing resumed" while the quick
+        # lane was about to run the call — a false statement about what just
+        # happened, which is a defect in its own right (DEC-34). It falls through to
+        # the honest skip instead: nothing recorded, nothing stamped, nothing said.
+        if is_gate and not snapshot_refused and dctx.get("chat_submission_id"):
             # Record ONLY a STANDING allow here ("Always allow" on a tool gate) — the
             # choice meant to carry forward, idempotent and keyed to persist across runs.
             # Deliberately DO NOT persist a SINGLE-USE bridge ("Approve once", or any
@@ -173,6 +276,17 @@ def _dispatch_resume(decision, *, vault, supervisor,
                 ("recorded standing allow" if (is_tool_gate and choice == "always allow")
                  else "no standing approval recorded"),
             )
+            # D3: "recorded, but this one will NOT resume" is a real outcome and
+            # the operator has to be able to read it. Without a line here the card
+            # simply stops being pending and nothing ever moves — the same thing
+            # the operator saw when the rail was broken outright.
+            _emit_gate_event(
+                "WARNING",
+                f"Recorded your answer on {_gate_card_label(decision, dctx, gate_type)}, "
+                f"but the parked run is gone, so nothing resumed - start the task "
+                f"again if you still want it.",
+                {"decision_id": decision.id, "gate_type": gate_type},
+            )
             return True
         logger.info(
             "[ResumeOnDecision] decision %s missing resume coords — skipping",
@@ -210,6 +324,16 @@ def _dispatch_resume(decision, *, vault, supervisor,
             _stamp_dispatched(decision, vault)
             logger.info("[ResumeOnDecision] %s gate DENIED for activity %s — finalized",
                         gate_type, activity_id)
+            # D3: a denial ends the task. Say so where the operator reads, so the
+            # parked card does not simply stop being pending with nothing to show
+            # for it.
+            _emit_gate_event(
+                "WARNING",
+                f"Denied: {_gate_card_label(decision, dctx, gate_type)} - "
+                f"the task was stopped and will not run.",
+                {"activity_id": activity_id, "decision_id": decision.id,
+                 "gate_type": gate_type},
+            )
             return True
         if is_reclassify:
             # Record the single-use class assignment and fall through to the resume
@@ -268,17 +392,35 @@ def _dispatch_resume(decision, *, vault, supervisor,
 
     _stamp_dispatched(decision, vault)
     _handled.add(decision.id)
+    # D3: label the re-dispatch for the lane it is actually on. Before the gate
+    # rail accepted a coords-carrying non-chat run, "chat" was true by
+    # construction; it no longer is, and an origin-partitioned live pane would
+    # file a forge/heal-lane resume under the operator's chat. Unchanged for a
+    # real chat submission.
+    _chat_sub = dctx.get("chat_submission_id")
+    _reason = "chat" if _chat_sub else "system"
     supervisor.submit(
         activity_id, shadow_id,
-        priority=1, reason="chat", origin="chat",
+        priority=1, reason=_reason, origin=_reason,
         resume_from_execution_id=execution_id,
-        chat_submission_id=dctx.get("chat_submission_id"),
+        chat_submission_id=_chat_sub,
         consult_affinity_log=False,
     )
     logger.info(
         "[ResumeOnDecision] re-dispatched activity %s (resume %s) after decision %s",
         activity_id, execution_id, decision.id,
     )
+    if is_gate:
+        # D3: THE missing half of the operator's loop. "Resolved: <card>" was the
+        # last thing they ever saw; nothing said the run had picked up again.
+        _emit_gate_event(
+            "SUCCESS",
+            f"Resumed after your approval: "
+            f"{_gate_card_label(decision, dctx, gate_type)}",
+            {"activity_id": activity_id, "shadow_id": shadow_id,
+             "execution_id": execution_id, "decision_id": decision.id,
+             "gate_type": gate_type, "origin": _reason},
+        )
     return True
 
 
@@ -286,13 +428,18 @@ def reclassification_can_be_recorded(dctx) -> bool:
     """Will ``_dispatch_resume`` be able to reach ``_record_reclassification`` for a
     decision carrying this context?
 
-    The Inbox panel asks BEFORE claiming the remedy worked. ``_dispatch_resume`` returns
-    False for a decision with no ``chat_submission_id`` — the resume machinery is
-    single-lane — so outside the chat lane a reclassify records NOTHING, and the panel
-    nonetheless notified "Reclassified as <class>. The task will re-check this call…" in
-    green. Nothing had been written; re-running did not help, because there was no
-    record to apply. The single-lane limitation is pre-existing and out of scope; the
-    affirmative claim about it was the defect.
+    The Inbox panel asks BEFORE claiming the remedy worked. It used to notify
+    "Reclassified as <class>. The task will re-check this call…" in green for a card
+    the dispatcher was going to drop on the floor; nothing had been written, and
+    re-running did not help, because there was no record to apply.
+
+    D3 (dogfood 0.10.28): the ``chat_submission_id`` refusal is GONE from this ladder,
+    because it is gone from ``_dispatch_resume`` for a gate. The resume machinery was
+    never really single-lane — a tool gate stamps its own resume coords at park time —
+    it was just refusing every non-chat run at the door. A reclassify on a forge/heal-
+    lane run now records and resumes exactly as it does in chat, which matters because
+    reclassify is the ONLY exit from the DENY band: without it that lane had no way out
+    at all.
 
     This mirrors the early-return ladder in ``_dispatch_resume`` and is deliberately
     NARROW: it reports only the STATICALLY decidable refusals. A True answer is "nothing
@@ -304,8 +451,10 @@ def reclassification_can_be_recorded(dctx) -> bool:
     d = dctx or {}
     if d.get("kind") != "gate" or d.get("gate_type") != "tool":
         return False        # reclassification is a TOOL-gate remedy
-    if not d.get("chat_submission_id"):
-        return False        # THE reported case: the dispatcher returns False here
+    # D3: no chat_submission_id check here. ``_dispatch_resume`` no longer has one
+    # for a gate, and a predicate that refuses what the dispatcher accepts is a
+    # false report in the OTHER direction — the panel would tell the operator their
+    # reclassification was not saved while the store was writing it.
     if d.get("resume_dispatched"):
         return False        # already handled; this decision will not be processed again
     if not d.get("execution_id"):

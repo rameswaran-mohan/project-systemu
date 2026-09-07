@@ -162,12 +162,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 #: Serialises the read-modify-write on the consent file (the ``table_store._PROPOSED_LOCK``
 #: pattern). Load-bearing, not hygiene — every mutator rewrites the WHOLE file from its own
@@ -412,6 +415,113 @@ def _parse_ts(value) -> Optional[datetime]:
         return None
 
 
+# ── the refusal, as something the operator can READ ──────────────────────────
+#
+# THE OBSERVATION (dogfood 28, replaying the v0.10.27 repro). The generation fence
+# WORKS: restore a pre-revoke ``census_consent.json`` and it authenticates against a
+# key that no longer exists, nothing is granted, no probe runs. What it does not do is
+# SAY so. ``census status`` renders that vault identically to one that was never
+# granted at all -- "not granted" for every category, and stop. An operator looking at
+# a file they just put back, told nothing about it, reasonably concludes the command
+# did not see it; the next thing they try is putting it back again, or hand-editing.
+# A refusal that is correct and invisible is the one combination that teaches the
+# operator to fight it.
+#
+# The reason is therefore a VALUE (DEC-32), carried beside the grants the load path
+# already returns. Nothing raises across this boundary: ``run_census`` still gets the
+# same empty dict from a damaged file that it always got.
+
+#: The file was signed by THIS vault, at a generation that has since been withdrawn.
+#: WITNESSED, never inferred (DEC-27): claimed only when the MAC actually verifies
+#: against a key derived at an earlier generation of this same vault.
+REFUSED_STALE_GENERATION = "stale generation"
+
+#: The MAC verified at no generation this store looked at -- a hand edit, a file from
+#: another vault, or a signature older than the bounded search below. The LESS specific
+#: claim, and therefore the fallback: it says only what was witnessed.
+REFUSED_SIGNATURE_MISMATCH = "signature mismatch"
+
+#: ``secrets/census_consent.epoch`` is missing or unreadable, so nothing on disk can say
+#: which generation the file belongs to. No signature question is even reached.
+REFUSED_NO_GENERATION_ANCHOR = "no generation anchor"
+
+#: Unreadable, unparseable, the wrong shape, or the unsigned ``version: 1`` format. Not
+#: one of the three above, and not silent either: the file is THERE and is not being
+#: honoured, which is the thing the operator cannot otherwise see.
+REFUSED_MALFORMED = "unreadable or unsigned consent file"
+
+#: The per-vault signing secret could not be obtained, so the file could not be checked
+#: at all. Stated as the inability it is rather than folded into a claim about the file.
+REFUSED_NO_VAULT_SECRET = "this vault's signing secret is unavailable"
+
+#: How many withdrawn generations back a refused file is searched before the diagnosis
+#: degrades to the less specific claim. Bounded so a large counter cannot turn a status
+#: read into an unbounded key-derivation loop; generous enough that a real operator's
+#: withdrawal history is covered.
+MAX_DIAGNOSED_GENERATIONS = 64
+
+#: The operator-facing sentence. ASCII only (DEC-32c) -- it reaches the same console
+#: every other v0.10.29/v0.10.30 verdict surface was made ASCII for.
+_REFUSAL_LINE = ("a consent file exists but was refused ({reason}); nothing is "
+                 "granted - re-run census grant if you meant it")
+
+
+class ConsentFileVerdict:
+    """The grants, and WHY there are none, as one value.
+
+    ``grants`` is exactly what :meth:`CensusConsentStore._load` has always returned --
+    the authenticated rows, or ``{}``. ``refused`` distinguishes the two states that
+    used to be spelled the same way: "there is no consent file" and "there is a consent
+    file and it was not honoured".
+    """
+
+    __slots__ = ("grants", "refused", "reason")
+
+    def __init__(self, grants=None, refused: bool = False,
+                 reason: str = "") -> None:
+        self.grants = {} if grants is None else grants
+        self.refused = refused
+        self.reason = reason
+
+    def __repr__(self) -> str:                       # pragma: no cover - debug
+        return "ConsentFileVerdict(refused={r!r}, reason={w!r}, rows={n})".format(
+            r=self.refused, w=self.reason, n=len(self.grants or {}))
+
+
+def refusal_line(verdict) -> str:
+    """The one line ``census status`` prints for a refused file, or ``""``.
+
+    Pure: a verdict in, a sentence out, no I/O and no vault. That is what lets the
+    CLI's call site be one line and lets this sentence be pinned without a CLI.
+
+    DEC-36: the concrete type is checked with ``type(x) is T`` before anything is read
+    off it. A stand-in that merely has a ``.refused`` renders nothing rather than
+    having whatever its ``__getattr__`` returns formatted into an operator-facing claim.
+    """
+    if type(verdict) is not ConsentFileVerdict:
+        return ""
+    if verdict.refused is not True:
+        return ""
+    reason = verdict.reason
+    if type(reason) is not str or not reason:
+        reason = REFUSED_MALFORMED
+    return _REFUSAL_LINE.format(reason=reason)
+
+
+def census_status_refusal_line(base_dir) -> str:
+    """``census status``'s refusal line for the vault at ``base_dir``, or ``""``.
+
+    The whole surface in one call, so the CLI's census-status renderer adds exactly one
+    line and no consent logic. Never raises: a status display that dies on a damaged
+    consent file is a worse version of the silence this closes.
+    """
+    try:
+        return refusal_line(CensusConsentStore(base_dir).consent_file_status())
+    except Exception:
+        logger.debug("[census] consent refusal read degraded", exc_info=True)
+        return ""
+
+
 class UnknownCensusCategory(ValueError):
     """Raised for a category outside :data:`CATEGORIES`.
 
@@ -636,30 +746,66 @@ class CensusConsentStore:
         ``session_secret`` is get-or-CREATE, so deriving the key on the fresh-install path
         would make a read-only privacy check mint and persist a vault secret on every
         default install — a side effect the census has no business having. Pinned by
-        ``test_a_fresh_install_read_does_not_mint_a_vault_secret``."""
+        ``test_a_fresh_install_read_does_not_mint_a_vault_secret``.
+
+        This is now a thin read of :meth:`_inspect`, which carries the REFUSAL REASON
+        alongside the same grants. Every caller of this method sees exactly what it
+        always saw: the value, and its emptiness, are unchanged -- and it does NOT ask
+        for the generation diagnosis, which is display work on a path ``run_census``
+        takes per category per survey."""
+        return self._inspect().grants
+
+    def consent_file_status(self) -> "ConsentFileVerdict":
+        """The grants AND why there are none -- the operator-facing read.
+
+        Distinct from :meth:`_load` on purpose, in both directions. ``run_census`` wants
+        the fence and nothing else; ``census status`` wants to be able to tell "there is
+        no consent file" apart from "there is one and it was refused", which is the whole
+        of this finding -- and it is the only caller that pays for the bounded generation
+        search. Never raises (DEC-32).
+        """
+        return self._inspect(diagnose=True)
+
+    def _inspect(self, *, diagnose: bool = False) -> "ConsentFileVerdict":
+        """THE VERIFICATION, with its verdict as a value.
+
+        Structurally identical to the fail-closed load it replaces -- every rejection
+        yields NO GRANTS -- with one addition: each rejection also names itself. The
+        grants are built on the success path ALONE, so the diagnosis below cannot
+        return the rows it just refused no matter how it goes wrong.
+        """
         try:
             if not self._file.exists():
-                return {}
+                # A vault that was never granted. Nothing was refused, so there is
+                # nothing to report, and no key derivation happens here.
+                return ConsentFileVerdict()
             raw = self._file.read_text(encoding="utf-8")
         except Exception:
-            return {}
+            return ConsentFileVerdict(refused=True, reason=REFUSED_MALFORMED)
         try:
             data = json.loads(raw)
         except Exception:
-            return {}
+            return ConsentFileVerdict(refused=True, reason=REFUSED_MALFORMED)
         # `type(x) is T` in the same frame before any operation on x (DEC-36): every
         # value below came off disk, and `.get`/`in`/`==` all dispatch on a hostile type.
         if type(data) is not dict:
-            return {}
+            return ConsentFileVerdict(refused=True, reason=REFUSED_MALFORMED)
         version = data.get("version")
         if type(version) is not int or version != CONSENT_FORMAT_VERSION:
-            return {}                                  # v1 (unsigned) is never honoured
+            # v1 (unsigned) is never honoured
+            return ConsentFileVerdict(refused=True, reason=REFUSED_MALFORMED)
         grants = data.get("grants")
         if type(grants) is not dict:
-            return {}
+            return ConsentFileVerdict(refused=True, reason=REFUSED_MALFORMED)
         claimed = data.get("mac")
         if type(claimed) is not str:
-            return {}
+            return ConsentFileVerdict(refused=True, reason=REFUSED_MALFORMED)
+        try:
+            candidate = claimed.encode("ascii")
+        except Exception:
+            # A non-ASCII mac field is the FILE's defect, so it is named as one rather
+            # than folded in with "we could not derive a key", which is ours.
+            return ConsentFileVerdict(refused=True, reason=REFUSED_MALFORMED)
         # THE GENERATION ANCHOR, read STRICTLY. A consent file with no readable anchor
         # is UNCONSENTED — the same rule the unsigned v1 format gets, and refused for the
         # same reason: nothing on disk can prove which generation an unanchored file
@@ -668,7 +814,8 @@ class CensusConsentStore:
         # never derives its expectation from an input the verified party controls (DEC-34).
         epoch = read_consent_epoch(self._base)
         if type(epoch) is not int:
-            return {}
+            return ConsentFileVerdict(refused=True,
+                                      reason=REFUSED_NO_GENERATION_ANCHOR)
         try:
             # The VERSION fed to the MAC is the module constant, not the file's field.
             # They are equal by the check above; using the constant means the verifier
@@ -676,13 +823,19 @@ class CensusConsentStore:
             # (DEC-34).
             expected = _consent_mac(_consent_key(self._base, epoch),
                                     CONSENT_FORMAT_VERSION, grants)
-            candidate = claimed.encode("ascii")
         except Exception:
-            return {}                                  # no key, or a non-ASCII mac field
+            return ConsentFileVerdict(refused=True,
+                                      reason=REFUSED_NO_VAULT_SECRET)
         # BYTES on both sides. `hmac.compare_digest` accepts str only when BOTH are
         # ASCII-only and raises otherwise, and the left operand here is file-controlled.
         if not hmac.compare_digest(candidate, expected.encode("ascii")):
-            return {}
+            # The unconditional half is the WITNESSED one: this MAC did not verify at
+            # this vault's current generation. Whether it verified at an EARLIER one is
+            # a further question, asked only where somebody is going to read the answer.
+            reason = REFUSED_SIGNATURE_MISMATCH
+            if diagnose:
+                reason = self._diagnose_mac_refusal(epoch, grants, candidate)
+            return ConsentFileVerdict(refused=True, reason=reason)
         out: Dict[str, dict] = {}
         for cat, row in grants.items():
             # An unknown category on disk is DROPPED on read, not honoured. A category
@@ -690,7 +843,46 @@ class CensusConsentStore:
             # only come from an older build of systemu itself, never from a forger.)
             if type(cat) is str and cat in CATEGORIES and type(row) is dict:
                 out[cat] = row
-        return out
+        return ConsentFileVerdict(grants=out)
+
+    def _diagnose_mac_refusal(self, epoch: int, grants, candidate: bytes) -> str:
+        """Which of the two MAC refusals this is. A DIAGNOSIS, never a decision.
+
+        The file has already been refused by the frame above; nothing here can change
+        that, and nothing here returns a grant. All this does is answer the operator's
+        actual question -- "is this the file I saved before I revoked, or is it a file
+        that was never mine?" -- because those have completely different remedies and
+        the fence spells them the same way.
+
+        ``stale generation`` is WITNESSED (DEC-27): it is claimed only when the file's
+        own MAC verifies against a key derived at an earlier generation OF THIS VAULT.
+        Everything else -- including a signature older than the bounded search, and a
+        search that could not run -- degrades to the less specific
+        ``signature mismatch``, which says only what was actually observed.
+
+        Bounded by :data:`MAX_DIAGNOSED_GENERATIONS`: this runs on a display path, and
+        an unbounded walk back through a large epoch would turn `census status` into a
+        key-derivation loop.
+        """
+        limit = MAX_DIAGNOSED_GENERATIONS
+        if type(limit) is not int or limit < 1:
+            return REFUSED_SIGNATURE_MISMATCH
+        if type(epoch) is not int or epoch < 1:
+            return REFUSED_SIGNATURE_MISMATCH       # generation 0: nothing is older
+        lowest = epoch - limit
+        if lowest < 0:
+            lowest = 0
+        for older in range(epoch - 1, lowest - 1, -1):
+            try:
+                previous = _consent_mac(_consent_key(self._base, older),
+                                        CONSENT_FORMAT_VERSION, grants)
+            except Exception:
+                logger.debug("[census] consent generation diagnosis degraded",
+                             exc_info=True)
+                return REFUSED_SIGNATURE_MISMATCH
+            if hmac.compare_digest(candidate, previous.encode("ascii")):
+                return REFUSED_STALE_GENERATION
+        return REFUSED_SIGNATURE_MISMATCH
 
     def is_granted(self, category: str) -> bool:
         """True iff ``category`` has a durable grant (regardless of pause state)."""

@@ -287,7 +287,22 @@ def _default_user_agent(monkeypatch):
 #:     ``assert "<private name>" not in ua`` publishes the very name it exists
 #:     to forbid.  A property about a private string must not be stated by
 #:     spelling it.
-_EXPECTED_DEFAULT_USER_AGENT = "systemu/0.9 (+https://pypi.org/project/systemu)"
+#: P7 (v0.10.30): the version is no longer re-typed here.  It was the literal
+#: "0.9", which stayed frozen for the whole of the 0.10 line -- and this
+#: equality is what kept it frozen, because changing the seed tool turned this
+#: red.  A pin on a stale fact preserves the staleness.  DERIVED now, for the
+#: same reason production derives it (``systemu/runtime/user_agent.py``); the
+#: property this file is about -- the identity names the public project and no
+#: private repository -- is unchanged and is still stated as an EQUALITY, so
+#: the allowlist-of-one reasoning in the note above still holds.
+def _expected_default_user_agent() -> str:
+    import systemu
+
+    return "systemu/{} (+https://pypi.org/project/systemu)".format(
+        systemu.__version__)
+
+
+_EXPECTED_DEFAULT_USER_AGENT = _expected_default_user_agent()
 
 
 def test_fetch_json_default_user_agent_names_no_private_repository(monkeypatch):

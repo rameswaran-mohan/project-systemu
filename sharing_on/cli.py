@@ -1652,6 +1652,8 @@ def census_grant_cmd(category, assume_yes):
       1  you were asked and declined (a bare Enter counts as no)
       2  there was no terminal to ask on -- nothing was recorded; re-run with
          --yes once you have read the disclosure
+      3  the category is unknown, or is declared but not yet grantable from
+         this build; nothing was recorded and you were not asked
 
     A `y` arriving on a pipe is not consent and is refused with exit 2. The
     same rule governs `systemu roots grant`.

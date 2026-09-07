@@ -49,9 +49,13 @@ _BULK_CARD_PLAIN_LEAD = (
 # IMPL-2: the exact option label a DENY tool card offers as the remedy, AND the exact
 # choice string the Inbox panel resolves with. ``decision_queue.resolve`` validates
 # choice-in-options, so a one-character drift between the two would raise instead of
-# resolving — hence ONE constant, imported by both surfaces. The trailing character is
-# a real ellipsis (U+2026), not three periods.
-RECLASSIFY_OPTION = "Reclassify effect…"
+# resolving -- hence ONE constant, imported by every surface that names it
+# (``cli_commands.py`` included; it used to re-type the literal).
+#
+# ASCII, three periods. This was a real ellipsis (U+2026) and was the LAST non-ASCII
+# constant in this module: on Windows the daemon console is cp1252, where an
+# unencodable character is a UnicodeEncodeError in place of the card (DEC-32c).
+RECLASSIFY_OPTION = "Reclassify effect..."
 
 
 class GateDescriptor(BaseModel):
@@ -296,13 +300,13 @@ class GateDescriptor(BaseModel):
             what = (
                 f"Runs the {tool_name!r} tool once, scored as the effect class you "
                 f"assigned ({assigned_class or 'unspecified'}). That classification is "
-                "single-use and cannot be remembered — the next identical call is "
+                "single-use and cannot be remembered -- the next identical call is "
                 "gated again from scratch.")
         elif is_deny:
             what = (
                 f"Runs the {tool_name!r} tool ({tags}). This effect could not be "
                 "classified and carries a high-severity signal, so it cannot be "
-                "remembered — you will be asked again every time. "
+                "remembered -- you will be asked again every time. "
                 f"'{RECLASSIFY_OPTION}' never runs anything by itself: you assign the "
                 "real effect class under typed confirmation, and a fresh approval card "
                 "is posted on that classification.")
@@ -326,10 +330,19 @@ class GateDescriptor(BaseModel):
             # Do NOT re-add the host-class clause until a resolver actually
             # populates it. tests/test_impl1_host_class_claim.py witnesses that
             # condition from the live gate and documents how to flip the pin.
+            # D3 HONESTY (dogfood 0.10.28): this line described the MEMORY
+            # semantics of one option and said nothing about what either option
+            # DOES to the parked run. Meanwhile the run's own status text told the
+            # operator to approve and then re-run the task by hand — so the card
+            # and the task list disagreed about whether an approval was worth
+            # anything, and the resume rail (which really does pick the run back
+            # up) was invisible from both. Both options run the call NOW; say so.
             what = (
-                f"Runs the {tool_name!r} tool ({tags}). 'Always allow' remembers "
-                "this exact tool body + effect set, so re-forging this tool "
-                "re-gates it.")
+                f"Runs the {tool_name!r} tool ({tags}). 'Approve once' runs it "
+                "now, this once. 'Always allow' runs it now and remembers this "
+                "exact tool body + effect set, so re-forging this tool re-gates "
+                "it. Either way the parked run picks up on its own -- you do not "
+                "need to start it again.")
         return cls(
             title=f"Run tool: {tool_name}",
             risk=risk,
@@ -396,7 +409,7 @@ class GateDescriptor(BaseModel):
         def _line(e, *, with_reason: bool = False) -> str:
             tags = ", ".join(e.effect_tags) or "unclassified"
             if not with_reason:
-                return f"  {e.name} — {tags}"
+                return f"  {e.name} -- {tags}"
             # The reason comes from the SAME predicate that excluded the tool, so the
             # card can never name a rule the code did not apply. "0 excluded" with no
             # reasons is what made the old promise unfalsifiable on screen. Bounded like
@@ -404,8 +417,11 @@ class GateDescriptor(BaseModel):
             # string, so a clip never removes the part that names WHY.
             why = batch_exclusion_reason(e)
             if len(why) > MAX_REASON_CHARS:
-                why = why[:MAX_REASON_CHARS - 1].rstrip() + "…"
-            return f"  {e.name} — {tags}  [excluded: {why}]"
+                # "..." is THREE characters where the ellipsis was one, so the
+                # budget moves with it -- the clipped reason must still fit the
+                # cap, not overrun it by two per excluded tool.
+                why = why[:MAX_REASON_CHARS - 3].rstrip() + "..."
+            return f"  {e.name} -- {tags}  [excluded: {why}]"
 
         def _listing(entries, *, with_reason: bool = False,
                      limit: int = MAX_LISTED_PER_BAND) -> list:
@@ -419,7 +435,7 @@ class GateDescriptor(BaseModel):
             out = [_line(e, with_reason=with_reason) for e in entries[:limit]]
             rest = len(entries) - limit
             if rest > 0:
-                out.append(f"  …and {rest} more (open the Inbox to review the full list)")
+                out.append(f"  ...and {rest} more (open the Inbox to review the full list)")
             return out
 
         rule = batch_rule_sentence()
@@ -442,7 +458,7 @@ class GateDescriptor(BaseModel):
                 out += [
                     "",
                     "These cannot be bulk-approved. Each is decided individually the "
-                    "first time it runs, on a card showing the actual arguments — and "
+                    "first time it runs, on a card showing the actual arguments -- and "
                     "an effect that could not be classified is reclassified there "
                     "under typed confirmation.",
                 ]
@@ -474,13 +490,13 @@ class GateDescriptor(BaseModel):
                 f"prompting mid-task. It does NOT cover the {len(excluded)} excluded "
                 f"tool(s). {rule} "
                 "Approval binds to each tool's exact body + effect set, so re-forging "
-                "one re-gates it — and a remembered tool is still gated on any call "
+                "one re-gates it -- and a remembered tool is still gated on any call "
                 "whose arguments score higher than what was reviewed here.")
         else:
             what = (
                 f"There is nothing to batch-approve: none of these {len(excluded)} "
                 f"tool(s) qualifies, so no batch option is offered. {rule} "
-                f"'{OPT_LEAVE_GATED}' just acknowledges this list — every one of these "
+                f"'{OPT_LEAVE_GATED}' just acknowledges this list -- every one of these "
                 "tools still works, and asks you the first time it runs, on a card "
                 "showing the actual arguments.")
 
@@ -585,10 +601,10 @@ class GateDescriptor(BaseModel):
                              str(getattr(t, "status", "?")))
             dry = getattr(t, "dry_run_status", "not_run")
             enabled = "enabled" if getattr(t, "enabled", False) else "disabled"
-            lines.append(f"{getattr(t, 'name', '?')} — {status}, {enabled}, dry-run: {dry}")
+            lines.append(f"{getattr(t, 'name', '?')} -- {status}, {enabled}, dry-run: {dry}")
         options = ["Dismiss", "Enable & run"]
         return cls(
-            title=f"Task blocked — {len(tools or [])} tool(s) not ready",
+            title=f"Task blocked -- {len(tools or [])} tool(s) not ready",
             risk="medium",
             inspect=f"Task: {act_name}\n" + "\n".join(lines),
             options=options,

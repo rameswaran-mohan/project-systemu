@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime
 from typing import Any, Dict
 
@@ -29,22 +30,238 @@ logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = {"success", "failure", "failed", "partial", "skipped_no_shadow",
                       "cancelled", "spend_cap_reached"}
 
+# D6: one vocabulary for "not finished", owned by the runtime module that owns
+# chat-task state — the page must not keep a second, drifting copy.
+from systemu.runtime.chat_task_registry import (          # noqa: E402
+    ACTIVE_CHAT_STATUSES as _ACTIVE_STATUSES,
+)
 
-def _make_chat_stop_handler(ts: str):
-    """Click handler: cooperative-cancel the chat task registered under `ts`."""
+# D5: how long the page waits for the submission event before telling the
+# operator it could not submit. Generous — the workflow lane refines a Scroll
+# (one LLM round-trip) before its chat-history row exists — but BOUNDED, because
+# an unbounded wait is the silence this defect is about.
+_ACK_TIMEOUT_SECONDS = 180.0
+_ACK_POLL_SECONDS = 0.35
+
+
+def _live_supervisor():
+    """The process Supervisor, or None when it was never started here."""
+    try:
+        from systemu.runtime.supervisor import Supervisor
+        return Supervisor.get()
+    except Exception:
+        return None
+
+
+# ── D5/D6 (dogfood 0.10.28) — the submit + stop contract ────────────────────
+#
+# D5: the operator clicked Run Task twice and watched the composer empty itself
+# while no task was ever created and nothing said why. The rule that closes it:
+# the composer clears ONLY once the submission has been ACKNOWLEDGED — an id
+# came back AND the submission event (the chat-history row) was witnessed. Every
+# other outcome — exception, timeout, no id, refused because something else is
+# running — leaves the text exactly where the operator typed it and names the
+# failure out loud.
+#
+# D6: a task parked on a gate swallowed new submissions, /continue and the Stop
+# button alike. Refusals now say WHY and what to do, Stop really cancels through
+# the runtime cancel entry, and a RUNNING row that no worker owns is labelled as
+# restored rather than dressed up as live work.
+
+_SUBMIT_FAILED_SUFFIX = "Your text is still here."
+
+
+def submit_failed_message(reason: str) -> str:
+    """The one failure line for every unacknowledged submission (D5). ASCII."""
+    reason = (str(reason) or "").strip() or "the task was not created"
+    if reason.endswith("."):
+        reason = reason[:-1]
+    return f"Could not submit: {reason}. {_SUBMIT_FAILED_SUFFIX}"
+
+
+def _task_when(entry: Dict[str, Any]) -> str:
+    return str(entry.get("ts") or "")[:19].replace("T", " ")
+
+
+def find_active_chat_task(entries) -> Any:
+    """The newest chat-history row that has not finished, or None (D6a).
+
+    This is what makes a refusal POSSIBLE to explain: 0.10.28 had no notion of
+    "something is already running", so a submission that went nowhere looked
+    exactly like one that went somewhere.
+    """
+    from systemu.runtime.chat_task_registry import ACTIVE_CHAT_STATUSES
+    for entry in reversed(list(entries or [])):
+        if isinstance(entry, dict) and entry.get("status") in ACTIVE_CHAT_STATUSES:
+            return entry
+    return None
+
+
+def active_task_toast(entry: Dict[str, Any], *, live: bool) -> str:
+    """D6(a): why this submission was refused, and what to do about it. ASCII."""
+    from systemu.runtime.chat_task_registry import task_title
+    head = f"A task is running ({task_title(entry)}, since {_task_when(entry)})."
+    if live:
+        return head + " Stop it or wait."
+    return (head + " Nothing is working on it - it was restored after a restart."
+            " Stop it to submit a new task.")
+
+
+def continue_waiting_toast(entry: Dict[str, Any]) -> str:
+    """D6(c): what /continue is actually waiting on, and where to resolve it."""
+    from systemu.runtime.chat_task_registry import task_title
+    title = task_title(entry)
+    status = entry.get("status")
+    if status == "pending_decision":
+        return (f"That task ({title}) is waiting on your approval. Resolve its "
+                f"card in Notifications, then it continues on its own.")
+    if status == "waiting_on_tools":
+        missing = ", ".join(list(entry.get("missing_tools") or [])[:4])
+        tail = f": {missing}" if missing else ""
+        return (f"That task ({title}) is waiting on tools{tail}. Enable them in "
+                f"the Tools Registry, then it continues on its own.")
+    if status == "needs_input":
+        return (f"That task ({title}) is waiting on an answer from you. Resolve "
+                f"its card in Notifications, then it continues on its own.")
+    return (f"That task ({title}) is still running, so /continue has nothing to "
+            f"extend yet. Wait for it, or stop it first.")
+
+
+def restored_task_note(entry: Dict[str, Any], *, live: bool) -> str:
+    """D6(d): the card note for a non-terminal row that no worker owns. ASCII."""
+    from systemu.runtime.chat_task_registry import ACTIVE_CHAT_STATUSES
+    if live or entry.get("status") not in ACTIVE_CHAT_STATUSES:
+        return ""
+    return "restored; not being worked - stop or resume"
+
+
+def stop_result_message(report: Dict[str, Any]):
+    """Turn a ``chat_task_registry.cancel_chat_task`` report into (text, type).
+
+    D6(b): the operator either sees "Stopped <title>" or the exact reason it
+    could not be stopped. There is no third, silent outcome.
+    """
+    title = report.get("title") or "the task"
+    if not report.get("stopped"):
+        reason = report.get("reason") or "the runtime gave no reason"
+        return f"Could not stop {title}: {reason}", "warning"
+    msg = f"Stopped {title}."
+    if not report.get("live"):
+        msg += " It was not being worked - the record is cleared."
+    note = report.get("gate_note") or ""
+    if note:
+        msg += f" Its pending approval card is left with a note: {note}."
+    return msg, "positive"
+
+
+def submission_witnessed(entries, task_id: str) -> bool:
+    """D5 acknowledgement: has the submission event landed for ``task_id``?
+
+    The chat-history row IS the submission event — both lanes write it (the
+    quick lane immediately, the workflow lane the moment its Scroll refines) and
+    both key it on the id the page generated. A run that dies before that row
+    exists produced no task, which is precisely the operator's witness.
+    """
+    if not task_id:
+        return False
+    for entry in list(entries or []):
+        if isinstance(entry, dict) and entry.get("ts") == task_id:
+            return True
+    return False
+
+
+def handle_chat_submit(*, text, entries, start, await_ack, notify, clear):
+    """THE chat submit chokepoint (D5 + D6a/c). Returns the acknowledged id or None.
+
+    Order is the contract, not a detail:
+      1. refuse an empty prompt;
+      2. refuse while another task is unfinished, saying WHY (and, for
+         /continue, what that task is waiting on) - the text is kept;
+      3. ``start()`` -> an id, or a named failure with the text kept;
+      4. ``await_ack(id)`` -> the submission event witnessed, or a named failure
+         with the text kept;
+      5. ONLY THEN ``clear()``.
+
+    ``start`` / ``await_ack`` / ``notify`` / ``clear`` are injected so this seam
+    is exercised without a NiceGUI client, a vault, an LLM or a daemon.
+    """
+    text = (text or "").strip()
+    if not text:
+        notify("Please enter a task.", type="warning")
+        return None
+
+    active = find_active_chat_task(entries)
+    if active is not None:
+        from systemu.runtime.chat_task_registry import chat_task_is_live
+        if text.lower().startswith("/continue"):
+            message = continue_waiting_toast(active)
+        else:
+            message = active_task_toast(active, live=chat_task_is_live(active))
+        notify(message, type="warning")
+        return None
+
+    try:
+        task_id = start()
+    except Exception as exc:
+        notify(submit_failed_message(exc), type="negative")
+        return None
+    if not task_id:
+        notify(submit_failed_message("no task id came back"), type="negative")
+        return None
+
+    try:
+        acknowledged, reason = await_ack(task_id)
+    except Exception as exc:
+        acknowledged, reason = False, str(exc)
+    if not acknowledged:
+        notify(submit_failed_message(reason), type="negative")
+        return None
+
+    clear()
+    notify("Task submitted.", type="positive")
+    return task_id
+
+
+def _make_chat_stop_handler(ts: str, vault: Any = None, on_done=None):
+    """Click handler: STOP the chat task recorded under `ts` (D6b).
+
+    0.10.28 only set an in-process flag, so a task restored after a daemon
+    restart - the exact case the operator hit - could not be stopped at all and
+    was told "Task is no longer running" while its row stayed RUNNING forever.
+    The handler now goes through the runtime cancel entry, which also withdraws
+    the pending gate card and writes the terminal state durably.
+    """
     def _stop(_=None):
-        from systemu.runtime import chat_task_registry as _reg
-        ok = False
+        from systemu.runtime.chat_task_registry import cancel_chat_task
+        from systemu.interface.dashboard_state import AppState
+        vlt = vault
+        if vlt is None:
+            try:
+                vlt = AppState.get().vault
+            except Exception:
+                vlt = None
         try:
-            ok = _reg.request_cancel(ts)
-        except Exception:
-            ok = False
+            supervisor = None
+            try:
+                from systemu.runtime.supervisor import Supervisor
+                supervisor = Supervisor.get()
+            except Exception:
+                supervisor = None
+            report = cancel_chat_task(vlt, ts, supervisor=supervisor)
+        except Exception as exc:   # never leave the click unanswered
+            report = {"stopped": False, "title": ts, "live": False,
+                      "gate_note": "", "reason": str(exc)}
+        message, kind = stop_result_message(report)
         try:
             from nicegui import ui as _ui
-            _ui.notify("Stopping…" if ok else "Task is no longer running.",
-                       type="warning" if ok else "info")
+            _ui.notify(message, type=kind)
         except Exception:
             pass
+        if report.get("stopped") and on_done is not None:
+            try:
+                on_done()
+            except Exception:
+                logger.debug("[ChatPage] post-stop refresh failed", exc_info=True)
     return _stop
 
 
@@ -205,6 +422,13 @@ def build_chat_page(prefill: str = "") -> None:
             "spend_cap_reached": THEME["warning"],
         }.get(status, THEME.get("text_muted", "#94a3b8"))
 
+        # D6(d): ask the runtime whether anything is actually working this row.
+        try:
+            from systemu.runtime.chat_task_registry import chat_task_is_live
+            _is_live = chat_task_is_live(entry, supervisor=_live_supervisor())
+        except Exception:
+            _is_live = True   # unsure -> do not accuse a live run of being dead
+
         card_opacity = "opacity: 0.55; " if is_stale else ""
         with ui.card().classes("w-full").style(
             f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
@@ -238,6 +462,16 @@ def build_chat_page(prefill: str = "") -> None:
                     ui.label(meta).style(
                         f"font-size: 11px; color: {THEME['text_muted']};"
                     )
+                    # D6(d): a row that came back RUNNING after a daemon restart
+                    # with no worker behind it must not read as live work.
+                    # The warn tint comes from the `s-text-warn` token class
+                    # (var(--color-warn)) — no inline colour, no raw hex, so the
+                    # palette stays editable in design/tokens.py alone.
+                    _note = restored_task_note(entry, live=_is_live)
+                    if _note:
+                        ui.label(_note).classes("s-text-warn").style(
+                            "font-size: 11px; font-weight: 600;"
+                        )
                 with ui.column().classes("items-end").style("gap: 6px;"):
                     ui.badge(status.upper().replace("_", " ")).style(
                         f"background: {status_color}; color: white; "
@@ -252,13 +486,15 @@ def build_chat_page(prefill: str = "") -> None:
                         # spends its active time at waiting_on_tools/pending_decision,
                         # not "running", so gate on all non-terminal states (the
                         # cancel_event is honored by both lanes). RESTART when terminal.
-                        if status in ("running", "waiting_on_tools",
-                                      "pending_decision", "needs_input"):
+                        if status in _ACTIVE_STATUSES:
                             _raw_ts = entry.get("ts", "")
-                            ui.button(icon="stop_circle",
-                                      on_click=_make_chat_stop_handler(_raw_ts)).props(
+                            ui.button(
+                                icon="stop_circle",
+                                on_click=_make_chat_stop_handler(
+                                    _raw_ts, vault, on_done=_render_history),
+                            ).props(
                                 "flat dense round size=sm color=negative"
-                            ).tooltip("Kill this job")
+                            ).tooltip("Stop this task")
                         elif status in ("success", "partial", "failed", "cancelled",
                                         "skipped_no_shadow", "spend_cap_reached"):
                             def _restart(_=None, _p=entry.get("prompt", "")):
@@ -363,52 +599,59 @@ def build_chat_page(prefill: str = "") -> None:
         prompt_input.set_value(prefill)
 
     def _on_submit() -> None:
-        raw = prompt_input.value.strip()
-        if not raw:
-            ui.notify("Please enter a task.", type="warning")
-            return
+        # D5: the composer is NOT cleared here. `handle_chat_submit` clears it,
+        # and only once the submission has been acknowledged.
+        raw = (prompt_input.value or "").strip()
 
         mode = lane.value or "quick"
         queue_mode = (mode == "queue")
-        prompt_input.set_value("")
-        status_label.set_text({
-            "quick":   "Answering…",
-            "queue":   "Queued — see Systemu Chat for progress",
-            "run_now": "Running…",
-        }.get(mode, "Running…"))
         # W7.4: do NOT disable the submit button — each submission runs in its
         # own thread, so concurrent chat tasks are fine. Disabling it for the
         # whole sync run made the UI itself serialize task submission.
 
         # Capture the NiceGUI client and target slot in the MAIN UI thread
-        # while the slot stack is still set up.  The background thread below
-        # has no slot context of its own, so re-entering the captured client
+        # while the slot stack is still set up.  The background threads below
+        # have no slot context of their own, so re-entering the captured client
         # via `with client:` is how we make ui.timer (and any other UI ops)
-        # work from inside the thread without `RuntimeError: The current
+        # work from inside a thread without `RuntimeError: The current
         # slot cannot be determined because the slot stack for this task is
         # empty.`
         client = ui.context.client
+
+        def _ui_call(fn) -> None:
+            """Run `fn` inside the captured client, from any thread."""
+            try:
+                if not _should_schedule_refresh(client):
+                    return
+                with client:
+                    ui.timer(0.01, fn, once=True)
+            except Exception:
+                logger.debug("[ChatPage] UI call skipped — client unavailable")
+
+        def _notify(message, **kwargs) -> None:
+            _ui_call(lambda: ui.notify(message, **kwargs))
+
+        def _clear() -> None:
+            # Only wipe what the operator actually submitted: if they typed a
+            # new draft while the first submission was being acknowledged,
+            # clearing would eat it.
+            def _do():
+                if (prompt_input.value or "").strip() == raw.strip():
+                    prompt_input.set_value("")
+            _ui_call(_do)
 
         # Phase 6 Batch 2 (6g): capture the run_direct_task return (the
         # Activity) so the completion handler can surface a live Work link.
         # A 1-slot list lets the daemon thread hand the result to _on_done
         # without a nonlocal/closure-rebind dance.
         result_holder: list = [None]
+        run_error: list = []
+        finished = threading.Event()
 
-        # v0.9.32 (D3.2): register a cancel token for THIS chat submission so the
-        # per-entry Stop button (chat_task_registry.request_cancel(ts)) can halt it.
         from datetime import datetime as _dt
         from systemu.runtime import chat_task_registry as _reg
-        # v0.9.32 review fix 3A: MICROSECOND precision (not seconds). This id is
-        # the cancel-registry key AND the chat-history entry id; at second
-        # granularity two submissions within the same wall-clock second collide
-        # — they share one cancel token (register is idempotent) and clobber each
-        # other's chat-history rows. Microsecond keeps it a valid sortable
-        # isoformat while making same-second submissions distinct.
-        task_ts = _dt.now().isoformat()
-        cancel_event = _reg.register(task_ts)
 
-        def _run() -> None:
+        def _run(task_ts, cancel_event) -> None:
             try:
                 if mode == "quick":
                     # W8.3: the fast lane — bounded ReAct loop, no scroll/
@@ -430,7 +673,9 @@ def build_chat_page(prefill: str = "") -> None:
                 )
             except Exception as exc:
                 logger.error("[ChatPage] task run failed: %s", exc)
+                run_error.append(exc)
             finally:
+                finished.set()
                 # v0.9.32: always drop the cancel token (registry-leak guard).
                 try:
                     _reg.unregister(task_ts)
@@ -446,6 +691,72 @@ def build_chat_page(prefill: str = "") -> None:
                 except Exception:
                     logger.debug("[ChatPage] post-run UI refresh skipped — client unavailable")
 
+        def _start() -> str:
+            """Begin the run and return the id it will be recorded under."""
+            # v0.9.32 review fix 3A: MICROSECOND precision (not seconds). This id
+            # is the cancel-registry key AND the chat-history entry id; at second
+            # granularity two submissions within the same wall-clock second
+            # collide — they share one cancel token (register is idempotent) and
+            # clobber each other's chat-history rows.
+            task_ts = _dt.now().isoformat()
+            cancel_event = _reg.register(task_ts)
+            try:
+                threading.Thread(target=_run, args=(task_ts, cancel_event),
+                                 name=f"chat-submit-{task_ts}", daemon=True).start()
+            except Exception:
+                _reg.unregister(task_ts)
+                raise
+            _ui_call(lambda: status_label.set_text({
+                "quick":   "Answering…",
+                "queue":   "Queued — see Systemu Chat for progress",
+                "run_now": "Running…",
+            }.get(mode, "Running…")))
+            return task_ts
+
+        def _await_ack(task_id):
+            """Wait for the submission event — the chat-history row (D5).
+
+            Both lanes write that row from the id we just handed them, so its
+            appearance is the first honest evidence that a task EXISTS. A run
+            that dies before it (the witnessed defect: scroll refinement failing)
+            reaches the `finished` branch and the operator keeps their text.
+
+            R-UX2: this waits, so it must never wait on the event loop. It is
+            only ever reached through ``handle_chat_submit`` from ``_submit``,
+            and ``_submit`` is only ever started on the ``chat-submit-gate``
+            daemon thread below — there is no other call site. Every UI effect
+            it produces (``_notify`` / ``_clear``) is handed back to the loop
+            through ``_ui_call``, never touched from here.
+            """
+            def _witnessed():
+                return submission_witnessed(vault.load_chat_history(limit=20), task_id)
+
+            deadline = time.monotonic() + _ACK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    if _witnessed():
+                        return True, ""
+                except Exception as exc:
+                    return False, f"could not read the task list ({exc})"
+                if finished.is_set():
+                    # Re-read once: the row may have landed between the two
+                    # checks above. Only then call it a non-submission.
+                    try:
+                        if _witnessed():
+                            return True, ""
+                    except Exception:
+                        pass
+                    if run_error:
+                        return False, str(run_error[0])
+                    return False, "the pipeline stopped before creating the task"
+                if time.monotonic() >= deadline:
+                    return False, "timed out waiting for the task to be created"
+                # offload-lint: ok — runs on the "chat-submit-gate" daemon
+                # thread started at the foot of _on_submit
+                # (threading.Thread(target=_submit, name="chat-submit-gate")),
+                # never on the event loop; see this function's docstring.
+                time.sleep(_ACK_POLL_SECONDS)
+
         def _on_done() -> None:
             status_label.set_text("")
             _render_history()
@@ -457,7 +768,7 @@ def build_chat_page(prefill: str = "") -> None:
             if activity is not None:
                 link = _work_link_for(activity)
                 ui.notify(
-                    "Task submitted — open it in Work.",
+                    "Task finished — open it in Work.",
                     type="positive",
                     actions=[{
                         "label": "View in Work",
@@ -466,7 +777,24 @@ def build_chat_page(prefill: str = "") -> None:
                     }],
                 )
 
-        threading.Thread(target=_run, daemon=True).start()
+        def _submit() -> None:
+            try:
+                entries = vault.load_chat_history(limit=20)
+            except Exception as exc:
+                logger.debug("[ChatPage] chat history unreadable at submit", exc_info=True)
+                _notify(submit_failed_message(f"the task list is unreadable ({exc})"),
+                        type="negative")
+                return
+            handle_chat_submit(
+                text=raw, entries=entries,
+                start=_start, await_ack=_await_ack,
+                notify=_notify, clear=_clear,
+            )
+
+        # The whole chokepoint runs off the UI thread: the blocker read touches
+        # disk and the acknowledgement waits on the pipeline, and doing either
+        # inline is exactly the "renderer freeze" the operator reported.
+        threading.Thread(target=_submit, name="chat-submit-gate", daemon=True).start()
 
         # v0.9.50 (6b): surface the running task immediately — re-render the
         # history a few times so the just-appended "running" entry appears, and

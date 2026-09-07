@@ -439,10 +439,24 @@ def build_welcome_page() -> None:
             # already booted on it. A status line and the gate beside it must be
             # the same claim. The render cost is bounded by the mint's 20 s memo,
             # which the health banner on this very page has usually just warmed.
+            #
+            # D4: the ONE mint call this page makes now goes through
+            # `provider_snapshot.refresh_now`, which PUBLISHES what it observed.
+            # The health banner at the top of every route (including this one)
+            # then reads that snapshot instead of spending its own loopback
+            # witness inside layout -- which is the blocking socket that froze
+            # the renderer. This page still spends the witness on its own
+            # render because step 1's verdict IS the page; it is bounded, it
+            # happens once per visit, and it is now the only surface that pays.
+            from systemu.runtime import provider_snapshot as _snap
             from systemu.runtime import provider_status as _ps
             _view = _ps.env_overlay(config)
-            _pstat = _ps.all_provider_statuses(
-                _view, cache_ttl_s=_ps.PROBE_CACHE_TTL_S)
+            _pstat = (_snap.refresh_now(
+                          _view, cache_ttl_s=_ps.PROBE_CACHE_TTL_S).statuses
+                      # A mint that blew up publishes nothing; fall back to the
+                      # zero-network read so this page still renders a full
+                      # (honest, unsatisfied) table rather than an empty one.
+                      or _ps.all_provider_statuses(_view, probe=_ps.unprobed))
             _usable = _ps.satisfied_providers(_pstat)
             if _usable:
                 ui.label(
@@ -466,12 +480,30 @@ def build_welcome_page() -> None:
                     "Credentials are never entered in the browser."
                 ).classes("s-banner s-banner--warn w-full")
 
-                def _recheck(_=None) -> None:
+                async def _recheck(_=None) -> None:
                     # W11.4: no restart dance — reload .env in place.
+                    #
+                    # D4: the verdict this button waits on is a loopback probe,
+                    # and it used to be awaited ON THE EVENT LOOP, so every
+                    # other client of this daemon froze for the duration. It
+                    # now ENQUEUES the work off-loop and re-renders when the
+                    # answer lands; the behaviour the operator sees (notify,
+                    # then navigate on success) is unchanged.
+                    import asyncio
                     _refresh_key_status(config)
+                    from systemu.runtime import provider_snapshot as _rsnap
                     from systemu.runtime import provider_status as _rps
                     _rps.clear_probe_cache()   # the operator just changed .env
-                    if _rps.any_provider_usable(_rps.env_overlay(config)):
+                    _rsnap.clear()             # ...so the old snapshot is void
+                    _rsnap.request_refresh()   # nudge the background refresher
+                    _view2 = _rps.env_overlay(config)
+                    try:
+                        _fresh = await asyncio.to_thread(
+                            _rsnap.refresh_now, _view2)
+                        _ok = _rps.any_satisfied(_fresh.statuses)
+                    except Exception:
+                        _ok = False
+                    if _ok:
                         ui.notify("Provider found — you're ready.",
                                   type="positive")
                         ui.navigate.to("/welcome")

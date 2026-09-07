@@ -581,15 +581,29 @@ def provider_credentials_card(config) -> None:
         "model id, not only by the dropdown above — is why a tier would fail."
     ).classes("s-muted")
 
+    def _unknown_table() -> dict:
+        return {s.provider: _ps.ProviderStatus(
+                    s.provider, s.display, s.env, s.rule,
+                    _ps.STATE_UNKNOWN, "status could not be determined")
+                for s in _ps.PROVIDER_SPECS}
+
     def _statuses(probe=None) -> dict:
-        """Mint, but a render may never raise — not even if the mint does."""
+        """Mint, but a render may never raise — not even if the mint does.
+
+        D4: the OBSERVED pass (probe=None, already off the render path in a
+        worker thread) publishes what it saw through
+        `provider_snapshot.refresh_now`, so the health banner on this very page
+        can read a real verdict instead of spending its own loopback witness
+        inside layout. The first, synchronous paint still uses `_unobserved`
+        and touches nothing.
+        """
         try:
+            if probe is None:
+                from systemu.runtime import provider_snapshot as _snap
+                return _snap.refresh_now(config).statuses or _unknown_table()
             return _ps.all_provider_statuses(config, probe=probe)
         except Exception:
-            return {s.provider: _ps.ProviderStatus(
-                        s.provider, s.display, s.env, s.rule,
-                        _ps.STATE_UNKNOWN, "status could not be determined")
-                    for s in _ps.PROVIDER_SPECS}
+            return _unknown_table()
 
     held = {"statuses": _statuses(probe=_unobserved), "observed": False}
 

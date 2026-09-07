@@ -9,6 +9,13 @@ from typing import List
 
 from dotenv import load_dotenv
 
+# The outbound identity is DERIVED from ``systemu.__version__`` rather than
+# re-typed here; both defaults below used to carry a literal frozen at 0.9.8.
+# Safe at module import: ``systemu/__init__.py`` imports nothing and
+# ``systemu.runtime.user_agent`` imports nothing but ``systemu``, so this
+# cannot cycle back into ``sharing_on``.
+from systemu.runtime.user_agent import user_agent as _user_agent
+
 # v0.8.0.2: load .env from CWD FIRST so every CLI verb (analyze, init,
 # scrolls, decisions, etc.) gets consistent dotenv behavior — not just
 # `daemon start`.  Previously only the install-time _PROJECT_ROOT/.env was
@@ -418,7 +425,7 @@ class Config:
     web_reader_backend: str = "auto"         # auto | jina | raw
     web_search_backend: str = "auto"         # auto | ddg | brave | tavily | searxng
     web_cache_ttl_seconds: int = 900
-    nominatim_user_agent: str = "systemu/0.9.8 (+https://pypi.org/project/systemu)"
+    nominatim_user_agent: str = field(default_factory=_user_agent)
     brave_api_key: str = ""                  # optional — OFF by default
     tavily_api_key: str = ""                 # optional — OFF by default
     searxng_url: str = ""                     # optional self-host — OFF by default
@@ -609,8 +616,7 @@ class Config:
             web_search_backend=os.getenv("SYSTEMU_WEB_SEARCH_BACKEND", "auto").lower(),
             web_cache_ttl_seconds=int(os.getenv("SYSTEMU_WEB_CACHE_TTL", "900")),
             nominatim_user_agent=os.getenv(
-                "SYSTEMU_NOMINATIM_UA",
-                "systemu/0.9.8 (+https://pypi.org/project/systemu)"),
+                "SYSTEMU_NOMINATIM_UA", _user_agent()),
             brave_api_key=os.getenv("SYSTEMU_BRAVE_API_KEY", ""),
             tavily_api_key=os.getenv("SYSTEMU_TAVILY_API_KEY", ""),
             searxng_url=os.getenv("SYSTEMU_SEARXNG_URL", ""),

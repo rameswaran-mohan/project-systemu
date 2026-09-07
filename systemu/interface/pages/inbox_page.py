@@ -354,12 +354,16 @@ def _reclassify_outcome_notice(dctx, cls: str):
     """Pure: the (message, notify-type) the panel shows after a reclassify resolves.
 
     The affirmative copy is only earned when the assignment will actually be RECORDED.
-    ``resume_on_decision._dispatch_resume`` returns False for a decision with no
-    ``chat_submission_id``, so outside the chat lane a reclassify writes nothing to the
-    approval store — yet the panel reported "Reclassified as <class>. …The task will
-    re-check this call on that classification and ask you to approve it" in green. The
-    operator was told a remedy had been applied when none had, and the suggested
-    recovery ("re-run the task") could not help either: there is no record to apply.
+    The panel used to report "Reclassified as <class>. …The task will re-check this
+    call on that classification and ask you to approve it" in green for a card the
+    dispatcher was going to drop; the operator was told a remedy had been applied when
+    none had, and the suggested recovery ("re-run the task") could not help either,
+    because there was no record to apply.
+
+    The answer comes from ``reclassification_can_be_recorded`` and NEVER from a
+    condition restated here — a second copy of the ladder is exactly how the two drift
+    into disagreeing. D3 (dogfood 0.10.28) removed that ladder's chat-lane refusal, and
+    this text needed no edit precisely because it never repeated it.
 
     Pure + exported so the honest-reporting rule is unit-testable without a NiceGUI
     runtime, like ``_validate_reclassify`` and ``_inbox_card_model``.

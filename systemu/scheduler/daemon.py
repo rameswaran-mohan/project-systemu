@@ -168,6 +168,18 @@ class DaemonReadiness:
     build_match: Optional[bool] = None
     build_note: str = ""
 
+    # -- D1: WHICH Python each side is running under -------------------------
+    # The build answers "is it the same code?"; this answers "is it the same
+    # interpreter?", and they fail independently: one venv can hold the code
+    # while another holds the packages a tool needs. It is also the fact that
+    # explains the second process row a Windows venv produces -- which, with
+    # nothing anywhere naming an interpreter, reads to an operator as two
+    # daemons racing for the port. Tri-state, fail-closed, exactly as above.
+    daemon_interpreter: Optional[str] = None
+    cli_interpreter: Optional[str] = None
+    interpreter_match: Optional[bool] = None
+    interpreter_note: str = ""
+
     # -- the vault-root fence (DEC-32) ---------------------------------------
     # True only when the boot was REFUSED because the operating vault root lies
     # inside the installed systemu package. Distinct from a plain not-ready:
@@ -229,20 +241,81 @@ def _own_build() -> dict:
     return {"version": version, "path": path}
 
 
+def _own_interpreter() -> dict:
+    """The Python THIS process is running under, and how it was reached.
+
+    Three facts, because on Windows an operator can see three:
+
+      * ``executable`` — ``sys.executable``, the path this process answers with;
+      * ``base`` — ``sys._base_executable``, the interpreter a virtual
+        environment's launcher actually runs (equal to ``executable`` outside
+        one);
+      * ``venv`` — whether this process is running out of a virtual
+        environment at all.
+
+    The pair is what explains the operator's second process row: on Windows
+    ``python -m venv`` installs ``Scripts/python.exe`` as a launcher that
+    CreateProcess-es ``base`` with the SAME argv and waits on it inside a job
+    object, so ONE daemon is two rows in a process list.
+
+    A statement about the CALLING interpreter and nothing else. Never raises.
+    """
+    executable = sys.executable if type(sys.executable) is str else ""
+    base = getattr(sys, "_base_executable", None)
+    if type(base) is not str or not base:
+        base = executable
+    try:
+        in_venv = bool(sys.prefix != sys.base_prefix)
+    except Exception:
+        in_venv = False
+    return {"executable": executable, "base": base, "venv": in_venv}
+
+
+def _recorded_interpreter(state: dict) -> Optional[dict]:
+    """The interpreter the DAEMON recorded, or None (UNVERIFIED).
+
+    Every value is pinned with ``type(x) is T`` in this frame before it is used
+    (DEC-36). A record of any other shape is UNVERIFIED, which is a distinct
+    state from agreement — never a path invented to fill the gap.
+    """
+    if type(state) is not dict:
+        return None
+    rec = state.get("interpreter")
+    if type(rec) is not dict:
+        return None
+    executable = rec.get("executable")
+    if type(executable) is not str or not executable:
+        return None
+    base = rec.get("base")
+    if type(base) is not str or not base:
+        base = executable
+    venv = rec.get("venv")
+    if type(venv) is not bool:
+        venv = False
+    return {"executable": executable, "base": base, "venv": venv}
+
+
 def _write_runtime_state_at(path: Path, *, pid: Optional[int], port: int,
                             host: Optional[str] = None,
-                            build: Optional[dict] = None) -> None:
+                            build: Optional[dict] = None,
+                            interpreter: Optional[dict] = None) -> None:
     """Write the runtime sidecar at an explicit path. Never raises.
 
     ``build`` is the F13 record of WHICH systemu the writing process imported.
-    Only the daemon process itself may pass one — see the structural fence in
-    tests/test_daemon_build_skew_witness.py.
+    ``interpreter`` is the D1 record of WHICH Python it is running under. Only
+    the daemon process itself may pass either — the parent knows the
+    interpreter it NAMED, which on Windows is routinely not the file the child
+    ends up executing. See the structural fences in
+    tests/test_daemon_build_skew_witness.py and
+    tests/test_dogfood28_d1_the_daemon_names_its_interpreter.py.
     """
     try:
         record = {"pid": (int(pid) if pid is not None else None),
                   "port": int(port),
                   "host": host or _readiness_host(),
-                  "build": (dict(build) if type(build) is dict else None)}
+                  "build": (dict(build) if type(build) is dict else None),
+                  "interpreter": (dict(interpreter)
+                                  if type(interpreter) is dict else None)}
         path.write_text(json.dumps(record), encoding="utf-8")
     except Exception:
         logger.debug("[Daemon] runtime-state write failed (ignored)", exc_info=True)
@@ -250,10 +323,11 @@ def _write_runtime_state_at(path: Path, *, pid: Optional[int], port: int,
 
 def _write_runtime_state(vault_dir: str, *, pid: Optional[int], port: int,
                          host: Optional[str] = None,
-                         build: Optional[dict] = None) -> None:
+                         build: Optional[dict] = None,
+                         interpreter: Optional[dict] = None) -> None:
     """Record which socket THIS daemon was told to serve. Never raises."""
     _write_runtime_state_at(_runtime_file_path(vault_dir), pid=pid, port=port,
-                            host=host, build=build)
+                            host=host, build=build, interpreter=interpreter)
 
 
 def _recorded_build(state: dict) -> tuple[Optional[str], Optional[str]]:
@@ -339,6 +413,125 @@ def _pidfile_process(vault_dir: str) -> tuple[Optional[int], bool]:
     pid_file.unlink(missing_ok=True)
     _runtime_file_path(vault_dir).unlink(missing_ok=True)
     return None, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IDEMPOTENCY — a daemon may never spawn a daemon for its own socket
+# ─────────────────────────────────────────────────────────────────────────────
+#  `start_daemon`'s single-instance guard reads the PIDFILE, and the pidfile is
+#  written by the PARENT the instant `Popen` returns and OVERWRITTEN by the
+#  child with its own pid seconds later. In between there is a window in which
+#  the guard reads nothing, and a second `start_daemon` for the same vault and
+#  port spawns a rival that races for the socket and writes the same vault.
+#
+#  Nothing calls `start_daemon` from inside a daemon today. That is what makes
+#  this the right moment to fence it: the project already ships a
+#  dispatcher-restart mechanism, and a re-exec loop is one review away.
+#
+#  The key is what the ruling names — the vault's daemon RECORD plus PID
+#  liveness — and both halves are load-bearing. The claim alone would refuse
+#  every restart from a shell that once held the variable; the record alone
+#  cannot tell "the daemon is up" from "I am the daemon".
+
+#: How a running daemon tells every process it starts WHICH socket it serves.
+#: Inherited by children, so a tool the daemon spawned cannot re-enter either.
+DAEMON_IDENTITY_ENV = "SYSTEMU_DAEMON_IDENTITY"
+
+#: Published by :func:`_publish_daemon_identity` about THIS process. In-process
+#: and not inheritable — the env var above is the half that crosses a process
+#: boundary, and it is exactly the half that needs the liveness witness.
+_ACTIVE_DAEMON_IDENTITY: Optional[str] = None
+
+
+def _identity_of_record(record_path, port) -> str:
+    """The (daemon record, port) pair as ONE comparable ASCII token.
+
+    Keyed on the RECORD rather than on the vault string because the record is
+    the thing both sides can name identically: `start_daemon` derives it from
+    the minted root, `_run_daemon_loop` already holds it as the file it writes
+    itself into. Two spellings of one vault produce one token; two vaults
+    produce two.
+
+    ASCII (DEC-32c): this token is quoted in an operator-facing refusal, and a
+    verdict a cp1252 console cannot encode is a verdict nobody reads.
+    """
+    try:
+        where = os.path.normcase(os.path.normpath(os.path.abspath(str(record_path))))
+    except Exception:
+        where = str(record_path)
+    try:
+        socket_port = int(port)
+    except (TypeError, ValueError):
+        socket_port = -1
+    token = "{}|{}".format(where, socket_port)
+    return token.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def daemon_identity(vault_dir, port) -> str:
+    """The identity of the daemon that serves ``(vault_dir, port)``."""
+    return _identity_of_record(_runtime_file_path(str(vault_dir)), port)
+
+
+def _publish_daemon_identity(record_path, port) -> str:
+    """THIS process declares the socket it is serving. Only a daemon may.
+
+    Called by :func:`_run_daemon_loop` about itself, next to the pid it records
+    — the same rule the build record follows (F13): the only process entitled
+    to say what is running here is the one that is running.
+    """
+    global _ACTIVE_DAEMON_IDENTITY
+    token = _identity_of_record(record_path, port)
+    _ACTIVE_DAEMON_IDENTITY = token
+    os.environ[DAEMON_IDENTITY_ENV] = token
+    return token
+
+
+def _identity_claims(vault_dir: str, port: int) -> bool:
+    """Does this process, or the daemon that started it, claim this socket?
+
+    DEC-36 — the concrete type is pinned in THIS frame before any comparison,
+    because ``==`` dispatches to the operand and a ``str`` subclass that answers
+    True to everything would otherwise arm the guard. DEC-34 — the comparison
+    is :func:`hmac.compare_digest` on two pinned ``str``s, never a polymorphic
+    operator against a value that arrived from outside this process.
+    """
+    import hmac
+
+    mine = daemon_identity(vault_dir, port)
+    if type(mine) is not str:
+        return False
+    for claim in (_ACTIVE_DAEMON_IDENTITY, os.environ.get(DAEMON_IDENTITY_ENV)):
+        if type(claim) is not str:
+            continue
+        if hmac.compare_digest(claim, mine):
+            return True
+    return False
+
+
+def _already_serving_this_socket(vault_dir: str, port: int) -> bool:
+    """True only when a LIVE daemon for this exact socket is already recorded.
+
+    The claim says "I am that daemon"; the vault's own record — written by the
+    executing process, never by a parent — says "and it is still alive". A
+    guard armed on the claim alone would survive `daemon stop` and refuse the
+    restart that fixes things, which is fail-closed onto the remedy: a defect,
+    not a stricter fence.
+    """
+    if not _identity_claims(vault_dir, port):
+        return False
+    state = _read_runtime_state(vault_dir)
+    if type(state) is not dict:
+        return False
+    pid = state.get("pid")
+    recorded_port = state.get("port")
+    if type(pid) is not int or type(recorded_port) is not int:
+        return False
+    try:
+        if recorded_port != int(port):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return _process_alive(pid)
 
 
 #: Where a witnessed port number came from. Three of these are the OPERATOR's
@@ -486,6 +679,84 @@ def _compare_builds(*, tracked: bool, daemon_version: Optional[str],
         f"different code than you are addressing it with. " + _BUILD_REMEDY)
 
 
+_INTERPRETER_REMEDY = ("Start it from the interpreter you are typing at: "
+                       "`systemu daemon stop` then `systemu daemon start`.")
+
+
+def _ascii_verdict(text: str) -> str:
+    """DEC-32c: a verdict a cp1252 console cannot encode is not a verdict."""
+    value = text if type(text) is str else str(text)
+    return value.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _venv_launcher_clause(recorded: dict) -> str:
+    """THE LINE THAT ENDS THE NIGHT, when a venv is what the daemon runs from.
+
+    An operator who sees two rows with identical daemon argv has exactly one
+    reading available to them -- two daemons racing for the port -- unless
+    something names the other executable and says what the pair is. This does
+    both. It says "can appear" because whether a given venv's `python.exe` is
+    a launcher or a copy is a property of the operator's Python installation,
+    and asserting more than we witnessed is the defect class, not the fix.
+    """
+    if type(recorded) is not dict or recorded.get("venv") is not True:
+        return ""
+    base = recorded.get("base")
+    executable = recorded.get("executable")
+    if type(base) is not str or not base:
+        return ""
+    if _same_path(base, executable):
+        return ""
+    return (" The daemon runs from a virtual environment, so on Windows its "
+            f"launcher can appear in a process list as a SECOND row running "
+            f"{base} with the same arguments -- that pair is one daemon, not "
+            "two, and only one of them holds the port.")
+
+
+def _compare_interpreters(*, tracked: bool, recorded: Optional[dict],
+                          mine: dict) -> tuple[Optional[bool], str]:
+    """THE SOLE comparison of "which Python is the daemon running under?".
+
+    Returns ``(match, note)`` where ``match`` is TRI-STATE, exactly as the
+    build comparison is:
+      * ``True``  — the daemon recorded the interpreter this process is using
+      * ``False`` — it recorded a DIFFERENT one
+      * ``None``  — UNVERIFIED: no daemon to ask, or it recorded nothing
+
+    ``None`` is never rendered as agreement. A daemon that records no
+    interpreter predates this record, which means it is a different daemon
+    build — the very condition being reported (DEC-27).
+    """
+    if not tracked:
+        # Nothing of ours is up: there is no interpreter claim to make, and
+        # inventing one would be noise on every `daemon status` of a stopped
+        # daemon.
+        return None, ""
+
+    my_exe = mine.get("executable") if type(mine) is dict else None
+    if type(my_exe) is not str or not my_exe:
+        my_exe = "an interpreter this process could not name"
+
+    if recorded is None:
+        return None, _ascii_verdict(
+            "UNVERIFIED interpreter: the daemon process did not record which "
+            "Python it runs under, so it cannot be compared with this CLI "
+            f"({my_exe}). It is an older daemon, or was started by a different "
+            "systemu install. " + _INTERPRETER_REMEDY)
+
+    daemon_exe = recorded["executable"]
+    if _same_path(daemon_exe, my_exe):
+        return True, _ascii_verdict(
+            f"same interpreter on both sides: {daemon_exe}"
+            + _venv_launcher_clause(recorded))
+
+    return False, _ascii_verdict(
+        f"INTERPRETER SKEW: the daemon process runs under {daemon_exe}, but "
+        f"this CLI is {my_exe}. A dependency installed by one is invisible to "
+        "the other, and a venv/base-install mix is the usual cause. "
+        + _INTERPRETER_REMEDY + _venv_launcher_clause(recorded))
+
+
 def probe_readiness(vault_dir: str, *, port: Optional[int] = None,
                     host: Optional[str] = None,
                     timeout: float = 1.0) -> DaemonReadiness:
@@ -558,12 +829,23 @@ def probe_readiness(vault_dir: str, *, port: Optional[int] = None,
     match, note = _compare_builds(tracked=alive, daemon_version=d_ver,
                                   daemon_path=d_path, mine=mine)
 
+    # D1 — WHICH Python the daemon runs under rides the SAME mint, for the same
+    # reason the build does: an operator staring at two process rows has no
+    # other place to learn it, and a second derivation would be a second answer.
+    rec_interp = _recorded_interpreter(recorded)
+    my_interp = _own_interpreter()
+    i_match, i_note = _compare_interpreters(tracked=alive, recorded=rec_interp,
+                                            mine=my_interp)
+
     return DaemonReadiness(
         ready=ready, pid=pid, process_alive=alive,
         host=resolved_host, port=resolved_port, reason=reason,
         daemon_version=d_ver, daemon_path=d_path,
         cli_version=mine["version"], cli_path=mine["path"],
         build_match=match, build_note=note,
+        daemon_interpreter=(rec_interp["executable"] if rec_interp else None),
+        cli_interpreter=my_interp["executable"],
+        interpreter_match=i_match, interpreter_note=i_note,
         port_source=port_source, port_provenance=provenance,
         vault_root=vault_root,
     )
@@ -607,9 +889,14 @@ def await_readiness(vault_dir: str, *, port: Optional[int] = None,
         saw_process = saw_process or verdict.process_alive
 
     if not verdict.ready:
+        # DEC-32c: `--`, not an em dash. This clause is the FAILURE verdict, and
+        # a console that cannot encode a verdict does not print a plainer one --
+        # it raises UnicodeEncodeError where the answer should have been, which
+        # on cp1252/cp437 is exactly the screen the operator most needs. Joined
+        # at the MINT so every consumer of this reason inherits the encoding.
         return _restate(
             verdict,
-            reason=(f"timed out after {float(timeout_s):.0f}s — {verdict.reason}"),
+            reason=(f"timed out after {float(timeout_s):.0f}s -- {verdict.reason}"),
         )
     return verdict
 
@@ -701,6 +988,23 @@ def start_daemon(
             refused=True,
         )
     vault_dir = _root_verdict.root
+
+    # ── IDEMPOTENCY: a daemon never spawns a daemon for its own socket ───────
+    # Ahead of the pidfile guard on purpose: this is exactly the window in
+    # which the pidfile says nothing (the parent's write is gone, or the
+    # child's has not happened yet), and it is the window a re-exec loop would
+    # double up in. The caller still gets a verdict -- refusing to SPAWN is not
+    # refusing to ANSWER, and `daemon start` on a running daemon must keep
+    # reporting the readiness of the one that is there.
+    if _already_serving_this_socket(vault_dir, port):
+        logger.warning(
+            "[Daemon] this process is already serving %s on port %d -- not "
+            "spawning a second daemon for the same vault and port", vault_dir,
+            int(port))
+        return await_readiness(
+            vault_dir, port=port,
+            timeout_s=(_start_timeout_s() if wait_timeout_s is None
+                       else wait_timeout_s))
 
     pid_file = _pid_file_path(vault_dir)
 
@@ -870,22 +1174,186 @@ def start_daemon(
     )
 
 
+#: The command-line marker that identifies a systemu daemon process. The
+#: `daemon stop --all` sweep has always keyed on this string; the DEFAULT path
+#: now consults the SAME one rather than spelling a second (DEC-43).
+_DAEMON_CMDLINE_MARKER = "systemu.scheduler.daemon"
+
+#: How far a process's creation time may sit past the pidfile's mtime before it
+#: is read as a different process. Both come off the same wall clock and the
+#: pidfile is always written after the process exists, so the healthy margin is
+#: negative; the slack absorbs filesystem timestamp granularity and a clock
+#: nudge, nothing more.
+_PIDFILE_CLOCK_SLACK_S = 5.0
+
+#: Bound on how much of a stranger's command line is quoted back. Nothing here
+#: is redacted because nothing is parsed out of it -- it is quoted whole, then
+#: bounded, so no truncation can ever cut a value out of its context (DEC-31).
+_STRANGER_CMDLINE_CAP = 200
+
+#: The three answers `_pidfile_names_this_daemon` gives. Module constants,
+#: compared with `is` by the one caller, so no value off disk can ever stand in
+#: for a verdict.
+_OWNER_DAEMON = "owner:daemon"
+_OWNER_GONE = "owner:gone"
+_OWNER_STRANGER = "owner:stranger"
+
+
+class DaemonStopRefused(Exception):
+    """`daemon stop` would not signal a pid it could not identify as ours.
+
+    Carries the pid and the operator-facing sentence. Raised only by
+    `stop_daemon`, and caught by its immediate caller -- the fence itself is
+    the code path NOT taken inside that function (nothing is signalled before
+    the verdict is in), so no frame in between can turn a refusal into a kill.
+    """
+
+    def __init__(self, message: str, *, pid):
+        super().__init__(message)
+        self.message = message
+        self.pid = pid
+
+
+def _pid_from_file(pid_file: Path) -> Optional[int]:
+    """The pid a pidfile names, or None when it names nothing usable.
+
+    DEC-36: the concrete type is pinned before the value is used. This used to
+    be a bare `int(...)` on file contents, so a truncated or hand-edited pidfile
+    raised ValueError out of `stop_daemon` and took the CLI with it.
+    """
+    try:
+        text = pid_file.read_text(encoding="utf-8", errors="backslashreplace").strip()
+    except Exception:
+        return None
+    if type(text) is not str or not text.isdigit():
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _pidfile_names_this_daemon(pid, pid_file: Path) -> tuple:
+    """``(verdict, evidence)`` -- may this pid be signalled? Never raises.
+
+    P4. `stop_daemon` used to read an integer and terminate it. A pidfile
+    outlives the daemon it names in every direction -- a crash, a `kill -9`, a
+    copied project folder -- and operating systems reissue pids, so a stale
+    record plus a reissued pid was a kill of somebody else's process reported as
+    "OK Daemon stopped."
+
+    Two checks, and they are not two layers of the same thing (DEC-34 forbids a
+    cheaper second layer that only manufactures confidence):
+
+      * THE COMMAND LINE names the daemon module. This is the check the `--all`
+        sweep has always made, consumed from the same marker constant.
+      * THE CREATION TIME is not LATER than the pidfile's mtime. The direction
+        is the counter-intuitive one and matters: `_run_daemon_loop` rewrites
+        the pidfile with its own pid seconds after the child starts, so for a
+        genuine daemon the PROCESS IS THE OLDER OF THE TWO. What this catches is
+        the reverse -- a process that began after the record naming it was
+        written, which therefore cannot be the process that record is about.
+        Reading the comparison the other way round would refuse every healthy
+        stop on every machine.
+
+    FAIL-CLOSED (DEC-27: completeness is witnessed, never inferred). A command
+    line that could not be read is not a command line that matched: no psutil,
+    AccessDenied, a non-list answer -- all refuse. `create_time` is genuinely
+    unavailable for many processes, so it is applied only when it is readable
+    and its absence never promotes anything on its own.
+
+    "Gone" is a THIRD answer, not a refusal. Nothing is there to terminate and
+    nothing is there to warn about; a refusal in that case would be the
+    cry-wolf that trains an operator to ignore refusals.
+    """
+    if type(pid) is not int:
+        return _OWNER_STRANGER, "the pidfile does not name a process id"
+    try:
+        import psutil
+    except Exception:
+        return _OWNER_STRANGER, "psutil is unavailable, so the pid could not be identified"
+    try:
+        proc = psutil.Process(pid)
+    except Exception:
+        return _OWNER_GONE, "no such process"
+    try:
+        if proc.is_running() is not True:
+            return _OWNER_GONE, "the process has exited"
+    except Exception:
+        return _OWNER_GONE, "the process could not be re-asked about"
+    try:
+        cmdline = proc.cmdline()
+    except Exception as exc:
+        return _OWNER_STRANGER, ("its command line could not be read ({})"
+                                 .format(type(exc).__name__))
+    if type(cmdline) is not list:
+        return _OWNER_STRANGER, "its command line could not be read"
+    joined = " ".join(a for a in cmdline if type(a) is str)
+    quoted = "cmdline: {}".format(joined[:_STRANGER_CMDLINE_CAP] or "(empty)")
+    if _DAEMON_CMDLINE_MARKER not in joined:
+        return _OWNER_STRANGER, quoted
+    try:
+        created = proc.create_time()
+        recorded_at = pid_file.stat().st_mtime
+    except Exception:
+        return _OWNER_DAEMON, quoted
+    if type(created) is not float or type(recorded_at) is not float:
+        return _OWNER_DAEMON, quoted
+    if created > recorded_at + _PIDFILE_CLOCK_SLACK_S:
+        return _OWNER_STRANGER, (
+            "it started after the pidfile that names it was written, so it "
+            "cannot be the process that file is about; " + quoted)
+    return _OWNER_DAEMON, quoted
+
+
+def _stop_refusal(pid, evidence: str, pid_file: Path) -> str:
+    """The ASCII sentence a refused stop prints (DEC-32c). Names what was seen,
+    so the operator can judge it, and the remedy, which is theirs to run."""
+    return ("pidfile names PID {pid} but that process is not a systemu daemon "
+            "({evidence}); not terminating - delete the pidfile if you know it "
+            "is stale: {path}").format(pid=pid, evidence=evidence, path=pid_file)
+
+
+def _terminate_pid(pid: int) -> None:
+    """Signal one process. The one place this program ends another process on
+    the default stop path, kept as its own seam so a test can witness that a
+    refusal signalled NOTHING without having to signal something to find out."""
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.kernel32.TerminateProcess(  # type: ignore[attr-defined]
+            ctypes.windll.kernel32.OpenProcess(1, False, pid), 0  # type: ignore[attr-defined]
+        )
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+
 def stop_daemon(vault_dir: str) -> bool:
-    """Send SIGTERM to the running daemon. Returns True if stopped."""
+    """Send SIGTERM to the running daemon. Returns True if stopped.
+
+    REFUSES, loudly and without signalling anything, when the pid on record
+    cannot be identified as this daemon -- see `_pidfile_names_this_daemon` for
+    what is checked and why. A pid that is simply gone is not a refusal: the
+    record is cleaned up and the answer is False.
+    """
     pid_file = _pid_file_path(vault_dir)
     if not pid_file.exists():
         _runtime_file_path(vault_dir).unlink(missing_ok=True)
         return False
 
-    pid = int(pid_file.read_text().strip())
+    pid = _pid_from_file(pid_file)
+    verdict, evidence = _pidfile_names_this_daemon(pid, pid_file)
+    if verdict is _OWNER_GONE:
+        pid_file.unlink(missing_ok=True)
+        _runtime_file_path(vault_dir).unlink(missing_ok=True)
+        return False
+    if verdict is not _OWNER_DAEMON:
+        # The pidfile is LEFT IN PLACE: it is the only evidence, and the remedy
+        # the message names is the operator's to run once they have looked.
+        raise DaemonStopRefused(_stop_refusal(pid, evidence, pid_file), pid=pid)
+
     try:
-        if sys.platform == "win32":
-            import ctypes
-            ctypes.windll.kernel32.TerminateProcess(  # type: ignore[attr-defined]
-                ctypes.windll.kernel32.OpenProcess(1, False, pid), 0  # type: ignore[attr-defined]
-            )
-        else:
-            os.kill(pid, signal.SIGTERM)
+        _terminate_pid(pid)
         pid_file.unlink(missing_ok=True)
         _runtime_file_path(vault_dir).unlink(missing_ok=True)
         logger.info("[Daemon] Stopped PID %d", pid)
@@ -935,6 +1403,13 @@ def get_status(vault_dir: str, *, port: Optional[int] = None,
         "cli_path": v.cli_path,
         "build_match": v.build_match,
         "build_note": v.build_note,
+        # D1 — WHICH interpreter each side runs under rides the same
+        # projection. A fact the mint carries but the dict drops is a fact no
+        # operator surface can reach.
+        "daemon_interpreter": v.daemon_interpreter,
+        "cli_interpreter": v.cli_interpreter,
+        "interpreter_match": v.interpreter_match,
+        "interpreter_note": v.interpreter_note,
     }
 
 
@@ -1085,9 +1560,21 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # the build is already on record.
     _runtime_state_file = pid_file.parent / _RUNTIME_FILE_NAME
     _write_runtime_state_at(_runtime_state_file, pid=os.getpid(), port=port,
-                            build=_own_build())
+                            build=_own_build(),
+                            interpreter=_own_interpreter())
+    # The SAME rule the build record follows: only the process that is running
+    # here may say what is running here. Published next to the pid it describes
+    # so the claim and its witness are written together, and inherited by every
+    # child so nothing this daemon starts can re-enter `start_daemon` for the
+    # socket this daemon already owns.
+    _publish_daemon_identity(_runtime_state_file, port)
     logger.info("[Daemon] running systemu %s from %s",
                 _own_build()["version"], _own_build()["path"])
+    # The same fact in the log, for the operator who is reading daemon.log
+    # rather than a CLI: the interpreter, and the base it was reached through.
+    logger.info("[Daemon] running under %s (base %s, venv=%s)",
+                _own_interpreter()["executable"], _own_interpreter()["base"],
+                _own_interpreter()["venv"])
 
     def _cleanup_runtime_files() -> None:
         pid_file.unlink(missing_ok=True)

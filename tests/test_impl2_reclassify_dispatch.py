@@ -424,18 +424,41 @@ def test_always_allow_without_the_reclassified_marker_is_still_standing(monkeypa
 
 # ── MED: the Inbox must not claim success when nothing was recorded ──────────
 #
-# ``_dispatch_resume`` returns False for a decision with no ``chat_submission_id``:
-# the reclassify branch is never reached, no store record is written, and re-running
-# does not help because there is no record to apply. The Inbox panel nonetheless
-# notified "Reclassified as <class>. …The task will re-check this call…" in green.
-# The single-lane limitation is pre-existing; the affirmative claim about it was not.
+# The Inbox panel used to notify "Reclassified as <class>. …The task will re-check
+# this call…" in green for a card the dispatcher was going to drop on the floor.
+# ``reclassification_can_be_recorded`` is the predicate it asks first, and it has to
+# track the dispatcher's own early-return ladder in BOTH directions: claiming a
+# remedy that will not be applied is a false report, and so is claiming a no-op while
+# the store is being written.
+#
+# D3 (dogfood 0.10.28) UPDATED THE GROUND TRUTH BELOW. The refusal used to be "no
+# chat_submission_id"; ``_dispatch_resume`` no longer has that guard for a gate (a
+# tool gate stamps its own resume coords at park time), so a reclassify on a
+# forge/heal-lane run now records and resumes exactly as it does in chat. That
+# matters because reclassify is the ONLY exit from the DENY band — without it that
+# lane had no way out at all. The predicate lost the same clause; these two tests
+# move together, which is the point of having them next to each other.
 
-def test_the_dispatcher_records_nothing_without_a_chat_submission(monkeypatch, tmp_path):
+def test_the_dispatcher_records_a_reclassify_outside_the_chat_lane(monkeypatch, tmp_path):
     """GROUND TRUTH for the predicate below: this is what actually happens today."""
     from systemu.runtime import resume_on_decision as rod
     store = _bind_store(monkeypatch, tmp_path)
     dec = _reclass_dec()
     dec.context.pop("chat_submission_id")
+    sup = _Sup()
+    assert rod._dispatch_resume(dec, vault=_Vault(), supervisor=sup,
+                                data_dir=str(tmp_path)) is True
+    assert _peek(store) == "local_write", "the operator's click must be recorded"
+    assert sup.submits == [("act_1", "shadow_1", "exec_A")]   # and the run resumes
+
+
+def test_the_dispatcher_still_records_nothing_without_a_run(monkeypatch, tmp_path):
+    """The refusal that REMAINS: a card with no execution_id has no run to resume, so
+    the reclassify branch is never reached and nothing is written."""
+    from systemu.runtime import resume_on_decision as rod
+    store = _bind_store(monkeypatch, tmp_path)
+    dec = _reclass_dec()
+    dec.context.pop("execution_id")
     assert rod._dispatch_resume(dec, vault=_Vault(), supervisor=_Sup(),
                                 data_dir=str(tmp_path)) is False
     assert _peek(store) is None, "nothing recorded — the operator's click did nothing"
@@ -449,8 +472,10 @@ def test_the_predicate_mirrors_the_dispatchers_early_returns():
             "execution_id": "exec_A"}
     assert reclassification_can_be_recorded(full) is True
 
-    # each early return, one at a time
-    assert reclassification_can_be_recorded({**full, "chat_submission_id": ""}) is False
+    # D3: the chat lane is no longer part of the ladder, in either direction.
+    assert reclassification_can_be_recorded({**full, "chat_submission_id": ""}) is True
+
+    # each remaining early return, one at a time
     assert reclassification_can_be_recorded({**full, "execution_id": None}) is False
     assert reclassification_can_be_recorded({**full, "gate_type": "command"}) is False
     assert reclassification_can_be_recorded({**full, "kind": "structured_question"}) is False

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import datetime
 import importlib.util
+import json
 import logging
 import os
 import subprocess
@@ -128,33 +129,247 @@ class ChromiumVerdict:
     used to decide on -- could not tell "playwright says no" apart from
     "playwright could not be asked", and spent 150 MB of the operator's
     connection on the difference.
+
+    `path` is the WITNESS, never the decision: the executable a PRESENT verdict
+    is about, so the log line can name it. Empty on every other state, and
+    empty when the path could not be re-read -- a missing witness downgrades
+    the LINE, never the verdict.
     """
 
-    __slots__ = ("state", "reason")
+    __slots__ = ("state", "reason", "path")
 
-    def __init__(self, state: str, reason: str = "") -> None:
+    def __init__(self, state: str, reason: str = "", path: str = "") -> None:
         self.state = state
         self.reason = reason
+        self.path = path
 
     def __repr__(self) -> str:                       # pragma: no cover - debug
-        return "ChromiumVerdict(state={s!r}, reason={r!r})".format(
-            s=self.state, r=self.reason)
+        return "ChromiumVerdict(state={s!r}, reason={r!r}, path={p!r})".format(
+            s=self.state, r=self.reason, p=self.path)
+
+
+class ChromiumProbeError(Exception):
+    """The probe could not be RUN. Not "the browser is missing".
+
+    Everything that raises this ends as UNKNOWN(reason). It exists so the
+    reason reaching the operator is a sentence about the registry rather than
+    an `IndexError` from three frames down.
+    """
+
+
+#: Playwright's own browser registry, relative to the installed package. It is
+#: the only thing that knows which chromium build THIS playwright will launch,
+#: and it is a plain JSON file: reading it costs a file read, where asking the
+#: driver the same question costs a Node process, a greenlet and an event loop.
+_REGISTRY_RELPATH = ("driver", "package", "browsers.json")
+
+#: The env var playwright honours for its browsers directory. Read here for the
+#: same reason playwright reads it: an operator who moved the browsers has
+#: moved the answer to "is chromium installed", and looking in the default
+#: place would report a present browser absent and re-download it.
+BROWSERS_PATH_ENV = "PLAYWRIGHT_BROWSERS_PATH"
+
+#: The directory playwright installs browsers into, under every platform cache.
+_BROWSERS_DIRNAME = "ms-playwright"
+
+#: Where playwright's documented `PLAYWRIGHT_BROWSERS_PATH=0` puts them --
+#: inside the wheel itself, not in a relative directory named "0".
+_LOCAL_BROWSERS_RELPATH = ("driver", "package", ".local-browsers")
+
+#: The executable layout inside `chromium-<revision>/`, newest first, per
+#: platform. `browsers.json` carries the revision but not the layout, so this
+#: half is replicated from playwright's published directory names; it is a
+#: CANDIDATE list and the first one that exists wins, which is what keeps a
+#: layout rename (chrome-win -> chrome-win64) from reading as an absent
+#: browser.
+_CHROMIUM_EXECUTABLES = {
+    "win32": (("chrome-win64", "chrome.exe"),
+              ("chrome-win", "chrome.exe")),
+    "darwin": (("chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"),
+               ("chrome-mac-arm64", "Chromium.app", "Contents", "MacOS",
+                "Chromium")),
+    "linux": (("chrome-linux", "chrome"),),
+}
+
+#: The characters a build revision may be made of. The registry ships inside
+#: the playwright wheel, so this is not an attacker boundary -- it is the
+#: cheapest way to keep a corrupted line from being joined onto a path.
+_REVISION_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz"
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+
+
+def _playwright_package_dir() -> str:
+    """Where the installed playwright package lives, WITHOUT importing it.
+
+    `find_spec` locates a package; it does not execute one. That is the whole
+    difference this finding turns on: importing `playwright.sync_api` pulls in
+    greenlet, the Node driver and an event loop, and it was that loop's
+    teardown -- not the browser, not the daemon -- that printed
+    `Task was destroyed but it is pending!` and a `TargetClosedError` after a
+    start that had already succeeded.
+    """
+    try:
+        spec = importlib.util.find_spec("playwright")
+    except Exception as exc:
+        raise ChromiumProbeError(
+            "playwright could not be located ({})".format(type(exc).__name__))
+    if spec is None:
+        raise ChromiumProbeError("playwright is not installed")
+    locations = getattr(spec, "submodule_search_locations", None)
+    try:
+        entries = list(locations or ())
+    except Exception:
+        entries = []
+    for entry in entries:
+        if type(entry) is str and entry:
+            return entry
+    origin = getattr(spec, "origin", None)
+    if type(origin) is str and origin:
+        return os.path.dirname(origin)
+    raise ChromiumProbeError("the playwright package has no directory")
+
+
+def _registry_path() -> str:
+    """The browser registry file this interpreter's playwright ships."""
+    return os.path.join(_playwright_package_dir(), *_REGISTRY_RELPATH)
+
+
+def _read_browser_registry(path: str) -> dict:
+    """The registry, as an object. RAISES rather than guessing.
+
+    A registry that cannot be read is the UNKNOWN case: guessing ABSENT here
+    re-downloads 150 MB on every start, and guessing PRESENT turns the browser
+    tools off with nothing said.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except Exception as exc:
+        raise ChromiumProbeError(
+            "the playwright browser registry could not be read ({})".format(
+                type(exc).__name__))
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise ChromiumProbeError(
+            "the playwright browser registry is not readable JSON")
+    if type(data) is not dict:
+        raise ChromiumProbeError(
+            "the playwright browser registry is not an object")
+    return data
+
+
+def _chromium_revision(registry) -> str:
+    """The chromium build number the registry names.
+
+    DEC-36: every value here came off disk, so its concrete type is pinned with
+    `type(x) is T` in this frame before anything is done with it -- `.get`,
+    `in` and `==` all dispatch.
+    """
+    if type(registry) is not dict:
+        raise ChromiumProbeError("the browser registry is not an object")
+    browsers = registry.get("browsers")
+    if type(browsers) is not list:
+        raise ChromiumProbeError("the browser registry lists no browsers")
+    for entry in browsers:
+        if type(entry) is not dict:
+            continue
+        name = entry.get("name")
+        if type(name) is not str or name != "chromium":
+            continue
+        revision = entry.get("revision")
+        if type(revision) is int:
+            revision = str(revision)
+        if type(revision) is not str or not revision.strip():
+            raise ChromiumProbeError(
+                "the browser registry names no chromium revision")
+        text = revision.strip()
+        if not set(text) <= _REVISION_CHARS:
+            raise ChromiumProbeError(
+                "the browser registry's chromium revision is not a build id")
+        return text
+    raise ChromiumProbeError("the browser registry names no chromium build")
+
+
+def _default_browsers_root(platform: str) -> str:
+    """Playwright's documented default cache directory for a platform.
+
+    Replicated rather than imported: every helper that resolves this inside
+    playwright lives under a module whose import starts the driver, which is
+    the cost this finding removes.
+    """
+    plat = platform if type(platform) is str else ""
+    if plat.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA")
+        if type(base) is not str or not base.strip():
+            base = os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(base, _BROWSERS_DIRNAME)
+    if plat == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Caches",
+                            _BROWSERS_DIRNAME)
+    base = os.environ.get("XDG_CACHE_HOME")
+    if type(base) is not str or not base.strip():
+        base = os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, _BROWSERS_DIRNAME)
+
+
+def _browsers_root(platform=None) -> str:
+    """The directory playwright would install chromium into on this machine."""
+    plat = platform if type(platform) is str else sys.platform
+    override = os.environ.get(BROWSERS_PATH_ENV)
+    text = override.strip() if type(override) is str else ""
+    if text == "0":
+        return os.path.join(_playwright_package_dir(), *_LOCAL_BROWSERS_RELPATH)
+    if text:
+        return text
+    return _default_browsers_root(plat)
+
+
+def _executable_candidates(platform=None) -> tuple:
+    """The executable paths, relative to `chromium-<revision>/`, to look for.
+
+    An unknown platform falls back to the linux layout rather than to nothing:
+    an empty list would make the probe raise and read UNKNOWN forever, where a
+    wrong guess reads ABSENT -- an answer the operator can act on.
+    """
+    plat = platform if type(platform) is str else sys.platform
+    key = "win32" if plat.startswith("win") else plat
+    layouts = _CHROMIUM_EXECUTABLES.get(key)
+    if type(layouts) is not tuple:
+        layouts = _CHROMIUM_EXECUTABLES["linux"]
+    return tuple(os.path.join(*parts) for parts in layouts)
 
 
 def _chromium_executable_path():
-    """Ask playwright where its chromium binary is. THE SYNC-API SEAM.
+    """Where playwright's chromium is, or would be. A PURE FILESYSTEM ANSWER.
 
-    RAISES whatever the sync API raises -- and that is the fix. This function
-    used to wrap the whole call in `except Exception: return None`, so an
-    `ImportError: DLL load failed while importing _greenlet` (witnessed on a
-    scratch Windows install with chromium fully on disk), a missing VC
-    runtime, or a half-finished install all came back as the same `None` that
-    a genuinely absent browser produces. `probe_chromium` catches this, in the
-    one frame that can tell the two apart.
+    THE DEFECT this replaces: this function used to open and close a whole
+    `sync_playwright()` context just to read a path. That starts the Node
+    driver, a greenlet and an event loop, and tearing that loop down inside a
+    daemon start leaked `Task was destroyed but it is pending!`, a
+    `Future exception was never retrieved` and a `playwright ... TargetClosedError`
+    onto the console and into `daemon.log` -- on a start that exited 0 with the
+    browser fully installed.
+
+    Nothing here imports playwright. The registry says which build, the
+    environment says where builds live, and the filesystem says whether the
+    file is there. RAISES `ChromiumProbeError` when the question cannot be
+    asked; `probe_chromium` catches that, in the one frame that can tell an
+    unanswerable probe apart from an absent browser.
     """
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        return p.chromium.executable_path
+    revision = _chromium_revision(_read_browser_registry(_registry_path()))
+    build_dir = os.path.join(_browsers_root(), "chromium-{}".format(revision))
+    candidates = [os.path.join(build_dir, rel)
+                  for rel in _executable_candidates()]
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return path
+        except Exception:
+            continue
+    # Nothing on disk: the FIRST candidate is where an install would put it, so
+    # an ABSENT verdict still names the place it looked.
+    return candidates[0]
 
 
 def chromium_present() -> bool:
@@ -197,12 +412,32 @@ def probe_chromium() -> ChromiumVerdict:
         present = chromium_present()
     except Exception as exc:
         reason = _probe_reason(exc)
+        # ONE line, and the traceback is NOT on it. `exc_info=True` here is the
+        # second half of the witnessed symptom: it made 92 of a successful
+        # `daemon start`'s 98 stderr lines a stack trace. The reason is what an
+        # operator can act on; the stack is for a DEBUG run.
         logger.warning("[provision] the chromium probe could not run: %s",
-                       reason, exc_info=True)
+                       reason)
+        logger.debug("[provision] the chromium probe could not run",
+                     exc_info=True)
         return ChromiumVerdict(CHROMIUM_UNKNOWN, reason)
     if present is True:
-        return ChromiumVerdict(CHROMIUM_PRESENT)
+        return ChromiumVerdict(CHROMIUM_PRESENT, path=_witness_path())
     return ChromiumVerdict(CHROMIUM_ABSENT)
+
+
+def _witness_path() -> str:
+    """The executable a PRESENT verdict is about, for the log line. Never a
+    decision: a path that cannot be re-read costs the line its detail and
+    changes no state, so this swallows what `_chromium_executable_path` raises
+    on purpose -- the frame above has already decided."""
+    try:
+        path = _chromium_executable_path()
+    except Exception:
+        logger.debug("[provision] could not name the present chromium",
+                     exc_info=True)
+        return ""
+    return path if type(path) is str else ""
 
 
 def _state_of(verdict) -> str:
@@ -221,6 +456,21 @@ def _state_of(verdict) -> str:
     if state is CHROMIUM_ABSENT:
         return CHROMIUM_ABSENT
     return CHROMIUM_UNKNOWN
+
+
+def _path_of(verdict) -> str:
+    """The executable a verdict names, or "" -- for the LOG, never a decision."""
+    if type(verdict) is not ChromiumVerdict:
+        return ""
+    path = verdict.path
+    return path if type(path) is str else ""
+
+
+#: What the PRESENT line says when the probe answered PRESENT but could not
+#: hand back the path (a race with an uninstall, a permission error on the
+#: re-read). The line still goes out: "the hook ran and found a browser" is the
+#: half a silent branch could not tell an operator.
+_UNREPORTED_PATH = "an unreported path"
 
 
 def _reason_of(verdict) -> str:
@@ -484,6 +734,13 @@ def ensure_chromium_async(*, console=None) -> None:
     state = _state_of(verdict)
     if state is CHROMIUM_PRESENT:
         _bootstrapped = True
+        # P3 -- the ONE branch that used to return in silence. Every other
+        # branch leaves a line, so a silent PRESENT was indistinguishable in
+        # the log from a provision hook that never ran, and those have
+        # different remedies. The console stays quiet: nothing to download is
+        # nothing to interrupt the operator with.
+        logger.info("[provision] chromium present at %s; nothing to download",
+                    _ascii(_path_of(verdict) or _UNREPORTED_PATH))
         return
     if state is CHROMIUM_UNKNOWN:
         # D3 -- THE DEFECT. `_chromium_executable_path` used to swallow the

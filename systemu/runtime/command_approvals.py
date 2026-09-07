@@ -79,6 +79,34 @@ RECLASSIFY_TTL_SECONDS = 30 * 60
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _emit_refusal_event(sig: str, *, minted_for, scored_under) -> None:
+    """D3: surface a SCOPE-refused resume bridge to the operator.
+
+    Only a real mismatch speaks; "no bridge on record" is the ordinary state of
+    every un-approved call and stays quiet. ASCII only. The signature is a sha1
+    digest, never operator input, but its concrete type is still pinned in this
+    frame before it is formatted (DEC-36) so a stored non-string cannot reach the
+    message. Lazy import + best-effort: the approval store must never depend on,
+    or be broken by, the notification layer.
+    """
+    try:
+        _sig = sig if type(sig) is str else ""
+        _minted = minted_for if type(minted_for) is str else ""
+        _under = scored_under if type(scored_under) is str else ""
+        from systemu.interface.notifications import log_event
+        log_event(
+            "WARNING", "tool",
+            "Your resume approval did not cover this call, so the gate will "
+            "re-ask: it was approved for {}, and this call is scored as {}.".format(
+                _minted or "an ordinary gate", _under or "an ordinary gate"),
+            {"tool_signature": _sig[:16], "minted_for": _minted,
+             "scored_under": _under},
+        )
+    except Exception:
+        logger.debug("[CommandApprovals] could not write bridge-refusal event",
+                     exc_info=True)
+
+
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
@@ -265,6 +293,14 @@ class CommandApprovalStore:
         reclassification is recorded, and by the DENY branch of the resume dispatcher.
         """
         want = for_reclassification or None
+        # The refusal is NOTIFIED after the lock is dropped, never inside it.
+        # ``EventBus.publish`` runs every subscriber synchronously on this thread
+        # and ``self._lock`` is a plain ``threading.Lock``, so emitting from within
+        # the critical section deadlocks any subscriber that reads this store — and
+        # the lock is then never released, wedging every later caller behind it.
+        # Carry the decision out in locals and speak on the other side.
+        refused = False
+        refused_scope = None
         with self._lock:
             self._data = self._load()
             pend = self._data.get("resume_pending") or {}
@@ -279,10 +315,21 @@ class CommandApprovalStore:
                     "%s, call is scored under %s — the gate re-asks",
                     sig, scope or "an ordinary gate",
                     want or "an ordinary gate")
-                return False
-            del pend[sig]
-            self._save()
-            return True
+                refused, refused_scope = True, scope
+            else:
+                del pend[sig]
+                self._save()
+        if refused:
+            # D3 (dogfood 0.10.28): a REFUSAL is not silence. The operator
+            # approved something and this says their approval did not cover
+            # the call in front of us, so the gate is about to re-ask. Without
+            # an operator-readable line that reads, from their seat, exactly
+            # like the resume-into-silence bug: a card resolved, then another
+            # card. An ABSENT bridge stays quiet deliberately — that is the
+            # ordinary state of every un-approved call and would be pure noise.
+            _emit_refusal_event(sig, minted_for=refused_scope, scored_under=want)
+            return False
+        return True
 
     def clear_resume_approved(self, sig: str) -> bool:
         """Drop any one-shot resume bridge for ``sig``, WHATEVER its scope. Returns

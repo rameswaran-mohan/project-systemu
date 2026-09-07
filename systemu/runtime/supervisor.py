@@ -1479,13 +1479,20 @@ class Supervisor:
                     "Answer it there to continue."
                 ),
             }
+        # D3 HONESTY (dogfood 0.10.28): this text was wrong twice over. It named
+        # "a shell command" for what is just as often a TOOL gate ("Run tool: X"),
+        # and it told the operator to re-run the task by hand -- which was true
+        # only because the resume rail refused every gate on a run with no
+        # chat_submission_id. It now resumes (resume_on_decision._dispatch_resume),
+        # so an operator who followed this line would start a SECOND run of work
+        # that was already picking itself back up.
         return {
             "status": "command_gate_blocked",
             "error":  "command_gate",
             "final_summary": (
-                "Blocked: a shell command requires operator approval and "
-                "was NOT run. Approve it (Always allow) in the inbox, then "
-                "re-run the task."
+                "Blocked: this action needs your approval and was NOT run. "
+                "Approve it in the inbox and the run picks up from here on "
+                "its own."
             ),
         }
 
@@ -1561,10 +1568,13 @@ class Supervisor:
         # post-mortem. Mirrors the cancelled branch: publish + early return; NO
         # retry, NO dead-letter, NO _analyze_failure (no storm).
         if status == "command_gate_blocked":
+            # D3: same correction as _pending_decision_result's copy of this
+            # sentence -- the gate is not always a shell command, and approving it
+            # now RESUMES the run instead of requiring a manual re-run.
             summary = result.get("final_summary") or (
-                "Blocked: a shell command requires operator approval and was "
-                "NOT run. Approve it (Always allow) in the inbox, then re-run "
-                "the task."
+                "Blocked: this action needs your approval and was NOT run. "
+                "Approve it in the inbox and the run picks up from here on "
+                "its own."
             )
             try:
                 from systemu.runtime.activity_completion import mark_activity_failed
