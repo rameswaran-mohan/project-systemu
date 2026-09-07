@@ -293,14 +293,14 @@ class TestResumeOnDecisionHandler:
                                   "shadow_id": "sh_R", "scroll_id": "scroll_R",
                                   "objective_id": 1},
                          dedup_key="stuck:scroll_R:obj_1:r1")
-        queue.resolve(did, choice=json.dumps({"action": "I'm in Bangalore"}))
+        queue.resolve(did, choice=json.dumps({"action": "I'm in Springfield"}))
         calls = []
         class FakeSup:
             def submit(self, activity_id, shadow_id, **kw):
                 calls.append((activity_id, shadow_id, kw)); return "sub_x"
         handle_decision_resolved(
             {"category": "operator_decision_resolved",
-             "context": {"decision_id": did, "choice": json.dumps({"action": "I'm in Bangalore"}),
+             "context": {"decision_id": did, "choice": json.dumps({"action": "I'm in Springfield"}),
                          "chat_submission_id": "2026-06-03T20:27:41"}},
             vault=vlt, supervisor=FakeSup(), data_dir=data_dir,
         )
@@ -311,7 +311,7 @@ class TestResumeOnDecisionHandler:
         assert kw["chat_submission_id"] == "2026-06-03T20:27:41"
         snap = read_snapshot("exec_R", data_dir=data_dir)
         stash = [n for n in snap.sticky_notes if n.startswith("__STUCK_ANSWER__::obj_1::")]
-        assert stash and "Bangalore" in stash[0]
+        assert stash and "Springfield" in stash[0]
 
     def test_handler_ignores_non_stuck_decisions(self, tmp_path):
         from systemu.runtime.resume_on_decision import handle_decision_resolved

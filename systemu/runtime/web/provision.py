@@ -104,21 +104,130 @@ def _remedy() -> str:
                                            cmd=_MANUAL_COMMAND)
 
 
+#: The three answers the chromium probe can give. UNKNOWN is the one this
+#: module used to spell as ABSENT, which is D3: a probe that could not RUN was
+#: read as a probe that had answered "no", and answered it again on every
+#: single daemon start.
+CHROMIUM_PRESENT = "PRESENT"
+CHROMIUM_ABSENT = "ABSENT"
+CHROMIUM_UNKNOWN = "UNKNOWN"
+
+#: An exception message is written by somebody else. Capped so one runaway
+#: repr cannot push the actionable half of the notice off the operator's
+#: console, and capped AFTER the ASCII spelling so the cap counts the
+#: characters that are actually printed (DEC-31 ordering).
+_REASON_CAP = 200
+
+
+class ChromiumVerdict:
+    """PRESENT / ABSENT / UNKNOWN(reason), as one value.
+
+    DEC-32 in its ordinary, non-security form: the fail-closed answer has to
+    ride IN the value that crosses into the deciding frame. A bool cannot
+    carry three states, so `chromium_present()` -- which is what this module
+    used to decide on -- could not tell "playwright says no" apart from
+    "playwright could not be asked", and spent 150 MB of the operator's
+    connection on the difference.
+    """
+
+    __slots__ = ("state", "reason")
+
+    def __init__(self, state: str, reason: str = "") -> None:
+        self.state = state
+        self.reason = reason
+
+    def __repr__(self) -> str:                       # pragma: no cover - debug
+        return "ChromiumVerdict(state={s!r}, reason={r!r})".format(
+            s=self.state, r=self.reason)
+
+
 def _chromium_executable_path():
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            path = p.chromium.executable_path
-            return path
-    except Exception:
-        return None
+    """Ask playwright where its chromium binary is. THE SYNC-API SEAM.
+
+    RAISES whatever the sync API raises -- and that is the fix. This function
+    used to wrap the whole call in `except Exception: return None`, so an
+    `ImportError: DLL load failed while importing _greenlet` (witnessed on a
+    scratch Windows install with chromium fully on disk), a missing VC
+    runtime, or a half-finished install all came back as the same `None` that
+    a genuinely absent browser produces. `probe_chromium` catches this, in the
+    one frame that can tell the two apart.
+    """
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        return p.chromium.executable_path
 
 
 def chromium_present() -> bool:
+    """PRESENT, as a bool, for callers that only ever wanted the happy answer.
+
+    RAISES when the probe cannot run. Nothing that DECIDES may call this:
+    a decision needs `probe_chromium()`, because "no" and "could not tell"
+    are different answers and only one of them may start a download.
+    """
     path = _chromium_executable_path()
-    if not path:
+    if type(path) is not str or not path:
         return False
-    return os.path.exists(path)
+    return True if os.path.exists(path) else False
+
+
+def _probe_reason(exc) -> str:
+    """One short ASCII clause naming why the probe could not answer.
+
+    The class name is kept: `ImportError` is the difference between "your
+    browser is missing" and "this interpreter cannot load playwright", and it
+    is the half an operator can search for.
+    """
+    name = type(exc).__name__
+    text = _ascii("{n}: {m}".format(n=name, m=exc))
+    if len(text) > _REASON_CAP:
+        text = text[:_REASON_CAP] + "..."
+    return text
+
+
+def probe_chromium() -> ChromiumVerdict:
+    """Is Playwright's chromium installed? PRESENT / ABSENT / UNKNOWN(reason).
+
+    `chromium_present` is called through the module attribute on purpose: it
+    is the seam this module's tests have always replaced, and it stays the one
+    place the two ANSWERABLE states are decided. What is new is that its
+    failure is caught HERE and given its own state, instead of being spelled
+    as absence somewhere further down.
+    """
+    try:
+        present = chromium_present()
+    except Exception as exc:
+        reason = _probe_reason(exc)
+        logger.warning("[provision] the chromium probe could not run: %s",
+                       reason, exc_info=True)
+        return ChromiumVerdict(CHROMIUM_UNKNOWN, reason)
+    if present is True:
+        return ChromiumVerdict(CHROMIUM_PRESENT)
+    return ChromiumVerdict(CHROMIUM_ABSENT)
+
+
+def _state_of(verdict) -> str:
+    """The state a decision may act on -- UNKNOWN for anything unrecognised.
+
+    DEC-36: the concrete type is pinned in the frame that decides, with
+    `type(x) is T`, and every other shape falls to UNKNOWN. Failing towards
+    UNKNOWN is what keeps a stand-in from authorising a download; failing
+    towards ABSENT is the defect being fixed.
+    """
+    if type(verdict) is not ChromiumVerdict:
+        return CHROMIUM_UNKNOWN
+    state = verdict.state
+    if state is CHROMIUM_PRESENT:
+        return CHROMIUM_PRESENT
+    if state is CHROMIUM_ABSENT:
+        return CHROMIUM_ABSENT
+    return CHROMIUM_UNKNOWN
+
+
+def _reason_of(verdict) -> str:
+    if type(verdict) is not ChromiumVerdict:
+        return "the probe returned no verdict"
+    reason = verdict.reason
+    return reason if type(reason) is str and reason else "no reason was given"
 
 
 def opted_out() -> bool:
@@ -162,6 +271,22 @@ def playwright_missing_notice() -> str:
             "download to start. The web tools that need a browser ({what}) "
             "stay unavailable until you run: {cmd}".format(
                 what=_WHAT_IT_BUYS, cmd=_remedy()))
+
+
+def chromium_probe_unknown_notice(reason) -> str:
+    """The line printed when the probe could not run at all.
+
+    It says three things and claims nothing else: that the question was not
+    answered, that nothing is being downloaded on the strength of a
+    non-answer, and that the browser tools stay off until the probe works. No
+    size, because nothing is coming down the connection; no remedy command,
+    because this module does not know which of the several causes it is and a
+    guessed remedy is the defect one floor up.
+    """
+    return ("systemu: could not determine whether Chromium is installed "
+            "({reason}); not downloading it; the web tools that need a browser "
+            "stay unavailable until the probe can run.".format(
+                reason=_ascii(reason)))
 
 
 def _ascii(text) -> str:
@@ -222,14 +347,22 @@ def announce_browser_autoinstall(*, console=None) -> Optional[str]:
     if opted_out():
         line = autoinstall_skipped_notice()
     elif not playwright_importable():
-        # BEFORE `chromium_present`, which asks playwright about its browser --
+        # BEFORE the chromium probe, which asks playwright about its browser --
         # a question that has no answer when playwright is not there, and which
         # this module used to let decide whether to promise a download.
         line = playwright_missing_notice()
-    elif chromium_present():
-        return None
     else:
-        line = autoinstall_notice()
+        verdict = probe_chromium()
+        state = _state_of(verdict)
+        if state is CHROMIUM_PRESENT:
+            return None
+        if state is CHROMIUM_UNKNOWN:
+            # D3: an unanswerable probe is NOT an absent browser. Announcing a
+            # download here is how a fully installed chromium was re-downloaded
+            # on every start.
+            line = chromium_probe_unknown_notice(_reason_of(verdict))
+        else:
+            line = autoinstall_notice()
     say(line)
     return line
 
@@ -347,8 +480,23 @@ def ensure_chromium_async(*, console=None) -> None:
                     "no chromium download to announce")
         say(playwright_missing_notice())
         return
-    if chromium_present():
+    verdict = probe_chromium()
+    state = _state_of(verdict)
+    if state is CHROMIUM_PRESENT:
         _bootstrapped = True
+        return
+    if state is CHROMIUM_UNKNOWN:
+        # D3 -- THE DEFECT. `_chromium_executable_path` used to swallow the
+        # sync API's exception and return None, and None was read as "not
+        # installed". On a box where the sync API raises (witnessed:
+        # `ImportError: DLL load failed while importing _greenlet`) that made
+        # every daemon start announce and re-spawn a 150 MB download for a
+        # chromium that was already on disk. An UNKNOWN authorises neither.
+        _bootstrapped = True
+        reason = _reason_of(verdict)
+        logger.warning("[provision] chromium presence is unknown (%s) -- "
+                       "no download", reason)
+        say(chromium_probe_unknown_notice(reason))
         return
     _bootstrapped = True
     log_path = _install_log_path()

@@ -62,6 +62,43 @@ def _closed_port() -> int:
 
 
 @pytest.fixture()
+def nothing_answers_on_the_default_port(monkeypatch) -> str:
+    """Witness the DEFAULT port at a loopback address nothing listens on.
+
+    HERMETICITY, not a weakening. The three tests that request this fixture are
+    about port 8765 -- the number this process GUESSES when nothing named one --
+    and about the branch that guess lands in: `nothing is accepting connections`,
+    the only branch carrying the `--port` remedy. 8765 is also a perfectly
+    ordinary port for an unrelated program to hold, and on a machine where one
+    does (a dashboard left running for another vault, another checkout's daemon)
+    the probe legitimately takes the `something is listening but no systemu
+    daemon is tracked for this vault` branch instead, where no remedy belongs.
+    The tests then failed for a fact about the BUILDER'S MACHINE rather than
+    about systemu, and a release gate may not turn on which ports its builder
+    happens to have free.
+
+    The port under test is UNCHANGED -- still 8765, still reached through the
+    real default-fallback path in `_resolve_readiness_port`, still asserted to
+    be `port_source == "default"`. Only the ADDRESS it is witnessed on is
+    pinned, through `SYSTEMU_DASHBOARD_HOST`, which is the shipped seam
+    `daemon._readiness_host` reads: the probe, the fallback and the reason text
+    are all still the production ones, so nothing here can hide a regression in
+    them.
+    """
+    host = "127.0.0.9"
+    monkeypatch.setenv("SYSTEMU_DASHBOARD_HOST", host)
+    # The premise is WITNESSED, not assumed -- asked with the very function the
+    # probe asks it with. A silently-listening address here would put these
+    # tests right back in the branch they exist to stay out of, and they would
+    # pass while testing nothing.
+    assert not daemon_mod._connection_succeeds(
+        host, daemon_mod.DEFAULT_DASHBOARD_PORT, 0.5), (
+        f"fixture premise broken: something is accepting connections on "
+        f"{host}:{daemon_mod.DEFAULT_DASHBOARD_PORT}")
+    return host
+
+
+@pytest.fixture()
 def vault_dir(tmp_path, monkeypatch) -> str:
     """A vault under tmp_path whose PARENT holds the daemon pid/runtime files.
 
@@ -81,7 +118,8 @@ def _minted_root(vault_dir: str) -> str:
 
 # ── the port that was probed, and where it came from ─────────────────────────
 
-def test_the_repro_after_a_stop_the_default_port_is_disclosed_as_a_guess(vault_dir):
+def test_the_repro_after_a_stop_the_default_port_is_disclosed_as_a_guess(
+        vault_dir, nothing_answers_on_the_default_port):
     """THE REPRO, in the state transition that produced it.
 
     The daemon recorded its real port in the sidecar; `daemon stop` deletes that
@@ -127,7 +165,8 @@ def test_an_explicit_port_is_disclosed_as_coming_from_the_port_flag(vault_dir):
     assert "--port" in verdict.reason, verdict.reason
 
 
-def test_the_defaulted_port_says_it_is_the_default_and_offers_the_remedy(vault_dir):
+def test_the_defaulted_port_says_it_is_the_default_and_offers_the_remedy(
+        vault_dir, nothing_answers_on_the_default_port):
     """No `--port`, no record, no env: 8765 is a GUESS and must say so, plus the
     one thing the operator can do about it."""
     verdict = daemon_mod.probe_readiness(vault_dir, timeout=0.2)
@@ -246,8 +285,8 @@ def test_the_status_command_prints_the_probed_port_and_the_vault(vault_dir,
     assert _flat(_minted_root(vault_dir)) in flat, res.output
 
 
-def test_the_bare_status_command_admits_the_port_is_a_default(vault_dir,
-                                                              monkeypatch):
+def test_the_bare_status_command_admits_the_port_is_a_default(
+        vault_dir, monkeypatch, nothing_answers_on_the_default_port):
     monkeypatch.setenv("COLUMNS", "200")
     from systemu.interface.cli_commands import daemon_status
 

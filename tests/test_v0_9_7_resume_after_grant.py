@@ -161,7 +161,7 @@ class TestResumeAfterGrantHappyPath:
             execution_id="exec-H2",
             activity_id="act-2",
             shadow_id="sh-2",
-            grant_payload={"operator_answer": "Use the Bangalore fallback"},
+            grant_payload={"operator_answer": "Use the Springfield fallback"},
         )
 
         snap = read_snapshot("exec-H2", data_dir=data_dir)
@@ -169,7 +169,7 @@ class TestResumeAfterGrantHappyPath:
                        if n.startswith("__HARNESS_GRANT__::exec-H2::")]
         assert len(grant_notes) == 1
         decoded = json.loads(grant_notes[0].split("::", 2)[2])
-        assert "Bangalore" in decoded["operator_answer"]
+        assert "Springfield" in decoded["operator_answer"]
 
     def test_deny_payload(self, tmp_path, monkeypatch):
         """DENY grant still re-submits so the shadow can continue with fallback."""

@@ -293,7 +293,7 @@ async def test_resume_input_grant_injects_answer(tmp_vault, mock_config,
     _seed_grant_snapshot(
         data_dir, exec_id,
         grant_payload={"kind": "INPUT",
-                       "operator_answer": "Use the Bangalore office address"},
+                       "operator_answer": "Use the Springfield office address"},
         pending={"request_id": "h4", "kind": "input",
                  "spec": {"question": "which office?"}, "fallback": ""},
     )
@@ -320,5 +320,5 @@ async def test_resume_input_grant_injects_answer(tmp_vault, mock_config,
                                        resume_from_execution_id=exec_id)
 
     assert result["status"] != "suspended_harness_escalation"
-    assert any("Bangalore" in str(o.get("message", "")) for o in captured["obs"]), \
+    assert any("Springfield" in str(o.get("message", "")) for o in captured["obs"]), \
         f"expected the operator_answer injected, got {captured['obs']}"

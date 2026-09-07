@@ -11,7 +11,7 @@ for weeks or longer:
 
 - Preferences ("prefers Italian food", "doesn't drink alcohol")
 - Family / relationships ("has a daughter named Maya", "wife works in finance")
-- Location patterns ("lives in Bangalore", "commutes to a co-working space in Indiranagar")
+- Location patterns ("lives in Springfield", "commutes to a co-working space in Riverside District")
 - Schedule patterns ("works 10am–7pm IST weekdays")
 - Tools / devices ("uses a MacBook Pro", "prefers Notion for notes")
 - Domains of expertise / interest ("knows Python well", "is learning Spanish")

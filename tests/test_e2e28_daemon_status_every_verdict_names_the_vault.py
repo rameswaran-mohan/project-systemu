@@ -17,8 +17,8 @@ N7  The Not-running panel WRAPPED the absolute vault path across Rich panel
 
         no live daemon process and nothing is accepting connections on
         127.0.0.1:8765 (port 8765 is the built-in default); vault: D:\\...
-        \\worktrees\\objectiv
-        e-wescoff-1b02d7\\systemu\\vault; if the daemon was started on ...
+        \\worktrees_dir\\exampl
+        e-nested-folder-1a2b3c\\systemu\\vault; if the daemon was started on ...
 
     The `roots` group already carries the ruling this breaks, in its own source:
     *a path wrapped at column 80 is not a path*.  A path split across two lines
@@ -52,9 +52,9 @@ _COLUMNS = "80"
 
 #: Rich draws panels with UNICODE box-drawing characters; they are not content.
 #: ASCII hyphens and pipes are deliberately NOT in this set: a real vault path
-#: carries hyphens (`objective-wescoff-1b02d7`), and stripping them would splice
-#: the two halves of a folded path back together -- hiding the very defect the
-#: N7 tests below exist to witness.
+#: carries hyphens (the fixture below nests one hyphenated directory name), and
+#: stripping them would splice the two halves of a folded path back together --
+#: hiding the very defect the N7 tests below exist to witness.
 _BOX = set("\u250c\u2510\u2514\u2518\u2500\u2502\u256d\u256e\u2570\u256f\u251c\u2524")
 
 
@@ -63,10 +63,19 @@ def _deep_vault(tmp_path) -> str:
 
     The witnessed path was 84 characters inside the panel body; anything that
     only fits by accident cannot witness the defect.
+
+    The parts below are SYNTHETIC, and deliberately so: this file ships inside
+    the sdist, so a fixture built from the development machine's own directory
+    names would publish them.  What the shape has to preserve is what the N7
+    property depends on -- six nested parts, one of them hyphenated with a
+    hex-like suffix, long enough that an 80-column panel must fold it.  The
+    hyphenated part carries four segments rather than two, so it is not the
+    two-word-plus-hex codename shape the hygiene fence in
+    ``tests/test_shippable_tree_names_no_private_place.py`` bans.
     """
     root = tmp_path
-    for part in ("Antigravity", "Project_systemu_pro", "dot_claude_worktrees",
-                 "objective-wescoff-1b02d7", "systemu", "vault"):
+    for part in ("Workspaces", "sample_project_root", "nested_worktrees_dir",
+                 "example-nested-folder-1a2b3c", "systemu", "vault"):
         root = root / part
     root.mkdir(parents=True, exist_ok=True)
     text = str(root)
@@ -105,6 +114,18 @@ _VERDICTS = {
     "not-running": dict(ready=False, process_alive=False),
 }
 
+#: D6 -- the exit code each verdict is RULED to answer with.
+#:
+#: This helper used to assert 0 for all three, which was a pin on the very
+#: behaviour D6 deliberately changed: an exit code that said "up" whatever the
+#: verdict was. Updating it here (and nowhere else in this file) keeps the
+#: helper honest about what a successful render is, while every assertion these
+#: tests exist for -- the vault root, the provenance clause, the unfolded path,
+#: the ASCII text -- is untouched and still runs on the SAME output. Those are
+#: the properties this file pins; the exit code is pinned in
+#: tests/test_e2e29_daemon_status_exit_codes.py.
+_RULED_EXIT_CODES = {"ready": 0, "starting": 2, "not-running": 1}
+
 
 def _run(monkeypatch, tmp_path, verdict: str) -> tuple[str, str]:
     """Render `daemon status` for one verdict.  Returns (output, vault_root)."""
@@ -120,7 +141,7 @@ def _run(monkeypatch, tmp_path, verdict: str) -> tuple[str, str]:
              "vault": SimpleNamespace()},
         env={"COLUMNS": _COLUMNS},
     )
-    assert res.exit_code == 0, res.output
+    assert res.exit_code == _RULED_EXIT_CODES[verdict], res.output
     return res.output, vault_root
 
 

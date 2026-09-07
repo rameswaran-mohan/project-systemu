@@ -440,7 +440,7 @@ CATEGORIES: Dict[str, dict] = {
         "excludes": ["install paths", "install dates", "sizes", "usage data",
                      "anything from inside the application"],
         "why": ("Knowing an application is installed changes planning more than almost "
-                "any other fact — it is the difference between planning around a tool "
+                "any other fact -- it is the difference between planning around a tool "
                 "you have and asking you for one."),
         "how": ("Reads the Windows uninstall registry keys (read-only), or lists "
                 "/Applications on macOS. No program is launched."),
@@ -462,7 +462,7 @@ CATEGORIES: Dict[str, dict] = {
         "why": ("\"git is available\" lets a plan use it instead of asking you to "
                 "install or name it."),
         "how": ("Looks up a fixed, published list of tool names on PATH. Nothing is "
-                "executed — presence is decided by the filesystem alone."),
+                "executed -- presence is decided by the filesystem alone."),
     },
     "cloud_sync_roots": {
         "title": "Cloud-sync folders",
@@ -472,7 +472,7 @@ CATEGORIES: Dict[str, dict] = {
         "why": ("Knowing where your synced folders are lets a plan find your documents "
                 "without you pointing at them."),
         "how": ("Checks a fixed list of location environment variables and well-known "
-                "folder names under your home directory. Directory existence only — "
+                "folder names under your home directory. Directory existence only -- "
                 "nothing inside is read or listed."),
     },
 }
@@ -517,7 +517,7 @@ def consent_card(category: str) -> dict:
     spec = CATEGORIES.get(str(category or ""))
     if spec is None:
         raise UnknownCensusCategory(
-            f"unknown census category {category!r} — known: {', '.join(sorted(CATEGORIES))}")
+            f"unknown census category {category!r} -- known: {', '.join(sorted(CATEGORIES))}")
     surfaced = str(category) in SURFACED_CATEGORIES
     return {
         "category": category,
@@ -553,7 +553,7 @@ def consent_card(category: str) -> dict:
         "transmission_notice": (
             "What this finds is stored on this machine, but NOT ONLY on this machine. "
             "Facts from this category are included in the planning prompt systemu sends "
-            "to its model provider on later runs — that is what makes the census useful, "
+            "to its model provider on later runs -- that is what makes the census useful, "
             "and it means the values it collects leave your computer. They are sent as "
             "clearly-marked untrusted data that the model is told to treat as "
             "description, never as instructions."),

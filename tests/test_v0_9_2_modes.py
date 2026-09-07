@@ -21,8 +21,8 @@ def _make_summary(**overrides):
         started_at=datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc),
         completed_at=datetime(2026, 6, 7, 12, 5, tzinfo=timezone.utc),
         status="success", intent="find burrito places near me",
-        outcome_summary="Ranked top 5 burrito spots in Bangalore",
-        key_facts_learned=[], files_produced=[], tags=["food", "bangalore"],
+        outcome_summary="Ranked top 5 burrito spots in Springfield",
+        key_facts_learned=[], files_produced=[], tags=["food", "springfield"],
     )
     kwargs.update(overrides)
     return SessionSummary(**kwargs)
@@ -59,7 +59,7 @@ class TestSqliteSessionSummaries:
             id="ss_a", session_id="a",
             intent="find food near me",
             outcome_summary="Listed local spots",
-            tags=["food", "bangalore"],
+            tags=["food", "springfield"],
         ))
         v.append_session_summary(_make_summary(
             id="ss_b", session_id="b",
@@ -67,7 +67,7 @@ class TestSqliteSessionSummaries:
             outcome_summary="Created travel plan",
             tags=["travel", "tokyo"],
         ))
-        out = v.search_session_summaries("bangalore", limit=5)
+        out = v.search_session_summaries("springfield", limit=5)
         assert [s.session_id for s in out] == ["a"]
 
     def test_query_filters_by_user(self, tmp_path):

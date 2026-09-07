@@ -21,10 +21,10 @@ class TestSessionSummaryModel:
             completed_at=datetime(2026, 6, 7, 12, 5, tzinfo=timezone.utc),
             status="success",
             intent="find burritos",
-            outcome_summary="Listed 5 burrito places in Bangalore",
-            key_facts_learned=["user lives in Bangalore"],
+            outcome_summary="Listed 5 burrito places in Springfield",
+            key_facts_learned=["user lives in Springfield"],
             files_produced=["/tmp/burritos.json"],
-            tags=["food", "bangalore"],
+            tags=["food", "springfield"],
             raw_chat_id=None,
         )
         kwargs.update(overrides)
@@ -155,9 +155,9 @@ class TestSessionSummaryFileBackend:
 
     def test_search_keyword_match_in_tags(self, tmp_path):
         v = self._make_vault(tmp_path)
-        v.append_session_summary(self._make_summary(id="ss_a", session_id="a", tags=["food", "bangalore"]))
+        v.append_session_summary(self._make_summary(id="ss_a", session_id="a", tags=["food", "springfield"]))
         v.append_session_summary(self._make_summary(id="ss_b", session_id="b", tags=["travel", "japan"]))
-        out = v.search_session_summaries("bangalore", limit=5)
+        out = v.search_session_summaries("springfield", limit=5)
         assert [s.session_id for s in out] == ["a"]
 
     def test_search_case_insensitive(self, tmp_path):
@@ -174,9 +174,9 @@ class TestEpisodicMemoryCapture:
 
         def fake_llm(**kw):
             return {
-                "outcome_summary": "Ranked top 5 burrito places in Bangalore",
-                "key_facts_learned": ["user is in Bangalore"],
-                "tags": ["food", "bangalore"],
+                "outcome_summary": "Ranked top 5 burrito places in Springfield",
+                "key_facts_learned": ["user is in Springfield"],
+                "tags": ["food", "springfield"],
             }
         monkeypatch.setattr(
             "systemu.runtime.episodic_memory.llm_call_json", fake_llm)
@@ -193,7 +193,7 @@ class TestEpisodicMemoryCapture:
         assert summary is not None
         assert summary.session_id == "sess_test"
         assert summary.outcome_summary.startswith("Ranked")
-        assert "bangalore" in [t.lower() for t in summary.tags]
+        assert "springfield" in [t.lower() for t in summary.tags]
 
     def test_capture_persists_to_vault(self, tmp_path, monkeypatch):
         from systemu.runtime import episodic_memory
@@ -266,7 +266,7 @@ class TestSessionTools:
         monkeypatch.setattr(
             "systemu.runtime.episodic_memory.llm_call_json",
             lambda **kw: {"outcome_summary": "burrito ranking",
-                          "key_facts_learned": [], "tags": ["food", "bangalore"]})
+                          "key_facts_learned": [], "tags": ["food", "springfield"]})
         episodic_memory.capture(
             vault=v, session_id="sess_burrito",
             intent="find burritos", chat_result=None,
@@ -368,8 +368,8 @@ class TestCliSession:
             prompt = kw.get("user", kw.get("prompt", ""))
             if "burrito" in prompt:
                 return {"outcome_summary": "ranked 5 burrito places",
-                        "key_facts_learned": ["user is in Bangalore"],
-                        "tags": ["food", "bangalore"]}
+                        "key_facts_learned": ["user is in Springfield"],
+                        "tags": ["food", "springfield"]}
             return {"outcome_summary": "found top ramen spots",
                     "key_facts_learned": ["user likes noodles"],
                     "tags": ["food", "ramen"]}
@@ -405,7 +405,7 @@ class TestCliSession:
         result = CliRunner().invoke(session_cli, ["show", "sess_burrito"])
         assert result.exit_code == 0
         assert "find burritos" in result.output
-        assert "bangalore" in result.output.lower()
+        assert "springfield" in result.output.lower()
 
     def test_session_search(self, tmp_path, monkeypatch):
         from click.testing import CliRunner

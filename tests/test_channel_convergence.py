@@ -277,12 +277,28 @@ def _default_user_agent(monkeypatch):
     return captured["headers"].get("User-Agent", "")
 
 
+#: The one User-Agent the fetcher is allowed to default to.
+#:
+#: Pinned as an EQUALITY, not as the absence of a particular private string.
+#: Two reasons, and the second is why this changed:
+#:   * an allowlist of one is strictly stronger -- "not the private repository"
+#:     passed for every other leak, including a personal account name;
+#:   * this file ships inside the sdist, so an assertion written as
+#:     ``assert "<private name>" not in ua`` publishes the very name it exists
+#:     to forbid.  A property about a private string must not be stated by
+#:     spelling it.
+_EXPECTED_DEFAULT_USER_AGENT = "systemu/0.9 (+https://pypi.org/project/systemu)"
+
+
 def test_fetch_json_default_user_agent_names_no_private_repository(monkeypatch):
     ua = _default_user_agent(monkeypatch)
-    assert "project-systemu-pro" not in ua, (
-        "the default User-Agent leaks the private repository name to every "
-        "third-party server the agent fetches from: " + repr(ua)
+    assert ua == _EXPECTED_DEFAULT_USER_AGENT, (
+        "the default User-Agent is sent to every third-party server the agent "
+        "fetches from, so it may name the public project and nothing else; "
+        "expected " + repr(_EXPECTED_DEFAULT_USER_AGENT) + ", got " + repr(ua)
     )
+    # A source host is where the private names live; the public project is
+    # named by its index page, never by a repository URL.
     assert "github.com" not in ua, repr(ua)
 
 

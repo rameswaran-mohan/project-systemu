@@ -194,7 +194,7 @@ def test_fact_extractor_stamps_content_derived_on_every_persisted_fact(
         return {"facts": [
             {"fact": "account_id is acct-42", "tags": ["account_id"],
              "confidence": 0.95},
-            {"fact": "User lives in Bangalore", "tags": ["location"],
+            {"fact": "User lives in Springfield", "tags": ["location"],
              "confidence": 0.9},
         ]}
 

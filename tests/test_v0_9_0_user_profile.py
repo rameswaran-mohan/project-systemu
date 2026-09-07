@@ -8,13 +8,13 @@ class TestUserProfileModel:
     def test_required_fields(self):
         from systemu.core.models import UserProfile
         p = UserProfile(
-            name="Jane Doe",
+            name="Alex",
             location_text="Springfield, USA",
             timezone="Asia/Kolkata",
-            default_output_dir="C:/Users/R/systemu-output",
+            default_output_dir="C:/Users/sample/systemu-output",
         )
         assert p.schema_version == 1
-        assert p.name == "Jane Doe"
+        assert p.name == "Alex"
         assert p.location_text == "Springfield, USA"
 
     def test_extra_forbid(self):
@@ -69,7 +69,7 @@ class TestUserProfileRuntimeAPI:
         from systemu.runtime.user_profile import save_profile, get_profile
         from systemu.core.models import UserProfile
         vlt = self._vault(tmp_path)
-        p = UserProfile(name="R", location_text="Bangalore, India",
+        p = UserProfile(name="R", location_text="Springfield, USA",
                         timezone="Asia/Kolkata", default_output_dir="/tmp/out")
         save_profile(vlt, p)
         loaded = get_profile(vlt)
@@ -138,7 +138,7 @@ class TestVaultUserProfileWrappers:
         from systemu.core.models import UserProfile
         vlt = self._vault(tmp_path)
         assert vlt.get_user_profile() is None
-        p = UserProfile(name="R", location_text="Bangalore, India",
+        p = UserProfile(name="R", location_text="Springfield, USA",
                         timezone="Asia/Kolkata", default_output_dir="/tmp")
         vlt.save_user_profile(p)
         assert vlt.get_user_profile() == p
@@ -205,13 +205,13 @@ class TestUserCLICommands:
         result = self._invoke(
             ["init"],
             vault_dir=vd, monkeypatch=monkeypatch,
-            input_text="Jane Doe\nSpringfield, USA\nAsia/Kolkata\n/tmp/systemu-out\n",
+            input_text="Alex\nSpringfield, USA\nAsia/Kolkata\n/tmp/systemu-out\n",
         )
         assert result.exit_code == 0, result.output
         from systemu.vault.vault import Vault
         prof = Vault(str(vd)).get_user_profile()
         assert prof is not None
-        assert prof.name == "Jane Doe"
+        assert prof.name == "Alex"
         assert prof.location_text == "Springfield, USA"
         assert prof.timezone == "Asia/Kolkata"
         assert prof.default_output_dir == "/tmp/systemu-out"
@@ -276,7 +276,7 @@ class TestFactExtractor:
                 "facts": [
                     {"fact": "User prefers Italian food",
                      "tags": ["preference", "cuisine"], "confidence": 0.85},
-                    {"fact": "User lives in Bangalore",
+                    {"fact": "User lives in Springfield",
                      "tags": ["location"], "confidence": 0.95},
                 ]
             }
@@ -350,7 +350,7 @@ class TestScrollRefinerConsumesProfile:
         from sharing_on.config import Config
         vlt = self._vault(tmp_path)
         vlt.save_user_profile(UserProfile(
-            name="R", location_text="Bangalore, India",
+            name="R", location_text="Springfield, USA",
             timezone="Asia/Kolkata", default_output_dir="/tmp/o"))
         vlt.append_user_fact(fact="User prefers Italian", source="explicit_user",
                               tags=["preference"])
@@ -369,12 +369,12 @@ class TestScrollRefinerConsumesProfile:
                      temperature=0.2, max_tokens=4000, **kw):
             captured["user"] = user
             return {
-                "title": "Find burritos in Bangalore",
-                "intent": "Discover top burrito restaurants in Bangalore.",
+                "title": "Find burritos in Springfield",
+                "intent": "Discover top burrito restaurants in Springfield.",
                 "expected_outcome": "Ranked list of burrito places.",
                 "narrative_md": "...",
                 "objectives": [
-                    {"id": 1, "goal": "Identify top burrito restaurants in Bangalore",
+                    {"id": 1, "goal": "Identify top burrito restaurants in Springfield",
                      "success_criteria": ">=10 names", "depends_on": []},
                 ],
                 "action_blocks": [],
@@ -390,11 +390,11 @@ class TestScrollRefinerConsumesProfile:
 
         payload = json.loads(captured["user"])
         assert "user_profile" in payload
-        assert payload["user_profile"]["location_text"] == "Bangalore, India"
+        assert payload["user_profile"]["location_text"] == "Springfield, USA"
         assert payload["user_profile"]["default_output_dir"] == "/tmp/o"
         assert "user_facts" in payload
         assert len(payload["user_facts"]) >= 1
-        assert scroll.name == "Find burritos in Bangalore"
+        assert scroll.name == "Find burritos in Springfield"
 
     def test_refine_from_text_works_without_profile(self, tmp_path, monkeypatch):
         """No profile yet: the payload omits user_profile gracefully."""
@@ -490,17 +490,17 @@ class TestRuntimeUserContext:
 
         # populated → contains name + location + facts
         vlt.save_user_profile(UserProfile(
-            name="Jane Doe", location_text="Springfield, USA",
+            name="Alex", location_text="Springfield, USA",
             timezone="Asia/Kolkata", default_output_dir="/tmp/o"))
         vlt.append_user_fact(fact="Prefers Italian food",
                               source="explicit_user", tags=["preference"])
-        vlt.append_user_fact(fact="Lives in Indiranagar",
+        vlt.append_user_fact(fact="Lives in Riverside",
                               source="auto_extract", tags=["location"],
                               confidence=0.9)
         block = _build_user_context_block(vlt)
-        assert "Jane Doe" in block
+        assert "Alex" in block
         assert "Springfield" in block
-        assert "Italian" in block or "Indiranagar" in block
+        assert "Italian" in block or "Riverside" in block
         # bounded: at most ~10 lines so token budget doesn't blow up
         assert block.count("\n") < 12
 

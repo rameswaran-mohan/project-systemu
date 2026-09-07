@@ -63,7 +63,7 @@ def _mk_vault(root: Path, *, tainted_fact: bool = True) -> Vault:
     (root / "tools" / "index.json").write_text("[]", encoding="utf-8")
     vault = Vault(str(root))
     vault.save_user_profile(UserProfile(
-        name="Op", location_text="Indiranagar, Bangalore",
+        name="Op", location_text="Riverside District, Springfield",
         timezone="Asia/Kolkata", default_output_dir=str(root / "output")))
     if tainted_fact:
         # written EXACTLY as fact_extractor.extract_from_chat writes it: the LLM

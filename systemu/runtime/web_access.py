@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "systemu/0.9.8 (+https://github.com/rameswaran-mohan/project-systemu)"
+USER_AGENT = "systemu/0.9.8 (+https://pypi.org/project/systemu)"
 OSM_ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
 _CTX = ssl.create_default_context()
 _OVERPASS_HOSTS = [

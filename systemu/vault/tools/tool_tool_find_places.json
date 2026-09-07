@@ -10,7 +10,7 @@
     },
     "near": {
       "type": "string",
-      "description": "Place name to center the search on (geocoded via OSM), e.g. 'Chennai' or 'Indiranagar, Bangalore'. Optional if lat/lon are supplied."
+      "description": "Place name to center the search on (geocoded via OSM), e.g. 'Chennai' or 'Riverside District, Springfield'. Optional if lat/lon are supplied."
     },
     "lat": {
       "type": "number",

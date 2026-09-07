@@ -98,7 +98,7 @@ class TestCrossProcessReconciler:
             },
             dedup_key="stuck:scroll_R:obj_1:r1",
         )
-        queue.resolve(did, choice=json.dumps({"action": "I'm in Bangalore"}))
+        queue.resolve(did, choice=json.dumps({"action": "I'm in Springfield"}))
 
         # Reality check: the resolved decision has NOT yet been marked dispatched.
         before = vlt.get_decision(did)
@@ -129,7 +129,7 @@ class TestCrossProcessReconciler:
         from systemu.runtime.execution_snapshot import read_snapshot
         snap = read_snapshot("exec_R", data_dir=data_dir)
         stash = [n for n in snap.sticky_notes if n.startswith("__STUCK_ANSWER__::obj_1::")]
-        assert stash and "Bangalore" in stash[0]
+        assert stash and "Springfield" in stash[0]
 
     def test_reconciler_is_idempotent_across_runs(self, tmp_path):
         """Test B: running the reconciler twice must NOT re-dispatch.

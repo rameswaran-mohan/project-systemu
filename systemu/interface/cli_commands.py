@@ -1381,15 +1381,31 @@ def _print_daemon_build(build_match, build_note: str) -> None:
     agreement: a daemon that recorded no build is an older/other build, which is
     the skew itself. A mismatch is LOUD but never fatal — a user mid-upgrade
     must still be able to reach ``daemon stop``.
+
+    D2 — IT GOES OUT UNWRAPPED, ONE LINE PER PATH. This used ``console.print``,
+    and Rich folds a paragraph at the console width wherever the break lands:
+    at 80 columns the witnessed line ``same build on both sides: systemu
+    0.10.29 from C:\\...`` arrived in four fragments. ``_print_daemon_where``
+    a few lines below already carries the ruling this broke — *a path wrapped
+    at column 80 is not a path*, because it can be neither pasted nor searched
+    for — and the build line is the one that matters MID-UPGRADE, where the
+    whole point of naming two installations is that the operator can go and
+    look at them. ``click.secho`` keeps the colour and does not wrap.
+
+    The marker is ASCII (DEC-32c): a cp1252 console cannot encode a warning
+    glyph, and on a line that carries a verdict the failure would be a
+    UnicodeEncodeError in place of the verdict. ``click.secho`` also prints the
+    note LITERALLY, so a build path containing ``[`` is no longer eaten as Rich
+    markup.
     """
     if not build_note:
         return
     if build_match is False:
-        console.print(f"  [red]⚠ {build_note}[/red]")
+        click.secho(f"  !! {build_note}", fg="red")
     elif build_match is True:
-        console.print(f"  [dim]{build_note}[/dim]")
+        click.secho(f"  {build_note}", dim=True)
     else:
-        console.print(f"  [yellow]⚠ {build_note}[/yellow]")
+        click.secho(f"  !! {build_note}", fg="yellow")
 
 
 @daemon_group.command("start")
@@ -1484,7 +1500,7 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
             console.print(f"[red]{_no_provider_message(config)}[/red]")
             ctx.exit(1)       # DEC-41: aborted != success
 
-    console.print(f"\n[cyan]⚡ Starting Systemu daemon on port {port} ...[/cyan]")
+    console.print(f"\n[cyan].. Starting Systemu daemon on port {port} ...[/cyan]")
     verdict = start_daemon(
         vault_dir=config.vault_dir,
         config=config,
@@ -1508,8 +1524,15 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
         console.print(f"[red]{_esc(verdict.reason)}[/red]")
         ctx.exit(_daemon_mod.VAULT_ROOT_REFUSED_EXIT)
 
+    # D5 / DEC-32c: the lifecycle VERDICT lines are ASCII. `OK` / `ERROR` / `..`
+    # replace the check, cross and lightning glyphs these carried. A console
+    # that cannot encode a verdict does not print a plainer one -- it raises a
+    # UnicodeEncodeError instead of printing anything, and `daemon start` and
+    # `daemon stop` are the first two commands a new install runs. (The panel
+    # bullets on `daemon status` are decoration on a bordered Rich panel, not
+    # verdicts, and stay as they are.)
     if verdict is not None and verdict.ready:
-        console.print("[green]✓ Daemon ready.[/green]")
+        console.print("[green]OK Daemon ready.[/green]")
         console.print(f"  Accepting connections on {verdict.url}")
         _print_daemon_build(verdict.build_match, verdict.build_note)
         console.print("  Use [bold]systemu daemon status[/bold] to check.")
@@ -1519,7 +1542,7 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
         # an operator sees it changes here.
         return verdict
 
-    console.print("[red]✗ Daemon did not become ready.[/red]")
+    console.print("[red]ERROR Daemon did not become ready.[/red]")
     reason = verdict.reason if verdict is not None else "no readiness verdict was produced"
     console.print(f"  {reason}")
     console.print(f"  Log: {Path(config.vault_dir) / 'daemon.log'}")
@@ -1567,9 +1590,22 @@ def daemon_stop(ctx, stop_all: bool):
 
     stopped = stop_daemon(config.vault_dir)
     if stopped:
-        console.print("[green]✓ Daemon stopped.[/green]")
+        console.print("[green]OK Daemon stopped.[/green]")
     else:
         console.print("[yellow]Daemon is not running.[/yellow]")
+
+
+#: D6 -- the process exit codes `daemon status` answers with. Named here rather
+#: than written as bare integers at the three `ctx.exit` sites so the values a
+#: script depends on and the values `--help` documents are ONE definition.
+#:
+#: 1 for "not running" follows the shell convention an operator already relies
+#: on (`systemu daemon status && open <url>`); 2 for "starting" is a distinct,
+#: non-zero, RETRYABLE state -- a wait loop must be able to tell "not up yet"
+#: from "not there at all" without parsing a Rich panel.
+_STATUS_EXIT_READY = 0
+_STATUS_EXIT_STARTING = 2
+_STATUS_EXIT_NOT_RUNNING = 1
 
 
 @daemon_group.command("status")
@@ -1585,6 +1621,18 @@ def daemon_status(ctx, port):
 
     Every verdict also names the vault it is about and where the port number
     came from, each on its own unwrapped line.
+
+    The EXIT CODE names the verdict, so a script never has to read the panel:
+
+    \b
+      0  Ready       -- the dashboard port accepted a connection
+      2  Starting    -- the tracked process is alive, nothing is listening yet
+      1  Not running -- nothing this vault tracks is serving that port; this
+         includes the case where something IS listening on the port but no
+         daemon is tracked for this vault, which is a foreign program on the
+         socket and not your dashboard
+
+    A build skew recolours the panel but never changes the exit code.
     """
     config, _ = _get_vault_and_config(ctx)
     from systemu.scheduler.daemon import get_status
@@ -1595,7 +1643,15 @@ def daemon_status(ctx, port):
     # twenty minutes. A skew recolours the panel but never changes the exit code.
     _bmatch = status["build_match"]
     _bnote = status["build_note"]
+    # D6: the exit code IS the verdict. Every branch below used to fall off the
+    # end of the function and leave 0, so `systemu daemon status && open <url>`
+    # opened a dashboard that was not there -- the one bit a script, a CI step
+    # or a health check can act on said "up" for all three answers. The code is
+    # taken from the SAME branch that renders the panel, so the two can never
+    # disagree; deriving it a second time from `status` would be the defect
+    # class, not the fix.
     if status["ready"]:
+        exit_code = _STATUS_EXIT_READY
         console.print(Panel(
             f"[green]● Ready[/green]  (PID {status['pid']})\n"
             f"{status['url']}",
@@ -1604,6 +1660,7 @@ def daemon_status(ctx, port):
         ))
         _print_daemon_build(_bmatch, _bnote)
     elif status["process_alive"]:
+        exit_code = _STATUS_EXIT_STARTING
         console.print(Panel(
             f"[yellow]◐ Starting[/yellow]  (PID {status['pid']})\n"
             f"{status['reason']}\n"
@@ -1612,6 +1669,7 @@ def daemon_status(ctx, port):
         ))
         _print_daemon_build(_bmatch, _bnote)
     else:
+        exit_code = _STATUS_EXIT_NOT_RUNNING
         console.print(Panel(
             "[dim]○ Not running[/dim]\n"
             f"{status['reason']}\n"
@@ -1625,6 +1683,12 @@ def daemon_status(ctx, port):
     # _vault.py watches. `.get` rather than `[...]`: a status dict from an older
     # daemon build is missing keys, and `daemon status` must still print.
     _print_daemon_where(status.get("vault_root"), status.get("port_provenance"))
+
+    # LAST, so a non-zero verdict never costs the operator the report: the
+    # panel, the vault line and the provenance line are all on the terminal
+    # before the code is named. The code is an ADDITION to the report, not a
+    # replacement for it.
+    ctx.exit(exit_code)
 
 
 def _print_daemon_where(vault_root, port_provenance) -> None:
@@ -2867,7 +2931,7 @@ _HEADLESS_INIT_HINT = (
 @user_group.command("init")
 @click.option("--name", default=None, help="Your name (skips that question).")
 @click.option("--location", default=None,
-              help="Where you are, e.g. 'Bangalore, India' (skips that question).")
+              help="Where you are, e.g. 'Springfield, USA' (skips that question).")
 @click.option("--timezone", "timezone_", default=None,
               help="IANA timezone, e.g. 'Asia/Kolkata' (skips that question).")
 @click.option("--output-dir", default=None,
@@ -2909,7 +2973,7 @@ def user_init(ctx, name, location, timezone_, output_dir, non_interactive):
         try:
             values = {
                 "name": click.prompt("Your name", default=d["name"]),
-                "location_text": click.prompt("Where are you? (e.g. 'Bangalore, India')"),
+                "location_text": click.prompt("Where are you? (e.g. 'Springfield, USA')"),
                 "timezone": click.prompt("Your timezone (IANA, e.g. 'Asia/Kolkata')",
                                          default=d["timezone"]),
                 "default_output_dir": click.prompt("Default output directory",
