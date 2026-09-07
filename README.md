@@ -1,25 +1,55 @@
 <p align="center">
-  <img src="systemu/interface/assets/logo.png" alt="Systemu" width="128" height="128">
+  <img src="systemu/interface/assets/logo.png" alt="Systemu" width="96" height="96">
 </p>
 
 <h1 align="center">Systemu</h1>
 
-> **A personal AI workforce you instruct in plain language or by showing it —
-> and that grows the capabilities it needs to finish the job, under your
-> governance.**
->
-> Ask a quick question and get an answer in seconds. Hand a whole task to a
-> chat and an AI specialist runs it end-to-end. Or record a task on screen
-> once and replay it forever. However you instruct it, when the agent hits
-> something it lacks mid-run — a tool that doesn't exist, a skill it wasn't
-> given, a file it can't read — it doesn't fail and it doesn't fake it. It
-> **requests** the missing capability, and an always-on **Governor** grants,
-> denies, or escalates the request by risk. Every action gated, logged, and
-> local. Self-provisioning, made safe.
+<p align="center"><b>The open-source AI agent that builds the tools it's missing — mid-task — and asks you first.</b></p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20816383.svg)](https://doi.org/10.5281/zenodo.20816383)
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT"></a>
+  <a href="https://pypi.org/project/systemu/"><img src="https://img.shields.io/pypi/v/systemu?color=2563EB&label=pypi" alt="PyPI"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
+  <a href="https://doi.org/10.5281/zenodo.20816383"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.20816383.svg" alt="DOI"></a>
+  <a href="https://github.com/rameswaran-mohan/project-systemu/stargazers"><img src="https://img.shields.io/github/stars/rameswaran-mohan/project-systemu?style=social" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/systemu-selfpatch.gif" alt="22-second walkthrough: the agent hits a missing tool, requests it, you review the spec and then the code, dependencies and the first run are gated separately, and the toolkit grows. Benchmark: 6% with a frozen toolkit vs 61% with governed self-provisioning over 179 trials." width="640">
+</p>
+
+```bash
+pip install "systemu[dashboard]"
+systemu init && systemu start      # opens the dashboard at localhost:8765
+```
+
+Give it a task. When it hits a capability it lacks — a tool that doesn't
+exist, a library it can't import, a file it can't read — it doesn't fail and
+it doesn't fake it. It **asks.** One card lands in your Inbox with a safe
+default of *Skip*; the code is shown before it can run; the first execution
+is gated as *dangerous-until-proven*. Approve, and the toolkit grows.
+**Local-first. MIT. Every action logged.**
+
+<table align="center">
+  <tr>
+    <td align="center"><img src="docs/assets/shot-forge-gate.png" alt="Inbox card: HIGH — Forge tool: pdf_encrypt. Safe default: Skip. Review & Forge." width="430"></td>
+    <td align="center"><img src="docs/assets/shot-tool-detail.png" alt="Build page: pdf_encrypt — DEPLOYED, AGENT-BUILT, dry-run PASSED, dependency pypdf." width="430"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>A real run, unedited: the agent needed <code>pdf_encrypt</code>; it asked.</sub></td>
+    <td align="center"><sub>Minutes later: <b>AGENT-BUILT · dry-run PASSED</b>, deployed with provenance.</sub></td>
+  </tr>
+</table>
+
+**Benchmarked, not asserted.** Across **179 trials / 5 models / 5 vendors**, a
+frozen toolkit solves **6%** of capability-gap tasks; governed self-provisioning
+solves **61%** (McNemar *p* = 2.8×10⁻¹⁰), graded by an external oracle.
+[Read the preprint ↗](https://doi.org/10.5281/zenodo.20816383) ·
+[How the benchmark works](#evidence) · [The Reverse-Harness pattern](#the-reverse-harness-pattern)
+
+> ⭐ **If this is the direction you think agents should go, star the repo.**
+> It is a solo, open-source project built from India — stars are the signal
+> that decides whether it gets seen.
 
 **Three ways to put it to work:**
 

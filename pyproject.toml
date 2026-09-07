@@ -11,7 +11,7 @@ name = "systemu"
 # change in those releases silently stopped reaching operator vaults.  Bump
 # `systemu/__init__.py` only; this metadata follows it.
 dynamic = ["version"]
-description = "Record computer activity and generate step-by-step instructions"
+description = "Open-source AI agent that builds the tools it is missing mid-task, under your governance (Reverse-Harness). Local-first, MIT."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
