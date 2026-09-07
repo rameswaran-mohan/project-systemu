@@ -146,7 +146,7 @@ def main():
 @click.pass_context
 def cli(ctx, debug: bool):
     """
-    systemu — Record computer activity and generate step-by-step instructions.
+    systemu -- Record computer activity and generate step-by-step instructions.
 
     \b
     Quick start:
@@ -877,7 +877,12 @@ def _provider_attribution_lines(config, *, probe=None) -> List[str]:
 def info():
     """Show platform capabilities and configuration status."""
     console.print()
-    console.rule("[bold]sharing_on — System Info[/bold]")
+    # N10 -- the title names what the operator TYPED. Two console scripts
+    # are one program (the root help says so), but an inspection screen
+    # that titles itself with the other name reads like the wrong tool
+    # opened. ASCII for the same reason every verdict here is: this line
+    # crosses a cp437 console.
+    console.rule("[bold]systemu - System Info[/bold]")
 
     # Platform
     platform = detect_platform()
@@ -958,7 +963,7 @@ _PROVIDER_CHOICES = ["auto", "openrouter", "google", "anthropic", "openai", "oll
 @cli.command()
 @click.option("--key", default=None,
               help="OpenRouter key non-interactively (CI). Prefer the hidden "
-                   "interactive prompt — argv lands in shell history.")
+                   "interactive prompt -- argv lands in shell history.")
 @click.option("--preset", type=click.Choice(["balanced", "quality", "budget"]),
               default=None, help="Model preset (default: ask).")
 @click.option("--output-dir", default=None, help="Where produced files land.")
@@ -1045,7 +1050,7 @@ def init(force: bool, no_seed: bool):
     skills, and tool implementations so the system has a working catalog
     on first run.
 
-    Idempotent — existing entries are kept unless ``--force`` is passed.
+    Idempotent -- existing entries are kept unless ``--force`` is passed.
     Use ``--no-seed`` if you want only the directory structure.
     """
     import json as _json
@@ -1357,10 +1362,10 @@ def _doctor_make_api_token(vault_dir: Optional[str]) -> None:
 @click.argument("scope_id", required=False)
 @click.option("--apply", "apply_mode", is_flag=True,
               help="Apply auto-recoverable actions (install-dep / enable-tool / "
-                   "reset-memory) via the shared recovery dispatchers — the same "
+                   "reset-memory) via the shared recovery dispatchers -- the same "
                    "apply path the web recovery panel uses. Gate reviews are skipped.")
 @click.option("--set-passphrase", "set_passphrase_mode", is_flag=True,
-              help="Set the dashboard login passphrase (R-SEC1). Reads --passphrase, "
+              help="Set the dashboard login passphrase. Reads --passphrase, "
                    "else stdin, else prompts interactively (twice). Prints the "
                    "SYSTEMU_DASHBOARD_PASSPHRASE_HASH= env line for Docker/headless "
                    "deployers. Does not require a scope_id.")
@@ -1368,8 +1373,8 @@ def _doctor_make_api_token(vault_dir: Optional[str]) -> None:
               help="Passphrase value for --set-passphrase (non-interactive). "
                    "Prefer stdin/prompt to keep it out of your shell history.")
 @click.option("--make-api-token", "make_api_token_mode", is_flag=True,
-              help="Mint a NEW bearer token for the local task API (R-UTL1 / "
-                   "U-1a). Printed ONCE and stored only as a hash; minting "
+              help="Mint a NEW bearer token for the local task API. "
+                   "Printed ONCE and stored only as a hash; minting "
                    "again revokes the previous token. Does not require a "
                    "scope_id.")
 @click.option("--vault", "vault_dir", default=None,
@@ -1494,9 +1499,9 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
 @click.option("--limit", "limit", default=15, type=int,
               help="Max results to show (0 = all). Ranked; the store is complete.")
 def find_tools_cmd(query, limit):
-    """Search your capability catalog for tools matching QUERY (R-CAP1 · CAP-4c).
+    """Search your capability catalog for tools matching QUERY.
 
-    Deterministic — no LLM, no model budget. Ranks the COMPLETE store, so every
+    Deterministic -- no LLM, no model budget. Ranks the COMPLETE store, so every
     tool stays reachable (never-subtract). Reads a fresh in-memory view without
     writing the index.
 
@@ -1517,7 +1522,7 @@ def find_tools_cmd(query, limit):
 
 @cli.group(name="spend-caps")
 def spend_caps_group():
-    """View or set per-task / per-day LLM spend caps (R-P3b).
+    """View or set per-task / per-day LLM spend caps.
 
     Caps are OFF by default. When a run REACHES its cap it halts honestly (no
     silent overrun); raise the cap and re-run to continue. An unknown/unpriced
@@ -1555,12 +1560,12 @@ def spend_caps_clear_cmd(kind):
 @click.option("--limit", "limit", default=30, type=int,
               help="Max results for a query (0 = all). Ranked; the store is complete.")
 def world_cmd(query, limit):
-    """Show what systemu's world model believes about your setup (R-W1 · §5.11).
+    """Show what systemu's world model believes about your setup.
 
     READ-ONLY. With no QUERY, summarises the fact store (facts by kind + active
     'searched, not found' notes). With a QUERY, shows everything known about that
     host/app/account (the never-subtract escape hatch). Empty until systemu surveys
-    your setup and works — a smaller world, never a broken one.
+    your setup and works -- a smaller world, never a broken one.
 
     \b
     Examples:
@@ -1703,14 +1708,14 @@ def capture():
 @click.option(
     "--auto-approve", is_flag=True, default=False,
     help="Bypass the scroll PENDING_APPROVAL gate. Still respects the "
-         "tool-dep allow-list (v0.6.8-d) — same as analyze --auto-approve.",
+         "tool-dep allow-list (v0.6.8-d) -- same as analyze --auto-approve.",
 )
 def capture_export_skill(session: str, output: str, auto_approve: bool):
     """Record once, export as a portable Anthropic Agent Skill.
 
     \b
     Example:
-      systemu capture export-skill ./captures/email_digest_cap_… \\
+      systemu capture export-skill ./captures/email_digest_cap_... \\
                  --output ./my-skill
     """
     from systemu.pipelines.capture_to_skill import export_skill_from_capture

@@ -45,6 +45,22 @@ THE FENCE (DEC-32: a fence is a VALUE, not a raise)
     since v0.7.4.  The defect being fenced is falling INTO a package tree the
     operator is not standing in, which is a different fact and is what the
     ``refused`` bit reports.
+
+TWO HOMES, TWO QUESTIONS (N9)
+    ``home`` is the directory the root was RESOLVED AGAINST -- this process's
+    cwd.  It answers "where is the operator standing", and the carve-out above
+    is the only thing that may consult it: a root pointed at
+    ``<site-packages>/systemu/vault`` must not be able to carve ITSELF out of
+    its own refusal, which is exactly what happens if the carve-out is moved to
+    a root-derived directory.
+
+    ``operating_home`` is where FILES GO -- see :func:`operating_home_for`.  It
+    is a pure function of the resolved root, so every process holding the same
+    root names the same home whatever cwd it was launched from.  It is a DERIVED
+    member rather than a stored one, so not even a hand-built verdict can carry
+    a home that contradicts its root.  The daemon child's cwd and
+    ``execution_snapshot.audit_data_root()`` both consume this one member;
+    nothing downstream re-derives either from a cwd.
 """
 
 from __future__ import annotations
@@ -85,6 +101,33 @@ def _within(child: str, parent: str) -> bool:
     return c == p or c.startswith(p + os.sep)
 
 
+def operating_home_for(root: str) -> str:
+    """THE operating home of a vault root -- a pure function of the root alone.
+
+    N9. This is the ONE definition, for EVERY layout: the vault directory's
+    parent, unless the root is the default ``<home>/systemu/vault`` layout, in
+    which case ``<home>``.  Nothing here reads a cwd, an env var or the clock,
+    so two processes that resolved the same root name the same home however they
+    were launched -- which is the whole property the audit tree needs and the
+    one a cwd could never provide.
+
+    The defect this replaces: the audit-root resolver inverted the default
+    layout (correct, and cwd-free) and then fell back to the PROCESS CWD for
+    every other layout, so a mounted vault -- exactly the shape the mint honours
+    verbatim -- split the writer's tree from the reader's again.  The daemon
+    derived its child's cwd from the same cwd-shaped field, so the two answers
+    were both accidents of whoever asked first.
+    """
+    norm = _norm(root)
+    parts = Path(norm).parts
+    suffix = Path(DEFAULT_RELATIVE_VAULT).parts
+    if len(parts) > len(suffix):
+        tail = tuple(os.path.normcase(p) for p in parts[-len(suffix):])
+        if tail == tuple(os.path.normcase(p) for p in suffix):
+            return _norm(Path(*parts[:-len(suffix)]))
+    return _norm(Path(norm).parent)
+
+
 @dataclass(frozen=True)
 class VaultRootVerdict:
     """The minted answer.  ``refused`` is the fence bit; it travels WITH the
@@ -92,12 +135,34 @@ class VaultRootVerdict:
     verdict about it."""
 
     root: str            # absolute, normalised
-    home: str            # the operating home it was derived from
+    # The directory the root was RESOLVED AGAINST -- this process's cwd. It
+    # answers "where is the operator standing", which is what the package-tree
+    # carve-out below needs and NOT what a consumer wants when it needs a home
+    # to put files under. Read `operating_home` for that; see N9 in
+    # `operating_home_for`.
+    home: str
     source: str          # "explicit" | "env" | "default"
     package_dir: str     # the package tree this process imported
     inside_package: bool
     refused: bool
     reason: str          # "" unless refused
+
+    @property
+    def operating_home(self) -> str:
+        """THE operating home (N9) -- where FILES GO for this verdict's layout.
+
+        A DERIVED member, deliberately not a stored one. A stored field could be
+        handed a value that contradicts ``root``, and "two answers, one of them
+        wrong" is the entire defect class this closes; as a property it is
+        recomputed from ``root`` by :func:`operating_home_for` every time, so no
+        constructor -- test double included -- can mint a verdict whose home and
+        root disagree.
+
+        Identical in every process that resolved the same root, whatever cwd
+        each was launched from. ``audit_data_root()`` and the daemon child's cwd
+        both consume THIS, never ``home``.
+        """
+        return operating_home_for(self.root)
 
 
 def resolve_vault_root(
@@ -157,7 +222,8 @@ def refusal_message(verdict: VaultRootVerdict) -> str:
         "",
         "  resolved vault root : {}".format(verdict.root),
         "  systemu package dir : {}".format(verdict.package_dir),
-        "  operating home      : {}".format(verdict.home),
+        "  resolved against    : {}".format(verdict.home),
+        "  operating home      : {}".format(verdict.operating_home),
         "  root chosen from    : {}".format(verdict.source),
         "",
         "Starting here would write daemon state, secrets and capability stores",

@@ -247,7 +247,7 @@ def clamp_tripwire(report: Any) -> Dict[str, Any]:
                 "This is structurally impossible while IMPL-5 holds "
                 "(_entry_origin clamps surveyed entries to content_derived; "
                 "_needs_ask always asks for content_derived). Treat as a SECURITY "
-                "regression, not as improved table payoff — read table_payoff's "
+                "regression, not as improved table payoff -- read table_payoff's "
                 "module docstring before changing either helper."
             ),
         }
@@ -272,7 +272,7 @@ def format_inventory_hit(rep: Dict[str, Any]) -> List[str]:
             n = rep["table_silent"]
             if isinstance(n, int) and n > 0:
                 lines.append(
-                    f"  !! CLAMP REGRESSION — table-sourced silent binds: {n} "
+                    f"  !! CLAMP REGRESSION -- table-sourced silent binds: {n} "
                     f"(healthy is 0; this is a SECURITY regression, not payoff)"
                 )
             elif n is None:
@@ -286,7 +286,7 @@ def format_inventory_hit(rep: Dict[str, Any]) -> List[str]:
             f"Inventory-hit rate: {rep.get('rate', 0.0):.0%} "
             f"({rep.get('avoided_gap', 0)}/{rep.get('supplied', 0)} supplied "
             f"requirements avoided a from-scratch gap)",
-            f"  bound with no ask: {rep.get('silent', 0)} · "
+            f"  bound with no ask: {rep.get('silent', 0)}; "
             f"pre-filled one-click confirm: {rep.get('prefilled_confirm', 0)}",
             f"  from your table: {rep.get('table_avoided_gap', 0)} of "
             f"{rep.get('table_supplied', 0)}",

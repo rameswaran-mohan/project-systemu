@@ -54,67 +54,38 @@ def _now_iso() -> str:
 DEFAULT_DATA_DIRNAME = "data"
 
 
-def _home_from_default_layout(root: Path) -> Optional[Path]:
-    """Invert the vault mint's DEFAULT layout: ``<home>/systemu/vault`` -> ``<home>``.
-
-    ``None`` when the minted root does not end in that layout (an absolute
-    ``SYSTEMU_VAULT_DIR``, a container mount): there is no home to recover from
-    such a root, and inventing one is how a resolver starts disagreeing with the
-    callers that pass their own ``data_dir``.
-    """
-    from systemu.runtime.vault_root import DEFAULT_RELATIVE_VAULT
-
-    suffix = Path(DEFAULT_RELATIVE_VAULT).parts
-    parts = root.parts
-    if len(parts) <= len(suffix):
-        return None
-    tail = tuple(os.path.normcase(p) for p in parts[-len(suffix):])
-    want = tuple(os.path.normcase(p) for p in suffix)
-    if tail != want:
-        return None
-    return Path(*parts[:-len(suffix)])
-
-
 def audit_data_root(explicit=None) -> Path:
     """THE ONE resolver for the audit data root -- the ``<root>/audit/exec_*/`` tree.
 
     WHY THIS EXISTS.  Both ends of the snapshot pathway used to spell the answer as
     the relative string ``"data"``, which every process then resolved against its
-    OWN working directory.  The daemon child is spawned with ``cwd=operating_home``
-    (``scheduler/daemon.py``, the ``operating_home`` handed to ``Popen``), so it
-    wrote under the operator's home; ``systemu debug avoidable-ask`` read under
+    OWN working directory.  The daemon child is spawned with its operating home as
+    cwd, so it wrote under that home; ``systemu debug avoidable-ask`` read under
     wherever the operator happened to be standing.  Same machine, same vault env,
     same snapshot file on disk -- and the report answered "no run has persisted a
     RequirementReport yet", which is a claim about EVERY run that ever executed,
     produced by a purely local accident of the shell's cwd.
 
     THE RULE.  The audit data root is ``<operating home>/data``, and the operating
-    home comes from the vault-root MINT (``vault_root.resolve_vault_root``) rather
-    than from a second derivation here.  Two ways, in order, both minted:
+    home is the ONE minted field ``vault_root.resolve_vault_root().operating_home``
+    -- a pure function of the resolved root (see
+    :func:`~systemu.runtime.vault_root.operating_home_for`), so every process that
+    shares ``SYSTEMU_VAULT_DIR`` names the same tree whatever directory it was
+    launched from.  ``scheduler/daemon.py`` sets the child's cwd from that same
+    field, so the callers that pass a relative ``data_dir`` of their own
+    (``scheduler/jobs.py`` passes ``Path("data")``) land in the same place.
 
-      1. INVERT THE DEFAULT LAYOUT.  The mint's default root is
-         ``<home>/systemu/vault``, so stripping that suffix names the same home for
-         every process that shares ``SYSTEMU_VAULT_DIR`` -- whatever directory each
-         one was launched from.  This is the branch that fixes the defect: the
-         daemon parent pins that env var to the minted absolute root before the
-         spawn, so the operator's shell and the daemon child invert the same string.
-      2. OTHERWISE the mint's own ``home`` field, which is this process's operating
-         home.  A root that does not end in the default layout (an absolute
-         ``SYSTEMU_VAULT_DIR``, a container mount) carries no home to recover, and
-         this branch is byte-identical to the ``Path("data")`` it replaced.
-
-    WHAT BRANCH 2 DOES NOT DO, said plainly: it does not make an arbitrary absolute
-    vault root readable from another cwd.  Rooting the audit tree inside such a
-    vault WOULD -- and would also split it from the callers below that pass a
-    relative ``data_dir`` of their own (``scheduler/jobs.py`` passes
-    ``Path("data")``), which is the same class of defect with a new location.  So
-    the honest answer there is the unchanged one, and the operator surface that
-    renders an unmeasured verdict NAMES the directory it searched
-    (``interface/cli_commands.py``, ``debug_avoidable_ask``) so a mismatch is
-    visible rather than reported as a fact about the corpus.
+    N9 -- WHAT THIS FUNCTION USED TO DO, and why it was wrong.  It inverted the
+    DEFAULT layout here, in a private copy of the mint's own layout rule, and then
+    fell back to the verdict's ``home`` field for everything else.  That field is
+    the PROCESS CWD.  So the invariance held for ``<home>/systemu/vault`` and for
+    nothing else: an absolute ``SYSTEMU_VAULT_DIR`` -- a container mount, the shape
+    the mint explicitly honours verbatim -- put the writer and the reader back on
+    two different trees.  A resolver with a branch that answers from the cwd is a
+    cwd-relative resolver that is right by coincidence on one layout.
 
     NO FILE MOVES.  With no ``SYSTEMU_VAULT_DIR`` set the mint returns
-    ``<cwd>/systemu/vault``, branch 1 returns ``<cwd>``, and the result is
+    ``<cwd>/systemu/vault`` and its operating home is ``<cwd>``, so the result is
     ``<cwd>/data`` -- the location every existing install already holds.
 
     ``explicit`` always wins and is returned unchanged: the reconcilers already
@@ -125,11 +96,7 @@ def audit_data_root(explicit=None) -> Path:
         return Path(explicit)
     from systemu.runtime.vault_root import resolve_vault_root
 
-    verdict = resolve_vault_root()
-    home = _home_from_default_layout(Path(verdict.root))
-    if home is None:
-        home = Path(verdict.home)
-    return home / DEFAULT_DATA_DIRNAME
+    return Path(resolve_vault_root().operating_home) / DEFAULT_DATA_DIRNAME
 
 
 def _snapshot_path(data_dir: Path, execution_id: str) -> Path:

@@ -126,7 +126,7 @@ def _handle_pending_decision_or_run(ctx, work):
 
 @click.group("scrolls")
 def scrolls_group():
-    """Manage Scrolls — refined SOPs extracted from capture sessions."""
+    """Manage Scrolls -- refined SOPs extracted from capture sessions."""
 
 
 @scrolls_group.command("list")
@@ -327,7 +327,7 @@ def scrolls_approve(ctx, scroll_id: str):
 
 @click.group("army")
 def army_group():
-    """Manage the Shadow Army — autonomous agent personas."""
+    """Manage the Shadow Army -- autonomous agent personas."""
 
 
 @army_group.command("list")
@@ -701,7 +701,7 @@ def settings_show_cmd(ctx):
 @click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
 @click.pass_context
 def settings_set_cmd(ctx, key: str, value: str, as_json: bool):
-    """Set an allow-listed setting (canonical CLI-owned write — Phase 2)."""
+    """Set an allow-listed setting (canonical CLI-owned write -- Phase 2)."""
     from systemu.interface.command import verbs as _verbs
     _, vault = _get_vault_and_config(ctx)
     result = _verbs.settings_set(key, value, vault=vault)
@@ -809,7 +809,7 @@ def tools_dryrun(ctx, tool_id: str):
 @click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
 @click.pass_context
 def tools_enable_cmd(ctx, tool_id: str, as_json: bool):
-    """Gate-3 enable a tool (canonical CLI-owned write — Phase 2)."""
+    """Gate-3 enable a tool (canonical CLI-owned write -- Phase 2)."""
     from systemu.interface.command import dispatch as _dispatch
     _, vault = _get_vault_and_config(ctx)
     result = _dispatch.dispatch("tools enable", [tool_id], vault=vault)
@@ -950,7 +950,7 @@ def tools_deps_approve(package: str, tool_id: Optional[str], by: str):
     The approval is persisted to ``data/dep_approvals.json``.  After this
     command returns, the next ToolRegistry self-heal call that encounters
     this package will install it.  Already-running shadows do not
-    retroactively benefit — restart the daemon or re-trigger the activity.
+    retroactively benefit -- restart the daemon or re-trigger the activity.
     """
     store = _deps_store()
     newly = store.approve(package, approved_by=by, tool_id=tool_id)
@@ -965,7 +965,7 @@ def tools_deps_approve(package: str, tool_id: Optional[str], by: str):
 def tools_deps_revoke(package: str):
     """Remove a pip package from the allow-list.
 
-    Does not uninstall the package — that's a separate decision.  In-process
+    Does not uninstall the package -- that's a separate decision.  In-process
     caches in already-running daemons / workers retain "satisfied" state
     until restart; the revoke takes effect for any newly-started process.
     """
@@ -1019,7 +1019,7 @@ def tools_deps_sync(ctx, dry_run: bool):
     """Install every approved dep into the current Python (pre-warm).
 
     Useful at deploy time to avoid the first-call latency hit.  Honours
-    the resolved InstallMode — when mode=OFF nothing happens; when
+    the resolved InstallMode -- when mode=OFF nothing happens; when
     mode=PROMPT only approved deps are processed (which is all this
     command is for); when mode=ALWAYS this command is effectively a
     speedup over lazy installs.
@@ -1077,17 +1077,17 @@ def tools_deps_sync(ctx, dry_run: bool):
 @army_group.command("awaken")
 @click.option("--name", "-n", required=True, help="Name for the new Shadow.")
 @click.option("--activity", "-a", default=None, help="Activity ID to assign immediately.")
-@click.option("--creativity",      type=int, default=50, show_default=True, help="Creativity level 0–100.")
-@click.option("--professionalism", type=int, default=50, show_default=True, help="Professionalism level 0–100.")
-@click.option("--techie",          type=int, default=50, show_default=True, help="Techie depth 0–100.")
-@click.option("--thinking",        type=int, default=50, show_default=True, help="Thinking depth 0–100.")
+@click.option("--creativity",      type=int, default=50, show_default=True, help="Creativity level 0-100.")
+@click.option("--professionalism", type=int, default=50, show_default=True, help="Professionalism level 0-100.")
+@click.option("--techie",          type=int, default=50, show_default=True, help="Techie depth 0-100.")
+@click.option("--thinking",        type=int, default=50, show_default=True, help="Thinking depth 0-100.")
 @click.pass_context
 def army_awaken(ctx, name: str, activity: Optional[str],
                 creativity: int, professionalism: int, techie: int, thinking: int):
     """Manually create (awaken) a new Shadow persona.
 
     If --activity is provided, the shadow is assigned to that activity.
-    Persona dimension sliders (0–100) adjust the shadow's system prompt tone.
+    Persona dimension sliders (0-100) adjust the shadow's system prompt tone.
     """
     import os as _os
     # Inject persona dimensions as env vars so shadow_decision.create_shadow can read them
@@ -1144,7 +1144,7 @@ def army_awaken(ctx, name: str, activity: Optional[str],
 def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool, origin: str):
     """Execute a Scroll via a Shadow (agentic runtime).
 
-    Uses the ShadowRuntime ReAct loop: Reason → Tool Call → Observe → repeat.
+    Uses the ShadowRuntime ReAct loop: Reason -> Tool Call -> Observe -> repeat.
     Requires the Shadow to have at least one DEPLOYED tool. Use --dry-run to
     preview the execution plan without invoking real tools (all PROPOSED tools allowed).
 
@@ -1289,7 +1289,7 @@ def evolve_apply(ctx, evolution_id: str):
 
 @click.group("chat")
 def chat_group():
-    """Direct chat tasks — skip the capture/record flow."""
+    """Direct chat tasks -- skip the capture/record flow."""
 
 
 @chat_group.command("submit")
@@ -1402,10 +1402,13 @@ def _print_daemon_build(build_match, build_note: str) -> None:
 def daemon_start(ctx, port: int, foreground: bool, wait_s):
     """Start the Systemu background daemon.
 
-    DEC-41: the spawn is a CLAIM, not a witness. This command does not report
-    success — and does not exit 0 — until a real connection to the dashboard
-    port has been observed to succeed. The wait is BOUNDED; a daemon that never
-    becomes ready is reported honestly with a nonzero exit instead of hanging.
+    Spawning is a CLAIM, not proof. This command does not report success -- and
+    does not exit 0 -- until a real connection to the dashboard port has been
+    observed to succeed. The wait is BOUNDED; a daemon that never becomes ready
+    is reported honestly with a nonzero exit instead of hanging.
+
+    The dashboard ships as an optional extra. Without it nothing binds the port,
+    so this command refuses at once and prints the command that installs it.
     """
     config, vault = _get_vault_and_config(ctx)
     from systemu.scheduler import daemon as _daemon_mod
@@ -1429,8 +1432,8 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
         from rich.markup import escape as _esc
         _lead, _cmd, _then = _od.unavailable_reason_parts(("nicegui",))
         console.print(
-            f"[red]✗ Cannot start the daemon: the web dashboard is not "
-            f"installed.[/red]\n"
+            f"[red]ERROR: cannot start the daemon -- the web dashboard is "
+            f"not installed.[/red]\n"
             f"  {_esc(_lead.rstrip())}"
         )
         # F29/D9: THE COMMAND GOES OUT UNWRAPPED, ON ITS OWN LINE. Rich breaks a
@@ -1446,8 +1449,8 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
         console.print(
             f"[dim]  `daemon start` reports success only when a real connection "
             f"to the dashboard port succeeds, so without it there is nothing to "
-            f"witness. Everything else — recording, analysis, tools, the whole "
-            f"CLI — works on the default install.[/dim]"
+            f"witness. Everything else -- recording, analysis, tools, the whole "
+            f"CLI -- works on the default install.[/dim]"
         )
         ctx.exit(1)           # DEC-41: not started != success
 
@@ -1576,9 +1579,12 @@ def daemon_stop(ctx, stop_all: bool):
 def daemon_status(ctx, port):
     """Show the Systemu daemon status.
 
-    DEC-43: the verdict is the SAME mint `daemon start` waits on — a real
-    connection to the dashboard port. A live PID is not a listening socket, so
-    a daemon that is still migrating is reported as STARTING, not as running.
+    The verdict is the SAME witness `daemon start` waits on -- a real connection
+    to the dashboard port. A live PID is not a listening socket, so a daemon
+    that is still migrating is reported as STARTING, not as running.
+
+    Every verdict also names the vault it is about and where the port number
+    came from, each on its own unwrapped line.
     """
     config, _ = _get_vault_and_config(ctx)
     from systemu.scheduler.daemon import get_status
@@ -1612,6 +1618,41 @@ def daemon_status(ctx, port):
             "Start with: [bold]systemu daemon start[/bold]",
             title="⚡ Systemu Daemon", border_style="dim"
         ))
+
+    # Consumed HERE, by name, from the mint's projection -- so that deleting the
+    # consumption deletes it from this function's source, which is what the
+    # reachability pin in tests/test_e2e28_daemon_status_every_verdict_names_the
+    # _vault.py watches. `.get` rather than `[...]`: a status dict from an older
+    # daemon build is missing keys, and `daemon status` must still print.
+    _print_daemon_where(status.get("vault_root"), status.get("port_provenance"))
+
+
+def _print_daemon_where(vault_root, port_provenance) -> None:
+    """The two facts that make ANY verdict readable: which vault, whose port.
+
+    N3 -- these used to ride only on ``status["reason"]``, which the renderer
+    above prints on the Starting and Not-running panels and NOT on Ready. So the
+    Ready panel was PID + URL + build line, and "Ready" for WHICH vault, on WHOSE
+    port, was unanswerable on a machine with two of either.
+
+    N7 -- and they are emitted with ``click.echo`` OUTSIDE the panel, because
+    Rich folds a panel body to the console width: the witnessed Not-running panel
+    split an absolute vault path across two lines (`...objectiv` / `e-wescoff...`).
+    The `roots` group above already carries the ruling this broke -- *a path
+    wrapped at column 80 is not a path* -- and a folded path can be neither
+    pasted nor searched for. The panel keeps the verdict, the PID and the URL,
+    which fit; the path-shaped facts go where nothing wraps them.
+
+    Both values are CONSUMED from the mint's projection (``vault_root`` and the
+    provenance clause ``get_status`` carries). Re-deriving either here would put
+    a second answer on the surface, which is the defect class, not the fix.
+    """
+    from systemu.scheduler.daemon import vault_note
+
+    if type(vault_root) is str and vault_root:
+        click.echo(vault_note(vault_root))
+    if type(port_provenance) is str and port_provenance:
+        click.echo(port_provenance)
 
 
 # -----------------------------------------------------------------------------
@@ -1926,9 +1967,19 @@ def start_cmd(ctx, port: int, no_browser: bool):
     """Start Systemu and open the dashboard.
 
     The whole first run in one command: it does exactly what
-    `systemu daemon start` does --- same provider gate, same setup fallback,
-    same refusals, same exit codes --- and then, once a real connection to the
+    `systemu daemon start` does - same provider gate, same setup fallback,
+    same refusals, same exit codes - and then, once a real connection to the
     dashboard has been witnessed, opens it in your browser.
+
+    The dashboard ships as an optional extra, so a default install does not
+    have it and this command refuses at once. Add it with:
+
+    
+        pip install "systemu[dashboard]"
+
+    (The quotes matter on zsh, which reads the brackets as a file pattern.)
+    Everything else - recording, analysis, tools, the rest of the CLI - works
+    on the default install.
 
     No witness, no browser: a start that did not become ready keeps its own
     nonzero exit and its own diagnosis. Use --no-browser on a headless box.
@@ -2139,9 +2190,9 @@ def debug_suggest_specialty(ctx, shadow_id: str):
     """Analyse a shadow's memory and suggest a specialty tag (v0.4.4-c).
 
     Reads SHADOW_MEMORY.md + memory_buffer.jsonl and counts curated
-    keyword matches.  Suggests a specialty when one tag has ≥5 hits and
-    ≥40% of total matched hits.  Operator applies via Workshop edit
-    dialog — this command is inspection-only.
+    keyword matches.  Suggests a specialty when one tag has 5 or more hits
+    and at least 40% of total matched hits.  Operator applies via Workshop
+    edit dialog -- this command is inspection-only.
     """
     _, vault = _get_vault_and_config(ctx)
     from systemu.runtime.specialty_suggester import suggest_specialty
@@ -2235,16 +2286,16 @@ def debug_tool_metrics(low_success: bool, threshold: float, min_calls: int):
               help="Coverage threshold for the Stage-3 arm-gate (default 20).")
 @click.pass_context
 def debug_s4_shadow_meter(ctx, min_runs: int):
-    """SHADOW park-surface report for the external-verification net (R-A13b-2iii).
+    """SHADOW park-surface report for the external-verification net.
 
     Reads the record-only ``s4_shadow`` meter (``<vault>/metrics/metrics.json``) and
     renders, per effect-class, ``would_stamp / would_credit / would_park / park_rate``,
     then prints the pure Stage-3 arm-gate verdict (READY / NOT_READY + reasons).
 
-    READ-ONLY diagnostics — this command never writes the meter, the credit path, or any
+    READ-ONLY diagnostics -- this command never writes the meter, the credit path, or any
     store. The verdict is NOT ``would_park==0``: it requires coverage >= --min-runs, no
-    benign class stamping (effect_tags mis-wire ⇒ spurious park), and every stamped class
-    with an actual credit channel (a stamp-only class ⇒ dead channel ⇒ spurious park).
+    benign class stamping (effect_tags mis-wire => spurious park), and every stamped class
+    with an actual credit channel (a stamp-only class => dead channel => spurious park).
     """
     from systemu.runtime.metrics_store import MetricsStore
     from systemu.runtime.s4_activation import (
@@ -2281,14 +2332,14 @@ def debug_s4_shadow_meter(ctx, min_runs: int):
 @debug_group.command("avoidable-forge")
 @click.pass_context
 def debug_avoidable_forge(ctx):
-    """R-A13.5 · CAP-10 — the avoidable-forge rate over the vault's forged tools.
+    """The avoidable-forge rate over the vault's forged tools.
 
     Deterministic post-hoc replay (never an LLM judge): for every forged tool,
-    re-runs the capability-slot query — does an EXISTING tool already occupy its
-    slot (would it have bound instead of forging a duplicate)? This is the CAP-10
-    tripwire that adjudicates the DEC-18 "no embeddings" question, reported beside
-    the §10 avoidable-ask rate. READ-ONLY — computes over the live capability index,
-    writes nothing.
+    re-runs the capability-slot query -- does an EXISTING tool already occupy its
+    slot (would it have bound instead of forging a duplicate)? It is the tripwire
+    on whether keyword matching alone finds a tool you already have, and it is
+    reported beside the avoidable-ask rate. READ-ONLY -- computes over the live
+    capability index, writes nothing.
     """
     from systemu.runtime.replay_metrics import avoidable_forge_report, format_avoidable_forge
     _, vault = _get_vault_and_config(ctx)
@@ -2466,18 +2517,18 @@ def debug_avoidable_ask(ctx):
 @click.option("--corpus", default=None, type=click.Path(),
               help="Scenario corpus directory (default: fixtures/field).")
 def debug_resolver_replay(corpus):
-    """R-A13.5 · §10 IMPL-15 — the DEFINITIVE avoidable-ask rate, by resolver replay.
+    """The DEFINITIVE avoidable-ask rate, by resolver replay.
 
     This is the ask-side twin of ``avoidable-forge``, and it is a genuine replay:
     for each labelled scenario in ``fixtures/field/`` it re-runs the REAL resolver
-    (``requirement_binder.compute_requirements`` — the same function the runtime
+    (``requirement_binder.compute_requirements`` -- the same function the runtime
     calls) over the scenario's recorded inventory, with the operator's answer known,
     and asks whether a source would have bound that answer. Never an LLM judge.
 
     \b
     HOW THIS DIFFERS FROM ``avoidable-ask``:
       * ``avoidable-ask`` AGGREGATES the live ``ask_corpus.jsonl``. Those rows carry
-        no situation snapshot — not even a schema_path — so nothing can replay them.
+        no situation snapshot -- not even a schema_path -- so nothing can replay them.
         It is a directional proxy and says so.
       * this command REPLAYS. It can tell "the binder held exactly this value" apart
         from "the binder held a DIFFERENT value", which no attempt-counting signal
@@ -2489,9 +2540,9 @@ def debug_resolver_replay(corpus):
 
     \b
     EXIT STATUS:
-      0  DEFINITIVE — the corpus reconciled against its roster (a rate, or an
+      0  DEFINITIVE -- the corpus reconciled against its roster (a rate, or an
          honest "no assessable asks")
-      1  NOT definitive — a scenario failed to load/replay, or the corpus drifted
+      1  NOT definitive -- a scenario failed to load/replay, or the corpus drifted
          from roster.json (a rostered fixture is missing, or an unrostered one is
          present)
 
@@ -2603,7 +2654,7 @@ def debug_failure_histogram(group_by: str, event_types: Optional[str], top: int)
 
 @click.group("decisions")
 def decisions_group():
-    """Manage the OperatorDecisionQueue — operator decisions awaiting resolution.
+    """Manage the OperatorDecisionQueue -- operator decisions awaiting resolution.
 
     The queue is the v0.8.0 operator-decision surface for non-TTY contexts.
     When a dashboard-spawned CLI subprocess needs operator input and
@@ -2660,11 +2711,11 @@ def decisions_list(ctx):
               help="Set the gate mode dial (persisted to .env).")
 @click.pass_context
 def decisions_mode(ctx, set_mode):
-    """Show or set the gate-mode dial (spec §4.3 / D4).
+    """Show or set the gate-mode dial.
 
     Modes:
       bypass        auto-grant every gate EXCEPT the safety floor (dep/recovery
-                    + floor capabilities). DANGEROUS — most gates run unattended.
+                    + floor capabilities). DANGEROUS -- most gates run unattended.
       risk_tiered   the Governor (default): auto-grant low risk, ask otherwise.
       approve_only  always ask the operator.
 
@@ -2902,15 +2953,23 @@ def user_show(ctx):
 @click.argument("value")
 @click.pass_context
 def user_set(ctx, field: str, value: str):
-    """Update one typed field on the profile — creating it if there is none.
+    """Set one field on your user profile.
 
-    F3: this used to refuse with "No profile set. Run `sharing_on user init`
-    first", which on a box with no TTY was a dead end (init could only prompt).
-    That sentence is QUOTED, not an instruction — F23 left the old program name
-    in it deliberately, because rewriting a quotation makes it a misquotation.
-    A `set` on a missing profile now creates one from the wizard's own
-    defaults with this field applied.
+    FIELD is one of: name, location_text, timezone, default_output_dir.
+    VALUE is stored exactly as given.
+
+    If you have no profile yet, this creates one from the same defaults the
+    setup wizard offers and applies FIELD to it -- so it works on a machine
+    with no terminal to prompt at. Run `systemu user show` to review the
+    result.
     """
+    # F3/F23 -- the engineering history behind that last paragraph, kept here
+    # because a code comment is where it belongs and `--help` is not. This
+    # command used to refuse with "No profile set. Run `sharing_on user init`
+    # first", which on a box with no TTY was a dead end: `init` could only
+    # prompt. The old program name inside that quotation was deliberate --
+    # rewriting a quotation makes it a misquotation -- and the whole note then
+    # rode out to every operator who typed `user set --help`.
     from systemu.core.models import UserProfile
     _cfg, vault = _get_vault_and_config(ctx)
     prof = vault.get_user_profile()

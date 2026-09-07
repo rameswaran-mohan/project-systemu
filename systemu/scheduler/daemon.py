@@ -182,6 +182,12 @@ class DaemonReadiness:
     # the guess -- and printed it in exactly the same voice as a chosen number.
     # The provenance rides out WITH the port so no surface can lose it.
     port_source: str = ""
+    # The RENDERED provenance clause, minted once beside the source it describes.
+    # `port_source` alone is a token no operator surface can print, and a surface
+    # that re-formats it drifts from the wording folded into `reason` -- which is
+    # how the Ready panel came to disclose neither (N3). The clause rides the
+    # value so every verdict can print the same words without deriving them.
+    port_provenance: str = ""
     # The operating vault root this verdict is ABOUT, taken from the one mint
     # (`systemu.runtime.vault_root.resolve_vault_root`). "Not running" is only
     # meaningful once the operator knows which vault it is not running for.
@@ -375,6 +381,24 @@ def vault_note(vault_root: str) -> str:
     return "vault: {}".format(vault_root)
 
 
+def daemon_operating_home(vault_dir) -> Path:
+    """The directory the daemon child runs in -- the ONE minted operating home.
+
+    N9. This used to be `Path(resolve_vault_root(...).home)`, i.e. the PARENT's
+    cwd, derived here and separately again inside `audit_data_root()`. On the
+    default layout the two agreed by construction; on any other layout (an
+    absolute `SYSTEMU_VAULT_DIR`, a container mount) they were two independent
+    accidents of who called from where, and the snapshot tree the child wrote
+    was not the tree the operator's shell read.
+
+    `operating_home` is a pure function of the resolved root, so this answer and
+    `audit_data_root()`'s are the same answer, not two that happen to match.
+    """
+    from systemu.runtime.vault_root import resolve_vault_root as _rvr
+
+    return Path(_rvr(explicit=vault_dir).operating_home)
+
+
 def _resolve_readiness_port(vault_dir: str, port: Optional[int],
                             recorded_state: Optional[dict] = None
                             ) -> tuple[int, str]:
@@ -540,7 +564,8 @@ def probe_readiness(vault_dir: str, *, port: Optional[int] = None,
         daemon_version=d_ver, daemon_path=d_path,
         cli_version=mine["version"], cli_path=mine["path"],
         build_match=match, build_note=note,
-        port_source=port_source, vault_root=vault_root,
+        port_source=port_source, port_provenance=provenance,
+        vault_root=vault_root,
     )
 
 
@@ -749,17 +774,12 @@ def start_daemon(
     import os
     import systemu
 
-    # The OPERATING HOME — the directory the operator is standing in. It is the
-    # child's cwd, so every relative path the child touches lands where the
-    # parent's would have.
-    #
-    # This used to be conditional: cwd only when it "looked like" a systemu
-    # working dir (a `.env` or `.systemu_mode` present), else
-    # `Path(systemu.__file__).parent.parent`. Launching from an empty directory
-    # therefore ran the whole daemon inside the package tree — that is the
-    # v0.10.23 defect this file's `resolve_child_vault_dir` fences. The shape of
-    # the cwd no longer decides anything.
-    operating_home = Path(_root_verdict.home)
+    # The OPERATING HOME. It is the child's cwd, so every relative path the child
+    # touches -- including the `data_dir=Path("data")` that `scheduler/jobs.py`
+    # passes -- lands where `audit_data_root()` looks. ONE named derivation,
+    # CALLED here rather than inlined, so there is a single place for both to
+    # agree on and a test can invoke it without starting a daemon.
+    operating_home = daemon_operating_home(_root_verdict.root)
 
     # project_root stays derived exactly as before, and ONLY feeds PYTHONPATH:
     # it answers "where is the code", which is a different question from "where
@@ -905,6 +925,7 @@ def get_status(vault_dir: str, *, port: Optional[int] = None,
         # the projection too: a fact the mint carries but the dict drops is a
         # fact no operator surface can reach.
         "port_source": v.port_source,
+        "port_provenance": v.port_provenance,
         "vault_root": v.vault_root,
         # F13 — WHICH build the daemon is executing rides the same projection,
         # so no consumer has to (or may) derive it a second way.
