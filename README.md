@@ -41,6 +41,8 @@ is gated as *dangerous-until-proven*. Approve, and the toolkit grows.
   </tr>
 </table>
 
+🎬 **[Watch the 60-second walkthrough (MP4)](docs/assets/systemu-demo.mp4)** — the same run, every gate in order, built only from unedited screenshots.
+
 **Benchmarked, not asserted.** Across **179 trials / 5 models / 5 vendors**, a
 frozen toolkit solves **6%** of capability-gap tasks; governed self-provisioning
 solves **61%** (McNemar *p* = 2.8×10⁻¹⁰), graded by an external oracle.
