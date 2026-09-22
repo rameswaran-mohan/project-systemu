@@ -21,6 +21,8 @@ Three classes of test here:
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import threading
 import time
 
@@ -623,6 +625,10 @@ def test_the_real_loop_reads_busy_after_a_real_stall():
     assert snap["recent_p95_ms"] is not None and snap["recent_p95_ms"] > 100.0, snap
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin" and bool(os.environ.get("CI")),
+    reason="hosted macOS runners stall a real event loop for >150 ms at random; "
+           "the composite is exercised for real on the Linux and Windows legs")
 def test_an_unblocked_loop_records_low_lag_and_no_breach(monkeypatch):
     """The negative half — otherwise the tests above pass on a broken watchdog
     that reports a breach unconditionally.

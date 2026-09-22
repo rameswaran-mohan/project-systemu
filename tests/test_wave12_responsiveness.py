@@ -62,7 +62,8 @@ class TestTimezoneIana:
         pytest.importorskip("tzlocal")
         from systemu.interface.pages.welcome import detect_timezone
         tz = detect_timezone()
-        assert "/" in tz, f"expected IANA name (got {tz!r})"
+        # "UTC" is itself an IANA key (hosted runners are pinned to it)
+        assert "/" in tz or tz in ("UTC", "Etc/UTC"), f"expected IANA name (got {tz!r})"
 
     def test_never_raises_without_tzlocal(self, monkeypatch):
         import builtins

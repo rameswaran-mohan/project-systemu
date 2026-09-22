@@ -29,6 +29,21 @@ def _vault(tmp_path):
     return FileVault(Vault(str(tmp_path / "vault")))
 
 
+def _tick() -> None:
+    """Return once the wall clock is strictly past the stamp it showed on entry.
+
+    The preview closes its range at now (inclusive). A run stamped within the
+    same clock tick -- ~1 ms on Windows, ~16 ms on older kernels -- would sit
+    inside the previewed window and the 'not silently widened' pin would then
+    fail for a reason that is the clock, not the card."""
+    import time
+    from datetime import datetime, timezone
+    t0 = datetime.now(timezone.utc)
+    deadline = time.monotonic() + 0.1
+    while datetime.now(timezone.utc) <= t0 and time.monotonic() < deadline:
+        time.sleep(0.0005)
+
+
 def _act(vault, eid="quick_1", oid=0, action="send_email", params=None, success=True):
     audit_log.append_action(getattr(vault, "_v", vault), execution_id=eid,
                             objective_id=oid, action=action,
@@ -643,6 +658,7 @@ def test_card_writes_exactly_the_previewed_range_not_a_re_resolved_one(tmp_path,
     buttons = {label: el for label, el in found["Button"]}
 
     _click(buttons["Preview export"])
+    _tick()                                            # past the previewed close (coarse clock)
     _act(v, eid="quick_during")                        # a run finishes mid-confirmation
     _click(buttons["Write export file"])
 
