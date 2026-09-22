@@ -59,7 +59,10 @@ import ast
 import re
 import subprocess
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 from pathlib import Path
 
 import click
@@ -76,7 +79,11 @@ _SCANNED_PACKAGES = ("systemu", "sharing_on")
 #: notes, plans and release archaeology: its shell pipelines (``| tail -5``)
 #: and ``list/show/refine`` shorthand are prose about argv, not argv, so only
 #: the program-name half applies there.
-_LIVE_DOCS = ("README.md", "USER_GUIDE.md", "OPERATOR-SOP.md", "MIGRATION.md")
+_LIVE_DOCS = ("README.md", "USER_GUIDE.md", "OPERATOR-SOP.md")
+#: Live docs that not every checkout carries (the upgrade note only ships
+#: with trees that have an upgrade path). Same full resolution when present;
+#: their absence is not a finding.
+_OPTIONAL_LIVE_DOCS = ("MIGRATION.md",)
 
 
 # --------------------------------------------------------------------------- #
@@ -238,7 +245,7 @@ def test_every_command_string_names_an_invocable_command():
 def _doc_files():
     """Every markdown document in the repo, live docs first."""
     seen = set()
-    for name in _LIVE_DOCS:
+    for name in _LIVE_DOCS + _OPTIONAL_LIVE_DOCS:
         p = REPO_ROOT / name
         if p.exists():
             seen.add(p)
@@ -302,8 +309,10 @@ def test_live_docs_name_only_fully_invocable_commands():
 
     findings = []
     scanned = 0
-    for name in _LIVE_DOCS:
+    for name in _LIVE_DOCS + _OPTIONAL_LIVE_DOCS:
         path = REPO_ROOT / name
+        if name in _OPTIONAL_LIVE_DOCS and not path.exists():
+            continue
         assert path.exists(), f"{name} is gone -- revisit _LIVE_DOCS"
         scanned += 1
         for tokens in _invocations(path.read_text(encoding="utf-8", errors="replace"),
@@ -312,7 +321,7 @@ def test_live_docs_name_only_fully_invocable_commands():
             if reason:
                 findings.append(f"{name}: {' '.join(tokens)!r} -- {reason}")
 
-    assert scanned == len(_LIVE_DOCS)
+    assert scanned >= len(_LIVE_DOCS)
     assert not findings, (
         "operator-facing documents name commands that cannot be invoked:\n  "
         + "\n  ".join(sorted(set(findings)))

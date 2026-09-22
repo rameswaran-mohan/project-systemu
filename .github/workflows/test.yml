@@ -137,7 +137,9 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # The pinned lockfile is not part of the public tree; the extras
+          # below carry everything this leg needs.
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           # v0.10.24: [dev] carries the optional groups (playwright, nicegui)
           # that left the core install; requirements.txt already pins them, but
           # the extra keeps this leg honest if that lockfile is ever slimmed.
@@ -194,7 +196,8 @@ jobs:
           python-version: "3.11"
       - name: Install (compose tests only)
         run: |
-          pip install pytest pyyaml
+          # tests/conftest.py imports the package at collection time.
+          pip install -e . pytest pyyaml
       - name: Render every profile
         run: |
           # Compose requires SOME .env even if everything has defaults.

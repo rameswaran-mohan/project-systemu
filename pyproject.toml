@@ -83,7 +83,11 @@ dependencies = [
     "apscheduler>=3.11",   # daemon's periodic jobs
     "pydantic>=2.0",       # vault Pydantic models
     "httpx>=0.27",         # used by the Ollama provider + general http
-    "mcp>=1.0",            # v0.9.36 P2: official MCP client/server SDK (isolated under runtime/mcp/sdk)
+    "mcp>=1.0,<2",         # v0.9.36 P2: official MCP client/server SDK (isolated under runtime/mcp/sdk).
+                           # <2: verified against mcp 2.2.0 -- `mcp.client.streamable_http.streamablehttp_client`
+                           # (our streamable-HTTP transport, transports.py) and `mcp.server.fastmcp`
+                           # (the test reference servers) are gone in 2.x; stdio/sse still import.
+                           # Porting to the 2.x Client/MCPServer API is a separate change.
     "pyyaml>=6.0",         # config + skill migrator + skill exporter
     "ddgs>=9.14",
     "keyring>=24",
@@ -145,6 +149,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "fakeredis>=2.20",
+    "tomli>=2.0; python_version < '3.11'",  # tests read pyproject via tomllib (3.11+)
 ]
 
 # Three install modes — pick one with: pip install -e ".[<mode>]"
@@ -217,6 +222,10 @@ sharing_on = "sharing_on.cli:main"
 systemu = "sharing_on.cli:main"
 
 [tool.pytest.ini_options]
+# Bare `pytest` (CI) does not put the repo root on sys.path the way
+# `python -m pytest` (the local gate) does; tests import the repo-root
+# `tools/` lint helpers, so pin the root explicitly.
+pythonpath = ["."]
 markers = [
     "linux_only: tests that only run on Linux (playwright, posix-only paths)",
     "docker_required: tests that need a docker daemon",
