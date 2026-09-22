@@ -58,7 +58,7 @@ jobs:
           fi
 
           echo "=== STEP 2/4: pip install test deps ==="
-          pip install pyyaml
+          pip install pyyaml setuptools wheel build
 
           echo "=== STEP 2b/4: the DEFAULT install must work without extras ==="
           # The property the v0.10.24 slimming created: `pip install systemu`

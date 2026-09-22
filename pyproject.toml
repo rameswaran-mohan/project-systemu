@@ -150,6 +150,11 @@ dev = [
     "pytest-asyncio>=0.23",
     "fakeredis>=2.20",
     "tomli>=2.0; python_version < '3.11'",  # tests read pyproject via tomllib (3.11+)
+    # the wheel-content fence builds a wheel with --no-build-isolation; a 3.12+
+    # venv ships no setuptools, so the backend must be a declared dev dep
+    "setuptools>=68.0",
+    "wheel",
+    "build",
 ]
 
 # Three install modes — pick one with: pip install -e ".[<mode>]"
