@@ -47,7 +47,10 @@ def test_wrapper_prints_message_and_exits_75_on_pending():
     # equal console scripts for one entry point, so pinning either literal made
     # the coherence fix look like a regression -- while accepting a name pip
     # never puts on PATH. `<installed program> decisions resolve dec_abc`.
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
     from pathlib import Path
     _scripts = tomllib.loads(
         (Path(__file__).resolve().parents[1] / "pyproject.toml")

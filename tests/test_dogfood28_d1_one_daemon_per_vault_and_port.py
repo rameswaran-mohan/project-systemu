@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -79,6 +80,24 @@ _RECORD_TIMEOUT_S = 150.0
 #: of magnitude wider than that, so the witness does not depend on losing a
 #: race it was written to detect.
 _RECORD_WATCH_S = 20.0
+
+
+_MAC_FRAMEWORK_EXE = re.compile(
+    r"^(?P<root>.*/Versions/(?P<ver>\d+\.\d+))/Resources/Python\.app/Contents/MacOS/Python$"
+)
+
+
+def _canonical_interpreter(path: str) -> str:
+    """realpath + normcase, and on macOS framework builds the process's exe is
+    `.../Versions/X.Y/Resources/Python.app/Contents/MacOS/Python` while the
+    launched symlink resolves to `.../Versions/X.Y/bin/pythonX.Y` -- the same
+    interpreter. Fold the former onto the latter so the pin compares identity,
+    not the launcher's spelling."""
+    real = os.path.realpath(path)
+    m = _MAC_FRAMEWORK_EXE.match(real.replace("\\", "/"))
+    if m:
+        real = f"{m.group('root')}/bin/python{m.group('ver')}"
+    return os.path.normcase(real)
 
 
 def _free_port() -> int:
@@ -297,8 +316,8 @@ def test_the_executing_daemon_runs_under_the_interpreter_we_launched(started_dae
             exes.append(psutil.Process(pid).exe() or "")
         except Exception:
             exes.append("")
-    launched = os.path.normcase(os.path.realpath(venv_python))
-    normalised = [os.path.normcase(os.path.realpath(e)) if e else "" for e in exes]
+    launched = _canonical_interpreter(venv_python)
+    normalised = [_canonical_interpreter(e) if e else "" for e in exes]
     assert launched in normalised, (
         f"the interpreter this test launched ({venv_python}) is nowhere in the "
         f"executing daemon's process chain {list(zip(chain, exes))} -- the "
@@ -315,11 +334,18 @@ def test_every_extra_row_is_a_launcher_that_never_imported_systemu(started_daemo
     assert recorded is not None
     extras = {p.pid for p in started_daemon.same_argv_processes()} - {recorded}
 
+    # A system-wide psutil.net_connections() scan is refused without root on
+    # macOS (proc_pidinfo on other users' processes). The pin only needs the
+    # rows we spawned, and those are ours to inspect.
     listeners = set()
-    for conn in psutil.net_connections(kind="inet"):
-        if conn.laddr and conn.laddr.port == started_daemon.port \
-                and conn.status == psutil.CONN_LISTEN and conn.pid:
-            listeners.add(conn.pid)
+    for pid in extras | {recorded}:
+        try:
+            conns = psutil.Process(pid).net_connections(kind="inet")
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+        for conn in conns:
+            if conn.laddr and conn.laddr.port == started_daemon.port                     and conn.status == psutil.CONN_LISTEN:
+                listeners.add(pid)
     assert not (listeners & extras), (
         f"a process that is not the recorded daemon ({sorted(listeners & extras)}) "
         f"is listening on port {started_daemon.port} -- two servers, one vault")

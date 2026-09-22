@@ -151,7 +151,8 @@ def test_docx_fixture_is_msoffcrypto_encryptable():
     # fail — this test pins which path a correct docx tool takes.
     import io
 
-    import msoffcrypto
+    msoffcrypto = pytest.importorskip(
+        "msoffcrypto", reason="msoffcrypto-tool is a runtime-installed dependency, not a declared one")
 
     from systemu.pipelines.tool_dry_run import _sandbox_paths
 

@@ -85,7 +85,8 @@ def test_mark_dead_letter_pushes_to_deadletter_list(fake_redis) -> None:
     q.mark_running(sid)
     q.mark_dead_letter(sid, "out of retries")
     # Dead-letter list grew by one
-    dl_key = f"systemu:deadletter"
+    # The key carries the queue's prefix (SYSTEMU_REDIS_PREFIX in the real-Redis CI leg).
+    dl_key = f"{q._prefix}:deadletter"
     assert q._redis.llen(dl_key) == 1
 
 

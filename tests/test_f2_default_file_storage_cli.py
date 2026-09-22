@@ -272,7 +272,10 @@ def test_doctor_scope_refuses_with_a_runnable_remedy_not_a_bare_error(tmp_path):
     # F23: resolve the program name instead of spelling one of the two equal
     # console scripts -- the property is "a command the operator can copy",
     # which a literal that pip may not install would not have proven.
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
     _scripts = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )["project"]["scripts"]

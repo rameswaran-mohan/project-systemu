@@ -156,7 +156,10 @@ class TestPackaging:
     def test_package_data_includes_vault_and_implementations(self):
         import pathlib
         try:
-            import tomllib  # Python 3.11+
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # Python 3.10
+                import tomli as tomllib
         except ModuleNotFoundError:  # Python 3.10
             tomllib = pytest.importorskip("tomli")
         root = pathlib.Path(__file__).resolve().parent.parent

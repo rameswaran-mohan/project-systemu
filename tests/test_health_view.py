@@ -9,7 +9,19 @@ from __future__ import annotations
 from systemu.interface.pages import health
 
 
-def test_health_view_surfaces_profile_provider_keyring_daemon():
+class _PresentKeyring:
+    """A keyring that exists and is unlocked (the doctor probe reads None)."""
+
+    def get_password(self, service, key):
+        return None
+
+
+def test_health_view_surfaces_profile_provider_keyring_daemon(monkeypatch):
+    # The chip must follow the four inputs. On a headless Linux runner there is
+    # no SecretService, the profile honestly reports plaintext_fallback, and
+    # that is a WARNING -- so pin a present keyring for this all-healthy case.
+    from systemu.runtime import platform_profile as pp
+    monkeypatch.setattr(pp, "_usable_keyring", lambda: _PresentKeyring())
     v = health.health_view(provider_configured=True, provider_reachable=True,
                            keyring_locked=False, daemon_running=True)
     assert v["profile"]["forged_net_jail"] == "absent"

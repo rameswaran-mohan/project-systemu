@@ -107,7 +107,10 @@ class TestPackContract:
         as missing.
         """
         import re
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10
+            import tomli as tomllib
         from systemu.runtime import optional_deps as od
 
         pyproject = tomllib.loads(

@@ -148,8 +148,15 @@ def test_public_ipv6_literal_still_admissible():
     from systemu.runtime.readback_client import _url_is_admissible
     # 2606:4700:4700::1111 (Cloudflare) — global, NOT 6to4/mapped/teredo.
     assert _url_is_admissible("https://[2606:4700:4700::1111]/") is True
-    # a 6to4 literal embedding a PUBLIC IPv4 (8.8.8.8) is a legit public target.
-    assert _url_is_admissible("https://[2002:808:808::]/") is True
+    # a 6to4 literal embedding a PUBLIC IPv4 (8.8.8.8) is a legit public target
+    # on stdlibs that class 2002::/16 as global; Python >= 3.12.4 / 3.11.10
+    # (gh-113171) marks the whole 6to4 block non-global and the gate then
+    # FAILS CLOSED. Either way the verdict must follow the stdlib, never
+    # admit what it refuses.
+    import ipaddress
+    six_to_four = ipaddress.ip_address("2002:808:808::")
+    expected = not (six_to_four.is_private or six_to_four.is_reserved)
+    assert _url_is_admissible("https://[2002:808:808::]/") is expected
 
 
 # ── HARDENING 1: a HOSTNAME that resolves to a 6to4-embedded internal IPv4 is

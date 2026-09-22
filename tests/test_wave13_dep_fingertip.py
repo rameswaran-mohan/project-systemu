@@ -37,7 +37,10 @@ class TestCommonPackagesBundled:
         (The same idiom was already found and replaced in
         tests/test_starter_pack_conformance.py; this was the second copy.)
         """
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10
+            import tomli as tomllib
 
         data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
         shipped = {

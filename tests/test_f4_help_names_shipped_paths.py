@@ -93,7 +93,10 @@ def test_the_replacement_instruction_names_a_real_command():
     name against ``[project.scripts]`` instead. Strictly stronger: the old form
     would have passed for a name pip never puts on PATH.
     """
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
 
     from sharing_on.cli import cli
 

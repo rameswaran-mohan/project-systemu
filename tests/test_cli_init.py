@@ -6,12 +6,16 @@ import subprocess
 from pathlib import Path
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def test_init_creates_vault_and_seeds_starter_catalog(tmp_path):
     """sharing_on init must copy starter tools + skills from package data
     into the CWD vault if the vault doesn't already exist."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("OPENROUTER_", "SYSTEMU_", "SHARING_ON_"))}
     env["PATH"] = os.environ.get("PATH", "")
+    env["PYTHONPATH"] = str(_REPO_ROOT)  # init creates ./systemu in cwd; the package must still win
     env["PYTHONIOENCODING"] = "utf-8"
 
     result = subprocess.run(
@@ -43,6 +47,7 @@ def test_init_is_idempotent(tmp_path):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("OPENROUTER_", "SYSTEMU_", "SHARING_ON_"))}
     env["PATH"] = os.environ.get("PATH", "")
+    env["PYTHONPATH"] = str(_REPO_ROOT)  # init creates ./systemu in cwd; the package must still win
     env["PYTHONIOENCODING"] = "utf-8"
 
     for run_n in range(2):

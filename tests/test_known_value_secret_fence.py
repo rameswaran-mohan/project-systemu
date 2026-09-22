@@ -166,9 +166,26 @@ def test_a_credential_that_is_a_SUBSTRING_of_a_longer_token_does_not_redact_it(v
     assert ap._value_is_secret("hunter2xxlarge-instance", vault) is False
 
 
+
+class _HermeticKeyring:
+    """In-memory stand-in for the OS keyring (the three methods the store calls)."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get_password(self, service, key):
+        return self.store.get((service, key))
+
+    def set_password(self, service, key, value):
+        self.store[(service, key)] = value
+
+    def delete_password(self, service, key):
+        self.store.pop((service, key), None)
+
+
 # ── 4. END-TO-END through the real promotion path ─────────────────────────────
 
-def test_a_stored_credential_is_refused_by_the_REAL_promotion_path(tmp_path):
+def test_a_stored_credential_is_refused_by_the_REAL_promotion_path(tmp_path, monkeypatch):
     """The WIRING pin. Every test above calls ``_value_is_secret`` directly, so a
     mutation that simply stopped threading ``vault`` at the call site left all of them
     green while the fix was dead in production — it survived the first mutation round.
@@ -181,6 +198,14 @@ def test_a_stored_credential_is_refused_by_the_REAL_promotion_path(tmp_path):
 
     SECRET = "correcthorsebatterystaple"
     v = S3Vault(tmp_path)
+    # A host with no OS keyring (headless Linux CI) sends the store to its
+    # FLAGGED plaintext fallback file, and the on-disk sweep below would then
+    # find the secret in the store's own at-rest file -- the documented fallback,
+    # not a promotion leak. Pin a hermetic keyring so the sweep witnesses the
+    # promotion path alone.
+    from systemu.runtime.credentials import store as _store_mod
+    _fake_kr = _HermeticKeyring()
+    monkeypatch.setattr(_store_mod, "usable_keyring", lambda: _fake_kr)
     CredentialStore(base_dir=v.root).set("acme_login", SECRET)
 
     snaps = _assert_realistic(

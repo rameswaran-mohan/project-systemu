@@ -34,7 +34,10 @@ import sharing_on
 from systemu.runtime import vault_migrator as vm
 
 try:  # Python 3.11+
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
 except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
     tomllib = pytest.importorskip("tomli")
 

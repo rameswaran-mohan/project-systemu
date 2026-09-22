@@ -97,7 +97,7 @@ jobs:
           # tests, and --tb=short to show short tracebacks even with --maxfail.
           pytest tests/ --ignore=tests/e2e \
             -m "not linux_only and not docker_required" \
-            -ra --tb=short --maxfail=5
+            -ra --tb=short --maxfail=50
 
   # ── Integration suite against REAL Postgres + Redis ────────────────────────
   # Catches drift between fakeredis/in-memory SQLite and the real services

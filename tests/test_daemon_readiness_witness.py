@@ -415,7 +415,10 @@ def _init_advice_spellings() -> tuple:
     from every blob. Resolving against `[project.scripts]` keeps both arms
     load-bearing under either spelling.
     """
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
     scripts = tomllib.loads(
         (Path(__file__).resolve().parents[1] / "pyproject.toml")
         .read_text(encoding="utf-8"))["project"]["scripts"]
