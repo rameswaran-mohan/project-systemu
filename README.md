@@ -9,6 +9,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT"></a>
   <a href="https://pypi.org/project/systemu/"><img src="https://img.shields.io/pypi/v/systemu?color=2563EB&label=pypi" alt="PyPI"></a>
+  <a href="https://github.com/rameswaran-mohan/project-systemu/actions/workflows/test.yml"><img src="https://github.com/rameswaran-mohan/project-systemu/actions/workflows/test.yml/badge.svg?branch=main" alt="tests"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
   <a href="https://doi.org/10.5281/zenodo.20816383"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.20816383.svg" alt="DOI"></a>
   <a href="https://github.com/rameswaran-mohan/project-systemu/stargazers"><img src="https://img.shields.io/github/stars/rameswaran-mohan/project-systemu?style=social" alt="GitHub stars"></a>
