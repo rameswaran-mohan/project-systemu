@@ -487,7 +487,7 @@ def forge_tool(
         title="Forge New Tool?",
         message=(
             f"Tool: [bold]{tool.name}[/bold]\n"
-            f"Type: {tool.tool_type}\n"
+            f"Type: {getattr(tool.tool_type, 'value', tool.tool_type)}\n"
             f"Description: {tool.description}\n"
             f"Dependencies: {', '.join(tool.dependencies) or 'none'}\n\n"
             f"Context scroll: {scroll.name}"

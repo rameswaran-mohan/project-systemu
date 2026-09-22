@@ -226,7 +226,7 @@ def test_cli_gate_message_is_byte_identical_with_a_collision(
     assert captured["dedup_key"] == "tool_forge:" + tool.id
     assert captured["message"] == (
         "Tool: [bold]open_issue[/bold]\n"
-        "Type: ToolType.PYTHON_FUNCTION\n"
+        "Type: python_function\n"
         "Description: opens an issue\n"
         "Dependencies: none\n\n"
         "Context scroll: s1"
@@ -246,7 +246,7 @@ def test_cli_gate_message_is_byte_identical_without_a_collision(
 
     assert captured["message"] == (
         "Tool: [bold]open_issue[/bold]\n"
-        "Type: ToolType.PYTHON_FUNCTION\n"
+        "Type: python_function\n"
         "Description: opens an issue\n"
         "Dependencies: none\n\n"
         "Context scroll: s1"

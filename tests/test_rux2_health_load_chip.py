@@ -35,6 +35,22 @@ from systemu.runtime.loop_lag import LoopLagWatchdog
 _OK = dict(provider_configured=True, provider_reachable=True,
            keyring_locked=False, daemon_running=True)
 
+
+class _PresentKeyring:
+    """A keyring that exists and is unlocked (the doctor probe reads None)."""
+
+    def get_password(self, service, key):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _present_keyring(monkeypatch):
+    """The chip under test must follow ``_OK`` and the load series, not the
+    runner's desktop: a headless Linux box has no SecretService, the profile
+    honestly reports plaintext_fallback, and that alone is a WARNING."""
+    from systemu.runtime import platform_profile as pp
+    monkeypatch.setattr(pp, "_usable_keyring", lambda: _PresentKeyring())
+
 # A calm, MEASURED CPU series — the state a production box is normally in.
 _CALM_CPU = (22.0,) * 5
 

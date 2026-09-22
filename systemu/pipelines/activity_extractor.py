@@ -671,7 +671,7 @@ def _queue_forge_notifications(
         deps_str = ", ".join(tool.dependencies) if tool.dependencies else "none"
         message = (
             f"Tool: {tool.name}\n"
-            f"Type: {tool.tool_type}\n"
+            f"Type: {getattr(tool.tool_type, 'value', tool.tool_type)}\n"
             f"Description: {tool.description}\n"
             f"Parameters: {', '.join(param_names) or 'none'}\n"
             f"Dependencies: {deps_str}\n"

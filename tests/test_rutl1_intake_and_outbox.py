@@ -1292,9 +1292,11 @@ class TestOutboxContract:
         ``pathlib.Path`` on the HOST platform produces, same as every other
         path helper in it)."""
         from systemu.runtime.outbox import _esc_path
+        import os
         result = _esc_path("/x.pdf")
-        assert result == "\\x.pdf", result
-        assert not result.startswith("\\\\"), result
+        # the host's pathlib spells the root: a backslash on Windows, '/' on POSIX
+        assert result == os.sep + "x.pdf", result
+        assert not result.startswith(os.sep * 2), result
 
     def test_esc_path_empty_string_produces_no_separator_at_all(self):
         """Before this fix: ``_esc_path("")`` rendered ``".\\"`` — a
@@ -1310,8 +1312,10 @@ class TestOutboxContract:
         under the drive — both already rendered correctly before this fix
         and must still render identically after it."""
         from systemu.runtime.outbox import _esc_path
-        assert _esc_path("subdir/report.pdf") == "subdir\\report.pdf"
-        assert _esc_path("C:\\dir\\x.pdf") == "C:\\dir\\x.pdf"
+        import os
+        assert _esc_path("subdir/report.pdf") == "subdir" + os.sep + "report.pdf"
+        if os.name == "nt":   # a drive-rooted spelling only exists on Windows
+            assert _esc_path("C:\\dir\\x.pdf") == "C:\\dir\\x.pdf"
 
     # ── the hook's risk profile ──────────────────────────────────────────────
 

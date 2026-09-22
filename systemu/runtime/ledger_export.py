@@ -268,6 +268,25 @@ def write_export(vault, *, fmt: str = "csv", since: Any = None, until: Any = Non
     return result
 
 
+def _strictly_after(until_ts: str, *, budget_s: float = 0.05) -> None:
+    """Hold (bounded) until the wall clock is strictly PAST ``until_ts``.
+
+    The window is CLOSED at ``until_ts`` (inclusive, AC3) and the export's own
+    ledger row is stamped by the audit writer's clock at append time. A coarse
+    clock (Windows hands out the same microsecond stamp for ~1 ms, older
+    kernels for ~16 ms) can give the window's close and the export event the
+    SAME stamp, and the event then lands inside the window it reports on --
+    the re-export is no longer byte-stable. Spin at most ``budget_s``; a clock
+    that never advances is left alone (honest -- never a hang).
+    """
+    if not until_ts:
+        return
+    import time
+    deadline = time.monotonic() + budget_s
+    while ledger.norm_ts(_now().isoformat()) <= until_ts and time.monotonic() < deadline:
+        time.sleep(0.0005)
+
+
 def _record_export_event(vault, result: Dict[str, Any]) -> bool:
     """"the export event is itself a ledger row" (§6). Goes through the EXISTING single
     action-audit writer — no new durable writer is introduced.
@@ -280,6 +299,7 @@ def _record_export_event(vault, result: Dict[str, Any]) -> bool:
     # append_action_audit — it has no __getattr__. Reach the raw Vault the same way
     # dashboard_state._resolve_project_root does.
     raw = getattr(vault, "_v", vault)
+    _strictly_after(result.get("until_ts") or "")
     try:
         audit_log.append_action(
             raw,
