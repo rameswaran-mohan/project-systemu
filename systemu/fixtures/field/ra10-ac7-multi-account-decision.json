@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "id": "ra10-ac7-multi-account-decision",
+  "title": "Two acting identities for one service force a decision — the ask is necessary (R-A10 AC7 / IMPL-8)",
+  "provenance": {
+    "release": "R-A10",
+    "source_test": "tests/test_ra10_binder.py::test_ac7_multiple_accounts_for_service_force_a_decision",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "open the pull request",
+    "success_criteria": "the PR is open"
+  },
+  "capability": {
+    "name": "gh_act",
+    "parameters_schema": {
+      "account": { "type": "string", "description": "github account to act as" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [
+      {
+        "name": "github",
+        "auth_kind": "oauth",
+        "has_live_token": true,
+        "account": "alice",
+        "origin_class": "operator",
+        "source_kind": "connected_service"
+      },
+      {
+        "name": "github",
+        "auth_kind": "oauth",
+        "has_live_token": true,
+        "account": "bob",
+        "origin_class": "operator",
+        "source_kind": "connected_service"
+      }
+    ],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {},
+    "declared_intents": []
+  },
+  "asks": [
+    {
+      "schema_path": "account",
+      "class": "decision",
+      "operator_answer": "alice",
+      "label": "necessary",
+      "why": "Two credential-bearing github identities match the leaf. _bind_inventory_entry returns None on >=2 matches so the leaf falls through to a decision requirement rather than silently picking one. Asking WHICH identity is the correct behaviour: a resolver that guessed here would act as the wrong user. The ask is necessary even though the answer ('alice') is present in the situation."
+    }
+  ]
+}

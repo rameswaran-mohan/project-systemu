@@ -1,33 +1,64 @@
-"""R-W1 (W-A slice-1) — the World Model v2 fact substrate (§5.11.a/.b).
-
-The greenfield FOUNDATION the successor W-program (W-A…W-F) rides on:
+"""R-W1 — the World Model v2 fact store and its query views (§5.11.a/.b).
 
   * WM-1  a universal, durable, provenance-IMMUTABLE ``Fact`` store;
   * WM-2  negative knowledge (``NegativeFact``) with a short TTL — "searched and
-          NOT found" is a first-class, expiring fact;
-  * WM-4  a deterministic ``world.query`` view family over the store.
+          NOT found" is a first-class, expiring fact — plus the per-run record of
+          which negatives a run consulted (``consulted_negatives``), so a run's
+          handoff can cite them (§5.11 AC2);
+  * WM-4  a deterministic ``world.query`` view family over the store, and the survey
+          WATERMARK that read-side staleness is derived from.
 
-PURE substrate — **nothing in the run loop reads or writes it yet.** Slice-2 wires
-the payoff (the §5.1 SituationReport becomes a ranked *view* over this store, the
-§5.5 discovery negative-fact loop, and the §5.3 binder's AC1 assertion). Because no
-existing bind source reads the store (verified: no run-loop module imports this),
-the §5.11.f risk-5 invariant holds trivially — the agent behaves IDENTICALLY when
-this feature is absent or empty (a smaller world, never a broken one).
+ROLE. The durable memory of what systemu has learned about the operator's world. It is
+LIVE on every run: written at the survey stage (live inventory + consented census),
+written and read at the discovery-before-forge seam, read into the open-world planner's
+prompt as a ranked, fenced view, read by the executing agent through the registered
+``world_query`` tool, and cited in run handoffs. Earlier revisions of this docstring
+described it as a substrate with no run-loop reader or writer; that stopped being true
+at W-A slice-2a and is corrected here (DEC-34c). The callers below are pinned against
+the tree by ``tests/test_wm_module_doc_names_callers.py``.
 
-Trust (WM-15 / §5.10.b): a ``Fact`` is untrusted DATA carrying an IMMUTABLE
+CALLERS. Direct importers of this module:
+
+  - ``systemu/runtime/world_model_populator.py`` — the WRITE-ONLY projector:
+    ``populate_from_situation`` turns each run's SituationReport into facts plus a
+    survey watermark (called from ``ShadowRuntime.execute``'s survey stage).
+  - ``systemu/runtime/ambient_census.py`` — the WM-7 consent-gated census producer
+    (``run_census``, same survey stage); consent revocation purges through
+    ``FactStore.purge_source_ref``.
+  - ``systemu/runtime/world_model_discovery.py`` — the WM-2 discovery-miss loop at the
+    discovery-before-forge seam in ``shadow_runtime``: records "searched, not found",
+    clears it when the capability turns up, and reads it back for the operator CLI.
+  - ``systemu/runtime/world_query.py`` — the FENCED read surface: the planner's
+    goal-conditioned view (with its trim digest), the ``world_query`` tool's views,
+    and the handoff's negative-fact citation.
+  - ``systemu/interface/cli_commands.py`` — ``run_world``, the read-only operator CLI.
+
+Reached through ``world_query`` (they never import this module themselves):
+
+  - ``situational_inventory.compose_world_view`` — puts the ranked view (and what its
+    budget trim left out) on ``SituationReport.world_facts`` for the planner prompt.
+  - ``world_tools.world_query_handler`` — the registered ``world_query`` tool.
+  - ``shadow_runtime._augment_summary_with_committed_effects`` — the handoff composer;
+    it cites the negative facts the run consulted, from the per-run record only.
+
+TRUST. (WM-15 / §5.10.b) A ``Fact`` is untrusted DATA carrying an IMMUTABLE
 ``origin_class``. Taint never launders — the store REJECTS any attempt to change a
-fact's ``origin_class`` on update (E1). ``Fact.taint_permits_silent_bind`` is a
-taint-only, NECESSARY-NOT-SUFFICIENT advisory: the §5.3 binder (slice-2) is the sole
-authority and ANDs taint ∧ confidence ∧ verification ∧ effect-class. This module
-DESCRIBES; it never AUTHORIZES (§5.10.b#3). It holds ids/names/paths only, never a
-secret value (E6).
+fact's ``origin_class`` on update (E1). This module DESCRIBES; it never AUTHORIZES
+(§5.10.b#3, DEC-26): no bind source reads the store. ``SituationReport.world_facts`` is
+not among the fields ``requirement_binder`` enumerates, and every row read back through
+``world_query`` is clamped to ``content_derived`` regardless of its stored origin.
+``Fact.taint_permits_silent_bind`` is a taint-only, NECESSARY-NOT-SUFFICIENT advisory
+with no production caller today; it is never itself a gate. It holds ids/names/paths
+only, never a secret value (E6).
 
-Deferred to slice-2+ and W-D (documented, not dropped): the report-as-view inversion,
-the binder AC1 assertion, the discovery negative-fact write/read loop, populating the
-store from live inventory, and WM-5 WorldGraph / WM-3 belief-revision / WM-13 gardener
-decay (all W-D — so slice-1 facts are FLAT, no edges, and there is no confidence decay;
-"absence expires faster than presence" is realised here as a short ABSOLUTE default
-TTL, and becomes relative-to-presence when W-D decay lands).
+Because nothing that decides reads the store, the §5.11.f risk-5 property holds by
+construction: an absent, empty, or corrupt store yields a smaller world (an empty view,
+no citation), never a broken run.
+
+Still deferred to W-D (documented, not dropped): WM-5 WorldGraph, WM-3 belief revision
+and WM-13 gardener decay — so facts are FLAT (no edges), there is no confidence decay,
+and "absence expires faster than presence" is realised as a short ABSOLUTE default TTL
+that becomes relative-to-presence when W-D decay lands.
 """
 from __future__ import annotations
 
@@ -37,6 +68,8 @@ import logging
 import os
 import re
 import tempfile
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -180,6 +213,98 @@ class NegativeFact(BaseModel):
             return True
 
 
+# ── WM-2 / §5.11 AC2: which negative facts a RUN consulted (citation half) ───
+# A run's handoff must be able to say "I concluded X was unavailable because I searched
+# and did not find it — here is what I probed, who asserted it, and how old it is". That
+# needs a record of WHICH negatives this run touched, and the record must be WITNESSED,
+# not inferred: attributing store rows to a run by timestamp would cite another run's
+# search as this one's. So ``FactStore`` notes a negative against the ACTIVE run's
+# execution id (the ``chat_submission_ctx`` carrier ``ShadowRuntime.execute`` sets) at
+# the moment the run WRITES it (``put_negative``) or READS a live one
+# (``query_negative``), and forgets it when the run invalidates it (``drop_negative``).
+#
+# Process-local and in-memory on purpose: it is a citation aid for the operator-facing
+# handoff, never a decision input (DEC-26 — it describes, it never authorizes), and
+# keeping it off disk means reading it can never write, refresh, or extend anything in
+# the store. Its failure modes all point the safe way — a resumed run (new execution
+# id) or a restarted process cites FEWER absences, never a false one. Bounded.
+
+_CONSULTED_LOCK = threading.Lock()
+#: execution_id -> {scope: NegativeFact}, least-recently-noted run first.
+_CONSULTED: "OrderedDict[str, Dict[str, NegativeFact]]" = OrderedDict()
+_MAX_CONSULTING_RUNS = 64
+_MAX_CONSULTED_PER_RUN = 32
+
+
+def _active_run_id() -> str:
+    """The active run's execution id, or ``""`` outside a run. Never raises."""
+    try:
+        from systemu.runtime.chat_submission_ctx import current_execution_id
+        eid = current_execution_id()
+    except Exception:
+        return ""
+    return eid if type(eid) is str else ""
+
+
+def note_negative_consulted(neg: NegativeFact) -> None:
+    """Record that the ACTIVE run consulted ``neg``. Outside a run, a no-op — an
+    operator CLI read is not a run consultation. Re-noting a scope keeps the latest
+    record. Bounded per run and across runs (oldest evicted). Never raises."""
+    try:
+        if type(neg) is not NegativeFact:
+            return
+        eid = _active_run_id()
+        if not eid:
+            return
+        with _CONSULTED_LOCK:
+            per_run = _CONSULTED.pop(eid, None) or {}
+            per_run.pop(neg.scope, None)
+            per_run[neg.scope] = neg.model_copy(deep=True)
+            while len(per_run) > _MAX_CONSULTED_PER_RUN:
+                per_run.pop(next(iter(per_run)))
+            _CONSULTED[eid] = per_run
+            while len(_CONSULTED) > _MAX_CONSULTING_RUNS:
+                _CONSULTED.popitem(last=False)
+    except Exception:
+        logger.debug("[world-model] consultation note skipped (non-fatal)", exc_info=True)
+
+
+def forget_negative_consulted(scope: str) -> None:
+    """The active run invalidated ``scope`` (the thing now EXISTS, CAP-5): it no longer
+    explains this run's outcome, so it must not be cited. Never raises."""
+    try:
+        eid = _active_run_id()
+        if not eid:
+            return
+        with _CONSULTED_LOCK:
+            per_run = _CONSULTED.get(eid)
+            if per_run is not None:
+                per_run.pop(str(scope), None)
+    except Exception:
+        logger.debug("[world-model] consultation forget skipped (non-fatal)", exc_info=True)
+
+
+def consulted_negatives(execution_id: Optional[str]) -> List[NegativeFact]:
+    """The negative facts run ``execution_id`` consulted, NEWEST FIRST by
+    ``recorded_at`` (an unparseable stamp sorts oldest), ties by scope. Copies — a
+    caller cannot mutate the record. ``[]`` for an unknown/blank id. Never raises."""
+    try:
+        if type(execution_id) is not str or not execution_id:
+            return []
+        with _CONSULTED_LOCK:
+            rows = [n.model_copy(deep=True)
+                    for n in (_CONSULTED.get(execution_id) or {}).values()]
+    except Exception:
+        return []
+
+    def _key(n: NegativeFact):
+        try:
+            return (0, -_as_dt(n.recorded_at).timestamp(), n.scope)
+        except Exception:
+            return (1, 0.0, n.scope)
+    return sorted(rows, key=_key)
+
+
 # ── survey watermark: what the last survey actually COVERED ──────────────────
 # Absence of re-confirmation is only evidence of staleness when the survey genuinely
 # looked. The survey is scope-varying (grant-scoped roots, a per-run file cap, per-source
@@ -200,8 +325,9 @@ _MAX_NEGATIVES = 500
 
 
 class SurveyWatermark(BaseModel):
-    """One survey's coverage record. Written by the populator; read only by the
-    operator-facing surfaces.
+    """One survey's coverage record. Written by the populator; read by ``world_query``
+    (the staleness of every composed-view row and every tool answer) and by the
+    operator CLI.
 
     ``at`` is REQUIRED on purpose: defaulting it would make a malformed/older row
     validate to read-time *now*, which is newer than every fact — turning the whole
@@ -571,6 +697,9 @@ class FactStore:
                 live[neg.scope] = neg          # belt-and-braces
             negs = live
         self._save_negatives(negs)
+        # Witness the consultation for the active run's handoff citation (AC2). After
+        # the save, so a write that failed is never cited as recorded.
+        note_negative_consulted(neg)
 
     def drop_negative(self, scope: str) -> bool:
         """Invalidate the negative fact for ``scope`` ON WRITE (CAP-5 / WM-2): once the
@@ -579,7 +708,11 @@ class FactStore:
 
         This is the only removal on the store, and it is safe precisely because it
         deletes a SUPPRESSION rather than a belief — the failure mode of dropping one
-        too eagerly is a redundant search, never a missed one."""
+        too eagerly is a redundant search, never a missed one.
+
+        Also un-cites ``scope`` for the active run: an absence the run itself saw
+        disproved no longer explains its outcome."""
+        forget_negative_consulted(scope)
         negs = self._load_negatives()
         if scope not in negs:
             return False
@@ -589,16 +722,20 @@ class FactStore:
 
     def query_negative(self, scope: str, now: Optional[str] = None) -> Optional[NegativeFact]:
         """The negative fact for ``scope`` IFF present and not yet expired (AC2). An
-        expired negative returns None ⇒ the caller re-searches."""
+        expired negative returns None ⇒ the caller re-searches.
+
+        A live hit inside a run is noted as CONSULTED by that run (the in-memory
+        citation record, never the store — this stays read-only w.r.t. the store)."""
         neg = self._load_negatives().get(scope)
         if neg is None or neg.is_expired(now):
             return None
+        note_negative_consulted(neg)
         return neg
 
     def all_negatives(self) -> List[NegativeFact]:
         return list(self._load_negatives().values())
 
-    # ── survey watermarks (write: populator · read: operator surfaces) ───────
+    # ── survey watermarks (write: populator · read: world_query staleness + CLI) ──
     @property
     def _surveys_path(self) -> Path:
         return self._dir / "surveys.json"

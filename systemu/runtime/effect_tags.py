@@ -10,6 +10,21 @@ properties are load-bearing:
     a new modality add its own tag at runtime. Determinism *classifies and gates*
     a proposal; it never *refuses* the plan.
 
+  * **Registration governance (IMPL-10).** Registering a tag grows the
+    vocabulary; it never launders a class. A registered extension tag is in the
+    UNKNOWN band at the gate: no rule in ``action_governance`` maps it, so
+    ``evaluate_action`` scores it exactly as it scores an unclassifiable effect
+    (REQUIRE_APPROVAL, or DENY when a high-severity signal is present).
+    ``high_severity=True`` makes the tag ITSELF such a signal, so a tag
+    registered high-severity sits on the DENY floor (operator-remediable by
+    IMPL-2 reclassification, never rubber-stampable). Only code mapping a class
+    into the gate, or an explicit operator reclassification, moves it out of
+    the band. Severity is monotone: it may be raised, and is never lowered -- a
+    re-registration asking for a lower severity (including of a canonical
+    high-severity tag) is REFUSED, returned as a :class:`TagRegistration` whose
+    ``outcome`` says so, and logged; nothing is raised across the boundary
+    (DEC-32) and the severity in force is unchanged.
+
   * **Advisory, escalate-only classifier.** ``classify_source`` is a deterministic
     AST scan of a tool's source for effectful sinks. It is a SIGNAL, not a proof:
     the absence of a tag is NEVER "no effect" (unparseable source ⇒ UNKNOWN), and
@@ -49,8 +64,12 @@ before ``effect_signals`` pulls ``EffectTag`` back, so there is no import cycle.
 from __future__ import annotations
 
 import ast
+import logging
+import threading
 from enum import Enum
 from typing import Set
+
+logger = logging.getLogger(__name__)
 
 
 class EffectTag(str, Enum):
@@ -278,20 +297,89 @@ BATCH_APPROVABLE: "frozenset[EffectTag]" = frozenset({
 _CANONICAL = {t.value: t for t in EffectTag}
 # Runtime-registered extension tags: value -> is_high_severity
 _EXTENSIONS: "dict[str, bool]" = {}
+# Serialises check-then-set in register_effect_tag, so two registrations of the
+# same tag cannot interleave into a lowering. Reads stay lock-free (a dict get).
+_REGISTRY_LOCK = threading.Lock()
+
+# ── IMPL-10: the outcome of a registration, as a VALUE ───────────────────────
+REGISTERED = "registered"              # a new extension tag entered the registry
+RAISED = "raised"                      # an existing tag's severity went UP
+UNCHANGED = "unchanged"                # asked for the severity already in force
+REFUSED_LOWERING = "refused_lowering"  # asked to go DOWN: refused, logged, untouched
+CANONICAL = "canonical"                # a code-mapped tag: the registry never edits it
 
 
-def register_effect_tag(value: str, *, high_severity: bool = False) -> str:
-    """Register a new effect class proposed by a tier/modality at runtime.
+@_dataclass(frozen=True)
+class TagRegistration:
+    """What :func:`register_effect_tag` did. A refusal is carried HERE, never as
+    an exception (DEC-32: a fence is a value, not a raise -- a caller that catches
+    broadly must not be able to mistake a refused lowering for a success)."""
 
-    Idempotent; returns the normalized value. Registering a canonical value is a
-    no-op. This is the open-vocabulary hook — a novel actuation can declare its
-    own effect class, and the gate then treats it by its declared severity."""
+    value: str            # the normalized tag value
+    high_severity: bool   # the severity IN FORCE after the call
+    outcome: str          # one of the outcome constants above
+
+    @property
+    def refused(self) -> bool:
+        return self.outcome == REFUSED_LOWERING
+
+
+def register_effect_tag(value: str, *, high_severity: bool = False) -> TagRegistration:
+    """Register an effect class proposed by a tier/modality at runtime (IMPL-10).
+
+    The open-vocabulary hook: a novel actuation can name its own effect class
+    so the gate can GATE it -- not so the gate can wave it through. A registered
+    extension tag is in the UNKNOWN band at ``action_governance.evaluate_action``
+    (REQUIRE_APPROVAL, DENY with a high-severity signal), whatever severity it
+    was registered with; ``high_severity=True`` additionally makes the tag a
+    high-severity signal of its own, which puts it on the DENY floor. Only a
+    literal ``True`` registers high severity (read with ``is True``, DEC-36).
+
+    Monotone. A tag's severity may be RAISED; a request to lower it -- an
+    existing high-severity extension re-registered as not high, or a canonical
+    high-severity tag registered as not high -- is REFUSED: the registry is left
+    exactly as it was, the refusal is logged at WARNING, and the returned
+    :class:`TagRegistration` has ``outcome == REFUSED_LOWERING`` and reports the
+    severity still in force. Canonical tags are code-mapped and never edited by
+    the registry. An empty value is a programming error and raises ValueError.
+    """
     v = str(value or "").strip().lower()
     if not v:
         raise ValueError("effect tag value must be a non-empty string")
-    if v not in _CANONICAL:
-        _EXTENSIONS[v] = bool(high_severity)
-    return v
+    want = high_severity is True
+    with _REGISTRY_LOCK:
+        if v in _CANONICAL:
+            in_force = v in _HIGH_SEVERITY_VALUES
+            if in_force and not want:
+                logger.warning(
+                    "[EffectTags] refused to LOWER the severity of canonical tag %r "
+                    "(IMPL-10: registration never lowers severity)", v)
+                return TagRegistration(v, True, REFUSED_LOWERING)
+            return TagRegistration(v, in_force, CANONICAL)
+        current = _EXTENSIONS.get(v)
+        if type(current) is not bool:
+            _EXTENSIONS[v] = want
+            return TagRegistration(v, want, REGISTERED)
+        if current and not want:
+            logger.warning(
+                "[EffectTags] refused to LOWER the severity of tag %r from high to "
+                "not-high (IMPL-10: registration never lowers severity)", v)
+            return TagRegistration(v, True, REFUSED_LOWERING)
+        if want and not current:
+            _EXTENSIONS[v] = True
+            return TagRegistration(v, True, RAISED)
+        return TagRegistration(v, current, UNCHANGED)
+
+
+def is_extension_tag(value) -> bool:
+    """True iff ``value`` names a RUNTIME-REGISTERED tag (not a canonical one).
+
+    The gate's IMPL-10 hook: no rule in ``action_governance`` maps such a tag,
+    so it scores in the UNKNOWN band."""
+    if isinstance(value, EffectTag):
+        return False
+    v = str(value or "").strip().lower()
+    return v in _EXTENSIONS and v not in _CANONICAL
 
 
 def coerce(value) -> str:

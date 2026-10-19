@@ -143,6 +143,16 @@ _TYPED_CONFIRM_KEYS = ("requires_typed_confirm", "typed_confirm",
 _MAX_REMOTE_ENUM = 4
 
 
+def _is_elicitation(context: Dict[str, Any]) -> bool:
+    """True iff the decision is a QUESTION (structured question / form), whatever
+    it rides on. A harness INPUT gate is ``kind="gate"`` but carries a
+    ``requested_schema``: it is a question, and its Deny/Approve options are not
+    answers. One predicate for classify, render and resolve."""
+    requested_schema = context.get("requested_schema")
+    return bool(context.get("kind") == "structured_question"
+                or isinstance(requested_schema, dict) and requested_schema)
+
+
 def _elicitation_field_remote(props: Dict[str, Any]) -> bool:
     """True iff a single-field elicitation is safe to resolve remotely.
 
@@ -191,9 +201,7 @@ def classify_resolution(context: Any) -> str:
     # A structured_question, or anything carrying a requested_schema, is an
     # elicitation. It is remote only as a single safe field.
     requested_schema = context.get("requested_schema")
-    is_elicitation = (kind == "structured_question"
-                      or isinstance(requested_schema, dict) and requested_schema)
-    if is_elicitation:
+    if _is_elicitation(context):
         schema = requested_schema if isinstance(requested_schema, dict) else {}
         props = schema.get("properties") if isinstance(schema, dict) else None
         if _elicitation_field_remote(props or {}):
@@ -294,10 +302,13 @@ def classify_resolution(context: Any) -> str:
 # note. It is keyed FIRST on the PERSISTED ``resolution_class`` bit — buttons are
 # opt-in per recognized shape, never the default — then on the decision's shape.
 #
-# CRITICAL wire contract: the inbound resolver (``resolve_from_channel``) maps
-# ``a1..a4`` POSITIONALLY to ``decision.options[0..3]``. So the option builder
-# MUST emit ``(f"a{i+1}", decision.options[i])`` — the SAME positional convention
-# — or a tapped button would resolve the wrong option. We mirror that here.
+# CRITICAL wire contract: a button's ``a{i+1}`` key means position ``i`` of the
+# list the button was RENDERED from, and the inbound resolver
+# (``resolve_from_channel``) maps it back against the SAME list: an option card
+# against ``decision.options``, a one-field enum QUESTION against its enum
+# values. Mapping an enum button onto ``decision.options`` (a question's
+# placeholder "Submit", or a harness gate's Deny/Approve) records the wrong
+# thing - that was the shipped defect.
 
 # Surface hints the push layer understands.
 SURFACE_BUTTONS = "buttons"          # inline tappable option buttons
@@ -341,9 +352,7 @@ def _single_field_spec(context: Dict[str, Any]):
     multi-field / secret / non-elicitation.
     """
     requested_schema = context.get("requested_schema")
-    is_elicitation = (context.get("kind") == "structured_question"
-                      or isinstance(requested_schema, dict) and requested_schema)
-    if not is_elicitation:
+    if not _is_elicitation(context):
         return None
     schema = requested_schema if isinstance(requested_schema, dict) else {}
     props = schema.get("properties") if isinstance(schema, dict) else None
@@ -366,15 +375,19 @@ def render_options(decision: Any, *, tag: str) -> Tuple[str, List[Tuple[str, str
     """Decide the push surface for a parked ``decision``.
 
     Returns ``(surface_hint, options)`` where ``options`` is a list of
-    ``(choice_key, label)`` pairs with POSITIONAL keys (``a1``->options[0] …).
+    ``(choice_key, label)`` pairs with POSITIONAL keys into the list the labels
+    came from (``decision.options`` for a gate, the enum for a question).
 
     Keyed FIRST on the persisted ``resolution_class`` (fail-closed: anything but
     ``"remotely_resolvable"`` — including absent — is ``dashboard_only``), then on
-    shape:
-      * gate with 1..4 options            -> ``("buttons", positional options)``
+    shape. A QUESTION is decided before any gate shape, because a one-field
+    question can ride a gate (a harness INPUT gate) whose Deny/Approve options
+    are not answers:
       * single-field enum (<=4)           -> ``("buttons", positional enum values)``
       * single free-text string field     -> ``("reply", [])``  (operator /answers)
-      * multi-field / 5+ / unknown        -> ``("dashboard_only", [])``
+      * any other question shape          -> ``("dashboard_only", [])``
+      * gate with 1..4 options            -> ``("buttons", positional options)``
+      * 5+ / unknown                      -> ``("dashboard_only", [])``
     Never raises.
     """
     context = getattr(decision, "context", None) or {}
@@ -387,25 +400,27 @@ def render_options(decision: Any, *, tag: str) -> Tuple[str, List[Tuple[str, str
     if context.get("resolution_class") != RESOLUTION_REMOTE:
         return (SURFACE_DASHBOARD_ONLY, [])
 
+    # A question renders as a question - never as the gate's buttons.
+    if _is_elicitation(context):
+        field = _single_field_spec(context)
+        if field is not None:
+            _name, spec = field
+            enum = spec.get("enum")
+            if isinstance(enum, list) and 1 <= len(enum) <= _MAX_REMOTE_ENUM:
+                return (SURFACE_BUTTONS,
+                        [(f"a{i + 1}", str(v)) for i, v in enumerate(enum)])
+            # A plain free-text string field → reply hint (operator /answers).
+            if spec.get("type", "string") == "string":
+                return (SURFACE_REPLY, [])
+        return (SURFACE_DASHBOARD_ONLY, [])
+
     # Gate → positional buttons from the record's option list.
     if _gate_is_button_shaped(decision, context):
         options = list(getattr(decision, "options", []) or [])[:_MAX_REMOTE_ENUM]
         return (SURFACE_BUTTONS,
                 [(f"a{i + 1}", label) for i, label in enumerate(options)])
 
-    # Single-field elicitation.
-    field = _single_field_spec(context)
-    if field is not None:
-        _name, spec = field
-        enum = spec.get("enum")
-        if isinstance(enum, list) and 1 <= len(enum) <= _MAX_REMOTE_ENUM:
-            return (SURFACE_BUTTONS,
-                    [(f"a{i + 1}", str(v)) for i, v in enumerate(enum)])
-        # A plain free-text string field → reply hint (operator /answers).
-        if spec.get("type", "string") == "string":
-            return (SURFACE_REPLY, [])
-
-    # Multi-field / 5+ / unrecognized → dashboard only.
+    # 5+ / unrecognized → dashboard only.
     return (SURFACE_DASHBOARD_ONLY, [])
 
 
@@ -448,6 +463,37 @@ def parse_callback(data) -> Optional[tuple[str, str]]:
     if prefix != "d" or not tag or choice_key not in _CHOICE_KEYS:
         return None
     return (tag, choice_key)
+
+
+# ── The typed answer grammar: ``/answer <tag> <value>`` ───────────────────────
+#
+# ONE grammar, used by BOTH sides: the push prints ``answer_example(tag)`` and
+# the handler parses with ``parse_answer_args`` (registered under
+# ``ANSWER_COMMAND``), so the promise and the parser cannot drift apart again.
+# ``<value>`` is the rest of the message: free text for a free-text question, an
+# option's label (case-insensitive) or 1-based number for an enum question or an
+# option card (``a1..a4`` keep working).
+
+ANSWER_COMMAND = "answer"
+ANSWER_VALUE_PLACEHOLDER = "<value>"
+
+
+def answer_example(tag: str, value: str = ANSWER_VALUE_PLACEHOLDER) -> str:
+    """The literal command an operator types to answer decision ``tag``."""
+    return f"/{ANSWER_COMMAND} {tag} {value}"
+
+
+def parse_answer_args(args) -> Optional[Tuple[str, str]]:
+    """``"<tag> <value...>"`` -> ``(tag, value)``; None when either is missing.
+
+    The value keeps its inner whitespace (a free-text answer is a sentence)."""
+    if not isinstance(args, str):
+        return None
+    parts = args.strip().split(None, 1)
+    if len(parts) != 2:
+        return None
+    tag, value = parts[0], parts[1].strip()
+    return (tag, value) if value else None
 
 
 # ── R-P1 resolution path ──────────────────────────────────────────────────────
@@ -638,22 +684,71 @@ def _match_open_decision(queue, tag: str):
     return None
 
 
+_ECHO_CAP = 200
+
+
+def _echo(value: Any, cap: int = _ECHO_CAP) -> str:
+    """A value as it may be echoed back to the chat: MASK first, THEN cap
+    (DEC-31 - truncating first could leave the head of a secret unmasked)."""
+    from systemu.messaging.gateway import mask_outbound
+    text = mask_outbound(str(value))
+    if len(text) > cap:
+        text = text[:cap - 3] + "..."
+    return text
+
+
+def _title_of(decision: Any) -> str:
+    return _echo(getattr(decision, "title", "") or "", cap=120).rstrip(" .?!:")
+
+
+def _recorded_reply(shown: Any, decision: Any) -> str:
+    title = _title_of(decision)
+    if title:
+        return f"Recorded: {_echo(shown)} for {title}."
+    return f"Recorded: {_echo(shown)}."
+
+
+def _options_reply(labels: List[Any], decision: Any, tag: str) -> str:
+    listing = ", ".join(f"{i + 1} = {_echo(v, cap=60)}" for i, v in enumerate(labels))
+    title = _title_of(decision)
+    where = f" for {title}" if title else ""
+    return (f"Nothing was recorded. Valid options{where}: {listing}. "
+            f"Reply {answer_example(tag, '<number or label>')}.")
+
+
+def _pick(labels: List[Any], choice: Optional[str], value: Optional[str]) -> Optional[int]:
+    """Index into ``labels`` for a typed value (label, case-insensitive, then
+    its 1-based number) or a button key ``a1..a4``. None when nothing matches."""
+    if value is not None:
+        typed = value.strip()
+        for i, label in enumerate(labels):
+            if str(label).strip().lower() == typed.lower():
+                return i
+        if typed.isdigit() and 1 <= int(typed) <= len(labels):
+            return int(typed) - 1
+    if choice in _CHOICE_ORDER and _CHOICE_ORDER.index(choice) < len(labels):
+        return _CHOICE_ORDER.index(choice)
+    return None
+
+
 def resolve_from_channel(
     tag: str,
-    choice: str,
+    choice: Optional[str],
     *,
     sender_id: str,
     channel: str,
     queue=None,
     resolver: Optional[Callable[[str, str], Any]] = None,
     now: Optional[Callable[[], float]] = None,
+    value: Optional[str] = None,
 ) -> Tuple[ResolveOutcome, str]:
     """Resolve a parked decision from a chat channel (Telegram). Server-side gate.
 
     Args:
         tag:        the short decision tag from the callback (``d|<tag>|<key>``).
-        choice:     the choice key off the wire (``a1``..``a4``). ONLY the index
-                    is trusted; the option label is re-derived from the record.
+        choice:     the button key off the wire (``a1``..``a4``), or None. ONLY
+                    the index is trusted; what it selects is re-derived from the
+                    record (the option list, or a question's enum).
         sender_id:  the platform user id (defense-in-depth allowlist re-check).
         channel:    the channel name (e.g. ``"telegram"``) — audited.
         queue:      injectable OperatorDecisionQueue (defaults to the real one).
@@ -661,6 +756,16 @@ def resolve_from_channel(
                     SAME dashboard resolve fn. Defaults to ``queue.resolve``.
         now:        injectable monotonic-ish clock ``() -> float`` for the rate
                     limiter (defaults to ``time.monotonic``).
+        value:      the operator's TYPED answer (``/answer <tag> <value>``), or
+                    None for a button tap. A question uses it as its answer; an
+                    option card matches it against the option labels/numbers.
+
+    The decision's kind decides what is recorded - never the wire:
+      * a QUESTION (one-field form, even one riding a harness input gate)
+        records the structured ``{field: value}`` JSON the dashboard form
+        records: the typed text for free text, the ENUM VALUE for an enum;
+      * an option card (a command/tool gate) records one of its options.
+    A value that fits neither records nothing and the reply lists the options.
 
     Returns ``(ResolveOutcome, human_msg)``.
     """
@@ -693,8 +798,15 @@ def resolve_from_channel(
                 "I couldn't find that decision — it may have already been handled.")
 
     # 4. Status must be pending (idempotent: a double-tap gets a friendly note).
+    #    IMPL-11: a card withdrawn because its run was CANCELLED is not "already
+    #    resolved" - nobody resolved it. The phone gets the same notice as every
+    #    other surface, and the answer is written as an operator-readable event.
     status = getattr(decision, "status", None)
     if status != "pending":
+        from systemu.approval.decision_queue import (
+            record_late_answer, was_expired_by_cancel)
+        if was_expired_by_cancel(decision):
+            return ("EXPIRED", record_late_answer(decision, channel=channel))
         return ("EXPIRED", "That decision is already resolved. Nothing to do.")
 
     context = getattr(decision, "context", None) or {}
@@ -713,25 +825,52 @@ def resolve_from_channel(
         return ("REFUSED_TYPED_CONFIRM",
                 "That decision can't be resolved from here — open the dashboard.")
 
-    # 6. Map the choice key POSITIONALLY to the option list, re-derived from the
-    #    RECORD. Unrecognized key or out-of-range index → BAD_CHOICE.
-    options = list(getattr(decision, "options", []) or [])
-    if choice not in _CHOICE_ORDER:
-        return ("BAD_CHOICE", "I didn't recognise that choice.")
-    idx = _CHOICE_ORDER.index(choice)
-    if idx >= len(options):
-        return ("BAD_CHOICE", "That option isn't available for this decision.")
-    mapped_choice = options[idx]
+    # 6. Decide WHAT to record from the RECORD's kind (never from the wire).
+    if _is_elicitation(context):
+        # A question: only a one-field, non-secret, text-or-enum form is
+        # answerable here; it records the structured value, never an option
+        # label ("Submit" / a gate's Deny-Approve are not answers).
+        field = _single_field_spec(context)
+        spec = field[1] if field is not None else {}
+        enum = spec.get("enum")
+        if field is not None and isinstance(enum, list) and enum:
+            idx = _pick(enum, choice, value)
+            if idx is None:
+                return ("BAD_CHOICE", _options_reply(enum, decision, tag))
+            shown = enum[idx]
+        elif field is not None and spec.get("type", "string") == "string":
+            if value is None or not value.strip():
+                return ("BAD_CHOICE",
+                        "Nothing was recorded. This question needs a typed "
+                        f"answer: reply {answer_example(tag)}.")
+            shown = value.strip()
+        else:
+            return ("REFUSED_TYPED_CONFIRM",
+                    "That question can't be answered from here - open the dashboard.")
+        mapped_choice = json.dumps({field[0]: shown})
+    else:
+        # An option card: the choice is one of the record's options.
+        options = list(getattr(decision, "options", []) or [])
+        idx = _pick(options, choice, value)
+        if idx is None:
+            return ("BAD_CHOICE", _options_reply(options, decision, tag))
+        mapped_choice = shown = options[idx]
 
     # 7. Call the SAME dashboard resolve fn. This sets status+choice+publishes the
     #    operator_decision_resolved event; the existing reconciler / EventBus
     #    subscriber dispatch the resume. We do NOT re-implement resume here.
+    from systemu.approval.decision_queue import AnswerNotNeeded
     resolve_fn = resolver or queue.resolve
     try:
         if resolver is not None:
             resolve_fn(decision.id, mapped_choice)
         else:
             queue.resolve(decision.id, choice=mapped_choice)
+    except AnswerNotNeeded as late:
+        # IMPL-11: the run was cancelled between the lookup above and this
+        # resolve. The queue recorded nothing and already wrote the event; the
+        # phone gets the same notice. Before ValueError, which it subclasses.
+        return ("EXPIRED", str(late))
     except ValueError:
         # The record's option list disagreed with the queue's membership check
         # (shouldn't happen — we mapped from the same options) → treat as a bad
@@ -753,5 +892,5 @@ def resolve_from_channel(
         "mapped_choice": mapped_choice, "outcome": "OK",
     })
 
-    # 9. Success.
-    return ("OK", f"Done — resolved as “{mapped_choice}”.")
+    # 9. Success: a closing line naming what was recorded.
+    return ("OK", _recorded_reply(shown, decision))

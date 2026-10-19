@@ -69,31 +69,74 @@ class VaultTokenStore:
             logger.debug("[MCP-OAuth] could not clear token store at %s", self.path, exc_info=True)
 
 
-def build_sdk_oauth_provider(server_id: str, *, vault, authorization_url: str = ""):
+class VaultOAuthStorage:
+    """The SDK ``mcp.client.auth.TokenStorage`` protocol over a VaultTokenStore.
+
+    Verified identical on mcp 2.3.0 and mcp 1.30.0: async ``get_tokens`` /
+    ``set_tokens`` (``mcp.shared.auth.OAuthToken``) and ``get_client_info`` /
+    ``set_client_info`` (``OAuthClientInformationFull``). Both live in ONE
+    encrypted-at-rest file as ``{"tokens": {...}, "client_info": {...}}``;
+    nothing here is ever logged."""
+
+    def __init__(self, store: VaultTokenStore):
+        self._store = store
+
+    def _section(self, key: str):
+        raw = self._store.load().get(key)
+        return raw if isinstance(raw, dict) and raw else None
+
+    def _write(self, key: str, model) -> None:
+        data = self._store.load()
+        data[key] = model.model_dump(mode="json", exclude_none=True)
+        self._store.save(data)
+
+    async def get_tokens(self):
+        from mcp.shared.auth import OAuthToken
+        raw = self._section("tokens")
+        return OAuthToken.model_validate(raw) if raw else None
+
+    async def set_tokens(self, tokens) -> None:
+        self._write("tokens", tokens)
+
+    async def get_client_info(self):
+        from mcp.shared.auth import OAuthClientInformationFull
+        raw = self._section("client_info")
+        return OAuthClientInformationFull.model_validate(raw) if raw else None
+
+    async def set_client_info(self, client_info) -> None:
+        self._write("client_info", client_info)
+
+
+def build_sdk_oauth_provider(server_id: str, *, vault, authorization_url: str = "",
+                             redirect_uri: str = "http://127.0.0.1/callback",
+                             client_name: str = "systemu"):
     """FALLBACK path: construct the official SDK OAuthClientProvider backed by the
-    0600 VaultTokenStore. Lazy SDK import so a missing `mcp` never breaks module
-    load.
+    vault token store. Lazy SDK import so a missing `mcp` never breaks module
+    load. ``authorization_url`` is the protected MCP server's URL (the SDK's
+    ``server_url``; it discovers the authorization server from there).
 
-    VERIFY against the installed package: the class lives in `mcp.client.auth`
-    (guess ``OAuthClientProvider``) and takes a token-storage object exposing
-    ``get_tokens()`` / ``set_tokens()`` (guess — the real protocol may be
-    ``TokenStorage`` with different method names). Adapt the adapter below to the
-    actual contract. Isolated here so a name change is a one-file edit.
+    D-MCP2: verified on mcp 2.3.0 and mcp 1.30.0 -- ``OAuthClientProvider(
+    server_url, client_metadata, storage, ...)`` lives in ``mcp.client.auth`` on
+    both lines; ``client_metadata`` is REQUIRED (the pre-port call omitted it
+    and raised TypeError on either line). The provider is an ``Auth`` of the
+    HTTP library the installed line uses (httpx on 1.x, httpx2 on 2.x), which is
+    what ``compat.open_streamable_http(auth=...)`` hands to that line's client.
+    Not wired into the live connect path (OAuth URL-mode stays the preferred
+    flow; see acquire_oauth).
     """
-    from mcp.client.auth import OAuthClientProvider  # VERIFY path + name
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.shared.auth import OAuthClientMetadata
 
-    store = VaultTokenStore(vault, server_id)
-
-    class _Adapter:  # VERIFY method names against mcp's TokenStorage protocol
-        async def get_tokens(self):
-            return store.load() or None
-
-        async def set_tokens(self, tokens):
-            store.save(dict(tokens) if tokens else {})
-
-    return OAuthClientProvider(  # VERIFY constructor kwargs
+    metadata = OAuthClientMetadata(
+        redirect_uris=[redirect_uri],
+        client_name=client_name,
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+    )
+    return OAuthClientProvider(
         server_url=authorization_url,
-        storage=_Adapter(),
+        client_metadata=metadata,
+        storage=VaultOAuthStorage(VaultTokenStore(vault, server_id)),
     )
 
 

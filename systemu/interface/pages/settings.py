@@ -874,9 +874,31 @@ def _model_input(label: str, description: str, current_value: str):
     return inp
 
 
+def _env_file_path() -> Path:
+    """THE .env this install edits: ``<operating_home>/.env``.
+
+    D-9. This writer opened ``Path(".env")`` -- a CWD-RELATIVE path, which the
+    vault-root doctrine (N9) forbids for exactly the reason it forbids it
+    everywhere else: a cwd is an accident of who launched the process, while
+    ``operating_home`` is a pure function of the resolved root, so every process
+    holding the same root names the same directory however it was started.
+
+    It worked only because the daemon spawns its child with
+    ``cwd=operating_home``. Any caller that reaches this writer from anywhere
+    else -- a CLI subcommand, a future in-process surface, an operator running
+    the dashboard by hand -- silently wrote a SECOND .env that the next boot
+    would not read, and the setting looked like it had not saved.
+
+    Consumed the way ``execution_snapshot.audit_data_root()`` consumes it: the
+    ONE minted member off the verdict, never a home re-derived from a cwd.
+    """
+    from systemu.runtime.vault_root import resolve_vault_root
+    return Path(resolve_vault_root().operating_home) / ".env"
+
+
 def _update_env_var(key: str, value: str) -> None:
-    """Update a single variable in the .env file."""
-    env_path = Path(".env")
+    """Update a single variable in the operating home's .env file."""
+    env_path = _env_file_path()
     if not env_path.exists():
         env_path.write_text(f"{key}={value}\n", encoding="utf-8")
         return
@@ -1072,22 +1094,33 @@ def adherence_card() -> None:
         except (ValueError, Exception) as exc:
             ui.notify(f"Error saving execution mode: {exc}", type="negative")
 
+    # R1: a preset that switches ON a harness auto-grant lowers approval
+    # requirements, so it applies only with its name typed here; a tightening
+    # preset stays one click. Checked server-side in save_adherence_preset_confirmed.
+    preset_confirm = ui.input(
+        label="Type the preset name to apply a preset that adds auto-grants"
+    ).classes("s-input")
+
     def _apply_preset():
         pname = preset_sel.value
         if not pname:
             ui.notify("Select a preset first.", type="warning")
             return
         try:
-            save_adherence_preset(pname)
+            saved, message = save_adherence_preset_confirmed(
+                pname,
+                typed=preset_confirm.value if type(preset_confirm.value) is str
+                else "")
+            if not saved:
+                ui.notify(message, type="warning")
+                return
+            preset_confirm.value = ""
             # Update the adherence selector to reflect the preset's level
             from systemu.runtime.adherence import ADHERENCE_PRESETS
             new_level = ADHERENCE_PRESETS[pname].get("SYSTEMU_EXECUTION_ADHERENCE", "auto")
             adherence_sel.value = new_level
             preset_sel.value = ""
-            ui.notify(
-                f"Preset '{pname}' applied. Restart daemon to fully apply.",
-                type="positive",
-            )
+            ui.notify(message, type="positive")
         except (KeyError, Exception) as exc:
             ui.notify(f"Error applying preset: {exc}", type="negative")
 
@@ -1121,6 +1154,97 @@ _GATE_OVERRIDE_VERDICTS = {
 # Gate types the override grid exposes (the adapters that flow into the queue).
 _GATE_TYPES = ("scroll", "dep", "forge", "evolution", "recovery", "harness",
                "mcp", "mcp_call", "sampling")
+
+
+# ── R1 (spec section 10 / 5.10.b#5): posture LOOSENING is a typed confirmation ──
+#
+# Any change that LOWERS approval requirements -- a looser gate mode, disabling the
+# floor, a per-gate override that auto-grants more, a preset that switches on
+# harness auto-grants -- needs the operator to type a phrase naming the new
+# posture. Tightening (and an unchanged save) stays one click. The rule lives in
+# these pure, NiceGUI-free functions the click handlers call, so it runs
+# server-side and is testable without a browser.
+
+# The harness auto-grant switches a preset writes, with the defaults
+# ``runtime.harness_policy`` applies when the variable is unset.
+_AUTO_GRANT_DEFAULTS = {
+    "SYSTEMU_HARNESS_AUTO_GRANT_TOOL": False,
+    "SYSTEMU_HARNESS_AUTO_GRANT_SKILL": True,
+    "SYSTEMU_HARNESS_AUTO_GRANT_ACCESS": False,
+    "SYSTEMU_HARNESS_AUTO_GRANT_COMPUTE": True,
+    "SYSTEMU_HARNESS_AUTO_GRANT_SUBAGENT": False,
+    "SYSTEMU_AUTO_FORGE_TOOLS": False,
+}
+_TRUE_WORDS = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
+
+
+# The gate-mode loosening rule is shared with the CLI (``decisions mode`` /
+# ``settings set gate_mode``), so it lives NiceGUI-free in ``command_approvals``;
+# re-exported here so this page and its tests name it where they always did.
+from systemu.runtime.command_approvals import (  # noqa: E402
+    posture_change_refusal, posture_loosening)
+
+
+def save_gate_mode_confirmed(*, mode, overrides, no_floor, typed="") -> tuple:
+    """Save the Gate-Mode dial, refusing a LOOSENING without its typed phrase.
+
+    Returns ``(saved, message)`` -- a value, never a raise across the boundary for
+    a refusal. Compares against the posture currently in force
+    (``gate_mode_settings.get_gate_mode_settings``)."""
+    from systemu.runtime.gate_mode_settings import (get_gate_mode_settings,
+                                                    save_gate_mode_settings)
+    proposed = {"mode": mode, "overrides": dict(overrides or {}),
+                "no_floor": bool(no_floor)}
+    refusal = posture_change_refusal(
+        posture_loosening(get_gate_mode_settings(), proposed), typed)
+    if refusal:
+        return False, refusal
+    save_gate_mode_settings(mode=mode, overrides=proposed["overrides"],
+                            no_floor=proposed["no_floor"])
+    return True, f"Gate mode set to '{mode}'. Restart daemon to fully apply."
+
+
+def _flag_on(raw, default: bool) -> bool:
+    v = raw.strip().lower() if type(raw) is str else ""
+    if v in _TRUE_WORDS:
+        return True
+    if v in _FALSE_WORDS:
+        return False
+    return default
+
+
+def preset_loosening(preset_name) -> list:
+    """The auto-grant switches applying ``preset_name`` would turn ON (relative to
+    the values in force now, unset meaning the policy default). Raises KeyError for
+    an unknown preset, like ``adherence.apply_preset``."""
+    import os
+
+    from systemu.runtime.adherence import apply_preset
+    env_map = apply_preset(preset_name)
+    turned_on = []
+    for key, value in sorted(env_map.items()):
+        if key not in _AUTO_GRANT_DEFAULTS:
+            continue
+        default = _AUTO_GRANT_DEFAULTS[key]
+        if _flag_on(value, False) and not _flag_on(os.environ.get(key), default):
+            turned_on.append(key)
+    return turned_on
+
+
+def save_adherence_preset_confirmed(preset_name, *, typed="") -> tuple:
+    """Apply an adherence preset, refusing one that switches ON a harness
+    auto-grant unless the operator typed the preset's name. ``(saved, message)``."""
+    loosened = preset_loosening(preset_name)
+    if loosened:
+        from systemu.runtime.command_approvals import confirm_phrase_matches
+        if not confirm_phrase_matches(typed, str(preset_name)):
+            return False, (
+                f"Preset '{preset_name}' lowers approval requirements: it turns on "
+                f"{', '.join(loosened)}. Type {preset_name} exactly in the "
+                "confirmation box to apply it. Nothing was saved.")
+    save_adherence_preset(preset_name)
+    return True, f"Preset '{preset_name}' applied. Restart daemon to fully apply."
 
 
 def _gate_mode_card_model(settings: dict) -> dict:
@@ -1231,6 +1355,16 @@ def gate_mode_card() -> None:
             value=model["no_floor"],
         )
 
+    # R1: a change that LOWERS approval requirements saves only with a typed
+    # phrase naming the new posture (the refusal says exactly what to type);
+    # tightening stays one click. Checked server-side in save_gate_mode_confirmed.
+    ui.label(
+        "Loosening the posture (a looser mode, disabling the floor, an auto-grant "
+        "override) needs you to type what you are switching on. Tightening does not."
+    ).classes("s-muted").style("font-size: 12px; margin-top: 8px;")
+    gate_confirm = ui.input(
+        label="Type the confirmation phrase (only when loosening)").classes("s-input")
+
     def _save_gate_mode():
         try:
             overrides = {
@@ -1238,16 +1372,18 @@ def gate_mode_card() -> None:
                 for gt, sel in override_sels.items()
                 if sel.value  # skip "" (= mode default)
             }
-            save_gate_mode_settings(
+            saved, message = save_gate_mode_confirmed(
                 mode=mode_sel.value,
                 overrides=overrides,
                 no_floor=bool(no_floor_box.value) if no_floor_box else False,
+                typed=gate_confirm.value if type(gate_confirm.value) is str else "",
             )
+            if not saved:
+                ui.notify(message, type="warning")
+                return
+            gate_confirm.value = ""
             _danger_banner.refresh(mode_sel.value)
-            ui.notify(
-                f"Gate mode set to '{mode_sel.value}'. Restart daemon to fully apply.",
-                type="positive",
-            )
+            ui.notify(message, type="positive")
         except (ValueError, Exception) as exc:
             ui.notify(f"Error saving gate mode: {exc}", type="negative")
 

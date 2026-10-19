@@ -72,7 +72,10 @@ def test_every_block_of_a_fresh_report_says_not_measured(tmp_path, monkeypatch):
 
     for block in ("No-prior-attempt asks:",
                   "DEFINITIVE avoidable (resolvable-confirmed):",
-                  "Inventory-hit:",
+                  # re-pointed: the inventory-hit block now reads the durable
+                  # per-run table record; the snapshot-read "Inventory-hit:" block
+                  # is retired.
+                  "Inventory-hit (table record):",
                   "Quick-lane asks:"):
         line = next((ln for ln in out.splitlines() if block in ln), None)
         assert line is not None, f"the {block!r} block vanished from the report:\n{out}"

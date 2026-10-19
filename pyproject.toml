@@ -83,14 +83,20 @@ dependencies = [
     "apscheduler>=3.11",   # daemon's periodic jobs
     "pydantic>=2.0",       # vault Pydantic models
     "httpx>=0.27",         # used by the Ollama provider + general http
-    "mcp>=1.0,<2",         # v0.9.36 P2: official MCP client/server SDK (isolated under runtime/mcp/sdk).
-                           # <2: verified against mcp 2.2.0 -- `mcp.client.streamable_http.streamablehttp_client`
-                           # (our streamable-HTTP transport, transports.py) and `mcp.server.fastmcp`
-                           # (the test reference servers) are gone in 2.x; stdio/sse still import.
-                           # Porting to the 2.x Client/MCPServer API is a separate change.
+    "mcp>=1.23,<3",        # v0.9.36 P2: official MCP client/server SDK (isolated under runtime/mcp/sdk).
+                           # D-MCP2: BOTH major lines. runtime/mcp/sdk/compat.py feature-detects the
+                           # names that differ (2.x first, then 1.x). Full MCP test set verified in
+                           # clean venvs on mcp 2.3.0 and 1.30.0 (latest of each line) and on 1.23.0,
+                           # the floor: the newest 1.x with ONLY the legacy streamablehttp_client.
     "pyyaml>=6.0",         # config + skill migrator + skill exporter
     "ddgs>=9.14",
     "keyring>=24",
+    # S5 / 2d: DPAPI (win32crypt) for the at-rest secret envelope. It used to
+    # arrive on Windows only because `mcp` happened to depend on it; without it
+    # secrets silently stayed plaintext. Declared so the envelope is a
+    # guarantee, and the platform profile reports `dpapi` only after a real
+    # protect/unprotect round trip (systemu/runtime/credentials/at_rest.py).
+    "pywin32>=306; sys_platform == 'win32'",
 
     # --- W12-B1: the starter tool pack works from `pip install systemu` ---
     # Every pip dep the curated 41-tool seed pack declares ships with the
@@ -135,6 +141,7 @@ dashboard = ["nicegui>=2.0"]         # `systemu daemon start`, the web UI
 all = [
     "playwright>=1.50.0",
     "nicegui>=2.0",
+    "anthropic>=0.40",   # [anthropic] -- the native Anthropic provider SDK
 ]
 
 # Contributor install.  README has told people to run `pip install -e ".[dev]"`
@@ -286,6 +293,11 @@ include = ["sharing_on*", "systemu*"]
     "interface/assets/fonts/*.txt",
     # v0.9.37: brand logo (favicon + sidebar mark)
     "interface/assets/*.png",
+    # 1e: the labelled scenario corpus `systemu debug resolver-replay` replays.
+    # A byte-identical mirror of the repo's fixtures/field (pinned by
+    # tests/test_resolver_replay_ships_its_corpus.py); without it an installed
+    # wheel has no corpus and the command can only report that it found none.
+    "fixtures/field/*.json",
 ]
 "systemu.vault" = ["**/*.json", "**/*.md", "**/*.py"]
 

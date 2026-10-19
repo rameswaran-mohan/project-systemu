@@ -103,23 +103,37 @@ def test_the_refusals_install_command_is_still_on_one_unwrapped_line(
 # N8 -- the inventory-hit lines
 # --------------------------------------------------------------------------- #
 
-#: A report with a payoff split AND a fired clamp, so every branch that emits a
-#: character renders in one call.
-_LOUD = {
-    "supplied": 4, "avoided_gap": 3, "rate": 0.75,
-    "silent": 1, "prefilled_confirm": 2,
-    "table_supplied": 2, "table_avoided_gap": 2, "table_silent": 1,
-}
+#: Re-pointed (GATE-6) from the retired snapshot formatter to the durable-record
+#: formatter, which is now the ONLY inventory-hit surface. A record report with a
+#: payoff split, a fired clamp AND an unreadable run record, so every branch that emits
+#: a character renders in one call. The searched path carries a non-ASCII directory
+#: name -- an operator's home can -- so the ASCII rule is tested against input that
+#: would break it, not merely against literals that happen to be clean.
+def _loud_record_report():
+    from systemu.runtime.table_payoff_record import RecordScan, RunRecord
+
+    def row(path, bound):
+        return {"event": "supplied", "table_item_id": "t-1", "item_name": "n",
+                "schema_path": path, "objective_id": 1, "tool": "t", "state": "have",
+                "bound_as": bound}
+
+    rec = RunRecord(root_execution_id="exec_a", consulted=True,
+                    supplied=(row("/a", "prefilled_confirm"),
+                              row("/b", "prefilled_confirm"), row("/c", "silent")),
+                    executions=frozenset({"exec_a"}))
+    scan = RecordScan(searched="C:/Users/Ren\u00e9/data/audit/table_payoff/run_*.jsonl",
+                      records=(rec,), unreadable=1)
+    return table_payoff.record_inventory_hit_report(scan)
 
 
 def test_the_inventory_hit_lines_are_ascii():
-    for line in table_payoff.format_inventory_hit(_LOUD):
-        _assert_ascii(line, "format_inventory_hit")
+    for line in table_payoff.format_record_inventory_hit(_loud_record_report()):
+        _assert_ascii(line, "format_record_inventory_hit")
 
 
 def test_the_clamp_regression_alarm_is_ascii():
     """The loudest line the module emits, on the path that emits it."""
-    lines = table_payoff.format_inventory_hit(_LOUD)
+    lines = table_payoff.format_record_inventory_hit(_loud_record_report())
     alarm = [ln for ln in lines if "CLAMP REGRESSION" in ln]
     assert alarm, f"the fixture did not fire the alarm: {lines}"
     for line in alarm:
@@ -145,10 +159,11 @@ def test_the_runtime_clamp_warning_is_ascii():
 
 
 def test_the_payoff_split_still_reports_both_halves():
-    """Anti-vacuity: the separator changed, the two counts did not."""
-    joined = "\n".join(table_payoff.format_inventory_hit(_LOUD))
-    assert "bound with no ask: 1" in joined, joined
+    """Anti-vacuity: the separator changed, the two counts did not -- and they are
+    still two counts, never one relabelled total."""
+    joined = "\n".join(table_payoff.format_record_inventory_hit(_loud_record_report()))
     assert "pre-filled one-click confirm: 2" in joined, joined
+    assert "silent: 1" in joined, joined
 
 
 # --------------------------------------------------------------------------- #

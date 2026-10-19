@@ -223,6 +223,34 @@ def repair_route(kind: str, status: str) -> tuple:
     return (label, route)
 
 
+def _broke_when(stamp: Any) -> str:
+    """``YYYY-MM-DD HH:MM UTC`` for an ISO stamp, "" if it cannot be read. ASCII."""
+    if type(stamp) is not str or not stamp:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        when = datetime.fromisoformat(stamp)
+        if when.tzinfo is not None:
+            when = when.astimezone(timezone.utc)
+        return when.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return ""
+
+
+def broken_line(it: Any) -> str:
+    """R-B1: the one-line diagnosis a health-broken card LEADS with (§5.10.c
+    "broken/stale cards lead with a one-line diagnosis"), e.g. ``credential
+    removed (since 2026-10-19 09:30 UTC)``. "" for anything the health layer did
+    not break -- a `broken` status with no recorded reason is a different failure
+    and keeps its existing card. ASCII only."""
+    reason = getattr(it, "broken_reason", "") or ""
+    if (getattr(it, "status", "") or "") != "broken" or type(reason) is not str \
+            or not reason:
+        return ""
+    since = _broke_when(getattr(it, "broken_at", None))
+    return f"{reason} (since {since})" if since else reason
+
+
 def consult_button_label(vault) -> str:
     """"Set the table" on a cold install, "Resume setting the table" once some
     areas are already answered (§5.10.1). Pure enough to test; defensive because
@@ -308,6 +336,11 @@ def _render_card(it: Any, *, on_pin=None, on_remove=None) -> None:
                         icon="close",
                         on_click=lambda _e=None, k=_k, r=_ref, n=_nm: on_remove(k, r, n),
                     ).props("flat dense round size=sm color=grey").tooltip("Remove from table")
+        # R-B1: a card whose backing thing went away LEADS with why and since when,
+        # above its old description -- the description is what it WAS.
+        _broken = broken_line(it)
+        if _broken:
+            ui.label(_broken).classes("s-text-danger").style("font-size: 12px;")
         detail = getattr(it, "detail", "") or ""
         if detail:
             ui.label(detail).classes("s-muted").style("font-size: 12px;")

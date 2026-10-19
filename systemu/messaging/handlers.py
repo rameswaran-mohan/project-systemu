@@ -14,16 +14,24 @@ import logging
 from typing import Callable, Dict
 
 from .gateway import InboundCommand
-from .decision_bridge import resolve_from_channel
+from .decision_bridge import (
+    ANSWER_COMMAND,
+    answer_example,
+    parse_answer_args,
+    resolve_from_channel,
+)
 
 logger = logging.getLogger(__name__)
 
-# Recognized choice keys for /answer <tag> <choice>. A bare 1..4 maps to a1..a4.
+# Button keys a typed value may also name (a bare 1..4 maps to a1..a4). Passed
+# to the resolver ALONGSIDE the typed value: an option card or an enum question
+# may use the key, a free-text question uses the value itself.
 _ANSWER_CHOICE_KEYS = {"a1", "a2", "a3", "a4"}
 _ANSWER_USAGE = (
-    "Usage: /answer <tag> <a1..a4>\n"
-    "The <tag> is the short code on the decision message; the choice is the "
-    "option to pick (a1, a2, a3, a4 — or just 1, 2, 3, 4)."
+    f"Usage: {answer_example('<tag>')}\n"
+    "The <tag> is the short code on the decision message. The <value> is your "
+    "answer: free text for a question, or an option's label or number "
+    "(1, 2, 3 ...; a1..a4 also work) when there are options."
 )
 
 
@@ -49,7 +57,7 @@ def handle_help(_: InboundCommand) -> str:
         "/shadows              — list shadows\n"
         "/approve <scroll_id>  — approve a pending scroll\n"
         "/reject  <scroll_id>  — reject a pending scroll\n"
-        "/answer <tag> <a1-a4> — resolve a parked decision (or tap its button)\n"
+        f"{answer_example('<tag>')} — answer a parked decision (or tap its button)\n"
         "/why <tag>            — why a parked decision is asking (read-only)\n"
         "/help                 — this message\n"
         "\nPlain text without a leading / is treated as /chat."
@@ -205,11 +213,11 @@ def handle_reject(cmd: InboundCommand) -> str:
 
 
 def _normalize_choice(raw: str) -> str | None:
-    """Map a user-typed choice to a canonical ``a1..a4`` key, or None if invalid.
+    """Map a typed value to a canonical ``a1..a4`` button key, or None.
 
     Accepts an explicit ``a1..a4`` (case-insensitive) OR a bare ``1..4``. Anything
-    else (out-of-range number, a word, an ``a5``) is rejected so the caller can
-    show a usage hint rather than guess.
+    else is NOT a key - but it may still be a valid answer (free text, a label),
+    so the caller passes the raw value on regardless and the resolver decides.
     """
     token = (raw or "").strip().lower()
     if token in _ANSWER_CHOICE_KEYS:
@@ -222,23 +230,24 @@ def _normalize_choice(raw: str) -> str | None:
 
 
 def handle_answer(cmd: InboundCommand) -> str:
-    """Resolve a parked decision from chat: ``/answer <tag> <a1..a4>``.
+    """Resolve a parked decision from chat: ``/answer <tag> <value>``.
 
+    The grammar is the one the push prints (``decision_bridge.answer_example``).
     The typed sibling of tapping an inline button — both feed the SAME
     server-side resolver (``resolve_from_channel``), gated by the persisted
-    SEC-1 ``resolution_class`` bit and the sender allowlist. We only parse the
-    tag + choice here; every safety check lives in the resolver.
+    SEC-1 ``resolution_class`` bit and the sender allowlist. We only split the
+    tag from the value here: whether the value is a valid answer depends on the
+    decision's kind, which only the resolver may look up (after its allowlist
+    check), so every value reaches it.
     """
-    parts = (cmd.args or "").split()
-    if len(parts) < 2:
+    parsed = parse_answer_args(cmd.args)
+    if parsed is None:
         return _ANSWER_USAGE
-    tag, raw_choice = parts[0], parts[1]
-    choice = _normalize_choice(raw_choice)
-    if choice is None:
-        return _ANSWER_USAGE
+    tag, value = parsed
     try:
         _outcome, message = resolve_from_channel(
-            tag, choice, sender_id=cmd.user_id or "", channel="telegram",
+            tag, _normalize_choice(value), sender_id=cmd.user_id or "",
+            channel="telegram", value=value,
         )
         return message
     except Exception as exc:
@@ -313,6 +322,6 @@ def default_handlers() -> Dict[str, Callable[[InboundCommand], str]]:
         "shadows":    handle_shadows,
         "approve":    handle_approve,
         "reject":     handle_reject,
-        "answer":     handle_answer,
+        ANSWER_COMMAND: handle_answer,
         "why":        handle_why,
     }

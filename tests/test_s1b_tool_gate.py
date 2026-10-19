@@ -125,10 +125,11 @@ def test_always_allowed_signature_skips_gate(tmp_path, monkeypatch):
     sb, store = _sandbox_with_store(tmp_path, vault=object())
     tool, impl = _make_tool(tmp_path, name="send_email", effect_tags=["send_message"])
 
-    # Pre-approve the EXACT signature the gate will compute. host_class is
-    # DEFERRED (no host resolver yet) so it is unconditionally "".
+    # Pre-approve the EXACT signature the gate will compute -- which binds the
+    # tool's DERIVED host class (IMPL-1): send_message is a network effect and
+    # this spec declares no hosts, so the class is "undeclared".
     sig = _expected_sig(impl, name="send_email",
-                        effect_tags=["send_message"], host_class="")
+                        effect_tags=["send_message"], host_class="undeclared")
     store.approve(sig, command="send_email")
 
     asyncio.run(sb.execute_tool(tool.implementation_path, {}, tool=tool))
@@ -190,3 +191,51 @@ def test_net_read_only_tool_runs(tmp_path, monkeypatch):
     # Must NOT raise (ALLOW) and must NOT post a gate.
     asyncio.run(sb.execute_tool(tool.implementation_path, {}, tool=tool))
     assert called["enqueue"] is False
+
+
+# ── Test 6: a pre-host-check approval of a NETWORKED tool re-asks once ────────
+
+def test_a_legacy_empty_host_class_approval_re_asks_a_networked_tool_once(
+        tmp_path, monkeypatch):
+    """Sibling of test 3 (GATE-6, IMPL-1 upgrade path). An approval minted BEFORE
+    host checks existed was keyed on host_class="" and bound no host. For a
+    NETWORKED tool the gate neither honours it silently (that would bless every
+    host the spec names) nor drops it silently: it posts an ordinary approval
+    card that says why it is asking, names the hosts, and leaves the old allow on
+    record. Approving the card's own signature stops the asking."""
+    posted = {}
+
+    class _FakeInbox:
+        def __init__(self, vault):
+            pass
+
+        def enqueue(self, descriptor, *, gate_type, context_extras=None, **kw):
+            posted["descriptor"] = descriptor
+            posted["context_extras"] = context_extras or {}
+            return "dec_legacy_host"
+
+    monkeypatch.setattr("systemu.interface.command.inbox.InboxQueue", _FakeInbox)
+
+    sb, store = _sandbox_with_store(tmp_path, vault=object())
+    tool, impl = _make_tool(tmp_path, name="send_email", effect_tags=["send_message"])
+    legacy = _expected_sig(impl, name="send_email",
+                           effect_tags=["send_message"], host_class="")
+    store.approve(legacy, command="send_email")
+
+    with pytest.raises(PendingOperatorDecision):
+        asyncio.run(sb.execute_tool(tool.implementation_path, {}, tool=tool))
+
+    card = posted["descriptor"]
+    assert ("approved before host checks existed; confirm the hosts it may "
+            "reach: undeclared") in card.inspect
+    assert "Always allow" in card.options          # an ordinary card, not a DENY
+    assert store.is_approved(legacy) is True        # nothing silently dropped
+    new_sig = posted["context_extras"]["tool_signature"]
+    assert new_sig != legacy
+
+    # Once: the operator's "Always allow" records the card's signature, and the
+    # next identical call runs without a card.
+    store.approve(new_sig, command="send_email")
+    posted.clear()
+    asyncio.run(sb.execute_tool(tool.implementation_path, {}, tool=tool))
+    assert "descriptor" not in posted

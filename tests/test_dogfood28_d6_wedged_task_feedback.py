@@ -77,6 +77,14 @@ class _FakeQueue:
         self.expired.append(dedup_key)
         return self._expires
 
+    # IMPL-11 (GATE-6 authorised): the chat Stop withdraws a run's cards through
+    # the ONE queue function; the fake returns the row's parked decision id when
+    # it "expires" (and nothing when it cannot).
+    def expire_cards_for_run(self, **coords):
+        self.run_expiries = getattr(self, "run_expiries", []) + [dict(coords)]
+        parked = coords.get("decision_id")
+        return [parked] if (self._expires and parked) else []
+
 
 def _running_entry(**over):
     entry = {
@@ -301,7 +309,12 @@ class TestStopCancelsForReal:
         entry = _parked_entry()
         queue = _FakeQueue(expires=True)
         report = cancel_chat_task(_FakeVault([entry]), entry["ts"], queue=queue)
-        assert queue.expired == ["cmd_gate:rm"]
+        # IMPL-11 (GATE-6): THIS run's card, through the one function - never the
+        # params-independent dedup key, which can name another run's card.
+        assert queue.run_expiries == [{
+            "execution_id": None, "activity_id": "act_wedged",
+            "chat_submission_id": entry["ts"], "decision_id": "dec_abc"}]
+        assert queue.expired == []
         assert report["gate_withdrawn"] is True
         assert report["stopped"] is True
 

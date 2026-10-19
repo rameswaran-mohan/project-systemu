@@ -178,6 +178,34 @@ class TestSamplingGateRailAndFloor:
         assert s["server_id"] == "srv1" and s["tier"] == 2
 
 
+def _connect_in_memory(server, *, sampling_callback):
+    """D-MCP2: an in-memory (server, ClientSession) pair that works on BOTH SDK
+    lines. mcp 2.x removed ``mcp.shared.memory.create_connected_server_and_client_session``;
+    what remains on both lines is ``create_client_server_memory_streams`` +
+    ``ClientSession`` + lowlevel ``Server.run`` -- the same pieces the removed
+    helper was built from."""
+    from contextlib import asynccontextmanager
+
+    import anyio
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    @asynccontextmanager
+    async def _cm():
+        async with create_client_server_memory_streams() as (client_streams, server_streams):
+            async with anyio.create_task_group() as tg:
+                async def _serve():
+                    await server.run(server_streams[0], server_streams[1],
+                                     server.create_initialization_options())
+                tg.start_soon(_serve)
+                async with ClientSession(client_streams[0], client_streams[1],
+                                         sampling_callback=sampling_callback) as client:
+                    yield client
+                tg.cancel_scope.cancel()
+
+    return _cm()
+
+
 class TestHermeticSamplingRoundTrip:
     @pytest.mark.asyncio
     async def test_in_process_server_sampling_routes_through_stubbed_llm_router(self, monkeypatch):
@@ -194,19 +222,20 @@ class TestHermeticSamplingRoundTrip:
         async def fake_llm_call(*, tier, system, user, config, **kw):
             captured["routed"] = True
             captured["user"] = user
+            captured["system"] = system
+            captured["max_tokens"] = kw.get("max_tokens")
             return {"content": "PARENT-ANSWER", "model": "stub/model"}
 
         monkeypatch.setattr(sampling, "_llm_call", fake_llm_call)
 
         # Build a connected (server, client-session) pair over in-memory streams.
-        # VERIFIED against mcp==1.26.0: create_connected_server_and_client_session.
-        from mcp.shared.memory import create_connected_server_and_client_session as connect
+        # D-MCP2: verified on mcp 2.3.0 and mcp 1.30.0 (see _connect_in_memory).
 
         # A minimal server that, when its one tool is called, asks the CLIENT to sample.
         server = transports.build_test_sampling_server()
 
         sampling_cb = transports.make_sampling_callback(config=object(), tier=2)
-        async with connect(server, sampling_callback=sampling_cb) as client:
+        async with _connect_in_memory(server, sampling_callback=sampling_cb) as client:
             await client.initialize()
             result = await client.call_tool("ask_parent", {"q": "what is 2+2?"})
 
@@ -215,6 +244,10 @@ class TestHermeticSamplingRoundTrip:
         assert "PARENT-ANSWER" in text
         assert captured.get("routed") is True
         assert "what is 2+2?" in captured["user"]
+        # D-MCP2: the server's system prompt and token ceiling reach the router
+        # on both lines (mcp 2.x spells them system_prompt / max_tokens).
+        assert captured["system"] == transports.TEST_SAMPLING_SYSTEM_PROMPT
+        assert captured["max_tokens"] == transports.TEST_SAMPLING_MAX_TOKENS
 
 
 class TestRemotePolicy:

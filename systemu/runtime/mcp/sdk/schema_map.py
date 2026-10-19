@@ -59,20 +59,47 @@ def mcp_schema_to_parameters(input_schema: Optional[Dict[str, Any]]) -> Dict[str
     }
 
 
+_MISSING = object()
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def _snake(wire_name: str) -> str:
+    return _CAMEL_BOUNDARY_RE.sub("_", wire_name).lower()
+
+
+def wire_field(obj: Any, wire_name: str, default: Any = None) -> Any:
+    """Read MCP wire field ``wire_name`` (camelCase, as spelled on the wire) off
+    an SDK model of EITHER official-SDK line, or off a plain dict.
+
+    D-MCP2: mcp 1.x models expose the wire name as the attribute
+    (``result.isError``); mcp 2.x models expose snake_case attributes behind a
+    camelCase alias (``result.is_error``), so ``getattr(result, "isError",
+    False)`` is silently ``False`` there -- a failed tool call reads as success,
+    a destructive tool loses its ``destructiveHint``. Tries the wire name, then
+    its snake_case form (a ``None`` counts as absent, as the pre-port
+    ``inputSchema``/``input_schema`` fallback did); ``default`` when neither
+    carries a value."""
+    if obj is None:
+        return default
+    for name in (wire_name, _snake(wire_name)):
+        if isinstance(obj, dict):
+            value = obj.get(name, _MISSING)
+        else:
+            value = getattr(obj, name, _MISSING)
+        if value is not _MISSING and value is not None:
+            return value
+    return default
+
+
 def _extract_annotations(ann: Any) -> Dict[str, Any]:
-    """Pull the known annotation hint fields off an SDK annotations object OR a
-    plain dict into a plain dict (drops Nones)."""
+    """Pull the known annotation hint fields off an SDK annotations object (either
+    SDK line) OR a plain dict into a plain dict keyed by the WIRE names (drops
+    Nones)."""
     out: Dict[str, Any] = {}
     if ann is None:
         return out
-    if isinstance(ann, dict):
-        for k in _ANNOTATION_KEYS:
-            v = ann.get(k)
-            if v is not None:
-                out[k] = v
-        return out
     for k in _ANNOTATION_KEYS:
-        v = getattr(ann, k, None)
+        v = wire_field(ann, k)
         if v is not None:
             out[k] = v
     return out
@@ -86,18 +113,9 @@ def to_systemu_schema(mcp_tool: Any) -> Dict[str, Any]:
     the real required[], and annotations are flattened to a plain dict. P3's
     grant tool dicts are built from this (so register_server_tools gets the
     right schema + action tier)."""
-    if isinstance(mcp_tool, dict):
-        description = mcp_tool.get("description", "")
-        input_schema = mcp_tool.get("inputSchema")
-        if input_schema is None:
-            input_schema = mcp_tool.get("input_schema")
-        ann = mcp_tool.get("annotations")
-    else:
-        description = getattr(mcp_tool, "description", "")
-        input_schema = getattr(mcp_tool, "inputSchema", None)
-        if input_schema is None:
-            input_schema = getattr(mcp_tool, "input_schema", None)
-        ann = getattr(mcp_tool, "annotations", None)
+    description = wire_field(mcp_tool, "description", "")
+    input_schema = wire_field(mcp_tool, "inputSchema")
+    ann = wire_field(mcp_tool, "annotations")
     return {
         "description": sanitize_description(str(description or "")),
         "parameters_schema": mcp_schema_to_parameters(

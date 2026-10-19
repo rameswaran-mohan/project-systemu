@@ -95,6 +95,160 @@ def detect_timezone() -> str:
         return "UTC"
 
 
+#: The three variables step 2 writes. They ARE the record of the operator's
+#: preset choice -- ``Config`` resolves the shipped budget defaults when they
+#: are absent, so the resolved config cannot tell "chose budget" from "never
+#: opened step 2" and is not a witness for the read-back below.
+PRESET_TIER_ENV = ("SYSTEMU_TIER1_MODEL", "SYSTEMU_TIER2_MODEL",
+                   "SYSTEMU_TIER3_MODEL")
+
+#: What Finish must do with the persona fact. The fact log is APPEND-only, so
+#: "write" is not the safe default: a wizard whose select is prefilled (as it
+#: now is) re-submits the same answer on every visit, and each one would grow
+#: another 'Usage persona:' line that ``current_persona`` then has to read past.
+PERSONA_WRITE = "write"
+PERSONA_FORGET = "forget"
+PERSONA_KEEP = "keep"
+
+
+def saved_preset(env=None) -> str:
+    """The preset name the SAVED tier vars spell, or "" when none were written.
+
+    D-1. The wizard used to build its dropdown with no ``value=`` at all, so an
+    operator who had already chosen ``quality`` came back to a blank select --
+    on a page that, one section above, was correctly reporting which providers
+    those very tiers routed to.
+
+    DERIVED FROM THE REGISTRY THAT WROTE THEM, never from a second table: the
+    same ``PRESETS`` mapping ``finalize_onboarding`` expands is matched back, so
+    the name shown here and the models on disk cannot drift apart, and a preset
+    added later reads back with nobody editing this function.
+
+    ALL THREE vars must be present and must match one preset exactly. A partial
+    write is not a choice, and hand-tuned tiers that match nothing return "" --
+    telling the operator nothing beats telling them something untrue. Never
+    raises.
+    """
+    import os
+    environ = os.environ if env is None else env
+    try:
+        from sharing_on.model_presets import PRESETS
+        current = []
+        for name in PRESET_TIER_ENV:
+            raw = environ.get(name)
+            value = raw.strip() if type(raw) is str else ""
+            if not value:
+                return ""
+            current.append(value)
+        for preset in sorted(PRESETS):
+            tiers = PRESETS.get(preset) or {}
+            if [(tiers.get(f"tier{i}") or "") for i in (1, 2, 3)] == current:
+                return preset
+    except Exception:
+        logger.debug("[Welcome] saved preset read-back failed", exc_info=True)
+    return ""
+
+
+def welcome_initial_values(vault, config, *, env=None) -> dict:
+    """Every field the wizard collects, initialised from what Finish SAVED.
+
+    ``{preset, persona, name, location, timezone, output_dir}`` -- the one
+    builder each widget takes its ``value=`` from, so there is a single place
+    where "what did the operator already tell us" is answered and a single
+    place a test can pin it.
+
+    Each half is read through the SAME reader its writer's other consumers use:
+    the preset from :func:`saved_preset` (the preset registry), the persona from
+    ``persona_content.current_persona`` (the reader the Settings switcher reads,
+    so the two screens cannot disagree about which persona is current), and the
+    four typed fields from the ``UserProfile`` record ``save_onboarding`` wrote.
+
+    NO SAVED STATE MEANS TODAY'S PAGE, exactly: blanks, a detected timezone and
+    the config's output folder. Never raises -- an unhappy vault must not stop
+    the first screen an operator ever sees from rendering.
+    """
+    values = {"preset": "", "persona": "", "name": "", "location": "",
+              "timezone": "", "output_dir": ""}
+    try:
+        values["preset"] = saved_preset(env)
+    except Exception:
+        logger.debug("[Welcome] preset read-back failed", exc_info=True)
+    try:
+        from systemu.interface.persona_content import current_persona
+        values["persona"] = current_persona(vault) or ""
+    except Exception:
+        logger.debug("[Welcome] persona read-back failed", exc_info=True)
+    profile = None
+    try:
+        profile = vault.get_user_profile()
+    except Exception:
+        logger.debug("[Welcome] profile read-back failed", exc_info=True)
+    if profile is not None:
+        for key, attr in (("name", "name"), ("location", "location_text"),
+                          ("timezone", "timezone"),
+                          ("output_dir", "default_output_dir")):
+            raw = getattr(profile, attr, "")
+            values[key] = raw.strip() if type(raw) is str else ""
+    if not values["output_dir"]:
+        try:
+            raw = getattr(config, "output_dir", "")
+            values["output_dir"] = raw if type(raw) is str else ""
+        except Exception:
+            values["output_dir"] = ""
+    if not values["timezone"]:
+        # Detected ONLY as the fallback. Detecting it as the widget's value is
+        # what overwrote an operator who had corrected the guess.
+        values["timezone"] = detect_timezone()
+    return values
+
+
+def persona_write_plan(saved, chosen) -> str:
+    """What Finish must do with the persona fact. Pure; total; never raises.
+
+    Three cases, and the middle one is the fix: an UNCHANGED answer is a no-op
+    (the select is prefilled now, so "unchanged" is the common case), a CLEARED
+    select forgets the fact rather than silently keeping a stale one, and only a
+    genuinely different answer is written.
+    """
+    was = saved.strip() if type(saved) is str else ""
+    now = chosen.strip() if type(chosen) is str else ""
+    if now == was:
+        return PERSONA_KEEP
+    return PERSONA_WRITE if now else PERSONA_FORGET
+
+
+def apply_persona_choice(vault, chosen, *, saved=None, add_fact_fn=None,
+                         forget_fact_fn=None) -> str:
+    """Carry out :func:`persona_write_plan` and report which plan it ran.
+
+    ``add_fact_fn`` / ``forget_fact_fn`` are the writer seams -- production
+    leaves them None and the module's own writers are used; a test injects them
+    to witness that a no-op Finish reaches NO writer at all, which counting
+    facts afterwards cannot distinguish from a write that happened to be
+    idempotent (the fact log is append-only, so it never is).
+
+    Forgetting goes through the existing ``user_profile.forget_fact`` path --
+    the same supersede-in-place the rest of the product uses -- and forgets
+    every live persona fact, so ``current_persona`` really does answer None
+    afterwards rather than uncovering an older one.
+    """
+    from systemu.runtime.user_profile import add_fact, forget_fact, get_facts
+    add = add_fact if add_fact_fn is None else add_fact_fn
+    forget = forget_fact if forget_fact_fn is None else forget_fact_fn
+    if saved is None:
+        from systemu.interface.persona_content import current_persona
+        saved = current_persona(vault) or ""
+    plan = persona_write_plan(saved, chosen)
+    if plan == PERSONA_WRITE:
+        add(vault, f"Usage persona: {(chosen or '').strip()}",
+            source="onboarding", tags=["office_context", "persona"])
+    elif plan == PERSONA_FORGET:
+        for fact in get_facts(vault, tags=["persona"]):
+            if (fact.fact or "").strip().startswith("Usage persona:"):
+                forget(vault, fact.id, reason="cleared in onboarding")
+    return plan
+
+
 def _refresh_key_status(config, *, env_file: str = ".env") -> bool:
     """Notice a provider added to .env while /welcome is open (W11.4).
 
@@ -192,6 +346,90 @@ def _sentence(text: str) -> str:
     return body if body.endswith((".", "!", "?")) else body + "."
 
 
+#: D-13 / e2e31: THE WELCOME-SIDE SDK CLAUSE IS RETIRED.
+#:
+#: This page used to carry ``PROVIDER_SDK_PACKAGES``, ``_optional_deps``,
+#: ``missing_sdk_remedy`` and ``tier_sdk_warning`` -- a second table of which
+#: provider needs which SDK, a second probe for whether it is installed, and a
+#: second wording of the remedy. It existed because the MINT called an
+#: Anthropic key with no SDK "satisfied", so nothing upstream of this page had
+#: the fact to hand.
+#:
+#: The mint now refuses that machine itself (e2e31 ruling (c)) and its verdict
+#: carries the sentence AND the remedy, so every consumer inherits it:
+#: ``unusable_selected`` for the caveat under "Provider ready", and
+#: ``ProviderStatus.blocker`` for ``no_provider_banner`` below. Keeping the
+#: clause printed the same `pip install "systemu[anthropic]"` TWICE in one
+#: paragraph (measured), and left this page probing with
+#: ``importlib.metadata`` while the mint probed with ``find_spec`` -- one fact,
+#: two answers, which is the DEC-43 split this page has been bitten by before.
+
+
+def no_provider_banner(statuses) -> str:
+    """Step 1's banner for the machine where NOTHING is usable.
+
+    WHY IT IS A BUILDER NOW (e2e31). This sentence used to be written inline in
+    the render, and after ruling (c) it became the screen the WITNESSED machine
+    actually lands on: an operator with ANTHROPIC_API_KEY set and no
+    ``anthropic`` package has no satisfied provider, so ``tier_readiness_
+    warning`` above is silent by design and step 1 falls here. What it said on
+    its own was ``configure_hint``'s list -- which names ANTHROPIC_API_KEY as
+    something to go and set. That operator HAS set it. Telling them to set it
+    again is a false implication, and the one fact they need (the SDK, and the
+    pip line) was nowhere on the page.
+
+    SO IT READS THE MINT, and only the mint. ``ProviderStatus.blocker`` is ""
+    for a provider nobody configured and carries the whole sentence -- reason
+    and remedy -- for one that IS configured and still cannot be built. That is
+    the discriminator this page needs and the one it must not invent: the
+    retired clause scored ``routed_tier_providers`` instead, which on a machine
+    with NO keys at all still routes tier 1 to Anthropic, so it lectured a fresh
+    operator about an SDK for a provider they had never chosen (measured).
+
+    The caveat above and this banner never render together -- the branches are
+    mutually exclusive -- so the remedy appears exactly once wherever the
+    operator is standing.
+
+    Never raises: a blocked-provider lookup that blew up must not cost the
+    operator the banner that tells them nothing works. The banner text itself is
+    unchanged, em dash included -- it is a browser label, not a console line,
+    and the mint's sentences are ASCII by construction (DEC-32c).
+    """
+    from systemu.runtime import provider_status as _ps
+    text = (
+        "No LLM provider is usable yet — and Systemu can't think "
+        "without one. " + _ps.configure_hint(statuses)
+        + " Get an OpenRouter key at openrouter.ai/keys. Edit the "
+        ".env file next to the app, save, then click Re-check. "
+        "Credentials are never entered in the browser."
+    )
+    try:
+        blocked = blocked_providers(statuses)
+    except Exception:
+        logger.debug("[Welcome] blocked-provider lookup failed", exc_info=True)
+        blocked = []
+    for st in blocked:
+        text += f" {_sentence(st.blocker)}"
+    return text
+
+
+def blocked_providers(statuses) -> list:
+    """Every provider the operator DID configure that still cannot be built.
+
+    Table order, and read off the minted value rather than off the wording of
+    ``detail`` (DEC-34: never decide by matching a string the producer owns).
+    Never raises; a status object that is not the mint's contributes nothing.
+    """
+    from systemu.runtime import provider_status as _ps
+    out = []
+    for spec in _ps.PROVIDER_SPECS:
+        st = (statuses or {}).get(spec.provider)
+        blocker = getattr(st, "blocker", "")
+        if type(blocker) is str and blocker:
+            out.append(st)
+    return out
+
+
 def tier_readiness_warning(statuses, config) -> str:
     """Step 1's second sentence: "...but not for the tiers you are on". Or "".
 
@@ -221,6 +459,18 @@ def tier_readiness_warning(statuses, config) -> str:
         satisfied = _ps.satisfied_providers(statuses)
         if not satisfied:
             return ""
+        # D-13, RETIRED HERE (e2e31 ruling (c)). This used to compute a
+        # welcome-side `tier_sdk_warning` and append it, because the mint called
+        # an Anthropic key with no SDK SATISFIED and so nothing was "unusable
+        # selected" on that machine. The mint no longer does: an unimportable
+        # SDK is an unsatisfied provider whose own detail already reads
+        # "SDK not installed - ANTHROPIC_API_KEY is set but the Anthropic SDK is
+        # missing; pip install ...". Keeping the clause here printed that remedy
+        # TWICE (measured on a three-key machine before this change), and two
+        # wordings of one fact in one paragraph is the reader's version of two
+        # verdicts. The clause survives ONLY in the no-provider branch -- see
+        # `no_provider_banner`, the one screen the mint's per-row detail never
+        # reaches.
         unusable = _ps.unusable_selected(
             statuses, _ps.routed_tier_providers(config))
         if not unusable:
@@ -318,9 +568,10 @@ def save_onboarding(vault, *, name: str, location: str, timezone: str,
         default_output_dir=output_dir.strip(),
     )
     vault.save_user_profile(profile)
-    if persona.strip():
-        add_fact(vault, f"Usage persona: {persona.strip()}",
-                 source="onboarding", tags=["office_context", "persona"])
+    # D-1: the persona is NOT written unconditionally any more. With the select
+    # prefilled, an unchanged answer must reach no writer, and a cleared one
+    # must forget the fact instead of leaving a stale one behind.
+    apply_persona_choice(vault, persona)
     if role.strip():
         add_fact(vault, f"Role: {role.strip()}",
                  source="onboarding", tags=["office_context"])
@@ -368,13 +619,19 @@ def finalize_onboarding(vault, config, *, name: str, location: str = "",
         from sharing_on.model_presets import PRESETS
         tiers = PRESETS.get(preset or "")
         if tiers:
+            import os as _os
             from systemu.interface.pages.settings import _update_env_var
-            _update_env_var("SYSTEMU_TIER1_MODEL", tiers["tier1"])
-            _update_env_var("SYSTEMU_TIER2_MODEL", tiers["tier2"])
-            _update_env_var("SYSTEMU_TIER3_MODEL", tiers["tier3"])
-            config.tier1_model = tiers["tier1"]
-            config.tier2_model = tiers["tier2"]
-            config.tier3_model = tiers["tier3"]
+            for _i, _var in enumerate(PRESET_TIER_ENV, start=1):
+                _model = tiers[f"tier{_i}"]
+                _update_env_var(_var, _model)
+                setattr(config, f"tier{_i}_model", _model)
+                # D-1: the LIVE environment is patched too, exactly as the
+                # live config is one line up. Without it the choice is only on
+                # disk until the next boot, and `saved_preset` -- which reads
+                # the vars, because the resolved config cannot tell "chose
+                # budget" from "never opened step 2" -- would show this
+                # operator a blank dropdown for the rest of the session.
+                _os.environ[_var] = _model
         save_onboarding(
             vault, name=name, location=location, timezone=timezone,
             output_dir=output_dir, role=role or "", org=org or "",
@@ -411,6 +668,12 @@ def build_welcome_page() -> None:
     # W11.4: while the gate holds (fresh install, key/profile missing) the
     # wizard is mandatory — no skip is offered. Voluntary visitors keep it.
     _gate_active = bool(onboarding_gate(vault, config))
+
+    # D-1: read back what Finish saved BEFORE any widget is built, so every
+    # field below takes its initial value from the one builder. A returning
+    # operator used to be shown an empty wizard by a page that had already read
+    # their tiers three sections down.
+    _initial = welcome_initial_values(vault, config)
 
     with ui.column().classes("w-full items-center"):
         with ui.column().classes("s-card").style("max-width: 720px; width: 100%;"):
@@ -472,12 +735,12 @@ def build_welcome_page() -> None:
                 if _tier_warn:
                     ui.label(_tier_warn).classes("s-banner s-banner--warn w-full")
             else:
+                # e2e31: one label, one builder. The sentence is unchanged; what
+                # it now carries is the SDK clause for the operator whose key IS
+                # set and whose provider still cannot be constructed -- the
+                # machine that lands HERE rather than on the caveat above.
                 ui.label(
-                    "No LLM provider is usable yet — and Systemu can't think "
-                    "without one. " + _ps.configure_hint(_pstat)
-                    + " Get an OpenRouter key at openrouter.ai/keys. Edit the "
-                    ".env file next to the app, save, then click Re-check. "
-                    "Credentials are never entered in the browser."
+                    no_provider_banner(_pstat)
                 ).classes("s-banner s-banner--warn w-full")
 
                 async def _recheck(_=None) -> None:
@@ -521,7 +784,9 @@ def build_welcome_page() -> None:
                 "'quality' is recommended for office work; 'budget' is the "
                 "cheapest. Change anytime in Settings."
             ).classes("s-muted")
-            preset_select = ui.select(sorted(PRESETS), label="Preset").classes("s-input s-input-full")
+            # Kept on ONE line: tests/test_wave12_responsiveness pins the
+            # full-width class and the label on the line that names the widget.
+            preset_select = ui.select(sorted(PRESETS), label="Preset", value=_initial["preset"] or None).classes("s-input s-input-full")
             if is_budget_class(getattr(config, "tier1_model", "")):
                 ui.label(
                     "Currently on a flash/free-class reasoning model — fine "
@@ -532,17 +797,26 @@ def build_welcome_page() -> None:
             ui.label(f"3 · {onboarding_steps()[2]}").classes("s-section-head")
             persona_in = ui.select(
                 personas(), label="How will you use Systemu?",
+                value=_initial["persona"] or None,
             ).classes("s-input s-input-full")
-            name_in = ui.input("Your name").classes("s-input s-input-full")
+
+            name_in = ui.input(
+                "Your name", value=_initial["name"],
+            ).classes("s-input s-input-full")
+
             loc_in = ui.input(
                 "Location (city, country)",
                 placeholder="Chennai, IN",
+                value=_initial["location"],
             ).classes("s-input s-input-full")
-            tz_in = ui.input("Timezone", value=detect_timezone()).classes(
-                "s-input s-input-full")
+
+            tz_in = ui.input(
+                "Timezone", value=_initial["timezone"],
+            ).classes("s-input s-input-full")
+
             out_in = ui.input(
                 "Where should produced files go?",
-                value=getattr(config, "output_dir", "") or "",
+                value=_initial["output_dir"],
             ).classes("s-input s-input-full")
             role_in = ui.input(
                 "Your role (optional)", placeholder="Finance analyst",

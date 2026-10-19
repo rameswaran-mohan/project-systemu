@@ -460,6 +460,15 @@ class Tool(BaseModel):
     # An EMPTY list is never "no effect" — a tool with no readable source is
     # UNKNOWN-until-classified at the gate.
     effect_tags: List[str] = []
+    # IMPL-1 (capability diff): the hosts this tool DECLARES it may reach. Read by
+    # `command_approvals.tool_host_class`, which folds it into the standing-
+    # approval signature, so changing a tool's declared hosts re-gates it. Optional
+    # and empty by default: a networked tool that declares none derives the class
+    # `undeclared` -- the honest class for a generic fetcher whose host comes from
+    # its ARGUMENTS. A real field (not an extra key) because the model ignores
+    # unknown keys on load and `Vault.save_tool` writes `model_dump()`, so an
+    # undeclared-in-the-model `hosts` key was silently erased by the next save.
+    hosts: List[str] = []
     # R-A12c INT-1 (spec §5.8): the name of an S3 external-verification evidence
     # channel this tool can produce (e.g. "api_readback"). None = no channel — the
     # tool cannot yet furnish `confirmed` external ground-truth. INTERIM: the

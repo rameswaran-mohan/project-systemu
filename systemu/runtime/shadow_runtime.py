@@ -433,15 +433,29 @@ def _augment_summary_with_committed_effects(summary: str, context) -> str:
     A no-op (returns ``summary`` unchanged) when there are zero confirmed effects,
     when the context has no ``_external_evidence`` store, or on ANY error — it NEVER
     raises, so it can never break a terminal/handoff finalize. getattr-guarded so a
-    context without the store is safe."""
+    context without the store is safe.
+
+    Then (R-W1 WM-2, §5.11 AC2) appends the negative facts THIS run consulted
+    (``world_query.render_negative_citations``, keyed by ``context.execution_id``) —
+    nothing when it consulted none; same never-raises contract."""
     try:
         from systemu.runtime.committed_effects import render_committed_effects
         _ledger = render_committed_effects(
             getattr(context, "_external_evidence", {}) or {})
         if _ledger:
-            return f"{summary}\n\n{_ledger}"
+            summary = f"{summary}\n\n{_ledger}"
     except Exception:
         logger.debug("[Runtime IMPL-7] committed-effects augment failed (swallowed)",
+                     exc_info=True)
+    # R-W1 WM-2 (§5.11 AC2): cite the negative facts THIS run consulted, from the
+    # per-run record (never the store). Describes; authorizes nothing (DEC-26).
+    try:
+        from systemu.runtime.world_query import render_negative_citations
+        _neg = render_negative_citations(getattr(context, "execution_id", None))
+        if _neg:
+            summary = f"{summary}\n\n{_neg}"
+    except Exception:
+        logger.debug("[Runtime WM-2] negative-fact citation failed (swallowed)",
                      exc_info=True)
     return summary
 
@@ -1463,8 +1477,34 @@ def _build_llm_tool_catalog(vault=None, config=None) -> List[Dict[str, Any]]:
 # ─────────────────────────────────────────────────────────────────────────
 
 
+def _record_table_payoff(report, situation, *, site, root_execution_id, execution_id,
+                         tool=None, scroll_id=None, activity_id=None,
+                         chat_submission_id=None, vault=None) -> None:
+    """T5 / R-B5 / R-A17 -- append this binder pass to the run's DURABLE table-payoff
+    record (``table_payoff_record``): the run consulted the table, and which
+    requirements a table item supplied, keyed by the ROOT execution id so every resume
+    of the run lands in the same file.
+
+    Called from BOTH requirement-binder call sites (the pre-loop producer and the
+    mid-loop TOOL_CALL binder) -- the only places that know a table item supplied a
+    requirement. OBSERVABILITY ONLY: it never touches the report, the context or the
+    ask, and it never raises into the run (the recorder already never raises; this
+    guard covers an import failure too)."""
+    try:
+        from systemu.runtime.table_payoff_record import record_binder_pass
+        record_binder_pass(report, situation, site=site,
+                           root_execution_id=root_execution_id,
+                           execution_id=execution_id, tool=tool, scroll_id=scroll_id,
+                           activity_id=activity_id,
+                           chat_submission_id=chat_submission_id, vault=vault)
+    except Exception:
+        logger.debug("[Runtime] table-payoff record skipped (non-fatal)", exc_info=True)
+
+
 def _populate_requirement_report(context, *, objectives, capability, situation,
-                                 vault=None, config=None) -> None:
+                                 vault=None, config=None, root_execution_id=None,
+                                 execution_id=None, scroll_id=None, activity_id=None,
+                                 chat_submission_id=None) -> None:
     """B10 producer wiring: invoke ``build_requirement_report`` and stash the
     result on ``context._requirement_report`` (B6 captures + resume-restores +
     persists it), then — if the report carries a non-empty ``ask_bundle`` —
@@ -1532,6 +1572,18 @@ def _populate_requirement_report(context, *, objectives, capability, situation,
             logger.debug("[Runtime] %s", _tw.get("message"))
     except Exception:
         logger.debug("[Runtime] clamp tripwire skipped (non-fatal)", exc_info=True)
+
+    # T5 -- the durable table-payoff record. SAME ORDERING RULE as the tripwire above
+    # and for the same reason: a table-sourced SILENT bind is not in the ask_bundle, so
+    # writing after the empty-ask early return would drop exactly the bind the DEC-25
+    # alarm exists for. It writes to the audit tree only -- nothing on `context`, so
+    # the AC6 snapshot byte-identity is untouched. Legacy callers that pass no run id
+    # record nothing (the recorder needs a root key).
+    _record_table_payoff(report_dict, situation, site="preloop",
+                         root_execution_id=root_execution_id,
+                         execution_id=execution_id, scroll_id=scroll_id,
+                         activity_id=activity_id, chat_submission_id=chat_submission_id,
+                         vault=vault)
 
     # AC6 no-op: no missing requirements ⇒ leave the snapshot BYTE-IDENTICAL. We do
     # NOT stash an empty-ask report (that would flip the persisted requirement_report
@@ -1612,7 +1664,10 @@ def _trigger_episodic_capture(
         )
         try:
             from systemu.runtime.episodic_memory import _warn_operator_degraded
-            _warn_operator_degraded(session_id=session_id, reason=str(exc))
+            # D13 — the SAME gate as capture()-returns-None, so a missing
+            # SDK is named with its remedy on both, never one each.
+            _warn_operator_degraded(session_id=session_id, reason=str(exc),
+                                    exc=exc)
         except Exception:
             pass
 
@@ -6033,6 +6088,12 @@ class ShadowRuntime:
                     situation=getattr(context, "_situation_report", None) or {},
                     vault=self.vault,
                     config=self.config,
+                    # T5: the run's keys for the durable table-payoff record.
+                    root_execution_id=root_eid,
+                    execution_id=execution_id,
+                    scroll_id=getattr(scroll, "id", None),
+                    activity_id=getattr(activity, "id", None),
+                    chat_submission_id=getattr(self, "_chat_submission_id", None),
                 )
 
             # R-P3b: per-task spend-cap baseline, captured lazily at the first gate
@@ -7202,6 +7263,21 @@ class ShadowRuntime:
                                     getattr(context, "_situation_report", None) or {},
                                     context,
                                     provided_params=decision.get("parameters") or {},
+                                    vault=self.vault)
+                                # T5: the binder has just accepted (or not) table
+                                # items for THIS call -- record it durably, under the
+                                # run's ROOT id so a resume shares the record.
+                                # Observability only; never touches _b_report/_b_ask.
+                                _record_table_payoff(
+                                    _b_report,
+                                    getattr(context, "_situation_report", None) or {},
+                                    site="midloop", root_execution_id=root_eid,
+                                    execution_id=execution_id,
+                                    tool=decision.get("tool_name"),
+                                    scroll_id=getattr(scroll, "id", None),
+                                    activity_id=getattr(activity, "id", None),
+                                    chat_submission_id=getattr(
+                                        self, "_chat_submission_id", None),
                                     vault=self.vault)
                             _b_ask = list(getattr(_b_report, "ask_bundle", None) or []) \
                                 if _b_report is not None else []

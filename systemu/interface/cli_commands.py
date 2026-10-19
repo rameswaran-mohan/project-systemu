@@ -701,14 +701,50 @@ def settings_show_cmd(ctx):
     _settings_show_body(ctx)
 
 
+def _gate_mode_posture_refusal(proposed: dict, confirm) -> str:
+    """R1 (spec section 10 / 5.10.b#5): why this CLI write of the gate-mode dial
+    must NOT be saved, or "" when it may. A change that LOWERS approval
+    requirements needs ``--confirm "<phrase>"`` naming the new posture -- the same
+    phrase, from the same rule (``command_approvals.posture_loosening``), as the
+    Settings card; tightening stays one command. ASCII."""
+    from systemu.runtime.command_approvals import (posture_change_refusal,
+                                                   posture_loosening)
+    from systemu.runtime.gate_mode_settings import get_gate_mode_settings
+    tokens = posture_loosening(get_gate_mode_settings(), proposed)
+    phrase = " ".join(tokens)
+    return posture_change_refusal(tokens, confirm,
+                                  how=f'with --confirm "{phrase}"')
+
+
 @settings_cmd.command("set")
 @click.argument("key")
 @click.argument("value")
 @click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
+@click.option("--confirm", "confirm", default=None, metavar="PHRASE",
+              help="Typed confirmation naming the new posture. Required when the "
+                   "write LOWERS approval requirements (e.g. gate_mode bypass "
+                   "needs --confirm \"bypass\"); a tightening needs none.")
 @click.pass_context
-def settings_set_cmd(ctx, key: str, value: str, as_json: bool):
+def settings_set_cmd(ctx, key: str, value: str, as_json: bool, confirm):
     """Set an allow-listed setting (canonical CLI-owned write -- Phase 2)."""
     from systemu.interface.command import verbs as _verbs
+    if key == "gate_mode":
+        # R1: this writes ONLY the mode; overrides and the floor stay as they are.
+        from systemu.runtime.gate_mode_settings import get_gate_mode_settings
+        _now = get_gate_mode_settings()
+        refusal = _gate_mode_posture_refusal(
+            {"mode": value, "overrides": dict(_now.get("overrides") or {}),
+             "no_floor": bool(_now.get("no_floor"))}, confirm)
+        if refusal:
+            if as_json:
+                from systemu.interface.command.result import (CommandResult,
+                                                              CommandStatus)
+                click.echo(CommandResult(status=CommandStatus.ERROR,
+                                         summary=refusal).to_json())
+            else:
+                console.print(f"[red]Not saved:[/red] {refusal}")
+            ctx.exit(2)
+            return
     _, vault = _get_vault_and_config(ctx)
     result = _verbs.settings_set(key, value, vault=vault)
     if as_json:
@@ -863,6 +899,65 @@ def tools_recalibrate_cmd(ctx, tool_id: str, reason: str, as_json: bool):
     else:
         console.print(result.to_rich())
     ctx.exit(result.exit_code)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  tools diff — approved state vs what is on disk now (read-only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tools_group.command("diff")
+@click.argument("tool", required=False)
+@click.option("--json", "as_json", is_flag=True,
+              help="Print the report as JSON, for scripts.")
+@click.option("--pending", is_flag=True,
+              help="Also list each dependency waiting for approval and every "
+                   "package installing it would add (asks pip; may take up to a "
+                   "minute per package).")
+@click.pass_context
+def tools_diff_cmd(ctx, tool: Optional[str], as_json: bool, pending: bool):
+    """Compare each standing tool approval with what is on disk now.
+
+    For every tool you approved with "Always allow" (or only TOOL, by name or
+    id), compares what the approval covered -- the implementation body, the
+    effect tags, the host class and the approved dependencies -- with what is
+    on disk and installed now, and prints one verdict per tool. A value that
+    cannot be determined is reported as unknown, never as a match. Read-only:
+    nothing is approved, revoked or installed.
+
+    \b
+    Exit status:
+      0  every tool is as approved
+      1  something differs, or cannot be confirmed
+      2  an approval store could not be read
+    Pending dependencies (--pending) are listed but do not change the exit
+    status: nothing has been approved for them yet.
+    """
+    from systemu.runtime import capability_diff as _cd
+    _, vault = _get_vault_and_config(ctx)
+    try:
+        report = _cd.build_report_from_disk(vault=vault, data_dir=Path("data"),
+                                            only=tool)
+        # Pip runs here, in this CLI process -- never on a dashboard thread.
+        pending_rows = _cd.resolve_pending(Path("data")) if pending else None
+    except _cd.ApprovalStoreUnreadable as exc:
+        line = f"Cannot read the approval store at {exc.path} ({exc.reason})."
+        if as_json:
+            click.echo(json.dumps({"error": line, "exit_code": 2}, ensure_ascii=True))
+        else:
+            click.echo(line.encode("ascii", "backslashreplace").decode("ascii"))
+        ctx.exit(2)
+        return
+    if as_json:
+        payload = report.to_dict()
+        if pending_rows is not None:
+            payload["pending"] = [plan.to_dict() for _s, _e, plan in pending_rows]
+        click.echo(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True))
+    else:
+        click.echo(_cd.render_text(report), nl=False)
+        if pending_rows is not None:
+            click.echo("")
+            click.echo(_cd.render_pending_text(pending_rows), nl=False)
+    ctx.exit(report.exit_code)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1446,7 +1541,7 @@ def _print_daemon_interpreter(interpreter_match, interpreter_note: str) -> None:
         click.secho(f"  !! {interpreter_note}", fg="yellow")
 
 
-def _print_start_failure(reason: str, log_path) -> None:
+def _print_start_failure(reason: str, log_path, remedy=None) -> None:
     """P1 -- the FAILED readiness verdict, unwrapped, one line per path.
 
     The third sibling of ``_print_daemon_build`` and ``_print_daemon_interpreter``
@@ -1467,10 +1562,31 @@ def _print_start_failure(reason: str, log_path) -> None:
     ASCII throughout (DEC-32c, D5): this is the failure screen, and a console
     that cannot encode a verdict raises where the verdict should have been.
     The ``ERROR`` prefix is unchanged -- e2e29 pins it.
+
+    D-10 -- THE TAIL IS THE MINT'S, WHEN THE MINT HAS ONE. ``remedy`` is
+    ``DaemonReadiness.remedy``: a sentence the refusal itself minted because it
+    knew something this function cannot see. The witnessed case is the
+    port-in-use refusal, where the generic tail below is not merely unhelpful
+    but WRONG -- ``daemon stop`` is pidfile-scoped, the pidfile it reads is this
+    vault's, and the process holding the port belongs to another one, so the
+    operator runs it and is told "Daemon is not running", which contradicts the
+    refusal three lines above. A remedy that cannot work where it is printed is
+    a false assertion about what the operator can do (DEC-34 in product copy).
+
+    The generic tail stays for every failure that has no minted remedy -- a
+    timeout on a daemon of OURS is exactly what it was written for. The choice
+    is made by ONE fact, the presence of a minted remedy; this function does not
+    work out for itself which kind of failure it is looking at.
+
+    The minted remedy carries an absolute path, so it goes out on the same
+    unwrapping writer for the same reason everything else on this screen does.
     """
     click.secho("ERROR Daemon did not become ready.", fg="red")
     click.secho("  {}".format(reason))
     click.secho("  Log: {}".format(log_path))
+    if type(remedy) is str and remedy:
+        click.secho("  {}".format(remedy))
+        return
     click.secho("  Stop the stuck process with: "
                 + click.style("systemu daemon stop", bold=True))
 
@@ -1560,11 +1676,11 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
     from sharing_on.setup_flow import key_present, run_setup
     if not key_present():
         if _sys.stdin.isatty():
-            console.print("[yellow]No LLM provider is usable yet — let's set "
+            console.print("[yellow]No LLM provider is usable yet -- let's set "
                           "one up before starting.[/yellow]")
             run_setup(interactive=True, print_fn=lambda s: console.print(s))
             if not key_present():
-                console.print("[yellow]Still no usable provider — start "
+                console.print("[yellow]Still no usable provider -- start "
                               "aborted. Run [bold]systemu setup[/bold] when "
                               "ready.[/yellow]")
                 ctx.exit(1)   # DEC-41: aborted != success
@@ -1605,6 +1721,32 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
     # `daemon stop` are the first two commands a new install runs. (The panel
     # bullets on `daemon status` are decoration on a bordered Rich panel, not
     # verdicts, and stay as they are.)
+    # NIT: THE IDEMPOTENT CASE SAYS WHAT ACTUALLY HAPPENED. A second `daemon
+    # start` used to print a raw log record -- "[systemu.scheduler.daemon]
+    # WARNING: [Daemon] Already running (PID 30616). Stop it first." -- and then
+    # "OK Daemon ready.", which is true of a daemon this invocation did not
+    # start. An operator reading the pair in order stops the daemon that was
+    # serving them. One plain line instead, gated on the MINTED fact: the CLI
+    # cannot re-derive "was it already there", because a ready verdict looks
+    # identical either way. `click.secho`, not `console.print`: the line carries
+    # a URL and must not fold. `getattr` because a verdict minted by an older
+    # build carries no such field, and this branch must then simply not be
+    # taken.
+    if (verdict is not None and verdict.ready
+            and getattr(verdict, "already_serving", False) is True):
+        click.secho(
+            "OK Daemon already serving this vault (PID {}) on {}".format(
+                verdict.pid, verdict.url),
+            fg="green")
+        # F13 / D1 are KEPT here on purpose: `daemon start` against a daemon
+        # that is already up is exactly the mid-upgrade screen they exist for
+        # -- new CLI, old daemon still holding the port. They print only when
+        # there is something to say, and are indented under the verdict line.
+        _print_daemon_build(verdict.build_match, verdict.build_note)
+        _print_daemon_interpreter(verdict.interpreter_match,
+                                  verdict.interpreter_note)
+        return verdict
+
     if verdict is not None and verdict.ready:
         console.print("[green]OK Daemon ready.[/green]")
         console.print(f"  Accepting connections on {verdict.url}")
@@ -1622,7 +1764,13 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
         return verdict
 
     reason = verdict.reason if verdict is not None else "no readiness verdict was produced"
-    _print_start_failure(reason, Path(config.vault_dir) / "daemon.log")
+    # D-10: the remedy comes FROM the verdict. `getattr` because a verdict
+    # minted by an older build carries no such field, and a failed start must
+    # still print its screen (the same reading `daemon status` gives an older
+    # projection).
+    remedy = getattr(verdict, "remedy", "") if verdict is not None else ""
+    _print_start_failure(reason, Path(config.vault_dir) / "daemon.log",
+                         remedy=remedy)
     ctx.exit(1)
 
 
@@ -1789,7 +1937,12 @@ def daemon_status(ctx, port):
     # reachability pin in tests/test_e2e28_daemon_status_every_verdict_names_the
     # _vault.py watches. `.get` rather than `[...]`: a status dict from an older
     # daemon build is missing keys, and `daemon status` must still print.
-    _print_daemon_reason(status.get("reason"), status.get("vault_root"))
+    # D-6: the provenance note is handed in so the reason can be de-duplicated
+    # against the SAME string the standalone line below prints. Passed, not
+    # re-derived: two derivations of one clause is how the screen came to say
+    # it twice in the first place.
+    _print_daemon_reason(status.get("reason"), status.get("vault_root"),
+                         status.get("port_provenance"))
     _print_daemon_where(status.get("vault_root"), status.get("port_provenance"))
 
     # LAST, so a non-zero verdict never costs the operator the report: the
@@ -1799,16 +1952,43 @@ def daemon_status(ctx, port):
     ctx.exit(exit_code)
 
 
-def _reason_outside_the_panel(reason, vault_root) -> str:
-    """The mint's reason, minus the vault clause the ``vault:`` line carries.
+def _drop_clause(text: str, clause: str) -> str:
+    """Remove ONE minted clause from a minted sentence, by identity.
 
-    P8. The clause is removed by EXACT-STRING IDENTITY against
-    ``daemon.vault_note(vault_root)`` -- the same function that produced it, and
-    the same value the projection already carries -- never by parsing the
-    sentence for something that looks like a path. A sentence-parser here would
-    be a second, disagreeing derivation of a fact the mint already answered
-    (DEC-43), and it would be the one that silently stops matching when the
-    wording changes.
+    The clause is matched WHOLE, in the punctuation the mint joined it with:
+    parenthesised (``... (port 8765 is the built-in default ...)``), joined with
+    a semicolon (``...; vault: <path>``), or bare. Nothing is parsed for a
+    shape -- the caller passes the exact string the mint produced, so a wording
+    change removes the clause or removes nothing, and can never remove
+    something else that happens to look similar.
+    """
+    if type(text) is not str or type(clause) is not str or not clause:
+        return text if type(text) is str else ""
+    for form in (" (" + clause + ")", "(" + clause + ")",
+                 "; " + clause, clause + "; ", clause):
+        if form in text:
+            return text.replace(form, "", 1)
+    return text
+
+
+def _reason_outside_the_panel(reason, vault_root, port_provenance=None) -> str:
+    """The mint's reason, minus the two clauses the unwrapped lines carry.
+
+    P8 (the vault clause) and D-6 (the port's provenance). Both are removed by
+    EXACT-STRING IDENTITY against the values the projection already carries --
+    ``daemon.vault_note(vault_root)`` and ``status["port_provenance"]``, the
+    strings the mint itself produced -- never by parsing the sentence for
+    something that looks like a path or a port clause. A sentence-parser here
+    would be a second, disagreeing derivation of a fact the mint already
+    answered (DEC-43), and it would be the one that silently stops matching
+    when the wording changes.
+
+    D-6's witness: `daemon status` printed `accepting connections on
+    http://127.0.0.1:55193 (port 55193 is the one this vault's daemon
+    recorded)` and then, two lines below, the same sentence again on its own
+    row. The standalone line is the one that survives -- it is minted from the
+    projection by ``_print_daemon_where`` on the writer that does not fold --
+    and the copy folded into the reason goes.
 
     Nothing else is touched: what is left is the mint's own words, including the
     ``--port`` remedy on the not-running verdict and "no systemu daemon is
@@ -1816,22 +1996,20 @@ def _reason_outside_the_panel(reason, vault_root) -> str:
     only thing on screen that tells a foreign program on the socket from a
     dashboard.
 
-    DEC-36: both arguments arrive from a projection an older daemon may have
-    minted without either key, so the concrete type is pinned in this frame.
+    DEC-36: every argument arrives from a projection an older daemon may have
+    minted without the key, so the concrete type is pinned in this frame.
     """
     from systemu.scheduler.daemon import vault_note
 
     text = reason if type(reason) is str else ""
     if type(vault_root) is str and vault_root:
-        clause = vault_note(vault_root)
-        for form in ("; " + clause, clause + "; ", clause):
-            if form in text:
-                text = text.replace(form, "", 1)
-                break
+        text = _drop_clause(text, vault_note(vault_root))
+    if type(port_provenance) is str and port_provenance:
+        text = _drop_clause(text, port_provenance)
     return text.strip()
 
 
-def _print_daemon_reason(reason, vault_root) -> None:
+def _print_daemon_reason(reason, vault_root, port_provenance=None) -> None:
     """WHY the verdict is what it is -- outside the panel, unwrapped.
 
     ``click.echo``, never ``console.print``: this sentence carries a port, a
@@ -1839,7 +2017,7 @@ def _print_daemon_reason(reason, vault_root) -> None:
     Rich folds a paragraph at the console width wherever the break lands. It is
     also printed LITERALLY, so a path containing ``[`` is not eaten as markup.
     """
-    text = _reason_outside_the_panel(reason, vault_root)
+    text = _reason_outside_the_panel(reason, vault_root, port_provenance)
     if text:
         click.echo(text)
 
@@ -2014,12 +2192,23 @@ def roots_grant(ctx, path: str, assume_yes: bool):
     canon = canonicalize(path)
 
     # --- refuse before asking, before consent is even mentioned ---
+    #
+    # D-12: THE REFUSAL ECHOES WHAT THE OPERATOR TYPED. The CHECK is still made
+    # against `canon` -- `canonicalize` remains the only authority on what the
+    # path IS -- but the sentence quotes the input, because a refusal is a claim
+    # ABOUT WHAT THE OPERATOR SAID and the one thing that makes such a claim
+    # checkable is seeing your own words come back. `normcase` case-folds, so
+    # the witnessed refusal answered `c:\users\...\notthere` for a string typed
+    # with capitals: a typo is visible in `Documnets` and invisible once the
+    # whole string has been rewritten into a form nothing in the shell history
+    # matches. Nothing is derived here -- `path` is printed exactly as click
+    # received it, so there is still no second normalizer in this group.
     if not os.path.exists(canon):
-        click.echo(f"Refused: that path does not exist: {canon}")
+        click.echo(f"Refused: that path does not exist: {path}")
         click.echo("Nothing was granted.")
         ctx.exit(1)
     if not os.path.isdir(canon):
-        click.echo(f"Refused: that path is not a directory: {canon}")
+        click.echo(f"Refused: that path is not a directory: {path}")
         click.echo("A grant names a folder, not a file. Nothing was granted.")
         ctx.exit(1)
 
@@ -2046,8 +2235,11 @@ def roots_grant(ctx, path: str, assume_yes: bool):
         click.echo("")
         click.echo("Refused: there is no terminal to ask on "
                    "(Docker / CI / a service).")
+        # D-12: as typed. This one names a command to RE-RUN, and a path
+        # rewritten inside it is a command the operator cannot recognise as
+        # their own -- nor, if it was relative, paste back into the same shell.
         click.echo(f"Re-run with --yes once you have read the above: "
-                   f"systemu roots grant {canon} --yes")
+                   f"systemu roots grant {path} --yes")
         click.echo("Nothing was granted.")
         ctx.exit(consent_prompt.CONSENT_NO_TERMINAL)
     if answer != consent_prompt.CONSENT_GRANTED:
@@ -2092,7 +2284,11 @@ def roots_revoke(ctx, path: str):
         click.echo("The next survey will stop reading inside it.")
         return
 
-    click.echo(f"Not granted: {canon}")
+    # D-12: the REFUSAL echoes what was typed, while `Revoked:` above keeps
+    # naming the canonical path -- that line reports what the store no longer
+    # holds, and the store holds exactly one string. This line reports what the
+    # operator asked for and the store did not have.
+    click.echo(f"Not granted: {path}")
     click.echo("Nothing was changed. Run `systemu roots list` to see what is granted.")
     ctx.exit(1)
 
@@ -2564,71 +2760,6 @@ def debug_avoidable_forge(ctx):
         click.echo(line)
 
 
-def _persisted_requirement_rows(data_dir=None):
-    """R-B5 / T5 (spec section 10) -- every persisted RequirementReport's requirements,
-    flattened into ONE list for the inventory-hit metric.
-
-    WHERE THE INPUT COMES FROM. A run's ``RequirementReport`` survives the run in
-    exactly one place: ``ExecutionSnapshot.requirement_report``
-    (``systemu/runtime/execution_snapshot.py``:102, serialised at :272), on disk at
-    ``<data_dir>/audit/exec_<execution_id>/resume_snapshot.json`` (:54). Everywhere
-    else it is held only on ``context._requirement_report`` for the life of the
-    process (``shadow_runtime.py``:1545), so there is nothing else durable to read.
-    The directory scan mirrors the one existing precedent for finding runs this way,
-    ``scheduler/jobs.py``:806 (``_scan_wait_execution_ids``); ``data_dir`` defaults to
-    ``execution_snapshot.audit_data_root()``, the SAME mint ``write_snapshot`` defaults
-    to, so the reader and the writer resolve the same directory without a second
-    derivation -- and without either of them resolving it against its own cwd.
-
-    THE POPULATION IS SPARSE, AND THAT IS A PROPERTY OF THE INPUT, NOT A BUG HERE: a
-    snapshot is written when a run suspends and DELETED when the resume consumes it
-    (``delete_snapshot``, :230). The metric therefore reads the runs that persisted a
-    report, never "all runs ever". The caller renders NOT MEASURED -- never 0% -- when
-    the set is empty, because an unmeasured population is a different claim from a
-    measured zero.
-
-    READ-ONLY, and deliberately NOT via ``read_snapshot``: that entry point migrates
-    and may raise ``SnapshotRefused`` on a newer schema (DEC-9), which is correct for
-    a RESUME (it must not re-execute effects against a shape it cannot read) and wrong
-    for a printout, which may never adjudicate a run. Anything unreadable is skipped;
-    nothing here raises and nothing here writes.
-
-    The flatten is ``table_payoff._requirements`` -- the metric's OWN projection,
-    imported rather than re-implemented. Re-reading ``per_objective`` locally would be
-    a second copy of the projection that module documents as single-owner (see its
-    note on the deleted ``_is_ask`` mirror): it would drift silently, and the count
-    would keep rendering while measuring something else.
-    """
-    from systemu.runtime import table_payoff
-    from systemu.runtime.execution_snapshot import audit_data_root
-
-    base = audit_data_root(data_dir)
-    rows = []
-    try:
-        audit = base / "audit"
-        if not audit.is_dir():
-            return rows
-        exec_dirs = sorted(audit.glob("exec_*"))
-    except Exception:
-        return rows
-
-    for exec_dir in exec_dirs:
-        try:
-            snap = exec_dir / "resume_snapshot.json"
-            if not snap.is_file():
-                continue
-            data = json.loads(snap.read_text(encoding="utf-8"))
-        except Exception:
-            continue                       # corrupt / unreadable => not counted
-        if not isinstance(data, dict):
-            continue
-        report = data.get("requirement_report")
-        if not isinstance(report, dict):
-            continue
-        rows.extend(table_payoff._requirements(report))
-    return rows
-
-
 @debug_group.command("avoidable-ask")
 @click.pass_context
 def debug_avoidable_ask(ctx):
@@ -2654,14 +2785,14 @@ def debug_avoidable_ask(ctx):
         and you changed nothing. Reported apart from the cases it could NOT have
         produced. Includes the ask-to-resolve trend. Credential asks are never
         recorded.
-      * INVENTORY-HIT -- the same question from the other end: how often what it
-        already knew (including your own table) turned a from-scratch gap into a
-        pre-filled one-click confirm. The silent binds and the pre-filled
-        confirms are separate counts and are never summed. Read from the
-        requirement reports left behind in execution snapshots
-        (``data/audit/exec_*/resume_snapshot.json``), so a vault whose runs
-        never suspended has none, and the unmeasured line names the directory it
-        searched.
+      * INVENTORY-HIT -- the same question from the other end: of the runs
+        that had your table on hand, how many had it answer at least one
+        requirement (a pre-filled one-click confirm instead of asking you from
+        scratch). The silent binds and the pre-filled confirms are separate
+        counts and are never summed. Read from the durable per-run table record
+        (``data/audit/table_payoff/``), which no resume deletes; the unmeasured
+        line names the directory it searched, and a record that cannot be read
+        is named rather than silently left out.
       * QUICK-LANE asks -- the only one of the four about the quick lane, which
         writes none of the corpora above. One row per question, so how often the
         lane's own question cap ended a run, and how much of that traffic was
@@ -2671,46 +2802,36 @@ def debug_avoidable_ask(ctx):
     from systemu.runtime.replay_metrics import (
         avoidable_ask_report, format_avoidable_ask, format_quick_lane_ask,
         quick_lane_ask_report)
-    from systemu.runtime.table_payoff import format_inventory_hit, inventory_hit_report
     _, vault = _get_vault_and_config(ctx)
     for line in format_avoidable_ask(avoidable_ask_report(vault)):
         click.echo(line)
 
-    # R-B5 / T5 (section 10, section 5.10.e AC7) -- the inventory-hit payoff, printed
-    # beside the avoidable-ask lines because the two answer the same operator question
-    # from opposite ends: how often did it ask, and how often did the inventory spare
-    # the ask. AC7 is a SPLIT, not a total -- format_inventory_hit renders `silent` and
-    # `prefilled_confirm` as separate counts, and they must never be summed here or a
-    # collapse in one would hide behind the other.
+    # R-B5 / T5 (DEC-27) -- the inventory-hit payoff, printed beside the avoidable-ask
+    # lines because the two answer the same operator question from opposite ends: how
+    # often did it ask, and how often did the operator's table spare the ask.
     #
-    # READ-ONLY by construction: this reads inventory_hit_report / format_inventory_hit
-    # only. The section 5.10.c chips are NOT rendered here -- answered_from_table WRITES
-    # the novelty ledger, so a printout that called it would burn an item's novelty
-    # every time an operator asked for metrics.
-    from systemu.runtime.execution_snapshot import audit_data_root
-    _audit_dir = audit_data_root() / "audit"
-    rows = _persisted_requirement_rows()
+    # It reads the DURABLE per-run table record (``table_payoff_record``): one file per
+    # root run, written by the binder the moment a table item supplied a requirement,
+    # never deleted by the snapshot lifecycle. Its DENOMINATOR is the runs that
+    # consulted the table -- witnessed by the same record -- and an empty record is NOT
+    # MEASURED, never 0%. Unreadable run files are counted and named, and while any
+    # exist the silent-bind tripwire is reported NOT EVALUATED, never healthy.
+    #
+    # RETIRED: a second block used to read the RequirementReport cached in each run's
+    # resume snapshot. A resume DELETES that snapshot, so the population it measured
+    # shrank over time; it is gone (the snapshots themselves still serve resume).
+    #
+    # AC7 is a SPLIT, not a total: silent binds and pre-filled confirms are separate
+    # counts. READ-ONLY: scan_records never writes, and the chips' builders are not
+    # called -- answered_from_table WRITES the novelty ledger, so a printout that
+    # called it would burn an item's novelty every time an operator asked for metrics.
+    from systemu.runtime.table_payoff import (
+        format_record_inventory_hit, record_inventory_hit_report)
+    from systemu.runtime import table_payoff_record as _tpr
     click.echo("")
-    if not rows:
-        # An unmeasured population is a different claim from a measured zero; the
-        # zeros the formatter would print here would read as "the table never paid
-        # off". Same rule (and wording) as resolver_replay's "this is NOT 0%".
-        #
-        # AND IT NAMES THE DIRECTORY IT SEARCHED. The sentence used to read "no run
-        # has persisted a RequirementReport yet" -- a claim about every run on the
-        # machine, printed on a machine that held one, because the search root came
-        # off the operator's cwd. An unmeasured verdict is only honest when the
-        # reader can see WHERE it looked and check.
-        click.echo("Inventory-hit: NOT MEASURED -- no persisted RequirementReport "
-                   "was found; NO RATE (this is NOT 0%)")
-        click.echo(f"  (searched: {_audit_dir}{os.sep}exec_*"
-                   f"{os.sep}resume_snapshot.json)")
-        click.echo("  (the per-run report is cached in the execution snapshot there, "
-                   "written when a run")
-        click.echo("   suspends and consumed when it resumes.)")
-    else:
-        for line in format_inventory_hit(inventory_hit_report(rows)):
-            click.echo(line)
+    for line in format_record_inventory_hit(
+            record_inventory_hit_report(_tpr.scan_records())):
+        click.echo(line)
 
     # R-QL1 (DEC-7) -- the QUICK-LANE ask surface. DEC-7's amended criterion is about
     # the quick lane's operator-question cap, and BOTH blocks above are deep-lane: they
@@ -2926,8 +3047,12 @@ def decisions_list(ctx):
 @click.option("--set", "set_mode", default=None,
               type=click.Choice(["bypass", "risk_tiered", "approve_only"]),
               help="Set the gate mode dial (persisted to .env).")
+@click.option("--confirm", "confirm", default=None, metavar="PHRASE",
+              help="Typed confirmation naming the new posture. Required when --set "
+                   "LOWERS approval requirements (e.g. --set bypass needs "
+                   "--confirm \"bypass\"); a tightening needs none.")
 @click.pass_context
-def decisions_mode(ctx, set_mode):
+def decisions_mode(ctx, set_mode, confirm):
     """Show or set the gate-mode dial.
 
     Modes:
@@ -2937,11 +3062,22 @@ def decisions_mode(ctx, set_mode):
       approve_only  always ask the operator.
 
     With no --set, prints the current mode + per-type overrides + floor state.
+    A --set that lowers approval requirements is refused unless --confirm names
+    the new posture exactly (the refusal prints the phrase).
     """
     from systemu.runtime.gate_mode_settings import (
         get_gate_mode_settings, save_gate_mode_settings)
 
     if set_mode is not None:
+        # R1 (spec section 10 / 5.10.b#5): --set writes the mode and RESETS the
+        # overrides and the floor, so that is the posture compared -- a dropped
+        # "deny" override is a loosening the phrase must name too.
+        refusal = _gate_mode_posture_refusal(
+            {"mode": set_mode, "overrides": {}, "no_floor": False}, confirm)
+        if refusal:
+            console.print(f"[red]Not saved:[/red] {refusal}")
+            ctx.exit(2)
+            return
         try:
             save_gate_mode_settings(mode=set_mode)
         except ValueError as exc:
@@ -2995,7 +3131,10 @@ def _reclassify_needs_the_inbox(choice: str) -> bool:
 @click.option("--choice", "-c", required=True, help="One of the decision's options.")
 @click.pass_context
 def decisions_resolve(ctx, decision_id: str, choice: str):
-    """Resolve a pending decision with the operator's chosen option."""
+    """Resolve a pending decision with the operator's chosen option.
+
+    If the decision's run was cancelled, the answer is not needed: nothing is
+    recorded, the notice is printed, and the command exits 0 (nothing failed)."""
     if _reclassify_needs_the_inbox(choice):
         console.print(
             "[red]Not available here.[/red] Reclassifying an effect requires a typed "
@@ -3006,10 +3145,17 @@ def decisions_resolve(ctx, decision_id: str, choice: str):
         ctx.exit(2)
         return
     _, vault = _get_vault_and_config(ctx)
-    from systemu.approval.decision_queue import OperatorDecisionQueue
+    from systemu.approval.decision_queue import AnswerNotNeeded, OperatorDecisionQueue
     queue = OperatorDecisionQueue(vault)
     try:
         resolved = queue.resolve(decision_id, choice=choice)
+    except AnswerNotNeeded as late:
+        # IMPL-11: the card's run was cancelled. Not a failure - nothing was
+        # recorded and nothing needed recording - so the notice is printed as
+        # itself (no "Invalid choice:" prefix) and the command exits 0. Caught
+        # before ValueError, which it subclasses.
+        console.print(str(late), markup=False, highlight=False)
+        return
     except KeyError as exc:
         console.print(f"[red]Not found:[/red] {exc}")
         ctx.exit(1)

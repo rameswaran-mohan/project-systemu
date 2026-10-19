@@ -24,6 +24,7 @@ Security:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set
@@ -81,6 +82,49 @@ def route_callback(callback_data, sender_id: str) -> tuple[str, str]:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  One poller per bot token per process
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Telegram serves ``getUpdates`` to ONE long-poller per bot token; a second one
+# gets 409 Conflict, and each gateway's EventPusher pushes every event again.
+# The daemon used to start a gateway at boot while ``run_dashboard`` (launched
+# inside the same daemon process) started a second one. The daemon now owns the
+# only gateway, and this registry makes the pair impossible to reintroduce: a
+# second ``start()`` for a token that already has a live poller in this process
+# returns the polling instance instead of spawning another. Keyed on a digest of
+# the token so the raw token is never a dict key that a debug dump could print.
+# The claim is live exactly while the owner's poll thread is alive: a stopped or
+# crashed owner (or one whose library was missing) frees the token for a later
+# start(), and a wedged-but-alive one keeps it (a second poller would 409).
+
+_REGISTRY_LOCK = threading.Lock()
+_RUNNING: Dict[str, "TelegramGateway"] = {}
+
+
+def _token_key(bot_token: str) -> str:
+    return hashlib.sha256(bot_token.encode("utf-8")).hexdigest()
+
+
+def running_gateway(bot_token: Optional[str] = None) -> Optional["TelegramGateway"]:
+    """The gateway currently polling for ``bot_token`` in this process, or None.
+
+    ``bot_token`` defaults to ``SHARING_ON_TELEGRAM_BOT_TOKEN``. Read-only: this
+    is how a surface that does not own the gateway (the dashboard) shows its
+    status without starting one.
+    """
+    if bot_token is None:
+        import os
+        bot_token = os.environ.get("SHARING_ON_TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token:
+        return None
+    with _REGISTRY_LOCK:
+        owner = _RUNNING.get(_token_key(bot_token))
+    if owner is not None and owner._poller_alive():
+        return owner
+    return None
+
+
 class TelegramGateway:
     """Telegram bot — long-poll inbound, push outbound."""
 
@@ -107,26 +151,48 @@ class TelegramGateway:
         self._app = None             # python-telegram-bot Application, lazily built
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._dup_start_logged = False
 
     # ── Public lifecycle ────────────────────────────────────────────
 
-    def start(self) -> None:
-        """Spawn a background thread running the bot's poll loop."""
-        if self._thread and self._thread.is_alive():
-            logger.info("[TelegramGateway] already running — start() is a no-op")
-            return
+    def _poller_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run_poll_loop,
-            daemon=True,
-            name="telegram-gateway",
-        )
-        self._thread.start()
+    def start(self) -> "TelegramGateway":
+        """Spawn a background thread running the bot's poll loop.
+
+        Returns the instance that OWNS the poller for this bot token: ``self``
+        normally, or the instance already polling the same token in this
+        process (no second poller is spawned; an INFO line says so once).
+        Callers must use the returned instance.
+        """
+        key = _token_key(self.bot_token)
+        with _REGISTRY_LOCK:
+            owner = _RUNNING.get(key)
+            if owner is not None and owner._poller_alive():
+                if owner is self:
+                    logger.info("[TelegramGateway] already running -- start() is a no-op")
+                elif not owner._dup_start_logged:
+                    owner._dup_start_logged = True
+                    logger.info(
+                        "[TelegramGateway] a gateway for this bot token is already "
+                        "polling in this process -- returning it instead of starting "
+                        "a second poller (one getUpdates poller per token)")
+                return owner
+
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run_poll_loop,
+                daemon=True,
+                name="telegram-gateway",
+            )
+            _RUNNING[key] = self
+            self._thread.start()
         logger.info(
             "[TelegramGateway] started (allowlist=%d user%s)",
             len(self.allowlist), "" if len(self.allowlist) == 1 else "s",
         )
+        return self
 
     def stop(self) -> None:
         """Signal the poll loop to exit.  Returns once the thread joined."""

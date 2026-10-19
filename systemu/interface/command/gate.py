@@ -75,13 +75,23 @@ class GateDescriptor(BaseModel):
     # for every non-elicitation gate (back-compat). Carried so the operator
     # card can render a multi-field form and the reconciler can type-coerce.
     requested_schema:  dict = Field(default_factory=dict)
+    # R1 (spec section 10): the irreversible classes this card's action carries
+    # (``action_governance.irreversible_effects`` over the SCORED tags) and the
+    # phrase the operator must type to approve it once. Empty on every other card.
+    irreversible_effects: List[str] = Field(default_factory=list)
+    confirm_phrase:    str = ""
     model_config = {"extra": "forbid"}
 
     def to_decision_context(self, *, gate_type: str) -> dict:
         """Serialize this descriptor into an OperatorDecision.context payload.
         kind="gate" marks queue rows owned by the Inbox facade so legacy
-        decision rows (kind="harness_review"/...) stay distinguishable."""
-        return {
+        decision rows (kind="harness_review"/...) stay distinguishable.
+
+        R1: a typed-confirm card carries its stamp HERE, from the descriptor, so the
+        card the operator sees and the context every resolve path reads are one
+        value. ``requires_typed_confirm`` also floors the card off the phone
+        (``messaging.decision_bridge.classify_resolution``)."""
+        ctx = {
             "kind":              "gate",
             "gate_type":         gate_type,
             "risk":              self.risk,
@@ -90,22 +100,63 @@ class GateDescriptor(BaseModel):
             "what_approve_does": self.what_approve_does,
             "tool_id":           self.tool_id,
         }
+        if self.irreversible_effects:
+            from systemu.runtime.command_approvals import (
+                CONFIRM_PHRASE_KEY, IRREVERSIBLE_EFFECTS_KEY, IRREVERSIBLE_FLAG_KEY,
+                REQUIRES_TYPED_CONFIRM_KEY)
+            ctx[IRREVERSIBLE_FLAG_KEY] = True
+            ctx[IRREVERSIBLE_EFFECTS_KEY] = list(self.irreversible_effects)
+            ctx[REQUIRES_TYPED_CONFIRM_KEY] = True
+            ctx[CONFIRM_PHRASE_KEY] = self.confirm_phrase
+        return ctx
 
     @classmethod
     def from_decision_context(cls, ctx: dict, *, title: str = "",
                               options=None, dedup: str = "") -> "GateDescriptor":
         """Reconstruct a descriptor from a stored context (+ the decision's
-        title/options/dedup_key, which live on the OperatorDecision itself)."""
+        title/options/dedup_key, which live on the OperatorDecision itself).
+
+        A DEPENDENCY card's "what installing it would add" section is refreshed
+        here from the session cache: the card is stored when it is posted, which
+        is usually before pip has finished resolving, so the stored section is a
+        placeholder. Cache read only -- this runs on render paths and never starts
+        a subprocess."""
+        inspect = ctx.get("inspect", "")
+        _dedup = dedup or ctx.get("dedup", "")
+        if ctx.get("gate_type") == "dep" and type(_dedup) is str \
+                and _dedup.startswith("dep:"):
+            try:
+                from systemu.runtime.capability_diff import with_dep_card_section
+                inspect = with_dep_card_section(inspect, _dedup[len("dep:"):])
+            except Exception:
+                pass    # the stored card is still a truthful card
+        opts = list(options if options is not None else ctx.get("options", []))
+        risk = ctx.get("risk", "low")
+        # R1: re-derived from the stored context by the SAME function every resolve
+        # path uses -- so a money card an OLDER build posted (it carries scored
+        # effect_tags but no R1 stamp, and still offers "Always allow") renders as
+        # what it is: high risk, no standing option, a phrase to type.
+        from systemu.runtime.command_approvals import (expected_confirm_phrase,
+                                                       irreversible_card_effects)
+        irrev = list(irreversible_card_effects(ctx))
+        phrase = ""
+        if irrev:
+            opts = [o for o in opts
+                    if not (type(o) is str and o.strip().lower() == "always allow")]
+            risk = "high"
+            phrase = expected_confirm_phrase(ctx)
         return cls(
             title=title or ctx.get("title", ""),
-            risk=ctx.get("risk", "low"),
-            inspect=ctx.get("inspect", ""),
-            options=list(options if options is not None else ctx.get("options", [])),
+            risk=risk,
+            inspect=inspect,
+            options=opts,
             safe_default=ctx.get("safe_default", ""),
             what_approve_does=ctx.get("what_approve_does", ""),
             dedup=dedup or ctx.get("dedup", ""),
             # Back-compat: legacy dep rows stored the id as first_seen_tool_id.
             tool_id=ctx.get("tool_id") or ctx.get("first_seen_tool_id", "") or "",
+            irreversible_effects=irrev,
+            confirm_phrase=phrase,
         )
 
     @classmethod
@@ -176,22 +227,36 @@ class GateDescriptor(BaseModel):
         )
 
     @classmethod
-    def from_dep(cls, entry) -> "GateDescriptor":
+    def from_dep(cls, entry, *, transitive=None) -> "GateDescriptor":
         """Build a GateDescriptor from a pending dependency entry.
 
         ``entry`` mirrors a ``DepApprovalStore.list_pending()`` row:
         ``{"package", "first_seen_tool", "first_seen_tool_id",
         "request_count", ...}``.  Installing arbitrary packages on the floor
         is a high-risk action, so safe-default is "Dismiss".
+
+        The card also says what approving would REALLY install: ``pip install X``
+        brings in every package X needs that is not already present. ``transitive``
+        is a resolved ``capability_diff.TransitivePlan``; without one the section
+        comes from the session cache, and a card posted by a live run starts the
+        resolution on a worker thread (never on this thread). When nothing is
+        resolved the card says so -- it never lists a guess.
         """
         package = entry.get("package", "?")
         tool = entry.get("first_seen_tool") or entry.get("first_seen_tool_id") or "?"
         count = entry.get("request_count", 1)
         options = ["Dismiss", "Approve & Install"]
+        inspect = f"Requested by {tool} x{count}"
+        try:
+            from systemu.runtime.capability_diff import with_dep_card_section
+            inspect = with_dep_card_section(inspect, str(package),
+                                            transitive=transitive, may_prefetch=True)
+        except Exception:
+            pass    # the card without the section is still a truthful card
         return cls(
             title=f"Install dependency: {package}",
             risk="high",
-            inspect=f"Requested by {tool} x{count}",
+            inspect=inspect,
             options=options,
             safe_default=options[0],
             what_approve_does=(f"pip install {package} and re-run the "
@@ -237,7 +302,11 @@ class GateDescriptor(BaseModel):
                   reason: str = "", effect_tags=None,
                   reclassified: bool = False,
                   assigned_class: str = "",
-                  args_preview=None) -> "GateDescriptor":
+                  args_preview=None,
+                  host_class: str = "",
+                  legacy_host_class: str = "",
+                  irreversible_effects=(),
+                  confirm_phrase: str = "") -> "GateDescriptor":
         """Build a GateDescriptor for a gated forged/registry tool call (S1b, THE
         CRUX). Mirrors ``from_command``: safe_default "Deny" (index 0, fail-closed),
         dedup keyed on the EXACT tool signature (``tool:<sig>``) so re-attempts and
@@ -264,11 +333,18 @@ class GateDescriptor(BaseModel):
         params-independent signature), and no second reclassify, because the operator
         has already classified this call. Risk stays "high": an effect that was refused
         once does not become routine because it now has a label.
+
+        R1 ``irreversible_effects`` (``action_governance.irreversible_effects`` over the
+        SCORED tags, computed by the gate) marks the spec section 10 typed-confirm
+        surface: risk HIGH, options exactly ["Deny", "Approve once"] -- never "Always
+        allow", never bulk -- and "Approve once" needs the operator to type
+        ``confirm_phrase``. A DENY card keeps its refusal shape (it approves nothing).
         """
         # normalise via .value: Verdict is a str-Enum and str(member) is
         # "Verdict.DENY", which would not match and would re-offer the option.
         is_deny = str(getattr(verdict, "value", verdict) or "").strip().lower() == "deny"
-        if reclassified:
+        irrev = sorted({str(e) for e in (irreversible_effects or ())})
+        if reclassified or (irrev and not is_deny):
             options = ["Deny", "Approve once"]
         elif is_deny:
             # NO "Approve once" (adversarial review, CRITICAL). It does NOTHING at the
@@ -284,6 +360,15 @@ class GateDescriptor(BaseModel):
             options = ["Deny", "Approve once", "Always allow"]
         tags = ", ".join(sorted(str(t) for t in (effect_tags or []))) or "unclassified"
         inspect = f"tool: {tool_name}\neffects: {tags}\nverdict: {verdict}"
+        if host_class:
+            # The host class the signature binds (``command_approvals.tool_host_class``):
+            # "none", "undeclared", or the hostnames the tool's spec declares.
+            inspect += f"\nhosts: {host_class}"
+        if legacy_host_class:
+            # The upgrade path: an approval minted before host checks existed bound
+            # no host, so a networked tool is asked again -- and the card says why.
+            inspect += ("\napproved before host checks existed; confirm the hosts "
+                        f"it may reach: {legacy_host_class}")
         if args_preview:
             # WHICH call this is. The tool signature is params-INDEPENDENT, so without
             # the arguments two entirely different calls render an identical card — and
@@ -312,24 +397,18 @@ class GateDescriptor(BaseModel):
                 "is posted on that classification.")
         else:
             # IMPL-1 HONESTY: name ONLY what the signature this card is about
-            # actually binds. This line used to promise "+ host class". That is
-            # true of ``command_approvals.tool_signature`` -- it takes a
-            # host_class and re-gates on a changed one -- but it is false of THIS
-            # SYSTEM: no host resolver exists yet, so ``_maybe_gate_tool``
-            # (tool_sandbox.py) passes host_class="" unconditionally behind a
-            # comment saying the host signal is DEFERRED, and first_gate_review
-            # mirrors it. So a host-parameterized tool blessed while it talked to
-            # one host stays blessed against EVERY host, and the card was
-            # promising a fence the store does not have.
-            #
-            # The re-forge clause IS true today: body_hash is the sha1 of the
-            # implementation bytes, so a re-forged body yields a different
-            # signature and gates again. It also matches the sibling bulk
-            # first-gate card below, which already words it that way.
-            #
-            # Do NOT re-add the host-class clause until a resolver actually
-            # populates it. tests/test_impl1_host_class_claim.py witnesses that
-            # condition from the live gate and documents how to flip the pin.
+            # actually binds. The host-class clause was REMOVED in v0.10.27
+            # because nothing populated it -- the gate passed host_class=""
+            # unconditionally, so a host-parameterized tool blessed against one
+            # host stayed blessed against every host. It is back because it is
+            # true again: ``_maybe_gate_tool`` now binds
+            # ``command_approvals.tool_host_class(tool)`` -- derived from the
+            # tool's DECLARED effect tags and hosts -- into the signature, so a
+            # change to the hosts the spec declares re-gates the tool exactly as
+            # a re-forged body does. The bulk first-gate card below and
+            # ``first_gate_review`` bind the same class from the same function.
+            # (The per-CALL resolved target is still deferred; this binds the
+            # declared class, which is what the clause says.)
             # D3 HONESTY (dogfood 0.10.28): this line described the MEMORY
             # semantics of one option and said nothing about what either option
             # DOES to the parked run. Meanwhile the run's own status text told the
@@ -340,9 +419,34 @@ class GateDescriptor(BaseModel):
             what = (
                 f"Runs the {tool_name!r} tool ({tags}). 'Approve once' runs it "
                 "now, this once. 'Always allow' runs it now and remembers this "
-                "exact tool body + effect set, so re-forging this tool re-gates "
-                "it. Either way the parked run picks up on its own -- you do not "
-                "need to start it again.")
+                "exact tool body + effect set + host class, so re-forging this "
+                "tool or changing the hosts it may reach re-gates it. Either way "
+                "the parked run picks up on its own -- you do not need to start "
+                "it again.")
+        stamp = irrev if not is_deny else []
+        phrase = ""
+        if stamp:
+            # R1: the card says WHAT is approved, WHY it cannot be remembered, and
+            # exactly what to type. ASCII (DEC-32c): the operator reads this line
+            # back on whatever console codepage they run.
+            from systemu.runtime.action_governance import MONEY_EFFECTS
+            from systemu.runtime.command_approvals import _ascii, typed_confirm_phrase
+            phrase = (confirm_phrase if type(confirm_phrase) is str
+                      and confirm_phrase.strip() else typed_confirm_phrase(tool_name))
+            phrase = _ascii(phrase).strip()
+            why = ("it moves money" if any(e in MONEY_EFFECTS for e in stamp)
+                   else "its effect cannot be undone")
+            classed = (f", scored as the effect class you assigned "
+                       f"({assigned_class or 'unspecified'})" if reclassified else "")
+            risk = "high"
+            what = _ascii(
+                f"Runs the {tool_name!r} tool ONCE, now ({tags}){classed}. "
+                f"This action cannot be undone - {why} "
+                f"({', '.join(stamp)}) - so it cannot be remembered: there is no "
+                "'Always allow' and no batch approval, and you will be asked again "
+                f"every time. To approve it, type {phrase} exactly in the "
+                "confirmation box and choose 'Approve once'. A click without the "
+                "phrase approves nothing. The parked run then picks up on its own.")
         return cls(
             title=f"Run tool: {tool_name}",
             risk=risk,
@@ -351,6 +455,8 @@ class GateDescriptor(BaseModel):
             safe_default=options[0],
             what_approve_does=what,
             dedup=f"tool:{sig}",
+            irreversible_effects=list(stamp),
+            confirm_phrase=phrase,
         )
 
     @classmethod

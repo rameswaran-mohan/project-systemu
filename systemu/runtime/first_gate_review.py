@@ -142,6 +142,13 @@ class ReviewEntry(BaseModel):
     effect_tags: Tuple[str, ...] = ()
     verdict: str = ""
     reason: str = ""
+    # The two signature parts the other fields do not already carry. With them the
+    # entry recomputes to ``signature`` on its own, which is what lets
+    # `systemu tools diff` read a bulk approval back out of the decision ledger and
+    # say WHAT it bound. Defaulted, so a card stored by an older build still loads
+    # (its entries simply cannot be verified, and the report says so).
+    body_hash: str = ""
+    host_class: str = ""
 
     model_config = {"extra": "forbid", "frozen": True}
 
@@ -261,12 +268,14 @@ def batch_rule_sentence() -> str:
 
 
 def build_entry(*, tool_id: str, name: str, effect_tags: Sequence[str],
-                signature: str) -> ReviewEntry:
+                signature: str, body_hash: str = "",
+                host_class: str = "") -> ReviewEntry:
     """Build one review entry, scoring it at migration time."""
     tags = tuple(sorted(str(t) for t in (effect_tags or ())))
     verdict, reason = migration_verdict(name, tags)
     return ReviewEntry(tool_id=tool_id or "", name=name or "", signature=signature or "",
-                       effect_tags=tags, verdict=verdict, reason=reason)
+                       effect_tags=tags, verdict=verdict, reason=reason,
+                       body_hash=body_hash or "", host_class=host_class or "")
 
 
 def is_bulk_eligible(verdict: Any) -> bool:
@@ -474,6 +483,7 @@ def collect_backfilled_entries(vault_dir, *, tool_signature_fn=None) -> List[Rev
 
     if tool_signature_fn is None:
         from systemu.runtime.command_approvals import tool_signature as tool_signature_fn
+    from systemu.runtime.command_approvals import signature_host_class, tool_host_class
 
     for row in index:
         try:
@@ -487,17 +497,32 @@ def collect_backfilled_entries(vault_dir, *, tool_signature_fn=None) -> List[Rev
             name = body.get("name") or row.get("name") or ""
             tags = list(body.get("effect_tags") or [])
             body_hash = _body_hash(vault_dir, body)
-            # host_class is empty for the same reason the live gate leaves it empty:
-            # there is no host resolver yet (see tool_sandbox._maybe_gate_tool D1). If
-            # that changes, the signature computed here must change WITH it or a swept
-            # allow would key on a signature the gate never looks up.
+            # The host class comes from the SAME function the live gate calls, over
+            # the SAME view of the tool the gate sees (the validated ``Tool`` model,
+            # which is what ``vault.get_tool`` hands the gate -- a raw-JSON key the
+            # model drops must not count here either). If this disagreed with the
+            # gate by one byte, a swept allow would key on a signature the gate never
+            # looks up and the card would report tools as remembered that still ask.
+            host_class = tool_host_class(_gate_view(body))
             sig = tool_signature_fn(name, body_hash, {str(t) for t in tags},
-                                    host_class="")
+                                    host_class=signature_host_class(host_class))
             entries.append(build_entry(tool_id=tid, name=name, effect_tags=tags,
-                                       signature=sig))
+                                       signature=sig, body_hash=body_hash,
+                                       host_class=host_class))
         except Exception:  # noqa: BLE001
             logger.debug("[FirstGateReview] skipping tool row", exc_info=True)
     return entries
+
+
+def _gate_view(body: Dict[str, Any]):
+    """The tool as the live gate sees it: the validated ``Tool`` model (what
+    ``vault.get_tool`` returns). Falls back to the raw mapping only for a row the
+    model cannot load -- a row the gate could never load either."""
+    try:
+        from systemu.core.models import Tool
+        return Tool.model_validate(body)
+    except Exception:  # noqa: BLE001
+        return body
 
 
 def _body_hash(vault_dir, body: Dict[str, Any]) -> str:

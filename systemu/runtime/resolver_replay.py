@@ -47,6 +47,11 @@ plaintext answer for a secret-classified ``schema_path`` (see
 BOUNDARY — what this does NOT measure
 =====================================
 * It measures the corpus in ``fixtures/field/``, **not** production traffic.
+  The wheel ships a byte-identical copy as package data
+  (``systemu/fixtures/field/``, found with ``importlib.resources``) so the
+  command works after ``pip install``; a source checkout replays its own
+  ``fixtures/field/``. If neither exists the report says NO CORPUS and names
+  the remedy -- see :func:`resolve_corpus_dir`.
   Live ``ask_corpus.jsonl`` rows carry no situation snapshot, so they cannot be
   replayed by this or any other harness without a recorder change. Wiring a
   snapshot recorder into the live ask rail is NOT part of this module.
@@ -207,17 +212,78 @@ class ScenarioResult:
 
 
 # ── loading ──────────────────────────────────────────────────────────────────
+#: The env var that points the replay at a purpose-built corpus.
+CORPUS_ENV = "SYSTEMU_FIELD_CORPUS"
+
+#: Where the corpus lives inside the ``systemu`` package (package data, see
+#: ``[tool.setuptools.package-data]``). An installed wheel has ONLY this copy.
+PACKAGED_CORPUS_PARTS = ("fixtures", "field")
+
+#: Where a corpus directory came from -- it decides which remedy an absent
+#: corpus names (a typo in ``--corpus`` is not a broken install).
+ORIGIN_ARGUMENT = "argument"
+ORIGIN_ENV = "env"
+ORIGIN_SOURCE_CHECKOUT = "source checkout"
+ORIGIN_PACKAGE = "package"
+
+
+def _source_checkout_corpus() -> Optional[Path]:
+    """``<repo>/fixtures/field`` when this module runs from a SOURCE CHECKOUT.
+
+    A checkout is recognised by its ``pyproject.toml`` next to the package and a
+    corpus WITH its roster -- never by the bare directory, so an installed wheel
+    (where ``parents[2]`` is ``site-packages``) can never mistake some unrelated
+    ``fixtures/`` directory for this corpus. ``None`` everywhere else.
+    """
+    root = Path(__file__).resolve().parents[2]
+    corpus = root / "fixtures" / "field"
+    if (root / "pyproject.toml").is_file() and (corpus / ROSTER_FILENAME).is_file():
+        return corpus
+    return None
+
+
+def packaged_corpus_dir() -> Path:
+    """The corpus the WHEEL ships, located with ``importlib.resources``.
+
+    Before 1e the corpus was resolved only repo-relative and was not package
+    data, so on an installed wheel ``systemu debug resolver-replay`` read
+    ``<site-packages>/fixtures/field`` -- a directory that does not exist.
+    """
+    from importlib.resources import files
+
+    node = files("systemu")
+    for part in PACKAGED_CORPUS_PARTS:
+        node = node / part
+    return Path(str(node))
+
+
+def resolve_corpus_dir(corpus_dir: Optional[Path] = None) -> Tuple[Path, str]:
+    """``(directory, origin)`` for the corpus a replay reads.
+
+    Order: an explicit argument, then ``SYSTEMU_FIELD_CORPUS``, then the source
+    checkout's ``fixtures/field`` (byte-identical to the packaged copy, pinned by
+    ``tests/test_resolver_replay_ships_its_corpus.py``), then the packaged copy.
+    """
+    if corpus_dir is not None:
+        return Path(corpus_dir), ORIGIN_ARGUMENT
+    env = os.environ.get(CORPUS_ENV, "").strip()
+    if env:
+        return Path(env), ORIGIN_ENV
+    checkout = _source_checkout_corpus()
+    if checkout is not None:
+        return checkout, ORIGIN_SOURCE_CHECKOUT
+    return packaged_corpus_dir(), ORIGIN_PACKAGE
+
+
 def default_corpus_dir() -> Path:
-    """``<repo>/fixtures/field`` — the DEC-11 field corpus.
+    """The DEC-11 field corpus this replay reads when no directory is given.
 
     Overridable with ``SYSTEMU_FIELD_CORPUS`` (used by tests to replay a
-    purpose-built corpus without touching the real one).
+    purpose-built corpus without touching the real one). From a source checkout
+    it is ``<repo>/fixtures/field``; from an installed wheel it is the packaged
+    copy (:func:`packaged_corpus_dir`).
     """
-    env = os.environ.get("SYSTEMU_FIELD_CORPUS", "").strip()
-    if env:
-        return Path(env)
-    # systemu/runtime/resolver_replay.py → <repo>/fixtures/field
-    return Path(__file__).resolve().parents[2] / "fixtures" / "field"
+    return resolve_corpus_dir(None)[0]
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -801,6 +867,12 @@ class ReplayReport:
     #: ``observed − declared`` — unrostered ``*.json`` on disk (a registration defect).
     extra: "frozenset[str]"
     details: Tuple[Dict[str, Any], ...]
+    #: The corpus directory the replay looked for and did NOT find (``""`` when it
+    #: exists). A distinct state from "an empty corpus": nothing was there to
+    #: reconcile, so the render says that plainly and names what to do.
+    corpus_absent: str = ""
+    #: Where that directory came from (``ORIGIN_*``) -- it picks the remedy.
+    corpus_origin: str = ""
 
     @property
     def error_count(self) -> int:
@@ -856,7 +928,8 @@ def resolver_replay_report(corpus_dir: Optional[Path] = None) -> ReplayReport:
     fixture's declared label — the corpus's whole value as a regression tripwire,
     surfaced at the top level rather than buried per-scenario.
     """
-    scenarios, errors, declared, missing, extra = load_corpus(corpus_dir)
+    corpus_path, origin = resolve_corpus_dir(corpus_dir)
+    scenarios, errors, declared, missing, extra = load_corpus(corpus_path)
     errors = list(errors)          # own the list; replay-time errors append here
     counts = {AVOIDABLE: 0, NECESSARY: 0, UNASSESSABLE: 0}
     reasons: Dict[str, int] = {}
@@ -908,7 +981,47 @@ def resolver_replay_report(corpus_dir: Optional[Path] = None) -> ReplayReport:
         missing=missing,
         extra=extra,
         details=tuple(details),
+        corpus_absent=("" if corpus_path.is_dir() else str(corpus_path)),
+        corpus_origin=origin,
     )
+
+
+def _ascii(text: str) -> str:
+    """ASCII-only rendering for a verdict line (a path may carry any character)."""
+    return str(text).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _format_absent_corpus(report: "ReplayReport") -> List[str]:
+    """The plain NO CORPUS render: what was looked for, where, and what to do.
+
+    Deliberately not the INCOMPLETE banner. "The corpus drifted from its roster"
+    and "there is no corpus here at all" have different fixes, and the second one
+    on an installed wheel is a packaging fact the operator cannot debug from a
+    roster count. ASCII-only, and never a rate.
+    """
+    where = _ascii(report.corpus_absent)
+    lines = [
+        "Avoidable-ask rate (resolver replay): NO CORPUS - no scenario corpus "
+        f"found at {where}; NO RATE (this is NOT 0%)",
+    ]
+    if report.corpus_origin in (ORIGIN_PACKAGE, ORIGIN_SOURCE_CHECKOUT):
+        lines += [
+            "  The labelled scenario corpus did not ship with this install (or was",
+            "  removed from it), so there is nothing to replay.",
+            "  To fix: reinstall it with `pip install --force-reinstall systemu`, or",
+            "  point --corpus / SYSTEMU_FIELD_CORPUS at a directory that holds",
+            "  roster.json and its fixtures.",
+        ]
+    else:
+        source = ("--corpus" if report.corpus_origin == ORIGIN_ARGUMENT
+                  else CORPUS_ENV)
+        lines += [
+            f"  {source} names a directory that does not exist.",
+            "  To fix: point --corpus / SYSTEMU_FIELD_CORPUS at a directory that",
+            "  holds roster.json and its fixtures, or unset both to replay the",
+            "  corpus that ships with systemu.",
+        ]
+    return lines
 
 
 def format_resolver_replay(report: "ReplayReport") -> List[str]:
@@ -926,8 +1039,13 @@ def format_resolver_replay(report: "ReplayReport") -> List[str]:
         raise TypeError(
             "format_resolver_replay requires a ReplayReport; got "
             f"{type(report).__name__}. The DEFINITIVE banner may be rendered only "
-            "from a report whose derived `definitive` property vouches for it — a "
+            "from a report whose derived `definitive` property vouches for it -- a "
             "dict (or None) cannot, so it is refused at the boundary.")
+
+    if report.corpus_absent:
+        # Nothing was found to reconcile at all. `definitive` is False here too
+        # (declared == 0), so this branch can only ever REMOVE a claim.
+        return _format_absent_corpus(report)
 
     definitive = report.definitive
     rate = report.rate
@@ -938,7 +1056,7 @@ def format_resolver_replay(report: "ReplayReport") -> List[str]:
         # broken run into a quotable headline number.
         what: List[str] = []
         if report.declared == 0:
-            what.append("NO committed roster (roster.json empty or absent) — no "
+            what.append("NO committed roster (roster.json empty or absent) -- no "
                         "denominator to be definitive over")
         if report.missing:
             what.append(f"{len(report.missing)} rostered fixture(s) MISSING from "
@@ -951,13 +1069,13 @@ def format_resolver_replay(report: "ReplayReport") -> List[str]:
         if not what:                      # non-definitive with no attributable cause
             what.append("the corpus did not reconcile against its roster")
         lines.append(
-            "Avoidable-ask rate (resolver replay): INCOMPLETE REPLAY — "
+            "Avoidable-ask rate (resolver replay): INCOMPLETE REPLAY -- "
             + "; ".join(what)
             + "; NO RATE (this is NOT 0%)"
         )
     elif rate is None:
         lines.append("Avoidable-ask rate (resolver replay): NO ASSESSABLE ASKS "
-                     "— no rate (this is NOT 0%)")
+                     "-- no rate (this is NOT 0%)")
     else:
         lines.append(
             f"Avoidable-ask rate (resolver replay): "
@@ -968,7 +1086,7 @@ def format_resolver_replay(report: "ReplayReport") -> List[str]:
             "  (DEFINITIVE over the fixtures/field corpus: the real inventory/resolver was"
         )
         lines.append(
-            "   re-run per scenario with the operator's answer known — not a proxy. It does"
+            "   re-run per scenario with the operator's answer known -- not a proxy. It does"
         )
         lines.append(
             "   NOT measure the live ask stream, whose rows carry no situation snapshot.)"
@@ -993,11 +1111,11 @@ def format_resolver_replay(report: "ReplayReport") -> List[str]:
         lines.append(
             "  confirm basis: "
             + ", ".join(f"{k}={v}" for k, v in sorted(mb.items()))
-            + "  (canonical is the lossier fold — it casefolds and folds separators)"
+            + "  (canonical is the lossier fold -- it casefolds and folds separators)"
         )
     mis = report.mislabelled or ()
     if mis:
-        lines.append(f"  ⚠ {len(mis)} ask(s) disagree with their fixture label:")
+        lines.append(f"  WARNING: {len(mis)} ask(s) disagree with their fixture label:")
         for m in mis[:10]:
             lines.append(f"      {m['scenario_id']}:{m['schema_path']} "
                          f"declared={m['declared']} replayed={m['replayed']} "
@@ -1005,22 +1123,24 @@ def format_resolver_replay(report: "ReplayReport") -> List[str]:
     # Named, not merely counted — "3 files missing" is not actionable, the names are.
     if report.missing:
         lines.append(
-            f"  ⚠ {len(report.missing)} rostered fixture(s) MISSING (named by "
-            f"roster.json, absent on disk — their asks are gone from the denominator):"
+            f"  WARNING: {len(report.missing)} rostered fixture(s) MISSING (named by "
+            f"roster.json, absent on disk -- their asks are gone from the denominator):"
         )
         for s in sorted(report.missing)[:10]:
             lines.append(f"      {s}")
     if report.extra:
         lines.append(
-            f"  ⚠ {len(report.extra)} unrostered fixture(s) present (on disk, not in "
-            f"roster.json — de-rostering to shrink the denominator is the very thing "
+            f"  WARNING: {len(report.extra)} unrostered fixture(s) present (on disk, not in "
+            f"roster.json -- de-rostering to shrink the denominator is the very thing "
             f"the roster forbids):"
         )
         for s in sorted(report.extra)[:10]:
             lines.append(f"      {s}")
     errs = report.errors or ()
     if errs:
-        lines.append(f"  ⚠ {len(errs)} corpus error(s):")
+        lines.append(f"  WARNING: {len(errs)} corpus error(s):")
         for e in errs[:10]:
             lines.append(f"      {e}")
-    return lines
+    # DEC-32c: verdict-carrying output is ASCII-only -- the literals above are,
+    # and an interpolated scenario id / path / error may carry any character.
+    return [_ascii(line) for line in lines]

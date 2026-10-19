@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -343,14 +344,13 @@ def launcher_stub_pids(rows) -> frozenset:
 
 
 def _scan_daemon_processes() -> tuple:
-    """The psutil scan, PID-VERIFIED-LIVE — best-effort, empty on error. SLOW
-    on Windows (cmdline for every process ~ 1 s); only ever call via the cache
-    below.
+    """THE SCAN, PID-VERIFIED-LIVE — best-effort, empty on error. NEVER call
+    this from a render: it walks EVERY process on the machine.
 
     Returns one :class:`DaemonProcess` per VERIFIED-LIVE daemon, de-duplicated
     by pid, carrying whatever of (port, vault, cwd, exe) that daemon's own
     LIVE launch line or sidecar could establish. The pids of the records that
-    did not survive verification are kept in the scan cache (see
+    did not survive verification ride along on the published snapshot (see
     ``pruned_daemon_pids``) so the prune is visible rather than silent.
 
     P0: two passes, and the order matters. The first collects every snapshot row
@@ -360,11 +360,41 @@ def _scan_daemon_processes() -> tuple:
     are visible too (``excluded_launcher_pids``) and are kept distinct from
     pruned records: a pruned pid FAILED liveness, a launcher passed it and
     simply is not a daemon.
+
+    D-3 (e2e 0.10.31): WHOEVER RUNS THIS PUBLISHES IT. The scan is the only
+    thing that observes the process table, so its result IS the current
+    observation -- there is no second, fresher source for a reader to prefer.
+    Publishing from inside the scan rather than from the refresher that called
+    it is what makes that true for every caller, including the five test files
+    that drive the scan directly.
+    """
+    procs, pruned, launchers = _run_daemon_scan()
+    # Kept for the module's own bookkeeping; the READERS below go to the
+    # snapshot, which is the one thing a render can reach without scanning.
+    _daemon_procs_cache["pruned"] = pruned
+    _daemon_procs_cache["launchers"] = launchers
+    try:
+        from systemu.runtime import render_snapshots as _rs
+        _rs.publish(_rs.DAEMON_SCAN, _rs.DaemonScanSnapshot(
+            taken_at=time.monotonic(), interval_s=_rs.refresh_interval_s(),
+            procs=procs, pruned=pruned, launchers=launchers))
+    except Exception:
+        logger.debug("[HealthBanner] daemon scan not published", exc_info=True)
+    return procs
+
+
+def _run_daemon_scan() -> tuple:
+    """``(procs, pruned, launchers)`` for ONE pass. Never raises.
+
+    Split out of :func:`_scan_daemon_processes` so every exit -- including the
+    two that give up before a single row is read -- produces a COMPLETE triple.
+    A pass that established nothing must publish "nothing", not leave an older
+    observation standing as if it had just been re-taken.
     """
     try:
         import psutil
     except Exception:
-        return ()
+        return ((), (), ())
     self_pid = os.getpid()
     found = []
     pruned = []
@@ -390,7 +420,7 @@ def _scan_daemon_processes() -> tuple:
             except Exception:
                 continue
     except Exception:
-        return ()
+        return ((), (), ())
 
     launchers = launcher_stub_pids(rows)
     for raw_pid, proc in rows:
@@ -415,15 +445,17 @@ def _scan_daemon_processes() -> tuple:
             ))
         except Exception:
             continue
-    _daemon_procs_cache["pruned"] = tuple(pruned)
-    _daemon_procs_cache["launchers"] = tuple(sorted(launchers))
-    return tuple(found)
+    return (tuple(found), tuple(pruned), tuple(sorted(launchers)))
 
 
 def pruned_daemon_pids() -> tuple:
     """The pids the last scan REFUSED to count: dead, reissued, or no longer
-    the daemon. Evidence that the prune happened, for tests and for support."""
-    value = _daemon_procs_cache.get("pruned")
+    the daemon. Evidence that the prune happened, for tests and for support.
+
+    Read off the SAME published snapshot the records come from, so the count
+    and its prune list can never describe two different passes."""
+    snap = _scan_snapshot()
+    value = snap.pruned if snap is not None else ()
     return value if type(value) is tuple else ()
 
 
@@ -435,7 +467,8 @@ def excluded_launcher_pids() -> tuple:
     is simply not a daemon. A support conversation that cannot tell them apart
     is back to arguing about a row count.
     """
-    value = _daemon_procs_cache.get("launchers")
+    snap = _scan_snapshot()
+    value = snap.launchers if snap is not None else ()
     return value if type(value) is tuple else ()
 
 
@@ -452,36 +485,56 @@ def _scan_daemon_count() -> int:
 
 _PROBE_TTL_S = 20.0
 _daemon_probe_cache = {"ts": -1e9, "count": 0}
-#: The ONE source the per-process records come from. Stale records are pruned
-#: HERE -- they never enter it -- so nothing downstream has to know they existed.
-#: No durable file is written or deleted by this module (see docs/CONC-MAP.md:
-#: the daemon runtime sidecar keeps its single registered writer, daemon.py).
+#: Vestigial after D-3 (the records now live on the published snapshot), kept
+#: because it is the scan's own scratch space and five test files reset its
+#: ``ts`` to force a re-scan. No durable file is written or deleted by this
+#: module (see docs/CONC-MAP.md: the daemon runtime sidecar keeps its single
+#: registered writer, daemon.py).
 _daemon_procs_cache: dict = {"ts": -1e9, "procs": (), "pruned": (), "launchers": ()}
 
 
-def _daemon_processes(_now: Optional[float] = None) -> tuple:
-    """The per-daemon records, TTL-cached alongside the count (W12-B5).
-
-    Production reaches the psutil scan ONCE per TTL: ``_count_systemu_daemons``
-    misses first, its ``_scan_daemon_count`` fills this cache on the way
-    through, and ``build_health_state``'s call below is then a cache hit.
-
-    Never raises. A probe that blew up returns no records, which the model reads
-    as "ports unknowable" and answers with the stronger warning.
-    """
-    import time
-    now = time.monotonic() if _now is None else _now
-    if now - _daemon_procs_cache["ts"] < _PROBE_TTL_S:
-        return _daemon_procs_cache["procs"]
+def _scan_snapshot():
+    """The published :class:`~systemu.runtime.render_snapshots.
+    DaemonScanSnapshot`, or None -- "we have not looked yet". Never raises."""
     try:
-        procs = _scan_daemon_processes()
+        from systemu.runtime import render_snapshots as _rs
+        return _rs.daemon_scan()
     except Exception:
-        procs = ()
-    if type(procs) is not tuple:
-        procs = tuple(procs or ())
-    _daemon_procs_cache["ts"] = now
-    _daemon_procs_cache["procs"] = procs
-    return procs
+        return None
+
+
+def _daemon_processes(_now: Optional[float] = None) -> tuple:
+    """The per-daemon records, READ FROM THE PUBLISHED SNAPSHOT. Never scans.
+
+    D-3: this used to run ``_scan_daemon_processes`` behind a 20 s TTL, and the
+    profile put 1622 ms of one ``_build_layout`` right here. The TTL bounded how
+    OFTEN the machine-wide walk was paid, not WHERE -- so every 20 s exactly one
+    page paint froze the event loop for over a second. The scan now runs on the
+    shared refresher thread (``render_snapshots``) and publishes; this frame
+    reads.
+
+    No snapshot means NO RECORDS, and no records means the multi-daemon
+    diagnosis does not fire. That direction is chosen: it can only ever fail to
+    warn about a second daemon, never invent a port race off an observation
+    nobody took. A missing or stale snapshot is NUDGED, never awaited.
+    """
+    snap = _scan_snapshot()
+    if snap is None:
+        _request_scan_refresh()
+        return ()
+    if snap.stale:
+        _request_scan_refresh()
+    procs = snap.procs
+    return procs if type(procs) is tuple else ()
+
+
+def _request_scan_refresh() -> bool:
+    """Ask for a fresh scan. NEVER blocks, never scans. False if nobody heard."""
+    try:
+        from systemu.runtime import render_snapshots as _rs
+        return _rs.request_refresh()
+    except Exception:
+        return False
 
 
 def _count_systemu_daemons(_now: Optional[float] = None) -> int:
@@ -741,18 +794,24 @@ def build_health_state(vault_dir: Optional[Path] = None, *, config=None,
     _statuses, _observed, _age = _provider_view(config, provider_probe)
     if not _ps.any_satisfied(_statuses):
         if not _observed:
-            # The keyless witness has NOT been spent on this render (D4). The
-            # credentials genuinely are absent -- that costs no network to
-            # establish -- but whether Ollama answers is not yet known, and the
-            # banner must not assert what it declined to look at.
+            # D-11: A HEDGE MAY NOT CARRY A VERDICT. The keyless witness has
+            # not been spent (D4), so whether a provider is usable here is
+            # simply not known -- and this copy used to hedge and assert in one
+            # sentence ("Checking providers... No LLM provider is usable ...").
+            # On /welcome it sat directly above step 1's "Provider ready: ..."
+            # line, minted from this same provider_status. Two sentences, one
+            # screen, opposite claims, and the unfounded one was ours.
+            #
+            # No CTA either: a remedy IS a verdict. "Set a key and restart the
+            # daemon" tells the operator the thing is broken, which is the
+            # finding we just said we had not made.
             message = (
                 PROVIDER_CHECKING_PREFIX
-                + "No LLM provider is usable from the daemon's environment so "
-                "far: no credential is set, and whether the keyless provider "
-                "answers has not been checked yet. Until one is usable, "
-                "LLM-driven steps (capture analysis, scroll refinement) will "
-                "fail silently and you'll only get raw captured events."
+                + "whether an LLM provider is usable from the daemon's "
+                "environment has not been established yet. This will say what "
+                "it finds."
             )
+            cta = None
         else:
             _as_of = ("" if _age is None
                       else " (as of {} s ago)".format(int(_age)))
@@ -762,10 +821,11 @@ def build_health_state(vault_dir: Optional[Path] = None, *, config=None,
                 "refinement) will fail silently and you'll only get raw "
                 "captured events."
             )
+            cta = _ps.configure_hint(_statuses) + " Then restart the daemon."
         state.issues.append(HealthIssue(
             severity="warning",
             message=message,
-            cta=_ps.configure_hint(_statuses) + " Then restart the daemon.",
+            cta=cta,
         ))
 
     if vault_dir is not None and not _vault_writable(vault_dir):
@@ -811,26 +871,44 @@ def build_health_state(vault_dir: Optional[Path] = None, *, config=None,
 
 # -- NiceGUI renderer (thin wrapper) -----------------------------------------
 
-def render_health_banner(vault_dir: Optional[Path] = None) -> None:
-    """Paint the banner if there are any health issues.  Silent when healthy."""
+#: How often an OPEN page checks whether a new observation has landed. This is
+#: NOT how often anything is observed -- the tick reads two timestamps under a
+#: lock and returns. 2 s is well inside "did that just fix itself?" patience and
+#: far cheaper than the 1 s job-badge timer the same layout already arms.
+BANNER_POLL_S = 2.0
+
+
+def snapshot_key() -> tuple:
+    """WHEN each published observation was taken. THE CHANGE DETECTOR (D-11).
+
+    Every source the banner reads is a background snapshot, so "has anything I
+    could say changed" is exactly "has any of them been re-taken". Reading only
+    the timestamps is what makes a tick that finds nothing new free -- it
+    rebuilds no state and touches no vault.
+    """
+    try:
+        from systemu.runtime import provider_snapshot as _snap
+        provider = _snap.published_taken_at()
+    except Exception:
+        provider = None
+    try:
+        from systemu.runtime import render_snapshots as _rs
+        others = _rs.taken_at_key()
+    except Exception:
+        others = ()
+    return (("provider", provider),) + tuple(others)
+
+
+def _paint_health_state(state: "HealthState") -> None:
+    """Paint one HealthState. Paints NOTHING when there is nothing to say."""
     from nicegui import ui
     from systemu.interface.dashboard_state import THEME
 
-    # D4: declining to probe on the render path is only honest if something
-    # else does. This is idempotent and costs a lock and a flag read once the
-    # thread is up; it is the production start point for the refresher, on the
-    # one function every dashboard route reaches.
-    try:
-        from systemu.runtime import provider_snapshot as _snap
-        _snap.start_refresher()
-    except Exception:
-        pass  # a refresher we could not start leaves the banner at "checking"
-
-    state = build_health_state(vault_dir)
     if not state.has_any:
         return  # quiet when healthy
 
-    color = THEME.get("danger", "#ef4444") if state.worst_severity == "danger" else THEME.get("warning", "#f59e0b")
+    color = THEME.get("danger", "#ef4444") if state.worst_severity == "danger" \
+        else THEME.get("warning", "#f59e0b")
     with ui.row().style(
         f"background: {color}22; "                  # ~13% opacity tint
         f"border-left: 4px solid {color}; "
@@ -854,3 +932,61 @@ def render_health_banner(vault_dir: Optional[Path] = None) -> None:
                                 f"color: {THEME['text_muted']}; font-size: 12px; "
                                 f"font-family: monospace; line-height: 1.4;"
                             )
+
+
+def render_health_banner(vault_dir: Optional[Path] = None) -> None:
+    """Paint the banner, and keep it honest on a page that stays open.
+
+    Silent when healthy -- but MOUNTED even then (D-11). A renderer that
+    returned early when it had nothing to say could never say anything later,
+    and everything it reads now arrives after the paint: the provider verdict
+    and the daemon scan are both background observations. So the refreshable
+    container and its timer are armed unconditionally; only the CONTENTS are
+    conditional.
+    """
+    from nicegui import ui
+
+    # D4: declining to probe on the render path is only honest if something
+    # else does. This is idempotent and costs a lock and a flag read once the
+    # thread is up; it is the production start point for the refresher, on the
+    # one function every dashboard route reaches.
+    try:
+        from systemu.runtime import provider_snapshot as _snap
+        _snap.start_refresher()
+    except Exception:
+        pass  # a refresher we could not start leaves the banner at "checking"
+
+    # D-3: and the same for the process scan this render also declines to run.
+    # Registration is idempotent; the producer is THE SCAN itself, which
+    # publishes what it found.
+    try:
+        from systemu.runtime import render_snapshots as _rs
+        _rs.register(_rs.DAEMON_SCAN, _scan_daemon_processes)
+        _rs.start_refresher()
+    except Exception:
+        pass  # a refresher we could not start leaves the banner with no records
+
+    @ui.refreshable
+    def _body() -> None:
+        _paint_health_state(build_health_state(vault_dir))
+
+    _body()
+
+    # The tick that resolves an open page. It repaints ONLY when a new
+    # observation has landed: a timer that repaints unconditionally destroys
+    # and rebuilds the DOM every interval, which is the defect class
+    # ui_helpers.RepaintGate exists for.
+    seen = {"key": snapshot_key()}
+
+    def _tick() -> None:
+        key = snapshot_key()
+        if key == seen["key"]:
+            return
+        seen["key"] = key
+        _body.refresh()
+
+    try:
+        from systemu.interface.ui_helpers import safe_timer
+        safe_timer(BANNER_POLL_S, _tick)
+    except Exception:
+        logger.debug("[HealthBanner] resolve timer not armed", exc_info=True)

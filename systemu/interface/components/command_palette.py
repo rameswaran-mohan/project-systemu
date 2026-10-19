@@ -14,10 +14,16 @@ code path here that resolves a decision, dispatches, or spawns anything.
 
 Shape of the work (UX-9)
 ------------------------
-``build_index(vault)`` derives the index ONCE per page render from in-memory
-projections; ``match()`` is pure and takes no vault, so opening the overlay and
-typing in it cannot read the vault. Matching is deterministic lexical scoring --
-no model call on this or any other hot path.
+``build_index(vault)`` derives the index from in-memory projections;
+``match()`` is pure and takes no vault, so opening the overlay and typing in it
+cannot read the vault. Matching is deterministic lexical scoring -- no model
+call on this or any other hot path.
+
+D-3 (e2e 0.10.31): that index used to be derived ONCE PER PAGE RENDER, at mount
+time, on the event loop. Profiled at 286 ms per render on a 40-tool vault -- on
+EVERY route, for an overlay the operator had not opened. ``build_index`` now
+runs on the shared refresher (``runtime/render_snapshots``) and publishes; the
+overlay reads the published index per keystroke via ``palette_entries()``.
 
 Every projection is read defensively: one broken source degrades that group to
 empty, it never blanks the palette.
@@ -355,6 +361,59 @@ def grouped(results: Sequence[PaletteEntry]) -> List[tuple]:
     return [(g, buckets[g]) for g in GROUPS if buckets.get(g)]
 
 
+# ── the published index (D-3: never built on the render path) ───────────────
+
+def publish_index(vault) -> None:
+    """Build the index and PUBLISH it. NEVER call this from a render.
+
+    The producer the shared refresher runs. ``build_index`` is unchanged and
+    stays THE builder; this only decides WHERE it runs and WHO waits for it.
+    Both projections it reaches (``capability_index.derive_index`` and
+    ``table_reconciler.project``) are documented deterministic + idempotent and
+    load only, so running them off the main thread races nothing.
+    """
+    import time as _time
+    from systemu.runtime import render_snapshots as _rs
+    entries = build_index(vault)
+    _rs.publish(_rs.PALETTE_INDEX, _rs.PaletteIndexSnapshot(
+        taken_at=_time.monotonic(), interval_s=_rs.refresh_interval_s(),
+        entries=tuple(entries)))
+
+
+def palette_entries() -> List[PaletteEntry]:
+    """The entries to match against RIGHT NOW. Reads; never builds.
+
+    D-3 (e2e 0.10.31): ``build_command_palette`` used to call ``build_index``
+    at MOUNT time, so every page paint on every route paid 286 ms to assemble
+    an overlay the operator had not opened -- the capability index plus the
+    whole table projection, from the vault, with no memo in front of it.
+
+    With no published index this returns the STATIC navigation rows and nudges
+    a refresh. A smaller palette, never a wrong one: nothing here can mint a
+    tool row, and the rows it does return were never vault-derived. Reading at
+    MATCH time rather than mount time also makes the palette strictly fresher
+    than it was -- it is opened long after the paint that mounted it.
+    """
+    try:
+        from systemu.runtime import render_snapshots as _rs
+        snap = _rs.palette_index()
+    except Exception:                                    # pragma: no cover
+        logger.debug("[Palette] index snapshot unavailable", exc_info=True)
+        return _static_entries()
+    if snap is None or not snap.entries:
+        try:
+            _rs.request_refresh()      # non-blocking; False if none is running
+        except Exception:                                # pragma: no cover
+            pass
+        return _static_entries()
+    if snap.stale:
+        try:
+            _rs.request_refresh()
+        except Exception:                                # pragma: no cover
+            pass
+    return list(snap.entries)
+
+
 # ── the overlay (NiceGUI) ───────────────────────────────────────────────────
 
 def build_command_palette(vault) -> None:
@@ -363,17 +422,25 @@ def build_command_palette(vault) -> None:
     Called once from the shared layout, so the palette exists on every page.
     Rendering failures are swallowed: a broken palette must never take the
     page down with it.
+
+    D-3: mounting COSTS NO VAULT READ. The index is built by the shared
+    refresher (``render_snapshots``) and read back per keystroke by
+    :func:`palette_entries`.
     """
     try:
         from nicegui import ui
     except Exception:                                    # pragma: no cover
         return
 
+    # Registration is idempotent and re-points the producer at the vault THIS
+    # page was handed, so a second run_dashboard() cannot strand the index on a
+    # stale one. Both cost a lock and a dict write.
     try:
-        entries = build_index(vault)
+        from systemu.runtime import render_snapshots as _rs
+        _rs.register(_rs.PALETTE_INDEX, lambda: publish_index(vault))
+        _rs.start_refresher()
     except Exception:                                    # pragma: no cover
-        logger.debug("[Palette] index build failed", exc_info=True)
-        return
+        logger.debug("[Palette] index refresher not started", exc_info=True)
 
     with ui.dialog() as dialog, ui.card().classes("s-card").style(
         "min-width: 520px; max-width: 90vw;"
@@ -395,7 +462,9 @@ def build_command_palette(vault) -> None:
     def _render(_e=None) -> None:
         results.clear()
         with results:
-            hits = match(entries, box.value or "")
+            # Read at MATCH time: the operator opens this long after the paint
+            # that mounted it, so by then the refresher has published.
+            hits = match(palette_entries(), box.value or "")
             if not hits:
                 ui.label("No matches").classes("s-muted").style(
                     "font-size: 12px; padding: 6px;")

@@ -16,6 +16,12 @@ Load-bearing rules (all under test in ``tests/test_action_governance.py``):
     the narrow **DENY floor**: UNKNOWN ∩ a high-severity signal (irreversible /
     destructive-param / money) fails closed to DENY with an honest handoff, not a
     rubber-stampable card. This bounds *blast radius*, not *world breadth*.
+  * **A registered tag is still UNKNOWN here (IMPL-10).** A tag added at runtime
+    via ``effect_tags.register_effect_tag`` is mapped by no rule in this module,
+    so ``_effective_tags`` scores it in the same UNKNOWN band as an unclassifiable
+    effect; one registered high-severity is also a high-severity signal, so it is
+    on the DENY floor. Registration cannot make an effect frictionless, and since
+    the registry refuses to lower a severity, it cannot soften a verdict either.
   * **No false positive.** The name verb-map does not escalate a tool whose
     tool-side tags say it is local-only (so `send_summary_to_log` stays ALLOW).
   * **`shell_exec` is an APPROVAL-band effect, and STAYS in `_LOCAL_TAGS`.**
@@ -40,6 +46,42 @@ Load-bearing rules (all under test in ``tests/test_action_governance.py``):
     first-run review card. :func:`batch_approvable` answers that question against
     the `effect_tags.BATCH_APPROVABLE` allowlist.
 
+    **A fourth question (R1): is this effect IRREVERSIBLE?** Answered in exactly ONE
+    place, :func:`irreversible_effects`, from the tag set the governor SCORED
+    (:func:`effective_tags`, never the declared tags). A gate whose scored effects
+    include an irreversible class is the spec section 10 typed-confirm surface:
+    HIGH risk, Deny / "Approve once" only, never a standing approval of any kind
+    (the approval store refuses one too), never bulk, never remote, and "Approve
+    once" needs the operator to TYPE a phrase naming the action. The card, the
+    resolve path, the resume rail and the gate itself all read this one function's
+    answer (stamped on the gate as ``irreversible`` / ``irreversible_effects``).
+
+    The mapping, chosen conservatively from this vocabulary (:data:`IRREVERSIBLE_EFFECTS`):
+
+      * ``money_move`` -- IN. Money that has moved has no undo the system controls.
+      * ``local_delete`` -- IN. The vocabulary carries no recycle-path signal, so
+        no delete can be proven recoverable, and the shipped ``file_delete`` body
+        calls ``Path.unlink()`` -- a permanent delete. Conservative: a delete is
+        irreversible until a recycle-path signal exists to say otherwise.
+      * the literal markers ``irreversible`` / ``money_spend`` / ``payment`` /
+        ``funds_move`` -- IN. The remote floor (``messaging.decision_bridge
+        ._FLOOR_EFFECT_TAGS``) already names them; a tag set carrying one is
+        exactly as irreversible here as it is there, so the two sets cannot
+        disagree about a card.
+      * ``send_message`` -- OUT. A delivered message cannot be recalled, but the
+        spec scores a single send as an ordinary REQUIRE_APPROVAL preview card
+        and reserves typed-confirm for the MASS-send escalator; widening it here
+        would contradict that ruling.
+      * ``net_mutate`` -- OUT. "An external system with no undo" is a property of
+        the resolved HOST, and there is no per-call host resolver yet (the gate's
+        ``target`` stays None). Tagging every external mutation irreversible
+        would turn every calendar edit into a typed-confirm card. When a host
+        resolver lands, a system-of-record host is the input to add.
+      * everything else (reads, local writes, shell, oauth, capture/actuation
+        classes, ``no_effect``, ``unknown``) -- OUT: either reversible, or
+        already governed by its own band (an UNKNOWN effect with a high-severity
+        signal is the DENY floor, which offers no approval at all).
+
 This is the evaluator only. Wiring the live gates (`_maybe_gate_command`,
 `_gate_mcp_call`, the forged execute path) to delegate through it — and closing
 the `trusted_inprocess` bypass — is S1b.
@@ -52,7 +94,8 @@ from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
 
-from systemu.runtime.effect_tags import EffectTag, coerce, is_high_severity
+from systemu.runtime.effect_tags import (EffectTag, coerce, is_extension_tag,
+                                         is_high_severity)
 
 
 # §13.3 — effect classes that make a tool ineligible for the in-process fast path.
@@ -369,6 +412,14 @@ def _effective_tags(ctx: ActionContext) -> Set[str]:
     host and — only when NOT tool-side-local-only — the name verb map."""
     tags: Set[str] = {coerce(t) for t in ctx.effect_tags} or {EffectTag.UNKNOWN.value}
 
+    # IMPL-10: a runtime-registered tag is mapped by NO rule below, so it is in
+    # the UNKNOWN band -- dangerous until code or an operator maps it. It stays in
+    # the set (disclosed, and a high-severity registration is itself a DENY-floor
+    # signal via `_high_severity_signal`); UNKNOWN joins it, so every rule that
+    # applies to an unclassifiable effect applies to it too.
+    if any(is_extension_tag(t) for t in tags):
+        tags.add(EffectTag.UNKNOWN.value)
+
     network = ctx.target_is_network and not ctx.operator_confirmed_read_only
 
     # A tool whose tool-side classification is already complete and carries no
@@ -433,6 +484,45 @@ def effective_tags(ctx: ActionContext) -> Set[str]:
     invalidate every stored approval.
     """
     return _effective_tags(ctx)
+
+
+# ── R1: the ONE irreversibility derivation (see the module docstring) ─────────
+#
+# Money classes are listed separately because the typed confirmation names the
+# AMOUNT when a money call carries one; every other irreversible class confirms by
+# the tool name.
+MONEY_EFFECTS = frozenset({
+    EffectTag.MONEY_MOVE.value, "money_spend", "payment", "funds_move",
+})
+IRREVERSIBLE_EFFECTS = MONEY_EFFECTS | frozenset({
+    EffectTag.LOCAL_DELETE.value,
+    "irreversible",
+})
+
+
+def irreversible_effects(effect_tags) -> Tuple[str, ...]:
+    """The irreversible classes in ``effect_tags``, sorted and unique; ``()`` when
+    there are none. THE one place irreversibility is decided (R1).
+
+    Pass the tags the governor SCORED (:func:`effective_tags`) -- an untagged
+    ``wire_funds`` declares nothing and scores ``money_move``. The input may be a
+    value read back off disk (a decision context), so the container and every
+    member are type-pinned in this frame before anything operates on them
+    (DEC-36); a member that is not a plain ``str`` (or an ``EffectTag``) is
+    skipped, never coerced through a dispatching operator.
+    """
+    if type(effect_tags) not in (list, tuple, set, frozenset):
+        return ()
+    found = set()
+    for tag in effect_tags:
+        if type(tag) is EffectTag:
+            tag = tag.value
+        if type(tag) is not str:
+            continue
+        norm = tag.strip().lower()
+        if norm in IRREVERSIBLE_EFFECTS:
+            found.add(norm)
+    return tuple(sorted(found))
 
 
 # Operator-facing phrases for the effect classes a batch may not contain. Used ONLY to

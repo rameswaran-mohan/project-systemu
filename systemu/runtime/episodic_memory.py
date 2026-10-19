@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,26 +45,126 @@ def _has_llm_provider(config) -> bool:
     return _ps.any_provider_usable(config)
 
 
-def _warn_operator_degraded(*, session_id: str, reason: str) -> None:
+#: A distribution name an operator can be handed inside a `pip install` line.
+#: Anything else came from somebody else's exception and is not put on a
+#: console as a command.
+_PACKAGE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+
+#: Where a plain ``ImportError`` keeps the name that ``ModuleNotFoundError``
+#: puts in ``.name``.
+_NO_MODULE_NAMED = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
+
+
+def _missing_package_name(exc) -> str:
+    """The top-level distribution an import failure is about, or ``""``.
+
+    ``anthropic.types`` is ``anthropic``: handing the operator
+    ``pip install anthropic.types`` would be a remedy that cannot run, which is
+    worse than the module name it replaced.
+    """
+    name = getattr(exc, "name", None)
+    if type(name) is not str or not name.strip():
+        # A plain ImportError carries the name only in its text.
+        text = str(exc)
+        match = _NO_MODULE_NAMED.search(text if type(text) is str else "")
+        if match is None:
+            return ""
+        name = match.group(1)
+    top = name.split(".")[0].strip()
+    return top if _PACKAGE_NAME.match(top) else ""
+
+
+def missing_dependency_remedy(exc) -> Optional[str]:
+    """The remedy sentence for an import failure, or ``None`` to change nothing.
+
+    D13 -- a degradation that names a Python module names nothing the operator
+    can act on. ``No module named 'anthropic'`` is true, and it leaves them to
+    guess that the fix is a pip install of a package they never asked for.
+
+    Two answers, and never a third:
+      * a package :mod:`systemu.runtime.optional_deps` REGISTERS -> that
+        group's own remedy, built by the one ``install_command`` builder so the
+        shell-safe quoting cannot drift, plus the post-install step the wheel
+        alone does not cover;
+      * anything else -> the plain ``pip install <package>`` line. Never an
+        invented ``systemu[...]`` extra: pip accepts an unknown extra and
+        silently installs nothing, which is a remedy that reports success and
+        fixes the problem not at all.
+
+    PURE OF THE ENVIRONMENT ON PURPOSE. The import ALREADY failed -- that is
+    the witness, and it is the only one consulted. Asking
+    ``optional_deps.is_installed`` a second time would be a cheaper source that
+    can disagree with it (DEC-34): a present-but-broken distribution answers
+    "installed" and would take the remedy away from the operator who most needs
+    it.
+
+    ``type(exc) is T`` rather than ``isinstance`` (DEC-36): the two concrete
+    classes Python raises for a missing module are pinned in this frame, and
+    every other shape -- including an object that merely claims to be an
+    ImportError -- falls to ``None``, which is the "leave the line exactly as
+    it was" answer.
+    """
+    kind = type(exc)
+    if kind is not ModuleNotFoundError and kind is not ImportError:
+        return None
+    package = _missing_package_name(exc)
+    if not package:
+        return None
+
+    from systemu.runtime import optional_deps
+    group = optional_deps.group_for_package(package)
+    if group is None:
+        return "the {p} SDK is not installed (pip install {p})".format(p=package)
+
+    remedy = "{label} is not installed ({pkgs}). Install it with: {cmd}".format(
+        label=group.label, pkgs=", ".join(group.packages),
+        cmd=optional_deps.install_command(group.packages))
+    if group.post_install:
+        remedy = "{r}  Then: {p}".format(r=remedy, p=group.post_install)
+    return remedy
+
+
+def _degraded_detail(reason: str, exc) -> str:
+    """What goes after ``Reason:`` -- the remedy when there is one.
+
+    Best-effort in the strict sense: the NOTICE is the load-bearing half and
+    the remedy is polish on it, so a helper that raises costs the operator the
+    remedy and never the warning.
+    """
+    try:
+        remedy = missing_dependency_remedy(exc)
+    except Exception:
+        logger.debug("[Episodic] remedy lookup failed", exc_info=True)
+        return reason
+    return remedy if type(remedy) is str and remedy else reason
+
+
+def _warn_operator_degraded(*, session_id: str, reason: str, exc=None) -> None:
     """F12 / P1 — cross-session recall is an ADVERTISED capability. When a run
     produces no summary, the task still reports SUCCESS, so a ``logger.warning``
     leaves the operator believing a feature ran that did not (DEC-34: a false
     assertion of capability). Name the feature, not just "an LLM call failed" —
     the router's own notice cannot tell the operator WHICH capability went dark.
-    Best-effort: never break the end-of-run path."""
+    Best-effort: never break the end-of-run path.
+
+    D13 — ``exc``, when the caller has it, is what turns "Reason: No module
+    named 'anthropic'" into an install command. The operator gets the remedy;
+    the event record below keeps the raw reason, because trading one blindness
+    for another is not a fix."""
     logger.warning("[Episodic] summarize failed for %s: %s", session_id, reason)
     try:
         from systemu.interface.notifications import log_event
+        detail = _degraded_detail(reason, exc)
         # ASCII-only (DEC-32c) — this crosses into event_log.jsonl, the
         # dashboard panes and a Windows console.
         msg = (
             "Cross-session recall did not record this session: no episodic "
-            f"summary was stored, so future sessions cannot recall it. Reason: {reason}"
+            f"summary was stored, so future sessions cannot recall it. Reason: {detail}"
         ).encode("ascii", "backslashreplace").decode("ascii")
         log_event(
             "WARNING", "memory", msg,
             {"kind": "episodic_degraded", "session_id": session_id,
-             "reason": reason[:500]},
+             "reason": reason[:500], "remedy": detail[:500] if detail != reason else ""},
         )
     except Exception:
         logger.error("[Episodic] degraded notice failed to emit for %s", session_id)
@@ -139,7 +240,7 @@ def capture(
             temperature=0.2,
         )
     except Exception as exc:
-        _warn_operator_degraded(session_id=session_id, reason=str(exc))
+        _warn_operator_degraded(session_id=session_id, reason=str(exc), exc=exc)
         return None
 
     if not isinstance(result, dict):

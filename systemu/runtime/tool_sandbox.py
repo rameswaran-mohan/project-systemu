@@ -334,6 +334,60 @@ def _resolved_decision_is_the_follow_up(decision, *, pending_class: Optional[str
     return bool(stored_fp) and bool(want_fp) and stored_fp == want_fp
 
 
+def _typed_confirm_witnessed(decision, *, phrase: str, fingerprint: str) -> bool:
+    """R1: may this RESOLVED decision approve the irreversible call in front of the
+    gate on the chat lane? Every condition is fail-closed and type-pinned (DEC-36):
+
+    * the choice is exactly "Approve once" (no standing / bulk label is honoured);
+    * the decision was not already spent by the resume rail (``resume_dispatched``):
+      one typed confirmation buys ONE run, and the workflow lane's bridge is it;
+    * its stamped args fingerprint equals THIS call's -- the dedup key is
+      params-independent, so without this an approval typed for one amount or
+      recipient would cash a different call on the same tool body;
+    * its ``confirm_typed`` matches the phrase computed LIVE from this call, in
+      constant time (``command_approvals.confirm_phrase_matches``).
+    """
+    import hmac as _hmac
+
+    from systemu.runtime.command_approvals import (APPROVE_ONCE, CONFIRM_TYPED_KEY,
+                                                   confirm_phrase_matches)
+    ctx = getattr(decision, "context", None)
+    if type(ctx) is not dict:
+        return False
+    choice = getattr(decision, "choice", None)
+    if type(choice) is not str or choice.strip().lower() != APPROVE_ONCE.lower():
+        return False
+    if ctx.get("resume_dispatched"):
+        return False
+    stored = ctx.get("args_fingerprint")
+    if type(stored) is not str or not stored:
+        return False
+    if type(fingerprint) is not str or not fingerprint:
+        return False
+    if not _hmac.compare_digest(stored.encode("utf-8"), fingerprint.encode("utf-8")):
+        return False
+    return confirm_phrase_matches(ctx.get(CONFIRM_TYPED_KEY), phrase)
+
+
+def _emit_typed_confirm_refusal(tool_name, phrase, effects) -> None:
+    """R1: say, where the operator reads, why an approval did not run the call.
+    ASCII; best-effort -- the notification layer must never break the gate."""
+    try:
+        from systemu.interface.notifications import log_event
+        from systemu.runtime.command_approvals import _ascii
+        log_event(
+            "WARNING", "tool",
+            _ascii(f"Not approved: Run tool: {tool_name} - it cannot be undone "
+                   f"({', '.join(effects)}), and the approval did not carry the typed "
+                   f"confirmation for this exact call. Nothing ran; approve the new "
+                   f"card by typing {phrase}."),
+            {"tool_name": str(tool_name)[:80]},
+        )
+    except Exception:
+        logger.debug("[Sandbox] could not write the typed-confirm refusal event",
+                     exc_info=True)
+
+
 def _small_args_preview(parameters: Any, *, max_keys: int = 8, max_len: int = 80) -> Dict[str, Any]:
     """A small, bounded args preview for the ActionContext (S1b tool gate).
 
@@ -1278,26 +1332,52 @@ class ToolSandbox:
         # net_read UP to net_mutate, which would over-gate every network-READING
         # tool (weather lookups, page fetches, API GETs) that the governor is
         # meant to ALLOW frictionlessly (test_action_governance::test_net_read_allow).
-        # We have NO host resolver yet, so `target` stays None and both the network
-        # flag and `host_class` stay UNCONDITIONALLY empty. `evaluate_action`
+        # We have NO per-call host resolver yet, so `target` stays None and the
+        # network flag stays UNCONDITIONALLY empty. (The signature's `host_class`
+        # below is a different thing: the class the tool's SPEC declares, bound so
+        # that changing declared hosts re-gates -- see tool_host_class.) `evaluate_action`
         # already routes every effect from `effect_tags` alone: net_read ⇒ ALLOW
         # (frictionless majority); net_mutate / send_message / oauth_call /
         # money_move / local_delete ⇒ REQUIRE_APPROVAL (via _APPROVAL_TAGS);
         # empty ⇒ UNKNOWN ⇒ REQUIRE_APPROVAL. When a host resolver exists it will
-        # populate `target` + `target_is_network` from the RESOLVED host, and
-        # `host_class` will re-enter the signature — a deliberate future change.
+        # populate `target` + `target_is_network` from the RESOLVED host.
         target_is_network = False
-        host_class = ""
+        # IMPL-1 host class: derived from the tool's DECLARED spec (its effect tags
+        # and declared hosts) by ONE function, which the bulk first-gate review and
+        # `systemu tools diff` read too -- so none of them can key a tool on a
+        # different value. It is NOT the resolved call target above: that stays
+        # deferred, and this is a property of the spec, not of one call.
+        from systemu.runtime.command_approvals import (signature_from_parts,
+                                                       tool_host_class, tool_signature)
+        host_class = tool_host_class(tool)
 
         # D2 body-hash: sha1 of the resolved implementation file; fall back to
         # id:version for a built-in / v2 code-registered tool with no impl path.
         body_hash = self._tool_body_hash(tool)
 
         # D3 signature: computed HERE and stamped into the gate context_extras so
-        # the resume path (Task 4) reads it back rather than recomputing.
-        from systemu.runtime.command_approvals import tool_signature
-        sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
-                             effect_tags, host_class=host_class)
+        # the resume path (Task 4) reads it back rather than recomputing. It is
+        # computed FROM its parts, and the parts are stamped beside it on the card:
+        # the approval store keeps only the sha1, so without them nothing could
+        # later say WHAT an approval bound -- `systemu tools diff` reads them back
+        # from the decision ledger and believes them only when they recompute to
+        # the stamped sha1.
+        _sig_parts = {
+            "name": getattr(tool, "name", tool_name),
+            "tool_id": getattr(tool, "id", "") or "",
+            "body_hash": body_hash,
+            "effect_tags": sorted(effect_tags),
+            "host_class": host_class,
+        }
+        sig = signature_from_parts(_sig_parts)
+        if sig is None:     # parts that cannot sign: fall back to the raw function
+            sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
+                                 effect_tags, host_class=host_class)
+        # The signature this tool had BEFORE host classes existed. For a `none`-class
+        # tool it IS `sig` (that is the upgrade ruling); for a networked tool it is
+        # the old approval the gate must not honour silently -- see below.
+        _pre_host_sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
+                                       effect_tags, host_class="")
 
         # Resolve the approval store (fail-closed: no store → still gate). Resolved
         # BEFORE scoring because IMPL-2's operator reclassification is an INPUT to
@@ -1346,6 +1426,22 @@ class ToolSandbox:
 
         verdict, reason = evaluate_action(ctx)
 
+        # R1 (spec section 10): is THIS call irreversible? Answered by the one
+        # derivation (``action_governance.irreversible_effects``) over the tags the
+        # governor just SCORED -- an untagged ``wire_funds`` declares nothing and
+        # scores money_move. The answer is computed here, at the point of effect,
+        # and every bypass below reads it: no standing approval covers such a call,
+        # a resume bridge covers it only when minted against ITS arguments after a
+        # typed confirmation, and a chat-lane approval only when it carries the
+        # typed phrase for this exact call. The ActionContext is NOT touched, so the
+        # scoring ``tool_dry_run._gate_skip_reason`` mirrors stays byte-identical.
+        from systemu.runtime.action_governance import irreversible_effects
+        from systemu.runtime.command_approvals import typed_confirm_phrase
+        _scored_tags = effective_tags(ctx)
+        _irrev = irreversible_effects(_scored_tags)
+        _phrase = (typed_confirm_phrase(getattr(tool, "name", tool_name), parameters,
+                                        _irrev) if _irrev else "")
+
         def _spend_reclassification() -> None:
             """Single-use: a reclassification is spent by the call it authorised, so
             the very next identical call is scored from scratch (and DENYs again).
@@ -1356,6 +1452,8 @@ class ToolSandbox:
                 except Exception:
                     logger.debug("[Sandbox] could not consume reclassification",
                                  exc_info=True)
+
+        _legacy_host_class = ""
 
         # MASK is deliberately NOT in this tuple. ``evaluate_action`` has no MASK
         # producer today, so listing it changed nothing — but it is the one branch here
@@ -1389,8 +1487,26 @@ class ToolSandbox:
             # classification — the remedy would silently become a bypass. The honest
             # follow-up card must post at least once. (The standing allow is left
             # intact; it resumes covering ordinary calls once the one-shot is spent.)
-            if store is not None and not pending_class and store.is_approved(sig):
+            # R1: NO standing approval covers an irreversible call -- not one minted
+            # by an older build, not a hand-edited file. Like the DENY band, only the
+            # CONSUMPTION side can say so for every store state.
+            if (store is not None and not pending_class and not _irrev
+                    and store.is_approved(sig)):
                 return  # "Always allow" on record → run
+            # IMPL-1 upgrade path. A NETWORKED tool approved before host checks
+            # existed holds an allow on its pre-host signature, which bound no host
+            # at all. It is neither honoured silently (that would bless every host
+            # the spec now names) nor dropped silently: it falls through to the card
+            # below, which says why it is asking again and names the hosts. The old
+            # allow is left on record; "Always allow" here records the new one.
+            if (store is not None and not pending_class and not _irrev
+                    and _pre_host_sig != sig):
+                try:
+                    if store.is_approved(_pre_host_sig):
+                        _legacy_host_class = host_class
+                except Exception:
+                    logger.debug("[Sandbox] could not read the pre-host approval",
+                                 exc_info=True)
             # One-shot resume-approval (park→resume bridge): honored exactly once.
             # This is the WORKFLOW-lane bypass under a pending reclassification — and it
             # applies ONLY when the bridge is the follow-up card's own "Approve once",
@@ -1410,8 +1526,15 @@ class ToolSandbox:
             # classification. The scope check refuses those, in both directions: an
             # unscoped bridge cannot redeem a reclassified call, and a scoped bridge
             # cannot redeem an ordinary one.
+            #
+            # R1: for an irreversible call the bridge must also carry a typed
+            # confirmation minted against THIS call's arguments (the rail mints one
+            # only after checking the phrase). An unscoped bridge -- an older build's,
+            # or one minted on a bare click -- does not redeem it.
+            _confirm_kw = ({"require_confirmed": True, "confirmed_args": fingerprint}
+                           if _irrev else {})
             if store is not None and store.consume_resume_approved(
-                    sig, for_reclassification=pending_class):
+                    sig, for_reclassification=pending_class, **_confirm_kw):
                 _spend_reclassification()
                 return
             # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
@@ -1447,8 +1570,17 @@ class ToolSandbox:
                             and _resolved_decision_is_the_follow_up(
                                 decision, pending_class=pending_class,
                                 fingerprint=fingerprint)):
-                        _spend_reclassification()
-                        return
+                        # R1: an irreversible call runs on the chat lane only when
+                        # the decision carries the typed phrase for THIS call. The
+                        # decision is consumed either way, so a bare click is spent
+                        # here and the card below is posted fresh.
+                        if _irrev and not _typed_confirm_witnessed(
+                                decision, phrase=_phrase, fingerprint=fingerprint):
+                            _emit_typed_confirm_refusal(
+                                getattr(tool, "name", tool_name), _phrase, _irrev)
+                        else:
+                            _spend_reclassification()
+                            return
                 except Exception:
                     logger.debug("[Sandbox] tool-gate approve-once bypass check failed; "
                                  "falling through to re-gate (fail-closed)",
@@ -1475,7 +1607,27 @@ class ToolSandbox:
             # expects — nothing on the surface would let them notice the swap. Bounded
             # by _small_args_preview (8 keys / 80 chars) and secret-masked upstream.
             args_preview=ctx.args_preview,
+            # IMPL-1: what a standing approval of this card binds to, hosts included,
+            # and -- for a networked tool approved before host checks -- why it asks.
+            host_class=host_class,
+            legacy_host_class=_legacy_host_class,
+            # R1: the typed-confirm surface -- Deny / Approve once only, high risk,
+            # and the phrase the operator must type. Stamped into the decision
+            # context by the descriptor itself, so card and resolve path agree.
+            irreversible_effects=_irrev,
+            confirm_phrase=_phrase,
         )
+        if _irrev and store is not None and not pending_class:
+            # R1: tell the store this signature may never hold a STANDING approval,
+            # so it refuses one "even if a caller asks". Written by the gate (the
+            # classifier), never by a caller asking for an approval. Not under a
+            # pending reclassification: that classification is params-scoped and
+            # single-use, so it says nothing about the signature's ordinary calls.
+            try:
+                store.mark_one_shot_only(sig, effects=_irrev)
+            except Exception:
+                logger.debug("[Sandbox] could not mark %s one-shot-only", sig,
+                             exc_info=True)
         # D3: stamp the signature (+ tool name) so the resume path reads it back;
         # carry the run's resume coords so a PARKED tool gate is resumable.
         #
@@ -1503,13 +1655,14 @@ class ToolSandbox:
         # above): re-keying it here would invalidate every stored approval.
         _resume_extras = {
             "tool_signature": sig,
+            "tool_parts": _sig_parts,
             "tool_name": getattr(tool, "name", tool_name),
             "tool_id": getattr(tool, "id", "") or "",
             # NOTE: the verdict stamped here is the verdict AS SCORED — i.e. the NEW
             # one when a reclassification was applied. That is what the recorder and
             # the remote classifier must reason about, not the original DENY.
             "verdict": getattr(verdict, "value", str(verdict)),
-            "effect_tags": sorted(effective_tags(ctx)),
+            "effect_tags": sorted(_scored_tags),
             "destructive": ctx.is_destructive_param,
             # R-UX3 / UX-14: persist the evaluate_action REASON structurally so
             # the "why?" panel can render it without re-scoring the call (the
@@ -1572,26 +1725,17 @@ class ToolSandbox:
             # "Approve once" either, and it does offer the reclassify remedy.
             message=(f"Operator approval required to run tool "
                      f"`{getattr(tool, 'name', tool_name)}`. Open the dashboard Inbox "
-                     f"and choose {' / '.join(descriptor.options)}."),
+                     f"and choose {' / '.join(descriptor.options)}."
+                     + (f" It cannot be undone, so 'Approve once' needs you to type "
+                        f"{descriptor.confirm_phrase} on the card."
+                        if descriptor.irreversible_effects else "")),
         )
 
     def _tool_body_hash(self, tool) -> str:
         """D2 body-hash: sha1 of the resolved implementation file's bytes. Falls
         back to ``<id>:<version>`` for a built-in / v2 code-registered tool with
         no on-disk implementation path (or if the file can't be read)."""
-        import hashlib
-        impl_path = (getattr(tool, "implementation_path", None)
-                     or getattr(tool, "impl_path", None) or "")
-        if impl_path:
-            try:
-                p = Path(impl_path)
-                if not p.is_absolute():
-                    p = self.vault_root.parent / impl_path
-                return hashlib.sha1(p.resolve().read_bytes()).hexdigest()
-            except Exception:
-                logger.debug("[Sandbox] tool body-hash read failed for %s; "
-                             "falling back to id:version", impl_path, exc_info=True)
-        return f"{getattr(tool, 'id', '')}:{getattr(tool, 'version', '')}"
+        return tool_body_hash(tool, self.vault_root)[0]
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1634,6 +1778,38 @@ class ToolSandbox:
             return True
 
         return False
+
+
+def tool_body_hash(tool, vault_root) -> "tuple[str, bool]":
+    """The body hash the live tool gate binds, plus whether the declared
+    implementation file was MISSING.
+
+    Returns ``(hash, impl_missing)``. ``hash`` is the sha1 of the implementation
+    file's bytes; a tool with no implementation path (a built-in / v2
+    code-registered tool) or whose file cannot be read falls back to
+    ``<id>:<version>`` -- exactly what the gate keys on. ``impl_missing`` is True
+    only in the second fallback: a path was declared and could not be read. The
+    gate ignores it; the capability diff reports that body as ``missing`` instead
+    of pretending the fallback string is a body.
+
+    One function so the gate (``ToolSandbox._tool_body_hash``) and the diff can
+    never hash a tool two different ways. A relative path anchors at
+    ``vault_root.parent`` -- the convention ``execute_tool`` resolves with.
+    """
+    import hashlib
+    impl_path = (getattr(tool, "implementation_path", None)
+                 or getattr(tool, "impl_path", None) or "")
+    if impl_path:
+        try:
+            p = Path(impl_path)
+            if not p.is_absolute():
+                p = Path(vault_root).parent / impl_path
+            return hashlib.sha1(p.resolve().read_bytes()).hexdigest(), False
+        except Exception:
+            logger.debug("[Sandbox] tool body-hash read failed for %s; "
+                         "falling back to id:version", impl_path, exc_info=True)
+            return f"{getattr(tool, 'id', '')}:{getattr(tool, 'version', '')}", True
+    return f"{getattr(tool, 'id', '')}:{getattr(tool, 'version', '')}", False
 
 
 def truncate_result(result: "ToolResult", tool) -> "ToolResult":

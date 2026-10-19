@@ -98,6 +98,136 @@ def _emit_gate_event(level: str, message: str, context: Dict[str, Any]) -> None:
         logger.debug("[ResumeOnDecision] could not write gate event", exc_info=True)
 
 
+def _ascii_line(text) -> str:
+    """DEC-32c: a verdict-carrying line is ASCII, on any console codepage."""
+    return str(text).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def typed_confirm_refusal_for(decision) -> str:
+    """R1: why this RESOLVED decision may not take effect, or "" when it may.
+
+    The one rule (``command_approvals.typed_confirm_refusal``) applied to the
+    decision as recorded: its context, its choice, and the operator's typed text
+    the Inbox patched in when it resolved the card. A money / irreversible card
+    resolved by any surface that never asked for the phrase (the CLI, a phone, a
+    stale card's "Always allow") is refused here. Never raises: a check that itself
+    fails refuses (fail-closed), and a decision whose context is not a dict carries
+    no stamp to refuse on (the gate re-derives irreversibility live regardless).
+    """
+    try:
+        from systemu.runtime.command_approvals import (CONFIRM_TYPED_KEY,
+                                                       typed_confirm_refusal)
+        dctx = getattr(decision, "context", None)
+        if type(dctx) is not dict:
+            return ""
+        return typed_confirm_refusal(dctx, choice=getattr(decision, "choice", None),
+                                     typed=dctx.get(CONFIRM_TYPED_KEY))
+    except Exception:
+        logger.warning("[ResumeOnDecision] typed-confirm check failed -- refusing",
+                       exc_info=True)
+        return "the typed confirmation could not be checked, so nothing ran."
+
+
+def reopen_unconfirmed_gate(decision, vault, reason: str) -> bool:
+    """R1: put a typed-confirm card that was resolved WITHOUT its phrase back in
+    front of the operator -- status pending, no choice -- so "a click without the
+    typed phrase resolves nothing". Returns True when the card is (now, or already)
+    re-opened.
+
+    Re-reads the decision first and acts only while it is still ``resolved``: a
+    decision the chat lane already consumed, or one already re-opened, is left
+    alone (re-opening a consumed one would post a second live card for one call).
+    The reason is stamped as ``typed_confirm_refused`` (which also stops the
+    dispatcher from ever acting on the re-opened row) and the operator's
+    mismatching text is dropped. Best-effort; never raises.
+    """
+    try:
+        from systemu.runtime.command_approvals import (CONFIRM_TYPED_KEY,
+                                                       TYPED_CONFIRM_REFUSED_KEY)
+        fresh = vault.get_decision(decision.id)
+        status = getattr(fresh, "status", None)
+        if status == "pending" and (getattr(fresh, "context", None) or {}).get(
+                TYPED_CONFIRM_REFUSED_KEY):
+            return True     # already re-opened (the rail and the executor both ask)
+        if status != "resolved":
+            return False
+        ctx = dict(getattr(fresh, "context", None) or {})
+        ctx.pop(CONFIRM_TYPED_KEY, None)
+        ctx[TYPED_CONFIRM_REFUSED_KEY] = reason if type(reason) is str else "refused"
+        fresh.context = ctx
+        fresh.status = "pending"
+        fresh.choice = None
+        fresh.resolved_at = None
+        vault.save_decision(fresh)
+        _handled.discard(decision.id)
+        logger.warning("[ResumeOnDecision] re-opened %s: %s", decision.id, reason)
+        return True
+    except Exception:
+        logger.warning("[ResumeOnDecision] could not re-open %s", getattr(
+            decision, "id", "?"), exc_info=True)
+        return False
+
+
+def _reread_decision(decision, vault):
+    """IMPL-11: ``(status, fresh_decision)`` re-read from the vault, or
+    ``(None, None)`` when the re-read fails. The status is type-pinned (DEC-36)."""
+    try:
+        fresh = vault.get_decision(decision.id)
+    except Exception:
+        return None, None
+    status = getattr(fresh, "status", None)
+    return (status if type(status) is str else None), fresh
+
+
+def _refuse_withdrawn_or_cancelled(decision, fresh, fresh_status, vault, dctx,
+                                   gate_type) -> bool:
+    """IMPL-11: True (and the operator is told) when this resolution must not take
+    effect because the card was WITHDRAWN (expired on disk) or its RUN WAS
+    CANCELLED (the durable marker, or the card's own persisted reason).
+
+    Writes nothing over an expired card - the copy the event carried is stale. A
+    still-resolved card of a cancelled run is stamped ``resume_refused`` (on the
+    FRESH copy) so the reconciler drops it too. Best-effort around the marker read:
+    an unreadable marker is no marker (``cancelled_run_coordinates`` logs it)."""
+    from systemu.approval.decision_queue import (cancelled_run_coordinates,
+                                                 record_late_answer,
+                                                 run_was_cancelled,
+                                                 was_expired_by_cancel)
+    current = fresh if fresh is not None else decision
+    ctx = getattr(current, "context", None)
+    if type(ctx) is not dict:
+        ctx = dctx
+    if fresh_status == "expired" and not was_expired_by_cancel(current):
+        _handled.add(decision.id)
+        _emit_gate_event(
+            "WARNING",
+            _ascii_line(
+                f"Not resumed: {_gate_card_label(decision, dctx, gate_type)} - the "
+                f"card was withdrawn before your answer was applied. Nothing ran."),
+            {"decision_id": decision.id, "gate_type": gate_type},
+        )
+        return True
+    try:
+        marks = cancelled_run_coordinates(vault)
+    except Exception:
+        marks = set()
+    if not (fresh_status == "expired"
+            or run_was_cancelled(ctx, marks) or run_was_cancelled(dctx, marks)):
+        return False
+    _handled.add(decision.id)
+    record_late_answer(current, channel="resume")
+    if fresh is not None and fresh_status == "resolved":
+        try:
+            fresh.context = {**(fresh.context or {}), "resume_refused": "run cancelled"}
+            vault.save_decision(fresh)
+        except Exception:
+            logger.debug("[ResumeOnDecision] could not stamp resume_refused on %s",
+                         decision.id, exc_info=True)
+    logger.info("[ResumeOnDecision] not resuming %s - its run was cancelled",
+                decision.id)
+    return True
+
+
 def _dispatch_resume(decision, *, vault, supervisor,
                      data_dir: Optional[Path] = None) -> bool:
     """Given a resolved stuck `structured_question` decision, stash the
@@ -165,6 +295,13 @@ def _dispatch_resume(decision, *, vault, supervisor,
         return False
     if dctx.get("resume_dispatched"):
         return False
+    # R1: a typed-confirm card this rail RE-OPENED (resolved without its phrase) is
+    # pending again with no choice. A replayed event must never read that empty
+    # choice as a Deny and finalize the run; nothing here acts until the operator
+    # resolves the card again.
+    if (getattr(decision, "status", None) == "pending"
+            and dctx.get("typed_confirm_refused")):
+        return False
     execution_id = dctx.get("execution_id")
     if not execution_id:
         logger.info("[ResumeOnDecision] decision %s has no execution_id — skipping", decision.id)
@@ -211,6 +348,22 @@ def _dispatch_resume(decision, *, vault, supervisor,
     if snap is not None:
         activity_id = activity_id or getattr(snap, "activity_id", None)
         shadow_id = shadow_id or getattr(snap, "shadow_id", None)
+
+    # IMPL-11: the event is a SNAPSHOT of the card. Re-read the card and the durable
+    # cancelled-run marker NOW - after the read-only work above, before any side
+    # effect below (deny finalize, approval bridge, snapshot stash, re-dispatch) -
+    # and refuse when the card was withdrawn (expired) or its run was cancelled: an
+    # answer and a cancel that land together must never resume the stopped run.
+    # ONE re-read: ``fresh_status`` is also what the money gate's "already spent"
+    # check below uses. A failed re-read leaves ``fresh_status`` None (that check
+    # keeps failing closed) and falls back to the card as the event carried it.
+    # Residual: a cancel that lands between this check and supervisor.submit (local
+    # work on this thread - the bridge mint / snapshot stash) is not caught here.
+    fresh_status, fresh = _reread_decision(decision, vault)
+    if _refuse_withdrawn_or_cancelled(decision, fresh, fresh_status, vault, dctx,
+                                      gate_type):
+        return False
+
     if not (activity_id and shadow_id):
         # v0.10.21: a GATE with no resume coords (an iteration-1 park whose decision
         # predates the context-coord stamp, or any coords-less gate) can't be RESUMED,
@@ -257,6 +410,22 @@ def _dispatch_resume(decision, *, vault, supervisor,
             # semantics for a parked instance that no longer exists.
             _v = str(dctx.get("verdict") or "").strip().lower()
             _is_reclass = is_tool_gate and choice.startswith("reclassify")
+            # R1: a money / irreversible card is never remembered. With no run to
+            # resume there is nothing to approve once either, so it records nothing
+            # and says so rather than "recorded your answer".
+            _refusal = typed_confirm_refusal_for(decision) if is_gate else ""
+            if _refusal:
+                _stamp_dispatched(decision, vault)
+                _handled.add(decision.id)
+                _emit_gate_event(
+                    "WARNING",
+                    _ascii_line(
+                        f"Not approved: {_gate_card_label(decision, dctx, gate_type)} - "
+                        f"{_refusal} Nothing ran and nothing was remembered; start the "
+                        f"task again if you still want it."),
+                    {"decision_id": decision.id, "gate_type": gate_type},
+                )
+                return True
             _standing = (is_tool_gate and choice == "always allow" and _v != "deny")
             # The reclassify exclusion is UNREACHABLE by construction today, and is kept
             # deliberately: a reclassify is never "always allow", and only ever arrives
@@ -335,6 +504,41 @@ def _dispatch_resume(decision, *, vault, supervisor,
                  "gate_type": gate_type},
             )
             return True
+        if not is_reclassify:
+            # R1 (spec section 10): a money / irreversible card takes effect only as
+            # "Approve once" WITH the operator's typed phrase. Any surface that
+            # resolved it without one (the CLI, a phone, a stale card's "Always
+            # allow") resolves nothing: no bridge, no standing allow, no re-dispatch
+            # -- the card goes back to the Inbox and the operator is told why.
+            _refusal = typed_confirm_refusal_for(decision)
+            if _refusal:
+                _reopened = reopen_unconfirmed_gate(decision, vault, _refusal)
+                _emit_gate_event(
+                    "WARNING",
+                    _ascii_line(
+                        f"Not approved: {_gate_card_label(decision, dctx, gate_type)} - "
+                        f"{_refusal} Nothing ran"
+                        + ("; the card is back in your Inbox." if _reopened else ".")),
+                    {"activity_id": activity_id, "decision_id": decision.id,
+                     "gate_type": gate_type},
+                )
+                return False
+            # R1: ONE typed confirmation buys ONE run. Two runs parked on the same
+            # (params-independent) dedup key share one card; if the chat lane
+            # already consumed this decision for its own call, minting a bridge
+            # here too would run the money call twice on one confirmation. The
+            # event that reached us is a snapshot -- re-read before minting.
+            # IMPL-11: the re-read is the ONE taken above, before any side effect
+            # (``fresh_status``; None when it failed - still fail-closed here).
+            from systemu.runtime.command_approvals import irreversible_card_effects
+            if is_tool_gate and irreversible_card_effects(dctx):
+                if fresh_status != "resolved":
+                    logger.warning(
+                        "[ResumeOnDecision] irreversible gate %s is %r, not "
+                        "resolved -- already spent; minting nothing", decision.id,
+                        fresh_status)
+                    _handled.add(decision.id)
+                    return False
         if is_reclassify:
             # Record the single-use class assignment and fall through to the resume
             # submit. Deliberately NO _record_gate_approval: a reclassify must never
@@ -656,6 +860,33 @@ def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
                         "[ResumeOnDecision] reclassified card for %s carried no "
                         "assigned_class — recording nothing; the run will re-gate", sig)
                     return
+            # R1 (spec section 10): a money / irreversible card is NEVER remembered and
+            # takes effect only as "Approve once" with the operator's typed phrase.
+            # The dispatcher already refused anything else; this is the recorder's
+            # own half of that rule, so no caller can reach a mint without it. The
+            # one thing minted is a single-use bridge bound to the args fingerprint
+            # of the call the phrase was typed against -- the gate honours it for
+            # THAT call only (``consume_resume_approved(require_confirmed=True)``).
+            from systemu.runtime.command_approvals import (CONFIRM_TYPED_KEY,
+                                                           irreversible_card_effects,
+                                                           typed_confirm_refusal)
+            if irreversible_card_effects(dctx):
+                _why = typed_confirm_refusal(dctx, choice=choice,
+                                             typed=dctx.get(CONFIRM_TYPED_KEY))
+                _fp = dctx.get("args_fingerprint")
+                if choice != "approve once" or _why:
+                    logger.warning("[ResumeOnDecision] irreversible tool gate %s "
+                                   "resolved %r -- recording NOTHING (%s)", sig,
+                                   choice, _why or "not an approve-once")
+                    return
+                if type(_fp) is not str or not _fp:
+                    logger.warning("[ResumeOnDecision] irreversible tool gate %s "
+                                   "carried no args fingerprint -- recording "
+                                   "NOTHING; the run will re-gate", sig)
+                    return
+                store.mark_resume_approved(sig, for_reclassification=scope,
+                                           confirmed_args=_fp)
+                return
             if choice == "always allow" and verdict and not reclassified:
                 store.approve(sig)
             else:

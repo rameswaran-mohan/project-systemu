@@ -121,9 +121,14 @@ def test_provider_key_present_does_attempt_the_llm_call(monkeypatch):
     assert len(vault.appended) == 1
 
 
-def test_has_llm_provider_detects_any_of_the_four_keys():
+def test_has_llm_provider_detects_any_of_the_four_keys(monkeypatch):
     """The guard is satisfied by ANY of the four provider keys (openrouter /
     google / anthropic / openai), and is defensive against a missing attr."""
+    # e2e31 (GATE-6): the Anthropic key only satisfies the guard when the SDK
+    # its class imports is there, so the SDK seam is driven PRESENT and this
+    # pins "key + SDK -> ready". "Key without SDK" is the sibling test below.
+    from systemu.llm import providers as _providers
+    monkeypatch.setattr(_providers, "_find_spec", lambda name: object())
     assert episodic_memory._has_llm_provider(_keyless_config()) is False
 
     for attr in ("openrouter_api_key", "google_api_key",
@@ -136,3 +141,21 @@ def test_has_llm_provider_detects_any_of_the_four_keys():
     cfg = _keyless_config()
     cfg.openrouter_api_key = "   "
     assert episodic_memory._has_llm_provider(cfg) is False
+
+
+def test_has_llm_provider_refuses_a_key_without_its_sdk(monkeypatch):
+    """The other half of ``test_has_llm_provider_detects_any_of_the_four_keys``:
+    the SDK seam answers ABSENT. An Anthropic key alone must not satisfy the
+    guard -- capture would go on to the summarize call and die on
+    ``ModuleNotFoundError``. A key for a provider that needs no optional SDK
+    still does."""
+    from systemu.llm import providers as _providers
+    monkeypatch.setattr(_providers, "_find_spec", lambda name: None)
+
+    cfg = _keyless_config()
+    cfg.anthropic_api_key = "some-value"
+    assert episodic_memory._has_llm_provider(cfg) is False
+
+    cfg = _keyless_config()
+    cfg.google_api_key = "some-value"
+    assert episodic_memory._has_llm_provider(cfg) is True

@@ -45,7 +45,32 @@ from pydantic import BaseModel, Field
 # List[str]/dict conventions elsewhere in the vault.
 ITEM_KINDS = {"service", "mcp_server", "tool", "data_root", "credential_ref",
               "preference", "device"}
-ITEM_STATUSES = {"declared", "configuring", "ready", "stale", "broken", "suggested"}
+#: The legal `status` values and what each one MEANS on the operator's table. The
+#: set below is derived from this map, so a status cannot join the vocabulary
+#: without saying what it means. Pinned complete against everything the projector
+#: and this module ASSIGN to a status (AST-scanned in
+#: ``tests/test_rb1_table_health.py``): a status the projector emits and this map
+#: does not carry is a state nothing can ask about, and the /table colour map
+#: renders it as grey, unremarkable inventory -- a silent downgrade (F24).
+ITEM_STATUS_MEANINGS: Dict[str, str] = {
+    "declared": ("intent only - the operator said they have it, but no live store "
+                 "object backs it yet"),
+    "configuring": "setup is in flight in one of the existing flows",
+    "ready": "a live store object backs it and systemu can use it",
+    "stale": "it exists but has not been verified recently enough to trust",
+    "broken": ("it was relied on and is no longer usable - the backing thing went "
+               "away or failed; the item stays listed with the reason until the "
+               "operator removes it or the thing comes back"),
+    "suggested": ("a proposal waiting in the tray - not part of the inventory until "
+                  "the operator accepts it"),
+    # F24 emits this from `_project_tools`. NOT `broken`: nothing failed, an
+    # optional dependency group was simply never installed, and the word decides
+    # whether the operator reaches for pip or for the forge.
+    "unavailable": ("the record is fine, but an optional dependency group it needs "
+                    "is not installed on this machine - a pip install fixes it, the "
+                    "forge does not"),
+}
+ITEM_STATUSES = set(ITEM_STATUS_MEANINGS)
 #: The five legal `provenance` values (R-B4). Previously documented ONLY in the
 #: field comment on `TableItem.provenance`, which meant nothing could ASK whether a
 #: value was known — and a renderer that cannot tell "unknown" from "known" has to
@@ -80,6 +105,24 @@ class TableItem(BaseModel):
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
     verified_at: Optional[str] = None
+
+    # ── R-B1 health -- PROJECTOR-OWNED ───────────────────────────────────────
+    # Written only by `table_reconciler.project()`. Every SIDECAR row has them
+    # cleared on merge, so no hand-edited or task-written file can forge a break
+    # or back-date one. Defaults keep an items.json written before these fields
+    # existed loading exactly as it did.
+    #: the one-line, ASCII reason the health layer broke this item ("credential
+    #: removed", ...). "" when the health layer has not broken it -- a `broken`
+    #: status with no reason is some OTHER failure (e.g. a tool's failed dry run).
+    broken_reason: str = ""
+    #: when the backing thing was first seen gone (ISO-8601 UTC). It is the moment
+    #: it BROKE, carried forward unchanged on every later tick; None when healthy.
+    broken_at: Optional[str] = None
+    #: folder-backed (`data_root` kind) items only: the canonical GrantedRoots root
+    #: whose grant covers ``ref["root_path"]`` -- taken FROM GrantedRoots each tick,
+    #: never from the item. None when no granted root covers the folder (which then
+    #: confers nothing, §5.10.b#3).
+    data_root: Optional[str] = None
 
 
 def _dir(vault) -> Path:
@@ -127,6 +170,41 @@ def load_items(vault) -> List[TableItem]:
         return out
     except Exception:
         return []
+
+
+def load_items_witnessed(vault) -> Optional[List[TableItem]]:
+    """The persisted snapshot, or ``None`` when it cannot be WITNESSED (R-B1).
+
+    ``load_items`` answers ``[]`` for an absent OR unreadable snapshot, which is the
+    right shape for a badge and the wrong one for a health surface: "0 broken" read
+    from a table nobody has projected yet is a reassuring claim nothing backs.
+    ``None`` covers both "the reconciler has not written it yet" and "it cannot be
+    read"; ``snapshot_state`` says which. A malformed ENTRY is skipped exactly as
+    ``load_items`` skips it -- one bad row is not an unreadable table."""
+    try:
+        raw = json.loads(_items_path(vault).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if type(raw) is not list:
+        return None
+    out: List[TableItem] = []
+    for entry in raw:
+        if type(entry) is not dict:
+            continue
+        try:
+            out.append(TableItem(**entry))
+        except Exception:
+            continue
+    return out
+
+
+def snapshot_state(vault) -> str:
+    """``"absent"`` (never projected) or ``"unreadable"`` -- the reason
+    ``load_items_witnessed`` returned None. Never raises."""
+    try:
+        return "unreadable" if _items_path(vault).exists() else "absent"
+    except Exception:
+        return "unreadable"
 
 
 def save_items(vault, items: List[TableItem]) -> None:

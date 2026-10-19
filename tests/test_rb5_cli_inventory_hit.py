@@ -9,15 +9,14 @@ real command (``systemu debug avoidable-ask``) through ``CliRunner`` -- the same
 so a green here cannot mean "the helper works in isolation" again.
 
 WHERE THE INPUT COMES FROM, and why these fixtures are written the way they are.
-A run's ``RequirementReport`` survives the run in exactly one place:
-``ExecutionSnapshot.requirement_report`` (systemu/runtime/execution_snapshot.py:102,
-serialised at :272) on disk at
-``<data_dir>/audit/exec_<execution_id>/resume_snapshot.json`` (:54). Everywhere else
-it lives only on ``context._requirement_report`` for the life of the process
-(shadow_runtime.py:1545). So the fixtures below are written by the REAL
-``write_snapshot`` from a REAL ``RequirementReport``, not by hand-rolling the JSON:
-a hand-rolled fixture would keep passing after the persisted shape moved, which is
-precisely the failure mode this file exists to close.
+The command reads the DURABLE per-run table record
+(``<audit data root>/audit/table_payoff/run_<root>.jsonl``, written by the binder via
+``table_payoff_record.record_binder_pass``). It used to read the RequirementReport
+cached in each run's resume snapshot -- deleted when a resume consumes it, so the
+measured population shrank over time (DEC-27); that block is retired. The fixtures
+below are written by the REAL recorder, not by hand-rolling the JSON: a hand-rolled
+fixture would keep passing after the persisted shape moved, which is precisely the
+failure mode this file exists to close.
 
 AC7 is about a SPLIT, not a total: ``silent`` and ``prefilled_confirm`` must be
 rendered as separate counts. Summing them would let a collapse in ``silent`` (which
@@ -34,7 +33,9 @@ from click.testing import CliRunner
 
 from systemu.core.models import Requirement, RequirementReport
 from systemu.interface import cli_commands as cc
-from systemu.runtime.execution_snapshot import ExecutionSnapshot, write_snapshot
+from systemu.runtime import table_payoff_record as tpr
+from systemu.runtime.situational_inventory import SituationReport, compose_table
+from systemu.runtime.table_store import TableItem
 
 _CLI_SOURCE = Path(cc.__file__)
 
@@ -47,16 +48,25 @@ def _req(**over) -> Requirement:
     return Requirement(**base)
 
 
-def _persist(data_dir: Path, execution_id: str, reqs) -> Path:
-    """Persist one run's RequirementReport through the REAL snapshot writer."""
-    report = RequirementReport(per_objective={1: list(reqs)}, ask_bundle=[])
-    snap = ExecutionSnapshot(
-        execution_id=execution_id, shadow_id="sh", scroll_id="sc",
-        requirement_report=report.model_dump(mode="json"),
-    )
-    path = write_snapshot(snap, data_dir=data_dir)
-    assert path is not None, "fixture premise: the snapshot writer wrote the file"
-    return Path(path)
+def _record(data_dir: Path, execution_id: str, reqs) -> Path:
+    """Record one run's binder pass through the REAL durable recorder, with the
+    operator's table on hand (so the run counts as having consulted it)."""
+    item = TableItem(id="t-1", kind="service", name="recipient",
+                     ref={"server": "https://example.invalid/t1"})
+    status = tpr.record_binder_pass(
+        RequirementReport(per_objective={1: list(reqs)}, ask_bundle=[]),
+        compose_table(SituationReport(), [item]),
+        root_execution_id=execution_id, execution_id=execution_id, site="midloop",
+        data_dir=data_dir)
+    assert status["consulted"] and status["error"] is None, status
+    return tpr.run_record_path(execution_id, data_dir=data_dir)
+
+
+def _hermetic(monkeypatch):
+    """The command resolves the audit root the production way; make sure no vault env
+    points it somewhere other than the cwd ``_run`` stands in."""
+    from systemu.runtime import vault_root as vr
+    monkeypatch.delenv(vr.VAULT_DIR_ENV, raising=False)
 
 
 @pytest.fixture()
@@ -84,39 +94,41 @@ def _inventory_lines(output: str):
     return [ln for ln in output.splitlines() if "Inventory-hit" in ln]
 
 
-# == 1. AC7 -- the split renders, over the REAL persisted input ===============
+# == 1. AC7 -- the split renders, over the REAL durable record ===============
 def test_cli_renders_silent_and_prefilled_confirm_as_separate_counts(
         monkeypatch, tmp_path, vault):
-    """AC7. One silent bind and one pre-filled confirm, persisted by two DIFFERENT
-    runs, so this also pins that the command reads the whole snapshot set rather
-    than one file."""
-    _persist(tmp_path / "data", "run-a",
-             [_req(schema_path="/a", value_origin="operator")])      # -> silent
-    _persist(tmp_path / "data", "run-b",
-             [_req(schema_path="/b", value_origin="content_derived",  # -> confirm
-                   table_item_id="t-1")])
+    """AC7. One silent bind and one pre-filled confirm, recorded by two DIFFERENT
+    runs, so this also pins that the command reads the whole record set rather than
+    one file. (Re-pointed from resume snapshots to the durable record; in the record
+    every row is table-sourced, so the silent one is also the DEC-25 alarm.)"""
+    _hermetic(monkeypatch)
+    _record(tmp_path / "data", "run-a",
+            [_req(schema_path="/a", value_origin="operator",          # -> silent
+                  table_item_id="t-1")])
+    _record(tmp_path / "data", "run-b",
+            [_req(schema_path="/b", value_origin="content_derived",   # -> confirm
+                  table_item_id="t-1")])
 
     out = _run(monkeypatch, tmp_path, vault)
 
-    assert "bound with no ask: 1" in out, out
-    assert "pre-filled one-click confirm: 1" in out, out
+    assert "pre-filled one-click confirm: 1; silent: 1" in out, out
     # the two are NEVER summed into one headline
-    assert "bound with no ask: 2" not in out
-    assert "Inventory-hit rate: 100% (2/2" in out, out
-    assert "from your table: 1 of 1" in out, out
+    assert "pre-filled one-click confirm: 2" not in out
+    assert "silent: 2" not in out
+    assert "Inventory-hit (table record): 100% of runs (2/2" in out, out
 
 
 def test_the_split_is_a_split_not_a_relabelled_total(monkeypatch, tmp_path, vault):
     """Mutation guard for AC7: with only confirms on disk the silent count must read
     0 and the confirm count must read the real number. A formatter that printed the
     same total twice would pass the test above and fail here."""
-    _persist(tmp_path / "data", "run-c", [
-        _req(schema_path="/a", value_origin="content_derived"),
-        _req(schema_path="/b", value_origin="content_derived"),
+    _hermetic(monkeypatch)
+    _record(tmp_path / "data", "run-c", [
+        _req(schema_path="/a", value_origin="content_derived", table_item_id="t-1"),
+        _req(schema_path="/b", value_origin="content_derived", table_item_id="t-1"),
     ])
     out = _run(monkeypatch, tmp_path, vault)
-    assert "bound with no ask: 0" in out, out
-    assert "pre-filled one-click confirm: 2" in out, out
+    assert "pre-filled one-click confirm: 2; silent: 0 (healthy is 0)" in out, out
 
 
 # == 2. the empty input set is NOT MEASURED, never a fabricated 0% ===========
@@ -165,15 +177,23 @@ def _called_names(fn: ast.FunctionDef):
     return out
 
 
-def test_the_metrics_command_consults_inventory_hit_report():
+def test_the_metrics_command_consults_the_durable_record():
     """THE reachability pin. Delete the call site in ``debug_avoidable_ask`` and this
     test goes red -- which is the whole point: R-B5 shipped once already with both
-    payoff helpers fully unit tested and no production caller at all."""
+    payoff helpers fully unit tested and no production caller at all.
+
+    Re-pointed from the snapshot reader to the RECORD reader, and it pins the
+    retirement too: the snapshot-reading path may not come back beside it."""
     called = _called_names(_function_node(_CLI_SOURCE, "debug_avoidable_ask"))
-    assert "inventory_hit_report" in called, \
-        "the metrics command no longer consults inventory_hit_report"
-    assert "format_inventory_hit" in called, \
+    assert "scan_records" in called, \
+        "the metrics command no longer reads the durable table record"
+    assert "record_inventory_hit_report" in called, \
+        "the metrics command no longer consults the record inventory-hit report"
+    assert "format_record_inventory_hit" in called, \
         "the metrics command no longer renders the inventory-hit lines"
+    retired = called & {"_persisted_requirement_rows", "inventory_hit_report",
+                        "format_inventory_hit"}
+    assert not retired, f"the retired snapshot-reading block is back: {sorted(retired)}"
 
 
 def test_the_metric_is_read_only_no_novelty_ledger_from_the_cli():
@@ -186,23 +206,22 @@ def test_the_metric_is_read_only_no_novelty_ledger_from_the_cli():
 
 
 # == 4. a metrics printout may never adjudicate a run ========================
-def test_an_unreadable_snapshot_is_skipped_and_the_rest_still_counts(
+def test_an_unreadable_run_record_is_named_and_the_rest_still_counts(
         monkeypatch, tmp_path, vault):
-    """``read_snapshot`` raises ``SnapshotRefused`` on a newer schema (DEC-9) -- right
-    for a resume, wrong for a printout. A corrupt or future-schema file must degrade
-    to "not counted", never to a crashed metrics command."""
-    _persist(tmp_path / "data", "run-good",
-             [_req(schema_path="/a", value_origin="operator")])
-
-    junk = tmp_path / "data" / "audit" / "exec_run-bad"
-    junk.mkdir(parents=True, exist_ok=True)
-    (junk / "resume_snapshot.json").write_text("{not json", encoding="utf-8")
-
-    future = tmp_path / "data" / "audit" / "exec_run-future"
-    future.mkdir(parents=True, exist_ok=True)
-    (future / "resume_snapshot.json").write_text(
-        json.dumps({"execution_id": "run-future", "schema_version": 9999,
-                    "requirement_report": "not-a-dict"}), encoding="utf-8")
+    """A run record that cannot be read must degrade to "named and excluded", never
+    to a crashed metrics command -- and never to a silently smaller population
+    (DEC-27). A record holding only junk lines is read, and its lines are counted
+    as skipped. (Re-pointed from corrupt / future-schema resume snapshots.)"""
+    _hermetic(monkeypatch)
+    good = _record(tmp_path / "data", "run-good",
+                   [_req(schema_path="/a", value_origin="content_derived",
+                         table_item_id="t-1")])
+    (good.parent / "run_run-bad.jsonl").mkdir()            # exists, cannot be read
+    (good.parent / "run_run-junk.jsonl").write_text(
+        "{not json\n" + json.dumps(["not", "a", "row"]) + "\n", encoding="utf-8")
 
     out = _run(monkeypatch, tmp_path, vault)
-    assert "bound with no ask: 1" in out, out
+    assert "Inventory-hit (table record): 100% of runs (1/1" in out, out
+    assert "1 run record(s) could not be read" in out, out
+    assert "2 malformed rows skipped" in out, out
+    assert "NOT EVALUATED for 1 unreadable" in out, out

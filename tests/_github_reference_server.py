@@ -11,7 +11,7 @@ issue:
 Two properties make this the JOIN point for the G-DEMO v0 acceptance fixture:
 
   * It returns a **dict** (NOT a str), annotated as an ``IssueResult`` TypedDict.
-    Against the installed FastMCP (mcp 1.28.0) a plain ``-> dict`` return is
+    Against FastMCP (mcp 1.28.0; MCPServer on mcp 2.3.0 behaves the same) a plain ``-> dict`` return is
     wrapped one level deep under ``structuredContent = {"result": {...}}`` — which
     would hide ``html_url`` from ``_synthesize_directive`` (it reads ``html_url``
     at the TOP level) and silently degrade the receipt to CLAIMED. A TypedDict (or
@@ -24,13 +24,25 @@ Two properties make this the JOIN point for the G-DEMO v0 acceptance fixture:
     the ``n`` embedded in the path is how the create seam and the readback seam
     JOIN with no shared runtime state (the mock-REST handler parses ``n`` back out).
 
+Runs on BOTH official-SDK lines (D-MCP2): the server class comes from systemu's
+ONE SDK seam, ``systemu.runtime.mcp.sdk.compat`` -- mcp 2.x ``MCPServer`` probed
+first, then mcp 1.x ``FastMCP``.
+
 Run as a script: ``python tests/_github_reference_server.py``.
 """
+import sys
+from pathlib import Path
 from typing import TypedDict
 
-from mcp.server.fastmcp import FastMCP
+# Spawned as a bare script, sys.path[0] is tests/. Put THIS checkout first so
+# the seam that picks the server class is the one under test.
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-mcp = FastMCP("github")
+from systemu.runtime.mcp.sdk.compat import LAYOUT  # noqa: E402
+
+mcp = LAYOUT.require("server_class")("github")
 
 
 class IssueResult(TypedDict):

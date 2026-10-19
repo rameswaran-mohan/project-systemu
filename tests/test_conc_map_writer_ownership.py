@@ -565,3 +565,202 @@ def test_side_store_writes_are_atomic(rel):
         f"{rel} is a durable side-store but does not use os.replace() for an atomic "
         f"write — a mid-write crash could leave a torn file. Keep the tmp+replace pattern."
     )
+
+
+# --- PLAN-11 / 1d: every metrics.json writer holds the store lock ------------
+_METRICS_RMW_WRITERS = ("incr", "incr_s4_shadow_meter", "record_resolution")
+
+
+@pytest.mark.parametrize("method", _METRICS_RMW_WRITERS)
+def test_every_metrics_json_writer_holds_the_state_lock(method):
+    """The fatigue row now says LOCK+A. That claim is only true while EVERY
+    read-modify-write of metrics.json runs under ``_STATE_LOCK`` -- one unlocked
+    writer reopens the lost-update race for all three. Pinned on the AST of each
+    writer: its body must open ``with _STATE_LOCK`` before any ``_load``."""
+    import ast
+    import inspect
+
+    from systemu.runtime.metrics_store import MetricsStore
+
+    fn = ast.parse(inspect.cleandoc("\n" + inspect.getsource(
+        getattr(MetricsStore, method))))
+    body = fn.body[0].body
+    stmts = [s for s in body if not (isinstance(s, ast.Expr)
+                                     and isinstance(s.value, ast.Constant))]
+    assert stmts and isinstance(stmts[0], ast.With), method
+    ctx = stmts[0].items[0].context_expr
+    assert isinstance(ctx, ast.Name) and ctx.id == "_STATE_LOCK", method
+
+
+def test_the_fatigue_row_states_the_lock_and_the_bound():
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    row = next(ln for ln in text.splitlines()
+               if ln.startswith("| Fatigue metrics `metrics/metrics.json`"))
+    assert "LOCK+A" in row and "_STATE_LOCK" in row
+    assert "unlocked RMW" not in row
+    from systemu.runtime.metrics_store import LATENCY_WINDOW
+    assert f"`LATENCY_WINDOW` = {LATENCY_WINDOW}" in text
+
+
+# =========================================================================== #
+# APPENDED - R-B1 OnTheTable health (DEC-10 review checkpoint)
+#
+# Everything below is appended; nothing above is edited. The one statement that
+# reaches backwards is the allowlist widening right here, and it is the review
+# this guard exists to force: `table_reconciler.project()` now constructs a
+# GrantedRootsStore to project the operator's granted roots as folder cards and
+# to take each folder card's `data_root` from the grant that covers it. It is a
+# READ-ONLY holder (list_roots only) - the same standing as build_roots and the
+# binder - and that is pinned twice: by the CONC-MAP row bound below, and by an
+# AST pin in tests/test_rb1_table_health.py that fails if the reconciler ever
+# calls grant / revoke / _write. Mutating the declared set in place (rather than
+# adding a WRITER_OWNERSHIP entry) keeps the parametrize ids above aligned: they
+# were computed when the decorator ran, so a new KEY would mismatch them.
+# =========================================================================== #
+
+WRITER_OWNERSHIP["GrantedRoots (<vault>/granted_roots.json)"]["allowed"].add(
+    "runtime/table_reconciler.py")   # R-B1: READ-ONLY holder (list_roots)
+
+
+def test_the_table_reconciler_grantedroots_read_has_its_conc_map_row():
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    anchor = "**R-B1 table health - GrantedRoots READ side**"
+    assert text.count(anchor) == 1
+    row = next(ln for ln in text.splitlines() if anchor in ln)
+    assert "list_roots()" in row and "read-only" in row
+
+
+# --- R-B1 appended guards: the health tick's trigger set and the names backfill ---
+# Their own dict and their own parametrized tests (reusing `_caller_files`), so the
+# WRITER_OWNERSHIP ids above stay aligned with the entries they were computed from.
+TABLE_HEALTH_OWNERSHIP = {
+    "R-B1 table health tick (<root>/table/items.json - second trigger)": {
+        "call": "run_health_checks(",
+        "allowed": {"scheduler/jobs.py"},          # _table_health_job, the daemon tick
+        "def": "runtime/table_reconciler.py",
+        "conc_map_row": "**R-B1 table health tick**",
+        "note": ("A second scheduler TRIGGER of the one items.json writer, serialized "
+                 "by table_reconciler._RECONCILE_LOCK. A third trigger (a UI 'verify "
+                 "now', a CLI verb) needs the same review: it would run the keyring "
+                 "backfill and a write from a new thread."),
+    },
+    "R-B1 credential names backfill (<root>/.credential_names.json)": {
+        "call": "backfill_names(",
+        "allowed": {"runtime/table_reconciler.py"},   # backfill_credential_names
+        "def": "runtime/credentials/store.py",
+        "conc_map_row": "**R-B1 credential names registry**",
+        "note": ("The registry's one BACKGROUND writer, under credentials.store."
+                 "_NAMES_LOCK with set/delete. Another caller would be another "
+                 "background writer of a file operator deletes also rewrite."),
+    },
+}
+
+
+@pytest.mark.parametrize("store,spec", TABLE_HEALTH_OWNERSHIP.items(),
+                         ids=["health_tick", "names_backfill"])
+def test_table_health_writer_sets_match_conc_map(store, spec):
+    callers = _caller_files(spec["call"], scan_root=_SYSTEMU, def_file=spec["def"])
+    assert callers == spec["allowed"], (
+        f"\nCONC-MAP writer-ownership VIOLATION for: {store}\n"
+        f"  callers of `{spec['call']}`: {sorted(callers)}\n"
+        f"  declared: {sorted(spec['allowed'])}\n  {spec['note']}")
+
+
+@pytest.mark.parametrize("store,spec", TABLE_HEALTH_OWNERSHIP.items(),
+                         ids=["health_tick", "names_backfill"])
+def test_table_health_store_has_a_conc_map_row(store, spec):
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    assert text.count(spec["conc_map_row"]) == 1, store
+
+
+def test_the_items_json_writer_is_serialized_and_says_so():
+    import ast
+    import inspect
+
+    from systemu.runtime import table_reconciler
+
+    fn = ast.parse(inspect.cleandoc("\n" + inspect.getsource(
+        table_reconciler.reconcile_once)))
+    withs = [n for n in ast.walk(fn) if isinstance(n, ast.With)]
+    assert any(isinstance(w.items[0].context_expr, ast.Name)
+               and w.items[0].context_expr.id == "_RECONCILE_LOCK" for w in withs)
+    row = next(ln for ln in _CONC_MAP.read_text(encoding="utf-8").splitlines()
+               if "**R-B1 table health tick**" in ln)
+    assert "LOCK+A" in row and "_RECONCILE_LOCK" in row
+
+# --- T5 durable table-payoff record (appended) --------------------------------
+# Kept OUT of the parametrized WRITER_OWNERSHIP dict on purpose: that dict is consumed
+# by decorators at import time, and this file is append-only for this packet. The
+# three pins below are the same two-way binding the parametrized tests give every
+# other guarded store, plus the retention claim the row is required to make.
+_T5_RECORD = {
+    "call": "record_binder_pass(",
+    "allowed": {"runtime/shadow_runtime.py"},   # _record_table_payoff, both binder sites
+    "def": "runtime/table_payoff_record.py",
+    "conc_map_row": "**T5 table-payoff record** `audit/table_payoff/run_<root>.jsonl`",
+}
+
+
+def test_t5_table_payoff_record_writer_set_matches_conc_map():
+    """Sole writer: the shadow runtime's binder call sites. Both halves, as above: a
+    new caller is an unreviewed writer, and a LOST caller means the record went inert
+    (the metric and the chips would read an ever-staler file)."""
+    callers = _caller_files(_T5_RECORD["call"], scan_root=_SYSTEMU,
+                            def_file=_T5_RECORD["def"])
+    assert callers == _T5_RECORD["allowed"], (
+        f"T5 table-payoff record writers changed: {sorted(callers)} "
+        f"(CONC-MAP declares {sorted(_T5_RECORD['allowed'])}) -- update docs/CONC-MAP.md "
+        f"and run the DEC-10 review")
+
+
+def test_t5_table_payoff_record_has_exactly_one_conc_map_row():
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    assert text.count(_T5_RECORD["conc_map_row"]) == 1
+
+
+def test_t5_table_payoff_record_row_states_retention_and_the_alias_write_is_atomic():
+    """No silent growth claim: the row must say the record is UNBOUNDED, and the one
+    whole-file write in the module (the derived alias) must be tmp + os.replace."""
+    row = next(ln for ln in _CONC_MAP.read_text(encoding="utf-8").splitlines()
+               if _T5_RECORD["conc_map_row"] in ln)
+    assert "RETENTION: UNBOUNDED" in row
+    assert "os.replace(" in (_SYSTEMU / _T5_RECORD["def"]).read_text(encoding="utf-8")
+
+
+# --- IMPL-11 cancelled-run marker (appended) ----------------------------------
+# Same two-way binding as the T5 block above, kept out of the parametrized dict for
+# the same reason. `"def": ""` on purpose: the def file IS the writer (the call sits
+# in expire_cards_for_run, in the same module), and the def-line filter already drops
+# the definition - so this is a REACHABILITY pin: delete the call and the declared
+# writer goes missing.
+_IMPL11_MARKER = {
+    "call": "record_cancelled_run(",
+    "allowed": {"approval/decision_queue.py"},   # expire_cards_for_run, every cancel path
+    "def": "",
+    "conc_map_row": "**IMPL-11 cancelled-run marker** `<root>/cancelled_runs.json`",
+}
+
+
+def test_impl11_cancelled_run_marker_writer_set_matches_conc_map():
+    callers = _caller_files(_IMPL11_MARKER["call"], scan_root=_SYSTEMU,
+                            def_file=_IMPL11_MARKER["def"])
+    assert callers == _IMPL11_MARKER["allowed"], (
+        f"IMPL-11 cancelled-run marker writers changed: {sorted(callers)} "
+        f"(CONC-MAP declares {sorted(_IMPL11_MARKER['allowed'])}) -- update "
+        f"docs/CONC-MAP.md and run the DEC-10 review")
+
+
+def test_impl11_cancelled_run_marker_has_exactly_one_conc_map_row():
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    assert text.count(_IMPL11_MARKER["conc_map_row"]) == 1
+
+
+def test_impl11_cancelled_run_marker_is_locked_atomic_and_bounded():
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    section = text[text.index(_IMPL11_MARKER["conc_map_row"]):][:1400]
+    assert "LOCK+A" in section and "RETENTION" in section
+    src = (_SYSTEMU / "approval" / "decision_queue.py").read_text(encoding="utf-8")
+    body = src[src.index("def record_cancelled_run("):]
+    body = body[:body.index("\ndef ")]
+    assert "with _CANCELLED_RUNS_LOCK:" in body and "os.replace(" in body
+    assert "CANCELLED_RUNS_RETENTION" in body

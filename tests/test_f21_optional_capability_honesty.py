@@ -846,3 +846,117 @@ def test_install_command_is_a_single_copyable_line():
     cmd = od.install_command(["playwright"])
     assert cmd == 'pip install "systemu[browser]"'
     assert "\n" not in cmd
+
+
+# --------------------------------------------------------------------------- #
+# 4b. THE MISSING FENCE DIRECTION (e2e31)
+#
+# The pyproject comment above `[project.optional-dependencies]` claims "tests/
+# test_f21_optional_capability_honesty.py fences BOTH directions".  Only ONE
+# was fenced: `test_every_group_names_a_real_extra_that_contains_its_packages`
+# refuses a GROUP with no extra.  Nothing refused an EXTRA with no group -- and
+# that is the half that was actually violated: `[anthropic]` had shipped since
+# v0.7-e with no registry entry, so `pip install "systemu[anthropic]"` was a
+# real, working command that no surface in the product could ever print.  A
+# false claim of enforcement is itself a defect of the DEC-34 class, so the
+# claim is now true.
+#
+# THE EXCLUSIONS ARE A COMMITTED BASELINE, not a convention the checked party
+# may decline: every name below must still be a declared extra (a stale excuse
+# is a failure) and every extra outside it must be registered.  Both directions
+# are fatal, so the list cannot grow silently.
+# --------------------------------------------------------------------------- #
+
+#: Extra -> why it is deliberately NOT a capability group.  An extra earns a
+#: group when its ABSENCE is a capability the product lists and must disclose;
+#: these are not that.
+_EXTRAS_WITH_NO_GROUP = {
+    "all": (
+        "meta: the union of the capability extras. A group for it would make "
+        "the remedy for one missing package install all of them."),
+    "dev": (
+        "meta: contributor tooling (pytest, pytest-asyncio, fakeredis) plus "
+        "the capability extras. Not a capability of the shipped product."),
+    "openai-native": (
+        "declares NO packages -- the OpenAI SDK is a CORE dependency. There is "
+        "nothing that can be absent, so there is nothing to disclose. "
+        "Mechanically checked below."),
+    "browser-use": (
+        "an out-of-tree plugin declaration (v0.7-f). Nothing in this tree "
+        "imports browser_use, so there is no in-product capability whose "
+        "absence it would explain. Mechanically checked below."),
+    "mem0": (
+        "an alternate memory BACKEND selected by SYSTEMU_MEMORY_BACKEND, whose "
+        "swap point (systemu/runtime/memory_backends/mem0.py) already raises "
+        "its own refusal naming the install command. That is a second copy of "
+        "the recipe and is filed as debt; it is excluded here rather than "
+        "silently registered, because registering it changes `doctor` output "
+        "and belongs to its own slice."),
+    "local": (
+        "an install MODE, not a capability: every package it names is ALSO a "
+        "core dependency, so test_no_group_package_is_also_a_core_dependency "
+        "would refuse the group outright. Mechanically checked below."),
+    "docker-local": (
+        "an install MODE. A missing storage backend is disclosed by the W3.3 "
+        "storage-degraded health issue, which names the backend the operator "
+        "asked for -- not by a `pip install systemu[...]` line."),
+    "docker-enterprise": (
+        "an install MODE, as above (Postgres + Redis)."),
+}
+
+
+def _extra_package_names(extra: str) -> set:
+    extras = _pyproject()["project"]["optional-dependencies"]
+    return {od.canonical(re.split(r"[<>=!~;\[ ]", s.strip())[0])
+            for s in extras[extra]}
+
+
+def test_every_pyproject_extra_is_registered_or_explicitly_excluded():
+    """THE DIRECTION THAT WAS MISSING. An extra with no group is a `pip install
+    systemu[x]` the operator can run and the product can never recommend."""
+    extras = set(_pyproject()["project"]["optional-dependencies"])
+    registered = {g.extra for g in od.GROUPS}
+    unregistered = extras - registered - set(_EXTRAS_WITH_NO_GROUP)
+    assert not unregistered, (
+        f"pyproject declares {sorted(unregistered)} with no optional_deps "
+        f"GROUPS entry -- an absent package with no remedy path. Register it, "
+        f"or add it to _EXTRAS_WITH_NO_GROUP with the reason it is not a "
+        f"capability."
+    )
+
+
+def test_no_exclusion_outlives_the_extra_it_excuses():
+    """The other half of the baseline: a deleted or renamed extra must not
+    leave a standing excuse behind for the next one that reuses the name."""
+    extras = set(_pyproject()["project"]["optional-dependencies"])
+    stale = set(_EXTRAS_WITH_NO_GROUP) - extras
+    assert not stale, (
+        f"{sorted(stale)} is excused from needing a group but is no longer a "
+        f"declared extra -- drop the excuse")
+    for name, reason in _EXTRAS_WITH_NO_GROUP.items():
+        assert reason.strip(), f"{name} is excluded with no reason given"
+    assert not (set(_EXTRAS_WITH_NO_GROUP) & {g.extra for g in od.GROUPS}), (
+        "an extra cannot be both registered and excused")
+
+
+def test_the_mechanically_checkable_exclusion_reasons_are_true():
+    """Three of the eight reasons are claims about the tree, not judgement
+    calls. A stated reason nobody checks is how an exclusion list rots."""
+    assert _extra_package_names("openai-native") == set(), (
+        "[openai-native] now ships a package -- its exclusion reason "
+        "('declares NO packages') is no longer true")
+    assert "openai" in _core_dependency_names()
+
+    core = _core_dependency_names()
+    assert _extra_package_names("local") <= core, (
+        "[local] now names a package that is not core -- it can no longer be "
+        "excluded on the grounds that its absence is impossible")
+
+    hits = []
+    for path in (REPO / "systemu").rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="backslashreplace")
+        if "browser_use" in text:
+            hits.append(str(path.relative_to(REPO)))
+    assert not hits, (
+        f"{hits} imports browser_use -- [browser-use] is reachable after all "
+        f"and needs a group with a remedy")

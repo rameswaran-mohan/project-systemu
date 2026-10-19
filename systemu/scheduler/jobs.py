@@ -68,6 +68,37 @@ def _resume_waiting_chat_entry(vault, activity_id: str) -> None:
         logger.debug("[Job] _resume_waiting_chat_entry failed for %s", activity_id, exc_info=True)
 
 
+def _cancelled_runs(vault) -> set:
+    """IMPL-11: the durable cancelled-run marker (``decision_queue.
+    cancelled_run_coordinates`` - execution / chat submission / root, recorded at
+    cancel time by ``expire_cards_for_run``, every cancel path's one function).
+    Never keyed on the activity: a later re-run of the same task must still resume."""
+    from systemu.approval.decision_queue import cancelled_run_coordinates
+    return cancelled_run_coordinates(vault)
+
+
+def _belongs_to_cancelled_run(dctx, cancelled_runs: set) -> bool:
+    """True when this resolved card's run was cancelled: it is in the marker, or
+    the card itself carries the persisted cancellation reason (whatever its status
+    now - a writer that bypassed the late-answer refusal, or the documented
+    get->save race)."""
+    from systemu.approval.decision_queue import run_was_cancelled
+    return run_was_cancelled(dctx, cancelled_runs)
+
+
+def _refuse_resume_of_cancelled_run(decision, vault) -> None:
+    """Stamp ``resume_refused`` (never ``resume_dispatched`` — nothing was
+    dispatched) so later polls skip the card without reloading the witness."""
+    logger.info("[ResumeReconciler] not resuming decision %s — its run was cancelled",
+                decision.id)
+    try:
+        decision.context["resume_refused"] = "run cancelled"
+        vault.save_decision(decision)
+    except Exception:
+        logger.debug("[ResumeReconciler] could not stamp resume_refused on %s",
+                     decision.id, exc_info=True)
+
+
 def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
     """Cross-process safety net for v0.8.22.1 resume-after-decision.
 
@@ -101,6 +132,7 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
         return 0
 
     dispatched = 0
+    cancelled_runs = None
     for did in candidate_ids:
         try:
             decision = vault.get_decision(did)
@@ -144,6 +176,17 @@ def reconcile_resolved_stuck_decisions(vault, supervisor, data_dir=None) -> int:
         # _dispatch_resume.
         if (not is_gate and not is_attest
                 and not (dctx.get("activity_id") and dctx.get("shadow_id"))):
+            continue
+        if dctx.get("resume_refused"):
+            continue
+        # IMPL-11: never resume a cancelled run. An answer resolved before the
+        # cancel (e.g. from the CLI, which only this poll acts on) would otherwise
+        # resurrect the run the operator stopped. Read lazily, once per tick: only a
+        # real dispatch candidate pays for the marker read.
+        if cancelled_runs is None:
+            cancelled_runs = _cancelled_runs(vault)
+        if _belongs_to_cancelled_run(dctx, cancelled_runs):
+            _refuse_resume_of_cancelled_run(decision, vault)
             continue
         try:
             if _rod._dispatch_resume(
@@ -401,6 +444,7 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
     # OUTSIDE the loop — that placement is the fix.
     from systemu.runtime.ask_promotion import PromotionBudget
     _promotion_budget = PromotionBudget()
+    cancelled_runs = None
     for did in candidate_ids:
         try:
             decision = vault.get_decision(did)
@@ -423,6 +467,17 @@ def reconcile_resolved_harness_grants(*, vault, supervisor, data_dir=None) -> in
         activity_id = dctx.get("activity_id")
         shadow_id = dctx.get("shadow_id")
         if not (execution_id and activity_id and shadow_id):
+            continue
+        if dctx.get("resume_refused"):
+            continue
+        # IMPL-11 ruling 4: never resume - and never Governor.grant a capability
+        # for - a run the operator cancelled (an answer given before the cancel).
+        # Same durable marker the resume reconciler consults; checked BEFORE any
+        # materialisation. Read lazily, once per tick.
+        if cancelled_runs is None:
+            cancelled_runs = _cancelled_runs(vault)
+        if _belongs_to_cancelled_run(dctx, cancelled_runs):
+            _refuse_resume_of_cancelled_run(decision, vault)
             continue
 
         try:
@@ -644,6 +699,7 @@ def reconcile_resolved_mcp_oauth(*, vault, supervisor, data_dir=None) -> int:
 
     dispatched = 0
     now = utcnow()
+    cancelled_runs = None
     for did in candidate_ids:
         try:
             decision = vault.get_decision(did)
@@ -660,6 +716,16 @@ def reconcile_resolved_mcp_oauth(*, vault, supervisor, data_dir=None) -> int:
         activity_id = dctx.get("activity_id")
         shadow_id = dctx.get("shadow_id")
         if not (execution_id and activity_id and shadow_id):
+            continue
+        if dctx.get("resume_refused"):
+            continue
+        # IMPL-11: never resume a run the operator cancelled (an OAuth answer given
+        # before the cancel). Same durable marker as the stuck-decision and
+        # harness-grant reconcilers; read lazily, once per tick.
+        if cancelled_runs is None:
+            cancelled_runs = _cancelled_runs(vault)
+        if _belongs_to_cancelled_run(dctx, cancelled_runs):
+            _refuse_resume_of_cancelled_run(decision, vault)
             continue
 
         try:
@@ -1084,6 +1150,23 @@ def reconcile_recovery_gates(*, vault, engine=None, inbox_cls=None, queue_cls=No
                     q.expire_by_dedup_key(d.dedup_key)
                 except Exception:
                     logger.debug("[Recovery] expire skipped", exc_info=True)
+
+
+def _table_health_job() -> None:
+    """APScheduler entry for the R-B1 OnTheTable health tick (default every 10
+    minutes, ``SYSTEMU_TABLE_HEALTH_MINUTES``): the credential-names backfill, then
+    the reconcile whose projection marks orphans ``broken`` with a reason and takes
+    folder cards' ``data_root`` from GrantedRoots. Thin wrapper over
+    ``table_reconciler.run_health_checks`` using the daemon-initialised ``_vault``,
+    mirroring ``_recovery_gate_reconciler_job``. Best-effort: never crashes the
+    tick, and a no-op before ``init_jobs``."""
+    if _vault is None:
+        return
+    try:
+        from systemu.runtime.table_reconciler import run_health_checks
+        run_health_checks(_vault)
+    except Exception:
+        logger.exception("[OnTheTable] table health tick crashed")
 
 
 def _recovery_gate_reconciler_job() -> None:

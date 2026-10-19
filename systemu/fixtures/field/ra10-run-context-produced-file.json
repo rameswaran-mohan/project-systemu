@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "ra10-run-context-produced-file",
+  "title": "A file this run already produced supplies the next step's path leaf — the ask was avoidable",
+  "provenance": {
+    "release": "R-A10",
+    "source_test": "tests/test_ra10_binder.py (source #2, _bind_run_context)",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "attach the artifact",
+    "success_criteria": "the artifact is attached"
+  },
+  "capability": {
+    "name": "attach",
+    "parameters_schema": {
+      "attachment_path": { "type": "string", "description": "the file to attach" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {},
+    "declared_intents": []
+  },
+  "files": [
+    { "path": "out/prior.md", "text": "produced earlier in this run\n" }
+  ],
+  "files_produced": ["{root}/out/prior.md"],
+  "asks": [
+    {
+      "schema_path": "attachment_path",
+      "class": "input",
+      "operator_answer": "{root}/out/prior.md",
+      "label": "avoidable",
+      "why": "Source #2 (_bind_run_context) offers a file THIS run already produced. It binds content_derived at confidence 0.5, so it stays below T_high and surfaces as a one-click confirm rather than a silent bind — but the value was already in hand, so asking the operator to supply the path was avoidable."
+    }
+  ]
+}

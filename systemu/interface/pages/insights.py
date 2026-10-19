@@ -136,10 +136,15 @@ def build_first_run_journey_card() -> None:
 
     Collapsed by default. It is a first-run surface, so it must not push the
     Insights tabs down the page for the rest of the install's life.
+
+    "Time to first task" rides the card's CAPTION, so it is readable without
+    expanding anything; the sentence inside says what it spans, or why it is
+    NOT MEASURED. Both come from ``runtime.funnel`` - this page formats nothing.
     """
     from systemu.interface.dashboard_state import AppState
     from systemu.runtime.funnel import (
-        JOURNEY_TITLE, PRIVACY_NOTE, journey_rows,
+        JOURNEY_TITLE, PRIVACY_NOTE, TIME_TO_FIRST_TASK_LABEL, journey_rows,
+        time_to_first_task,
     )
 
     try:
@@ -149,7 +154,9 @@ def build_first_run_journey_card() -> None:
         vault = None
 
     rows = journey_rows(vault)
-    with ui.expansion(JOURNEY_TITLE).classes("w-full"):
+    ttft = time_to_first_task(vault)
+    caption = f"{TIME_TO_FIRST_TASK_LABEL}: {ttft.text}"
+    with ui.expansion(JOURNEY_TITLE, caption=caption).classes("w-full"):
         with ui.element("table").classes("s-table"):
             with ui.element("thead"):
                 with ui.element("tr"):
@@ -163,6 +170,7 @@ def build_first_run_journey_card() -> None:
                             ui.label(label).classes("s-cell")
                         with ui.element("td"):
                             ui.label(when).classes("s-cell")
+        ui.label(ttft.explanation).classes("s-muted")
         ui.label(PRIVACY_NOTE).classes("s-muted")
 
 

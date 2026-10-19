@@ -38,6 +38,10 @@ KEYRING_DPAPI = "dpapi"
 KEYRING_KEYCHAIN = "keychain"
 KEYRING_SECRETSERVICE = "secretservice"
 KEYRING_PLAINTEXT = "plaintext_fallback"
+#: Windows Credential Manager. The Windows keyring row reads ``dpapi`` only off a
+#: WORKING envelope (S5 / R-A3); without one, a usable keyring is named for what
+#: it is -- on a Windows host, this.
+KEYRING_WINCRED = "wincred"
 
 FORGED_NET_JAIL_ABSENT = "absent"
 
@@ -128,40 +132,183 @@ def _usable_keyring():
         return None
 
 
-def _dpapi_available() -> bool:
-    """Is the Windows DPAPI at-rest envelope usable here?"""
+def _envelope_status():
+    """The at-rest envelope's WORKING status: a real protect/unprotect round trip
+    through the seam secrets use (``at_rest.envelope_status``), never an import
+    check. Returns ``(working, reason)``; never raises."""
     try:
-        from systemu.runtime.credentials.at_rest import is_encrypted_at_rest
-        return bool(is_encrypted_at_rest())
+        from systemu.runtime.credentials.at_rest import envelope_status
+        st = envelope_status()
+        working = st.working is True
+        reason = st.reason if type(st.reason) is str else ""
+        return working, ("" if working else (reason or "the envelope probe failed"))
+    except Exception as exc:
+        return False, f"the envelope probe could not run ({type(exc).__name__})"
+
+
+# ── the secrets row (2d) ─────────────────────────────────────────────────────
+SECRETS_DPAPI = "dpapi"
+SECRETS_KEYRING = "keyring"
+SECRETS_PLAINTEXT = "plaintext"
+
+
+def _secrets_witness(platform_str: str, usable_fn: Callable[[], object],
+                     envelope_fn: Callable[[], tuple]) -> tuple:
+    """ONE reading of each seam both secrets rows derive from (S5 / R-A3).
+
+    Returns ``(keyring, working, why)``: the usable keyring object (or None), and
+    whether the at-rest envelope round trip WORKS, with the reason when it does
+    not. The envelope is probed only on a Windows leg -- there is no DPAPI
+    elsewhere -- and exactly once, so ``secrets_at_rest`` and ``keyring_backend``
+    cannot come from two probes that disagree. Never raises.
+    """
+    try:
+        kr = usable_fn()
     except Exception:
-        return False
+        kr = None
+    if not platform_str.startswith("win"):
+        return kr, False, ""
+    try:
+        working, why = envelope_fn()
+    except Exception as exc:
+        return kr, False, f"the envelope probe could not run ({type(exc).__name__})"
+    return kr, working is True, (why if type(why) is str else "")
 
 
-def keyring_backend(platform_str: Optional[str] = None, *,
+def secrets_at_rest(platform_str: Optional[str] = None, *,
                     usable: Optional[Callable[[], object]] = None,
-                    dpapi: Optional[Callable[[], bool]] = None) -> str:
-    """Resolve the effective secret-at-rest backend to the STABLE enum.
+                    envelope: Optional[Callable[[], tuple]] = None) -> dict:
+    """What actually protects the secrets this product persists.
 
-    Windows reports ``dpapi`` whenever the OS keyring (Credential Manager) OR
-    the DPAPI at-rest envelope is available (both bind the secret to the user).
-    macOS → ``keychain``, Linux/other POSIX → ``secretservice`` when a real
-    backend exists. With no backend at all it degrades to ``plaintext_fallback``
-    (a flagged 0600 file) — the honest, reported last-resort.
+    ``{"backend", "label", "reason"}`` where ``backend`` is one of
+    ``dpapi`` / ``keyring`` / ``plaintext`` and ``label`` is what a surface
+    prints (``plaintext (<reason>)`` for the last). A claim only a working
+    envelope can earn: ``dpapi`` requires Windows AND a DPAPI round trip that
+    succeeded just now. Without one, a usable OS keyring still holds the
+    credential store's secrets (``keyring``, with the reason naming what stays
+    plaintext); with neither, it is ``plaintext`` with the reason. Never raises.
     """
     platform_str = platform_str or sys.platform
-    usable_fn = usable if usable is not None else _usable_keyring
-    dpapi_fn = dpapi if dpapi is not None else _dpapi_available
-    has_backend = usable_fn() is not None
+    return _secrets_row(platform_str, _secrets_witness(
+        platform_str,
+        usable if usable is not None else _usable_keyring,
+        envelope if envelope is not None else _envelope_status))
+
+
+def _secrets_row(platform_str: str, witness: tuple) -> dict:
+    """The ``secrets_at_rest`` row from one :func:`_secrets_witness` reading."""
+    kr, working, why = witness
+    has_keyring = kr is not None
 
     if platform_str.startswith("win"):
-        if has_backend or dpapi_fn():
+        if working is True:
+            return {"backend": SECRETS_DPAPI, "label": SECRETS_DPAPI, "reason": ""}
+        why = why or "the DPAPI envelope is not working"
+        if has_keyring:
+            reason = (f"DPAPI envelope unavailable: {why}; credentials are in the "
+                      "OS keyring, but OAuth tokens and dashboard secrets are "
+                      "stored as plaintext files")
+            return {"backend": SECRETS_KEYRING, "label": SECRETS_KEYRING,
+                    "reason": _ascii(reason)}
+        reason = _ascii(f"DPAPI envelope unavailable: {why}; no OS keyring backend")
+        return {"backend": SECRETS_PLAINTEXT,
+                "label": f"{SECRETS_PLAINTEXT} ({reason})", "reason": reason}
+
+    # POSIX: there is no DPAPI; the 0600 file mode is the control for files.
+    if has_keyring:
+        return {"backend": SECRETS_KEYRING, "label": SECRETS_KEYRING, "reason": ""}
+    reason = "no OS keyring backend; secret files are protected only by 0600 mode"
+    return {"backend": SECRETS_PLAINTEXT,
+            "label": f"{SECRETS_PLAINTEXT} ({reason})", "reason": reason}
+
+
+def _ascii(text: str) -> str:
+    return str(text).encode("ascii", "backslashreplace").decode("ascii")
+
+
+#: keyring's own backend layout (``keyring.backends.<name>``) -> the enum. Used
+#: only to NAME a usable keyring on a Windows leg whose envelope does not work.
+_KEYRING_BY_MODULE = (
+    ("keyring.backends.windows", KEYRING_WINCRED),
+    ("keyring.backends.macos", KEYRING_KEYCHAIN),
+    ("keyring.backends.secretservice", KEYRING_SECRETSERVICE),
+    ("keyring.backends.libsecret", KEYRING_SECRETSERVICE),
+    ("keyring.backends.kwallet", KEYRING_SECRETSERVICE),
+)
+
+
+def _keyring_named_by_itself(kr) -> Optional[str]:
+    """The enum for the backend ``kr`` actually is, read off its backend class's
+    module; None when it does not say. ``kr`` is the ``keyring`` module the
+    usability probe returns (its ``get_keyring()`` is the backend) or a backend.
+    Never raises."""
+    try:
+        get = getattr(kr, "get_keyring", None)
+        backend = get() if callable(get) else kr
+        module = type(backend).__module__
+    except Exception:
+        return None
+    if type(module) is not str:
+        return None
+    module = module.lower()
+    for prefix, name in _KEYRING_BY_MODULE:
+        if module == prefix or module.startswith(prefix + "."):
+            return name
+    return None
+
+
+def _keyring_row(platform_str: str, witness: tuple, secrets_row: dict) -> str:
+    """The ``keyring_backend`` row from the SAME witness as ``secrets_row``.
+
+    On Windows ``dpapi`` is read off the secrets row -- the one place a WORKING
+    envelope earns it -- so the two rows cannot disagree about it.
+    """
+    kr = witness[0]
+    if platform_str.startswith("win"):
+        if secrets_row.get("backend") == SECRETS_DPAPI:
             return KEYRING_DPAPI
-        return KEYRING_PLAINTEXT
-    if not has_backend:
+        if kr is None:
+            return KEYRING_PLAINTEXT
+        # Named by the keyring in hand, so a simulated Windows leg on another
+        # host never names a backend that is not there; a Windows host's
+        # keyring is Credential Manager.
+        return _keyring_named_by_itself(kr) or KEYRING_WINCRED
+    if kr is None:
         return KEYRING_PLAINTEXT
     if platform_str == "darwin":
         return KEYRING_KEYCHAIN
     return KEYRING_SECRETSERVICE
+
+
+def keyring_backend(platform_str: Optional[str] = None, *,
+                    usable: Optional[Callable[[], object]] = None,
+                    dpapi: Optional[Callable[[], bool]] = None,
+                    envelope: Optional[Callable[[], tuple]] = None) -> str:
+    """Resolve the effective secret-at-rest backend to the STABLE enum.
+
+    S5 / R-A3 -- truthful. Windows reports ``dpapi`` ONLY when the DPAPI at-rest
+    envelope round trip works -- the same witness, and the same derivation, as
+    the ``secrets_at_rest`` row (a usable Credential Manager no longer stands in
+    for it). Without a working envelope a usable keyring is named for what it is
+    (``wincred`` on a Windows host); with neither it is ``plaintext_fallback``.
+    macOS -> ``keychain``, Linux/other POSIX -> ``secretservice`` when a real
+    backend exists. With no backend at all it degrades to ``plaintext_fallback``
+    (a flagged 0600 file) -- the honest, reported last-resort; the reason lives
+    on the ``secrets_at_rest`` row.
+
+    ``envelope`` returns ``(working, reason)``; ``dpapi`` is the older bool form
+    of the same witness, kept for existing callers.
+    """
+    platform_str = platform_str or sys.platform
+    if envelope is None and dpapi is not None:
+        def envelope():
+            return ((True, "") if dpapi() is True
+                    else (False, "the DPAPI envelope is not working"))
+    witness = _secrets_witness(
+        platform_str,
+        usable if usable is not None else _usable_keyring,
+        envelope if envelope is not None else _envelope_status)
+    return _keyring_row(platform_str, witness, _secrets_row(platform_str, witness))
 
 
 def _host_capabilities(platform_str: str, in_container: bool) -> list:
@@ -212,6 +359,11 @@ def platform_profile(*, platform_str: Optional[str] = None,
     except Exception:
         py_version = ".".join(str(x) for x in sys.version_info[:3])
 
+    # S5 / R-A3: ONE reading of the keyring and envelope seams feeds BOTH
+    # secrets rows, so `keyring_backend` and `secrets_at_rest` cannot disagree.
+    witness = _secrets_witness(platform_str, _usable_keyring, _envelope_status)
+    secrets_row = _secrets_row(platform_str, witness)
+
     return {
         "os": platform_str,
         "os_family": _os_family(platform_str),
@@ -220,7 +372,10 @@ def platform_profile(*, platform_str: Optional[str] = None,
         # No host desktop inside a container -> capture is not directly available
         # (it is offered via the Host Companion honesty row instead).
         "capture_available": not in_container,
-        "keyring_backend": keyring_backend(platform_str),
+        "keyring_backend": _keyring_row(platform_str, witness, secrets_row),
+        # 2d: what protects the secrets this product persists, derived from a
+        # WORKING envelope (a real DPAPI round trip), never from an import.
+        "secrets_at_rest": secrets_row,
         # IMPL-13: no OS egress jail exists yet -> the forged-network hard-DENY
         # stands in for it. The profile reports this honestly.
         "forged_net_jail": FORGED_NET_JAIL_ABSENT,
@@ -317,6 +472,61 @@ def _probe_daemon_state(vault_dir: Optional[str] = None) -> Optional[dict]:
         return None
 
 
+def _probe_secret_backups(vault_dir: Optional[str] = None) -> Optional[list]:
+    """S5 / R-A3: the plaintext ``<secret>.pre-encrypt.bak`` copies in the
+    operating vault (``at_rest.plaintext_backups``).
+
+    With no ``vault_dir`` the root is the ONE mint the daemon-start
+    re-encryption pass itself uses (``resolve_vault_root``), so the doctor looks
+    exactly where the backups are written. A cheap local glob; never decrypts.
+    None when undeterminable; never raises.
+    """
+    try:
+        from systemu.runtime.credentials import at_rest
+        if vault_dir is None:
+            from systemu.runtime.vault_root import resolve_vault_root
+            vault_dir = resolve_vault_root().root
+        return at_rest.plaintext_backups(vault_dir)
+    except Exception:
+        return None
+
+
+def _secret_backup_problems(backups) -> list:
+    """One non-blocking warning per plaintext backup, naming its path and what
+    to do. ASCII; a path, never a value."""
+    from systemu.runtime.credentials import at_rest
+    rows = []
+    for b in backups or ():
+        if type(b) is not dict:
+            continue
+        backup, secret = b.get("backup"), b.get("secret_file")
+        relative, state = b.get("relative"), b.get("secret_state")
+        if not all(type(x) is str for x in (backup, secret, relative, state)):
+            continue
+        if state == at_rest.SECRET_ENCRYPTED:
+            message = (f"A plaintext copy of a secret is on disk: {backup}. The "
+                       f"secret file it copies ({secret}) is encrypted; this copy "
+                       "is not.")
+            cta = ("Check that systemu still works with the encrypted file, then "
+                   f"delete {backup}.")
+        elif state == at_rest.SECRET_MISSING:
+            message = (f"A plaintext copy of a secret is on disk: {backup}. The "
+                       f"secret file it copied ({secret}) no longer exists.")
+            cta = f"If you no longer need that secret, delete {backup}."
+        else:
+            message = (f"A secret file was NOT re-encrypted and is still plaintext: "
+                       f"{secret}. Its plaintext backup is kept at {backup}.")
+            cta = ("Restart the daemon to retry: it re-encrypts the file and checks "
+                   "the result before replacing it (the daemon log's [S5] line says "
+                   "why a try failed). Keep the backup until the file is encrypted, "
+                   f"then delete {backup}.")
+        rows.append({
+            "id": f"secret_plaintext_backup:{relative}", "severity": "warning",
+            "blocking": False, "message": _ascii(message), "cta": _ascii(cta),
+        })
+    return rows
+
+
 def _probe_daemon_running(vault_dir: Optional[str] = None) -> Optional[bool]:
     """Best-effort daemon READINESS. A thin projection of ``_probe_daemon_state``
     (never a second derivation). Returns None if undeterminable."""
@@ -369,6 +579,59 @@ def _last_error() -> Optional[str]:
     return None
 
 
+def _provider_sdk_groups() -> dict:
+    """extra -> the provider ids whose SDK that optional group ships.
+
+    e2e31. DERIVED, never declared: the providers registry's ``sdk_package``
+    joined to ``optional_deps``' group registry. A hand-written "anthropic is a
+    provider group" list here would be a second table of which provider needs
+    which package -- the split the welcome page's retired clause was.
+
+    A group absent from the answer is a CAPABILITY group and keeps the
+    unconditional rule, which is also where every failure lands: if the
+    providers registry cannot be imported, or ``sdk_package`` raises or hands
+    back a non-``str`` for ANY provider, this answers ``{}``. An unread row
+    could map to any group, so no group can be gated on the rows that did read.
+    """
+    from systemu.runtime import optional_deps as _od
+    from systemu.runtime import provider_status as _ps
+    out: dict = {}
+    try:
+        from systemu.llm import providers as _providers
+        for spec in _ps.PROVIDER_SPECS:
+            package = _providers.sdk_package(spec.provider)
+            if type(package) is not str:
+                return {}
+            if not package:
+                continue                 # needs no optional SDK
+            group = _od.group_for_package(package)
+            if group is None:
+                continue                 # no extra ships it: nothing to gate
+            out.setdefault(group.extra, []).append(spec.provider)
+    except Exception:
+        return {}
+    return {extra: tuple(pids) for extra, pids in out.items()}
+
+
+def _provider_unconfigured(statuses, provider: str) -> bool:
+    """Did the mint OBSERVE that nobody configured ``provider``?
+
+    True only for the mint's own verdict that the credential is absent: state
+    ``missing`` with an empty blocker (a set key whose SDK is absent is
+    ``missing`` WITH a blocker -- that operator did choose the provider).
+    Anything else -- no status, a status that is not the mint's type, a field
+    of the wrong concrete type -- is not that observation, and answers False so
+    the warning stays: suppressing it is the "looks fine" direction.
+    """
+    from systemu.runtime import provider_status as _ps
+    st = statuses.get(provider) if type(statuses) is dict else None
+    if type(st) is not _ps.ProviderStatus:
+        return False
+    state, blocker = st.state, st.blocker
+    return (type(state) is str and state == _ps.STATE_MISSING
+            and type(blocker) is str and blocker == "")
+
+
 def build_doctor_report(*, provider_configured: Optional[bool] = None,
                         provider_reachable: Optional[bool] = None,
                         keyring_locked: Optional[bool] = None,
@@ -378,7 +641,8 @@ def build_doctor_report(*, provider_configured: Optional[bool] = None,
                         vault_dir: Optional[str] = None,
                         platform_str: Optional[str] = None,
                         in_container: Optional[bool] = None,
-                        config=None, provider_probe=None) -> dict:
+                        config=None, provider_probe=None,
+                        secret_backups: Optional[list] = None) -> dict:
     """The self-diagnosis report. Pure given its inputs; every probe is
     injectable so tests drive killed/locked states deterministically.
 
@@ -446,6 +710,31 @@ def build_doctor_report(*, provider_configured: Optional[bool] = None,
                    "protection.",
         })
 
+    # -- 2d: a Windows envelope that does not WORK (non-blocking warning) --
+    # The keyring row above can read `dpapi` (Credential Manager) while the
+    # file-held secrets -- OAuth tokens, dashboard secrets -- sit in plaintext
+    # because the DPAPI envelope is absent or broken. Never silent.
+    _sec = prof.get("secrets_at_rest") or {}
+    if prof["os_family"] == "windows" and _sec.get("backend") != SECRETS_DPAPI:
+        problems.append({
+            "id": "secrets_envelope_unavailable", "severity": "warning",
+            "blocking": False,
+            "message": _ascii("Secret files are not encrypted at rest: "
+                              + str(_sec.get("reason") or "the DPAPI envelope "
+                                    "is not working") + "."),
+            "cta": "Reinstall systemu so its pywin32 dependency is present "
+                   "(pip install --force-reinstall systemu), then restart the "
+                   "daemon; plaintext secrets are re-encrypted at daemon start.",
+        })
+
+    # -- S5 / R-A3: plaintext backups of secrets (non-blocking warning) ----
+    # The daemon-start pass copies a plaintext secret to `<file>.pre-encrypt.bak`
+    # before encrypting it, and KEEPS the copy when the new envelope does not
+    # verify. Each copy is a plaintext secret on disk; never silent.
+    if secret_backups is None:
+        secret_backups = _probe_secret_backups(vault_dir)
+    problems.extend(_secret_backup_problems(secret_backups))
+
     # -- daemon (non-blocking warning) ------------------------------------
     if daemon_running is False:
         problems.append({
@@ -484,10 +773,21 @@ def build_doctor_report(*, provider_configured: Optional[bool] = None,
     # all because "the dashboard URL does nothing" and "web_read says it cannot
     # run" are the two questions a slimmer default install creates, and the
     # answer to both is one line the operator can copy.
+    #
+    # e2e31: a group that ships a PROVIDER SDK is a problem only for the
+    # operator who chose that provider. Reported unconditionally, `[anthropic]`
+    # put a WARNINGS pill on /health for every install running on OpenRouter or
+    # Google. The group stays LISTED in `optional_groups` either way
+    # (never-subtract); only the problem row is gated. An operator who set the
+    # key is also told by the provider row itself, which carries the remedy.
     from systemu.runtime import optional_deps as _od
     optional_groups = _od.group_status()
+    provider_groups = _provider_sdk_groups()
     for _g in optional_groups:
         if _g["installed"]:
+            continue
+        served = provider_groups.get(_g["extra"], ())
+        if served and all(_provider_unconfigured(statuses, p) for p in served):
             continue
         problems.append({
             "id": f"optional_group_missing:{_g['extra']}",

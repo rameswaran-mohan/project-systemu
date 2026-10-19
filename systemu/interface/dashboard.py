@@ -1319,6 +1319,24 @@ def _install_loop_lag_watchdog(ng_app) -> None:
 #  Public entry points
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _attach_messaging(state) -> None:
+    """Show the daemon's messaging gateway on the dashboard state (read-only).
+
+    The daemon owns the process's ONE Telegram gateway and its EventPusher
+    (``scheduler.daemon._start_messaging``, which runs before this dashboard is
+    launched in the same process). This dashboard used to start a SECOND
+    gateway + pusher on the same bot token: two ``getUpdates`` pollers conflict
+    (Telegram 409s one) and every push went out twice. So this only READS the
+    daemon's handle for status; it never starts, and never stops, a gateway.
+    """
+    try:
+        from systemu.messaging.telegram_gateway import running_gateway
+        state.messaging_gateway = running_gateway()
+    except Exception as _msg_exc:
+        logger.debug("[Dashboard] could not read the messaging gateway: %s",
+                     _msg_exc)
+
+
 def run_dashboard(
     config,
     *,
@@ -1508,44 +1526,8 @@ def run_dashboard(
             _wt_exc,
         )
 
-    # ── Start messaging gateway (Phase 3, opt-in) ──────────────────────────
-    # Reads SHARING_ON_TELEGRAM_BOT_TOKEN; if absent the gateway is dormant
-    # and zero behaviour changes for existing users.  Allowlist enforcement
-    # happens inside the gateway — empty allowlist means refuse to start.
-    try:
-        from systemu.messaging.telegram_gateway import build_from_env as _build_telegram
-        from systemu.messaging.handlers import default_handlers as _msg_handlers
-        gateway = _build_telegram(command_handlers=_msg_handlers())
-        if gateway is not None:
-            gateway.start()
-            state.messaging_gateway = gateway
-            logger.info("[Dashboard] Telegram gateway started.")
-
-            # Subscribe the EventBus→push translator so the bot can
-            # proactively notify on approval requests, execution
-            # completion, watchdog fires, and tool proposals.
-            try:
-                from systemu.messaging.event_pusher import EventPusher
-                from systemu.interface.event_bus import EventBus as _EventBus2
-                pusher = EventPusher(gateway)
-                pusher.subscribe(_EventBus2.get())
-                state.messaging_pusher = pusher
-                logger.info("[Dashboard] Messaging event pusher subscribed.")
-            except Exception as _push_exc:
-                logger.warning(
-                    "[Dashboard] EventPusher failed to start (non-fatal): %s",
-                    _push_exc,
-                )
-        else:
-            logger.debug(
-                "[Dashboard] Telegram gateway not configured "
-                "(set SHARING_ON_TELEGRAM_BOT_TOKEN to enable)."
-            )
-    except Exception as _msg_exc:
-        logger.warning(
-            "[Dashboard] Messaging gateway failed to start (non-fatal): %s",
-            _msg_exc,
-        )
+    # ── Messaging gateway (Phase 3, opt-in) — see _attach_messaging ────────
+    _attach_messaging(state)
 
     register_routes()
 
@@ -1561,19 +1543,8 @@ def run_dashboard(
             Supervisor.get().shutdown()
         except Exception:
             pass
-        # Stop the messaging gateway + event pusher if running.
-        try:
-            pusher = getattr(state, "messaging_pusher", None)
-            if pusher is not None:
-                pusher.shutdown()
-        except Exception:
-            pass
-        try:
-            gw = getattr(state, "messaging_gateway", None)
-            if gw is not None:
-                gw.stop()
-        except Exception:
-            pass
+        # The messaging gateway + pusher belong to the daemon (see
+        # _attach_messaging): the dashboard neither starts nor stops them.
 
     logger.info("[Dashboard] Starting on http://%s:%d", host, port)
     ui.run(

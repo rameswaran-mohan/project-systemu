@@ -24,12 +24,25 @@ can flip the world for every surface at once and prove they all agree, and the
 only way a future surface cannot accidentally invent a second, disagreeing
 answer.  Do not add ``try: import nicegui`` anywhere.
 
-NEVER CACHED.  The probe reads ``importlib.metadata`` on every call.  A cache
-would be the DEC-32 staleness trap in miniature: a long-lived daemon that
-answered "available" once would keep answering it after the operator
-uninstalled the extra, and the value crossing the boundary would be a claim
-about a machine state that no longer holds.  ``importlib.metadata.distribution``
-is a directory stat against ``sys.path``; the cost is not worth the lie.
+MEMOISED, PER DISTRIBUTION, FOR THE PROCESS LIFETIME.  :func:`is_installed`
+asks ``importlib.metadata`` the FIRST time a given distribution is probed and
+remembers that verdict (present or absent) in a module-level memo keyed on the
+PEP 503 canonical name; every later call for the same name answers from the
+memo.  The memo is never expired by time -- only :func:`clear_probe_cache`
+empties it (a test that fakes the metadata tree, or an installer that has just
+finished) -- and it holds at most ``_MEMO_CAP`` = 512 names; past that the
+probe still answers correctly, it just stops remembering.
+
+This docstring used to claim the probe was not cached at all, and the reason
+it gave is still the cost of the memo: a long-lived process that
+answered "available" once keeps answering it after the operator uninstalls the
+extra, until it is restarted or the memo is cleared.  The memo was taken on
+anyway, on measured evidence (D-3, e2e 0.10.31): the walk is ~5 ms per call on
+Windows and the dashboard layout asked it 42 times per page paint.  The
+staleness is bounded in the direction that matters: every remedy this module
+mints is a ``pip install`` run OUTSIDE this process, and the surfaces that
+print one already say to restart afterwards.  See :func:`is_installed` for the
+full trade.
 
 WHY DISTRIBUTION METADATA AND NOT ``find_spec``.  Tool manifests declare pip
 DISTRIBUTION names (``python-docx``, ``pillow``), whose import names differ
@@ -109,6 +122,24 @@ GROUPS: Tuple[OptionalGroup, ...] = (
         label="Web dashboard",
         covers="`systemu daemon start` and the UI on http://localhost:8765",
     ),
+    # e2e31. The `[anthropic]` extra had shipped since v0.7-e with no entry
+    # here, so `pip install "systemu[anthropic]"` was a working command the
+    # product could never print -- and the provider mint, having no remedy to
+    # offer, had no reason to look for the package at all. That is the half of
+    # the fence pyproject CLAIMED was enforced and was not.
+    OptionalGroup(
+        extra="anthropic",
+        packages=("anthropic",),
+        label="Anthropic models",
+        # PRECISE, like the browser row above. Without this package an
+        # `anthropic/*` tier is NOT necessarily dead: `llm_router.resolve_
+        # provider_keyaware` serves the same catalog ids through OpenRouter on
+        # a machine that has an OpenRouter key and no Anthropic one. What
+        # breaks is the NATIVE path -- the tier the router really sends to
+        # Anthropic, which is exactly the machine with ANTHROPIC_API_KEY set.
+        covers="tiers the router sends to Anthropic itself (an `anthropic/*` "
+               "or `claude-*` model with ANTHROPIC_API_KEY set)",
+    ),
 )
 
 _BY_PACKAGE: Dict[str, OptionalGroup] = {
@@ -121,19 +152,59 @@ def group_for_package(package: str) -> Optional[OptionalGroup]:
     return _BY_PACKAGE.get(canonical(package))
 
 
+#: The memo below is a RENDER optimisation, not a registry -- an unbounded
+#: corpus must not grow an unbounded dict. Past the cap the probe still answers
+#: correctly, it just stops remembering.
+_MEMO_CAP = 512
+
+#: canonical distribution name -> the probe's verdict for THIS interpreter.
+_INSTALLED_MEMO: Dict[str, bool] = {}
+
+
+def clear_probe_cache() -> None:
+    """Forget every memoised availability verdict.
+
+    The seam for the caller that genuinely needs a re-walk: a test that faked
+    the metadata tree, or an installer that has just finished.
+    """
+    _INSTALLED_MEMO.clear()
+
+
 def is_installed(package: str) -> bool:
     """Is this pip distribution present in the CURRENT interpreter?
 
     THE SINGLE PROBE. Every availability answer in the product resolves here.
     Fails CLOSED: anything other than a distribution we can positively find is
     reported absent, because "I could not tell" must never render as ready.
+
+    D-3 (e2e 0.10.31): ANSWERED ONCE PER DISTRIBUTION, NOT ONCE PER CALLER.
+    ``importlib.metadata.distribution`` walks every ``sys.path`` entry with
+    ``listdir`` + ``stat``; profiled on Windows that is ~5 ms, and the dashboard
+    layout asked it FORTY-TWO times per page paint (once per tool row, through
+    ``capability_index._apply_availability``) -- 218 ms of the event loop, on
+    every route. The per-row listing surfaces paid the same toll again.
+
+    The memo is process-lifetime rather than TTL'd on purpose. A TTL bounds how
+    OFTEN the walk is paid, not WHERE it is paid, and WHERE is the whole
+    finding. The verdict cannot go stale in a direction that matters either:
+    every remedy this module mints is a ``pip install`` run OUTSIDE this
+    process, and the surfaces that print it already say to restart afterwards.
     """
+    key = canonical(package)
+    memo = _INSTALLED_MEMO.get(key)
+    # DEC-36: pin the concrete type in this frame. A memo slot holding anything
+    # but a bool is not a verdict, and must fall through to the real probe.
+    if type(memo) is bool:
+        return memo
     from importlib import metadata
     try:
-        metadata.distribution(canonical(package))
-        return True
+        metadata.distribution(key)
+        found = True
     except Exception:
-        return False
+        found = False
+    if len(_INSTALLED_MEMO) < _MEMO_CAP:
+        _INSTALLED_MEMO[key] = found
+    return found
 
 
 def missing_packages(packages: Iterable[str]) -> Tuple[str, ...]:

@@ -30,6 +30,26 @@ NO REAL DOWNLOAD AND NO REAL DAEMON. `subprocess.Popen` is monkeypatched at
 the module for the chromium spawn and at the stdlib for the daemon spawn; the
 product's own functions are never replaced by stand-ins that decide the
 outcome under test.
+
+WHICH INSTALL THIS RUNS ON -- D8 (GATE-6). Every test here used to pin the
+machine with `chromium_present` alone. Two later changes moved the seam out
+from under that pin: 0.10.30 put an IMPORTABILITY gate in front of the
+presence probe (`pip install "systemu[dashboard]"` ships no playwright, and on
+that install the announcement path returns at the gate), and 0.10.31 turned
+the presence probe into a filesystem check behind a tri-state
+`probe_chromium` -> `ChromiumVerdict`. On an install without the `browser`
+extra the pinned seam was therefore never reached: eight of these tests
+stopped testing the announcement property and started failing on the
+"Playwright is not installed" line -- and with the extra installed all 64
+chromium tests passed, so nothing said so.
+
+So the install is pinned at BOTH seams the decision frames consult:
+`playwright_importable` and the presence answer under `probe_chromium`. No
+assertion is weakened -- a pin says which machine, never what the product
+should print. `test_the_pinned_seams_*` are the positive control: they patch
+each seam to RAISE and require the product path to carry the exception out,
+so a product that stops consulting one of them fails loudly here instead of
+leaving these tests quietly pinning nothing.
 """
 from __future__ import annotations
 
@@ -75,13 +95,51 @@ class _Recorder:
         return SimpleNamespace(pid=4242)
 
 
+class _SeamNotConsulted(Exception):
+    """Raised BY a pinned seam, to prove the product really asks it."""
+
+
+#: The genuine tri-state probe, held before any test can pin over it. The pin
+#: below derives its verdict by RUNNING this, so a second `_pin_install` in one
+#: test cannot end up asking the first one's stand-in what the machine is.
+_REAL_PROBE_CHROMIUM = provision.probe_chromium
+
+
+def _pin_install(monkeypatch, *, playwright=True,
+                 chromium=provision.CHROMIUM_ABSENT):
+    """Pin the install these tests are about: playwright importable or not,
+    and chromium PRESENT / ABSENT / UNKNOWN.
+
+    The presence answer is pinned at `chromium_present`, and the verdict the
+    REAL `probe_chromium` derives from it is then pinned at `probe_chromium`,
+    so both seams are fixed and it is still the product's own tri-state
+    wrapping that decided which verdict they are fixed to. Hand-building a
+    `ChromiumVerdict` here would be a stand-in deciding the outcome under test.
+    """
+    monkeypatch.setattr(provision, "playwright_importable", lambda: playwright)
+
+    if chromium is provision.CHROMIUM_UNKNOWN:
+        def present():
+            raise provision.ChromiumProbeError("pinned: the probe cannot run")
+    else:
+        answer = chromium is provision.CHROMIUM_PRESENT
+
+        def present():
+            return answer
+
+    monkeypatch.setattr(provision, "chromium_present", present)
+    verdict = _REAL_PROBE_CHROMIUM()
+    assert verdict.state is chromium, (verdict, chromium)
+    monkeypatch.setattr(provision, "probe_chromium", lambda: verdict)
+
+
 # -- the order, and the line ------------------------------------------------
 
 def test_the_console_line_comes_before_the_spawn(clean_provision, monkeypatch):
     """Announcing a download after starting it is the same silence with extra
     steps: by then the bytes are already moving."""
     rec = _Recorder()
-    monkeypatch.setattr(provision, "chromium_present", lambda: False)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_ABSENT)
     monkeypatch.setattr(provision.subprocess, "Popen", rec.popen)
     monkeypatch.setattr(provision, "_publish_banner", lambda: None)
 
@@ -94,7 +152,7 @@ def test_the_console_line_comes_before_the_spawn(clean_provision, monkeypatch):
 def test_the_line_names_what_how_big_why_where_and_the_opt_out(clean_provision,
                                                                monkeypatch):
     rec = _Recorder()
-    monkeypatch.setattr(provision, "chromium_present", lambda: False)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_ABSENT)
     monkeypatch.setattr(provision.subprocess, "Popen", rec.popen)
     monkeypatch.setattr(provision, "_publish_banner", lambda: None)
 
@@ -117,19 +175,24 @@ def test_the_opt_out_suppresses_the_spawn_and_says_it_was_skipped(
     """The opt-out must be what stops the spawn -- not the accident of this
     machine already having chromium.
 
-    `chromium_present` is made to RAISE rather than return False: a test that
-    let the presence probe answer would go green on a developer box with
-    chromium installed even if the opt-out had stopped working entirely, which
-    is exactly how this fence was found unwitnessed.
+    BOTH probe seams are made to RAISE rather than return False: a test that
+    let either of them answer would go green on a developer box with chromium
+    installed even if the opt-out had stopped working entirely, which is
+    exactly how this fence was found unwitnessed. `playwright_importable` is
+    pinned rather than guarded because the SKIPPED notice legitimately asks it
+    which remedy to print (`_remedy`), and pinning it is what makes that line
+    the same sentence on every install.
     """
     rec = _Recorder()
     monkeypatch.setenv(ENV, "true")
     monkeypatch.setattr(provision.subprocess, "Popen", rec.popen)
+    monkeypatch.setattr(provision, "playwright_importable", lambda: True)
 
     def must_not_run():
         raise AssertionError("probed for chromium after the operator opted out")
 
     monkeypatch.setattr(provision, "chromium_present", must_not_run)
+    monkeypatch.setattr(provision, "probe_chromium", must_not_run)
 
     provision.ensure_chromium_async(console=rec.console)
 
@@ -146,7 +209,7 @@ def test_a_present_chromium_neither_announces_nor_spawns(clean_provision,
     """Nothing to download is nothing to say. A line on every start would be
     noise, and noise is how a real notice gets scrolled past."""
     rec = _Recorder()
-    monkeypatch.setattr(provision, "chromium_present", lambda: True)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_PRESENT)
     monkeypatch.setattr(provision.subprocess, "Popen", rec.popen)
 
     provision.ensure_chromium_async(console=rec.console)
@@ -163,7 +226,7 @@ def test_a_failed_spawn_retracts_the_announcement(clean_provision, monkeypatch):
         rec.events.append("spawn")
         raise OSError("no such file")
 
-    monkeypatch.setattr(provision, "chromium_present", lambda: False)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_ABSENT)
     monkeypatch.setattr(provision.subprocess, "Popen", exploding_popen)
 
     provision.ensure_chromium_async(console=rec.console)
@@ -189,7 +252,7 @@ def test_an_already_bootstrapped_module_says_nothing(monkeypatch):
 def test_announce_names_the_download_when_chromium_is_missing(clean_provision,
                                                               monkeypatch):
     rec = _Recorder()
-    monkeypatch.setattr(provision, "chromium_present", lambda: False)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_ABSENT)
 
     line = provision.announce_browser_autoinstall(console=rec.console)
 
@@ -201,7 +264,7 @@ def test_announce_names_the_download_when_chromium_is_missing(clean_provision,
 def test_announce_says_nothing_when_chromium_is_present(clean_provision,
                                                         monkeypatch):
     rec = _Recorder()
-    monkeypatch.setattr(provision, "chromium_present", lambda: True)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_PRESENT)
 
     line = provision.announce_browser_autoinstall(console=rec.console)
 
@@ -215,11 +278,13 @@ def test_announce_reports_the_opt_out_without_probing_for_chromium(
     they said no is work nobody asked for."""
     rec = _Recorder()
     monkeypatch.setenv(ENV, "true")
+    monkeypatch.setattr(provision, "playwright_importable", lambda: True)
 
     def must_not_run():
         raise AssertionError("probed for chromium after the operator opted out")
 
     monkeypatch.setattr(provision, "chromium_present", must_not_run)
+    monkeypatch.setattr(provision, "probe_chromium", must_not_run)
 
     line = provision.announce_browser_autoinstall(console=rec.console)
 
@@ -290,7 +355,7 @@ def test_start_daemon_announces_the_download_before_spawning_the_child(
     monkeypatch.delenv("SYSTEMU_DASHBOARD_PORT", raising=False)
 
     rec = _Recorder()
-    monkeypatch.setattr(provision, "chromium_present", lambda: False)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_ABSENT)
     monkeypatch.setattr(provision, "_console_write", rec.console)
     # The DAEMON child's spawn -- `start_daemon` does `import subprocess`
     # inside the function, so the stdlib attribute is the seam.
@@ -319,7 +384,7 @@ def test_start_daemon_says_nothing_when_chromium_is_already_there(
     monkeypatch.delenv("SYSTEMU_DASHBOARD_PORT", raising=False)
 
     rec = _Recorder()
-    monkeypatch.setattr(provision, "chromium_present", lambda: True)
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_PRESENT)
     monkeypatch.setattr(provision, "_console_write", rec.console)
     monkeypatch.setattr(_stdlib_subprocess, "Popen", rec.popen)
 
@@ -329,3 +394,86 @@ def test_start_daemon_says_nothing_when_chromium_is_already_there(
     )
 
     assert rec.events == ["spawn"], rec.events
+
+
+# -- the positive control: the pins are pinning the CONSULTED seams ---------
+
+def test_the_pinned_seams_are_the_ones_ensure_consults(clean_provision,
+                                                       monkeypatch):
+    """D8's own guard. `_pin_install` is only worth anything while the product
+    still reads these two module attributes; the day it stops, every pinned
+    test above would silently go back to answering from THIS machine -- green
+    with the browser extra, and testing the wrong install without it.
+
+    Patch each seam to raise: the product path has to carry the exception out.
+    A seam nobody consults cannot.
+    """
+    rec = _Recorder()
+    monkeypatch.setattr(provision.subprocess, "Popen", rec.popen)
+    monkeypatch.setattr(provision, "_publish_banner", lambda: None)
+
+    def boom():
+        raise _SeamNotConsulted("this seam was not consulted")
+
+    monkeypatch.setattr(provision, "playwright_importable", boom)
+    with pytest.raises(_SeamNotConsulted):
+        provision.ensure_chromium_async(console=rec.console)
+
+    monkeypatch.setattr(provision, "playwright_importable", lambda: True)
+    monkeypatch.setattr(provision, "probe_chromium", boom)
+    with pytest.raises(_SeamNotConsulted):
+        provision.ensure_chromium_async(console=rec.console)
+
+    assert "spawn" not in rec.events, rec.events
+
+
+def test_the_pinned_seams_are_the_ones_announce_consults(clean_provision,
+                                                         monkeypatch):
+    """The same control for the PARENT's copy of the line -- the one the
+    operator actually reads, and a separate decision frame with its own
+    lookups."""
+    rec = _Recorder()
+
+    def boom():
+        raise _SeamNotConsulted("this seam was not consulted")
+
+    monkeypatch.setattr(provision, "playwright_importable", boom)
+    with pytest.raises(_SeamNotConsulted):
+        provision.announce_browser_autoinstall(console=rec.console)
+
+    monkeypatch.setattr(provision, "playwright_importable", lambda: True)
+    monkeypatch.setattr(provision, "probe_chromium", boom)
+    with pytest.raises(_SeamNotConsulted):
+        provision.announce_browser_autoinstall(console=rec.console)
+
+    assert rec.lines == [], rec.lines
+
+
+def test_the_pin_helper_pins_the_state_it_was_asked_for(clean_provision,
+                                                        monkeypatch):
+    """And the control's control: `_pin_install` asserts the verdict the real
+    `probe_chromium` derived, so a pin that quietly produced UNKNOWN for every
+    request -- which authorises no download and would make several tests above
+    pass for the wrong reason -- cannot go unnoticed."""
+    for state in (provision.CHROMIUM_PRESENT, provision.CHROMIUM_ABSENT,
+                  provision.CHROMIUM_UNKNOWN):
+        _pin_install(monkeypatch, chromium=state)
+        assert provision.probe_chromium().state is state
+        assert provision.playwright_importable() is True
+
+
+def test_an_unanswerable_probe_announces_nothing_and_downloads_nothing(
+        clean_provision, monkeypatch):
+    """The third state, reachable now that the pin can express it: UNKNOWN is
+    not ABSENT. Announcing on a non-answer is how a chromium that was already
+    on disk got re-downloaded on every single daemon start."""
+    rec = _Recorder()
+    _pin_install(monkeypatch, chromium=provision.CHROMIUM_UNKNOWN)
+    monkeypatch.setattr(provision.subprocess, "Popen", rec.popen)
+
+    provision.ensure_chromium_async(console=rec.console)
+
+    assert "spawn" not in rec.events, rec.events
+    assert len(rec.lines) == 1, rec.lines
+    assert "150 mb" not in rec.lines[0].lower(), rec.lines[0]
+    assert "could not determine" in rec.lines[0].lower(), rec.lines[0]

@@ -183,6 +183,20 @@ def health_view(*, load: "dict | None" = None, **overrides) -> dict:
     }
 
 
+def secrets_at_rest_text(prof) -> str:
+    """S5 / R-A3 -- the capability table's "Secrets at rest" value.
+
+    The ``secrets_at_rest`` row's own label, read from the profile in the view
+    this page was built from (never a probe on render). A row this function
+    cannot read is "unknown", never a claim. ASCII only.
+    """
+    row = prof.get("secrets_at_rest") if type(prof) is dict else None
+    label = row.get("label") if type(row) is dict else None
+    if type(label) is not str or not label:
+        return "unknown - the platform profile did not report it"
+    return label.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def _provider_text(provider: dict) -> str:
     if not provider["configured"]:
         return "not configured"
@@ -230,6 +244,288 @@ def _needs_you_section():
         return needs_you_breakdown(vault)
     except Exception:
         return None
+
+
+#: How many broken items /health lists one line each before the count alone has
+#: to do (the /table page shows them all).
+_BROKEN_LINES_CAP = 5
+
+
+def table_status_text(needs) -> str:
+    """R-B1 — the /health "Table" row: ``"N broken"``, from the Needs-you breakdown.
+
+    Never a reassuring number it cannot back: no breakdown (no vault open, or the
+    accounting failed) is "unknown", a table the reconciler has not projected yet is
+    "not checked yet", and an unreadable snapshot is "unknown" — not "0 broken".
+    ASCII only."""
+    if type(needs) is not dict:
+        return "unknown - the table could not be checked from this page"
+    if not needs.get("table_checked"):
+        if needs.get("table_why") == "absent":
+            return "not checked yet - the table has not been projected"
+        return "unknown - the table snapshot could not be read"
+    n = needs.get("table_broken")
+    n = n if type(n) is int and n >= 0 else 0
+    return f"{n} broken"
+
+
+# ── PLAN-11 / DEC-11: the approval fatigue the system records ───────────────
+#
+# The counters in ``runtime/metrics_store.py`` were written on every gate
+# decision from S1b on and shown NOWHERE: ``MetricsStore.snapshot()`` had no
+# reader outside tests. This section is that reader. It renders from a
+# PUBLISHED render snapshot (``render_snapshots``) -- the store is a file, and
+# no page reads a file on the event loop -- and every measure whose denominator
+# is 0 says NOT MEASURED. A "0%" with nothing behind it would be a reassuring
+# claim the store cannot back.
+
+_NOT_MEASURED = "NOT MEASURED"
+
+#: How often an OPEN /health checks whether a fresher approval snapshot landed.
+#: The tick reads one timestamp under a lock -- it never reads the store.
+APPROVALS_POLL_S = 2.0
+
+
+def _fmt_duration(ms: float) -> str:
+    """A time-to-decision, in the unit a person reads it in. ASCII only."""
+    s = float(ms) / 1000.0
+    if s < 60.0:
+        return f"{s:.1f}s"
+    if s < 3600.0:
+        return f"{s / 60.0:.1f} min"
+    return f"{s / 3600.0:.1f} h"
+
+
+def _median(xs: list) -> float:
+    ordered = sorted(xs)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _p90(xs: list) -> float:
+    """Nearest-rank 90th percentile: a value that was actually observed."""
+    import math
+    ordered = sorted(xs)
+    return ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def approvals_view(metrics, *, unread_reason: str = "") -> dict:
+    """Pure render-DATA for the /health "Approvals" section.
+
+    ``metrics`` is a ``MetricsStore.snapshot()`` dict (as published in an
+    ``ApprovalMetricsSnapshot``), or None when no snapshot has been read --
+    in which case every row says NOT MEASURED and a note says why.
+
+    Returns ``{"measured", "rows": [(label, value)], "notes": [str]}``; every
+    string is ASCII. The denominator of each row:
+
+      * cards resolved, Always-allow grants, bulk decisions -> resolved cards;
+      * median / 90th percentile -> the timed decisions in the bounded window;
+      * approved without reading -> approvals that were timed;
+      * all-time line -> every timed decision on record.
+
+    A row whose denominator is 0 reads NOT MEASURED, never 0 / 0%.
+    """
+    from systemu.runtime import metrics_store as _ms
+
+    fast = f"{_ms.FAST_APPROVAL_S:g}s"
+    bulk = f"{_ms._BULK_WINDOW_S:g}s"
+    labels = (
+        "Gate cards resolved",
+        "Median time to decision",
+        "90th percentile time to decision",
+        f"Approved without reading (decided in under {fast})",
+        "Always allow grants",
+        f"Bulk decisions (within {bulk} of the previous decision)",
+        "All-time time to decision",
+    )
+
+    def _int(key: str) -> int:
+        x = metrics.get(key)
+        return x if type(x) is int and x >= 0 else 0
+
+    def _num(key: str):
+        x = metrics.get(key)
+        return float(x) if type(x) in (int, float) else None
+
+    if type(metrics) is not dict:
+        reason = unread_reason or "the approval counters have not been read"
+        return {
+            "measured": False,
+            "rows": [(lbl, f"{_NOT_MEASURED} - not read yet") for lbl in labels],
+            "notes": [f"Approval counters not read yet: {reason}."],
+        }
+
+    resolved = _int("gate_cards_resolved")
+    if resolved == 0:
+        return {
+            "measured": False,
+            "rows": [(lbl, f"{_NOT_MEASURED} - no resolved gate card is on record")
+                     for lbl in labels],
+            "notes": ["Nothing to measure yet: these fill in as gate cards are "
+                      "decided."],
+        }
+
+    series = metrics.get("resolution_latency_ms")
+    window = ([float(x) for x in series if type(x) in (int, float)]
+              if type(series) is list else [])
+    no_timed = f"{_NOT_MEASURED} - no timed decision is on record"
+    if window:
+        last = f"(last {_plural(len(window), 'decision')})"
+        median = f"{_fmt_duration(_median(window))} {last}"
+        p90 = f"{_fmt_duration(_p90(window))} {last}"
+    else:
+        median = p90 = no_timed
+
+    timed = _int("approvals_timed")
+    unread = min(_int("approvals_unread"), timed)
+    if timed:
+        share = (f"{100.0 * unread / timed:.0f}% ({unread} of "
+                 f"{_plural(timed, 'approval')})")
+    else:
+        share = f"{_NOT_MEASURED} - no timed approval is on record"
+
+    count = _int("resolution_latency_count")
+    total, lo, hi = (_num("resolution_latency_sum_ms"),
+                     _num("resolution_latency_min_ms"),
+                     _num("resolution_latency_max_ms"))
+    if count and total is not None and lo is not None and hi is not None:
+        all_time = (f"avg {_fmt_duration(total / count)}, fastest "
+                    f"{_fmt_duration(lo)}, slowest {_fmt_duration(hi)} over "
+                    f"{_plural(count, 'decision')}")
+    else:
+        all_time = no_timed
+
+    rows = list(zip(labels, (
+        str(resolved), median, p90, share,
+        str(_int("always_allow_grants")), str(_int("bulk_approve_events")),
+        all_time,
+    )))
+    return {
+        "measured": True,
+        "rows": rows,
+        "notes": [
+            (f"Median and 90th percentile cover at most the {_ms.LATENCY_WINDOW} "
+             "most recent decisions; the all-time line covers every decision "
+             "on record."),
+            ("An approval is Approve, Approve once, Always allow, or a "
+             "trust/install choice; a Deny is never counted as one."),
+            ("Cards a gate-mode policy resolved automatically are included, "
+             "recorded as decided in 0s."),
+        ],
+    }
+
+
+def _approvals_store_dir():
+    """The metrics directory of THIS process's open vault, or None. No I/O."""
+    try:
+        from pathlib import Path
+
+        from systemu.interface.dashboard_state import AppState
+        root = getattr(getattr(AppState.get(), "vault", None), "root", None)
+        if root is None:
+            return None
+        return str(Path(root) / "metrics")
+    except Exception:
+        return None
+
+
+def _published_approvals(store_dir: str):
+    """The PUBLISHED approval-metrics snapshot for ``store_dir``, or None.
+
+    Reads the render-snapshot slot; never produces, never touches the file.
+    Type-pinned in this frame (DEC-36), and a snapshot of a DIFFERENT store
+    (the slot is process-wide) is not an answer about this vault."""
+    try:
+        from systemu.runtime import metrics_store as _ms
+        from systemu.runtime import render_snapshots as _rs
+        snap = _rs.current(_ms.APPROVAL_METRICS_SNAPSHOT)
+    except Exception:
+        return None
+    if type(snap) is not _ms.ApprovalMetricsSnapshot:
+        return None
+    if type(snap.store_dir) is not str or snap.store_dir != store_dir:
+        return None
+    if type(snap.metrics) is not dict:
+        return None
+    return snap
+
+
+def _approvals_snapshot():
+    """``(snapshot | None, why)`` for the Approvals section. NEVER reads the file.
+
+    Registers the producer for this vault (idempotent; re-points it if the
+    vault changed) and nudges the shared refresher when there is no snapshot
+    or it is stale -- the D-3 shape: a render reads, it never produces."""
+    store_dir = _approvals_store_dir()
+    if store_dir is None:
+        return None, "no vault is open in this process"
+    try:
+        from systemu.runtime import metrics_store as _ms
+        from systemu.runtime import render_snapshots as _rs
+        _rs.register(_ms.APPROVAL_METRICS_SNAPSHOT,
+                     lambda: _ms.publish_approval_metrics(store_dir))
+        _rs.start_refresher()
+    except Exception:
+        _rs = None
+    snap = _published_approvals(store_dir)
+    if (snap is None or snap.stale) and _rs is not None:
+        try:
+            _rs.request_refresh()
+        except Exception:
+            pass
+    if snap is None:
+        return None, ("they are read off the page thread, and this section "
+                      "fills in when they arrive")
+    return snap, ""
+
+
+def _paint_approvals() -> None:
+    """The /health "Approvals" section, kept current on an open page."""
+    from nicegui import ui
+
+    ui.label("Approvals").classes("s-section-head")
+    holder = ui.column().classes("w-full").style("gap: 4px;")
+    seen = {"key": None}
+
+    def _paint() -> None:
+        snap, why = _approvals_snapshot()
+        seen["key"] = None if snap is None else snap.taken_at
+        view = approvals_view(None if snap is None else snap.metrics,
+                              unread_reason=why)
+        with holder:
+            for label, value in view["rows"]:
+                with ui.row().classes("w-full items-center").style("gap: 12px;"):
+                    ui.label(label).classes("s-muted").style("min-width: 260px;")
+                    ui.label(value).classes("s-cell")
+            for note in view["notes"]:
+                ui.label(note).classes("s-muted")
+
+    _paint()
+
+    # Repaint ONLY when a new observation has landed (D-11): the first visit
+    # after a restart finds no snapshot, nudges the refresher, and fills in a
+    # moment later without a reload.
+    def _tick() -> None:
+        store_dir = _approvals_store_dir()
+        snap = None if store_dir is None else _published_approvals(store_dir)
+        key = None if snap is None else snap.taken_at
+        if key == seen["key"]:
+            return
+        holder.clear()
+        _paint()
+
+    try:
+        from systemu.interface.ui_helpers import safe_timer
+        safe_timer(APPROVALS_POLL_S, _tick)
+    except Exception:
+        pass
 
 
 def build_health_page() -> None:
@@ -292,12 +588,24 @@ def build_health_page() -> None:
                         ("Questions waiting for an answer", _needs["asks"], "/inbox"),
                         ("Suggestions on your table",
                          _needs["table_suggestions"], "/table"),
+                        # R-B1: something the operator relied on went away
+                        ("Broken on your table",
+                         _needs.get("table_broken", 0), "/table"),
                     ):
                         if not _n:
                             continue
                         with ui.row().classes("w-full items-center").style("gap: 12px;"):
                             ui.label(f"{_lbl}: {_n}")
                             ui.link("open →", _href).classes("s-muted")
+                    # R-B1: each broken item's one-line reason, linking to /table
+                    # where its card leads with the same reason and a fix action.
+                    for _row in _needs.get("table_broken_rows", [])[:_BROKEN_LINES_CAP]:
+                        ui.link(_row["line"], _row["href"]).classes("s-muted")
+
+            # ── PLAN-11 / DEC-11: approval fatigue, from the published snapshot.
+            # Pinned by tests/test_plan11_approval_fatigue_surface.py (a stub
+            # render that must show the published numbers, plus an AST pin).
+            _paint_approvals()
 
             # ── live status ───────────────────────────────────────────────
             ui.label("Status").classes("s-section-head")
@@ -315,6 +623,9 @@ def build_health_page() -> None:
                 ("LLM provider", _provider_text(view["provider"])),
                 ("Keyring backend", kr_txt),
                 ("Daemon", daemon_txt),
+                # R-B1: how many things on the operator's table are broken. From
+                # the same breakdown as "Needs you" above -- no second read.
+                ("Table", table_status_text(_needs)),
                 ("systemu version (this process)",
                  view["versions"].get("systemu", "?")),
                 ("systemu path (this process)", _build.get("cli_path") or "?"),
@@ -336,6 +647,9 @@ def build_health_page() -> None:
                 ("Docker mode", "yes" if prof["docker_mode"] else "no"),
                 ("Capture available", "yes" if prof["capture_available"] else "no"),
                 ("Keyring backend", prof["keyring_backend"]),
+                # S5 / R-A3: what actually protects the secrets, from the
+                # snapshot's truthful row -- no probe on render.
+                ("Secrets at rest", secrets_at_rest_text(prof)),
                 ("Forged-network jail", prof["forged_net_jail"]),
                 ("Provider configured", "yes" if prof["provider_configured"] else "no"),
             ):

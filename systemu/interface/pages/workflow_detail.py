@@ -122,6 +122,12 @@ def build_workflow_detail_page(workflow_id: str) -> None:
     if snap.execution_id:
         _build_cost_panel(snap.execution_id)
 
+    # ── From your table (T5 / §5.10.c) ─────────────────────────────────
+    # What the operator's table supplied this run, from the durable per-run record:
+    # "Using from your table: <item>" in flight, "Answered from your table: N" after.
+    if snap.execution_id:
+        _build_table_payoff_panel(snap.workflow_id)
+
     # ── Receipts (fold-in #3 / DEC-13) ─────────────────────────────────
     # Verified/claimed badges for the run's external effects — "receipts, not
     # self-report". Renders only when the run produced a durable receipt.
@@ -314,6 +320,51 @@ def _build_cost_panel(execution_id: str) -> None:
             ui.label(view["total"]).classes("s-cell s-cell--bold")
         ui.label("Cost is an estimate from editable per-model prices (Settings). "
                  "It reflects spend, not success.").classes("s-muted")
+
+
+def table_payoff_panel_model(workflow_id: str, *, tracker=None):
+    """T5: the "from your table" chip model for this workflow's CURRENT run, or None.
+
+    Re-reads the tracker each call so a run that resumes (new execution id) or ends
+    while the page is open is followed. Delegates to the Work card's
+    ``table_chip_for`` -- one rule for both surfaces. ``tracker`` is a test seam."""
+    try:
+        from systemu.interface.pages.work import table_chip_for
+        snap = (tracker or WorkflowTracker.get()).get_workflow(workflow_id)
+        return table_chip_for(snap) if snap is not None else None
+    except Exception:
+        return None
+
+
+def _render_table_payoff_section(model, *, _ui=None) -> None:
+    """T5: the "From your table" section -- a heading and the shared chip renderer.
+    Token classes only. Renders nothing when there is no chip. ``_ui`` is a test seam."""
+    if not model:
+        return
+    from systemu.interface.pages.work import render_table_chips
+    _ui = ui if _ui is None else _ui
+    _ui.label("From your table").classes("s-section-head q-mt-md")
+    with _ui.card().classes("s-card w-full"):
+        render_table_chips(model, _ui=_ui)
+
+
+def _build_table_payoff_panel(workflow_id: str) -> None:
+    """T5: the section, kept current while the page is open. A gated refresh (W12)
+    repaints only when the chip model changes -- in-flight chips become the answered
+    count when the run ends, without a reload. Each tick is a stat plus a small cached
+    file read (``table_payoff_record.find_run``), never a blocking call."""
+    import json as _json
+
+    from systemu.interface.ui_helpers import gated_refresh, safe_timer
+
+    @ui.refreshable
+    def _panel() -> None:
+        _render_table_payoff_section(table_payoff_panel_model(workflow_id))
+
+    _panel()
+    safe_timer(3.0, gated_refresh(
+        lambda: _json.dumps(table_payoff_panel_model(workflow_id), sort_keys=True),
+        _panel.refresh))
 
 
 def _build_receipt_panel(execution_id: str) -> None:

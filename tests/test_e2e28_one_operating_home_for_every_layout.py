@@ -58,12 +58,25 @@ from systemu.scheduler import daemon as daemon_mod
 from systemu.vault.vault import Vault
 
 
-def _requirement_report() -> dict:
-    """3 of 4 inventory-supplied requirements kept out of a from-scratch gap."""
-    def req(state: str) -> dict:
-        return {"source": "situation", "state": state, "value_origin": "operator"}
-    return {"per_objective": {"1": [req("have"), req("have"), req("have"),
-                                    req("missing")]}}
+def _record_runs(prefix: str) -> None:
+    """Four runs through the PRODUCTION record writer (no ``data_dir``, exactly as
+    ``shadow_runtime`` calls it), three of which the table answered."""
+    from systemu.core.models import Requirement, RequirementReport
+    from systemu.runtime import table_payoff_record as tpr
+    from systemu.runtime.situational_inventory import SituationReport, compose_table
+    from systemu.runtime.table_store import TableItem
+    item = TableItem(id="t-1", kind="service", name="recipient",
+                     ref={"server": "https://example.invalid/t1"})
+    hit = Requirement(kind="decision", schema_path="/a", state="have",
+                      source="situation", value_origin="content_derived",
+                      confidence=0.8, table_item_id="t-1")
+    for i, reqs in enumerate(([hit], [hit], [hit], [])):
+        status = tpr.record_binder_pass(
+            RequirementReport(per_objective={1: reqs}),
+            compose_table(SituationReport(), [item]),
+            root_execution_id=f"{prefix}{i}", execution_id=f"{prefix}{i}",
+            site="midloop")
+        assert status["consulted"] and status["error"] is None, status
 
 
 def _mounted_layout(tmp_path, monkeypatch):
@@ -159,18 +172,18 @@ def test_the_fence_still_refuses_a_vault_inside_the_package(tmp_path, monkeypatc
 # --------------------------------------------------------------------------- #
 
 def test_the_writer_and_the_reader_agree_on_a_mounted_vault(tmp_path, monkeypatch):
-    """The D1 property, in the layout D1 did not cover. The PRODUCTION writer
-    (no ``data_dir``, exactly as ``shadow_runtime`` calls it) runs from one cwd
-    and the reader from another."""
+    """The D1 property, in the layout D1 did not cover. The PRODUCTION record
+    writer (no ``data_dir``, exactly as ``shadow_runtime`` calls it) runs from one
+    cwd and the reader from another. (Re-pointed from the retired resume-snapshot
+    reader to the durable per-run table record.)"""
     mount, elsewhere, vault_dir = _mounted_layout(tmp_path, monkeypatch)
 
     monkeypatch.chdir(elsewhere)
-    written = write_snapshot(ExecutionSnapshot(
-        execution_id="n9a", shadow_id="sh", scroll_id="sc",
-        requirement_report=_requirement_report()))
-    assert written is not None and written.is_file(), "fixture premise: a snapshot"
+    _record_runs("exec_n9a")
+    assert (mount / "data" / "audit" / "table_payoff").is_dir(), (
+        "fixture premise: the record landed under the mounted vault's home")
     assert not (elsewhere / "data").exists(), (
-        f"the writer resolved 'data' against its own cwd: {written}")
+        "the record writer resolved 'data' against its own cwd")
 
     monkeypatch.chdir(mount)
     monkeypatch.setattr(cc, "_get_vault_and_config",
@@ -178,8 +191,8 @@ def test_the_writer_and_the_reader_agree_on_a_mounted_vault(tmp_path, monkeypatc
     res = CliRunner().invoke(cc.debug_avoidable_ask, obj={})
     assert res.exit_code == 0, res.output
 
-    assert "Inventory-hit rate: 75% (3/4" in res.output, res.output
-    assert "Inventory-hit: NOT MEASURED" not in res.output, (
+    assert "Inventory-hit (table record): 75% of runs (3/4" in res.output, res.output
+    assert "Inventory-hit (table record): NOT MEASURED" not in res.output, (
         "the reader answered from its own cwd, not from the minted home")
 
 

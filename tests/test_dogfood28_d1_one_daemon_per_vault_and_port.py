@@ -340,7 +340,11 @@ def test_every_extra_row_is_a_launcher_that_never_imported_systemu(started_daemo
     listeners = set()
     for pid in extras | {recorded}:
         try:
-            conns = psutil.Process(pid).net_connections(kind="inet")
+            proc = psutil.Process(pid)
+            # psutil 6.0 renamed Process.connections() to net_connections();
+            # the declared floor is psutil>=5.9, so use whichever this one has.
+            list_conns = getattr(proc, "net_connections", None) or proc.connections
+            conns = list_conns(kind="inet")
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
         for conn in conns:

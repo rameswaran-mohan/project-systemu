@@ -10,7 +10,9 @@ requests, …) was invisible to the whole shell: badge said 0, rail said
 This module owns the complete accounting:
 
   * :func:`pending_ask_rows` — pending decisions that are NOT inbox gates.
-  * :func:`needs_you_total` — gates + asks (what the badge shows).
+  * :func:`needs_you_total` — gates + asks + what waits on /table: tray
+    suggestions (R-B4) and broken items with their reason (R-B1, see
+    :func:`table_attention`) — what the badge shows.
   * :func:`open_answer_dialog` — the one inline answer affordance, reusing
     the proven ``render_decision_card`` resolve→dispatch path (structured
     questions get their option pickers + free text; resolution publishes
@@ -86,6 +88,55 @@ def table_suggestion_count(vault) -> int:
         return 0
 
 
+def table_attention(vault) -> Dict[str, Any]:
+    """R-B1/R-B4 — what the /table is waiting on the operator for, from ONE read of
+    the projected snapshot (the badge polls this every 2s on every page).
+
+    ``broken_rows`` are the HEALTH-broken items only: status ``broken`` WITH a
+    recorded reason — something the operator relied on went away (a credential
+    removed, an MCP server disconnected, a folder grant revoked). A ``broken``
+    status with no reason is a different failure that already has its own surface
+    (a tool's failed dry run has its fail card; a forge-rejected tool was the
+    operator's own decision), and counting it here would nag about it forever.
+
+    ``checked`` is False when the snapshot could not be WITNESSED (never projected,
+    or unreadable — ``why`` says which). The COUNTS are then 0, the non-alarming
+    direction for a badge; the /health "Table" row reads ``checked`` and says
+    "unknown" instead of reassuring. Never raises.
+    """
+    try:
+        from systemu.runtime import table_store as ts
+        items = ts.load_items_witnessed(vault)
+        why = "" if items is not None else ts.snapshot_state(vault)
+    except Exception:
+        logger.debug("[Attention] could not read the table snapshot", exc_info=True)
+        items, why = None, "unreadable"
+    rows: List[Dict[str, Any]] = []
+    suggestions = 0
+    for it in (items or []):
+        status = getattr(it, "status", "") or ""
+        if status == "suggested":
+            suggestions += 1
+            continue
+        reason = getattr(it, "broken_reason", "") or ""
+        if status != "broken" or type(reason) is not str or not reason:
+            continue
+        name = str(getattr(it, "name", "") or "")
+        rows.append({
+            "id": getattr(it, "id", ""),
+            "name": name,
+            "kind": getattr(it, "kind", "") or "",
+            "reason": reason,
+            "since": getattr(it, "broken_at", None) or "",
+            # the one-line reason "Needs you" shows; the link is always the table
+            "line": f"{name}: {reason}",
+            "href": "/table",
+        })
+    rows.sort(key=lambda r: (r["since"], r["name"]))
+    return {"checked": items is not None, "why": why,
+            "suggestions": suggestions, "broken_rows": rows}
+
+
 def needs_you_breakdown(vault) -> Dict[str, Any]:
     """The complete pending-attention accounting, BY SURFACE.
 
@@ -93,7 +144,11 @@ def needs_you_breakdown(vault) -> Dict[str, Any]:
     second place work can wait — the /table tray — and a badge that counts it but
     always links to /inbox would send the operator to an empty page and tell them
     nothing needs them. So the breakdown carries the target: /inbox while anything
-    is queued there, /table when the tray is the ONLY thing waiting.
+    is queued there, /table when the table is the ONLY thing waiting.
+
+    R-B1 adds the table's BROKEN items (see :func:`table_attention`) to the same
+    total — extending ``needs_you_total``, never a parallel count (§5.10.a) — each
+    with a one-line reason and a link to /table.
     """
     gates = 0
     try:
@@ -102,13 +157,21 @@ def needs_you_breakdown(vault) -> Dict[str, Any]:
     except Exception:
         gates = 0
     asks = len(pending_ask_rows(vault))
-    suggestions = table_suggestion_count(vault)
+    table = table_attention(vault)
+    suggestions = table["suggestions"]
+    broken = len(table["broken_rows"])
+    waiting_on_table = suggestions + broken
     return {
         "gates": gates,
         "asks": asks,
         "table_suggestions": suggestions,
-        "total": gates + asks + suggestions,
-        "target": "/inbox" if (gates + asks) else ("/table" if suggestions else "/inbox"),
+        "table_broken": broken,
+        "table_broken_rows": table["broken_rows"],
+        "table_checked": table["checked"],
+        "table_why": table["why"],
+        "total": gates + asks + waiting_on_table,
+        "target": ("/inbox" if (gates + asks)
+                   else ("/table" if waiting_on_table else "/inbox")),
     }
 
 

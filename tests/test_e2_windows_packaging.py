@@ -12,12 +12,54 @@ misbehaviour, which is the thing under test.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from systemu.winpkg.build_step import (
+    BUILD_DIRNAME,
+    EMBEDDABLE_BUILD_DIRNAME,
+    EMBEDDABLE_SHA256,
+    LAUNCHER_BUILD_DIRNAME,
+    LAUNCHER_ERROR_LOG,
+    LAUNCHER_EXE_NAME,
+    LAUNCHER_QUIET_ENV_VAR,
+    WHEELHOUSE_BUILD_DIRNAME,
+    BuildInputsError,
+    build_all,
+    build_embeddable,
+    build_inputs_for,
+    build_launcher,
+    download_embeddable,
+    embeddable_pth_text,
+    find_csc,
+    launcher_compile_command,
+    render_launcher_source,
+    rewrite_embeddable_pth,
+    verify_build_inputs,
+)
+from systemu.winpkg.launcher import (
+    ACTION_HOTKEY,
+    ACTION_OPEN,
+    ACTION_STATUS,
+    EXIT_NOT_BUILT,
+    INSTALL_ROOT_ENV_VAR,
+    VAULT_DIR_ENV_VAR,
+    hotkey_host_status,
+    launch,
+    point_runtime_at_the_sibling_vault,
+    resolve_install_layout,
+)
 from systemu.winpkg.layout import (
     ENV_DIRNAME,
     ENV_PREVIOUS_DIRNAME,
@@ -485,3 +527,494 @@ def test_iss_installs_per_user_without_admin():
     # must resolve to %LOCALAPPDATA%\systemu, which is what layout.py assumes.
     assert '#define AppName        "systemu"' in text
     assert "DefaultDirName={localappdata}\\{#AppName}" in text
+
+
+# ── the build step: does anything actually PRODUCE the [Files] sources? ──────
+
+def _iss_file_sources() -> list:
+    """The real ``Source:`` values from ``[Files]`` — comments excluded.
+
+    Reading the section rather than the whole file, for the same reason
+    :func:`_iss_pip_command` does: a comment naming a path is not a Source line.
+    """
+    text = ISS_PATH.read_text(encoding="utf-8")
+    block = text.split("[Files]", 1)[1].split("[Icons]", 1)[0]
+    sources = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(";"):
+            continue
+        match = re.search(r'Source:\s*"([^"]+)"', stripped)
+        if match:
+            sources.append(match.group(1))
+    return sources
+
+
+def test_every_iss_build_input_is_produced_by_the_build_step(tmp_path):
+    """The gap this packet closed: ``[Files]`` read three trees that nothing in
+    the repo created, so ISCC aborted at the first Source line.
+
+    Resolve each Source the way Inno does — relative to the script's own
+    directory — and require it to be a path :mod:`systemu.winpkg.build_step`
+    builds. A new Source with no producer fails here.
+    """
+    text = ISS_PATH.read_text(encoding="utf-8")
+    exe_name = re.search(r'#define\s+AppExeName\s+"([^"]+)"', text).group(1)
+    assert exe_name == LAUNCHER_EXE_NAME
+
+    inputs = build_inputs_for(ISS_PATH.parent)
+    produced = {
+        inputs.embeddable_dir: "embeddable",
+        inputs.wheelhouse_dir: "wheelhouse",
+        inputs.launcher_exe: "launcher exe",
+    }
+
+    sources = _iss_file_sources()
+    assert len(sources) == 3, f"expected three build inputs, found {sources}"
+
+    resolved = []
+    for source in sources:
+        concrete = source.replace("{#AppExeName}", exe_name).rstrip("\\*")
+        resolved.append((ISS_PATH.parent / concrete).resolve())
+
+    assert resolved == list(produced), (
+        "an [Files] Source has no producer in systemu.winpkg.build_step; "
+        f"script wants {resolved}, the build step makes {list(produced)}"
+    )
+    # And the literal segment names, so a rename on either side is caught.
+    assert sources[0] == f"{BUILD_DIRNAME}\\{EMBEDDABLE_BUILD_DIRNAME}\\*"
+    assert sources[1] == f"{BUILD_DIRNAME}\\{WHEELHOUSE_BUILD_DIRNAME}\\*"
+    assert sources[2] == f"{BUILD_DIRNAME}\\{LAUNCHER_BUILD_DIRNAME}\\{{#AppExeName}}"
+
+
+def _valid_build_tree(tmp_path: Path):
+    """A structurally complete build tree, built from real files on disk.
+
+    Each verification test breaks exactly ONE thing in it, so a check that
+    stopped looking at that thing shows up as a test that no longer fails.
+    """
+    inputs = build_inputs_for(tmp_path)
+    env_dir = inputs.embeddable_dir
+    env_dir.mkdir(parents=True)
+    (env_dir / "python.exe").write_bytes(b"MZ\x90\x00")
+    (env_dir / "pythonw.exe").write_bytes(b"MZ\x90\x00")
+    (env_dir / "python312._pth").write_text(embeddable_pth_text("3.12.10"),
+                                            encoding="ascii")
+    pip_pkg = env_dir / "Lib" / "site-packages" / "pip"
+    pip_pkg.mkdir(parents=True)
+    (pip_pkg / "__init__.py").write_text("__version__ = '26.1.2'\n", encoding="utf-8")
+
+    inputs.wheelhouse_dir.mkdir(parents=True)
+    (inputs.wheelhouse_dir / "systemu-0.10.21-py3-none-any.whl").write_bytes(b"PK\x03\x04")
+    (inputs.wheelhouse_dir / "click-8.1.7-py3-none-any.whl").write_bytes(b"PK\x03\x04")
+
+    inputs.launcher_dir.mkdir(parents=True)
+    inputs.launcher_exe.write_bytes(b"MZ\x90\x00")
+    return inputs
+
+
+def test_a_complete_build_tree_verifies(tmp_path):
+    summary = verify_build_inputs(_valid_build_tree(tmp_path))
+    assert summary["wheels"] == 2
+    assert summary["launcher"].endswith(LAUNCHER_EXE_NAME)
+
+
+def test_an_embeddable_without_pip_is_refused(tmp_path):
+    """The embeddable distribution has no pip and no ensurepip. ``[Run]`` step 1
+    is ``env\\python.exe -m pip install``; shipping without pip vendored in makes
+    that step die on the target machine, and get-pip.py would need the network
+    AC5 forbids."""
+    inputs = _valid_build_tree(tmp_path)
+    (inputs.embeddable_dir / "Lib" / "site-packages" / "pip" / "__init__.py").unlink()
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        verify_build_inputs(inputs)
+    assert "pip is not vendored" in str(excinfo.value)
+
+
+def test_a_pth_that_only_MENTIONS_import_site_is_refused(tmp_path):
+    """``#import site`` is what the archive ships — the line is present but
+    commented out, so site never loads and ``python -m pip`` cannot work. A
+    substring check for "import site" passes on it; this must not."""
+    inputs = _valid_build_tree(tmp_path)
+    (inputs.embeddable_dir / "python312._pth").write_text(
+        "python312.zip\n.\nLib\\site-packages\n# Uncomment to run site.main()\n"
+        "#import site\n",
+        encoding="ascii",
+    )
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        verify_build_inputs(inputs)
+    assert "does not enable site" in str(excinfo.value)
+
+
+def test_a_pth_without_site_packages_on_the_path_is_refused(tmp_path):
+    inputs = _valid_build_tree(tmp_path)
+    (inputs.embeddable_dir / "python312._pth").write_text(
+        "python312.zip\n.\nimport site\n", encoding="ascii")
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        verify_build_inputs(inputs)
+    assert "Lib\\site-packages" in str(excinfo.value)
+
+
+def test_an_sdist_in_the_wheelhouse_is_refused(tmp_path):
+    """``pip install --no-index`` accepts an sdist and then tries to BUILD it,
+    which needs a build backend and, in practice, the network. AC5 is wheels or
+    it is nothing."""
+    inputs = _valid_build_tree(tmp_path)
+    (inputs.wheelhouse_dir / "some-dep-1.0.tar.gz").write_bytes(b"\x1f\x8b")
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        verify_build_inputs(inputs)
+    assert "some-dep-1.0.tar.gz" in str(excinfo.value)
+
+
+def test_a_wheelhouse_holding_only_the_systemu_wheel_is_refused(tmp_path):
+    inputs = _valid_build_tree(tmp_path)
+    (inputs.wheelhouse_dir / "click-8.1.7-py3-none-any.whl").unlink()
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        verify_build_inputs(inputs)
+    assert "dependencies are missing" in str(excinfo.value)
+
+
+def test_a_launcher_that_is_not_a_windows_executable_is_refused(tmp_path):
+    inputs = _valid_build_tree(tmp_path)
+    inputs.launcher_exe.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        verify_build_inputs(inputs)
+    assert "not a Windows executable" in str(excinfo.value)
+
+
+def test_building_only_one_stage_still_verifies_all_three(tmp_path):
+    """``--only`` narrows what is REBUILT, never what is checked. A partial
+    build that leaves a tree missing must not exit 0."""
+    inputs = build_inputs_for(tmp_path)
+    inputs.build_dir.mkdir(parents=True)
+
+    def _make_launcher():
+        inputs.launcher_dir.mkdir(parents=True, exist_ok=True)
+        inputs.launcher_exe.write_bytes(b"MZ\x90\x00")
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        build_all(inputs, project_root=tmp_path, only=["launcher"],
+                  builders={"launcher": _make_launcher})
+
+    assert inputs.launcher_exe.is_file(), "the selected stage must still run"
+    assert "embeddable" in str(excinfo.value) or "wheelhouse" in str(excinfo.value)
+
+
+def test_an_unknown_build_stage_is_refused(tmp_path):
+    inputs = build_inputs_for(tmp_path)
+    with pytest.raises(BuildInputsError) as excinfo:
+        build_all(inputs, project_root=tmp_path, only=["lancher"], builders={})
+    assert "lancher" in str(excinfo.value)
+
+
+# ── the embeddable runtime is fetched under a pinned digest ─────────────────
+
+def test_an_unpinned_python_version_is_never_fetched():
+    """The build step is upstream of every installed byte. An unknown version
+    must not be downloaded 'and then checked' — it must not be downloaded."""
+    calls = []
+
+    def _fetch(url):
+        calls.append(url)
+        return b"whatever"
+
+    with pytest.raises(BuildInputsError) as excinfo:
+        download_embeddable("3.13.99", fetch=_fetch)
+
+    assert calls == [], "an unpinned version must not reach the network at all"
+    assert "no pinned sha256" in str(excinfo.value)
+
+
+def test_a_tampered_embeddable_archive_is_refused():
+    version = next(iter(EMBEDDABLE_SHA256))
+    with pytest.raises(BuildInputsError) as excinfo:
+        download_embeddable(version, fetch=lambda url: b"not the real archive")
+    assert "digest mismatch" in str(excinfo.value)
+
+
+def test_a_matching_archive_is_returned_unchanged():
+    import hashlib
+
+    payload = b"pretend this is CPython"
+    digest = hashlib.sha256(payload).hexdigest()
+    assert download_embeddable("9.9.9", sha256=digest,
+                              fetch=lambda url: payload) == payload
+
+
+def test_rewriting_the_pth_turns_a_commented_import_site_into_a_live_one(tmp_path):
+    env_dir = tmp_path / "embeddable"
+    env_dir.mkdir()
+    shipped = env_dir / "python312._pth"
+    shipped.write_text(
+        "python312.zip\r\n.\r\n\r\n# Uncomment to run site.main() automatically\r\n"
+        "#import site\r\n",
+        encoding="ascii",
+    )
+
+    rewrite_embeddable_pth(env_dir, version="3.12.10")
+
+    lines = [ln.split("#", 1)[0].strip()
+             for ln in shipped.read_text(encoding="ascii").splitlines()]
+    assert "import site" in lines
+    assert "Lib\\site-packages" in lines
+    assert "python312.zip" in lines
+
+
+def _archive_shaped_like_the_python_org_embeddable() -> bytes:
+    """The real archive's shape: a windowed + console interpreter and a ``._pth``
+    with ``import site`` COMMENTED OUT, which is what python.org ships."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("python.exe", b"MZ\x90\x00")
+        archive.writestr("pythonw.exe", b"MZ\x90\x00")
+        archive.writestr("python312.zip", b"PK\x03\x04")
+        archive.writestr(
+            "python312._pth",
+            b"python312.zip\r\n.\r\n\r\n# Uncomment to run site.main() "
+            b"automatically\r\n#import site\r\n",
+        )
+    return buffer.getvalue()
+
+
+def test_build_embeddable_produces_a_runtime_the_verifier_accepts(tmp_path):
+    """The whole embeddable stage, offline: extract, fix the ._pth, vendor pip.
+
+    Drop any one of those and the tree that comes out is one ``[Run]`` step 1
+    cannot use — which is invisible until someone installs it.
+    """
+    inputs = _valid_build_tree(tmp_path)
+    shutil.rmtree(inputs.embeddable_dir)
+
+    payload = _archive_shaped_like_the_python_org_embeddable()
+    pip_wheel = tmp_path / "pip-26.1.2-py3-none-any.whl"
+    with zipfile.ZipFile(pip_wheel, "w") as wheel:
+        wheel.writestr("pip/__init__.py", "__version__ = '26.1.2'\n")
+        wheel.writestr("pip-26.1.2.dist-info/METADATA", "Name: pip\n")
+
+    fetched = []
+    build_embeddable(
+        inputs,
+        version="3.12.10",
+        sha256=hashlib.sha256(payload).hexdigest(),
+        fetch=lambda url: fetched.append(url) or payload,
+        pip_wheels=[pip_wheel],
+    )
+
+    assert fetched == [
+        "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip"
+    ]
+    assert (inputs.embeddable_dir / "Lib" / "site-packages" / "pip" /
+            "__init__.py").is_file()
+    live = [ln.split("#", 1)[0].strip() for ln in
+            (inputs.embeddable_dir / "python312._pth").read_text(encoding="ascii").splitlines()]
+    assert "import site" in live
+
+    # The same verification the real build runs must accept it.
+    assert verify_build_inputs(inputs)["wheels"] == 2
+
+
+def test_rewriting_the_pth_refuses_an_ambiguous_runtime(tmp_path):
+    env_dir = tmp_path / "embeddable"
+    env_dir.mkdir()
+    (env_dir / "python312._pth").write_text("python312.zip\n", encoding="ascii")
+    (env_dir / "python311._pth").write_text("python311.zip\n", encoding="ascii")
+
+    with pytest.raises(BuildInputsError):
+        rewrite_embeddable_pth(env_dir, version="3.12.10")
+
+
+# ── the launcher stub ────────────────────────────────────────────────────────
+
+def test_the_launcher_is_compiled_as_a_windowless_binary():
+    """Read the real command, not a comment: a console-subsystem launcher
+    flashes a black window on every Start-Menu click."""
+    command = launcher_compile_command(Path("csc.exe"), Path("a.cs"), Path("b.exe"))
+    assert "-target:winexe" in command
+    assert command[-1] == "a.cs"
+    assert "-out:b.exe" in command
+
+
+def test_the_generated_stub_exports_the_install_root_variable_the_launcher_reads():
+    """Cross-module pin: the stub sets it, launcher.py reads it, and the name
+    lives in exactly one place."""
+    source = render_launcher_source()
+    assert f'const string InstallRootEnvVar = "{INSTALL_ROOT_ENV_VAR}";' in source
+    assert f'start.EnvironmentVariables[InstallRootEnvVar] = dir;' in source
+    # Structural only — the behavioural proof is the compiled-launcher test below.
+    assert "Process.GetCurrentProcess()" in source
+    assert "MainModule.FileName" in source
+
+
+_CSC = find_csc()
+
+
+@pytest.mark.skipif(sys.platform != "win32" or _CSC is None,
+                    reason="needs Windows and the .NET Framework C# compiler")
+def test_the_compiled_launcher_finds_its_interpreter_beside_itself_not_in_the_cwd(tmp_path):
+    """The measured reason this is a compiled stub and not a distlib .exe shim.
+
+    A distlib launcher resolves a RELATIVE shebang through ``SearchPath()``,
+    which searches the current directory and PATH. Given ``#!env\\python.exe``
+    it ran an ``env\\python.exe`` that happened to sit in the CWD — a silently
+    wrong interpreter. Here the CWD holds exactly that decoy and must be
+    ignored.
+    """
+    inputs = build_inputs_for(tmp_path)
+    inputs.build_dir.mkdir(parents=True)
+    exe = build_launcher(inputs)
+
+    decoy = tmp_path / "decoy"
+    (decoy / ENV_DIRNAME).mkdir(parents=True)
+    (decoy / ENV_DIRNAME / "pythonw.exe").write_bytes(b"")
+
+    environ = dict(os.environ)
+    environ[LAUNCHER_QUIET_ENV_VAR] = "1"
+    completed = subprocess.run([str(exe)], cwd=str(decoy), env=environ,
+                               capture_output=True, timeout=180)
+
+    assert completed.returncode != 0, (
+        "there is no interpreter beside the launcher; it must refuse rather "
+        "than run whatever the CWD offers"
+    )
+
+    log = inputs.launcher_dir / LAUNCHER_ERROR_LOG
+    assert log.is_file(), "the launcher must log beside ITSELF, not in the CWD"
+    assert not (decoy / LAUNCHER_ERROR_LOG).exists()
+    text = log.read_text(encoding="utf-8")
+    assert str(inputs.launcher_dir / ENV_DIRNAME / "pythonw.exe") in text
+    assert str(decoy) not in text
+
+
+# ── the launcher's own decisions ─────────────────────────────────────────────
+
+def test_launcher_prefers_the_install_root_the_stub_exported(tmp_path):
+    exported = tmp_path / "from-the-stub"
+    layout = resolve_install_layout(
+        environ={INSTALL_ROOT_ENV_VAR: str(exported),
+                 "LOCALAPPDATA": str(tmp_path / "ignored")},
+        prefix=str(tmp_path / "also-ignored"),
+    )
+    assert layout.root == exported
+    assert layout.env_dir == exported / ENV_DIRNAME
+
+
+def test_launcher_falls_back_to_the_embedded_prefix_only_when_it_IS_an_env(tmp_path):
+    inside = resolve_install_layout(environ={}, prefix=str(tmp_path / "app" / ENV_DIRNAME))
+    assert inside.root == tmp_path / "app"
+
+    # A dev virtualenv is not an install root; guessing from it would put the
+    # vault somewhere arbitrary.
+    elsewhere = resolve_install_layout(
+        environ={"LOCALAPPDATA": str(tmp_path / "lad")},
+        prefix=str(tmp_path / "some" / ".venv"),
+    )
+    assert elsewhere.root == tmp_path / "lad" / "systemu"
+
+
+def test_launcher_points_the_runtime_at_the_SIBLING_vault(tmp_path):
+    """AC2's runtime half. ``Config``'s default vault_dir is the RELATIVE
+    ``systemu/vault``, which for a wheel install resolves inside
+    ``env\\Lib\\site-packages`` — an env swap on upgrade would then legitimately
+    delete the operator's data, and lifecycle.py could do nothing about it.
+    """
+    layout = resolve_layout(tmp_path)
+    environ: dict = {}
+
+    point_runtime_at_the_sibling_vault(layout, environ=environ)
+
+    resolved = Path(environ[VAULT_DIR_ENV_VAR])
+    assert resolved == layout.vault_dir
+    for env_path in (layout.env_dir, layout.env_staging_dir, layout.env_previous_dir):
+        with pytest.raises(ValueError):
+            resolved.relative_to(env_path)
+
+
+def test_an_operator_vault_override_is_not_stomped(tmp_path):
+    layout = resolve_layout(tmp_path)
+    environ = {VAULT_DIR_ENV_VAR: str(tmp_path / "somewhere-else")}
+    assert point_runtime_at_the_sibling_vault(layout, environ=environ) == \
+        str(tmp_path / "somewhere-else")
+
+
+def test_hotkey_is_reported_absent_and_never_silently_substituted(tmp_path):
+    """R-P7 is not built. ``--hotkey`` must fail loudly rather than open the
+    dashboard and look like it worked."""
+    layout = resolve_layout(tmp_path)
+    started = []
+    opened = []
+
+    result = launch(
+        ACTION_HOTKEY,
+        layout=layout,
+        environ={},
+        daemon_status=lambda vault: started.append(("status", vault)),
+        start_daemon=lambda vault, port: started.append(("start", vault)),
+        open_url=lambda url: opened.append(url) or True,
+    )
+
+    assert result.exit_code == EXIT_NOT_BUILT
+    assert started == [], "nothing may be started for a capability that does not exist"
+    assert opened == [], "a hotkey request must not turn into a dashboard open"
+    assert result.dashboard_url is None
+    assert hotkey_host_status()["available"] is False
+
+
+def test_open_starts_the_daemon_only_when_it_is_down(tmp_path):
+    layout = resolve_layout(tmp_path)
+
+    starts = []
+    opened = []
+    result = launch(
+        ACTION_OPEN, layout=layout, environ={}, port=8765,
+        daemon_status=lambda vault: False,
+        start_daemon=lambda vault, port: starts.append((vault, port)),
+        open_url=lambda url: opened.append(url) or True,
+    )
+    assert result.daemon_started is True
+    assert starts == [(str(layout.vault_dir), 8765)]
+    assert opened == ["http://127.0.0.1:8765"]
+    assert result.exit_code == 0
+
+    starts.clear()
+    again = launch(
+        ACTION_OPEN, layout=layout, environ={},
+        daemon_status=lambda vault: True,
+        start_daemon=lambda vault, port: starts.append((vault, port)),
+        open_url=lambda url: True,
+    )
+    assert again.daemon_started is False
+    assert starts == [], "a second launch must not start a second daemon"
+
+
+def test_a_browser_that_refuses_to_open_is_said_out_loud(tmp_path):
+    layout = resolve_layout(tmp_path)
+    result = launch(
+        ACTION_OPEN, layout=layout, environ={},
+        daemon_status=lambda vault: True,
+        start_daemon=lambda vault, port: None,
+        open_url=lambda url: False,
+    )
+    assert result.opened_dashboard is False
+    assert any("127.0.0.1:8765" in note for note in result.notes)
+
+
+def test_status_reports_the_layout_without_starting_anything(tmp_path):
+    layout = resolve_layout(tmp_path)
+    touched = []
+    result = launch(
+        ACTION_STATUS, layout=layout, environ={},
+        daemon_status=lambda vault: touched.append(vault),
+        start_daemon=lambda vault, port: touched.append(vault),
+        open_url=lambda url: touched.append(url) or True,
+    )
+    assert touched == []
+    assert result.exit_code == 0
+    joined = " ".join(result.notes)
+    assert str(layout.vault_dir) in joined
+    assert "R-P7 is not built" in joined

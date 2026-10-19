@@ -164,7 +164,7 @@ def test_decisions_mode_set_persists_and_loads(monkeypatch, tmp_path):
     from systemu.interface.command.gate_mode import load_default_policy, GateMode
 
     runner = CliRunner()
-    result = runner.invoke(decisions_group, ["mode", "--set", "bypass"])
+    result = runner.invoke(decisions_group, ["mode", "--set", "bypass", "--confirm", "bypass"])
     assert result.exit_code == 0, result.output
     # The persisted setting is reflected by the live policy loader.
     assert load_default_policy().mode is GateMode.BYPASS
@@ -179,7 +179,7 @@ def test_decisions_mode_set_bypass_prints_danger(monkeypatch, tmp_path):
     from systemu.interface.cli_commands import decisions_group
 
     runner = CliRunner()
-    result = runner.invoke(decisions_group, ["mode", "--set", "bypass"])
+    result = runner.invoke(decisions_group, ["mode", "--set", "bypass", "--confirm", "bypass"])
     assert result.exit_code == 0, result.output
     assert "DANGER" in result.output.upper() or "danger" in result.output.lower()
     assert "bypass" in result.output.lower()

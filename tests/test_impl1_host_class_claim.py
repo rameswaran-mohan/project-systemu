@@ -1,32 +1,33 @@
-"""IMPL-1 honesty pin: the tool gate card may not promise a host-class binding
-that the signature it is describing does not actually carry.
+"""IMPL-1 honesty pin: the tool gate card may claim a host-class binding ONLY
+because -- and only while -- the signature it describes actually carries one.
 
-THE DEFECT THIS PINS. ``command_approvals.tool_signature`` really does accept a
-``host_class`` and really does discriminate on it (tests/test_tool_signature.py
-::test_host_class_regate_and_default), so the card's old copy -- "'Always
-allow' remembers this exact tool body + effect set + host class." -- read as a
-true statement about the machinery. It was not a true statement about THIS
-SYSTEM. No host resolver exists yet, so every production caller passes
-``host_class=""`` unconditionally: ``tool_sandbox._maybe_gate_tool`` hardcodes
-it empty behind a comment saying the host signal is DEFERRED, and
-``first_gate_review`` mirrors that. A host-parameterized tool blessed while it
-was talking to one host therefore stays blessed against EVERY host -- and the
-consent surface told the operator the opposite.
+THE DEFECT THIS FILE WAS BORN TO PIN (v0.10.27). ``command_approvals
+.tool_signature`` has always accepted a ``host_class`` and discriminated on it,
+so the card's copy -- "'Always allow' remembers this exact tool body + effect
+set + host class" -- read as a true statement about the machinery. It was not
+true of the SYSTEM: every production caller passed ``host_class=""``, so a
+host-parameterized tool blessed while it talked to one host stayed blessed
+against EVERY host. The clause was removed and this file pinned its absence,
+conditional on a WITNESS that the live gate bound an empty host class.
 
-HOW TO FLIP THIS PIN CONSCIOUSLY. The two tests below are a conditional, not a
-ban on the words. ``test_production_gate_binds_an_empty_host_class`` is the
-WITNESS: it drives the real ToolSandbox gate and shows that the signature the
-operator is being asked to bless is the ``host_class=""`` one, and that a
-non-empty host class would have moved it. ``test_card_does_not_claim_a_host_
-class`` is the PIN, and it re-derives that witness before it asserts anything
-about the copy -- so the pin is only ever in force WHILE production binds an
-empty host class.
+THE CONSCIOUS FLIP (GATE-6, capability-diff Slice 2). The host class is now
+real: ``command_approvals.tool_host_class`` derives it deterministically from the
+tool's DECLARED spec -- ``none`` (no network effect; written into the signature
+as the empty string every pre-host signature carried), ``undeclared`` (a network
+effect and no declared hosts), or the sorted unique declared hostnames -- and
+``ToolSandbox._maybe_gate_tool`` binds it. The witness went red exactly as its
+docstring said it would, and was flipped, not weakened:
 
-When a future build lands a real host resolver and ``_maybe_gate_tool`` starts
-passing a resolved ``host_class``, the WITNESS goes red FIRST and names exactly
-what changed. That is the moment -- and the only moment -- to put the
-host-class clause back into the card copy and invert this pin. Do NOT relax the
-witness to keep the pin green: the pin means nothing without it.
+  * ``test_production_gate_binds_the_derived_host_class`` -- the WITNESS, now
+    asserting the live gate's stamped signature is the one keyed on the DERIVED
+    class (and, for a networked tool, NOT the old empty-class one);
+  * ``test_card_claims_the_host_class_it_binds`` -- the PIN, which re-derives
+    that witness first and only then requires the card to claim the binding and
+    show the ``hosts:`` line.
+
+If a future change stops binding the derived class, the witness goes red first
+and the card claim must come out again. Do NOT relax the witness to keep the
+pin green: the pin means nothing without it.
 
 Mirrors tests/test_s1b_tool_gate.py for how the live gate is reached, so the
 two files cannot disagree about what "the real gate" is.
@@ -46,12 +47,36 @@ EFFECT_TAGS = ["send_message"]          # REQUIRE_APPROVAL band -> a card with
                                         # which offers no standing allow at all).
 BODY = "def run():\n    return {'success': True}\n"
 
-# Any host that is not "". Used ONLY to show the emptiness the witness asserts is
-# load-bearing: were a host class ever bound, the signature would be a different one.
-OTHER_HOST = "tools.example.com"
+# The derivation table, written out by hand rather than computed with the
+# function under test: (tool name, declared effect tags, declared hosts, the
+# host class the card shows, the value the SIGNATURE is keyed on).
+CASES = [
+    # a network effect and no hosts -> "undeclared"
+    (TOOL_NAME, ["send_message"], None, "undeclared", "undeclared"),
+    # a network effect and hosts -> the sorted, unique, lower-cased hostnames
+    ("post_status_update", ["net_mutate"], ["Mail.Example.com", "api.example.com",
+                                            "api.example.com"],
+     "api.example.com,mail.example.com", "api.example.com,mail.example.com"),
+    # no network effect -> "none", which signs as the pre-host empty string
+    ("archive_old_reports", ["local_delete"], None, "none", ""),
+]
+
+# The STANDING-ALLOW card's cases. R1 (ruled 2026-10-19): ``local_delete`` is
+# irreversible -- the shipped file_delete unlinks permanently and nothing signals a
+# recycle path -- so its card offers no "Always allow" at all and cannot carry the
+# claim this test pins. The no-network row is re-pointed to ``clipboard_write``: an
+# approval-band, non-network, NON-irreversible class. The test asserts both
+# properties itself, so the example can never silently become irreversible again.
+# (GATE-6, authorised for exactly this case; the binding test above keeps CASES.)
+CLAIM_CASES = [
+    row if row[0] != "archive_old_reports"
+    else ("archive_old_reports", ["clipboard_write"], None, "none", "")
+    for row in CASES
+]
 
 
-def _drive_real_gate(tmp_path, monkeypatch):
+def _drive_real_gate(tmp_path, monkeypatch, *, name=TOOL_NAME,
+                     effect_tags=tuple(EFFECT_TAGS), hosts=None):
     """Run the REAL ToolSandbox action gate on an effectful forged tool and
     return the posted card, the stamped context_extras, and the body hash of the
     implementation the gate actually read."""
@@ -77,17 +102,18 @@ def _drive_real_gate(tmp_path, monkeypatch):
     # execute_tool resolves a path relative to vault_root.parent.
     impl_dir = tmp_path.parent / "impls"
     impl_dir.mkdir(parents=True, exist_ok=True)
-    impl_file = impl_dir / f"{TOOL_NAME}.py"
+    impl_file = impl_dir / f"{name}.py"
     impl_file.write_text(BODY, encoding="utf-8")
     rel = impl_file.relative_to(tmp_path.parent)
 
     tool = Tool(
-        id=f"tool_{TOOL_NAME}",
-        name=TOOL_NAME,
+        id=f"tool_{name}",
+        name=name,
         description="test tool for the IMPL-1 host-class claim",
         tool_type=ToolType.PYTHON_FUNCTION,
         implementation_path=str(rel),
-        effect_tags=list(EFFECT_TAGS),
+        effect_tags=list(effect_tags),
+        hosts=list(hosts or []),
         version=1,
     )
 
@@ -100,67 +126,78 @@ def _drive_real_gate(tmp_path, monkeypatch):
     return captured
 
 
-def _witnessed_empty_host_sig(captured):
+def _witnessed_derived_host_sig(captured, *, name, effect_tags, signed_class):
     """THE WITNESS, as a value. Returns the signature the gate stamped, having
-    established it is the ``host_class=""`` one. Raises the assertion (never a
-    bare False) so a caller cannot read a failure as a pass."""
+    established it is the one keyed on the DERIVED host class. Raises the
+    assertion (never a bare False) so a caller cannot read a failure as a pass."""
     sig = captured["context_extras"].get("tool_signature")
     # DEC-36: pin the concrete type in this frame before operating on it, so a
     # None / stub / mock cannot make the comparisons below vacuously agreeable.
     assert type(sig) is str and sig, f"gate stamped no tool_signature: {sig!r}"
 
-    empty_host = tool_signature(TOOL_NAME, captured["body_hash"],
-                                set(EFFECT_TAGS), host_class="")
-    assert sig == empty_host, (
-        "the live gate no longer binds an EMPTY host class. If a host resolver "
-        "has landed, this is the conscious-flip moment: re-add the host-class "
-        "clause to GateDescriptor.from_tool's copy and invert the pin in "
-        "test_card_does_not_claim_a_host_class. Do not weaken this assertion.")
+    derived = tool_signature(name, captured["body_hash"], set(effect_tags),
+                             host_class=signed_class)
+    assert sig == derived, (
+        "the live gate no longer binds the DERIVED host class. If the host class "
+        "was deliberately dropped from the signature, the card's host-class claim "
+        "must come out again and test_card_claims_the_host_class_it_binds must be "
+        "inverted. Do not weaken this assertion.")
+    if signed_class:
+        # A networked tool: the binding is real, so the pre-host-check (empty
+        # class) signature must be a DIFFERENT key -- that is what makes a change
+        # of declared hosts, and an approval minted before host checks, re-gate.
+        pre_host = tool_signature(name, captured["body_hash"], set(effect_tags),
+                                  host_class="")
+        assert sig != pre_host, "a networked tool signed with an empty host class"
     return sig
 
 
-def test_production_gate_binds_an_empty_host_class(tmp_path, monkeypatch):
+@pytest.mark.parametrize("name,effect_tags,hosts,shown_class,signed_class", CASES)
+def test_production_gate_binds_the_derived_host_class(
+        tmp_path, monkeypatch, name, effect_tags, hosts, shown_class, signed_class):
     """WITNESS. The signature the operator's "Always allow" is keyed on is
-    computed with ``host_class=""`` -- so the blessing does not discriminate on
-    host, and a card that says it does is making a promise the store cannot
-    keep."""
-    captured = _drive_real_gate(tmp_path, monkeypatch)
-    sig = _witnessed_empty_host_sig(captured)
-
-    # The emptiness is a real choice, not a no-op: host_class IS load-bearing in
-    # the signature, which is exactly why claiming it while passing "" was a lie
-    # rather than a harmless simplification.
-    other_host = tool_signature(TOOL_NAME, captured["body_hash"],
-                                set(EFFECT_TAGS), host_class=OTHER_HOST)
-    assert sig != other_host, (
-        "tool_signature stopped discriminating on host_class; "
-        "tests/test_tool_signature.py::test_host_class_regate_and_default "
-        "is the primary pin for that property")
+    computed with the host class derived from the tool's declared spec -- so the
+    blessing discriminates on it, and the card may say so."""
+    captured = _drive_real_gate(tmp_path, monkeypatch, name=name,
+                                effect_tags=effect_tags, hosts=hosts)
+    _witnessed_derived_host_sig(captured, name=name, effect_tags=effect_tags,
+                                signed_class=signed_class)
+    # The parts stamped beside the signature name the class the operator sees.
+    assert captured["context_extras"]["tool_parts"]["host_class"] == shown_class
 
 
-def test_card_does_not_claim_a_host_class(tmp_path, monkeypatch):
-    """THE PIN. While the witness above holds, no part of the rendered gate card
-    may use the phrase "host class" -- the claim and the code cannot drift apart
-    again without a test going red."""
-    captured = _drive_real_gate(tmp_path, monkeypatch)
-    _witnessed_empty_host_sig(captured)      # the conditional this pin rides on
+@pytest.mark.parametrize("name,effect_tags,hosts,shown_class,signed_class",
+                         CLAIM_CASES)
+def test_card_claims_the_host_class_it_binds(
+        tmp_path, monkeypatch, name, effect_tags, hosts, shown_class, signed_class):
+    """THE PIN. While the witness above holds, the standing-allow card tells the
+    operator what the blessing binds -- body, effect set AND host class -- and
+    shows the class it is binding on a `hosts:` line."""
+    # R1: a standing-allow card exists only for an approval-band effect that is
+    # NOT irreversible. Assert both of the example itself, so a later
+    # reclassification of its tag fails HERE, by name, not as a missing option.
+    from systemu.runtime.action_governance import (ActionContext, Verdict,
+                                                   evaluate_action,
+                                                   irreversible_effects)
+    assert irreversible_effects(list(effect_tags)) == (), effect_tags
+    assert evaluate_action(ActionContext(tool=name, effect_tags=set(effect_tags)))[0] \
+        is Verdict.REQUIRE_APPROVAL, effect_tags
+
+    captured = _drive_real_gate(tmp_path, monkeypatch, name=name,
+                                effect_tags=effect_tags, hosts=hosts)
+    _witnessed_derived_host_sig(captured, name=name, effect_tags=effect_tags,
+                                signed_class=signed_class)   # the conditional
 
     card = captured["descriptor"]
     what = card.what_approve_does
     assert type(what) is str and what, f"card has no what_approve_does: {what!r}"
 
     # The card really is the standing-allow one. Without this the pin could pass
-    # vacuously on a DENY card, whose copy never mentioned a host class anyway.
+    # vacuously on a DENY card, which offers no standing allow to describe.
     assert "Always allow" in card.options, card.options
 
-    rendered = "\n".join([card.title, card.inspect, what]).lower()
-    assert "host class" not in rendered, (
-        "the gate card claims a host-class binding, but the signature it "
-        "describes was computed with host_class='' (see the witness above): "
-        f"{what!r}")
-    assert "host_class" not in rendered, rendered
-
-    # The pin must not be satisfiable by deleting the sentence. The card still
-    # has to tell the operator what the blessing DOES bind.
-    assert "tool body" in what.lower(), what
-    assert "effect set" in what.lower(), what
+    assert "tool body + effect set + host class" in what, what
+    assert "changing the hosts it may reach re-gates it" in what, what
+    assert f"\nhosts: {shown_class}" in card.inspect, card.inspect
+    # ASCII: this is the line an operator quotes back, on any console codepage.
+    "\n".join([card.title, card.inspect, what]).encode("ascii")

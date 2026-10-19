@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .layout import resolve_layout
+from .layout import literal_layout, resolve_layout
 from .metrics import FirstRunMetrics
 
 
@@ -35,22 +35,13 @@ def _layout_for(root: Optional[str]):
 
 
 def _literal_layout(base: Path):
-    from .layout import (
-        InstallLayout, ENV_DIRNAME, ENV_STAGING_DIRNAME, ENV_PREVIOUS_DIRNAME,
-        VAULT_DIRNAME, WHEELHOUSE_DIRNAME, MARKER_FILENAME,
-        UNINSTALL_NOTICE_FILENAME,
-    )
-    return InstallLayout(
-        root=base,
-        env_dir=base / ENV_DIRNAME,
-        env_staging_dir=base / ENV_STAGING_DIRNAME,
-        env_previous_dir=base / ENV_PREVIOUS_DIRNAME,
-        vault_dir=base / VAULT_DIRNAME,
-        wheelhouse_dir=base / WHEELHOUSE_DIRNAME,
-        marker_file=base / MARKER_FILENAME,
-        uninstall_notice_file=base / UNINSTALL_NOTICE_FILENAME,
-        is_windows_native=sys.platform == "win32",
-    )
+    """Thin alias for :func:`systemu.winpkg.layout.literal_layout`.
+
+    The construction used to be inlined here AND in the launcher; one shared
+    constructor means a new :class:`InstallLayout` field cannot land in one copy
+    only.
+    """
+    return literal_layout(base)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

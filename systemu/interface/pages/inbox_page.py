@@ -118,6 +118,21 @@ def _inbox_card_model(descriptor) -> Dict[str, Any]:
     else:
         affirmative = _candidates[-1] if _candidates else ""
     risk = getattr(descriptor, "risk", "low")
+    # R1 (spec section 10): a money / irreversible card is approved once, under a
+    # TYPED confirmation, and never remembered. The descriptor already carries the
+    # derived stamp (``from_decision_context`` re-derives it for a card an older
+    # build posted); the model never draws a standing option on such a card, and
+    # hands the renderer the phrase to ask for. The server re-checks regardless.
+    irrev = list(getattr(descriptor, "irreversible_effects", []) or [])
+    typed_confirm = ""
+    if irrev:
+        options = [o for o in options
+                   if not (type(o) is str and o.strip().lower() == "always allow")]
+        if affirmative and affirmative not in options:
+            affirmative = options[-1] if len(options) > 1 else ""
+        risk = "high"
+        phrase = getattr(descriptor, "confirm_phrase", "")
+        typed_confirm = phrase if type(phrase) is str else ""
     return {
         "title": getattr(descriptor, "title", ""),
         "risk": risk,
@@ -130,6 +145,10 @@ def _inbox_card_model(descriptor) -> Dict[str, Any]:
         # High-risk gates get a visually-distinct (danger-bordered) card and
         # the affirmative option styled as a danger button.
         "destructive": risk in _DESTRUCTIVE_RISKS,
+        # R1: the phrase the operator must type before "Approve once" (""
+        # for every card that needs none), and the classes that require it.
+        "typed_confirm": typed_confirm,
+        "irreversible_effects": irrev,
     }
 
 
@@ -199,11 +218,66 @@ def _resolve_and_execute_gate(dec_id: str, choice: str, vault):
     forge → LLM code generation). Running it inside the NiceGUI click handler
     starved the websocket for seconds — the operator saw a connection-lost
     overlay and a frozen screen on every approve. Pure: no UI calls here.
+
+    R1: it resolves through ``inbox.resolve_pending_gate``, which runs the
+    server-side typed-confirm check BEFORE anything is recorded -- so even a
+    card that never drew the confirmation box cannot approve a money /
+    irreversible action on a click.
     """
-    from systemu.interface.command.inbox import InboxQueue, resolve_gate
-    queue = InboxQueue(vault)._queue
-    resolved = queue.resolve(dec_id, choice=choice)
-    return resolve_gate(resolved, vault=vault)
+    return _resolve_and_execute_confirmed_gate(dec_id, choice, vault, None)
+
+
+def _resolve_and_execute_confirmed_gate(dec_id: str, choice: str, vault, typed):
+    """R1: :func:`_resolve_and_execute_gate` carrying the text the operator typed
+    in a money / irreversible card's confirmation box. The check is server-side
+    (``inbox.resolve_pending_gate``): a click without the right phrase records
+    nothing and the result says why. Pure: no UI calls here."""
+    from systemu.interface.command.inbox import resolve_pending_gate
+    return resolve_pending_gate(dec_id, choice=choice, vault=vault, typed_confirm=typed)
+
+
+# D-2 (e2e v0.10.31): the toast types this page is allowed to show for a gate
+# resolution, and the honest fallback for a result that minted none.
+_NOTICE_KINDS = frozenset({"positive", "negative", "warning", "info"})
+_KIND_BY_STATUS = {"ok": "positive", "noop": "warning",
+                   "error": "negative", "queued": "info"}
+
+
+def gate_outcome_notice(result, *, choice: str = ""):
+    """Pure: the ``(message, notify-type)`` toast for a resolved gate.
+
+    The colour is the EXECUTOR's, not this page's: ``inbox.resolve_gate`` mints
+    ``data["notice_kind"]`` beside the sentence it wrote, and this reads it. The
+    page used to hard-code ``type="positive"`` for every resolution, so a Deny —
+    which stops the task — arrived in the same green toast as an approval.
+
+    The fallback for a result that carries no kind (every non render-only gate)
+    is the result STATUS, never a blanket positive: a blanket positive is the
+    defect. ``type(kind) is str`` before the membership test — a stored value is
+    an arbitrary object and ``in`` dispatches (DEC-36).
+    """
+    summary = getattr(result, "summary", None)
+    if type(summary) is not str or not summary:
+        summary = f"Resolved: {choice}" if choice else "Resolved."
+    data = getattr(result, "data", None)
+    kind = data.get("notice_kind") if isinstance(data, dict) else None
+    if type(kind) is str and kind in _NOTICE_KINDS:
+        return summary, kind
+    status = getattr(getattr(result, "status", None), "value", None)
+    return summary, _KIND_BY_STATUS.get(status if type(status) is str else "", "positive")
+
+
+def resolve_failure_notice(exc):
+    """Pure: the ``(message, notify-type)`` toast for a click whose resolve raised.
+
+    IMPL-11: an answer to a card whose run was cancelled is not a failure - nothing
+    failed and nothing was recorded; the answer was simply not needed. It is shown
+    as the notice itself, informational. Every other exception keeps the
+    "Resolve failed: ..." negative toast."""
+    from systemu.approval.decision_queue import AnswerNotNeeded
+    if isinstance(exc, AnswerNotNeeded):
+        return str(exc), "info"
+    return f"Resolve failed: {exc}", "negative"
 
 
 def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None:
@@ -264,6 +338,30 @@ def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None
         except Exception:
             pass  # an explanation failing must never break the gate card
 
+        # R1 (spec section 10): a money / irreversible card asks the operator to
+        # TYPE the phrase that names the action before "Approve once" does
+        # anything. The box is a convenience; the check that matters is
+        # server-side (``inbox.resolve_pending_gate``), so a click that skips it
+        # records nothing and the toast says why.
+        confirm_input = None
+        if model["irreversible_effects"] and "Approve once" in model["options"]:
+            with ui.column().style("gap: 2px;"):
+                ui.label("TYPE TO CONFIRM").classes("s-field-label")
+                if model["typed_confirm"]:
+                    ui.label(
+                        f"This cannot be undone ({', '.join(model['irreversible_effects'])})"
+                        f" and cannot be remembered. Type {model['typed_confirm']} "
+                        "exactly, then choose Approve once."
+                    ).classes("s-cell").style("white-space: pre-wrap; font-size: 13px;")
+                    confirm_input = ui.input(
+                        label=f"Type {model['typed_confirm']} to confirm").classes(
+                        "s-input")
+                else:
+                    ui.label(
+                        "This card carries no confirmation phrase, so it cannot be "
+                        "approved here. Deny it and run the task again."
+                    ).classes("s-cell").style("white-space: pre-wrap; font-size: 13px;")
+
         def _resolve_with(choice: str):
             # W7.1: async handler + to_thread — the resolve chain executes the
             # approved action (LLM/pip/dry-run) and must never run on the UI
@@ -277,15 +375,25 @@ def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None
                     client = ui.context.client
                 except Exception:
                     client = None
+                # R1: read the typed phrase at CLICK time, on the event loop.
+                typed = None
+                if confirm_input is not None and choice == "Approve once":
+                    typed = confirm_input.value if type(
+                        confirm_input.value) is str else ""
                 ui.notify(f"Working on it: {choice}…", type="info")
                 try:
                     result = await asyncio.to_thread(
-                        _resolve_and_execute_gate, dec_id, choice, vault)
-                    msg = getattr(result, "summary", None) or f"Resolved: {choice}"
-                    typ = "positive"
+                        _resolve_and_execute_confirmed_gate, dec_id, choice, vault,
+                        typed)
+                    # D-2: the executor names the outcome AND its colour. The
+                    # clicked label is only the fallback for a result with no
+                    # summary — the sentence itself is minted from the RECORDED
+                    # decision, which is what the resume rail acts on.
+                    msg, typ = gate_outcome_notice(result, choice=choice)
                 except Exception as exc:
-                    logger.exception("[Inbox] resolve failed for %s", dec_id)
-                    msg, typ = f"Resolve failed: {exc}", "negative"
+                    msg, typ = resolve_failure_notice(exc)
+                    if typ == "negative":
+                        logger.exception("[Inbox] resolve failed for %s", dec_id)
                 if client is not None:
                     try:
                         with client:

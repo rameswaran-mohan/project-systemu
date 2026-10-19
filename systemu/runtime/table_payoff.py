@@ -98,29 +98,41 @@ def _get(obj: Any, field: str) -> Any:
     return getattr(obj, field, None)
 
 
-def _requirements(report: Any) -> List[Any]:
-    """Flatten a RequirementReport (or a bare list) into one requirement list.
+def _requirements_keyed(report: Any) -> List[tuple]:
+    """THE projection: ``[(objective_id, requirement), ...]`` over a RequirementReport
+    (or a bare list, whose rows carry objective ``None``).
 
     Deliberately reads ``per_objective`` and NOT ``ask_bundle``: the bundle is a
     deduped SUBSET, so counting it would silently drop every silent bind — i.e.
     exactly the numerator the metric exists to measure. Never raises.
+
+    :func:`_requirements` is this list with the key dropped. It is kept as ONE
+    projection with two views (rather than a second flatten in the per-run record
+    writer, which needs the objective id) for the reason the ``_is_ask`` note below
+    gives: two copies of a projection drift silently and keep rendering.
     """
     try:
         if report is None:
             return []
         if isinstance(report, list):
-            return [r for r in report if r is not None]
+            return [(None, r) for r in report if r is not None]
         per = _get(report, "per_objective")
         if isinstance(per, dict):
-            out: List[Any] = []
-            for rows in per.values():
+            out: List[tuple] = []
+            for oid, rows in per.items():
                 if isinstance(rows, list):
-                    out.extend(r for r in rows if r is not None)
+                    out.extend((oid, r) for r in rows if r is not None)
             return out
         return []
     except Exception:
         logger.debug("[table_payoff] requirement flatten failed", exc_info=True)
         return []
+
+
+def _requirements(report: Any) -> List[Any]:
+    """Flatten a RequirementReport (or a bare list) into one requirement list —
+    :func:`_requirements_keyed` without the objective key. Never raises."""
+    return [r for _oid, r in _requirements_keyed(report)]
 
 
 # ── the ask predicate: ONE implementation, not two ──────────────────────────
@@ -151,6 +163,25 @@ def table_backed(report: Any) -> List[Any]:
     """Every requirement the operator's table supplied (carries a table_item_id)."""
     return [r for r in _requirements(report)
             if isinstance(_get(r, "table_item_id"), str) and _get(r, "table_item_id")]
+
+
+def table_backed_keyed(report: Any) -> List[tuple]:
+    """:func:`table_backed` with each requirement's objective id: ``[(oid, req)]``.
+
+    The per-run record (``table_payoff_record``) keys a supplied requirement by
+    objective as well as by schema path, so two objectives that both draw the same
+    leaf from the same item stay two facts."""
+    return [(oid, r) for oid, r in _requirements_keyed(report)
+            if isinstance(_get(r, "table_item_id"), str) and _get(r, "table_item_id")]
+
+
+def bound_as(req: Any) -> str:
+    """How a table-supplied requirement bound: ``"silent"`` or ``"prefilled_confirm"``.
+
+    Read off THE ask predicate (the binder's own ``_needs_ask``, imported above), never
+    a local rule. Under the IMPL-5 clamp every table bind asks, so ``"silent"`` is the
+    DEC-25 tripwire reading, not a payoff."""
+    return "prefilled_confirm" if _needs_ask(req) else "silent"
 
 
 # ── §10 inventory-hit metric ────────────────────────────────────────────────
@@ -255,44 +286,6 @@ def clamp_tripwire(report: Any) -> Dict[str, Any]:
         logger.debug("[table_payoff] clamp_tripwire failed", exc_info=True)
         return {"table_silent": None, "evaluated": False, "fired": False,
                 "message": "table-clamp tripwire NOT EVALUATED (error)"}
-
-
-def format_inventory_hit(rep: Dict[str, Any]) -> List[str]:
-    """Human-readable metric lines (the §10 'trend, reported' surface).
-
-    The DEC-25 tripwire line is emitted FIRST and BEFORE the "nothing supplied"
-    early return. A clamp regression implies ``supplied > 0`` today, so the ordering
-    is not load-bearing for the current shape — but an alarm that renders only after
-    a payoff precondition passes is an alarm with a mute switch attached to unrelated
-    state, and this one must not have one.
-    """
-    lines: List[str] = []
-    try:
-        if isinstance(rep, dict) and "table_silent" in rep:
-            n = rep["table_silent"]
-            if isinstance(n, int) and n > 0:
-                lines.append(
-                    f"  !! CLAMP REGRESSION -- table-sourced silent binds: {n} "
-                    f"(healthy is 0; this is a SECURITY regression, not payoff)"
-                )
-            elif n is None:
-                # present-but-None = inventory_hit_report's error path. Distinct from
-                # a healthy 0, and must not render as one.
-                lines.append("  ?? table-clamp tripwire NOT EVALUATED")
-
-        if not isinstance(rep, dict) or not rep.get("supplied"):
-            return lines + ["Inventory-hit: no requirements were supplied by the inventory."]
-        return lines + [
-            f"Inventory-hit rate: {rep.get('rate', 0.0):.0%} "
-            f"({rep.get('avoided_gap', 0)}/{rep.get('supplied', 0)} supplied "
-            f"requirements avoided a from-scratch gap)",
-            f"  bound with no ask: {rep.get('silent', 0)}; "
-            f"pre-filled one-click confirm: {rep.get('prefilled_confirm', 0)}",
-            f"  from your table: {rep.get('table_avoided_gap', 0)} of "
-            f"{rep.get('table_supplied', 0)}",
-        ]
-    except Exception:
-        return lines + ["Inventory-hit: unavailable."]
 
 
 # ── §5.10.c the during-task chip row ────────────────────────────────────────
@@ -433,3 +426,196 @@ def answered_from_table(report: Any, vault=None, *,
     except Exception:
         logger.debug("[table_payoff] answered_from_table failed", exc_info=True)
         return {"count": 0, "chip": None, "suppressed": False}
+
+
+# ── §5.10.c the chips, rendered from the DURABLE per-run record ──────────────
+# The two builders above had ZERO production callers: the mechanism existed and the
+# operator never saw "answered from your table". ``run_chip_model`` is the one model
+# every surface renders (the Work run card, the workflow detail page, the chat task
+# card), and it is built ON those builders -- never beside them -- so a change to
+# either shows everywhere. Its input is a ``table_payoff_record.RunRecord``: the
+# durable record survives resume and run end, which a RequirementReport held on the
+# run's context does not.
+#
+# NOVELTY: the model hands ``answered_from_table`` NO vault, so rendering can never
+# advance (burn) the novelty ledger on a page refresh -- and, consequently, the
+# novelty gate does not suppress these chips. Advancing it needs a once-per-run
+# completion writer, which nothing here owns.
+
+USING_PREFIX = "Using from your table: "
+ANSWERED_PREFIX = "Answered from your table: "
+
+#: Longest item name a chip will show (operator-curated labels can be long).
+MAX_CHIP_NAME = 60
+
+_CHIP_TOOLTIP = ("Filled from an item on your table instead of being asked for "
+                 "from scratch.")
+
+
+def _ascii_text(text: Any, cap: int = MAX_CHIP_NAME) -> str:
+    """An operator label rendered ASCII-only: accents folded (NFKD), anything else
+    escaped (``backslashreplace``, the chat card's convention), control characters
+    blanked, then capped."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(text or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = "".join(ch if ch.isprintable() else " " for ch in s).strip()
+    s = s.encode("ascii", "backslashreplace").decode("ascii")
+    return s if len(s) <= cap else s[: max(0, cap - 3)] + "..."
+
+
+def run_chip_model(record: Any, *, in_flight: bool) -> Optional[Dict[str, Any]]:
+    """The chip a run card shows for what the operator's table supplied, or None.
+
+    In flight -> ``{"mode": "using", "labels": ["Using from your table: <item>", ...],
+    "count", "tooltip"}``: one chip per ITEM (deduped by ``using_from_table``), capped
+    at :data:`MAX_USING_CHIPS`, the remainder as ONE ``"+N more from your table"`` chip
+    -- never dropped.
+
+    Ended -> ``{"mode": "answered", "label": "Answered from your table: N", "items":
+    [names], "count", "tooltip"}``. N is ``answered_from_table``'s RAW count.
+
+    None when there is no record or the table supplied nothing (a consult with no hit
+    is not a payoff and earns no chip). Every string is ASCII. Never raises.
+    """
+    try:
+        rows = list(getattr(record, "supplied", None) or [])
+        if not rows:
+            return None
+        items = list(getattr(record, "items", None) or [])
+        answered = answered_from_table(rows, None)
+        count = answered.get("count") if isinstance(answered, dict) else None
+        if type(count) is not int or count <= 0:
+            return None
+        if in_flight:
+            using = using_from_table(rows, items)
+            labels = [USING_PREFIX + _ascii_text(c.get("name") or c.get("id"))
+                      for c in (using.get("chips") or [])]
+            overflow = using.get("overflow")
+            if type(overflow) is int and overflow > 0:
+                labels.append(f"+{overflow} more from your table")
+            return {"mode": "using", "labels": labels, "count": count,
+                    "tooltip": _CHIP_TOOLTIP}
+        names = [_ascii_text(i.get("name") or i.get("id")) for i in items]
+        return {"mode": "answered", "label": f"{ANSWERED_PREFIX}{count}",
+                "items": names, "count": count, "tooltip": _CHIP_TOOLTIP}
+    except Exception:
+        logger.debug("[table_payoff] run_chip_model failed", exc_info=True)
+        return None
+
+
+# ── §10 inventory-hit over the DURABLE per-run record (DEC-27) ───────────────
+# ``inventory_hit_report`` above measures one RequirementReport; its live caller is the
+# runtime ``clamp_tripwire``. Its old CLI input -- the report cached in each run's
+# resume snapshot -- was deleted when a resume consumed it, so the population it saw
+# shrank over time; that CLI block (and its formatter) is retired. These two read the
+# durable record instead (``table_payoff_record.scan_records``): the DENOMINATOR is
+# the set of runs that consulted the table, witnessed by the same file that carries
+# the numerator.
+
+RECORD_HIT_HEAD = "Inventory-hit (table record): "
+
+
+def record_inventory_hit_report(scan: Any) -> Dict[str, Any]:
+    """The run-level inventory-hit metric over a ``table_payoff_record.RecordScan``.
+
+    ``runs_consulted`` -- runs whose binder had the table on hand (the denominator).
+    ``runs_hit`` -- of those, runs where the table supplied at least one requirement.
+    ``rate`` -- ``runs_hit / runs_consulted``, or **None** when nothing was consulted
+    (an unmeasured population has no rate; it is never ``0.0``).
+    ``supplied`` / ``prefilled_confirm`` / ``silent`` -- requirement counts, the split
+    kept apart (``silent`` is the DEC-25 tripwire: healthy is zero).
+    ``unreadable`` / ``error`` / ``rows_skipped`` -- the witnessed gaps, carried through
+    so the formatter can say the population is partial instead of shrinking it.
+    ``tripwire_evaluated`` -- True ONLY when every run record was read (none unreadable,
+    the directory listed). ``silent`` is then a statement about the whole population;
+    otherwise it covers the readable records only, and a silent table bind may sit in
+    exactly the file that could not be read, so its zero is NOT a healthy reading
+    (DEC-25 + DEC-27: a fail-closed claim must be witnessed, never inferred)."""
+    from systemu.runtime.table_payoff_record import RunRecord
+    records = [r for r in (getattr(scan, "records", ()) or ()) if type(r) is RunRecord]
+    consulted = [r for r in records if r.consulted]
+    hit = [r for r in consulted if r.supplied]
+    supplied = sum(len(r.supplied) for r in consulted)
+    silent = sum(r.silent for r in consulted)
+    unreadable = getattr(scan, "unreadable", 0)
+    unreadable = unreadable if type(unreadable) is int else 0
+    error = getattr(scan, "error", None)
+    return {
+        "searched": str(getattr(scan, "searched", "") or ""),
+        "records": len(records),
+        "runs_consulted": len(consulted),
+        "runs_hit": len(hit),
+        "rate": (len(hit) / len(consulted)) if consulted else None,
+        "supplied": supplied,
+        "prefilled_confirm": supplied - silent,
+        "silent": silent,
+        "unreadable": unreadable,
+        "rows_skipped": sum(r.rows_skipped for r in records),
+        "error": error,
+        "measured": bool(consulted),
+        "tripwire_evaluated": unreadable == 0 and not error,
+    }
+
+
+def format_record_inventory_hit(rep: Dict[str, Any]) -> List[str]:
+    """ASCII lines for :func:`record_inventory_hit_report`.
+
+    The DEC-25 alarm renders FIRST and before any "not measured" return: an alarm
+    that renders only after a payoff precondition passes is an alarm with a mute switch
+    attached to unrelated state, and this one must not have one. Not measured is said in words,
+    with the directory that was searched, and is never a 0%. "Could not read / could
+    not list" is a different claim from "nothing there", and is worded as such."""
+    return [ln.encode("ascii", "backslashreplace").decode("ascii")
+            for ln in _record_hit_lines(rep)]
+
+
+def _record_hit_lines(rep: Dict[str, Any]) -> List[str]:
+    head = RECORD_HIT_HEAD
+    lines: List[str] = []
+    try:
+        if not isinstance(rep, dict):
+            return [head + "unavailable."]
+        silent = rep.get("silent")
+        if type(silent) is int and silent > 0:
+            lines.append(f"  !! CLAMP REGRESSION -- table-sourced silent binds: {silent} "
+                         f"(healthy is 0; this is a SECURITY regression, not payoff)")
+        searched = str(rep.get("searched") or "")
+        unreadable = rep.get("unreadable") or 0
+        if rep.get("error"):
+            return lines + [
+                f"{head}NOT MEASURED -- the record directory could not be listed "
+                f"({rep['error']}); NO RATE (this is NOT 0%)",
+                f"  (searched: {searched})"]
+        if not rep.get("measured"):
+            why = (f"{unreadable} run record(s) could not be read" if unreadable
+                   else "no run has consulted your table in the durable record")
+            return lines + [f"{head}NOT MEASURED -- {why}; NO RATE (this is NOT 0%)",
+                            f"  (searched: {searched})"]
+        # The tripwire may call itself healthy ONLY over a fully-read population. With
+        # any record unread, its zero covers the readable records and nothing more --
+        # say so, and never print the bare healthy-looking reading (fail closed: the
+        # healthy wording needs a positive witness, not the absence of a gap).
+        n_silent = rep.get("silent", 0)
+        if rep.get("tripwire_evaluated") is True:
+            silent_part = f"silent: {n_silent} (healthy is 0)"
+        elif unreadable:
+            silent_part = (f"silent: {n_silent} among readable records; "
+                           f"NOT EVALUATED for {unreadable} unreadable")
+        else:
+            silent_part = f"silent: {n_silent} (tripwire NOT EVALUATED)"
+        lines += [
+            f"{head}{rep['rate']:.0%} of runs ({rep['runs_hit']}/{rep['runs_consulted']} "
+            f"runs that had your table on hand had it answer at least one requirement)",
+            f"  requirements answered from your table: {rep.get('supplied', 0)} -- "
+            f"pre-filled one-click confirm: {rep.get('prefilled_confirm', 0)}; "
+            f"{silent_part}",
+            f"  (read: {searched}; {rep.get('records', 0)} run records, {unreadable} "
+            f"unreadable, {rep.get('rows_skipped', 0)} malformed rows skipped)",
+        ]
+        if unreadable:
+            lines.append(f"  !! {unreadable} run record(s) could not be read -- the rate "
+                         f"above EXCLUDES them (partial population)")
+        return lines
+    except Exception:
+        return lines + [head + "unavailable."]

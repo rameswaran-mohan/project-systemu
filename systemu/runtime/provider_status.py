@@ -157,11 +157,138 @@ class ProviderStatus:
     rule: str
     state: str
     detail: str
+    #: e2e31. "" unless this provider is unusable for a reason OTHER than a
+    #: missing credential -- today, an SDK this interpreter cannot import --
+    #: in which case it is that operator sentence, remedy included.
+    #:
+    #: WHY A FIELD AND NOT A SUBSTRING OF ``detail``. ``state`` is ``missing``
+    #: for two different machines now: nobody configured this provider, and
+    #: somebody configured it and it still cannot be built. Surfaces have to
+    #: tell those apart -- /welcome must not tell an operator to add a key they
+    #: already added, and must not lecture an operator with NO keys about an
+    #: SDK for a provider they never chose. A consumer that told them apart by
+    #: matching on the wording of ``detail`` would be deriving a decision from
+    #: a string the mint is free to reword (DEC-34); the discriminator rides
+    #: the VALUE instead. Defaulted, so the two out-of-module constructions
+    #: (settings, first_run) keep working unchanged.
+    blocker: str = ""
 
     @property
     def satisfied(self) -> bool:
-        """Has the thing that makes this provider usable been OBSERVED?"""
+        """Has the thing that makes this provider usable been OBSERVED?
+
+        A BLOCKER OUTRANKS THE STATE. ``satisfied`` is a derived property
+        precisely so a caller cannot assert a capability the fields do not
+        support, and ``blocker`` is now a second thing that decides usability --
+        so a status carrying one is NOT satisfied whatever its state says. That
+        combination is not hostile input, it is the honest-code accident this
+        shape exists to make impossible: a future surface that sets one field
+        and forgets the other. A blocker whose type is not ``str`` is not
+        something this module can vouch for either, and fails closed the same
+        way (DEC-36: pin the concrete type in the frame that decides).
+        """
+        blocker = self.blocker
+        if type(blocker) is not str or blocker:
+            return False
         return self.state in SATISFIED_STATES
+
+
+# ── the SDK witness for a KEY-BASED provider (e2e31) ────────────────────────
+#
+# A credential is not usability. ``AnthropicProvider`` imports its SDK inside
+# ``__init__``, so on an install with ANTHROPIC_API_KEY set and no ``anthropic``
+# package this table said "set", /welcome said "Provider ready: Anthropic", the
+# onboarding checklist admitted the machine, the health banner stayed silent --
+# and the first real call raised ``ModuleNotFoundError``. The registry's
+# ``try: from .anthropic import ...`` guard could never fire, so nothing in the
+# tree had ever actually ASKED (DEC-27: fail-closed completeness must be
+# WITNESSED, never inferred).
+#
+# The witness lives in ``systemu.llm.providers`` -- the same module that
+# decides which class serves a model -- and crosses this boundary as a VALUE,
+# never a raise (DEC-32). The import is deferred for the reason
+# ``routed_provider``'s is: this module is loaded by the CLI, the boot gate and
+# every dashboard render, while the provider package pulls in the OpenAI SDK.
+# It is reached ONLY for a provider whose credential is already present, so a
+# machine with no key pays nothing.
+
+#: The lead of the detail a blocked provider carries. Operator-facing, ASCII.
+_SDK_BLOCKED_LEAD = "SDK not installed"
+
+
+def sdk_blocker(spec: ProviderSpec) -> str:
+    """Empty when this provider can really be CONSTRUCTED here; the operator
+    sentence, remedy included, when it cannot.
+
+    Four of the five providers need no optional SDK -- three ride the core
+    ``openai`` client and one is core ``httpx`` -- and for them this is "" at
+    the cost of one dict lookup. Asking about them would refuse providers that
+    work, which is the mirror of the defect this closes.
+
+    FAILS CLOSED and NEVER RAISES. A registry we cannot import, an answer whose
+    concrete type is not what it should be, a probe that blew up: each of those
+    is "we could not establish that this works", and this module's whole rule is
+    that such an answer withholds the claim rather than making one.
+    """
+    def _ascii(text: str) -> str:
+        return text.encode("ascii", "backslashreplace").decode("ascii")
+
+    # FAIL CLOSED ON AN ID WE CANNOT READ. This used to normalise with
+    # ``spec.provider if type(spec.provider) is str else ""`` -- and "" then
+    # looked up as "this provider needs no SDK", i.e. SATISFIED. So a spec built
+    # with a ``str`` SUBCLASS (which `type(x) is str` correctly refuses to
+    # operate on, DEC-36) walked straight through the gate. A gate that cannot
+    # read its own input must refuse, not wave through.
+    if type(spec.provider) is not str or not spec.provider.strip():
+        return _ascii("provider id unusable - this row cannot be checked for "
+                      "the SDK its client needs, so it is not usable here")
+    provider = spec.provider
+    display = spec.display if type(spec.display) is str else provider
+    env = spec.env if type(spec.env) is str else ""
+
+    try:
+        from systemu.llm import providers as _providers
+    except Exception:
+        # Nothing can construct ANY provider on this install; "not usable" is
+        # simply true, and it must be a value rather than a traceback out of a
+        # render path.
+        return _ascii("provider stack unavailable - the SDK registry "
+                      "(systemu.llm.providers) could not be imported, so no "
+                      f"{display} client can be built here")
+
+    try:
+        package = _providers.sdk_package(provider)
+    except Exception:
+        package = None
+    if type(package) is not str:
+        return _ascii(f"{_SDK_BLOCKED_LEAD} - the provider registry gave no "
+                      f"usable answer about the {display} SDK")
+    if not package:
+        return ""                      # needs no optional SDK: nothing to miss
+
+    try:
+        importable = _providers.sdk_importable(provider)
+    except Exception:
+        importable = None
+    if type(importable) is bool and importable:
+        return ""
+
+    remedy = ""
+    try:
+        from systemu.runtime import optional_deps as _od
+        cmd = _od.install_command((package,))
+        remedy = cmd if type(cmd) is str else ""
+    except Exception:
+        remedy = ""
+    # THE REMEDY IS THE REGISTRY'S OWN. `optional_deps` is the one place that
+    # knows which extra ships which package and the one place that shell-quotes
+    # the extras token; writing `pip install ...` here would be a second copy
+    # that drifts, and an unquoted one is a line zsh refuses outright (F22).
+    if not remedy:
+        remedy = f"the `{package}` package provides it"
+    lead = (f"{env} is set but the {display} SDK is missing" if env
+            else f"the {display} SDK is missing")
+    return _ascii(f"{_SDK_BLOCKED_LEAD} - {lead}; {remedy}")
 
 
 # ── the witness for the keyless provider ────────────────────────────────────
@@ -262,12 +389,21 @@ def provider_status(spec: ProviderSpec, config, *,
         raw = ""
     value = raw.strip() if type(raw) is str else ""
 
-    def _mk(state: str, detail: str) -> ProviderStatus:
+    def _mk(state: str, detail: str, blocker: str = "") -> ProviderStatus:
         return ProviderStatus(spec.provider, spec.display, spec.env, spec.rule,
-                              state, detail)
+                              state, detail, blocker)
 
     if spec.rule == RULE_CREDENTIAL:
         if value:
+            # e2e31: the credential is necessary, not sufficient. A provider
+            # whose SDK this interpreter cannot import is UNSATISFIED however
+            # good the key is -- and the detail carries the remedy, because a
+            # refusal with no way out is the other half of the same defect.
+            # ORDER MATTERS: an operator with NO key is told to add the key,
+            # never to pip-install an SDK for a provider they never configured.
+            blocked = sdk_blocker(spec)
+            if blocked:
+                return _mk(STATE_MISSING, blocked, blocked)
             return _mk(STATE_SET, f"{spec.env} is set in .env")
         return _mk(STATE_MISSING, f"not set - add {spec.env} to .env")
 
@@ -550,8 +686,15 @@ def configure_hint(statuses: Dict[str, ProviderStatus]) -> str:
 
 def status_line(st: ProviderStatus) -> str:
     """One ASCII operator-facing line for a provider. Never prints a value."""
+    # e2e31: the mark is keyed on the STATE, and `missing` now covers two
+    # different machines -- no credential, and a credential whose SDK cannot be
+    # imported. "not set" beside a detail that reads "ANTHROPIC_API_KEY is set
+    # but the Anthropic SDK is missing" is a self-contradicting line in the
+    # operator's log, so the mark says what is true of both: not usable. The
+    # DETAIL still says which, and for the unconfigured provider it is still
+    # the words "not set - add <ENV> to .env".
     mark = {STATE_SET: "OK   set",
-            STATE_MISSING: "--   not set",
+            STATE_MISSING: "--   not usable",
             STATE_REACHABLE: "OK   reachable",
             STATE_UNREACHABLE: "--   not reachable",
             STATE_UNKNOWN: "?    unknown"}.get(st.state, "?    unknown")

@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from systemu.runtime.mcp.sdk import transports
 from systemu.runtime.mcp.sdk.schema_map import (
-    mcp_schema_to_parameters, _extract_annotations,
+    mcp_schema_to_parameters, _extract_annotations, wire_field,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,21 +80,20 @@ def _ssrf_precheck(spec: Dict[str, Any],
 def _normalise_tool(t: Any) -> Dict[str, Any]:
     """SDK Tool object -> plain dict (mapped schema + annotations).
 
-    Field names match the confirmed surface (mcp==1.26.0: inputSchema,
-    annotations.readOnlyHint/destructiveHint)."""
-    input_schema = getattr(t, "inputSchema", None)
-    if input_schema is None:
-        input_schema = getattr(t, "input_schema", None)
+    Fields are read by their WIRE names through ``wire_field`` so the same code
+    reads an mcp 1.x model (``inputSchema``, ``annotations.readOnlyHint``) and
+    an mcp 2.x model (``input_schema``, ``annotations.read_only_hint``)."""
+    input_schema = wire_field(t, "inputSchema")
     # v0.9.38 (review LOW): tolerate BOTH SDK-object and dict-shaped annotations
     # via the shared extractor. The live SDK hands a Pydantic object, but a
     # dict-shaped annotations (HTTP-JSON / tests) previously yielded {} because
     # this used getattr-only — silently dropping readOnlyHint mis-tiers a
     # read-only tool as an action tool. _extract_annotations handles both shapes
     # and uses the single _ANNOTATION_KEYS source of truth.
-    annotations: Dict[str, Any] = _extract_annotations(getattr(t, "annotations", None))
+    annotations: Dict[str, Any] = _extract_annotations(wire_field(t, "annotations"))
     return {
-        "name": str(getattr(t, "name", "") or ""),
-        "description": str(getattr(t, "description", "") or ""),
+        "name": str(wire_field(t, "name", "") or ""),
+        "description": str(wire_field(t, "description", "") or ""),
         "parameters_schema": mcp_schema_to_parameters(
             dict(input_schema) if isinstance(input_schema, dict) else input_schema),
         "annotations": annotations,
@@ -102,12 +101,16 @@ def _normalise_tool(t: Any) -> Dict[str, Any]:
 
 
 def _result_to_envelope(result: Any) -> Dict[str, Any]:
-    """SDK call result -> {"success", "response"} / {"success": False, "error"}."""
-    is_error = bool(getattr(result, "isError", False))
+    """SDK call result -> {"success", "response"} / {"success": False, "error"}.
+
+    D-MCP2: read by WIRE name (``wire_field``). On mcp 2.x the attributes are
+    ``is_error`` / ``structured_content``; a getattr on ``isError`` there is
+    always False, which reported every failed tool call as a success."""
+    is_error = bool(wire_field(result, "isError", False))
     parts: List[str] = []
-    structured = getattr(result, "structuredContent", None)
-    for p in (getattr(result, "content", None) or []):
-        txt = getattr(p, "text", None)
+    structured = wire_field(result, "structuredContent")
+    for p in (wire_field(result, "content") or []):
+        txt = wire_field(p, "text")
         if txt is not None:
             parts.append(str(txt))
     body: Any = structured if structured is not None else {"content": parts}

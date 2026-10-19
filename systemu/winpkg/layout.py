@@ -18,6 +18,7 @@ logic that one refactor could get wrong.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -69,6 +70,33 @@ class InstallLayout:
                 continue
             return False   # vault sits INSIDE an env dir -> deleting the env eats it
         return True
+
+
+def literal_layout(root: os.PathLike | str) -> InstallLayout:
+    """Build a layout whose root is taken LITERALLY, with no ``systemu`` suffix.
+
+    :func:`resolve_layout` appends a ``systemu`` component to the base it is
+    given, which is right for ``%LOCALAPPDATA%`` and wrong for a caller that
+    already knows the install root — Inno's ``{app}`` IS
+    ``%LOCALAPPDATA%\\systemu``, and appending again would put the marker file
+    somewhere the uninstaller never looks.
+
+    One constructor, used by both entry points that know their own root (the
+    installer CLI and the launcher). Two copies would drift the first time a
+    field is added to :class:`InstallLayout`.
+    """
+    root = Path(root)
+    return InstallLayout(
+        root=root,
+        env_dir=root / ENV_DIRNAME,
+        env_staging_dir=root / ENV_STAGING_DIRNAME,
+        env_previous_dir=root / ENV_PREVIOUS_DIRNAME,
+        vault_dir=root / VAULT_DIRNAME,
+        wheelhouse_dir=root / WHEELHOUSE_DIRNAME,
+        marker_file=root / MARKER_FILENAME,
+        uninstall_notice_file=root / UNINSTALL_NOTICE_FILENAME,
+        is_windows_native=sys.platform == "win32",
+    )
 
 
 def resolve_layout(

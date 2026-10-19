@@ -183,7 +183,19 @@ body, html {{ background: radial-gradient(1200px 600px at 78% -8%, #191d33 0%, v
 .s-btn--ghost, .s-btn--ghost .q-btn__content {{ color: var(--color-text) !important; }}
 .q-card {{ box-shadow: none !important; }}
 .q-field--outlined .q-field__control {{ border-radius: var(--radius-sm); }}
-.q-menu {{ border: 1px solid var(--color-border); box-shadow: 0 10px 30px rgba(0,0,0,.5) !important; }}
+/* Popup menus -- every select dropdown and context menu. THE FILL IS OURS.
+   This rule used to declare the chrome (a token border, a custom shadow) and
+   nothing else, leaving the SURFACE to whatever the Quasar theme layer beneath
+   happened to supply, while `body, html` above already forces
+   `color: var(--color-text)` -- which the menu inherits, because Quasar
+   teleports it to a bare div under <body> where no page container can reach it.
+   Measured against this stylesheet: with Quasar's `q-dark` class the fill came
+   out rgb(29,29,29); without it (light mode, an `options-dark` select, or any
+   change to the classes QMenu emits) rgb(255,255,255) under inherited
+   rgb(233,235,245) -- our near-white option text on white. Owning half a
+   surface leaves the other half to a third party, so both halves are declared
+   here, in tokens, opaquely. */
+.q-menu {{ background: var(--color-surface) !important; color: var(--color-text); border: 1px solid var(--color-border); box-shadow: 0 10px 30px rgba(0,0,0,.5) !important; }}
 {_legacy_compat_css()}"""
 
 

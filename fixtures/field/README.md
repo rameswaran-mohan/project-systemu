@@ -36,13 +36,24 @@ authoritative; read them, not prose here:
    `rate` are *derived* — never stored — so no failure path can emit a healthy
    `0.0`.
 
+## The shipped copy
+
+This directory is not package data, so on its own it never reaches a wheel. The
+wheel carries a **byte-identical mirror** at `systemu/fixtures/field/` (declared
+in `pyproject.toml` `[tool.setuptools.package-data]` and found at runtime with
+`importlib.resources`), which is what `systemu debug resolver-replay` reads after
+`pip install`. A source checkout keeps replaying this directory.
+`tests/test_resolver_replay_ships_its_corpus.py` fails on any difference between
+the two, so every change here is copied there in the same commit.
+
 ## Adding a scenario
 
 1. Write the JSON (minimal — one behaviour per scenario). Derive the `label` from
    the spec/AC intent, **not** from running the harness.
 2. Add its filename to `roster.json`.
-3. Run `python -m pytest tests/test_ra135_resolver_replay.py -q`.
-4. If your label disagrees with the replay (`mislabelled` is non-empty),
+3. Copy the changed `*.json` files to `systemu/fixtures/field/`.
+4. Run `python -m pytest tests/test_ra135_resolver_replay.py tests/test_resolver_replay_ships_its_corpus.py -q`.
+5. If your label disagrees with the replay (`mislabelled` is non-empty),
    investigate which side is wrong before touching either — that disagreement is
    the corpus's entire value as a tripwire.
 

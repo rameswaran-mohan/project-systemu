@@ -32,6 +32,122 @@ ACTIVE_CHAT_STATUSES = frozenset({
 # it (the operator still needs to know the run behind it is gone).
 GATE_CANCELLED_NOTE = "task was cancelled"
 
+# ── D-5 (e2e v0.10.31): why a chat task failed, and what to do about it ───────
+#
+# WITNESSED: a FAILED card carried the prompt, the timestamp, a red badge and a
+# restart button. The reason ("the tiers point at providers with no key") lived
+# only in the COLLAPSED Live-events pane, so the one affordance the card DID
+# offer -- restart -- was the one action guaranteed to fail again.
+#
+# Both spellings occur: ``direct_task`` writes "failed" for an extraction /
+# decision crash, a ShadowRuntime result status is "failure".
+FAILED_CHAT_STATUSES = frozenset({"failed", "failure"})
+
+FAILURE_STEP_PROVIDER = "Set a provider key in Settings."
+FAILURE_STEP_TOOL = "Enable the tool in the Tools Registry."
+FAILURE_STEP_UNKNOWN = "See Live events for details."
+
+# Matched against the LOWERCASED reason, provider first: an LLM-layer failure
+# routinely mentions a tool (the schema it was serializing), while a tool
+# failure does not mention a tier or a key. Deliberately NARROW -- an
+# unrecognized reason gets the honest pointer, never a guessed remedy.
+_PROVIDER_MARKERS = ("provider", "api key", "api_key", "no key", "tier=",
+                     "llm call failed")
+_TOOL_MARKERS = ("tool", "not enabled", "tools registry")
+
+# The row fields that name this task to an event. ``ts`` is the chat submission
+# id the lanes stamp as ``chat_submission_id``.
+_TASK_ID_KEYS = ("ts", "execution_id", "activity_id", "shadow_id",
+                 "submission_id", "scroll_id")
+
+
+def _task_ids(entry: Dict[str, Any]) -> set:
+    """Every id by which an event could name this chat task. Concrete types are
+    pinned before use (DEC-36) -- these values came off disk."""
+    out = set()
+    for key in _TASK_ID_KEYS:
+        value = entry.get(key)
+        if type(value) is str and value:
+            out.add(value)
+    return out
+
+
+def _event_names_task(event: Any, ids: set) -> bool:
+    if not isinstance(event, dict):
+        return False
+    context = event.get("context")
+    if not isinstance(context, dict):
+        return False
+    for value in context.values():
+        if type(value) is str and value in ids:
+            return True
+    return False
+
+
+def failure_reason(entry: Dict[str, Any], *, events: Any = None) -> str:
+    """The recorded reason this chat task FAILED, or "" when none was recorded.
+
+    Two sources, terminal record FIRST:
+
+      * the row's own ``error`` -- every lane that fails a chat task writes it
+        (``direct_task``, ``activity_completion``, ``subagent_fleet``);
+      * failing that, the last ERROR-level event that NAMES this task, which is
+        exactly what the operator had to open the Live-events pane to read.
+
+    An event is only borrowed when one of its context values IS one of this
+    row's ids: "the newest ERROR on screen" would happily attribute a stranger's
+    failure to this card. ``events`` defaults to the in-process EventBus ring
+    buffer (the pane's own source) and is the test seam.
+
+    Never raises: an unreadable row or event stream reports NO reason, which the
+    card renders as the Live-events pointer. It never invents one.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    recorded = entry.get("error")
+    if type(recorded) is str and recorded.strip():
+        return recorded.strip()
+    if events is None:
+        try:
+            from systemu.interface.event_bus import EventBus
+            events = EventBus.get().get_buffer()
+        except Exception:
+            logger.debug("[ChatTaskRegistry] no event buffer to read", exc_info=True)
+            return ""
+    ids = _task_ids(entry)
+    if not ids:
+        return ""
+    found = ""
+    try:
+        for event in list(events or []):
+            if not _event_names_task(event, ids):
+                continue
+            level = event.get("level")
+            if type(level) is not str or level.upper() != "ERROR":
+                continue
+            message = event.get("message")
+            if type(message) is str and message.strip():
+                found = message.strip()
+    except Exception:
+        logger.debug("[ChatTaskRegistry] unreadable event stream", exc_info=True)
+        return ""
+    return found
+
+
+def failure_next_step(reason: Any) -> str:
+    """The ONE next step a failure reason earns. ASCII; never empty.
+
+    An unrecognized reason resolves to the Live-events pointer rather than to a
+    plausible-sounding remedy: sending an operator to Settings for a failure
+    Settings cannot fix is the same class of false statement this defect is."""
+    text = reason.lower() if type(reason) is str else ""
+    if any(marker in text for marker in _PROVIDER_MARKERS):
+        return FAILURE_STEP_PROVIDER
+    if any(marker in text for marker in _TOOL_MARKERS):
+        return FAILURE_STEP_TOOL
+    return FAILURE_STEP_UNKNOWN
+
+
 _CANCEL_SUMMARY = "Stopped by operator"
 
 
@@ -173,27 +289,37 @@ def task_title(entry: Dict[str, Any], *, cap: int = 60) -> str:
 
 
 def _withdraw_gate(vault: Any, entry: Dict[str, Any], queue: Any) -> tuple:
-    """Retire the pending operator decision a cancelled run is parked on.
+    """Retire every pending decision card of the cancelled chat run.
 
-    Uses the decision queue's EXISTING public retirement API
-    (``expire_by_dedup_key``) — nothing in ``inbox.py`` / ``gate.py`` is touched.
-    Returns ``(withdrawn, note)``; when the card cannot be retired the note is
-    what the UI shows beside it so the operator is not left with a live-looking
-    gate for a run that no longer exists.
+    IMPL-11: routes through the ONE queue function every cancel path calls,
+    ``OperatorDecisionQueue.expire_cards_for_run`` — by the run's coordinates
+    (the row's ``ts`` IS the run's ``chat_submission_id``; its activity and
+    execution) and the exact card the row says the run is parked on. Each card is
+    expired with reason ``run cancelled``, so a late answer to it is refused.
+    Never by dedup key: a gate key is params-independent and can name ANOTHER
+    run's pending card. Returns ``(withdrawn, note)`` about the parked card;
+    when it cannot be retired the note is what the UI shows beside it so the
+    operator is not left with a live-looking gate for a run that no longer exists.
     """
-    if not (entry.get("decision_id") or entry.get("dedup_key")):
+    parked = entry.get("decision_id") or ""
+    try:
+        q = queue
+        if q is None:
+            from systemu.approval.decision_queue import OperatorDecisionQueue
+            q = OperatorDecisionQueue(vault)
+        expired = q.expire_cards_for_run(
+            execution_id=entry.get("execution_id"),
+            activity_id=entry.get("activity_id"),
+            chat_submission_id=entry.get("ts"),
+            decision_id=parked or None,
+        )
+    except Exception:
+        logger.debug("[ChatTaskRegistry] card withdrawal failed", exc_info=True)
+        expired = []
+    if not (parked or entry.get("dedup_key")):
         return False, ""
-    dedup_key = entry.get("dedup_key") or ""
-    if dedup_key:
-        try:
-            q = queue
-            if q is None:
-                from systemu.approval.decision_queue import OperatorDecisionQueue
-                q = OperatorDecisionQueue(vault)
-            if q.expire_by_dedup_key(dedup_key):
-                return True, ""
-        except Exception:
-            logger.debug("[ChatTaskRegistry] gate withdrawal failed", exc_info=True)
+    if parked and parked in expired:
+        return True, ""
     return False, GATE_CANCELLED_NOTE
 
 

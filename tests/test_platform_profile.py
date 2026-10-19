@@ -89,10 +89,17 @@ def test_com_uia_is_windows_only_on_a_native_host():
 # ── keyring_backend: the OS→enum mapping (DEP-1/6) ───────────────────────────
 
 def test_keyring_backend_maps_by_os_when_a_backend_is_usable():
+    """GATE-6 rewrite (S5 / R-A3): on Windows ``dpapi`` is earned only by a
+    WORKING envelope round trip, so the envelope check is faked on EVERY OS leg
+    and the same assertions hold on any host (ubuntu/macOS CI have no pywin32)."""
     real = lambda: object()
-    assert pp.keyring_backend("win32", usable=real) == "dpapi"
-    assert pp.keyring_backend("darwin", usable=real) == "keychain"
-    assert pp.keyring_backend("linux", usable=real) == "secretservice"
+    working = lambda: (True, "")
+    broken = lambda: (False, "the DPAPI envelope is not working (test)")
+    assert pp.keyring_backend("win32", usable=real, envelope=working) == "dpapi"
+    assert pp.keyring_backend("win32", usable=real, envelope=broken) != "dpapi"
+    for envelope in (working, broken):
+        assert pp.keyring_backend("darwin", usable=real, envelope=envelope) == "keychain"
+        assert pp.keyring_backend("linux", usable=real, envelope=envelope) == "secretservice"
 
 
 def test_keyring_backend_plaintext_fallback_when_no_backend_on_posix():

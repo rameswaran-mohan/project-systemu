@@ -135,6 +135,81 @@ def restored_task_note(entry: Dict[str, Any], *, live: bool) -> str:
     return "restored; not being worked - stop or resume"
 
 
+# D-5 (e2e v0.10.31): the two extra lines a FAILED card carries, and the design
+# tokens they render with (no inline colour — the palette stays editable in
+# design/tokens.py alone).
+_FAILURE_REASON_CLASS = "s-text-danger"
+_FAILURE_STEP_CLASS = "s-muted"
+# A reason is often ``str(exc)``; a traceback-sized one would swamp the card the
+# line exists to inform. Bounded here, with the full text still one click away
+# in Live events — which is where the pointer sends an operator anyway.
+_FAILURE_REASON_CAP = 240
+
+
+def _ascii_line(text: str) -> str:
+    """DEC-32c: an operator-facing verdict line is ASCII."""
+    return str(text).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def failed_task_lines(entry, *, registry=None):
+    """D-5: what a FAILED chat card says beyond its badge.
+
+    Returns ``[(text, token-class), ...]`` — EMPTY for any row that did not
+    fail, so a completed / running / parked card is untouched, and NEVER empty
+    for one that did: with no recorded reason the card still points at the pane
+    that has the detail. A blank FAILED card is the defect.
+
+    ``registry`` is the reason SOURCE seam (the runtime module that owns
+    chat-task state). The next-step mapping is not part of the seam — it is the
+    ruling itself, and a fake must not be able to answer it.
+    """
+    from systemu.runtime import chat_task_registry as _reg
+    if not isinstance(entry, dict) or entry.get("status") not in _reg.FAILED_CHAT_STATUSES:
+        return []
+    source = registry if registry is not None else _reg
+    try:
+        reason = source.failure_reason(entry)
+    except Exception:
+        logger.debug("[ChatPage] could not read the failure reason", exc_info=True)
+        reason = ""
+    reason = reason.strip() if type(reason) is str else ""
+    # Classify the WHOLE reason, then truncate for display — never the other way
+    # round. A marker sitting past the cap is still a fact about this failure,
+    # and reading the verdict off the clipped copy would silently downgrade a
+    # known remedy to "see Live events" (the DEC-31 ordering, in miniature).
+    step = _reg.failure_next_step(reason)
+    lines = []
+    if reason:
+        shown = (reason[:_FAILURE_REASON_CAP] + "..."
+                 if len(reason) > _FAILURE_REASON_CAP else reason)
+        lines.append((_ascii_line(f"Why it failed: {shown}"), _FAILURE_REASON_CLASS))
+    lines.append((_ascii_line(f"Next step: {step}"), _FAILURE_STEP_CLASS))
+    return lines
+
+
+def chat_table_chip_model(entry):
+    """T5 / §5.10.c: the "from your table" chip for one chat task card, or None.
+
+    Looks the run up in the DURABLE per-run record by the ids the card holds: the
+    entry's ``ts`` is the run's chat submission id (the only id a card has while the
+    run is in flight), and ``execution_id`` arrives when it ends (a resumed run's LAST
+    execution, found through its alias). In flight -- anything not in
+    ``_TERMINAL_STATUSES``, including a run parked on the pre-filled confirm card --
+    renders "Using from your table: <item>"; a finished card renders "Answered from
+    your table: N". A stat plus a small cached file read; never raises."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        from systemu.runtime import table_payoff, table_payoff_record
+        rec = table_payoff_record.find_run(execution_id=entry.get("execution_id"),
+                                           chat_submission_id=entry.get("ts"))
+        return table_payoff.run_chip_model(
+            rec, in_flight=entry.get("status") not in _TERMINAL_STATUSES)
+    except Exception:
+        logger.debug("[ChatPage] table chip unavailable", exc_info=True)
+        return None
+
+
 def stop_result_message(report: Dict[str, Any]):
     """Turn a ``chat_task_registry.cancel_chat_task`` report into (text, type).
 
@@ -472,6 +547,17 @@ def build_chat_page(prefill: str = "") -> None:
                         ui.label(_note).classes("s-text-warn").style(
                             "font-size: 11px; font-weight: 600;"
                         )
+                    # D-5: a FAILED row says WHY on the card, and what to do
+                    # next — not only inside the collapsed Live-events pane.
+                    for _text, _cls in failed_task_lines(entry):
+                        ui.label(_text).classes(_cls).style(
+                            "font-size: 11px; white-space: pre-wrap;"
+                        )
+                    # T5: what the operator's table supplied this run -- "Using
+                    # from your table: <item>" in flight, "Answered from your
+                    # table: N" (items on expand) once it ends.
+                    from systemu.interface.pages.work import render_table_chips
+                    render_table_chips(chat_table_chip_model(entry))
                 with ui.column().classes("items-end").style("gap: 6px;"):
                     ui.badge(status.upper().replace("_", " ")).style(
                         f"background: {status_color}; color: white; "

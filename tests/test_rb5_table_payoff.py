@@ -431,27 +431,29 @@ def test_tripwire_FIRES_when_the_real_clamp_is_punched(monkeypatch):
     assert "CLAMP REGRESSION" in (out["message"] or "")
 
 
-def test_tripwire_surfaces_in_the_formatted_metric():
-    """A counter nobody renders is not a tripwire. The §10 surface must SAY it."""
-    rep = table_payoff.inventory_hit_report(_Report([
-        _req(schema_path="/a", state="have", value_origin="operator",
-             table_item_id="t-1"),
-    ]))
-    assert rep["table_silent"] == 1
-    lines = table_payoff.format_inventory_hit(rep)
+def test_tripwire_surfaces_in_the_formatted_metric(tmp_path):
+    """A counter nobody renders is not a tripwire. The §10 surface must SAY it.
+
+    Re-pointed (GATE-6) from the retired snapshot formatter to the record formatter,
+    which is now the only inventory-hit surface: a table-sourced SILENT bind written by
+    the REAL recorder must come out of the REAL scan as the CLAMP REGRESSION line."""
+    rep = table_payoff.record_inventory_hit_report(_recorded_scan(
+        tmp_path, _req(schema_path="/a", state="have", value_origin="operator",
+                       table_item_id="t-1")))
+    assert rep["silent"] == 1
+    lines = table_payoff.format_record_inventory_hit(rep)
     assert any("CLAMP REGRESSION" in ln for ln in lines), lines
 
 
-def test_the_healthy_surface_does_not_mention_the_alarm():
+def test_the_healthy_surface_does_not_mention_the_alarm(tmp_path):
     """Discriminator for the test above — otherwise a surface that ALWAYS printed
-    the banner would pass it."""
-    rep = table_payoff.inventory_hit_report(_Report([
-        _req(schema_path="/a", state="have", value_origin="content_derived",
-             table_item_id="t-1"),
-    ]))
-    assert rep["table_silent"] == 0
+    the banner would pass it. (Re-pointed with it, over the same recorder + scan.)"""
+    rep = table_payoff.record_inventory_hit_report(_recorded_scan(
+        tmp_path, _req(schema_path="/a", state="have", value_origin="content_derived",
+                       table_item_id="t-1")))
+    assert rep["silent"] == 0
     assert not any("CLAMP REGRESSION" in ln
-                   for ln in table_payoff.format_inventory_hit(rep))
+                   for ln in table_payoff.format_record_inventory_hit(rep))
 
 
 def test_junk_input_is_an_honest_zero_not_an_error():
@@ -465,28 +467,76 @@ def test_junk_input_is_an_honest_zero_not_an_error():
         assert table_payoff.clamp_tripwire(junk)["fired"] is False
 
 
-def test_tripwire_reports_unknown_rather_than_healthy_when_it_cannot_look(monkeypatch):
-    """FAIL-CLOSED reporting on the REAL error path.
+def _recorded_scan(tmp_path, *reqs, unreadable=0):
+    """A RecordScan over runs written by the REAL recorder, plus ``unreadable`` run
+    files that exist but cannot be read (a directory under a run file's name)."""
+    from systemu.core.models import RequirementReport
+    from systemu.runtime import table_payoff_record as tpr
+    data = tmp_path / "data"
+    item = TableItem(id="t-1", kind="service", name="n",
+                     ref={"server": "https://example.invalid/t1"})
+    for i, req in enumerate(reqs):
+        tpr.record_binder_pass(RequirementReport(per_objective={1: [req]}),
+                               compose_table(SituationReport(), [item]),
+                               root_execution_id=f"exec_{i}", execution_id=f"exec_{i}",
+                               site="midloop", data_dir=data)
+    for j in range(unreadable):
+        (tpr.record_dir(data) / f"run_unreadable{j}.jsonl").mkdir(parents=True)
+    return tpr.scan_records(data_dir=data)
 
-    Zero is this wire's HEALTHY reading, so ``inventory_hit_report``'s ``except``
-    branch must NOT return 0 for it — that would be an alarm reporting "clamp intact"
-    precisely when it failed to evaluate. Every payoff counter degrades to 0; this one
-    degrades to None.
+
+def test_tripwire_reports_unknown_rather_than_healthy_when_it_cannot_look(tmp_path,
+                                                                          monkeypatch):
+    """FAIL-CLOSED reporting, on BOTH surfaces the alarm has (DEC-25 + DEC-27).
+
+    Zero is this wire's HEALTHY reading, so failing to look must never read as zero.
+
+    1. The RUNTIME wire (``clamp_tripwire`` over ``inventory_hit_report``, still live
+       in the producer): its error path degrades the counter to None, not 0, and the
+       wire says NOT EVALUATED rather than "clamp intact".
+    2. The OPERATOR surface (the record formatter; re-pointed from the retired
+       snapshot formatter, whose error path rendered NOT EVALUATED for a None
+       counter): when a run record cannot be read, a silent table bind may sit in
+       exactly that file, so the surface must not print a bare healthy-looking
+       ``silent: 0`` -- the readable count is qualified and the unreadable remainder
+       is NOT EVALUATED.
     """
-    monkeypatch.setattr(table_payoff, "_needs_ask",
-                        lambda r: (_ for _ in ()).throw(RuntimeError("boom")))
-    rep = table_payoff.inventory_hit_report(_Report([_req(schema_path="/a")]))
-    assert rep["table_silent"] is None, (
-        "the metric's error path returned a HEALTHY zero for the tripwire"
-    )
-    assert rep["silent"] == 0, "payoff counters should still degrade to 0"
+    # -- 1. the runtime wire, on its REAL error path --------------------------
+    with monkeypatch.context() as mp:
+        mp.setattr(table_payoff, "_needs_ask",
+                   lambda r: (_ for _ in ()).throw(RuntimeError("boom")))
+        rep = table_payoff.inventory_hit_report(_Report([_req(schema_path="/a")]))
+        assert rep["table_silent"] is None, (
+            "the metric's error path returned a HEALTHY zero for the tripwire")
+        assert rep["silent"] == 0, "payoff counters should still degrade to 0"
+        out = table_payoff.clamp_tripwire(_Report([_req(schema_path="/a")]))
+        assert out["evaluated"] is False and out["fired"] is False
+        assert "NOT EVALUATED" in (out["message"] or "")
 
-    out = table_payoff.clamp_tripwire(_Report([_req(schema_path="/a")]))
-    assert out["evaluated"] is False and out["fired"] is False
-    assert "NOT EVALUATED" in (out["message"] or "")
+    # -- 2. the operator surface, over an unreadable run record ---------------
+    scan = _recorded_scan(tmp_path, _req(schema_path="/a", table_item_id="t-1"),
+                          unreadable=1)
+    assert scan.unreadable == 1 and len(scan.records) == 1, "fixture premise"
 
-    lines = table_payoff.format_inventory_hit({"table_silent": None, "supplied": 0})
-    assert any("NOT EVALUATED" in ln for ln in lines), lines
+    rep = table_payoff.record_inventory_hit_report(scan)
+    assert rep["silent"] == 0, "the readable records still count"
+    assert rep["tripwire_evaluated"] is False, (
+        "the report claimed the tripwire was evaluated over records it never read")
+
+    lines = table_payoff.format_record_inventory_hit(rep)
+    joined = "\n".join(lines)
+    assert "silent: 0 among readable records; NOT EVALUATED for 1 unreadable" in joined, \
+        joined
+    assert "silent: 0 (healthy is 0)" not in joined, (
+        "a healthy-looking zero was printed while a run record could not be read")
+    assert joined.isascii()
+
+    # and with nothing unreadable the healthy reading is still allowed to say so
+    clean = table_payoff.record_inventory_hit_report(
+        _recorded_scan(tmp_path / "clean", _req(schema_path="/a", table_item_id="t-1")))
+    assert clean["tripwire_evaluated"] is True
+    assert "silent: 0 (healthy is 0)" in "\n".join(
+        table_payoff.format_record_inventory_hit(clean))
 
 
 def test_tripwire_reads_the_snapshot_dict_shape():

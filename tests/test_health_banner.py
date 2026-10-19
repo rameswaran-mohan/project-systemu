@@ -68,6 +68,26 @@ def test_multi_daemon_creates_danger_issue(monkeypatch, tmp_path):
     assert any("daemon stop --all" in (i.cta or "") for i in s.issues)
 
 
+def _quiet_probe(_url, _timeout=1.0):
+    """A keyless provider that answers nothing. D-11: the two tests below now
+    spend an EXPLICIT witness.
+
+    They used to assert the verdict sentence and its remedy off the path where
+    NOTHING had been observed. That was already only accidentally true: D4 took
+    the probe off the render, so the un-probed path started returning a hedge
+    that still carried the verdict ("Checking providers... No LLM provider is
+    usable ..."), and D-11 ruled that copy out -- on /welcome it sat directly
+    above step 1's "Provider ready: ..." line and contradicted it.
+
+    So the property F19 wrote these for (the remedy names EVERY provider, not
+    just OpenRouter) is pinned where it belongs: against an OBSERVED negative.
+    ``provider_probe=`` is the documented seam for exactly that -- a non-render
+    caller asking for a synchronous verdict with a witness of its own.
+    """
+    from systemu.runtime import provider_status as ps
+    return (ps.STATE_UNREACHABLE, "nothing answered (test)")
+
+
 def test_missing_openrouter_key_creates_warning(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with patch(
@@ -75,7 +95,7 @@ def test_missing_openrouter_key_creates_warning(monkeypatch, tmp_path):
         return_value=1,
     ):
         from systemu.interface.components.health_banner import build_health_state
-        s = build_health_state(vault_dir=tmp_path)
+        s = build_health_state(vault_dir=tmp_path, provider_probe=_quiet_probe)
     assert s.has_any
     assert s.worst_severity == "warning"
     # F19: the warning names every provider the operator could configure, so
@@ -93,8 +113,28 @@ def test_empty_openrouter_key_treated_as_missing(monkeypatch, tmp_path):
         return_value=1,
     ):
         from systemu.interface.components.health_banner import build_health_state
-        s = build_health_state(vault_dir=tmp_path)
+        s = build_health_state(vault_dir=tmp_path, provider_probe=_quiet_probe)
     assert any("OPENROUTER_API_KEY" in (i.cta or "") for i in s.issues)
+
+
+def test_an_unobserved_provider_state_asserts_nothing_and_prescribes_nothing(
+        monkeypatch, tmp_path):
+    """D-11, stated positively and kept in THIS file so the pair above cannot
+    drift back: with no witness spent, the banner hedges and stops."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    from systemu.runtime import provider_snapshot as psnap
+    psnap.stop_refresher()
+    psnap.clear()
+    with patch(
+        "systemu.interface.components.health_banner._count_systemu_daemons",
+        return_value=1,
+    ):
+        from systemu.interface.components.health_banner import build_health_state
+        s = build_health_state(vault_dir=tmp_path)
+    hits = [i for i in s.issues if "Checking providers" in i.message]
+    assert hits, [i.message for i in s.issues]
+    assert "No LLM provider is usable" not in hits[0].message, hits[0].message
+    assert hits[0].cta is None, hits[0].cta
 
 
 def test_unwritable_vault_creates_danger(monkeypatch, tmp_path):

@@ -1298,7 +1298,8 @@ class Supervisor:
             if entry is not None:
                 # We own the slot — release it and process the result
                 self._semaphore.release()
-                self._handle_result(payload, result)
+                self._handle_result(payload, self._honour_operator_cancel(
+                    cancel_event, result))
             else:
                 # Watchdog already cleaned up this slot; we are a zombie.
                 # Log but do not re-trigger any result handling.
@@ -1307,6 +1308,32 @@ class Supervisor:
                     "— result suppressed. status=%s",
                     key, result.get("status", "?"),
                 )
+
+    @staticmethod
+    def _honour_operator_cancel(cancel_event, result: Dict[str, Any]) -> Dict[str, Any]:
+        """IMPL-11: an operator Stop the run never observed still stops it.
+
+        The ReAct loop checks ``cancel_event`` only at its iteration boundary. A
+        gate that fires between the Stop and that boundary posts its card and
+        PARKS the run (``command_gate_blocked`` / ``suspended_*``) — the Stop was
+        lost and the fresh card would resume the run when answered. When the event
+        is set and we still own the slot, it can only be an operator cancel
+        (``request_cancel``; the watchdog pops the slot first and never reaches
+        here), so any outcome but ``success`` finalizes as ``cancelled`` — which
+        also expires the run's cards and waits. A run that finished anyway stays
+        finished.
+        """
+        try:
+            signalled = cancel_event is not None and cancel_event.is_set()
+        except Exception:
+            signalled = False
+        status = result.get("status") if isinstance(result, dict) else None
+        if not signalled or status in ("success", "cancelled"):
+            return result
+        logger.info("[Supervisor] operator cancel landed as the run ended %r — "
+                    "finalizing as cancelled", status)
+        return {**result, "status": "cancelled", "ended_as": status,
+                "final_summary": "Cancelled by operator"}
 
     @staticmethod
     def _should_retry(status: str, retry_count: int, structural: bool) -> bool:
@@ -1457,6 +1484,50 @@ class Supervisor:
                 "any surviving wait", execution_id, exc_info=True,
             )
 
+    def _expire_cards_on_cancel(self, payload: Dict[str, Any],
+                                result: Dict[str, Any]) -> None:
+        """IMPL-11: expire every pending decision card of a cancelled run through
+        the ONE queue function (``OperatorDecisionQueue.expire_cards_for_run``).
+
+        Coordinates: this execution's id (the result carries it), the activity
+        (shared by every resume of the run) and the chat submission (when the run
+        came from Chat). Runs on the cancelled run's own worker thread inside
+        ``_handle_result``. Best-effort: a vault-less Supervisor or a persistence
+        hiccup must never break the cancel finalizer — the CANCELLED mark is
+        already written.
+        """
+        vault = getattr(self, "vault", None)
+        if vault is None:
+            return
+        try:
+            from systemu.approval.decision_queue import OperatorDecisionQueue
+            OperatorDecisionQueue(vault).expire_cards_for_run(
+                execution_id=result.get("execution_id"),
+                activity_id=payload.get("activity_id"),
+                chat_submission_id=payload.get("chat_submission_id"),
+                root_execution_id=self._run_root_execution_id(
+                    result.get("execution_id")),
+            )
+        except Exception:
+            logger.warning(
+                "[Supervisor] could not expire the decision cards of cancelled "
+                "activity %s", payload.get("activity_id"), exc_info=True)
+
+    def _run_root_execution_id(self, execution_id: Optional[str]) -> Optional[str]:
+        """IMPL-11: the cancelled run's ROOT execution id, from its snapshot when one
+        exists (resumes of one run share the root; the result dict does not carry
+        it). Best-effort: no snapshot, or any read error, is simply no root."""
+        if not execution_id:
+            return None
+        try:
+            from systemu.runtime.execution_snapshot import read_snapshot
+            snap = read_snapshot(execution_id,
+                                 data_dir=getattr(self, "_snapshot_data_dir", None))
+            root = getattr(snap, "root_execution_id", None) if snap is not None else None
+            return root if (type(root) is str and root) else None
+        except Exception:
+            return None
+
     @staticmethod
     def _pending_decision_result(pd) -> Dict[str, Any]:
         """Classify a PendingOperatorDecision that unwound to the Supervisor (v0.10.21).
@@ -1551,6 +1622,9 @@ class Supervisor:
             # finalizer, and the reconciler's per-tick CANCELLED-check still bounds any
             # surviving wait (defense in depth).
             self._expire_pending_waits_on_cancel(result.get("execution_id"))
+            # IMPL-11: withdraw the run's parked decision cards too, so nothing in
+            # the Inbox / Needs you / the phone can answer (and resume) it.
+            self._expire_cards_on_cancel(payload, result)
             self._publish(
                 f"🚫 Cancelled by operator: {self._aname(activity_id)}",
                 level="WARNING",

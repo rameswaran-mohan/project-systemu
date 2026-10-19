@@ -193,6 +193,21 @@ def current_snapshot(key: Optional[str] = None, *,
     return snap
 
 
+def published_taken_at() -> Optional[float]:
+    """WHEN the published snapshot was minted, or None. Reads only the clock.
+
+    D-11: the change detector an OPEN page's timer compares against. It asks
+    for no config key on purpose -- the question is "has a new observation
+    landed since I last painted", not "is this observation about my config",
+    and answering the second one here would make a snapshot about a different
+    config look like no change at all.
+    """
+    with _lock:
+        snap = _snapshot
+    taken = getattr(snap, "taken_at", None)
+    return taken if type(taken) is float else None
+
+
 def clear() -> None:
     """Drop the published snapshot (tests; also after a config edit)."""
     global _snapshot

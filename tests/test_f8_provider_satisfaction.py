@@ -230,7 +230,14 @@ def test_satisfied_is_derived_from_state_not_stored_alongside_it():
     ("anthropic", "anthropic_api_key", "ANTHROPIC_API_KEY"),
     ("openai", "openai_api_key", "OPENAI_API_KEY"),
 ])
-def test_key_providers_are_decided_by_the_credential(provider, attr, env):
+def test_key_providers_are_decided_by_the_credential(provider, attr, env,
+                                                     monkeypatch):
+    # e2e31 (GATE-6): "key -> ready" is only true when the SDK the provider's
+    # class imports is there too, so the SDK seam is driven PRESENT here and
+    # this pins "key + SDK -> ready". The "key without SDK" direction is the
+    # sibling test below.
+    from systemu.llm import providers as _providers
+    monkeypatch.setattr(_providers, "_find_spec", lambda name: object())
     spec = ps.SPEC_BY_PROVIDER[provider]
     assert (spec.attr, spec.env, spec.rule) == (attr, env, ps.RULE_CREDENTIAL)
     _quiet = lambda _u, _t: (ps.STATE_UNKNOWN, "not probed")  # noqa: E731
@@ -513,3 +520,39 @@ def test_the_openrouter_key_section_agrees_with_the_table():
     assert "openrouter_key_status(" in src
     assert settings.openrouter_key_status(_cfg(openrouter_api_key="k"))[0].startswith("✓")
     assert not settings.openrouter_key_status(_cfg())[0].startswith("✓")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  e2e31 sibling: the credential is necessary, not sufficient
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("provider,attr,env", [
+    ("openrouter", "openrouter_api_key", "OPENROUTER_API_KEY"),
+    ("google", "google_api_key", "GOOGLE_API_KEY"),
+    ("anthropic", "anthropic_api_key", "ANTHROPIC_API_KEY"),
+    ("openai", "openai_api_key", "OPENAI_API_KEY"),
+])
+def test_a_key_without_its_sdk_is_not_ready(provider, attr, env, monkeypatch):
+    """The other half of ``test_key_providers_are_decided_by_the_credential``:
+    the SDK seam answers ABSENT. A provider whose class imports an optional SDK
+    is NOT ready on a key alone; a provider that needs none is unaffected,
+    because it has nothing to miss. Which is which is read off the registry,
+    never re-declared here."""
+    from systemu.llm import providers as _providers
+    monkeypatch.setattr(_providers, "_find_spec", lambda name: None)
+    _quiet = lambda _u, _t: (ps.STATE_UNKNOWN, "not probed")  # noqa: E731
+
+    st = ps.all_provider_statuses(_cfg(**{attr: "a-key"}), probe=_quiet)[provider]
+    if _providers.sdk_package(provider):
+        assert st.satisfied is False, f"{provider}: a key alone read as ready"
+        assert st.state == ps.STATE_MISSING
+        assert st.blocker and env in st.blocker, st.blocker
+    else:
+        assert st.satisfied is True and st.state == ps.STATE_SET, provider
+
+
+def test_the_sdk_sibling_is_not_vacuous():
+    """At least one key provider really declares an SDK, so the blocked branch
+    above is exercised and not skipped on every row."""
+    from systemu.llm import providers as _providers
+    assert _providers.sdk_package("anthropic") == "anthropic"

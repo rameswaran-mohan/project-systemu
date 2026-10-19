@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "id": "ra10-ac5-profile-user-fact-account",
+  "title": "A user_facts profile bind closes the gap but names a FACT ID, not a value — structurally unassessable (R-A10 AC5)",
+  "provenance": {
+    "release": "R-A10",
+    "source_test": "tests/test_ra10_binder.py::test_ac5_inventory_bind_from_user_facts_closes_gap_silently",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "call the billing API",
+    "success_criteria": "the call succeeded"
+  },
+  "capability": {
+    "name": "api_call",
+    "parameters_schema": {
+      "account_id": { "type": "string", "description": "the account id" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {
+      "name": "Op",
+      "location_text": "NYC",
+      "timezone": "UTC",
+      "default_output_dir": "{root}/out",
+      "user_facts": [
+        {
+          "id": "fact_1",
+          "ts": "2020",
+          "fact": "account_id is acct-42",
+          "tags": ["account_id"],
+          "source": "operator",
+          "confidence": 1.0
+        }
+      ]
+    },
+    "declared_intents": []
+  },
+  "asks": [
+    {
+      "schema_path": "account_id",
+      "class": "decision",
+      "operator_answer": "acct-42",
+      "label": "unassessable",
+      "why": "AC5 says inventory closes this gap, and the binder does bind it (state=have, source=operator_profile). But _bind_profile deliberately returns NO resolved value for a user_facts entry — a fact is a sentence ('account_id is acct-42'), not the parameter value — so no bound_value_digest is stamped and there is nothing for the replay to compare the answer against. Reporting this as 'avoidable' would be an unproven claim and as 'necessary' would be a false accusation, so it is unassessable. This is a real observability limit of the profile-fact bind path, not a fixture defect."
+    }
+  ]
+}

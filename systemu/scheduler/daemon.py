@@ -186,6 +186,29 @@ class DaemonReadiness:
     # nothing was spawned, nothing was written, and the remedy is different.
     refused: bool = False
 
+    # -- NIT: WAS THIS DAEMON ALREADY THERE? --------------------------------
+    # True only when `start_daemon` DECLINED TO SPAWN because a daemon of ours
+    # was already serving this vault, and then reported that one's readiness.
+    # The CLI cannot re-derive it -- a ready verdict looks identical whether or
+    # not this invocation is what made it ready -- so a second `daemon start`
+    # used to answer "OK Daemon ready.", which is true of a daemon it did not
+    # start, on the line right after a raw WARNING telling the operator to stop
+    # it. The fact rides the verdict (DEC-43) so the surface can say what
+    # actually happened.
+    already_serving: bool = False
+
+    # -- D-10: WHAT THE OPERATOR SHOULD ACTUALLY DO -------------------------
+    # A minted remedy, or "" when the generic one still fits. Every failed
+    # `daemon start` used to end with "Stop the stuck process with: systemu
+    # daemon stop", and on the port-in-use refusal that line does nothing where
+    # it is read: `daemon stop` is pidfile-scoped, the pidfile it reads belongs
+    # to THIS vault, and the process holding the port belongs to another one.
+    # A remedy that cannot work where it is printed is a false assertion about
+    # what the operator can do (DEC-34 in product copy), so the branch that
+    # knows better says so HERE, at the mint, rather than leaving the surface
+    # to work out which failure it is looking at.
+    remedy: str = ""
+
     # -- D6: WHICH socket, and WHOSE number it is ----------------------------
     # `port` alone is not an honest answer. Four different facts can produce it
     # (see PORT_SOURCE_*), and three of them are the operator's own choice while
@@ -924,6 +947,73 @@ def _find_listening_pid(port: int):
     return None
 
 
+def _holder_operating_home(pid) -> str:
+    """The OPERATING HOME of the systemu daemon holding a port, or ``""``.
+
+    D-10. THE RECORD IS THE HOLDER'S OWN ARGV. ``start_daemon`` spawns its
+    child as ``python -m systemu.scheduler.daemon --vault-dir <absolute root>
+    --port N``, so the root the other daemon serves was written into the
+    process table by the parent that started it. ``daemon_operating_home``
+    turns that root into the directory ``systemu daemon stop`` has to be run
+    from -- the SAME mint the spawn used, never a second derivation of "where
+    does that daemon live".
+
+    FAIL-CLOSED (DEC-27: completeness is witnessed, never inferred). A pid that
+    is not an int, a process psutil cannot be asked about, a command line that
+    does not name this daemon module, an argv carrying no ``--vault-dir``: all
+    answer ``""``. And ``""`` is not a smaller answer -- it selects a DIFFERENT
+    remedy. Naming the wrong vault would send the operator to stop a daemon
+    that is not the one holding the port, which is worse than naming none.
+
+    Never raises: this runs inside a refusal, and a refusal that raises where
+    the diagnosis should have been is the failure it exists to prevent.
+    """
+    if type(pid) is not int:
+        return ""
+    try:
+        import psutil
+        cmdline = psutil.Process(pid).cmdline()
+    except Exception:
+        logger.debug("[Daemon] holder cmdline unreadable (ignored)", exc_info=True)
+        return ""
+    if type(cmdline) is not list:
+        return ""
+    argv = [a for a in cmdline if type(a) is str]
+    if _DAEMON_CMDLINE_MARKER not in " ".join(argv):
+        return ""
+    for index, token in enumerate(argv):
+        if token == "--vault-dir" and index + 1 < len(argv):
+            try:
+                return str(daemon_operating_home(argv[index + 1]))
+            except Exception:
+                logger.debug("[Daemon] holder vault root unresolvable (ignored)",
+                             exc_info=True)
+                return ""
+    return ""
+
+
+#: D-10 -- what to do about a port this process may not touch. ASCII (DEC-32c);
+#: the known form carries a PATH, so every surface printing it must be an
+#: unwrapping writer.
+_PORT_CONFLICT_REMEDY_UNKNOWN = (
+    "no record here says which vault that process serves, so serve this one on "
+    "a free socket instead: systemu daemon start --port <number>")
+
+
+def port_conflict_remedy(home: str) -> str:
+    """THE SOLE MINT of the remedy a port-in-use refusal names.
+
+    ``home`` is ``_holder_operating_home``'s answer: the operating home of the
+    daemon holding the port, or ``""`` when the record does not say. The
+    fallback is not a lesser sentence -- it is the honest one, and it names the
+    only thing the operator can do without knowing whose daemon that is.
+    """
+    if type(home) is str and home:
+        return ('stop the daemon that holds the port from its own vault: '
+                'cd "{}" && systemu daemon stop'.format(home))
+    return _PORT_CONFLICT_REMEDY_UNKNOWN
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Public commands
 # ─────────────────────────────────────────────────────────────────────────────
@@ -997,14 +1087,19 @@ def start_daemon(
     # refusing to ANSWER, and `daemon start` on a running daemon must keep
     # reporting the readiness of the one that is there.
     if _already_serving_this_socket(vault_dir, port):
-        logger.warning(
+        # INFO, not WARNING: a daemon that is already doing its job is not a
+        # problem, and a log full of warnings about healthy states is a log
+        # nobody reads.
+        logger.info(
             "[Daemon] this process is already serving %s on port %d -- not "
             "spawning a second daemon for the same vault and port", vault_dir,
             int(port))
-        return await_readiness(
-            vault_dir, port=port,
-            timeout_s=(_start_timeout_s() if wait_timeout_s is None
-                       else wait_timeout_s))
+        return _restate(
+            await_readiness(
+                vault_dir, port=port,
+                timeout_s=(_start_timeout_s() if wait_timeout_s is None
+                           else wait_timeout_s)),
+            already_serving=True)
 
     pid_file = _pid_file_path(vault_dir)
 
@@ -1030,13 +1125,23 @@ def start_daemon(
         existing_pid = pid_file.read_text().strip()
         _pid, _alive = _pidfile_process(vault_dir)   # also cleans up if dead
         if _alive:
-            logger.warning("[Daemon] Already running (PID %s). Stop it first.", existing_pid)
-            return await_readiness(vault_dir, port=port,
-                                   timeout_s=(_start_timeout_s()
-                                              if wait_timeout_s is None
-                                              else wait_timeout_s))
+            # INFO, and no "Stop it first". The witnessed record was a WARNING
+            # instructing the operator to stop the daemon that was serving them
+            # -- printed immediately above "OK Daemon ready.", so the pair told
+            # them both that everything was fine and that they had to kill it.
+            # Nothing here is wrong: a `daemon start` against a running daemon
+            # is idempotent, and the answer is that daemon's own readiness.
+            logger.info(
+                "[Daemon] already running (PID %s) -- reporting the readiness "
+                "of the daemon already serving this vault", existing_pid)
+            return _restate(
+                await_readiness(vault_dir, port=port,
+                                timeout_s=(_start_timeout_s()
+                                           if wait_timeout_s is None
+                                           else wait_timeout_s)),
+                already_serving=True)
         logger.info(
-            "[Daemon] Stale PID file (PID %s no longer running) — starting fresh",
+            "[Daemon] Stale PID file (PID %s no longer running) -- starting fresh",
             existing_pid,
         )
         # _pidfile_process() already removed the PID file; nothing more to do.
@@ -1052,14 +1157,20 @@ def start_daemon(
     if not _check_port_available("127.0.0.1", port):
         holder = _find_listening_pid(port)
         who = f"PID {holder}" if holder else "an unknown process"
-        logger.error("[Daemon] Port %d is already in use by %s — refusing to start.",
+        logger.error("[Daemon] Port %d is already in use by %s -- refusing to start.",
                      port, who)
+        # D-10: the remedy rides the verdict. The generic tail the surface
+        # prints on every other failure ("Stop the stuck process with: systemu
+        # daemon stop") is pidfile-scoped, and the pidfile it reads is THIS
+        # vault's -- so from the refused directory it stops nothing and then
+        # says "Daemon is not running", contradicting the refusal above it.
         return DaemonReadiness(
             ready=False, pid=None, process_alive=False,
             host=_readiness_host(), port=int(port),
             reason=(f"port {port} is already in use by {who}; refusing to start a "
                     f"second daemon whose recordings would land in another vault "
                     f"(`systemu daemon stop --all`, or pick another --port)"),
+            remedy=port_conflict_remedy(_holder_operating_home(holder)),
         )
 
     # Spawn as a detached subprocess.
@@ -1163,7 +1274,7 @@ def start_daemon(
         env=env,
     )
     pid_file.write_text(str(proc.pid))
-    logger.info("[Daemon] Spawned background process PID %d — waiting for it to "
+    logger.info("[Daemon] Spawned background process PID %d -- waiting for it to "
                 "accept connections on port %d", proc.pid, port)
 
     # DEC-41: the spawn is a CLAIM. Only the connection is a WITNESS. Wait for
@@ -1499,6 +1610,30 @@ def _seed_and_advise(vault, *, logger_=None) -> None:
     _advise_if_vault_empty(vault, logger_=logger_)
 
 
+def _reencrypt_plaintext_secrets_at_start(vault_root=None, *, logger_=None):
+    """S5 / 2d: encrypt any plaintext secret file in the operating vault NOW.
+
+    Secrets written before the at-rest envelope existed (or while it was
+    unavailable) were upgraded only on their next write -- a token nobody
+    rotates stayed readable forever. This runs the one-time-backup-then-encrypt
+    pass (``at_rest.reencrypt_plaintext_secrets``) at every start; it is
+    idempotent, so only the first start after a plaintext write does anything.
+    The root is the ONE mint (``resolve_vault_root``) -- the same directory
+    ``CredentialStore`` writes to. Never raises: boot must not fail on this.
+    """
+    log = logger_ or logger
+    try:
+        from systemu.runtime.credentials import at_rest
+        if vault_root is None:
+            from systemu.runtime.vault_root import resolve_vault_root
+            vault_root = resolve_vault_root().root
+        return at_rest.reencrypt_plaintext_secrets(Path(vault_root), log=log)
+    except Exception:
+        log.exception("[Daemon] S5 plaintext-secret re-encryption failed -- "
+                      "continuing boot")
+        return None
+
+
 def provider_banner_lines(config, *, probe=None) -> list:
     """The startup banner's provider rows, MINTED (F19 / DEC-43).
 
@@ -1524,6 +1659,43 @@ def provider_banner_lines(config, *, probe=None) -> list:
         return rows
     except Exception as exc:  # pragma: no cover - defensive
         return [f"  Provider status unavailable ({type(exc).__name__})"]
+
+
+def _start_messaging(vault):
+    """W10.1: Telegram reach — the gateway + EventBus pusher shipped complete
+    in v0.8.x and were started by NOTHING. With the bot token + allowlist env
+    set, needs-you items and task outcomes reach the operator's phone, and
+    /status answers from there. Returns the gateway (or None when Telegram is
+    not configured / startup failed). Never raises: boot never fails on
+    messaging.
+
+    This is the process's ONLY gateway starter (the in-process dashboard reads
+    this handle, it never starts its own). ``start()`` returns the instance that
+    owns the token's poller; if one is already polling, the pusher is NOT
+    subscribed a second time, so every event is pushed once.
+    """
+    try:
+        from systemu.messaging.telegram_gateway import build_from_env as _tg_build
+        from systemu.messaging.handlers import build_status_handler, default_handlers
+        from systemu.messaging.event_pusher import EventPusher
+        from systemu.interface.event_bus import EventBus
+        _tg_handlers = {**default_handlers(),
+                        "status": build_status_handler(vault)}
+        _tg_built = _tg_build(command_handlers=_tg_handlers)
+        _tg_gateway = _tg_built.start() if _tg_built is not None else None
+        if _tg_gateway is not None and _tg_gateway is not _tg_built:
+            logger.info("[Daemon] Telegram gateway already running in this "
+                        "process -- reusing it")
+        elif _tg_gateway is not None:
+            _tg_pusher = EventPusher(_tg_gateway)
+            _tg_pusher.subscribe(EventBus.get())
+            logger.info("[Daemon] Telegram gateway + event pusher started")
+        else:
+            logger.info("[Daemon] Telegram not configured -- messaging dormant")
+        return _tg_gateway
+    except Exception:
+        logger.exception("[Daemon] messaging startup failed -- continuing boot")
+        return None
 
 
 def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
@@ -1597,7 +1769,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         try:
             _prewarm_tool_deps(config, vault)
         except Exception:
-            logger.exception("[Daemon] tool-dep pre-warm failed — continuing boot")
+            logger.exception("[Daemon] tool-dep pre-warm failed -- continuing boot")
 
     # v0.8.10: ensure a headless browser is available (background, non-blocking).
     # T0 fetch + T1 search work immediately; T2 browser tools come online once
@@ -1606,7 +1778,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         from systemu.runtime.web.provision import ensure_chromium_async
         ensure_chromium_async()
     except Exception:
-        logger.exception("[Daemon] browser provision probe failed — continuing boot")
+        logger.exception("[Daemon] browser provision probe failed -- continuing boot")
 
     # Create AppState FIRST so the scheduler jobs and the dashboard both use
     # the same vault backend (selected by SYSTEMU_STORAGE).  Without this,
@@ -1619,7 +1791,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         logger.info("[Daemon] Vault unified with AppState backend")
     except Exception as exc:
         logger.warning(
-            "[Daemon] AppState pre-creation failed (%s) — using file vault for scheduler", exc
+            "[Daemon] AppState pre-creation failed (%s) -- using file vault for scheduler", exc
         )
         state = None
         # vault remains the raw Vault(args.vault_dir) passed in — degraded mode
@@ -1660,6 +1832,10 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # complains about. It now lives in _seed_and_advise(), immediately after the
     # migrator.
 
+    # S5 / 2d: re-encrypt plaintext secrets proactively (one-time backup first),
+    # before any job or the dashboard reads them. Idempotent; never fatal.
+    _reencrypt_plaintext_secrets_at_start(logger_=logger)
+
     # Initialise jobs (sets module-level config/vault globals)
     init_jobs(config, vault)
 
@@ -1681,7 +1857,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
                     "[Daemon] Seeded %d tool dep approval(s) from %s", seeded, reqs
                 )
     except Exception:
-        logger.exception("[Daemon] tool dep approval seeding failed — continuing boot")
+        logger.exception("[Daemon] tool dep approval seeding failed -- continuing boot")
 
     # v0.7-c: migrate skills to Anthropic Agent Skills spec-conformant layout.
     # Idempotent; best-effort.  Runs once at boot to fix legacy skill_skill_<hash>/
@@ -1709,7 +1885,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
             for err in report.errors:
                 logger.warning("[Daemon] v0.7-c: skill migration error: %s", err)
     except Exception:
-        logger.exception("[Daemon] v0.7-c: skill_migrator failed — continuing boot")
+        logger.exception("[Daemon] v0.7-c: skill_migrator failed -- continuing boot")
 
     # v0.8.22 (A): silent vault upgrade migrator. Mirrors v0.7-c skill_migrator
     # pattern — best-effort; daemon boots even on migrator failure.
@@ -1724,7 +1900,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         from systemu.scheduler.tool_reconciler import recover_stale_dry_run_failures
         recover_stale_dry_run_failures(vault)
     except Exception:
-        logger.exception("[Daemon] v0.9.51: stale dry-run recovery failed — continuing boot")
+        logger.exception("[Daemon] v0.9.51: stale dry-run recovery failed -- continuing boot")
 
     # W12 (ship-blocker, audit-caught live): under the daemon there IS a
     # decision queue and a dashboard — operator asks must route there, not
@@ -1750,7 +1926,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
             # a headless box has no browser to satisfy them in. Log the
             # argv-only remedy each gate declares instead.
             logger.warning(
-                "[FirstRun] setup incomplete — %s",
+                "[FirstRun] setup incomplete -- %s",
                 ", ".join(c["id"] for c in _missing))
             for _c in _missing:
                 _hint = (_c.get("headless") or {}).get("hint")
@@ -1759,7 +1935,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
             logger.warning("[FirstRun]   full checklist: "
                            "`systemu onboarding status`")
     except Exception:
-        logger.exception("[Daemon] first-run check failed — continuing boot")
+        logger.exception("[Daemon] first-run check failed -- continuing boot")
 
     # v0.8.22.1 (R5): resume chat tasks when their stuck-loop decision is resolved.
     try:
@@ -1767,30 +1943,11 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         from systemu.runtime.supervisor import Supervisor
         _register_resume(vault, Supervisor.get(), data_dir=Path("data"))
     except Exception:
-        logger.exception("[Daemon] v0.8.22.1: resume-on-decision registration failed — continuing boot")
+        logger.exception("[Daemon] v0.8.22.1: resume-on-decision registration failed -- continuing boot")
 
-    # W10.1: Telegram reach — the gateway + EventBus pusher shipped complete
-    # in v0.8.x and were started by NOTHING. With the bot token + allowlist
-    # env set, needs-you items and task outcomes now reach the operator's
-    # phone, and /status answers from there. Best-effort: boot never fails
-    # on messaging.
-    try:
-        from systemu.messaging.telegram_gateway import build_from_env as _tg_build
-        from systemu.messaging.handlers import build_status_handler, default_handlers
-        from systemu.messaging.event_pusher import EventPusher
-        from systemu.interface.event_bus import EventBus
-        _tg_handlers = {**default_handlers(),
-                        "status": build_status_handler(vault)}
-        _tg_gateway = _tg_build(command_handlers=_tg_handlers)
-        if _tg_gateway is not None:
-            _tg_gateway.start()
-            _tg_pusher = EventPusher(_tg_gateway)
-            _tg_pusher.subscribe(EventBus.get())
-            logger.info("[Daemon] Telegram gateway + event pusher started")
-        else:
-            logger.info("[Daemon] Telegram not configured — messaging dormant")
-    except Exception:
-        logger.exception("[Daemon] messaging startup failed — continuing boot")
+    # W10.1: Telegram reach — see _start_messaging. Best-effort: boot never
+    # fails on messaging.
+    _start_messaging(vault)
 
     # Build scheduler
     scheduler = BackgroundScheduler()
@@ -1880,6 +2037,23 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         seconds=60,
         id="table_reconciler",
         name="OnTheTable Projection Reconciler",
+        replace_existing=True,
+    )
+
+    # R-B1: OnTheTable health tick -- the credential-names backfill, then a
+    # reconcile whose projection marks orphans `broken` with a reason (credential
+    # removed / MCP server disconnected / folder grant revoked). Runs on this
+    # scheduler's pool, never the UI thread; serialized with the 60s job above by
+    # table_reconciler._RECONCILE_LOCK. Cadence: SYSTEMU_TABLE_HEALTH_MINUTES
+    # (default 10), read once here at boot.
+    from systemu.scheduler.jobs import _table_health_job
+    from systemu.runtime.table_reconciler import health_interval_minutes
+    scheduler.add_job(
+        _table_health_job,
+        trigger="interval",
+        minutes=health_interval_minutes(),
+        id="table_health",
+        name="OnTheTable Health Tick",
         replace_existing=True,
     )
 
@@ -2017,7 +2191,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
         from systemu.interface.manual_event_bridge import ManualEventBridge
         ManualEventBridge.start(str(_Path(config.vault_dir).resolve()))
     except Exception:
-        logger.exception("[Daemon] manual event bridge failed to start — non-fatal")
+        logger.exception("[Daemon] manual event bridge failed to start -- non-fatal")
 
     logger.info("[Daemon] Scheduler started. PID=%d | Port=%d", os.getpid(), port)
     logger.info(
@@ -2034,7 +2208,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     # while recordings/decisions landed in whichever vault won.
     if not _dashboard_port_free(port):
         logger.critical(
-            "[Daemon] Port %d is already in use — another systemu daemon? "
+            "[Daemon] Port %d is already in use -- another systemu daemon? "
             "Refusing to start so recordings can't land in the wrong vault. "
             "Stop the other instance (`systemu daemon stop --all`) or use "
             "a different --port.", port)
@@ -2049,7 +2223,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
     _dash_missing = _od.missing_groups(("nicegui",))
     if _dash_missing:
         logger.warning(
-            "[Daemon] NO DASHBOARD — %s The daemon itself is running normally; "
+            "[Daemon] NO DASHBOARD -- %s The daemon itself is running normally; "
             "scheduled jobs, recordings and the CLI all work. Nothing will "
             "serve http://127.0.0.1:%d until you install it.",
             _od.unavailable_reason(("nicegui",)), port,
@@ -2065,7 +2239,7 @@ def _run_daemon_loop(config, vault, port: int, pid_file: Path) -> None:
 
     # Graceful shutdown on SIGTERM / SIGINT
     def _shutdown(signum, frame):
-        logger.info("[Daemon] Received signal %d — shutting down ...", signum)
+        logger.info("[Daemon] Received signal %d -- shutting down ...", signum)
         scheduler.shutdown(wait=False)
         _cleanup_runtime_files()
         sys.exit(0)

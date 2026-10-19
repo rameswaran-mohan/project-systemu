@@ -103,7 +103,56 @@ def work_row_model(snap: WorkflowSnapshot) -> Dict[str, Any]:
         "cost": summary.model_dump(mode="json"),
         "cost_chip": costing.chip_text(summary),
         "has_cost": (summary.tokens_in + summary.tokens_out) > 0,
+        # T5: what the operator's table supplied this run (None = nothing to show).
+        "table_chip": table_chip_for(snap),
     }
+
+
+def _run_ended(snap: WorkflowSnapshot) -> bool:
+    """The run has reached a terminal state (the "Run again" set, or a terminal
+    stage). Anything else -- running, parked on a gate, awaiting a confirm -- is in
+    flight."""
+    return (str(snap.status or "").lower() in _RERUN_STATUSES
+            or snap.stage in ("done", "failed"))
+
+
+def table_chip_for(snap: WorkflowSnapshot) -> Optional[Dict[str, Any]]:
+    """T5 / §5.10.c: the run's "from your table" chip model, or None.
+
+    Reads the DURABLE per-run record (``table_payoff_record.find_run`` -- a stat plus a
+    small, cached file read; a resumed run is found through its alias) and renders it
+    with ``table_payoff.run_chip_model``: "Using from your table: <item>" while the
+    run is in flight, "Answered from your table: N" once it has ended. Shared by the
+    workflow detail page. Never raises; no execution id means no chip."""
+    if not getattr(snap, "execution_id", None):
+        return None
+    try:
+        from systemu.runtime import table_payoff, table_payoff_record
+        rec = table_payoff_record.find_run(execution_id=snap.execution_id)
+        return table_payoff.run_chip_model(rec, in_flight=not _run_ended(snap))
+    except Exception:
+        return None
+
+
+def render_table_chips(model: Optional[Dict[str, Any]], *, _ui: Any = None) -> None:
+    """T5: render a ``run_chip_model`` -- token classes only (no hex, no inline
+    f-string style). In flight: one accent pill per chip. Ended: a dense expansion
+    titled "Answered from your table: N" with the items inside. Shared by the Work
+    row, the workflow detail page and the chat task card. ``_ui`` is a test seam."""
+    if not model:
+        return
+    if _ui is None:
+        from nicegui import ui as _ui
+    tip = model.get("tooltip") or ""
+    if model.get("mode") == "using":
+        with _ui.row().classes("items-center q-gutter-xs"):
+            for label in model.get("labels") or []:
+                _ui.label(label).classes("s-pill s-pill--accent").tooltip(tip)
+        return
+    with _ui.expansion(model.get("label") or "", icon="checklist") \
+            .classes("s-cell s-cell--bold").props("dense").tooltip(tip):
+        for name in model.get("items") or []:
+            _ui.label(name).classes("s-pill s-pill--muted")
 
 
 def _unlinked_activities(scrolls, activities) -> List[Dict[str, Any]]:
@@ -359,6 +408,10 @@ def _render_row(row: Dict[str, Any], on_refresh=None) -> None:
             if row.get("has_cost"):
                 ui.label(row["cost_chip"]).classes("s-pill s-pill--muted s-mono") \
                     .tooltip("LLM usage this run (cost is an estimate; edit prices in Settings)")
+
+            # T5: "Using from your table: <item>" in flight, "Answered from your
+            # table: N" (items on expand) once the run has ended.
+            render_table_chips(row.get("table_chip"))
 
             # Slice 2b: inspect-before-approve — open the unified gate card
             # (ensure_scroll_gate enqueues on demand; workflow_id == scroll_id).

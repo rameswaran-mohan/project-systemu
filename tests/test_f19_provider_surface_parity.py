@@ -582,7 +582,12 @@ def test_the_health_banner_still_warns_a_bare_machine_and_names_all_five():
 
 # ── surface 5: the first-run checklist / onboarding gate ─────────────────────
 
-def test_setup_status_key_check_accepts_any_provider():
+def test_setup_status_key_check_accepts_any_provider(monkeypatch):
+    # e2e31 (GATE-6): an Anthropic key is only "a provider" when the SDK its
+    # class imports is there, so the SDK seam is driven PRESENT and this pins
+    # "key + SDK -> ready". "Key without SDK" is the sibling test at the end.
+    from systemu.llm import providers as _providers
+    monkeypatch.setattr(_providers, "_find_spec", lambda name: object())
     from systemu.runtime.first_run import setup_status
     vault = SimpleNamespace()
     checks = {c["id"]: c for c in setup_status(_cfg(anthropic_api_key="a"), vault)}
@@ -680,3 +685,19 @@ def test_the_daemon_banner_reports_every_provider():
         assert spec.display in blob, f"{spec.display} is missing from the banner"
     blob.encode("ascii")
     assert not re.search(r"\bg\b", blob), "a credential VALUE must never be printed"
+
+
+# ── e2e31 sibling: the checklist does not admit a key whose SDK is absent ────
+
+def test_setup_status_key_check_refuses_a_key_without_its_sdk(monkeypatch):
+    """The other half of ``test_setup_status_key_check_accepts_any_provider``.
+    Same machine, same key; the SDK seam answers ABSENT. The onboarding gate
+    must not call this machine configured -- the first real call would raise
+    ``ModuleNotFoundError``."""
+    from systemu.llm import providers as _providers
+    monkeypatch.setattr(_providers, "_find_spec", lambda name: None)
+    from systemu.runtime.first_run import setup_status
+    vault = SimpleNamespace()
+    checks = {c["id"]: c for c in setup_status(_cfg(anthropic_api_key="a"), vault)}
+    assert checks["key_present"]["ok"] is False, (
+        "the checklist admitted a machine whose only provider cannot be built")

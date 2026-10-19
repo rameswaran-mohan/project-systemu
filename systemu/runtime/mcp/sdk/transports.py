@@ -1,9 +1,11 @@
 """v0.9.36 P2 — transport construction for the MCP client (SDK-isolated).
 
-The ONLY module that imports transport constructors. Everything is lazy-imported
-INSIDE functions — never at module import (no import-time SDK load, never connect
-at import). Declares client capabilities {elicitation, sampling} so connected
-servers may use them; routes server elicitation through the supplied callback
+Transport constructors come from the ONE SDK-line seam (``compat.LAYOUT``,
+D-MCP2) -- this module never names a line-specific constructor itself.
+Everything is lazy-imported INSIDE functions — never at module import (no
+import-time SDK load, never connect at import). Declares client capabilities
+{elicitation, sampling} so connected servers may use them; routes server
+elicitation through the supplied callback
 (the P1 surface seam — wired in Task 13).
 
 A transport spec is a plain dict:
@@ -11,13 +13,14 @@ A transport spec is a plain dict:
     http  : {"transport":"http"|"streamable-http","url":str,"headers":{...}?}
     sse   : {"transport":"sse","url":str,"headers":{...}?}
 
-Confirmed against mcp==1.26.0:
+Confirmed against mcp 2.3.0 and mcp 1.30.0 (both lines):
   - ClientSession(read_stream, write_stream, *, read_timeout_seconds=None,
         sampling_callback=None, elicitation_callback=None, ...) — positional
         streams + keyword callbacks.
-  - stdio_client(StdioServerParameters)         -> async cm yielding (read, write)
-  - streamablehttp_client(url=, headers=)       -> async cm yielding (read, write, get_session_id)
-  - sse_client(url=, headers=)                  -> async cm yielding (read, write)
+  - stdio_client(StdioServerParameters)  -> async cm yielding (read, write)
+  - sse_client(url=, headers=)           -> async cm yielding (read, write)
+  - streamable HTTP: see compat.open_streamable_http -- (read, write) on 2.x,
+        (read, write, get_session_id) on 1.x.
 """
 from __future__ import annotations
 
@@ -93,29 +96,26 @@ async def open_session(spec: Dict[str, Any], *,
             raise PermissionError(EGRESS_ENFORCER_UNAVAILABLE_STDIO)
 
     from mcp import ClientSession  # lazy
+    from systemu.runtime.mcp.sdk import compat  # the ONE SDK-line seam (lazy)
 
     cb = elicitation_callback or _default_elicitation_callback
 
     if transport == "stdio":
-        from mcp.client.stdio import stdio_client
-        params = build_stdio_params(spec)
-        client_cm = stdio_client(params)
+        client_cm = compat.open_stdio(build_stdio_params(spec))
     elif transport in ("http", "streamable-http"):
-        from mcp.client.streamable_http import streamablehttp_client
-        client_cm = streamablehttp_client(
-            url=str(spec.get("url") or ""),
+        client_cm = compat.open_streamable_http(
+            str(spec.get("url") or ""),
             headers=dict(spec.get("headers") or {}),
         )
     else:  # sse
-        from mcp.client.sse import sse_client
-        client_cm = sse_client(
-            url=str(spec.get("url") or ""),
+        client_cm = compat.open_sse(
+            str(spec.get("url") or ""),
             headers=dict(spec.get("headers") or {}),
         )
 
     async with client_cm as streams:
-        # stdio/sse yield (read, write); streamable-http yields
-        # (read, write, get_session_id). Take the first two either way.
+        # stdio/sse yield (read, write); streamable-http yields (read, write) on
+        # mcp 2.x and (read, write, get_session_id) on 1.x. Take the first two.
         read, write = streams[0], streams[1]
         # mcp==1.26.0 derives client capabilities from which callbacks are
         # passed: elicitation_callback advertises {elicitation}, sampling_callback
@@ -153,24 +153,28 @@ def make_sampling_callback(*, config, tier: int = 2, on_gate=None):
 
     async def _cb(context, params):  # noqa: ANN001
         import mcp.types as t
+        from systemu.runtime.mcp.sdk.schema_map import wire_field
 
         # SDK params -> plain dict (MCP-free core handles it). The optional
         # numeric fields are None when the server omits them — coerce to the
         # systemu defaults so the core's float()/int() casts never see None.
-        _temp = getattr(params, "temperature", None)
+        # D-MCP2: read by WIRE name — on mcp 2.x the attributes are
+        # system_prompt / max_tokens, and a getattr on systemPrompt / maxTokens
+        # silently dropped the server's system prompt and token ceiling.
+        _temp = wire_field(params, "temperature")
         req = {
-            "systemPrompt": getattr(params, "systemPrompt", "") or "",
-            "maxTokens": getattr(params, "maxTokens", 1024) or 1024,
+            "systemPrompt": wire_field(params, "systemPrompt", "") or "",
+            "maxTokens": wire_field(params, "maxTokens", 1024) or 1024,
             "temperature": 0.3 if _temp is None else _temp,
             "messages": [
                 {
-                    "role": getattr(m, "role", "user"),
+                    "role": wire_field(m, "role", "user"),
                     "content": {
                         "type": "text",
-                        "text": getattr(getattr(m, "content", None), "text", "") or "",
+                        "text": wire_field(wire_field(m, "content"), "text", "") or "",
                     },
                 }
-                for m in (getattr(params, "messages", []) or [])
+                for m in (wire_field(params, "messages", []) or [])
             ],
         }
         result = _sampling.route_sampling_request(
@@ -187,36 +191,65 @@ def make_sampling_callback(*, config, tier: int = 2, on_gate=None):
     return _cb
 
 
+TEST_SAMPLING_SYSTEM_PROMPT = "p4-test-sampling-system-prompt"
+TEST_SAMPLING_MAX_TOKENS = 64
+
+
 def build_test_sampling_server():
     """Hermetic in-process MCP server with one tool that asks the CLIENT to
     sample, then returns the answer. Test-only; lives here so the SDK import
-    stays isolated. Confirmed against mcp==1.26.0: lowlevel ``Server`` +
-    ``ServerSession.create_message(messages=[SamplingMessage], max_tokens=...)``.
+    stays isolated. Lowlevel ``Server`` +
+    ``ServerSession.create_message(messages=[SamplingMessage], max_tokens=...,
+    system_prompt=...)`` -- the same call on both SDK lines.
+
+    D-MCP2: handler REGISTRATION differs by line and is chosen by the ONE seam
+    (``compat.LAYOUT.lowlevel_api``): mcp 2.x takes ``on_list_tools=`` /
+    ``on_call_tool=`` constructor handlers ``(ctx, params)``; mcp 1.x uses the
+    ``@server.list_tools()`` / ``@server.call_tool()`` decorators.
     """
     import mcp.types as t
     from mcp.server.lowlevel import Server
+    from systemu.runtime.mcp.sdk import compat
+    from systemu.runtime.mcp.sdk.schema_map import wire_field
 
-    server = Server("p4-test-sampling-server")
+    tool = t.Tool(name="ask_parent", description="ask the client's model",
+                  inputSchema={"type": "object",
+                               "properties": {"q": {"type": "string"}},
+                               "required": ["q"]})
+
+    async def _ask_client(session, arguments):  # noqa: ANN001
+        # Ask the CLIENT for a completion (this triggers the client callback).
+        res = await session.create_message(
+            messages=[t.SamplingMessage(
+                role="user",
+                content=t.TextContent(type="text", text=str((arguments or {}).get("q", ""))),
+            )],
+            max_tokens=TEST_SAMPLING_MAX_TOKENS,
+            system_prompt=TEST_SAMPLING_SYSTEM_PROMPT,
+        )
+        answer = wire_field(wire_field(res, "content"), "text", "") or ""
+        return [t.TextContent(type="text", text=f"server-saw: {answer}")]
+
+    style = compat.LAYOUT.require("lowlevel_api")
+    if style == "on_handlers":  # mcp 2.x
+        async def _on_list_tools(ctx, params):  # noqa: ANN001
+            return t.ListToolsResult(tools=[tool])
+
+        async def _on_call_tool(ctx, params):  # noqa: ANN001
+            content = await _ask_client(ctx.session, wire_field(params, "arguments", {}))
+            return t.CallToolResult(content=content)
+
+        return Server("p4-test-sampling-server",
+                      on_list_tools=_on_list_tools, on_call_tool=_on_call_tool)
+
+    server = Server("p4-test-sampling-server")  # mcp 1.x: decorators
 
     @server.list_tools()
     async def _list_tools():
-        return [t.Tool(name="ask_parent", description="ask the client's model",
-                       inputSchema={"type": "object",
-                                    "properties": {"q": {"type": "string"}},
-                                    "required": ["q"]})]
+        return [tool]
 
     @server.call_tool()
     async def _call_tool(name, arguments):  # noqa: ANN001
-        # Ask the CLIENT for a completion (this triggers the client callback).
-        ctx = server.request_context
-        res = await ctx.session.create_message(
-            messages=[t.SamplingMessage(
-                role="user",
-                content=t.TextContent(type="text", text=str(arguments.get("q", ""))),
-            )],
-            max_tokens=64,
-        )
-        answer = getattr(getattr(res, "content", None), "text", "") or ""
-        return [t.TextContent(type="text", text=f"server-saw: {answer}")]
+        return await _ask_client(server.request_context.session, arguments)
 
     return server

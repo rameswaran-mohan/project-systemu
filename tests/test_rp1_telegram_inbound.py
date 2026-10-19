@@ -200,14 +200,61 @@ def test_answer_numeric_choice_maps_to_axn(monkeypatch):
     assert spy.calls[0]["choice"] == "a2"
 
 
-def test_answer_out_of_range_numeric_rejected(monkeypatch):
-    # A numeric choice outside 1..4 is not a valid key → usage hint, no resolve.
-    spy = _ResolveSpy()
-    monkeypatch.setattr(h, "resolve_from_channel", spy)
-    reply = h.handle_answer(InboundCommand(
-        user_id="123", command="answer", args="k3f7qa 9"))
-    assert "Usage" in reply or "usage" in reply
-    assert spy.calls == []
+def test_answer_out_of_range_numeric_reaches_the_resolver(monkeypatch):
+    # GATE-6 (ruled rewrite of test_answer_out_of_range_numeric_rejected): the
+    # push promises "/answer <tag> <value>", and "9" is a valid VALUE for a
+    # free-text question, so the handler can no longer reject it at parse time.
+    # It reaches the REAL resolver, which decides by the decision's kind.
+    import json
+    from systemu.messaging import decision_bridge as db
+
+    monkeypatch.setenv("SHARING_ON_TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setattr(db, "_rate_hits", {})
+
+    class _Dec:
+        def __init__(self, did, options, context, title):
+            self.id, self.options, self.title = did, list(options), title
+            self.context, self.status = dict(context), "pending"
+
+    class _Queue:
+        def __init__(self, dec):
+            self.dec, self.resolved = dec, []
+
+        def list_pending(self):
+            return [self.dec] if self.dec.status == "pending" else []
+
+        def resolve(self, did, *, choice):
+            self.resolved.append((did, choice))
+            self.dec.status = "resolved"
+
+    def _answer_nine(dec):
+        q = _Queue(dec)
+        monkeypatch.setattr(db, "_default_queue", lambda: q)
+        reply = h.handle_answer(InboundCommand(
+            user_id="123", command="answer",
+            args=f"{db.decision_tag(dec.id)} 9"))
+        return q, reply
+
+    # An option card: "9" is not one of its options -> the reply names the
+    # valid options and NOTHING is recorded.
+    card = _Dec("dec_card9", ["Deny", "Approve"],
+                {"kind": "gate", "gate_type": "tool",
+                 "resolution_class": "remotely_resolvable"}, "Run the sync")
+    q, reply = _answer_nine(card)
+    assert q.resolved == []
+    assert "Deny" in reply and "Approve" in reply
+    assert "Nothing was recorded" in reply
+
+    # A free-text question: "9" IS the answer, recorded as the structured value.
+    ask = _Dec("dec_ask9", ["Submit"],
+               {"kind": "structured_question",
+                "requested_schema": {"type": "object",
+                                     "properties": {"answer": {"type": "string"}},
+                                     "required": ["answer"]},
+                "resolution_class": "remotely_resolvable"}, "How many copies?")
+    q, reply = _answer_nine(ask)
+    assert q.resolved == [("dec_ask9", json.dumps({"answer": "9"}))]
+    assert reply == "Recorded: 9 for How many copies."
 
 
 def test_answer_missing_user_id_passes_empty(monkeypatch):

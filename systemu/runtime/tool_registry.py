@@ -715,12 +715,19 @@ class ToolRegistry:
         if result.status is InstallStatus.BLOCKED_DISABLED:
             return _install_blocked_dict(tool.name, declared, result.error or "")
         if result.status is InstallStatus.BLOCKED_PENDING_APPROVAL:
-            _maybe_enqueue_dep_gate(
-                vault=self._vault,
-                tool_id=tool.id, tool_name=tool.name,
-                package=str(result.pending_approval or declared),
-                request_count=1,
-            )
+            # ONE card per pending requirement, each naming its bare spec. This
+            # used to pass `str(result.pending_approval or declared)` -- the repr
+            # of a LIST -- so the card read "Install dependency: ['python-docx']",
+            # its dedup key carried the brackets, and Approve & Install ran
+            # `pip install "['python-docx']"`, which fails, and recorded the
+            # approval under a key the installer never checks.
+            for spec in (result.pending_approval or declared):
+                _maybe_enqueue_dep_gate(
+                    vault=self._vault,
+                    tool_id=tool.id, tool_name=tool.name,
+                    package=str(spec),
+                    request_count=1,
+                )
             return _install_pending_dict(
                 tool.name, result.pending_approval or declared, result.error or "",
             )

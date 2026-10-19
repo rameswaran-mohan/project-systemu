@@ -7,6 +7,10 @@
 .credentials.json
 **/.credentials.json
 
+# S5: the one-time PLAINTEXT copy of a secret file, taken before the daemon
+# re-encrypts it at rest (at_rest.BACKUP_SUFFIX) -- a secret, never commit.
+*.pre-encrypt.bak
+
 # ── Personal usage data (sharing_on capture sessions) ────────────────────────
 captures/
 systemu/captures/
@@ -100,6 +104,13 @@ memory_consolidation_meta.json
 
 # ── Installer-written runtime markers ─────────────────────────────────────────
 .systemu_mode
+
+# ── E2 Windows packaging build inputs (produced by systemu.winpkg.build_step) ─
+# Hundreds of MB of embeddable CPython + wheels + a compiled launcher. They are
+# BUILD OUTPUTS: `python -m systemu.winpkg.build_step` regenerates them, and the
+# generated launcher source is rendered from build_step.py, not edited here.
+packaging/windows/build/
+packaging/windows/Output/
 
 # ── Operator-local Compose overrides (keep .example, ignore actual file) ─────
 docker-compose.override.yml

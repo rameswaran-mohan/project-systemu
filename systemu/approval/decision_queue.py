@@ -25,11 +25,15 @@ Backends implement these in Task 3 (file_vault) and Task 4 (sqlite_vault).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +42,183 @@ if TYPE_CHECKING:
 
 
 _VALID_STATUS = ("pending", "resolved", "expired")
+
+# IMPL-11: the reason stamped on every card a run cancellation withdraws
+# (``context["expired_reason"]``). The run coordinates a card context carries are
+# execution_id / activity_id / chat_submission_id — no card carries a
+# root_execution_id; a resume mints a NEW execution_id but keeps the activity_id
+# and the chat_submission_id, so those two are what span the whole run.
+RUN_CANCELLED_REASON = "run cancelled"
+
+# IMPL-11: what an answer to such a card gets back, on every surface (dashboard,
+# CLI, phone). ASCII, a verdict string.
+LATE_ANSWER_NOTICE = "That run was cancelled; this answer was not needed."
+
+
+class AnswerNotNeeded(ValueError):
+    """Raised by ``resolve`` / ``resolve_with_context_patch`` for an answer to a
+    card whose run was cancelled. Nothing was recorded. ``str()`` is
+    :data:`LATE_ANSWER_NOTICE`; a ``ValueError`` so every caller that already
+    reports a refused answer (the CLI, the dashboard toasts, the phone bridge)
+    shows the notice instead of crashing.
+
+    The refusal is NOT the fence: the card's persisted ``status="expired"`` is,
+    and a caller that swallows this exception still leaves nothing resolved for
+    the resume rail to act on (DEC-32)."""
+
+    def __init__(self, decision_id: str = ""):
+        super().__init__(LATE_ANSWER_NOTICE)
+        self.decision_id = decision_id
+
+
+def was_expired_by_cancel(decision: Any) -> bool:
+    """True when ``decision`` is a card a run cancellation withdrew: status
+    ``expired`` AND the persisted ``expired_reason`` is ``run cancelled``.
+    Concrete types pinned before comparing (DEC-36) — both values are off disk."""
+    status = getattr(decision, "status", None)
+    context = getattr(decision, "context", None)
+    if type(status) is not str or status != "expired" or type(context) is not dict:
+        return False
+    reason = context.get("expired_reason")
+    return type(reason) is str and reason == RUN_CANCELLED_REASON
+
+
+def record_late_answer(decision: Any, *, channel: str = "") -> str:
+    """Write the operator-readable event for an answer that arrived after its run
+    was cancelled, and return the notice to show the answerer.
+
+    ONE writer for every surface: the queue's resolve paths call it, and so does
+    the phone bridge when it refuses a tap on such a card before reaching
+    ``resolve``. Records nothing on the decision. Best-effort: an event-log
+    failure never turns the refusal into a crash."""
+    try:
+        from systemu.interface.notifications import log_event
+        ctx = {"decision_id": getattr(decision, "id", ""),
+               "title": getattr(decision, "title", "")}
+        if channel:
+            ctx["channel"] = channel
+        log_event("INFO", "approval", LATE_ANSWER_NOTICE, ctx)
+    except Exception:
+        logger.debug("[DecisionQueue] could not write the late-answer event",
+                     exc_info=True)
+    return LATE_ANSWER_NOTICE
+
+
+# ── IMPL-11 ruling 3: the durable cancelled-run marker ─────────────────────────
+#
+# An answer given BEFORE a cancel leaves a RESOLVED card behind, which the
+# cancellation cannot expire (it only retires pending cards) - so without a record
+# of the cancel itself, the resume reconciler would re-dispatch the stopped run on
+# its next poll. Every cancel records the run here, at cancel time, before any card
+# is touched. Keyed on what the reconciler can check against a card: execution id,
+# chat submission, root execution id. NEVER the activity - a later re-run of the
+# same task shares it and must still resume.
+#
+# Store: ``<vault root>/cancelled_runs.json`` = {"version": 1, "runs": [
+#   {"at": iso, "execution_id": [...], "chat_submission_id": [...],
+#    "root_execution_id": [...]}, ...]}  - newest last, the newest
+# CANCELLED_RUNS_RETENTION entries kept. LOCK+A: _CANCELLED_RUNS_LOCK around the
+# read-modify-write, then tmp + os.replace. Writers are daemon threads only (the
+# supervisor's cancel finalizer, the chat Stop); see docs/CONC-MAP.md.
+CANCELLED_RUNS_RETENTION = 1000
+_CANCELLED_RUNS_FILE = "cancelled_runs.json"
+_CANCELLED_RUNS_LOCK = threading.Lock()
+MARKER_KEYS = ("execution_id", "chat_submission_id", "root_execution_id")
+
+
+def _cancelled_runs_path(vault: Any) -> Optional[Path]:
+    root = getattr(vault, "root", None)
+    if root is None:
+        return None
+    try:
+        return Path(root) / _CANCELLED_RUNS_FILE
+    except TypeError:
+        return None
+
+
+def _read_cancelled_runs(path: Path) -> List[Dict[str, Any]]:
+    """The recorded runs, oldest first. A missing file is no cancels; a damaged one
+    is logged LOUD and read as no cancels (the writer replaces it whole on the next
+    cancel) - it must never turn a cancel or a reconcile tick into a crash."""
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("[DecisionQueue] cancelled-run marker %s is unreadable - "
+                       "treating it as empty until the next cancel rewrites it",
+                       path, exc_info=True)
+        return []
+    runs = data.get("runs") if type(data) is dict else None
+    return [r for r in runs if type(r) is dict] if type(runs) is list else []
+
+
+def record_cancelled_run(vault: Any, marks: Dict[str, Iterable[str]]) -> bool:
+    """Durably record one cancelled run's coordinates (``MARKER_KEYS`` only).
+    Returns True when written. Best-effort: never raises."""
+    entry: Dict[str, Any] = {"at": datetime.now(tz=timezone.utc).isoformat()}
+    for key in MARKER_KEYS:
+        values = sorted({v for v in (marks.get(key) or ())
+                         if type(v) is str and v})
+        if values:
+            entry[key] = values
+    if len(entry) == 1:
+        return False
+    path = _cancelled_runs_path(vault)
+    if path is None:
+        logger.debug("[DecisionQueue] no vault root - cancelled-run marker not recorded")
+        return False
+    try:
+        with _CANCELLED_RUNS_LOCK:
+            runs = _read_cancelled_runs(path) + [entry]
+            runs = runs[-CANCELLED_RUNS_RETENTION:]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "runs": runs}, sort_keys=True),
+                           encoding="utf-8")
+            os.replace(tmp, path)
+        return True
+    except Exception:
+        logger.warning("[DecisionQueue] could not record the cancelled-run marker",
+                       exc_info=True)
+        return False
+
+
+def cancelled_run_coordinates(vault: Any) -> Set[Tuple[str, str]]:
+    """``{(key, value)}`` over every recorded cancelled run (``MARKER_KEYS``)."""
+    path = _cancelled_runs_path(vault)
+    if path is None:
+        return set()
+    out: Set[Tuple[str, str]] = set()
+    for run in _read_cancelled_runs(path):
+        for key in MARKER_KEYS:
+            values = run.get(key)
+            if type(values) is not list:
+                continue
+            out.update((key, v) for v in values if type(v) is str and v)
+    return out
+
+
+def run_was_cancelled(context: Any, marks: Set[Tuple[str, str]]) -> bool:
+    """True when a card's run is in the cancelled-run marker (``marks`` from
+    :func:`cancelled_run_coordinates`) or the card itself carries the persisted
+    cancellation reason. A card's execution id may be the run's ROOT (the root
+    execution's own cards), so execution and root ids are checked both ways."""
+    if type(context) is not dict:
+        return False
+    own = context.get("expired_reason")
+    if type(own) is str and own == RUN_CANCELLED_REASON:
+        return True
+    chat = context.get("chat_submission_id")
+    if type(chat) is str and chat and ("chat_submission_id", chat) in marks:
+        return True
+    for key in ("execution_id", "root_execution_id"):
+        value = context.get(key)
+        if type(value) is str and value and (
+                ("execution_id", value) in marks
+                or ("root_execution_id", value) in marks):
+            return True
+    return False
 
 
 def _metrics(vault: "Vault"):
@@ -54,6 +235,62 @@ def _metrics(vault: "Vault"):
 
     from systemu.runtime.metrics_store import MetricsStore
     return MetricsStore(_Path(vault.root) / "metrics")
+
+
+# IMPL-11 ruling 2: which cards ``activity_id`` ALONE may match. A RUN posts these
+# while it executes (they carry its coordinates via the run's contextvars), so a
+# card of this type naming the activity belongs to a run of it. Every other card
+# that names an activity is ABOUT the activity - its tools, its scroll, its shadow -
+# and outlives any one run (approving "Task blocked -- N tool(s) not ready" enables
+# tools for every future run), so one run's cancel never withdraws it on the
+# activity alone. Every gate type in the tree must sit in exactly one of the two
+# gate sets (pinned by tests/test_impl11_activity_scoped_cards.py).
+RUN_SCOPED_GATE_TYPES = frozenset({
+    "tool", "command", "harness", "mcp_call", "mcp_oauth", "sampling", "operator",
+})
+ACTIVITY_SCOPED_GATE_TYPES = frozenset({
+    "tools_blocked", "forge", "dep", "scroll", "evolution", "recovery", "tool_bulk",
+})
+RUN_SCOPED_KINDS = frozenset({"structured_question"})
+
+
+def _is_run_scoped(context: Dict[str, Any]) -> bool:
+    """True for a card a run posts while it executes (allowlist: an unknown or
+    absent kind is NOT run-scoped). Types pinned before membership (DEC-36)."""
+    kind = context.get("kind")
+    if type(kind) is not str:
+        return False
+    if kind in RUN_SCOPED_KINDS:
+        return True
+    gate_type = context.get("gate_type")
+    return (kind == "gate" and type(gate_type) is str
+            and gate_type in RUN_SCOPED_GATE_TYPES)
+
+
+def _belongs_to_run(context: Any, run: Dict[str, str], activity_id: str) -> bool:
+    """A pending card belongs to the cancelled run when it carries one of the run's
+    own coordinates (execution / chat submission), or names the run's activity AND
+    is a run-scoped card type."""
+    if type(context) is not dict:
+        return False
+    if _carries_run_coordinate(context, run):
+        return True
+    if not activity_id:
+        return False
+    got = context.get("activity_id")
+    return (type(got) is str and got == activity_id) and _is_run_scoped(context)
+
+
+def _carries_run_coordinate(context: Any, wanted: Dict[str, str]) -> bool:
+    """True when ``context`` (a card context off disk) carries any of ``wanted``'s
+    run coordinates. ``type(x) is T`` before any comparison (DEC-36)."""
+    if type(context) is not dict:
+        return False
+    for key, value in wanted.items():
+        got = context.get(key)
+        if type(got) is str and got and got == value:
+            return True
+    return False
 
 
 @dataclass
@@ -332,6 +569,7 @@ class OperatorDecisionQueue:
             decision = self._vault.get_decision(decision_id)
         except Exception as exc:
             raise KeyError(f"OperatorDecision {decision_id} not found: {exc}")
+        self._refuse_if_run_cancelled(decision)
         # v0.8.19 (R3): structured-question answers are JSON, not an option label —
         # skip the membership check for that kind; plain decisions stay strict.
         # v0.9.35 (P1): an elicitation FORM gate (carries a non-empty
@@ -375,6 +613,7 @@ class OperatorDecisionQueue:
             decision = self._vault.get_decision(decision_id)
         except Exception as exc:
             raise KeyError(f"OperatorDecision {decision_id} not found: {exc}")
+        self._refuse_if_run_cancelled(decision)
         # Same membership contract as resolve(): capability gates carry
         # options=["Deny","Approve"], so choice="Approve" passes the strict check.
         _ctx = decision.context or {}
@@ -535,7 +774,112 @@ class OperatorDecisionQueue:
             pass
         return True
 
+    def expire_cards_for_run(
+        self,
+        *,
+        execution_id: Optional[str] = None,
+        activity_id: Optional[str] = None,
+        chat_submission_id: Optional[str] = None,
+        decision_id: Optional[str] = None,
+        root_execution_id: Optional[str] = None,
+    ) -> List[str]:
+        """IMPL-11: withdraw every PENDING card that belongs to a cancelled run.
+
+        THE one place a run cancellation retires its decision cards. Called from
+        the supervisor's CANCELLED finalizer (``Supervisor._expire_cards_on_cancel``,
+        the sink of request_cancel / request_cancel_by_activity / a run that
+        finalizes ``cancelled`` itself) and from the chat Stop
+        (``chat_task_registry._withdraw_gate``, with the row's coordinates and
+        the exact parked card).
+        A card belongs to the run when its context carries one of the run's own
+        coordinates (``execution_id`` / ``chat_submission_id``), when it names the
+        run's ``activity_id`` AND is a run-scoped card type (``_is_run_scoped`` —
+        an activity-scoped card such as ``tools_blocked`` is never withdrawn on the
+        activity alone), or when it IS ``decision_id`` (the card a caller knows the
+        run is parked on, even if that card carries no coordinates). Each match becomes
+        ``status="expired"`` with ``context["expired_reason"] = "run cancelled"``
+        — the persisted witness a late answer and the resume reconciler key off.
+
+        FIRST it records the run in the durable cancelled-run marker
+        (:func:`record_cancelled_run`: execution / chat submission / root, plus each
+        expired card's own execution and chat submission), so an answer given
+        BEFORE the cancel - a resolved card this function cannot expire - never
+        resumes the run either (IMPL-11 ruling 3; the reconciler consults it).
+        ``root_execution_id`` is a marker coordinate only: no card carries it.
+
+        No coordinate given -> nothing expires (never "match all"). Coordinates
+        are compared only after their concrete type is pinned to a non-empty
+        ``str`` in this frame: a card context is data off disk (DEC-36).
+        Idempotent. Returns the ids it expired.
+        """
+        run = {}
+        for key, value in (("execution_id", execution_id),
+                           ("chat_submission_id", chat_submission_id)):
+            if type(value) is str and value:
+                run[key] = value
+        activity = activity_id if (type(activity_id) is str and activity_id) else ""
+        exact = decision_id if (type(decision_id) is str and decision_id) else ""
+        if not run and not activity and not exact:
+            return []
+        matched = [d for d in self.list_pending()
+                   if d.id == exact or _belongs_to_run(d.context, run, activity)]
+        marks: Dict[str, set] = {key: set() for key in MARKER_KEYS}
+        for key, value in run.items():
+            marks[key].add(value)
+        if type(root_execution_id) is str and root_execution_id:
+            marks["root_execution_id"].add(root_execution_id)
+        for decision in matched:
+            ctx = decision.context if type(decision.context) is dict else {}
+            for key in ("execution_id", "chat_submission_id"):
+                value = ctx.get(key)
+                if type(value) is str and value:
+                    marks[key].add(value)
+        record_cancelled_run(self._vault, marks)
+        expired: List[str] = []
+        for decision in matched:
+            decision.status = "expired"
+            decision.resolved_at = datetime.now(tz=timezone.utc)
+            decision.context = {**(decision.context or {}),
+                                "expired_reason": RUN_CANCELLED_REASON}
+            self._vault.save_decision(decision)
+            expired.append(decision.id)
+            logger.info("[DecisionQueue] expired %s (dedup_key=%r) — run cancelled",
+                        decision.id, decision.dedup_key)
+            self._publish_expired(decision, reason=RUN_CANCELLED_REASON)
+        return expired
+
     # ── Private helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _refuse_if_run_cancelled(decision: "OperatorDecision") -> None:
+        """IMPL-11: an answer to a card whose run was cancelled records nothing.
+        Runs BEFORE any mutation or save in both resolving paths: no status
+        change, no choice, no resolved event (so neither resume path fires), no
+        approval metric — only the operator-readable event, then the notice."""
+        if was_expired_by_cancel(decision):
+            record_late_answer(decision)
+            raise AnswerNotNeeded(decision.id)
+
+    def _publish_expired(self, decision: "OperatorDecision", *, reason: str) -> None:
+        """Best-effort ``operator_decision_expired`` event (same shape as
+        ``expire_by_dedup_key``'s, plus the reason) so the chat inline card and
+        the Needs-you rail drop the withdrawn card. Never blocks the saved status."""
+        try:
+            from systemu.interface.event_bus import EventBus
+            EventBus.get().publish({
+                "ts": decision.resolved_at.isoformat() if decision.resolved_at else "",
+                "level": "INFO",
+                "message": f"Expired: {decision.title}",
+                "category": "operator_decision_expired",
+                "context": {
+                    "decision_id": decision.id,
+                    "dedup_key": decision.dedup_key,
+                    "reason": reason,
+                    "chat_submission_id": (decision.context or {}).get("chat_submission_id"),
+                },
+            })
+        except Exception:
+            pass
 
     def _publish_resolved(self, decision: "OperatorDecision") -> None:
         """v0.8.22 (C): emit the EventBus event so the chat UI hides the inline card and

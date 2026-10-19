@@ -44,6 +44,28 @@ def _requirement_report() -> dict:
                                     req("missing")]}}
 
 
+def _record_runs(prefix: str) -> None:
+    """Four runs through the PRODUCTION record writer (no ``data_dir``, exactly as
+    ``shadow_runtime`` calls it), three of which the table answered -- the witnessed
+    ``75% (3/4 ...)`` shape, in the durable record."""
+    from systemu.core.models import Requirement, RequirementReport
+    from systemu.runtime import table_payoff_record as tpr
+    from systemu.runtime.situational_inventory import SituationReport, compose_table
+    from systemu.runtime.table_store import TableItem
+    item = TableItem(id="t-1", kind="service", name="recipient",
+                     ref={"server": "https://example.invalid/t1"})
+    hit = Requirement(kind="decision", schema_path="/a", state="have",
+                      source="situation", value_origin="content_derived",
+                      confidence=0.8, table_item_id="t-1")
+    for i, reqs in enumerate(([hit], [hit], [hit], [])):
+        status = tpr.record_binder_pass(
+            RequirementReport(per_objective={1: reqs}),
+            compose_table(SituationReport(), [item]),
+            root_execution_id=f"{prefix}{i}", execution_id=f"{prefix}{i}",
+            site="midloop")
+        assert status["consulted"] and status["error"] is None, status
+
+
 def _layout(tmp_path, monkeypatch):
     """A home with a vault, an unrelated directory to stand in, and the ONE env
     var both processes share in the witnessed repro."""
@@ -68,23 +90,22 @@ def _run_report(monkeypatch, vault_dir):
 # THE PIN: writer and reader agree across two working directories
 # --------------------------------------------------------------------------- #
 
-def test_the_inventory_hit_block_reads_the_writers_snapshot_from_another_cwd(
+def test_the_inventory_hit_block_reads_the_writers_record_from_another_cwd(
         tmp_path, monkeypatch):
-    """Write through the PRODUCTION writer path (no ``data_dir``, exactly as
-    ``shadow_runtime`` calls it) standing in the home; read from somewhere else."""
+    """Write through the PRODUCTION record-writer path (no ``data_dir``, exactly as
+    ``shadow_runtime`` calls it) standing in the home; read from somewhere else.
+    (Re-pointed from the retired resume-snapshot reader to the durable record.)"""
     home, elsewhere, vault_dir = _layout(tmp_path, monkeypatch)
 
     monkeypatch.chdir(home)
-    written = write_snapshot(ExecutionSnapshot(
-        execution_id="d1a", shadow_id="sh", scroll_id="sc",
-        requirement_report=_requirement_report()))
-    assert written is not None and written.is_file(), "fixture premise: a snapshot"
+    _record_runs("exec_d1a")
+    assert (home / "data" / "audit" / "table_payoff").is_dir(), "fixture premise"
 
     monkeypatch.chdir(elsewhere)
     out = _run_report(monkeypatch, vault_dir)
 
-    assert "Inventory-hit rate: 75% (3/4" in out, out
-    assert "Inventory-hit: NOT MEASURED" not in out, (
+    assert "Inventory-hit (table record): 75% of runs (3/4" in out, out
+    assert "Inventory-hit (table record): NOT MEASURED" not in out, (
         "the reader answered from the operator's cwd, not from the minted root")
 
 
@@ -116,8 +137,11 @@ def test_the_not_measured_line_names_the_directory_it_searched(
     monkeypatch.chdir(elsewhere)
     out = _run_report(monkeypatch, vault_dir)
 
-    assert "Inventory-hit: NOT MEASURED" in out, out
-    assert str(home / "data" / "audit") in out, (
+    line = next((ln for ln in out.splitlines()
+                 if ln.startswith("Inventory-hit (table record):")), None)
+    assert line is not None and "NOT MEASURED" in line, out
+    assert "NOT 0%" in line, line
+    assert str(home / "data" / "audit" / "table_payoff") in out, (
         "the unmeasured verdict does not name the directory it searched:\n" + out)
 
 

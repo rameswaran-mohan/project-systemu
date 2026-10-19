@@ -280,6 +280,7 @@ def _render_decision_push(
     detail (the gateway masks again).
     """
     from .decision_bridge import (
+        answer_example,
         callback_token,
         render_options,
         SURFACE_BUTTONS,
@@ -323,9 +324,11 @@ def _render_decision_push(
         )
 
     if surface_hint == SURFACE_REPLY:
+        # The example is printed from the SAME grammar the /answer handler
+        # parses (decision_bridge.answer_example / parse_answer_args).
         return OutboundMessage(
             text=(f"🔔 {headline}{detail}\n\n"
-                  f"Reply with /answer {tag} <value>."),
+                  f"Reply with {answer_example(tag)}."),
             category="approval",
         )
 

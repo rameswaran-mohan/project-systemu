@@ -28,9 +28,10 @@ than inferred from our own output — absence is not evidence (§5.11 read-side 
 The operator CLI still shows the stored fields: it is off every decision path.
 
 SCOPE (W-A final slice, R-W1). The slice-2c deferral is now CLOSED. This module is the
-read API + its fence, and it is reached from exactly two live surfaces:
+read API + its fence, and it is reached from exactly three live surfaces:
 
-  * :func:`goal_view` — the §5.11.b inversion. ``situational_inventory`` composes a
+  * :func:`goal_view_with_digest` (and its rows-only twin :func:`goal_view`) — the
+    §5.11.b inversion. ``situational_inventory`` composes a
     goal-conditioned RANKED view over the store into ``SituationReport.world_facts``,
     and ``render_situation_for_prompt`` renders those rows through
     :func:`render_facts_for_prompt`. The report now READS the store (it previously only
@@ -47,15 +48,22 @@ read API + its fence, and it is reached from exactly two live surfaces:
     that is a single JSON-response LLM call with no tools; the tool belongs to the
     EXECUTING agent's decision loop. So "trim, because more can be queried" holds
     across the run, not within the planner call. Documented rather than papered over:
-    the planner sees a trimmed world it cannot itself widen.
+    the planner sees a trimmed world it cannot itself widen. What it CAN see is how much
+    was trimmed: the view carries one fenced digest line (:func:`trim_digest_line`)
+    naming how many facts of which kinds its budget left out.
+  * :func:`render_negative_citations` — the run HANDOFF (``shadow_runtime``'s summary
+    composer) cites the negative facts the run consulted. It reads only the per-run
+    consultation record ``world_model`` keeps, never the store, and it is
+    operator-facing text, not a prompt.
 
-Both go through :func:`fenced_row`, so there is ONE place where a stored fact becomes
-prompt-facing bytes and ONE field allowlist to audit.
+The first two go through :func:`fenced_row`, so there is ONE place where a stored fact
+becomes prompt-facing bytes and ONE field allowlist to audit.
 """
 from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from systemu.runtime import world_model as _wm
@@ -140,7 +148,8 @@ def _row_of(item: Any, survey: Optional[Any] = None) -> dict:
 
 
 def render_facts_for_prompt(facts: List[Any], *, query: str = "",
-                            survey: Optional[Any] = None) -> str:
+                            survey: Optional[Any] = None,
+                            not_shown: Optional[Any] = None) -> str:
     """Render world.query results as a FENCED, deterministic JSON block (WM-15).
 
     Results describe WHAT EXISTS; they are never instructions. Uses the same
@@ -148,7 +157,13 @@ def render_facts_for_prompt(facts: List[Any], *, query: str = "",
     already wraps the SituationReport, so there is ONE fence implementation to audit.
 
     Accepts live ``Fact`` objects (the tool path) or pre-composed rows (the report
-    path) — see :func:`_row_of`."""
+    path) — see :func:`_row_of`.
+
+    ``not_shown`` is the composed view's trim remainder (``{kind: count}``, see
+    :func:`goal_view_with_digest`). When it is non-empty, ONE digest line from
+    :func:`trim_digest_line` is appended INSIDE the same fence, after the JSON line —
+    it describes the store, so it is fenced like every other world-model read. With no
+    remainder the block is byte-identical to what it was before the digest existed."""
     try:
         body = json.dumps(
             {"query": str(query or ""),
@@ -156,7 +171,74 @@ def render_facts_for_prompt(facts: List[Any], *, query: str = "",
             sort_keys=True, default=str)
     except Exception:
         body = json.dumps({"query": str(query or ""), "results": []}, sort_keys=True)
+    digest = trim_digest_line(not_shown)
+    if digest:
+        body = f"{body}\n{digest}"
     return fence(body)
+
+
+# ── the trim digest: the view says what its budget left out ──────────────────
+
+#: Bounds on the digest, so a poisoned snapshot cannot turn one line into a flood. A
+#: real store has a handful of kinds; past the cap the remaining kinds are folded into
+#: one ``other kinds`` entry whose count keeps the total EXACT.
+_DIGEST_MAX_KINDS = 16
+_DIGEST_MAX_KIND_LEN = 64
+
+
+def _ascii_one_line(text: str, cap: int) -> str:
+    """ASCII-only, single-line, bounded. Non-ASCII is backslash-escaped (never dropped
+    silently) and every control character becomes a space, so a kind cannot forge a
+    second line inside the fence."""
+    s = str(text).encode("ascii", "backslashreplace").decode("ascii")
+    s = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in s)
+    return s[:cap]
+
+
+def _valid_not_shown(not_shown: Any) -> dict:
+    """Re-validate a ``{kind: count}`` remainder. It rides ``model_dump()`` into a
+    persisted snapshot, so at render time it is UNTRUSTED input: only ``str`` kinds with
+    ``int`` counts > 0 survive. ``type(x) is T`` rather than ``isinstance`` (DEC-36): a
+    ``bool`` is an ``int`` subclass and must not read as a count. Never raises."""
+    out: dict = {}
+    try:
+        if type(not_shown) is not dict:
+            return {}
+        for kind, count in not_shown.items():
+            if type(kind) is not str or type(count) is not int or count <= 0:
+                continue
+            if not kind.strip():
+                continue
+            out[kind] = count
+    except Exception:
+        return {}
+    return out
+
+
+def trim_digest_line(not_shown: Any) -> str:
+    """The one-line digest of a trimmed view: ``"N more facts not shown: <kind> x<count>,
+    ..."``. ``""`` when nothing was trimmed (or the input is unusable).
+
+    Deterministic: kinds ordered by count descending, then kind ascending. ``N`` is the
+    exact total. ASCII-only. A DESCRIPTION of the store, never an instruction — and it
+    deliberately does not tell the reader to call ``world_query``: its main consumer
+    is the open-world planner, a single tool-less LLM call (see the note in
+    ``situational_inventory.render_situation_for_prompt``). The kinds it names are
+    what the executing agent's ``world_query`` ``about(<kind>)`` view reaches.
+    Never raises."""
+    try:
+        counts = _valid_not_shown(not_shown)
+        if not counts:
+            return ""
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        shown, rest = ordered[:_DIGEST_MAX_KINDS], ordered[_DIGEST_MAX_KINDS:]
+        parts = [f"{_ascii_one_line(k, _DIGEST_MAX_KIND_LEN)} x{c}" for k, c in shown]
+        if rest:
+            parts.append(f"other kinds x{sum(c for _k, c in rest)}")
+        total = sum(counts.values())
+        return f"{total} more facts not shown: {', '.join(parts)}"
+    except Exception:
+        return ""
 
 
 def render_provenance_for_prompt(fact_id: str, steps: Optional[List[Any]]) -> str:
@@ -201,6 +283,108 @@ def render_negative_for_prompt(neg: Any) -> str:
     return fence(body)
 
 
+# ── WM-2 / §5.11 AC2: the run HANDOFF cites the negative facts the run consulted ─
+# The operator-facing counterpart of :func:`render_negative_for_prompt`. Composed into a
+# handoff / terminal summary by ``shadow_runtime._augment_summary_with_committed_effects``
+# so the operator can see WHY the agent concluded something was unavailable: what was
+# probed, who asserted the absence, and how old it is.
+#
+# It renders ONLY from ``world_model.consulted_negatives`` — the per-run record the
+# store writes when the run itself writes or reads a negative — so it never opens the
+# store and never infers attribution. Plain ASCII text rather than a nonce'd fence: it
+# is a summary for a person, and a negative fact can never be ``content_derived``
+# (``NegativeFact`` refuses it), so every cited value was asserted by systemu or the
+# operator. Each value is still sanitised to one bounded ASCII line, so a scope or probe
+# can never forge a line of its own. It DESCRIBES; it authorizes nothing (DEC-26).
+
+NEGATIVE_CITATION_HEADER = (
+    "Searched and not found during this run (world-model negative facts; cited to "
+    "explain the outcome, they authorize nothing):")
+
+#: At most this many absences are listed; the rest are COUNTED on one more line rather
+#: than dropped silently.
+NEGATIVE_CITATION_LIMIT = 5
+
+_CITE_MAX_SCOPE_LEN = 120
+_CITE_MAX_PROBE_LEN = 120
+_CITE_MAX_PROBES = 8
+
+
+def _age_text(recorded_at: Any, now: Optional[str]) -> str:
+    """Compact age (``45s`` / ``12m`` / ``3h`` / ``2d``) of ``recorded_at`` at ``now``
+    (current time when None). ``unknown`` for an unparseable stamp; a stamp in the
+    future (clock skew) reads ``0s``. Never raises."""
+    try:
+        rec = _wm._as_dt(str(recorded_at))
+        cur = _wm._as_dt(now) if now else datetime.now(timezone.utc)
+        secs = max(0, int((cur - rec).total_seconds()))
+    except Exception:
+        return "unknown"
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def _newest_first_key(neg: Any) -> tuple:
+    try:
+        return (0, -_wm._as_dt(str(getattr(neg, "recorded_at", ""))).timestamp(),
+                str(getattr(neg, "scope", "")))
+    except Exception:
+        return (1, 0.0, str(getattr(neg, "scope", "")))
+
+
+def format_negative_citations(negs: Any, *, now: Optional[str] = None,
+                              limit: int = NEGATIVE_CITATION_LIMIT) -> str:
+    """The handoff citation block for ``negs``: :data:`NEGATIVE_CITATION_HEADER`, then
+    at most ``limit`` lines NEWEST FIRST, each naming the scope, its source (who
+    asserted the absence), what was probed, and its age — with ``, expired`` when the
+    note's TTL has run out (it still bore on the run; the age says how much). Any
+    remainder is counted on one ``(N more not listed)`` line. ``""`` when there is
+    nothing to cite. Pure, deterministic for a fixed ``now``, ASCII-only. Never
+    raises."""
+    try:
+        rows = sorted(list(negs or []), key=_newest_first_key)
+        if not rows:
+            return ""
+        cap = max(0, int(limit))
+        lines = [NEGATIVE_CITATION_HEADER]
+        for n in rows[:cap]:
+            scope = _ascii_one_line(getattr(n, "scope", "") or "-", _CITE_MAX_SCOPE_LEN)
+            origin = _ascii_one_line(getattr(n, "origin_class", "") or "-", 40)
+            probes = [_ascii_one_line(p, _CITE_MAX_PROBE_LEN)
+                      for p in list(getattr(n, "probes", None) or [])[:_CITE_MAX_PROBES]]
+            try:
+                expired = bool(n.is_expired(now))
+            except Exception:
+                expired = True
+            age = _age_text(getattr(n, "recorded_at", ""), now)
+            lines.append(
+                f"  - {scope}: searched, not found (source: {origin}; "
+                f"probed: {' | '.join(probes) or '-'}; "
+                f"age: {age}{', expired' if expired else ''})")
+        if len(rows) > cap:
+            lines.append(f"  - ({len(rows) - cap} more not listed)")
+        return "\n".join(lines)
+    except Exception:
+        logger.debug("[world-model] negative citation render skipped", exc_info=True)
+        return ""
+
+
+def render_negative_citations(execution_id: Optional[str], *,
+                              now: Optional[str] = None) -> str:
+    """The citation block for the negative facts run ``execution_id`` consulted, or
+    ``""`` when it consulted none (or the id is blank/unknown). Reads only the per-run
+    consultation record, never the store. Never raises."""
+    try:
+        return format_negative_citations(_wm.consulted_negatives(execution_id), now=now)
+    except Exception:
+        return ""
+
+
 # ── §5.11.b: the SituationReport as a goal-conditioned ranked VIEW ────────────
 
 #: How many fact rows the composed report view may carry into the planner prompt.
@@ -241,25 +425,49 @@ def goal_view(vault: Any, goal: str = "",
     decision rather than a subtraction.
 
     FAIL-SAFE: never raises. An absent, empty or broken store yields ``[]``, which is
-    byte-identical downstream to the feature being absent (§5.11.f risk-5)."""
+    byte-identical downstream to the feature being absent (§5.11.f risk-5).
+
+    The rows only; :func:`goal_view_with_digest` also returns what the trim left out."""
+    return goal_view_with_digest(vault, goal, limit)[0]
+
+
+def goal_view_with_digest(vault: Any, goal: str = "",
+                          limit: int = DEFAULT_VIEW_LIMIT) -> "tuple[List[dict], dict]":
+    """:func:`goal_view`'s rows PLUS the trim remainder ``{kind: count}``.
+
+    The remainder is what the view BUDGET cut: facts that would have been shown but for
+    ``limit``. Before it existed the remainder was dropped silently, so a planner shown
+    twelve rows could not tell a twelve-fact store from a two-hundred-fact one.
+    ``unconfirmed`` facts are NOT counted — they are excluded on staleness grounds
+    (the survey covered them and did not re-see them), and counting them in a "more
+    facts not shown" line would re-introduce the very "this may exist" signal the drop
+    removes. Both they and the counted remainder stay reachable through the
+    ``world_query`` tool (``about(<kind>)``), which is what makes the trim a view
+    decision rather than a subtraction.
+
+    An untrimmed view returns ``{}``. FAIL-SAFE: never raises; any failure yields
+    ``([], {})``."""
     try:
         store = _wm.FactStore(vault)
         survey = store.latest_survey()
         rows: List[dict] = []
+        not_shown: dict = {}
         cap = max(0, int(limit))
         for f in _wm.ranked_view(store, str(goal or "")):
-            if len(rows) >= cap:
-                break
             try:
                 if _wm.staleness_of(f, survey) == "unconfirmed":
+                    continue
+                if len(rows) >= cap:
+                    kind = str(getattr(f, "kind", "") or "") or "(no kind)"
+                    not_shown[kind] = not_shown.get(kind, 0) + 1
                     continue
                 rows.append(fenced_row(f, survey))
             except Exception:
                 continue                       # one bad fact never empties the view
-        return rows
+        return rows, not_shown
     except Exception:
         logger.debug("[world-model] goal view skipped (non-fatal)", exc_info=True)
-        return []
+        return [], {}
 
 
 # ── WM-4: the registered ``world.query`` tool family ─────────────────────────

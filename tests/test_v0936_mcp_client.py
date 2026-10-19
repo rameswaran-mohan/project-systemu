@@ -63,8 +63,17 @@ class TestSdkApiSpike:
     def test_transport_clients_importable(self):
         from mcp.client.stdio import stdio_client  # noqa: F401
         # Remote transports — confirm module paths (adjust if relocated).
-        from mcp.client.streamable_http import streamablehttp_client  # noqa: F401
+        # D-MCP2: mcp 2.x removed `streamablehttp_client`; its successor in the
+        # same module is `streamable_http_client` (also on mcp >= 1.24). One of
+        # the two must be importable from mcp.client.streamable_http, and it
+        # must be the one the ONE seam selected.
+        import mcp.client.streamable_http as sh
         from mcp.client.sse import sse_client  # noqa: F401
+        from systemu.runtime.mcp.sdk.compat import LAYOUT
+        factory = getattr(sh, "streamable_http_client", None) or \
+            getattr(sh, "streamablehttp_client")
+        assert callable(factory)
+        assert LAYOUT.streamable_http_factory is factory
 
     def test_server_module_for_hermetic_fixture(self):
         # The hermetic reference server (Task 3) uses the SDK's server module
@@ -849,6 +858,9 @@ class TestDiscoverAndPin:
                                 "args": [REF_SERVER], "env": {}})
         out = mc.discover_and_pin(mcp_vault, "stdio:ref")
         assert out["success"] is True
+        # D-MCP2: non-vacuity -- with the reference server unable to start, the
+        # loop below ran over [] and this test passed on mcp 2.x.
+        assert {"echo", "delete_thing"} <= {t["name"] for t in out["tools"]}
         # every discovered tool now has a pinned hash
         for t in out["tools"]:
             assert c.get_tool_hash(mcp_vault, "stdio:ref", t["name"]) is not None

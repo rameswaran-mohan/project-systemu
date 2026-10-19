@@ -42,14 +42,18 @@ WHY THERE IS NO "WHAT LEAVES THIS MACHINE" CLAUSE HERE
         so this is the DEFAULT install, not an opt-in;
       * "your chosen model provider" is also wrong for the common case: a
         ``google/*`` or ``anthropic/*`` tier on an OpenRouter-only box transits
-        openrouter.ai (``runtime/privacy.py:60-69`` names the DESTINATION on
-        purpose, not the model vendor).
+        openrouter.ai (``runtime.privacy._destination`` names the DESTINATION
+        on purpose, not the model vendor).
 
-    ``runtime/privacy.privacy_report`` is the shipped mint that already states
-    all of this, and ``/privacy`` is the page that renders it. So the card
-    carries NO transmission claim and links there instead. Restoring a
-    transmission clause needs an operator ruling on the wording, not a patch
-    here.
+    ``runtime/privacy.privacy_report`` is the shipped mint that states all of
+    this - the search relay, the page-read relay, the place-lookup hosts, the
+    MCP servers the operator connected, and Telegram when it is configured,
+    each derived from the value the product reads - and ``/privacy`` is the
+    page that renders it. So the card carries NO transmission claim and links
+    there instead (ruled 2026-08-14; permanent). Restoring a transmission
+    clause needs an operator ruling on the wording, not a patch here.
+    ``tests/test_privacy_disclosure.py`` pins that every third party named in
+    ``TRANSMISSION_OMISSION_REASON`` is disclosed on the page it points at.
 """
 from __future__ import annotations
 

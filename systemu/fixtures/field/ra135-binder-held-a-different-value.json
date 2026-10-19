@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "id": "ra135-binder-held-a-different-value",
+  "title": "The resolver would have bound a DIFFERENT value than the operator gave — the ask was necessary",
+  "provenance": {
+    "release": "R-A13.5",
+    "source_test": "authored for the replay: the discriminating case a proxy cannot see",
+    "added": "2026-07-21"
+  },
+  "objective": {
+    "id": 1,
+    "goal": "write the summary",
+    "success_criteria": "the summary exists"
+  },
+  "capability": {
+    "name": "write_doc",
+    "parameters_schema": {
+      "output_dir": { "type": "string", "description": "where to write the document" }
+    },
+    "effect_tags": []
+  },
+  "situation": {
+    "services": [],
+    "capabilities": [],
+    "roots": [],
+    "credentials": [],
+    "profile": {
+      "name": "Op",
+      "location_text": "NYC",
+      "timezone": "UTC",
+      "default_output_dir": "{root}/stale-default"
+    },
+    "declared_intents": []
+  },
+  "asks": [
+    {
+      "schema_path": "output_dir",
+      "class": "input",
+      "operator_answer": "{root}/the-actual-place",
+      "label": "necessary",
+      "why": "This is the case that separates a replay from an aggregator. The binder DID hold a candidate (the profile spine default), so any 'did it try?' proxy scores this ask as resolved-and-therefore-avoidable. But the candidate was WRONG: the operator redirected the output elsewhere. Asking was correct, and a silent bind would have written to the stale directory. Only re-running the resolver and comparing against the answer can tell this apart from ra10-profile-spine-output-dir, whose situation is structurally identical."
+    }
+  ]
+}
