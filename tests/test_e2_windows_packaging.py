@@ -22,7 +22,7 @@ import subprocess
 import sys
 import zipfile
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -575,7 +575,12 @@ def test_every_iss_build_input_is_produced_by_the_build_step(tmp_path):
     resolved = []
     for source in sources:
         concrete = source.replace("{#AppExeName}", exe_name).rstrip("\\*")
-        resolved.append((ISS_PATH.parent / concrete).resolve())
+        # An Inno Source is a WINDOWS path on every host that reads the script.
+        # Split it as one before joining: on Linux and macOS a backslash is an
+        # ordinary filename character, and `parent / "build\\embeddable"` is a
+        # single component that no build step could ever produce.
+        parts = PureWindowsPath(concrete).parts
+        resolved.append(ISS_PATH.parent.joinpath(*parts).resolve())
 
     assert resolved == list(produced), (
         "an [Files] Source has no producer in systemu.winpkg.build_step; "
