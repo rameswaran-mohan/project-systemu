@@ -31,9 +31,43 @@ Escape hatches, both explicit and in the test's own source:
 
 This does NOT weaken any gate: the gate still fires either way.
 """
+import os
+
 import pytest
 
 _TEST_POLL_TIMEOUT_S = 2.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STATE RESET - the process environment is the same at the end of every test
+#  as it was at the start.
+#
+#  Several product surfaces persist a setting by ALSO writing it into the live
+#  process environment (``gate_mode_settings.save`` sets SYSTEMU_GATE_MODE,
+#  the settings page sets SYSTEMU_STUCK_GUARD, the dashboard sets
+#  SYSTEMU_DASHBOARD_PORT, ...). That is correct for a daemon and fatal for a
+#  test process: ``monkeypatch.delenv(name, raising=False)`` on a name that is
+#  NOT set records nothing to undo, so the value the code under test writes
+#  outlives the test and silently reconfigures every later test in the same
+#  process (a later scroll-approval test ran under SYSTEMU_GATE_MODE=bypass).
+#
+#  DEC-44: this replaces no product behaviour and stubs nothing. It restores
+#  a snapshot of ``os.environ`` after the test (and after its fixtures have
+#  torn down, because it is set up first), so every test starts from the
+#  environment the session started with. It cannot turn a red test green: a
+#  test that relied on an earlier test's leaked variable was order-dependent.
+# ─────────────────────────────────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def _restore_process_environment():
+    before = dict(os.environ)
+    yield
+    if dict(os.environ) == before:
+        return
+    for key in [k for k in os.environ if k not in before]:
+        os.environ.pop(key, None)
+    for key, value in before.items():
+        if os.environ.get(key) != value:
+            os.environ[key] = value
 
 
 def resolve_gate_as_denied(vault, dedup_key: str, *, title: str = "gate"):
