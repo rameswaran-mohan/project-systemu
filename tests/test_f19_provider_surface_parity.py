@@ -667,8 +667,17 @@ def test_config_validate_accepts_any_provider_and_names_all_when_none():
     for spec in ps.PROVIDER_SPECS:
         assert spec.env in errs[0], f"{spec.display} is not offered"
 
+    # The accepted half names a provider whose client is CORE, so the verdict
+    # rests on the credential alone. Anthropic's client is the optional
+    # `anthropic` SDK, which `[dev]` does not install; without it that row is
+    # unsatisfied by design (the e2e31 SDK gate), and the only thing that could
+    # still pass this assertion was whatever answered on the default Ollama URL:
+    # a live daemon on a developer box, nothing on a CI runner, or a verdict an
+    # earlier test left in the 20 s probe memo. The keyless endpoint is pinned
+    # to the same dead port as `bare` so it cannot vote either way.
     ok = Config()
-    ok.anthropic_api_key = "a"
+    ok.ollama_url = "http://127.0.0.1:1"
+    ok.openrouter_api_key = "a"
     assert ok.validate() == []
 
 
