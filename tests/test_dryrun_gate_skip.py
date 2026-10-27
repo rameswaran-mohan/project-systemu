@@ -163,6 +163,13 @@ def _config_for(vault_dir: Path):
     config.tier3_model = "test"
     config.vault_dir = str(vault_dir)
     config.output_dir = str(vault_dir / "output")
+    # Set explicitly, as the other dry-run suites do. Left to the MagicMock,
+    # `int(getattr(config, "docker_tool_timeout", 60))` reads int(MagicMock())
+    # == 1, so every body these tests really execute had ONE second for a cold
+    # interpreter start -- which a loaded Windows host does not reliably make
+    # (a bare `python -c pass` from a venv measured 0.7-1.2 s under load).
+    # 30 s is the local-backend budget shadow_runtime uses for a live call.
+    config.docker_tool_timeout = 30
     return config
 
 
