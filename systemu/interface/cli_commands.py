@@ -2032,7 +2032,7 @@ def _print_daemon_where(vault_root, port_provenance) -> None:
 
     N7 -- and they are emitted with ``click.echo`` OUTSIDE the panel, because
     Rich folds a panel body to the console width: the witnessed Not-running panel
-    split an absolute vault path across two lines (`...objectiv` / `e-wescoff...`).
+    split an absolute vault path across two lines (`.../proj` / `ects/vault...`).
     The `roots` group above already carries the ruling this broke -- *a path
     wrapped at column 80 is not a path* -- and a folded path can be neither
     pasted nor searched for. The panel keeps the verdict, the PID and the URL,
