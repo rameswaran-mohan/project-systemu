@@ -477,7 +477,8 @@ def uncovered_areas(vault, session: ConsultSession) -> List[str]:
 def _is_secret_value(value: Any) -> bool:
     """Value-level secret check. REUSES ``ask_promotion._value_is_secret``, which
     itself reuses ``messaging.gateway.mask_outbound`` (the codebase's outbound
-    secret chokepoint) as a detector, plus the two shapes it provably misses. A
+    secret chokepoint) as a detector, plus the local checks it adds (a
+    space-separated credential flag, which the mask misses, and URI userinfo). A
     third mechanism would be a third vocabulary to keep in sync. Import failure ⇒
     treat as secret, matching that module's fail-closed posture."""
     try:

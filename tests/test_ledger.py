@@ -278,7 +278,12 @@ def test_f4_receipt_attaches_once_per_objective(tmp_path):
     rows = ledger.project(v, data_dir=tmp_path)
     verified = [r for r in rows if r.outcome["verification"] == "verified"]
     assert len(verified) == 1                                    # NOT fanned onto both effects
-    assert sum(1 for r in rows if r.outcome["verification"] is None) == 1
+    # the OTHER effect carries no receipt: the mint's claimed (DEC-13), not a blank
+    from systemu.runtime import verification_badge as vb
+    unreceipted = [r for r in rows if r.outcome["verification"] != "verified"]
+    assert len(unreceipted) == 1
+    assert unreceipted[0].outcome["verification"] == vb.mint_unreceipted("0").state == vb.CLAIMED
+    assert unreceipted[0].outcome["evidence_ref"] is None
 
 
 def test_f5_one_bad_byte_does_not_empty_the_ledger(tmp_path):

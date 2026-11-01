@@ -318,7 +318,7 @@ def _llm_shadow_decision(
 
     try:
         decision = llm_call_json(
-            tier=1,
+            stage="planner",
             system=load_prompt("evaluate_shadow_fit.md"),
             user=json.dumps({
                 "new_activity":     activity.model_dump(mode="json"),
@@ -602,7 +602,7 @@ def create_shadow(
 
     try:
         persona = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=load_prompt("generate_shadow_persona.md"),
             user=json.dumps({
                 "shadow_name":       shadow_name,

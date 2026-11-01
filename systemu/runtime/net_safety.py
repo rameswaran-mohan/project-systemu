@@ -10,8 +10,12 @@ reachable from ``web_read`` / ``web_search`` / ``find_places`` / ``geocode``.
 
 This module lifts that gold-standard logic VERBATIM so every outbound surface routes
 through the same gate (the "dedupe"), and adds :func:`url_is_admissible` as the
-surface-facing check. It is PURE — at most one ``socket.getaddrinfo`` per call, no
-durable writer, and it NEVER raises (a failure is a refusal, never an admit).
+surface-facing check. :func:`vet_host` is the one resolve-then-check primitive
+underneath all of it (R-A11b-1): it returns the exact addresses it checked, so a
+caller can connect to them instead of re-resolving, and it refuses non-canonical
+numeric IPv4 spellings (decimal / octal / hex / short) without asking a resolver.
+It is PURE — at most one ``socket.getaddrinfo`` per call, no durable writer, and
+it NEVER raises (a failure is a refusal, never an admit).
 
 Fail-closed contract (pinned in ``tests/test_net_safety.py``; the readback
 adversarial suite is the byte-identical regression floor):
@@ -36,8 +40,10 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 import socket
-from typing import Any, Iterable, Optional
+from dataclasses import dataclass
+from typing import Any, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -95,32 +101,106 @@ def embedded_ipv4_is_non_global(ip: Any) -> bool:
         return False
 
 
+# A host made only of digits / hex runs / dots that ``ipaddress`` did NOT accept
+# as a canonical literal: decimal ("2130706433"), octal ("0177.0.0.1"), hex
+# ("0x7f.1") and short ("127.1") IPv4 spellings. The OS resolver happily maps
+# every one of them to an address (all of the above are 127.0.0.1), but whether
+# a given resolver parses or forwards them varies, so they are refused
+# STRUCTURALLY -- no resolver is consulted. No real DNS name is all-numeric.
+_NONCANONICAL_IPV4 = re.compile(r"^(0x[0-9a-f]*|[0-9]+)(\.(0x[0-9a-f]*|[0-9]+)){0,3}\.?$",
+                                re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class HostVerdict:
+    """The outcome of vetting ONE host: admitted with the exact addresses that
+    were checked (connect to these and nothing else), or refused with a reason.
+
+    ``addresses`` are normalised literals (IPv6 UNBRACKETED), de-duplicated, in
+    resolver order; empty when refused."""
+
+    host: str
+    admitted: bool
+    addresses: Tuple[str, ...]
+    reason: str
+    # why it was refused, for callers that act on the class of refusal:
+    # "non_public" | "non_canonical" | "dns" | "no_address" | "no_host" | "error"
+    kind: str = ""
+
+
+def _refuse(host: str, reason: str, kind: str) -> HostVerdict:
+    return HostVerdict(host=host, admitted=False, addresses=(), reason=reason, kind=kind)
+
+
+def vet_host(host: str) -> HostVerdict:
+    """THE resolve-then-check primitive every egress surface uses.
+
+    * a canonical IP literal is classified directly (no DNS);
+    * a non-canonical numeric spelling of an IPv4 is refused structurally;
+    * a hostname is resolved with exactly ONE ``socket.getaddrinfo(host, None)``
+      and EVERY resolved address must be public (reject loopback / private /
+      link-local [incl. 169.254.169.254] / reserved / multicast / unspecified,
+      plus any IPv6 whose embedded IPv4 [6to4 / ipv4-mapped / teredo] is
+      non-global). A mixed set is refused WHOLE (rebind guard).
+
+    The caller connects to ``addresses`` -- never re-resolves the name (that
+    second resolution is the DNS-rebind TOCTOU). Fail-closed; never raises."""
+    try:
+        name = str(host or "").strip().lower()
+        if name.startswith("[") and name.endswith("]"):
+            name = name[1:-1]
+        if not name:
+            return _refuse(name, "no host", "no_host")
+        try:
+            literal = ipaddress.ip_address(name)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            if ip_is_non_global(literal) or embedded_ipv4_is_non_global(literal):
+                return _refuse(name, f"{name} is a non-public address", "non_public")
+            return HostVerdict(host=name, admitted=True, addresses=(str(literal),), reason="")
+        if _NONCANONICAL_IPV4.match(name):
+            return _refuse(name, f"{name!r} is a non-canonical numeric IP spelling",
+                           "non_canonical")
+        try:
+            infos = socket.getaddrinfo(name, None)
+        except Exception as exc:
+            return _refuse(name, f"DNS lookup failed for {name!r} ({type(exc).__name__})",
+                           "dns")
+        vetted: "list[str]" = []
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if ip_is_non_global(ip) or embedded_ipv4_is_non_global(ip):
+                # fail-closed on ANY non-global address in the set
+                return _refuse(name, f"{name} resolves to non-public address {ip}",
+                               "non_public")
+            literal_text = str(ip)
+            if literal_text not in vetted:
+                vetted.append(literal_text)
+        if not vetted:
+            return _refuse(name, f"{name} resolved to no usable address", "no_address")
+        return HostVerdict(host=name, admitted=True, addresses=tuple(vetted), reason="")
+    except Exception:
+        # defensive: a quirk anywhere above is a refusal, never an admit.
+        return _refuse(str(host or ""), "host could not be vetted", "error")
+
+
 def resolve_pinned_ip(host: str) -> Optional[str]:
     """Resolve a HOSTNAME to a single VETTED-PUBLIC IP LITERAL to PIN a socket to.
 
-    Does exactly ONE ``socket.getaddrinfo(host, None)`` and validates that EVERY
-    resolved address is public (reject loopback / private / link-local [incl.
-    169.254.169.254] / reserved / multicast / unspecified, plus any IPv6 whose
-    embedded IPv4 [6to4 / ipv4-mapped / teredo] is non-global). Returns the FIRST
-    vetted address as a normalised literal (IPv6 UNBRACKETED). Returns None if ANY
-    address is non-global OR resolution fails OR nothing resolved (fail-closed).
-    Never raises."""
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception:
+    Exactly :func:`vet_host` (ONE ``socket.getaddrinfo`` for a hostname, EVERY
+    resolved address must be public, a mixed set refused whole, non-canonical
+    numeric spellings refused without resolving). Returns the FIRST vetted
+    address as a normalised literal (IPv6 UNBRACKETED), or None when refused
+    (fail-closed). Never raises."""
+    verdict = vet_host(host)
+    if verdict.admitted is not True or not verdict.addresses:
         return None
-    first_public: Optional[str] = None
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            continue
-        if ip_is_non_global(ip) or embedded_ipv4_is_non_global(ip):
-            return None            # fail-closed on ANY non-global address in the set
-        if first_public is None:
-            first_public = str(ip)  # a normalised literal (no zone/scope suffix)
-    return first_public
+    return verdict.addresses[0]
 
 
 def host_resolves_public(host: str) -> bool:

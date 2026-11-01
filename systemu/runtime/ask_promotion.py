@@ -171,10 +171,11 @@ SCOPE LIMITS (each one closes a proven hole — see the pins)
     canonical marker (``replay_metrics`` → ``elicitation.is_secret_field``): a
     matching name token, or an explicit ``format="password"`` marker — nothing about
     the value itself. The VALUE goes through ``messaging.gateway.mask_outbound``, the
-    shipped outbound secret chokepoint (kv pairs, ``Bearer``/``Basic``,
-    ``sk-``/``AKIA``/``ghp_``/JWT/Slack prefixes, 40+-char hex), plus the two shapes
-    verified NOT to reach it — URI userinfo and a space-separated
-    ``--token``/``--password`` flag (see :func:`_value_is_secret`). A name-only fence
+    shipped outbound secret chokepoint (kv pairs, ``Bearer``/``Basic``, the
+    password in a URL's userinfo, ``sk-``/``AKIA``/``ghp_``/JWT/Slack prefixes, 40+-char
+    hex), plus the one shape verified NOT to reach it -- a space-separated
+    ``--token``/``--password`` flag -- and a local URI-userinfo check that runs before
+    the mask (see :func:`_value_is_secret`). A name-only fence
     is not enough on its own: the promoted fact is read VERBATIM into a system prompt
     (``shadow_runtime._build_user_context_block``, 5 most-recent facts) and into a
     tier-1 LLM payload (``scroll_refiner``, recent 20) on later, unrelated runs — so
@@ -382,21 +383,25 @@ def _comparable_canon_ref(snap: Any, key_id: Optional[str]) -> Optional[str]:
         return None
 
 
-#: The two secret shapes ``mask_outbound`` provably does not cover (verified against it
-#: directly — see the pins). Everything else it already handles: ``Bearer …``, ``sk-…``,
-#: ``ghp_…``, ``AKIA…``, JWTs, Slack tokens, long hex runs, and ``<secret-name>=<value>``
-#: / ``<secret-name>: <value>`` pairs.
+#: Two LOCAL checks that run before the ``mask_outbound`` pass in
+#: :func:`_value_is_secret`. ``mask_outbound`` already handles ``Bearer ...``, ``sk-...``,
+#: ``ghp_...``, ``AKIA...``, JWTs, Slack tokens, long hex runs, ``<secret-name>=<value>`` /
+#: ``<secret-name>: <value>`` pairs, and the password in a URL's userinfo.
 #:
-#: 1. URI userinfo — ``scheme://user:pass@host``. No token NAME and no known token
-#:    SHAPE, so nothing in the shipped detector fires; this is the exact value that
-#:    reached ``user_facts.jsonl``, the learned sidecar and ``items.json`` in the
-#:    reproduction. The pattern needs a colon-separated userinfo pair AND a terminating
-#:    ``@``, so ``http://host:8080/path`` (no ``@``) and ``https://user@host`` (no
-#:    password) do not match.
-#: 2. A credential flag separated by SPACE — ``--token VALUE``, ``--password VALUE``.
-#:    ``mask_outbound``'s kv pattern requires ``=`` or ``:``, so it catches
-#:    ``--token=VALUE`` and misses the space form, which is how a shell command is
-#:    actually written.
+#: 1. URI userinfo -- ``scheme://user:pass@host``. ``mask_outbound`` covers this too (its
+#:    shared span primitive, ``gateway.mask_secret_spans``, masks a URL's userinfo
+#:    password), so this pattern is no longer a supplement for a gap: it is an earlier,
+#:    narrower check that refuses without consulting the mask. When it was written the
+#:    shipped detector had no rule for it (no token NAME, no known token SHAPE), which is
+#:    how this exact value reached ``user_facts.jsonl``, the learned sidecar and
+#:    ``items.json`` in the reproduction. The pattern needs a colon-separated userinfo
+#:    pair with a NON-empty user AND a terminating ``@``, so ``http://host:8080/path`` (no
+#:    ``@``) and ``https://user@host`` (no password) do not match; ``redis://:pw@host``
+#:    (empty user) is left to the outbound mask alone.
+#: 2. A credential flag separated by SPACE -- ``--token VALUE``, ``--password VALUE``. This
+#:    is the one shape ``mask_outbound`` still does not cover (checked against it
+#:    directly): its kv pattern requires ``=`` or ``:``, so it catches ``--token=VALUE``
+#:    and misses the space form, which is how a shell command is actually written.
 _URI_USERINFO_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
 _CRED_FLAG_RE = re.compile(
     r"(?i)(?:^|\s)--?(?:token|password|passwd|secret|api[-_]?key|apikey|auth|"
@@ -418,7 +423,8 @@ def _value_is_secret(value: Any, vault: Any = None) -> bool:
     (every gateway push goes through it), and it is used here as a DETECTOR — if
     masking changes the text, the text contained something the codebase already
     considers a secret. Keeping one vocabulary means a token shape added there is
-    picked up here for free. Two shapes it does not cover are supplemented above.
+    picked up here for free. The one shape it does not cover (a space-separated
+    credential flag) is supplemented above, and URI userinfo is checked locally first.
 
     Verified NOT to fire on ordinary answers (paths, emails, service names, URLs,
     timezones) — a blanket refusal here would silently disable the whole slice, so the

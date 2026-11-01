@@ -63,7 +63,7 @@ def test_forge_payload_includes_preferred_packages(monkeypatch, tmp_path, tmp_va
 
     captured = {}
 
-    def fake_llm_call_json(*, tier, system, user, config, temperature, max_tokens):
+    def fake_llm_call_json(*, tier=None, system, user, config, temperature, max_tokens, **kw):
         # Capture the spec-step call (first call); skip subsequent code step.
         if "spec" not in captured:
             captured["spec"] = json.loads(user)
@@ -103,7 +103,7 @@ def test_forge_payload_with_no_approvals_lists_empty(monkeypatch, tmp_path, tmp_
 
     captured = {}
 
-    def fake_llm_call_json(*, tier, system, user, config, temperature, max_tokens):
+    def fake_llm_call_json(*, tier=None, system, user, config, temperature, max_tokens, **kw):
         if "spec" not in captured:
             captured["spec"] = json.loads(user)
             return {

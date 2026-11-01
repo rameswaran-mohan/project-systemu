@@ -52,6 +52,96 @@ def build_stdio_params(spec: Dict[str, Any]):
     )
 
 
+def _returncode(process: Any) -> Optional[int]:
+    """The exit code of an SDK server process, or None while it runs.
+
+    anyio ``Process`` and the 2.x win32 fallback expose ``returncode``; the 1.x
+    win32 fallback only wraps a ``Popen`` as ``.popen``."""
+    rc = getattr(process, "returncode", None)
+    if type(rc) is int:
+        return rc
+    popen = getattr(process, "popen", None)
+    if popen is not None:
+        try:
+            rc = popen.poll()
+        except Exception:
+            return None
+        if type(rc) is int:
+            return rc
+    return None
+
+
+class StdioWitness:
+    """What a stdio session leaves behind for an honest failure reason.
+
+    Owns a temp file the server's stderr goes to (instead of this process's
+    console) and receives the spawned process from the compat spawn witness.
+    ``exit_code`` is set ONLY when the server exited ON ITS OWN -- observed
+    within a short grace window after the session failed and BEFORE the SDK's
+    shutdown terminates it -- so a kill at teardown is never reported as the
+    server's own exit code. Use as a context manager (closes the temp file)."""
+
+    GRACE_S = 1.5
+
+    def __init__(self, known_values: Optional[list] = None) -> None:
+        import tempfile
+        self.errlog = tempfile.TemporaryFile()
+        self.spawned: list = []
+        self.exit_code: Optional[int] = None
+        self._known_values = [str(v) for v in (known_values or []) if v]
+
+    @classmethod
+    def for_spec(cls, spec: Dict[str, Any]):
+        """A witness for a stdio spec; a null context (``None``) otherwise."""
+        from contextlib import nullcontext
+        if str(spec.get("transport") or "").lower() != "stdio":
+            return nullcontext(None)
+        env = spec.get("env") or {}
+        return cls(known_values=list(env.values()) if isinstance(env, dict) else [])
+
+    def __enter__(self) -> "StdioWitness":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        try:
+            self.errlog.close()
+        except Exception:
+            pass
+
+    @property
+    def process(self) -> Any:
+        return self.spawned[-1] if self.spawned else None
+
+    async def settle(self) -> None:
+        """Record the exit code if the server is exiting on its own. Polls (never
+        a blocking wait) inside a shielded, bounded scope."""
+        proc = self.process
+        if proc is None or self.exit_code is not None:
+            return
+        import anyio
+        with anyio.CancelScope(shield=True):
+            with anyio.move_on_after(self.GRACE_S):
+                while _returncode(proc) is None:
+                    await anyio.sleep(0.05)
+        rc = _returncode(proc)
+        if type(rc) is int:
+            self.exit_code = rc
+
+    def stderr_lines(self) -> list:
+        """The last stderr lines, redacted before they are capped (DEC-31)."""
+        from systemu.runtime.mcp.sdk.failure import STDERR_WINDOW_BYTES, stderr_tail
+        f = self.errlog
+        try:
+            f.flush()
+            size = f.seek(0, 2)
+            start = max(0, size - STDERR_WINDOW_BYTES)
+            f.seek(start)
+            raw = f.read()
+        except Exception:
+            return []
+        return stderr_tail(raw, truncated=start > 0, known_values=self._known_values)
+
+
 async def _default_elicitation_callback(context, params):
     """Fail-closed default: decline. Real impl injected by the manager (Task 13)."""
     # Shape must match the SDK's ElicitResult; "decline" is the safe default.
@@ -63,7 +153,9 @@ async def open_session(spec: Dict[str, Any], *,
                        elicitation_callback: Optional[ElicitCallback] = None,
                        sampling_callback: Optional[ElicitCallback] = None,
                        init_timeout: float = 30.0,
-                       classification_trusted: bool = True):
+                       classification_trusted: bool = True,
+                       witness: Optional[StdioWitness] = None,
+                       egress: Any = None):
     """Yield a live, initialised ClientSession for ``spec``.
 
     Lazy-imports the SDK. Declares client capabilities and wires the
@@ -88,6 +180,24 @@ async def open_session(spec: Dict[str, Any], *,
     if transport not in _VALID_TRANSPORTS:
         raise ValueError(f"unknown MCP transport: {transport!r}")
 
+    # R-A11b-1: EVERY remote session is opened under an ADMITTING SSRF verdict
+    # issued for THIS url -- there is no unguarded default. The concrete type is
+    # pinned before the value is read (DEC-36); a mismatch refuses before any
+    # SDK import or socket. The session is then PINNED to the addresses the
+    # verdict checked (compat "connect-time pinning").
+    pin = None
+    if transport != "stdio":
+        from systemu.runtime.mcp.sdk.egress import EgressVerdict, PinnedRoutes
+        if egress is None:
+            raise PermissionError("remote MCP connect refused: no SSRF verdict was issued "
+                                  "for this session")
+        if type(egress) is not EgressVerdict or egress.admitted is not True:
+            raise PermissionError("remote MCP connect refused: the SSRF verdict does not admit it")
+        if egress.url != str(spec.get("url") or ""):
+            raise PermissionError("remote MCP connect refused: the SSRF verdict was issued "
+                                  "for a different URL")
+        pin = PinnedRoutes(egress)
+
     # §15.1(c): refuse a registry/untrusted stdio LAUNCH pre-jail (fail-closed).
     if transport == "stdio" and not classification_trusted:
         from systemu.runtime.action_governance import (
@@ -101,16 +211,23 @@ async def open_session(spec: Dict[str, Any], *,
     cb = elicitation_callback or _default_elicitation_callback
 
     if transport == "stdio":
-        client_cm = compat.open_stdio(build_stdio_params(spec))
+        if witness is not None:
+            client_cm = compat.open_stdio(build_stdio_params(spec),
+                                          errlog=witness.errlog,
+                                          spawned=witness.spawned)
+        else:
+            client_cm = compat.open_stdio(build_stdio_params(spec))
     elif transport in ("http", "streamable-http"):
         client_cm = compat.open_streamable_http(
             str(spec.get("url") or ""),
             headers=dict(spec.get("headers") or {}),
+            pin=pin,
         )
     else:  # sse
         client_cm = compat.open_sse(
             str(spec.get("url") or ""),
             headers=dict(spec.get("headers") or {}),
+            pin=pin,
         )
 
     async with client_cm as streams:
@@ -125,13 +242,20 @@ async def open_session(spec: Dict[str, Any], *,
         _session_kwargs = {"elicitation_callback": cb}
         if sampling_callback is not None:
             _session_kwargs["sampling_callback"] = sampling_callback
-        async with ClientSession(
-            read, write, **_session_kwargs,
-        ) as session:
-            import anyio
-            with anyio.fail_after(init_timeout):
-                await session.initialize()
-            yield session
+        try:
+            async with ClientSession(
+                read, write, **_session_kwargs,
+            ) as session:
+                import anyio
+                with anyio.fail_after(init_timeout):
+                    await session.initialize()
+                yield session
+        except Exception:
+            # Still INSIDE the transport: the SDK has not torn the server down
+            # yet, so an exit code observed now is the server's own (Defect 2).
+            if witness is not None:
+                await witness.settle()
+            raise
 
 
 def make_sampling_callback(*, config, tier: int = 2, on_gate=None):

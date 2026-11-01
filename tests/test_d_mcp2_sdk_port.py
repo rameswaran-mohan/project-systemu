@@ -360,7 +360,10 @@ def _header_recorder():
 @pytest.mark.asyncio
 class TestTransportSeamOnTheWire:
     @pytest.mark.parametrize("spec_transport,path", [("http", "/mcp"), ("sse", "/sse")])
-    async def test_operator_headers_reach_the_wire(self, spec_transport, path):
+    async def test_operator_headers_reach_the_wire(self, spec_transport, path, monkeypatch):
+        # R-A11b-1 (GATE-6, ruled): call_tool is SSRF-guarded; the operator
+        # allowance names the loopback host this test connects to.
+        monkeypatch.setenv("SYSTEMU_HARNESS_ALLOWED_MCP_HOSTS", "127.0.0.1")
         from systemu.runtime.mcp.sdk.manager import ConnectionManager
         mgr = ConnectionManager(default_timeout=15.0)
         with _header_recorder() as (base, seen):
@@ -371,7 +374,10 @@ class TestTransportSeamOnTheWire:
         assert seen, "no request reached the endpoint"
         assert seen[0].get("x-systemu-probe") == "probe-value-7", seen[0]
 
-    async def test_unreachable_server_is_the_honest_envelope_not_a_missing_symbol(self):
+    async def test_unreachable_server_is_the_honest_envelope_not_a_missing_symbol(self, monkeypatch):
+        # R-A11b-1 (GATE-6, ruled): call_tool is SSRF-guarded; the operator
+        # allowance names the loopback host this test connects to.
+        monkeypatch.setenv("SYSTEMU_HARNESS_ALLOWED_MCP_HOSTS", "127.0.0.1")
         from systemu.runtime.mcp import client as mc
         t0 = time.monotonic()
         out = mc.mcp_call_tool(server=f"http://127.0.0.1:{_free_port()}/mcp",
@@ -383,6 +389,10 @@ class TestTransportSeamOnTheWire:
         for marker in ("cannot import", "has no attribute", "No module named",
                        "SdkLayoutError"):
             assert marker not in out["error"], out["error"]
+        # ...and it really reached the socket: refused by the closed port, not
+        # by the SSRF guard (GATE-6 ruling).
+        assert "connection refused by 127.0.0.1:" in out["error"], out["error"]
+        assert "SSRF" not in out["error"], out["error"]
         assert time.monotonic() - t0 < 25
 
 
@@ -485,7 +495,11 @@ class TestRealTransports:
         ("streamable-http", "http"),
         ("sse", "sse"),
     ])
-    async def test_remote_round_trip_through_the_manager(self, transport, spec_transport):
+    async def test_remote_round_trip_through_the_manager(self, transport, spec_transport,
+                                                         monkeypatch):
+        # R-A11b-1 (GATE-6, ruled): call_tool is SSRF-guarded; the operator
+        # allowance names the loopback host this test connects to.
+        monkeypatch.setenv("SYSTEMU_HARNESS_ALLOWED_MCP_HOSTS", "127.0.0.1")
         from systemu.runtime.mcp.sdk.manager import ConnectionManager
         mgr = ConnectionManager(default_timeout=30.0)
         with _reference_server(transport) as url:

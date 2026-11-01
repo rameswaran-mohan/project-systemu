@@ -13,7 +13,17 @@ outside the JSON).
 {"action": "TOOL_CALL", "tool": "<name from the tools list>", "params": {…}, "reasoning": "<one short sentence>"}
 ```
 - `params` keys must follow the tool's parameters_schema / parameter_names.
-- Only tools in the provided list exist. Never invent tool names.
+- Only tools in the provided lists exist. Never invent tool names.
+- `tools` holds the most relevant tools in full. When `more_tools` is present it
+  lists further tools by name and capability slot only — they are callable too.
+  Before calling one of those (or when nothing listed fits), call
+  `find_tools` with `{"query": "<keywords or exact tool name>"}`: it searches
+  every tool systemu has and returns full records, each with its state.
+- If `find_tools` shows the right tool but it is not callable here (disabled,
+  broken, quarantined, not ready), ASK_USER to have the operator enable it —
+  never improvise or recreate a duplicate of it.
+- If `tool_catalog_status` is present, the tool list is incomplete: a tool
+  missing from it is NOT evidence that the tool does not exist.
 
 2. Deliver the final answer:
 ```

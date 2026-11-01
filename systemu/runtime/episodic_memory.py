@@ -232,7 +232,7 @@ def capture(
     }
     try:
         result = llm_call_json(
-            tier=1,
+            stage="summarize",
             system=_load_system_prompt(),
             user=json.dumps(user_payload, separators=(",", ":")),
             config=config,

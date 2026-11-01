@@ -44,7 +44,7 @@ def _plan_next(instruction: str, nodes: List[Dict[str, str]], history: List[Dict
             return {"action": "READ"}  # fail-safe: re-observe rather than crash
 
     from systemu.core.llm_router import llm_call_json
-    return llm_call_json(tier=2, system=system, user=user, config=config,
+    return llm_call_json(stage="executor", system=system, user=user, config=config,
                          temperature=0.1, max_tokens=512)
 
 

@@ -7,7 +7,8 @@ Each entry:
   * carries a check_fn that re-confirms the tool is still operator-allowlisted
     (fail-closed; disabled tools vanish from the catalog automatically);
   * uses the mapped parameters_schema (real required[]);
-  * sets is_action_tool from the MCP readOnlyHint (read-only => tier R, no gate).
+  * sets is_action_tool from the P21 effect classification (``is_mutation``):
+    raise-only, so a server's readOnlyHint can never lower it.
 
 No SDK import here — operates on the normalised dicts the manager produces.
 """
@@ -56,14 +57,15 @@ def _resolve_session_id() -> str:
 def _make_handler(vault, server: str, tool: str):
     def _handler(**kwargs) -> Dict[str, Any]:
         from sharing_on.config import Config
-        from systemu.runtime.mcp.dispatch import call_mcp_tool  # P0 chokepoint
+        from systemu.runtime.mcp.dispatch import call_mcp_tool_stamped  # P0 chokepoint
         cfg = Config.from_env()
         # The LLM passes only the tool's own params; server/tool come from the
         # closure (it cannot retarget another server). session_id is resolved
         # from the active run context (NOT from kwargs) so scoped trust works.
-        return call_mcp_tool(server, tool, dict(kwargs),
-                             vault=vault, config=cfg,
-                             session_id=_resolve_session_id())
+        # P21: the stamped variant carries the gate's record back for the ledger.
+        return call_mcp_tool_stamped(server, tool, dict(kwargs),
+                                     vault=vault, config=cfg,
+                                     session_id=_resolve_session_id())
     return _handler
 
 
@@ -77,6 +79,37 @@ def _make_check_fn(vault, server: str, tool: str):
     return _check
 
 
+def is_mutation(vault, server: str, tool: str, annotations: Any,
+                schema: Any) -> bool:
+    """P21 / DEC-34: does this MCP tool count as a MUTATION (``is_action_tool``)?
+
+    ``is_action_tool`` decides whether a call carries the per-actuation verification
+    obligation (``shadow_runtime._known_mutation_mcp_entry``, the ``mcp`` actuation
+    modality). It used to be ``not readOnlyHint`` -- the SERVER's word, read in
+    camelCase only -- so a server could drop the obligation for a destructive tool
+    by claiming read-only. It is now the gate's own classification
+    (``effect_class.classify_mcp_call``, hints read through ``wire_field``): the
+    tool is a mutation unless it lands in the read-only tier, which a hint reaches
+    only when nothing else (the name verb map, a money signal, the destructive hint,
+    the operator's declaration or assignment) classifies it. Fail-closed: any error
+    is a mutation.
+    """
+    try:
+        from systemu.runtime.mcp.connections import (get_operator_assigned_class,
+                                                     get_operator_effect_classes)
+        from systemu.runtime.mcp.effect_class import classify_mcp_call
+        cls = classify_mcp_call(
+            tool=tool, params={}, annotations=annotations, schema=schema,
+            operator_classes=get_operator_effect_classes(vault, server, tool),
+            operator_assigned=get_operator_assigned_class(vault, server, tool),
+            classification_trusted=True)
+        return cls.tier != "R"
+    except Exception:
+        logger.debug("[MCP] could not classify %s:%s -- treating it as a mutation",
+                     server, tool, exc_info=True)
+        return True
+
+
 def register_server_tools(vault, server: str, tools: List[Dict[str, Any]]) -> List[str]:
     """Register each enabled tool of ``server`` as a namespaced v2 entry.
 
@@ -88,16 +121,17 @@ def register_server_tools(vault, server: str, tools: List[Dict[str, Any]]) -> Li
         if not tool:
             continue
         full = namespaced_name(server, tool)
-        ann = dict(t.get("annotations") or {})
-        read_only = bool(ann.get("readOnlyHint"))
+        schema = dict(t.get("parameters_schema") or {"type": "object"})
         registry.register(
             name=full,
             toolset="mcp",
-            schema=dict(t.get("parameters_schema") or {"type": "object"}),
+            schema=schema,
             handler=_make_handler(vault, server, tool),
             check_fn=_make_check_fn(vault, server, tool),
             description=str(t.get("description") or f"MCP tool {tool} on {server}"),
-            is_action_tool=not read_only,   # read-only => tier R (ungated)
+            # P21: the classification, never the server's readOnlyHint alone.
+            is_action_tool=is_mutation(vault, server, tool, t.get("annotations"),
+                                       schema),
             max_result_size_chars=50_000,
         )
         names.append(full)

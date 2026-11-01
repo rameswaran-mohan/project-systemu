@@ -3,6 +3,12 @@
 
 Tries a graceful close (WM_CLOSE) first, then taskkill if still running.
 
+WHICH process is stopped is decided by
+``systemu.runtime.app_targets.resolve_close_target`` -- the same pure resolver
+the approval gate scores, signs and shows (P26), called here on these exact
+kwargs. This body acts on what it returns and on nothing else. A call the
+resolver refuses stops nothing.
+
 Parameters (via run() kwargs):
   application_name (str): Friendly name or executable name (e.g. "Snipping Tool",
                           "Microsoft Word", "SnippingTool.exe").
@@ -27,24 +33,6 @@ TOOL_META = {
     "dependencies": [],
 }
 
-_APP_EXEC_MAP = {
-    "snipping tool":        "SnippingTool.exe",
-    "snippingtool":         "SnippingTool.exe",
-    "microsoft word":       "WINWORD.EXE",
-    "word":                 "WINWORD.EXE",
-    "microsoft excel":      "EXCEL.EXE",
-    "excel":                "EXCEL.EXE",
-    "microsoft powerpoint": "POWERPNT.EXE",
-    "powerpoint":           "POWERPNT.EXE",
-    "notepad":              "notepad.exe",
-    "google chrome":        "chrome.exe",
-    "chrome":               "chrome.exe",
-    "microsoft edge":       "msedge.exe",
-    "edge":                 "msedge.exe",
-    "paint":                "mspaint.exe",
-    "calculator":           "calc.exe",
-}
-
 
 def run(
     application_name: str = "",
@@ -54,17 +42,24 @@ def run(
     force: bool = False,
 ) -> dict:
     """Close an application gracefully (or by force if requested)."""
-    if pid is not None:
-        return _kill_pid(pid, force=force)
+    from systemu.runtime.app_targets import AppTarget, resolve_close_target
 
-    target = application_name or name or executable
-    if not target:
-        return {"success": False, "killed": 0, "error": "Provide application_name, name, executable, or pid."}
+    target = resolve_close_target({
+        "application_name": application_name,
+        "name": name,
+        "executable": executable,
+        "pid": pid,
+        "force": force,
+    })
+    if type(target) is not AppTarget:
+        return {"success": False, "killed": 0,
+                "error": "Nothing was closed: " + target.reason + "."}
+    if target.kind == "pid":
+        return _kill_pid(int(target.value), force=target.force)
 
-    resolved = _APP_EXEC_MAP.get(target.strip().lower(), target)
-
+    resolved = target.value
     if sys.platform == "win32":
-        return _taskkill_windows(resolved, force=force)
+        return _taskkill_windows(resolved, force=target.force)
 
     # Unix fallback via pkill
     try:

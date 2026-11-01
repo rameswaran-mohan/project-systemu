@@ -61,6 +61,52 @@ _SHELL_TOOL_NAMES = {"run_command", "run_cli_command"}
 # not express.
 _COMMAND_GATE_DELEGABLE_TAGS = {"shell_exec", "local_read", "local_write"}
 
+# ── P23: the command gate scores the command that RUNS ───────────────────────
+#: ``error_type`` of a shell call whose command the gate could not determine.
+COMMAND_UNDETERMINABLE = "command_undeterminable"
+
+
+def _command_to_score(tool_name: str, call: Any):
+    """P23: ``((command, cwd), "")`` -- exactly what a command-gated tool will
+    run, read from the FINAL kwargs its body receives (``call``: the sealed value
+    ``execute_tool`` passes to execution unchanged) -- or ``(None, why)``.
+
+    Only the key the bodies execute is read: ``command`` (and ``cwd``). There is
+    no ``cmd`` fallback any more -- after sealing, a command under another key is
+    one the body never receives, and scoring it was how the gate came to sign one
+    string while the registry ran another. Types are pinned with ``type(x) is``
+    (DEC-36). Undeterminable (DEC-27) means: absent, not a str, blank, a NUL byte
+    in the command or cwd (no process can be spawned with one, and it would make
+    ``command_signature``'s ``cmd NUL cwd`` encoding ambiguous -- the property that
+    lets an empty-command approval match NOTHING), or, for ``run_cli_command``
+    (``shlex.split`` then ``shell=False``), a command ``shlex`` cannot split.
+    """
+    if not isinstance(call, dict):
+        return None, "the call carries no parameters"
+    command = dict.get(call, "command")
+    if command is None:
+        return None, "no 'command' parameter reaches the tool"
+    if type(command) is not str:
+        return None, "the command is not a string"
+    if not command.strip():
+        return None, "the command is empty"
+    if "\x00" in command:
+        return None, "the command contains a NUL byte"
+    cwd = dict.get(call, "cwd")
+    if cwd is None:
+        cwd = ""
+    elif type(cwd) is not str:
+        return None, "the working directory is not a string"
+    elif "\x00" in cwd:
+        return None, "the working directory contains a NUL byte"
+    if tool_name == "run_cli_command":
+        import shlex
+        try:
+            shlex.split(command)
+        except ValueError:
+            return None, "the command cannot be split into arguments"
+    return (command, cwd), ""
+
 
 def _derive_effect_tags_from_source(impl_path) -> set:
     """Re-derive a tool's effect tags from its ON-DISK body.
@@ -255,6 +301,11 @@ def args_fingerprint(parameters: Any) -> str:
     parameters. This fingerprint is what binds the record to the ONE call the
     operator actually classified.
 
+    P28: the per-tool gate passes the SEALED call (``execute_tool`` seals every
+    call before its gates), so the fingerprint is over the parameters the tool
+    RECEIVES, never the parameters as the model wrote them. See the migration note
+    in ``_maybe_gate_tool``.
+
     Deliberately hashed over the FULL parameters, not ``_small_args_preview``: the
     preview truncates to 8 keys and 80 characters per value, so two calls differing
     only past those bounds would share a fingerprint. ``sort_keys`` makes it
@@ -270,6 +321,73 @@ def args_fingerprint(parameters: Any) -> str:
         logger.debug("[Sandbox] could not fingerprint call parameters", exc_info=True)
         return ""
     return hashlib.sha1(canon.encode("utf-8", "replace")).hexdigest()
+
+
+def _gate_record(*, gate: str, verdict: Any, passed_via: str, effect_tags=None,
+                 effect_tags_basis: Optional[str] = None,
+                 decision_id: Any = None) -> Dict[str, Any]:
+    """R-P3b: a plain-JSON record of how ONE call got past a sandbox gate.
+
+    Minted only on a path that lets the call RUN, at the moment the gate decides, from
+    values the gate already holds -- it describes the decision that was made and never
+    re-scores anything. It carries no parameter values: the gate name, the verdict as
+    scored, the pass path, the effect classes and, when the pass consumed a known
+    operator decision, that decision's id.
+
+    ``effect_tags`` is recorded only when non-empty. An empty set is "the gate did not
+    classify this call", never "this call has no effect", so it is stored as ``None``.
+    """
+    tags = sorted({str(t) for t in (effect_tags or ())})
+    return {
+        "gate": gate,
+        "verdict": getattr(verdict, "value", verdict),
+        "passed_via": passed_via,
+        "decision_id": decision_id if (type(decision_id) is str and decision_id) else None,
+        "effect_tags": tags or None,
+        "effect_tags_basis": effect_tags_basis if tags else None,
+    }
+
+
+def _compose_gate_record(command_record: Optional[Dict[str, Any]],
+                         tool_record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The one record for a call that passed both gates in ``execute_tool``.
+
+    * ``tool_record`` is a full record when the per-tool gate scored the call;
+    * it is a ``{"delegated_to": "command", ...}`` marker when the shell-tool
+      carve-out handed the call to the command gate, in which case the command
+      gate's record stands and carries the tool's DECLARED effect classes;
+    * it is ``None`` when there was no Tool to score, and then the command gate's
+      record (or nothing) is all there is.
+    """
+    if tool_record is None:
+        return command_record
+    if tool_record.get("delegated_to") == "command":
+        if command_record is None:
+            return None
+        rec = dict(command_record)
+        rec["effect_tags"] = tool_record.get("effect_tags")
+        rec["effect_tags_basis"] = tool_record.get("effect_tags_basis")
+        return rec
+    return tool_record
+
+
+def _bridge_decision_id(store) -> Optional[str]:
+    """The decision id on the resume bridge this thread just redeemed (R-P3b), or
+    None when the bridge carried none (or the store cannot say). Never raises."""
+    try:
+        return store.take_consumed_resume_decision()
+    except Exception:
+        return None
+
+
+def _with_gate(result, gate: Optional[Dict[str, Any]]):
+    """Attach the call's gate record to its result (R-P3b). Never raises."""
+    if gate is not None and result is not None:
+        try:
+            result.gate = dict(gate)
+        except Exception:
+            logger.debug("[Sandbox] could not attach the gate record", exc_info=True)
+    return result
 
 
 def _resolved_decision_is_the_follow_up(decision, *, pending_class: Optional[str],
@@ -391,8 +509,12 @@ def _emit_typed_confirm_refusal(tool_name, phrase, effects) -> None:
 def _small_args_preview(parameters: Any, *, max_keys: int = 8, max_len: int = 80) -> Dict[str, Any]:
     """A small, bounded args preview for the ActionContext (S1b tool gate).
 
-    Truncates values so a large payload never bloats the gate card or the
-    should_mask secret scan. Non-dict params collapse to a single key."""
+    Truncates values so a large payload never bloats the should_mask secret scan.
+    Non-dict params collapse to a single key.
+
+    P28: this is NOT a card preview and no card may render it -- it drops every key
+    past the 8th and slices values before any redaction. Every approval card (tool,
+    target-gated and MCP) renders ``_card_args_preview`` instead."""
     if not isinstance(parameters, dict):
         return {"value": str(parameters)[:max_len]}
     out: Dict[str, Any] = {}
@@ -404,6 +526,112 @@ def _small_args_preview(parameters: Any, *, max_keys: int = 8, max_len: int = 80
             s = s[:max_len] + "…"
         out[str(k)] = s
     return out
+
+
+# ── P26: the per-target card ─────────────────────────────────────────────────
+#: Cap on one parameter value on an approval card (applied AFTER redaction).
+_CARD_VALUE_CAP = 300
+#: Cap on one parameter NAME on an approval card (applied AFTER redaction).
+_CARD_KEY_CAP = 80
+#: Cap on the resolved-target line; above ``app_targets.MAX_TARGET_CHARS`` so a
+#: target the resolver accepted is always shown whole.
+_CARD_TARGET_CAP = 1100
+
+
+def _card_text(value: Any, *, cap: int = _CARD_TARGET_CAP) -> str:
+    """Model-supplied text for an approval card: redacted FIRST, then capped by
+    the redactor itself (DEC-31). No redactor -> no value."""
+    if type(value) is str:
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=True, default=str)
+        except Exception:
+            text = "<{}>".format(type(value).__name__)
+    try:
+        from systemu.runtime.outbox import redact
+        return redact(text, max_len=cap)
+    except Exception:  # noqa: BLE001 -- DEC-31: no redactor, no value
+        logger.debug("[Sandbox] card redaction unavailable", exc_info=True)
+        return "[withheld: redaction unavailable]"
+
+
+def _card_args_preview(parameters: Any) -> Dict[str, Any]:
+    """P26 / P28: EVERY parameter that reaches the tool, for its approval card --
+    THE one card-preview function (DEC-43): the per-tool card of every tool, the
+    target-gated card and the MCP card all render it.
+
+    ``parameters`` is the sealed call -- the kwargs the body receives -- so this
+    is what the tool consumes, after the registry's reconciliation. Unlike
+    ``_small_args_preview`` no key is dropped (a 9th key reconciled onto ``path``
+    ran but was never shown); each value is redacted and only then capped
+    (DEC-31). Keys are model-controllable too (a ``**kwargs`` body, the subprocess
+    path), so each key is redacted then capped the same way; two keys that render
+    alike are both kept, the second marked, so no key can shadow another."""
+    if not isinstance(parameters, dict):
+        return {"value": _card_text(parameters, cap=_CARD_VALUE_CAP)}
+    out: Dict[str, Any] = {}
+    for k, v in dict.items(parameters):
+        key = _card_text(k, cap=_CARD_KEY_CAP)
+        if key in out:
+            n = 2
+            while "{} ({})".format(key, n) in out:
+                n += 1
+            key = "{} ({})".format(key, n)
+        out[key] = (v if v is None or type(v) in (bool, int, float)
+                    else _card_text(v, cap=_CARD_VALUE_CAP))
+    return out
+
+
+def _target_card(descriptor, target, *, legacy: bool):
+    """P26: the per-tool card, saying WHICH application it approves.
+
+    The resolved target leads the card, and the card says an approval covers that
+    one application -- and, when the tool held a parameter-free "Always allow"
+    from before targets were bound, that the old approval is no longer honoured.
+    A target that is not ``rememberable`` (a process ID) is offered no
+    "Always allow"; the gate never honours one for it either."""
+    line = target.describe(show=_card_text)
+    if legacy:
+        scope = ("An earlier 'Always allow' of {} covered every application. That "
+                 "approval is no longer honoured: approval now covers one "
+                 "application, so this one is asked once.".format(target.tool))
+    elif not target.rememberable:
+        scope = ("Approval now covers one application: this one process, once.")
+    else:
+        scope = ("Approval now covers one application: any other application is "
+                 "asked for separately.")
+    update = {"inspect": line + "\n" + scope + "\n" + descriptor.inspect}
+    options = list(descriptor.options)
+    remember = [o for o in options if type(o) is str and o.strip().lower() == "always allow"]
+    if not target.rememberable and remember:
+        update["options"] = [o for o in options if o not in remember]
+        update["what_approve_does"] = (
+            "Runs the {!r} tool once, now: {}. A process ID is reused by other "
+            "programs once its process exits, so this approval is never remembered "
+            "-- you will be asked again every time. The parked run then picks up on "
+            "its own.".format(target.tool, line))
+    else:
+        update["what_approve_does"] = (
+            "Approval now covers one application ({}); 'Always allow' remembers "
+            "only that one. ".format(line) + descriptor.what_approve_does
+            if remember else
+            "Approval covers one application ({}). ".format(line)
+            + descriptor.what_approve_does)
+    return descriptor.model_copy(update=update)
+
+
+def _stand_in_tool(tool_name: str, impl_path):
+    """P26: the Tool the per-target gate scores when the caller threaded none.
+
+    A launch/close call must never run ungated just because no ``Tool`` was in
+    scope (the per-tool gate is a no-op without one). Unknown provenance is
+    treated as forged; the effect tags are re-derived from the body on disk."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        name=tool_name, id="", version="", forged_by_systemu=True,
+        effect_tags=sorted(_derive_effect_tags_from_source(impl_path)),
+        implementation_path=str(impl_path) if impl_path is not None else "")
 
 
 # Programs that only READ system/file state. Deliberately tight: anything
@@ -471,6 +699,12 @@ def _normalize_output_paths(name: str, params: Any, output_dir: Optional[str]) -
     Returns a (possibly new) params dict; never raises.
     """
     if not isinstance(params, dict) or not output_dir:
+        return params
+    from systemu.runtime.app_targets import TARGET_GATED_TOOLS
+    if name in TARGET_GATED_TOOLS:
+        # P26: launch/close_application's ``path`` names the PROGRAM to act on, not
+        # a deliverable. Redirecting it would make the target depend on whether a
+        # directory exists (not on the call), and launch an output-dir file instead.
         return params
     try:
         out = Path(output_dir).resolve()
@@ -561,6 +795,14 @@ class ToolResult:
     error: Optional[str] = None
     timed_out: bool = False
     exit_code: int = 0
+    # R-P3b: how THIS call got past the sandbox gates (see ``_gate_record``), so the
+    # action-audit writers can stamp it on the row they write. ``None`` when no gate
+    # outcome was recorded for the call. Deliberately NOT part of ``to_dict`` -- it is
+    # audit provenance, not an observation for the model.
+    gate: Optional[Dict[str, Any]] = None
+    # R-P3b AC1: True once ``_after_successful_call`` has written THIS call's row to
+    # the global action audit, so the runtime's per-call row does not write a second.
+    audit_written: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -701,10 +943,17 @@ class ToolSandbox:
         execution_id,
         objective_id,
         user_id=None,
+        gate=None,
     ):
         """v0.9.1: action-tool audit hook. Called from the post-call success
         path after a tool returns ToolResult(success=True). No-op for
         non-action tools or when audit_log_enabled is False.
+
+        R-P3b: ``gate`` is the call's ``ToolResult.gate`` record; it is stamped on
+        the audit row as-is (no parameter values in it) so the action ledger can
+        show the verdict and effect classes the gate actually decided on. Returns
+        True only when the row was written (AC1: the caller marks the result so the
+        call is not audited twice); anything else means no row was written.
         """
         if not getattr(tool, "is_action_tool", False):
             return
@@ -716,23 +965,35 @@ class ToolSandbox:
             return  # no vault → can't audit; degrade silently
 
         from systemu.runtime import audit_log
+        # DEC-31: mask BEFORE anything is persisted, with the per-call audit row's
+        # own masker (mask, then clip each value). This row used to carry the raw
+        # parameters. Fail closed: no masker -> no values.
+        try:
+            from systemu.runtime.shadow_runtime import _truncate_audit_params
+            safe_params = _truncate_audit_params(params or {})
+        except Exception:
+            safe_params = {str(k): "[redaction unavailable - value dropped]"
+                           for k in (params or {})} if isinstance(params, dict) else {}
         try:
             audit_log.append_action(
                 vault,
                 execution_id=execution_id,
                 objective_id=objective_id,
                 action=tool.name,
-                params=params or {},
+                params=safe_params,
                 success=True,
                 error=None,
                 user_id=user_id,
+                gate=gate,
             )
+            return True
         except Exception as exc:  # pragma: no cover — best-effort
             import logging
             logging.getLogger(__name__).warning(
                 "[ToolSandbox] action audit write failed for %s: %s",
                 tool.name, exc,
             )
+            return False
 
     def _record_capability_outcome(
         self,
@@ -826,9 +1087,24 @@ class ToolSandbox:
         try:
             from systemu.runtime.tool_registry_v2 import registry as _v2_registry
             entry = _v2_registry.get(name)
+            from systemu.runtime.app_targets import TARGET_GATED_TOOLS
+            if entry is not None and name in TARGET_GATED_TOOLS:
+                # P26: a target-gated tool runs only where its target is resolved,
+                # gated and then consumed by the SAME resolver (the v1 body), never
+                # through a code-registered handler that need not consume it.
+                logger.warning("[ToolSandbox] ignoring the code-registered %s handler: "
+                               "it is gated per target on the vault path only", name)
+                entry = None
             if entry is not None and _v2_registry.available(
                 name, self._config or _build_empty_config()
             ):
+                # P21: a code-registered handler skips execute_tool, so the
+                # operator-command fence runs here too (by tool name).
+                from systemu.runtime.operator_cli_fence import refuse_operator_command
+                _operator_refusal = refuse_operator_command(
+                    name, params, approvals=self._command_approvals)
+                if _operator_refusal is not None:
+                    return _operator_refusal.as_parsed()
                 import asyncio as _asyncio
                 loop = _asyncio.get_running_loop()
                 # v0.9.33 (A): file_tools (and any sandbox-aware handler)
@@ -838,12 +1114,30 @@ class ToolSandbox:
                 # declares (or accepts via **kw) so handlers without those
                 # params don't raise TypeError.
                 _eff_params = _inject_sandbox_kwargs(entry.handler, dict(params or {}), _od)
+                # P23: a code-registered handler under a shell tool's name is
+                # command-gated on the very kwargs it receives -- by construction,
+                # not by the convention that none is ever registered.
+                if name in _SHELL_TOOL_NAMES:
+                    from systemu.runtime.tool_registry import SealedCallKwargs
+                    _eff_params = SealedCallKwargs(_eff_params)
+                    _refused = self._maybe_gate_command(name, _eff_params)
+                    if type(_refused) is ToolResult:
+                        return dict(_refused.parsed)
                 try:
                     if entry.is_async:
                         result = await entry.handler(**_eff_params)
                     else:
+                        # P28: run the sync handler INSIDE a copy of this run's
+                        # context. ``run_in_executor`` does not carry contextvars to
+                        # the worker thread, so a v2 handler (every workflow-lane
+                        # MCP call) saw NO run: the MCP gate read an empty run id
+                        # and no lineage, so it could not bind a typed one-shot to
+                        # the run that raised the card (nor scope "Trust this tool
+                        # for the session" to it).
+                        import contextvars as _contextvars
+                        _run_ctx = _contextvars.copy_context()
                         result = await loop.run_in_executor(
-                            None, lambda: entry.handler(**_eff_params)
+                            None, lambda: _run_ctx.run(entry.handler, **_eff_params)
                         )
                 except PendingOperatorDecision:
                     # v0.9.34 (P0 review HIGH-1): an action/destructive MCP tool
@@ -997,6 +1291,22 @@ class ToolSandbox:
                 exit_code=-1,
             )
 
+        # ── P21: the agent never runs a systemu OPERATOR command ─────────
+        # Ahead of the command gate, both gates' approvals and both execution
+        # paths: a call that would invoke an operator-only systemu CLI verb is
+        # refused HERE -- never carded, never covered by a standing approval
+        # (read, not consumed), never run. The refusal is this call's result, a
+        # value no frame between here and the agent can catch (DEC-32).
+        # Residuals (a spawn inside a tool BODY, run-time name construction):
+        # see systemu/runtime/operator_cli_fence.py.
+        from systemu.runtime.operator_cli_fence import refuse_operator_command
+        _operator_refusal = refuse_operator_command(
+            tool_name, parameters, tool=tool, impl_path=impl_path,
+            approvals=self._command_approvals)
+        if _operator_refusal is not None:
+            return ToolResult(success=False, error=_operator_refusal.message,
+                              parsed=_operator_refusal.as_parsed(), exit_code=-1)
+
         # ── v0.9.32 (D.4): per-command operator approval gate ─────────────
         # The single chokepoint for both shell tools (run_command,
         # run_cli_command) and both lanes. A destructive, non-allowlisted
@@ -1004,8 +1314,46 @@ class ToolSandbox:
         # PendingOperatorDecision (caught + parked by the workflow lane;
         # block-polled by the chat lane). Provably read-only commands and
         # already-approved signatures fall through and run.
-        self._maybe_gate_command(tool_name, parameters,
-                                 resolved_dedup=_command_gate_resolved)
+        #
+        # P23 / P28: the gates score the value that RUNS. EVERY call is SEALED
+        # first -- reconciled exactly as the path that will run it does
+        # (in-process: onto run()'s signature; subprocess: as given) -- and from
+        # here on ``parameters`` IS that sealed value: the command gate, the
+        # per-tool gate (its destructive check, fingerprint, typed-confirm phrase
+        # and card) read it, and both execution paths (and the fallback between
+        # them) consume it as-is. Sealed ONCE, here; never re-derived later.
+        _in_process = (self._registry is not None and impl_path.exists()
+                       and not force_subprocess
+                       and not _must_use_subprocess(tool_type, extra_packages))
+        parameters = self._seal_call(tool_name, parameters, in_process=_in_process)
+        # ── P26: launch/close_application are gated PER RESOLVED TARGET ─────
+        # Sealed like every call (above), then resolved by the ONE resolver the
+        # body itself calls on these same kwargs (``app_targets``). A target that
+        # cannot be resolved is refused here (a value; never carded or signed); a
+        # resolved launch is fenced AGAIN on the command line it would run, so no
+        # friendly-name mapping can smuggle a systemu operator command past the
+        # raw-string fence above. The per-tool gate then signs and shows it.
+        from systemu.runtime.app_targets import (TARGET_GATED_TOOLS, AppTarget,
+                                                 resolve_target)
+        _target = None
+        _gate_tool = tool
+        if tool_name in TARGET_GATED_TOOLS:
+            _target = resolve_target(tool_name, parameters)
+            if type(_target) is not AppTarget:
+                return self._refuse_undeterminable_target(tool_name, _target.reason)
+            if _target.action == "launch":
+                _operator_refusal = refuse_operator_command(
+                    tool_name, {"command": _target.value}, tool=tool,
+                    impl_path=impl_path, approvals=self._command_approvals)
+                if _operator_refusal is not None:
+                    return ToolResult(success=False, error=_operator_refusal.message,
+                                      parsed=_operator_refusal.as_parsed(), exit_code=-1)
+            if _gate_tool is None:
+                _gate_tool = _stand_in_tool(tool_name, impl_path)
+        _command_gate = self._maybe_gate_command(tool_name, parameters,
+                                                 resolved_dedup=_command_gate_resolved)
+        if type(_command_gate) is ToolResult:
+            return _command_gate    # P23: refused -- a value, never carded or signed
 
         # ── S1b (THE CRUX): per-tool live action gate ─────────────────────
         # The SAME chokepoint gates effectful forged/registry tools via the
@@ -1015,9 +1363,13 @@ class ToolSandbox:
         # existing quick-lane park/poll/resume machinery catches it unchanged. A
         # benign local (ALLOW) tool falls through and runs. No-op when the Tool
         # is out of scope (tool=None) — legacy/registry-less path unchanged.
-        self._maybe_gate_tool(tool, tool_name, parameters,
-                              resolved_dedup=_command_gate_resolved,
-                              impl_path=impl_path)
+        _tool_gate = self._maybe_gate_tool(_gate_tool, tool_name, parameters,
+                                           resolved_dedup=_command_gate_resolved,
+                                           impl_path=impl_path, target=_target)
+        # R-P3b: every return below this line is a call that PASSED the gates; each
+        # carries the record of how (``_with_gate``), so the audit writers can stamp
+        # the verdict and effect classes the gate decided on. None = nothing recorded.
+        _gate = _compose_gate_record(_command_gate, _tool_gate)
 
         # ── Fast path: ToolRegistry (direct Python function call) ─────────
         # Browser/Playwright tools MUST go through the subprocess path — their
@@ -1026,9 +1378,7 @@ class ToolSandbox:
         # forged-and-untrusted tools (requires_subprocess_isolation) — the
         # in-process fast path is full-daemon-privilege and generated code
         # only earns it via the operator's explicit trusted_inprocess.
-        if (self._registry is not None and impl_path.exists()
-                and not force_subprocess
-                and not _must_use_subprocess(tool_type, extra_packages)):
+        if _in_process:
             try:
                 from systemu.runtime.tool_registry import ToolDependencyError, ToolNotEnabledError
                 from systemu.approval.exceptions import PendingOperatorDecision
@@ -1045,15 +1395,15 @@ class ToolSandbox:
                 # v0.9.1: truncate_result is called here by callers that have
                 # the Tool object in scope (e.g. shadow_runtime in T12).
                 # execute_tool only has the impl path, not the Tool model.
-                return ToolResult(
+                return _with_gate(ToolResult(
                     success=success,
                     parsed=result_dict,
                     error=result_dict.get("error") if not success else None,
-                )
+                ), _gate)
             except ToolNotEnabledError as exc:
                 # Gate 3 violation — do NOT fall back to subprocess
                 logger.warning("[Sandbox] Gate 3 blocked '%s': %s", tool_name, exc)
-                return ToolResult(success=False, error=str(exc))
+                return _with_gate(ToolResult(success=False, error=str(exc)), _gate)
             except ToolDependencyError as exc:
                 # Missing/broken import — subprocess would fail identically; skip it.
                 # The registry already returns a structured result dict for this case
@@ -1062,7 +1412,8 @@ class ToolSandbox:
                 from systemu.runtime.tool_registry import _dep_error_dict
                 rd = _dep_error_dict(exc)
                 logger.warning("[Sandbox] Dep error for '%s': %s", tool_name, exc.missing)
-                return ToolResult(success=False, parsed=rd, error=rd["error"])
+                return _with_gate(ToolResult(success=False, parsed=rd, error=rd["error"]),
+                                  _gate)
             except PendingOperatorDecision:
                 # v0.8.18 Gate-4: an interactive credential ask (or any operator
                 # decision) was raised mid-call.  This is NOT a fast-path failure —
@@ -1079,10 +1430,10 @@ class ToolSandbox:
 
         # ── Subprocess fallback (no registry, dry-run, or Docker mode) ────
         if not impl_path.exists():
-            return ToolResult(
+            return _with_gate(ToolResult(
                 success=False,
                 error=f"Implementation not found: {impl_path}",
-            )
+            ), _gate)
 
         params_json = json.dumps(parameters)
 
@@ -1093,18 +1444,127 @@ class ToolSandbox:
 
         # Delegate to the configured backend.  All transports share the
         # same protocol: see systemu/runtime/backend/protocol.py.
-        return await self._backend.execute(
+        return _with_gate(await self._backend.execute(
             impl_path,
             params_json,
             timeout=effective_timeout,
             extra_packages=extra_packages or [],
-        )
+        ), _gate)
+
+    def _seal_call(self, tool_name: str, parameters: Any, *, in_process: bool):
+        """P23 / P28: the exact kwargs the tool's body will receive, sealed --
+        for EVERY tool, not only the shell and target-gated ones.
+
+        In-process, the registry reconciles parameter names onto ``run()`` -- so
+        the call is reconciled HERE, by the registry's own ``seal_call`` (without
+        importing the module), and the registry then runs that value verbatim.
+        On the subprocess path the runner calls ``run(**params)`` unreconciled, so
+        the parameters are sealed as given. A registry that cannot seal (a test
+        double) gets the parameters as given: whatever the value, execution
+        consumes exactly what the gate scored. Idempotent on an already-sealed
+        value (never re-reconciled)."""
+        from systemu.runtime.tool_registry import SealedCallKwargs
+        if type(parameters) is SealedCallKwargs:
+            return parameters
+        if in_process:
+            seal = getattr(self._registry, "seal_call", None)
+            sealed = None
+            if callable(seal):
+                try:
+                    sealed = seal(tool_name, parameters)
+                except Exception:
+                    logger.debug("[Sandbox] could not seal %s through the registry; "
+                                 "sealing the parameters as given", tool_name,
+                                 exc_info=True)
+            if type(sealed) is SealedCallKwargs:
+                return sealed
+        out = SealedCallKwargs(dict.copy(parameters) if isinstance(parameters, dict)
+                               else {})
+        if isinstance(parameters, dict):
+            out.presented = dict.copy(parameters)
+        return out
+
+    #: P23 name, kept for any caller that still reaches for it.
+    _seal_command_call = _seal_call
+
+    def _refuse_undeterminable_command(self, tool_name: str, parameters: Any,
+                                       why: str) -> "ToolResult":
+        """P23 / DEC-27: the result of a shell call whose command the gate cannot
+        determine. Never carded, never signed, never matched against an approval.
+        A standing approval on record for the EMPTY command (the old gate minted one
+        from a ``$ `` card's "Always allow") is VOID -- said so in the log."""
+        from systemu.runtime.command_approvals import _ascii, command_signature
+        cwd = dict.get(parameters, "cwd") if isinstance(parameters, dict) else None
+        cwd = cwd if type(cwd) is str else ""
+        store = self._command_approvals
+        if store is None:
+            try:
+                from systemu.runtime.command_approvals import init_default_store
+                store = init_default_store(Path("data"))
+            except Exception:
+                store = None
+        for _cwd in dict.fromkeys((cwd, "")):
+            _sig = command_signature("", cwd=_cwd)
+            try:
+                _void = store is not None and store.is_approved(_sig)
+            except Exception:
+                _void = False
+            if _void:
+                logger.warning(
+                    "[Sandbox] a standing approval on record for the EMPTY command "
+                    "(signature %s, cwd %r) is VOID: an empty command is never "
+                    "scored, so that approval covers nothing. %s was refused.",
+                    _sig, _cwd, tool_name)
+        message = _ascii(
+            "Refused {}: could not determine the command this call would run ({}). "
+            "Nothing was run and nothing was offered for approval. Pass the whole "
+            "command as one non-empty string in the 'command' parameter.".format(
+                tool_name, why))
+        logger.warning("[Sandbox] %s", message)
+        try:
+            from systemu.interface.notifications import log_event
+            log_event("WARNING", "tool", message,
+                      {"tool_name": str(tool_name)[:80], "reason": COMMAND_UNDETERMINABLE})
+        except Exception:
+            logger.debug("[Sandbox] could not write the refusal event", exc_info=True)
+        return ToolResult(success=False, error=message, exit_code=-1,
+                          parsed={"success": False, "error": message,
+                                  "error_type": COMMAND_UNDETERMINABLE})
+
+    def _refuse_undeterminable_target(self, tool_name: str, why: str) -> "ToolResult":
+        """P26 / DEC-27: the result of a launch/close call whose target cannot be
+        resolved deterministically. Never carded, never signed, never matched
+        against an approval. ``why`` comes from ``app_targets`` and echoes no
+        parameter value."""
+        from systemu.runtime.app_targets import TARGET_UNDETERMINABLE
+        from systemu.runtime.command_approvals import _ascii
+        verb = "close" if tool_name == "close_application" else "launch"
+        message = _ascii(
+            "Refused {}: could not determine which application this call would {} "
+            "({}). Nothing was run and nothing was offered for approval. Name one "
+            "application: a full path, an executable name, or a known name such as "
+            "'notepad'.".format(tool_name, verb, why))
+        logger.warning("[Sandbox] %s", message)
+        try:
+            from systemu.interface.notifications import log_event
+            log_event("WARNING", "tool", message,
+                      {"tool_name": str(tool_name)[:80], "reason": TARGET_UNDETERMINABLE})
+        except Exception:
+            logger.debug("[Sandbox] could not write the refusal event", exc_info=True)
+        return ToolResult(success=False, error=message, exit_code=-1,
+                          parsed={"success": False, "error": message,
+                                  "error_type": TARGET_UNDETERMINABLE})
 
     def _maybe_gate_command(self, tool_name: str, parameters: Dict[str, Any],
-                            *, resolved_dedup: Optional[str] = None) -> None:
+                            *, resolved_dedup: Optional[str] = None
+                            ) -> Optional[Dict[str, Any]]:
         """v0.9.32 (D.4): raise PendingOperatorDecision for a destructive,
         non-allowlisted shell command. No-op for non-shell tools, provably
         read-only commands, or already-approved signatures.
+
+        R-P3b: returns ``None`` for a non-shell tool (this gate did not look at the
+        call) and otherwise the ``_gate_record`` of how the command passed. The
+        command gate scores the command TEXT, so its record carries no effect class.
 
         ``resolved_dedup`` is the chat-lane "Approve once" one-shot bypass
         (D.6): when it matches this command's dedup key AND the decision queue
@@ -1114,14 +1574,25 @@ class ToolSandbox:
         Fail-closed posture: any failure to RESOLVE the approval store leaves
         the gate active (we still post + raise) — we never silently run an
         unapproved destructive command.
+
+        P23: ``parameters`` are the FINAL kwargs the body receives (``execute_tool``
+        passes the sealed value it then executes), and the command scored, signed,
+        shown on the card and stamped for the resume path is read from them by
+        ``_command_to_score``. A command that cannot be determined is never scored:
+        the return is a refusal ``ToolResult`` -- the call's result, a value
+        (DEC-32) -- and nothing is carded, signed or looked up. So no approval on
+        record for the EMPTY command can ever be consulted, let alone match.
         """
         if tool_name not in _SHELL_TOOL_NAMES:
-            return
+            return None
+        scored, why = _command_to_score(tool_name, parameters)
+        if scored is None:
+            return self._refuse_undeterminable_command(tool_name, parameters, why)
+        command, cwd = scored
         if not self.is_destructive_call(tool_name, parameters):
-            return  # provably read-only → run without approval
-
-        command = str(parameters.get("command") or parameters.get("cmd") or "")
-        cwd = str(parameters.get("cwd") or "")
+            # provably read-only → run without approval
+            return _gate_record(gate="command", verdict="allow",
+                                passed_via="read_only_command")
 
         from systemu.runtime.command_approvals import (
             command_signature, init_default_store)
@@ -1134,7 +1605,9 @@ class ToolSandbox:
         sig = command_signature(command, cwd=cwd)
         dedup = f"command:{sig}"
         if store is not None and store.is_approved(sig):
-            return  # "Always allow" on record → run
+            # "Always allow" on record → run
+            return _gate_record(gate="command", verdict="require_approval",
+                                passed_via="standing_approval")
 
         # v0.9.52: one-shot RESUME approval. The command-gate resume path marks
         # this signature when it re-submits a parked task that the operator
@@ -1142,7 +1615,9 @@ class ToolSandbox:
         # proceeds past the command instead of re-asking in a loop. A LATER,
         # unrelated command re-asks normally (the mark is single-use).
         if store is not None and store.consume_resume_approved(sig):
-            return
+            return _gate_record(gate="command", verdict="require_approval",
+                                passed_via="resume_bridge",
+                                decision_id=_bridge_decision_id(store))
 
         # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
         # exact decision with a non-Deny choice; honor it once without
@@ -1157,9 +1632,15 @@ class ToolSandbox:
         if resolved_dedup and resolved_dedup == dedup:
             try:
                 from systemu.approval.decision_queue import OperatorDecisionQueue
-                choice = OperatorDecisionQueue(self._vault).consume_resolved_choice(dedup)
+                # R-P3b: the decision itself (same single-use consume as the
+                # choice-only form), so the pass can name the decision it spent.
+                decision = OperatorDecisionQueue(self._vault).consume_resolved_decision(
+                    dedup)
+                choice = getattr(decision, "choice", None)
                 if choice is not None and (choice or "").strip().lower() != "deny":
-                    return
+                    return _gate_record(gate="command", verdict="require_approval",
+                                        passed_via="approve_once",
+                                        decision_id=getattr(decision, "id", None))
             except Exception:
                 logger.debug("[Sandbox] Approve-once bypass check failed; "
                              "falling through to re-gate (fail-closed)",
@@ -1232,8 +1713,15 @@ class ToolSandbox:
 
     def _maybe_gate_tool(self, tool, tool_name: str, parameters: Dict[str, Any],
                          *, resolved_dedup: Optional[str] = None,
-                         impl_path=None) -> None:
+                         impl_path=None, target=None) -> Optional[Dict[str, Any]]:
         """S1b (THE CRUX): the live per-tool action gate (IMPL-1).
+
+        R-P3b: on every path that lets the call run it RETURNS the ``_gate_record``
+        of that pass (verdict as scored, the governor's effective effect classes, the
+        pass path, the consumed decision's id when there is one). It returns ``None``
+        when there is no Tool to score, and a ``{"delegated_to": "command"}`` marker
+        on the shell-tool carve-out. The return value only REPORTS a decision this
+        function already made; nothing here reads it to decide anything.
 
         Builds an ``ActionContext`` from the Tool's EffectTags + target-network
         signal, runs the deterministic ``evaluate_action`` governor, and — for a
@@ -1291,12 +1779,24 @@ class ToolSandbox:
         ``_gate_skip_reason`` too. ``tests/test_dryrun_gate_skip.py``
         (``TestParityWithLiveGate``, t5) pins the two together for declared-tag
         inputs and fails on drift there; it does not cover the untagged path.
+
+        P26 ``target`` (an ``app_targets.AppTarget``, for launch/close_application
+        only): the signature also binds the resolved target
+        (``command_approvals.tool_target_signature``), so a standing approval
+        covers ONE application. The parameter-free approval such a tool held
+        before is not honoured -- it is noticed, logged, and the card says
+        approval now covers one application. A target that is not
+        ``rememberable`` (a process ID) is never covered by a standing approval
+        and is offered no "Always allow". The card shows the target and EVERY
+        parameter that reaches the tool, redacted then capped (DEC-31). The
+        ``ActionContext`` is untouched, so the dry-run mirror is unaffected.
         """
         if tool is None:
-            return  # no Tool to gate — legacy/registry-less path unchanged
+            return None  # no Tool to gate — legacy/registry-less path unchanged
 
         from systemu.runtime.action_governance import (
             ActionContext, Verdict, effective_tags, evaluate_action)
+        from systemu.runtime.tool_registry import presented_params
 
         effect_tags = {str(t) for t in (getattr(tool, "effect_tags", None) or [])}
 
@@ -1322,7 +1822,12 @@ class ToolSandbox:
         # path re-resolved here that could drift from it.
         if _command_gate_already_scored(tool, tool_name, effect_tags,
                                         impl_path=impl_path):
-            return
+            # The command gate's record stands for this call; what this gate can add
+            # is the tool's DECLARED effect classes (None when it declares none).
+            _declared = sorted(effect_tags)
+            return {"delegated_to": "command",
+                    "effect_tags": _declared or None,
+                    "effect_tags_basis": "declared" if _declared else None}
 
         # D1 host/target — DEFERRED until a real host resolver lands (a later
         # task). `target_is_network` means "an actually-RESOLVED untrusted host"
@@ -1369,15 +1874,28 @@ class ToolSandbox:
             "effect_tags": sorted(effect_tags),
             "host_class": host_class,
         }
+        # P26: the parameter-free signature, before a resolved target is bound in.
+        _param_free_sig = signature_from_parts(_sig_parts)
+        if target is not None:
+            _sig_parts["target"] = target.signed()
         sig = signature_from_parts(_sig_parts)
         if sig is None:     # parts that cannot sign: fall back to the raw function
-            sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
-                                 effect_tags, host_class=host_class)
+            if target is not None:
+                from systemu.runtime.command_approvals import (signature_host_class,
+                                                               tool_target_signature)
+                sig = tool_target_signature(
+                    getattr(tool, "name", tool_name), body_hash, effect_tags,
+                    host_class=signature_host_class(host_class), target=target.signed())
+            else:
+                sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
+                                     effect_tags, host_class=host_class)
         # The signature this tool had BEFORE host classes existed. For a `none`-class
         # tool it IS `sig` (that is the upgrade ruling); for a networked tool it is
         # the old approval the gate must not honour silently -- see below.
         _pre_host_sig = tool_signature(getattr(tool, "name", tool_name), body_hash,
                                        effect_tags, host_class="")
+        # P26: a process-ID target is never covered by a standing approval.
+        _rememberable = target is None or target.rememberable
 
         # Resolve the approval store (fail-closed: no store → still gate). Resolved
         # BEFORE scoring because IMPL-2's operator reclassification is an INPUT to
@@ -1410,6 +1928,30 @@ class ToolSandbox:
         # binds it to the exact parameters the operator classified, so a substituted
         # call on the same signature falls back to a fresh DENY (see args_fingerprint).
         fingerprint = args_fingerprint(parameters)
+        # P28 FINGERPRINT MIGRATION. ``parameters`` is the SEALED call, so the
+        # fingerprint is over what the tool RECEIVES. A build before P28 hashed the
+        # parameters as the model WROTE them; the two differ only when the registry
+        # reconciled a name (``file_path`` -> ``path``) or dropped a key. Only
+        # ONE-SHOT records bind a fingerprint (an IMPL-2 reclassification, the R1
+        # bridge's confirmed args, a resolved card's stamp) -- no standing approval
+        # does, so "Always allow" keeps covering exactly what it covered. A one-shot
+        # record minted against the as-written fingerprint does NOT match here: the
+        # call is gated again and asks once more (said in the log and on the card).
+        # A mismatch can only FAIL a match, never widen one.
+        _written = presented_params(parameters)
+        _written_fp = args_fingerprint(_written) if _written is not None else ""
+        _legacy_fp = _written_fp if (_written_fp and _written_fp != fingerprint) else ""
+        _stale_record = []
+
+        def _note_stale_record(what: str) -> None:
+            if not _stale_record:
+                logger.warning(
+                    "[Sandbox] %s for %s was recorded against the parameters as the "
+                    "model wrote them, before they were matched to the tool's own "
+                    "parameter names; it does not carry over, so this call asks once "
+                    "more.", what, getattr(tool, "name", tool_name))
+            _stale_record.append(what)
+
         pending_class = None
         if store is not None:
             try:
@@ -1419,6 +1961,13 @@ class ToolSandbox:
                 logger.debug("[Sandbox] could not read reclassification; scoring "
                              "without it (fail-closed)", exc_info=True)
                 pending_class = None
+            if not pending_class and _legacy_fp:
+                try:
+                    if store.peek_reclassified(sig, args_fingerprint=_legacy_fp):
+                        _note_stale_record("An operator reclassification")
+                except Exception:
+                    logger.debug("[Sandbox] could not read the as-written "
+                                 "reclassification", exc_info=True)
         if pending_class:
             ctx.operator_assigned_class = pending_class
             logger.info("[Sandbox] tool %s scored under operator reclassification %s",
@@ -1439,8 +1988,13 @@ class ToolSandbox:
         from systemu.runtime.command_approvals import typed_confirm_phrase
         _scored_tags = effective_tags(ctx)
         _irrev = irreversible_effects(_scored_tags)
-        _phrase = (typed_confirm_phrase(getattr(tool, "name", tool_name), parameters,
-                                        _irrev) if _irrev else "")
+        # P28: the phrase is derived from the SEALED call (what the tool receives),
+        # handed over as a plain dict -- ``typed_confirm_phrase`` pins ``type(x) is
+        # dict`` (DEC-36), which the ``SealedCallKwargs`` subclass is not.
+        _phrase = (typed_confirm_phrase(
+            getattr(tool, "name", tool_name),
+            dict.copy(parameters) if isinstance(parameters, dict) else parameters,
+            _irrev) if _irrev else "")
 
         def _spend_reclassification() -> None:
             """Single-use: a reclassification is spent by the call it authorised, so
@@ -1454,6 +2008,14 @@ class ToolSandbox:
                                  exc_info=True)
 
         _legacy_host_class = ""
+        _legacy_target = False
+
+        def _passed(passed_via: str, decision_id: Any = None) -> Dict[str, Any]:
+            """R-P3b: the record of THIS pass -- the verdict as scored and the
+            effective tags the governor scored (never the raw declared set)."""
+            return _gate_record(gate="tool", verdict=verdict, passed_via=passed_via,
+                                effect_tags=_scored_tags, effect_tags_basis="scored",
+                                decision_id=decision_id)
 
         # MASK is deliberately NOT in this tuple. ``evaluate_action`` has no MASK
         # producer today, so listing it changed nothing — but it is the one branch here
@@ -1465,7 +2027,7 @@ class ToolSandbox:
             # REQUIRE_APPROVAL). If a future scoring change ever reopens this path,
             # the one-shot is still spent rather than left standing.
             _spend_reclassification()
-            return  # frictionless majority — run unchanged
+            return _passed("auto_allow")  # frictionless majority — run unchanged
         # IMPL-1 — NO persisted approval of any kind may satisfy the DENY band.
         #
         # This check MUST precede every short-circuit below. The tool signature is
@@ -1491,15 +2053,36 @@ class ToolSandbox:
             # by an older build, not a hand-edited file. Like the DENY band, only the
             # CONSUMPTION side can say so for every store state.
             if (store is not None and not pending_class and not _irrev
-                    and store.is_approved(sig)):
-                return  # "Always allow" on record → run
+                    and _rememberable and store.is_approved(sig)):
+                return _passed("standing_approval")  # "Always allow" on record → run
+            # P26 upgrade path. A launch/close tool approved before targets were
+            # bound holds an allow on its PARAMETER-FREE signature, which covered
+            # every application. It is NOT honoured: the first call of each target
+            # asks once, and the log and the card say approval now covers one
+            # application. The old allow is left on record (it covers nothing).
+            if target is not None:
+                if store is not None and not pending_class and not _irrev:
+                    try:
+                        _legacy_target = any(
+                            store.is_approved(s)
+                            for s in dict.fromkeys((_param_free_sig, _pre_host_sig)) if s)
+                    except Exception:
+                        logger.debug("[Sandbox] could not read the parameter-free "
+                                     "approval", exc_info=True)
+                    if _legacy_target:
+                        logger.warning(
+                            "[Sandbox] a standing approval of %s on record covered "
+                            "EVERY application and is not honoured: approval now covers "
+                            "one application. Asking once for: %s",
+                            getattr(tool, "name", tool_name),
+                            target.describe(show=_card_text))
             # IMPL-1 upgrade path. A NETWORKED tool approved before host checks
             # existed holds an allow on its pre-host signature, which bound no host
             # at all. It is neither honoured silently (that would bless every host
             # the spec now names) nor dropped silently: it falls through to the card
             # below, which says why it is asking again and names the hosts. The old
             # allow is left on record; "Always allow" here records the new one.
-            if (store is not None and not pending_class and not _irrev
+            elif (store is not None and not pending_class and not _irrev
                     and _pre_host_sig != sig):
                 try:
                     if store.is_approved(_pre_host_sig):
@@ -1536,7 +2119,7 @@ class ToolSandbox:
             if store is not None and store.consume_resume_approved(
                     sig, for_reclassification=pending_class, **_confirm_kw):
                 _spend_reclassification()
-                return
+                return _passed("resume_bridge", decision_id=_bridge_decision_id(store))
             # Chat-lane "Approve once" one-shot bypass: the operator resolved THIS
             # exact decision with a non-Deny choice; honor once without persisting.
             #
@@ -1559,6 +2142,14 @@ class ToolSandbox:
                         self._vault).consume_resolved_decision(dedup)
                     choice = getattr(decision, "choice", None)
                     norm = (choice or "").strip().lower()
+                    # P28: a card an older build stamped with the AS-WRITTEN
+                    # fingerprint does not witness this sealed call (the checks
+                    # below fail it); say why it is asking once more.
+                    _dctx = getattr(decision, "context", None)
+                    _dfp = _dctx.get("args_fingerprint") if type(_dctx) is dict else None
+                    if (_legacy_fp and type(_dfp) is str and _dfp == _legacy_fp
+                            and choice is not None and norm != "deny"):
+                        _note_stale_record("An approval of this call")
                     # IMPL-2 — a RECLASSIFY resolution is not an approval. It shares this
                     # dedup key with the approval choices, so reading it as "not Deny,
                     # therefore approved" would let the reclassify click itself run the
@@ -1580,7 +2171,8 @@ class ToolSandbox:
                                 getattr(tool, "name", tool_name), _phrase, _irrev)
                         else:
                             _spend_reclassification()
-                            return
+                            return _passed("approve_once",
+                                           decision_id=getattr(decision, "id", None))
                 except Exception:
                     logger.debug("[Sandbox] tool-gate approve-once bypass check failed; "
                                  "falling through to re-gate (fail-closed)",
@@ -1604,9 +2196,12 @@ class ToolSandbox:
             # IMPL-2 (adversarial review, HIGH): the card must disclose WHICH call it
             # is. Two different calls share one tool signature, so without the args a
             # substituted call renders a card byte-identical to the one the operator
-            # expects — nothing on the surface would let them notice the swap. Bounded
-            # by _small_args_preview (8 keys / 80 chars) and secret-masked upstream.
-            args_preview=ctx.args_preview,
+            # expects — nothing on the surface would let them notice the swap.
+            # P26 / P28: EVERY tool's card lists EVERY parameter that reaches the
+            # tool -- ``parameters`` is the sealed call -- each redacted and only
+            # then capped (DEC-31), by the ONE card-preview function. No 9th key
+            # hides, and the card shows what runs, not what the model wrote.
+            args_preview=_card_args_preview(parameters),
             # IMPL-1: what a standing approval of this card binds to, hosts included,
             # and -- for a networked tool approved before host checks -- why it asks.
             host_class=host_class,
@@ -1617,6 +2212,14 @@ class ToolSandbox:
             irreversible_effects=_irrev,
             confirm_phrase=_phrase,
         )
+        if target is not None:
+            descriptor = _target_card(descriptor, target, legacy=_legacy_target)
+        if _stale_record:
+            descriptor = descriptor.model_copy(update={"inspect": descriptor.inspect + (
+                "\n\n" + _stale_record[0] + " was recorded against the parameters as "
+                "the model wrote them, before they were matched to this tool's own "
+                "parameter names, so it does not carry over: this card asks once "
+                "more, about the parameters shown above.")})
         if _irrev and store is not None and not pending_class:
             # R1: tell the store this signature may never hold a STANDING approval,
             # so it refuses one "even if a caller asks". Written by the gate (the
@@ -1724,7 +2327,10 @@ class ToolSandbox:
             # (no standing allow) and is now wrong twice over: a DENY card offers no
             # "Approve once" either, and it does offer the reclassify remedy.
             message=(f"Operator approval required to run tool "
-                     f"`{getattr(tool, 'name', tool_name)}`. Open the dashboard Inbox "
+                     f"`{getattr(tool, 'name', tool_name)}`"
+                     + (f" ({target.describe(show=_card_text)})"
+                        if target is not None else "")
+                     + f". Open the dashboard Inbox "
                      f"and choose {' / '.join(descriptor.options)}."
                      + (f" It cannot be undone, so 'Approve once' needs you to type "
                         f"{descriptor.confirm_phrase} on the card."

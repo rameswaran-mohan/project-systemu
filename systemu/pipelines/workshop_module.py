@@ -47,7 +47,7 @@ async def rebuild_scroll(scroll_id: str, prompt: str, config: Config, vault: Vau
     
     # 3. Call the Tier 2 reasoning engine
     decision = await async_llm_call_json(
-        tier=2,
+        stage="forge",
         system=system_prompt,
         user=user_prompt,
         config=config,

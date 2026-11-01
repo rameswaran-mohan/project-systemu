@@ -1,0 +1,47 @@
+{
+  "_doc": "Baseline for tools/lint_mask_primitive.py. Every mask function under systemu/ (name contains mask/redact/scrub) that does NOT reach the shared span primitive messaging.gateway.mask_secret_spans, with the reason it may. Enforced both ways: a mask function not listed here fails, and an entry that now reaches the primitive (or is gone) fails until it is deleted -- this list only shrinks. 'kind' is one of: primitive-internal (part of the primitive itself), whole-value (replaces the entire value, no span left to mask), identity (removes a KNOWN value by equality, not by shape), structural (drops a structural part of a parsed value), predicate (returns a bool, masks nothing), residual (a known gap, listed so it is visible -- not a permission).",
+  "functions": [
+    {
+      "path": "systemu/messaging/gateway.py",
+      "qualname": "_kv_mask",
+      "kind": "primitive-internal",
+      "reason": "The re.sub replacement callback of the primitive's own header/kv rule. mask_secret_spans calls it, so it cannot call mask_secret_spans."
+    },
+    {
+      "path": "systemu/runtime/credentials/known_values.py",
+      "qualname": "redact_known_secrets",
+      "kind": "identity",
+      "reason": "The known-value fence: replaces any token EQUAL to a stored credential (matched by keyed digest). It is the complement mask_outbound composes AFTER the primitive, for secrets no shape rule can see; running the shape rules here would only repeat them."
+    },
+    {
+      "path": "systemu/runtime/credentials/known_values.py",
+      "qualname": "_redact_token",
+      "kind": "identity",
+      "reason": "Per-token helper of redact_known_secrets (the known-value fence)."
+    },
+    {
+      "path": "systemu/runtime/credentials/store.py",
+      "qualname": "mask_secret",
+      "kind": "whole-value",
+      "reason": "Renders a stored credential as '<redacted:last4>' for display. The whole value is replaced; there is no surrounding text to span-mask."
+    },
+    {
+      "path": "systemu/winpkg/first_run.py",
+      "qualname": "_scrub",
+      "kind": "identity",
+      "reason": "Removes the ONE key being stored from a keyring backend's exception text, by equality (text.replace(secret, mask_secret(secret))). The value is known exactly, so no shape rule is needed."
+    },
+    {
+      "path": "systemu/queue/huey_app.py",
+      "qualname": "_mask_url",
+      "kind": "structural",
+      "reason": "Masks the password of the configured Redis broker URL for a log line by parsing it (urlsplit) and rebuilding the netloc with '***'. The input is a config URL, not free text."
+    },
+    {
+      "path": "systemu/runtime/action_governance.py",
+      "qualname": "should_mask",
+      "kind": "predicate",
+      "reason": "Returns a bool (does the args preview name a secret?); it masks nothing itself."
+    }
+  ]
+}

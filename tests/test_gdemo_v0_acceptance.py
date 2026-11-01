@@ -98,11 +98,17 @@ def _make_readback_handler(seen):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _drive_real_mcp_credit(tmp_path, monkeypatch, *, server, tool, objectives,
-                           claim_obj_id, params, annotations, readback_seen):
+                           claim_obj_id, params, annotations, readback_seen,
+                           operator=None):
     """Stand up a REAL MCP (server, tool) over stdio, pre-satisfy L2/L3, inject the
     mock-REST readback transport, and drive the real execute() loop with a scripted
     ``TOOL_CALL mcp__<server>__<tool>``. Returns ``(runtime, result, context,
-    cleanup)``. STUBS NEITHER the MCP-call seam NOR the readback seam."""
+    cleanup)``. STUBS NEITHER the MCP-call seam NOR the readback seam.
+
+    P21 (GATE-6, ruled): ``operator`` -- when the run stops at an operator card
+    (``PendingOperatorDecision``), ``operator(pending, vault)`` answers it the way an
+    operator would, and the task is run again once. Without one, a card is an error
+    (the registry is cleaned up first). No existing caller passes it."""
     import asyncio
     from unittest.mock import patch
     from sharing_on.config import Config
@@ -178,9 +184,25 @@ def _drive_real_mcp_credit(tmp_path, monkeypatch, *, server, tool, objectives,
         finally:
             ca.reset_default_store_for_tests()
 
-    with patch("systemu.runtime.shadow_runtime.llm_call_json", side_effect=decisions), \
-         patch("systemu.runtime.shadow_runtime._dispatch_refinery"):
-        result = asyncio.run(runtime.execute(shadow, activity))
+    def _run():
+        with patch("systemu.runtime.shadow_runtime.llm_call_json",
+                   side_effect=[dict(d) for d in decisions]), \
+             patch("systemu.runtime.shadow_runtime._dispatch_refinery"):
+            return asyncio.run(runtime.execute(shadow, activity))
+
+    from systemu.approval.exceptions import PendingOperatorDecision
+    try:
+        result = _run()
+    except PendingOperatorDecision as pending:
+        if operator is None:
+            _cleanup()
+            raise
+        try:
+            operator(pending, vault)
+            result = _run()
+        except BaseException:
+            _cleanup()
+            raise
     return runtime, result, _ctx.get("context"), _cleanup
 
 
@@ -299,11 +321,40 @@ def test_gdemo_receipt_is_grounded_and_unfabricated(tmp_path, monkeypatch):
 #  live path whose readback ECHOES the id — yet the receipt STAYS CLAIMED
 #  (confirmed is False), fail-closed: there is no independent MCP pre-submit probe
 #  to prove freshness, so a money-move can NEVER be faux-verified via self-report.
+#
+#  P21 (GATE-6, ruled): this test had gone VACUOUS -- the call never ran, so the
+#  receipt assertions held over a receipt that could not exist. Two things stopped
+#  it: the run is headless, so the legacy destructive-name prompt ("pay" in the
+#  name) auto-denied it; and P21's R1 gate refuses the seeded "Always allow" for a
+#  money call. It now runs the way an operator would make it run: the operator is
+#  at the console (the legacy prompt is answered yes), the run stops at the R1
+#  money card, the operator types the phrase (the amount) and approves ONCE, and
+#  the task is run again. The call RAN (witnessed by its own ledger row, carrying
+#  the approve-once pass and the card's decision id), and only then do the
+#  receipt assertions mean something.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_gdemo_money_move_stays_claimed(tmp_path, monkeypatch):
     monkeypatch.delenv("SYSTEMU_S4_STAMP", raising=False)
+    import systemu.runtime.shadow_runtime as _sr
+    from systemu.interface.command.inbox import resolve_pending_gate
+    from systemu.runtime import ledger
+    # An operator is at the console: the legacy destructive-name prompt is answered
+    # (instead of headless auto-deny), so the call reaches the MCP gate.
+    monkeypatch.setattr(_sr, "confirm", lambda *a, **k: True)
     seen: list = []
+    cards: list = []
+
+    def _operator(pending, vault):
+        card = vault.get_decision(pending.decision_id)
+        cards.append(card)
+        # R1: a money call -- the seeded "Always allow" covers nothing.
+        assert pending.options == ["Deny", "Approve once"], pending.options
+        assert card.context["confirm_phrase"] == "500"
+        res = resolve_pending_gate(card.id, choice="Approve once", vault=vault,
+                                   typed_confirm="500")
+        assert not (res.data or {}).get("typed_confirm_refused"), res.summary
+
     runtime, result, ctx, cleanup = _drive_real_mcp_credit(
         tmp_path, monkeypatch,
         server="pay", tool="create_payment",
@@ -311,8 +362,20 @@ def test_gdemo_money_move_stays_claimed(tmp_path, monkeypatch):
         claim_obj_id=1,
         params={"payee": "acme-vendor", "amount": "500"},
         annotations={"readOnlyHint": False},
-        readback_seen=seen)
+        readback_seen=seen, operator=_operator)
     try:
+        assert len(cards) == 1, "the run must stop at exactly one R1 money card"
+        # THE CALL RAN: the payment's own ledger row, written after the server
+        # answered, carrying the typed approve-once pass and that card's id.
+        rows = ledger.project(runtime.vault, data_dir=tmp_path)
+        paid = [r for r in rows if r.event_kind == "effect"
+                and r.action.get("tool") == "mcp__pay__create_payment"]
+        assert len(paid) == 1, [r.action for r in rows]
+        assert paid[0].outcome.get("status") == "success"
+        assert paid[0].gate.get("gate_kind") == "mcp"
+        assert paid[0].gate.get("passed_via") == "approve_once"
+        assert paid[0].gate.get("decision_id") == cards[0].id
+        assert "money_move" in (paid[0].action.get("effect_tags") or [])
         # fail-closed: a money-move MCP mutation with NO independent fresh probe must
         # NOT credit — even though the readback would echo the token.
         assert result.get("status") != "success", (
@@ -320,7 +383,9 @@ def test_gdemo_money_move_stays_claimed(tmp_path, monkeypatch):
             f"pre-submit probe (none exists for MCP); got {result.get('status')}")
         store = getattr(ctx, "_external_evidence", {}) or {}
         ev = store.get("1") or store.get(1)
-        # a receipt may be persisted (best-effort provenance) but must stay CLAIMED.
+        # The call ran, so a receipt IS persisted (best-effort provenance) -- and
+        # it must stay CLAIMED.
+        assert ev is not None, f"the call ran, so its receipt must exist; store={store}"
         assert not (ev and ev.get("confirmed") is True), (
             "a money-move can NEVER be faux-verified via a self-reported readback; "
             f"receipt must stay confirmed=False. store={store}")

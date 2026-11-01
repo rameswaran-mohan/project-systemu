@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from systemu.interface.components.receipt_panel import badge_model_for, render_badge
 from systemu.interface.ui_helpers import format_stamp
 from systemu.runtime.workflow_tracker import STAGES, WorkflowSnapshot
 
@@ -105,6 +106,9 @@ def work_row_model(snap: WorkflowSnapshot) -> Dict[str, Any]:
         "has_cost": (summary.tokens_in + summary.tokens_out) > 0,
         # T5: what the operator's table supplied this run (None = nothing to show).
         "table_chip": table_chip_for(snap),
+        # DEC-13: the run's verification badge -- the ONE mint's value, rendered by
+        # the shared component (receipt one click away). Nothing while in flight.
+        "badge": badge_model_for(snap.status, snap.execution_id),
     }
 
 
@@ -401,6 +405,10 @@ def _render_row(row: Dict[str, Any], on_refresh=None) -> None:
             # Status pill (tracker status, tinted per status_class)
             pill = _PILL_CLASS.get(row["status_class"], "s-pill--muted")
             ui.label(row["status"]).classes(f"s-pill {pill}")
+
+            # DEC-13: verified / claimed / measured / failed / handoff -- separate
+            # chrome from the status pill; a click opens the UX-10 receipt.
+            render_badge(row.get("badge"))
 
             # R-P3a: cost chip (tokens + currency, or tokens-only when Unknown).
             # Muted, neutral chrome — deliberately NOT a status tint, so cost

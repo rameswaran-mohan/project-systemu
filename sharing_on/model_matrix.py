@@ -10,21 +10,21 @@ instead of hard-coding a tier number.
 
 Two vocabularies live here and they are NOT the same thing:
 
-* **tier class** (``planner`` / ``binder`` / ``parser`` / ``verifier``) — which
-  ``Config`` knob carries this stage's tier. This is what actually routes.
-* **locality** (``cloud_default`` / ``local_capable`` / ``n/a``) — DEC-20a's
+* **tier class** -- which ``Config`` knob carries this stage's tier. This is
+  what actually routes. Several stages may share a class (and so a knob).
+* **locality** (``cloud_default`` / ``local_capable`` / ``n/a``) -- DEC-20a's
   declaration of which stages a local backend *could* serve first. It is a
   DECLARATION, not a routing input: nothing in this module or in ``llm_router``
   reads ``locality`` to pick a model. Making it route would be Privacy-Complete
-  Mode, which is marked "FLAGGED, NOT COMMITTED" behind its own spec pass. See
-  ``locality_of_stage`` and the doc for the full reasoning.
+  Mode, which DEC-20b flags as a candidate, not a commitment, behind its own
+  spec pass. See ``locality_of_stage`` and the doc for the full reasoning.
 
 Note the deliberate asymmetry with ``model_presets.locality_of``: that function
 classifies a MODEL ID; ``locality_of_stage`` here classifies a STAGE. They share
 a vocabulary and nothing else.
 
 Lives in ``sharing_on`` (not ``systemu``) for the same reason
-``model_presets`` does — the import direction is systemu -> sharing_on, never
+``model_presets`` does -- the import direction is systemu -> sharing_on, never
 the reverse, and ``llm_router`` (systemu/core) must be able to import it.
 """
 from __future__ import annotations
@@ -32,25 +32,33 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-# The four tier classes and the ``Config`` field that carries each one's tier.
+# Each tier class and the ``Config`` field that carries its tier.
 # ``verifier`` is the odd one out: ``Config.verifier_tier`` is an INT (=3) that
-# predates the matrix, while the three R-A10 knobs are STRINGS ("tier1"). The
+# predates the matrix, while the other knobs are STRINGS ("tier1"). The
 # resolver below handles both shapes rather than forcing a config migration.
 _CONFIG_FIELD_BY_CLASS: Dict[str, str] = {
-    "planner":  "planner_tier",
-    "binder":   "binder_tier",
-    "parser":   "parser_tier",
-    "verifier": "verifier_tier",
+    "planner":   "planner_tier",
+    "binder":    "binder_tier",
+    "parser":    "parser_tier",
+    "verifier":  "verifier_tier",
+    "reasoning": "reasoning_tier",
+    "judge":     "judge_tier",
+    "executor":  "executor_tier",
+    "forge":     "forge_tier",
 }
 
 # The fallback tier when a knob is absent or blank. These mirror the shipped
-# ``Config`` defaults exactly — a missing attribute must not silently change
+# ``Config`` defaults exactly -- a missing attribute must not silently change
 # which model a stage gets.
 _DEFAULT_TIER_BY_CLASS: Dict[str, int] = {
-    "planner":  1,   # deepest reasoning — open-world planning
-    "binder":   1,   # advisory bind-judgment
-    "parser":   3,   # mechanical schema-shaped transforms
-    "verifier": 3,   # deterministic verdict; LLM is advisory-only
+    "planner":   1,   # strongest: plans or decides the course of a run
+    "binder":    1,   # strongest: advisory bind-judgment
+    "parser":    3,   # cheap: parsers and summarizers (DEC-12)
+    "verifier":  3,   # verdicts are deterministic; the LLM only advises
+    "reasoning": 1,   # strongest: analysis/generation that informs, not decides
+    "judge":     1,   # LLM judges of a draft (scroll, skill, peer verdicts)
+    "executor":  2,   # per-step action choice inside a running loop
+    "forge":     2,   # tool/skill spec + code generation
 }
 
 
@@ -60,9 +68,13 @@ class StageRow:
 
     ``wired`` is the honesty field: True means a real call site in this build
     tags this stage, so changing its knob changes which model runs. False means
-    the stage is registered and resolvable but NO call site tags it yet —
+    the stage is registered and resolvable but NO call site tags it yet --
     setting its knob moves nothing until a call site is wired. ``call_site``
-    carries the provenance so the claim is checkable, not assertable.
+    (plus ``more_call_sites`` for a stage tagged in several files) carries the
+    provenance so the claim is checkable, not assertable:
+    ``tests/test_model_matrix_coverage.py`` checks that every file listed here
+    really tags the stage and that every file tagging it at a router call is
+    listed.
     """
     stage: str
     tier_class: str
@@ -70,9 +82,16 @@ class StageRow:
     wired: bool
     call_site: str
     note: str = ""
+    more_call_sites: Tuple[str, ...] = ()
+
+    @property
+    def call_sites(self) -> Tuple[str, ...]:
+        """Every file that tags this stage (empty for an unwired row)."""
+        first = (self.call_site,) if self.call_site else ()
+        return first + tuple(self.more_call_sites)
 
 
-#: The matrix. Stage names are the stable public vocabulary — a call site
+#: The matrix. Stage names are the stable public vocabulary -- a call site
 #: passes one of these to ``llm_router``'s ``stage=`` parameter.
 #:
 #: Locality per DEC-20a: parse-class stages are ``local_capable`` (the stages a
@@ -85,7 +104,16 @@ MATRIX: Dict[str, StageRow] = {
     "planner": StageRow(
         stage="planner", tier_class="planner", locality="cloud_default",
         wired=True, call_site="systemu/runtime/open_world_planner.py",
-        note="Open-world replanning over a SituationReport.",
+        more_call_sites=(
+            "systemu/pipelines/activity_extractor.py",
+            "systemu/pipelines/quick_task.py",
+            "systemu/pipelines/shadow_decision.py",
+        ),
+        note="Calls that plan or decide the course of a run: open-world "
+             "replanning over a SituationReport; activity extraction (decides "
+             "the skills/tools an approved scroll needs, plus its empty-result "
+             "retry); the quick lane's next-action choice; the shadow "
+             "assignment tiebreak (assign an existing shadow or create one).",
     ),
     "refiner": StageRow(
         stage="refiner", tier_class="planner", locality="cloud_default",
@@ -95,7 +123,7 @@ MATRIX: Dict[str, StageRow] = {
              "module tag this stage. THREE are on live production paths "
              "(refine_scroll's _call_refine + its GUI-rewrite retry, and "
              "refine_from_text's elder_intake); the other TWO are inside "
-             "_refine_with_gui_guard, which nothing in production calls — "
+             "_refine_with_gui_guard, which nothing in production calls -- "
              "refine_scroll re-implements that guard inline. Those two are "
              "tagged for consistency, but the wired=True claim rests on the "
              "three live ones.",
@@ -106,10 +134,63 @@ MATRIX: Dict[str, StageRow] = {
         wired=True, call_site="systemu/pipelines/fact_extractor.py",
         note="Extracts candidate user facts that the profile binder later "
              "consumes. NOTE: runtime/requirement_binder.py itself makes no "
-             "LLM call at all — it is deterministic — so this is the only "
+             "LLM call at all -- it is deterministic -- so this is the only "
              "genuine binder-class LLM stage in the build.",
     ),
-    # ---- parser class (mechanical, schema-shaped) ---------------------------
+    # ---- reasoning class (strongest; informs rather than decides) ----------
+    "reasoning": StageRow(
+        stage="reasoning", tier_class="reasoning", locality="cloud_default",
+        wired=True, call_site="systemu/pipelines/evolution_engine.py",
+        more_call_sites=(
+            "systemu/pipelines/refinery.py",
+            "systemu/pipelines/shadow_decision.py",
+            "systemu/pipelines/tool_inadequacy_diagnosis.py",
+            "systemu/runtime/auto_skill_extractor.py",
+            "systemu/runtime/supervisor.py",
+            "systemu/runtime/tools/delegate.py",
+        ),
+        note="Analysis and generation that inform a decision without making "
+             "it: evolution proposals, persona rewrite and wild-card "
+             "reflection; execution appraisal; persona generation for a new "
+             "shadow; tool-inadequacy diagnosis; skill / anti-pattern "
+             "extraction; supervisor failure analysis; a delegated subagent.",
+    ),
+    # ---- judge class (LLM judges of a draft) --------------------------------
+    "judge": StageRow(
+        stage="judge", tier_class="judge", locality="cloud_default",
+        wired=True, call_site="systemu/pipelines/scroll_validator.py",
+        more_call_sites=(
+            "systemu/pipelines/skill_validator.py",
+            "systemu/runtime/tools/mixture_of_agents.py",
+        ),
+        note="The scroll satisfiability check, skill validation, and the "
+             "mixture-of-agents peer verdicts.",
+    ),
+    # ---- executor class (per-step action choice in a running loop) ----------
+    "executor": StageRow(
+        stage="executor", tier_class="executor", locality="cloud_default",
+        wired=True, call_site="systemu/runtime/shadow_runtime.py",
+        more_call_sites=("systemu/runtime/web/act_loop.py",),
+        note="The shadow run loop's per-iteration decision call and the web "
+             "act loop's next-action call.",
+    ),
+    # ---- forge class (tool / skill generation) ------------------------------
+    "forge": StageRow(
+        stage="forge", tier_class="forge", locality="cloud_default",
+        wired=True, call_site="systemu/pipelines/tool_forge.py",
+        more_call_sites=(
+            "systemu/pipelines/tool_recalibrator.py",
+            "systemu/pipelines/skill_recalibrator.py",
+            "systemu/pipelines/workshop_module.py",
+        ),
+        note="Tool spec + code generation (the main forge path's spec and "
+             "code calls, code preview, spec proposals, reforge), skill "
+             "recalibration and the workshop scroll rebuild. Whether "
+             "forge should default to the strongest tier is an OPEN question "
+             "(the flash-tier forge-degradation debt); it stays at tier 2, "
+             "today's tier, until that is ruled.",
+    ),
+    # ---- parser class (cheap: parsers and summarizers) ----------------------
     "consult_parse": StageRow(
         stage="consult_parse", tier_class="parser", locality="local_capable",
         wired=True, call_site="systemu/runtime/table_consult.py",
@@ -120,6 +201,28 @@ MATRIX: Dict[str, StageRow] = {
         stage="desk_extraction", tier_class="parser", locality="local_capable",
         wired=True, call_site="systemu/runtime/extractor.py",
         note="Schema-validated record extraction from UNTRUSTED page text.",
+    ),
+    "summarize": StageRow(
+        stage="summarize", tier_class="parser", locality="local_capable",
+        wired=True, call_site="systemu/pipelines/memory_consolidator.py",
+        more_call_sites=(
+            "systemu/runtime/memory_consolidator.py",
+            "systemu/scheduler/jobs.py",
+            "systemu/pipelines/refinery.py",
+            "systemu/runtime/episodic_memory.py",
+            "systemu/pipelines/quick_task.py",
+        ),
+        note="Summarizers (DEC-12: cheap tier): shadow / global / per-run "
+             "memory consolidation, memory-candidate extraction, the episodic "
+             "session summary, and the quick lane's grounding-only synthesis. "
+             "All but the synthesis ran on tier 1 before this row existed.",
+    ),
+    "parse": StageRow(
+        stage="parse", tier_class="parser", locality="local_capable",
+        wired=True, call_site="systemu/pipelines/tool_dry_run.py",
+        more_call_sites=("systemu/runtime/context_builder.py",),
+        note="Mechanical transforms: dry-run test parameters and the "
+             "context-history compaction snapshot.",
     ),
     "brief_phrasing": StageRow(
         stage="brief_phrasing", tier_class="parser", locality="local_capable",
@@ -139,11 +242,16 @@ MATRIX: Dict[str, StageRow] = {
     # ---- verifier class (deterministic; LLM advisory-only) ------------------
     "verification": StageRow(
         stage="verification", tier_class="verifier", locality="n/a",
-        wired=False, call_site="",
-        note="goal_verifier / objective_verifier / harness_judge / coach already "
-             "read config.verifier_tier directly (predates the matrix). "
-             "Registered so the class is nameable; those call sites are NOT "
-             "re-routed through stage= in this slice.",
+        wired=True, call_site="systemu/runtime/goal_verifier.py",
+        more_call_sites=(
+            "systemu/runtime/objective_verifier.py",
+            "systemu/runtime/harness_judge.py",
+            "systemu/runtime/coach.py",
+        ),
+        note="The advisory LLM verdicts: goal and objective verification, the "
+             "harness-request judge and the coach's steer. The knob is the "
+             "pre-existing config.verifier_tier, so whatever an operator set "
+             "there is unchanged.",
     ),
 }
 
@@ -219,7 +327,8 @@ def locality_of_stage(stage: str) -> str:
     design. It exists so a future Privacy-Complete Mode can be built without
     re-auditing every call site, and so the privacy page can render the current
     reality. If you are reaching for this to pick a model, stop — that is PCM,
-    and it is gated behind its own spec pass plus per-stage fixture evidence.
+    and DEC-20b gates it behind its own spec pass plus per-stage fixture
+    evidence.
     """
     return require_stage(stage).locality
 

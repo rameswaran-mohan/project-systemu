@@ -292,6 +292,20 @@ TERMINAL_STATUSES = frozenset({
 })
 
 
+def _verification_of(status: Any, execution_id: Any) -> Optional[Dict[str, Any]]:
+    """The minted badge as JSON; ``None`` while the task claims no outcome yet. A
+    mint that could not run reads as not recorded (the render fence), never as
+    verified and never as a missing key."""
+    from systemu.runtime import verification_badge as vb
+    try:
+        badge = vb.run_badge(status, execution_id)
+    except Exception:
+        logger.debug("[TaskAPI] verification mint failed", exc_info=True)
+        badge = None
+    v = vb.view(badge)
+    return v.as_json() if v.show else None
+
+
 def project_task(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Project ONE chat-history entry into the API's task view. Field names are
     the record's own; nothing is invented. Text goes through the Outbox
@@ -305,6 +319,9 @@ def project_task(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "task_id": entry.get("ts") or "",
         "status": status,
         "terminal": status in TERMINAL_STATUSES,
+        # DEC-13: the run's verification badge, the ONE mint's value (state, label,
+        # counts, why) -- the same answer the dashboard row renders.
+        "verification": _verification_of(status, entry.get("execution_id")),
         "lane": entry.get("lane") or "workflow",
         "prompt": redact(entry.get("prompt") or ""),
         "outcome": redact(entry.get("summary") or ""),

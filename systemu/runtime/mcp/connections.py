@@ -11,6 +11,10 @@ State lives in ``<vault>/connections/mcp.json``:
      "enabled": [{"server": "...", "name": "...",
                   "description": "...", "schema": {...}}]}
 
+P21 adds ``"operator_effect_classes": {"<server>": {"<tool>": [...]}}`` -- the
+operator's own effect-class declaration per tool, never written from server data
+(:func:`set_operator_effect_classes`).
+
 Servers may also come from the read-only ``SYSTEMU_MCP_SERVER_URLS`` env
 (v0.9.5 semantics) — merged by :func:`all_servers`, never written back.
 Every function is defensive: a broken vault yields empty state, never an
@@ -36,8 +40,9 @@ def get_state(vault) -> Dict[str, Any]:
         path = _path(vault)
         if not path.exists():
             return {"servers": [], "enabled": [], "transports": {},
-                    "hashes": {}, "servers_meta": {}}
+                    "hashes": {}, "servers_meta": {}, "operator_effect_classes": {}}
         data = json.loads(path.read_text(encoding="utf-8"))
+        _declared = data.get("operator_effect_classes")
         return {
             # P0 shape — DO NOT alter (enabled entries keep description/schema/annotations).
             "servers": [s for s in (data.get("servers") or []) if isinstance(s, str)],
@@ -46,11 +51,15 @@ def get_state(vault) -> Dict[str, Any]:
             "transports": dict(data.get("transports") or {}),
             "hashes": dict(data.get("hashes") or {}),
             "servers_meta": dict(data.get("servers_meta") or {}),
+            # P21: the OPERATOR's effect-class declarations (see
+            # set_operator_effect_classes). Carried through every save so a write
+            # elsewhere in this file can never drop them.
+            "operator_effect_classes": dict(_declared) if type(_declared) is dict else {},
         }
     except Exception:
         logger.debug("[MCP] connections state unreadable", exc_info=True)
         return {"servers": [], "enabled": [], "transports": {},
-                "hashes": {}, "servers_meta": {}}
+                "hashes": {}, "servers_meta": {}, "operator_effect_classes": {}}
 
 
 def _save(vault, state: Dict[str, Any]) -> None:
@@ -227,6 +236,122 @@ def set_tool_hash(vault, server: str, name: str, def_hash: str) -> None:
 def get_tool_hash(vault, server: str, name: str) -> Optional[str]:
     server = (server or "").rstrip("/")
     return get_state(vault).get("hashes", {}).get(f"{server}\x00{name}")
+
+
+#: ``set_operator_effect_classes`` leaves this half of a tool's entry as it is.
+_KEEP = object()
+
+
+def _entry_parts(raw) -> tuple:
+    """``(declared_list_or_None, assignment_dict_or_None)`` from one stored entry.
+
+    A plain list is a declaration (the original, hand-editable shape). A dict may
+    carry both halves: ``{"classes": [...], "assigned": "<class>", ...}``. Any other
+    shape reads as nothing (fail-closed: no declaration, no assignment)."""
+    if type(raw) is list:
+        return (list(raw) if raw else None), None
+    if type(raw) is dict:
+        classes = raw.get("classes")
+        declared = list(classes) if type(classes) is list and classes else None
+        assigned = raw.get("assigned")
+        assignment = ({k: v for k, v in raw.items() if k != "classes"}
+                      if type(assigned) is str and assigned.strip() else None)
+        return declared, assignment
+    return None, None
+
+
+def set_operator_effect_classes(vault, server: str, name: str, classes=_KEEP, *,
+                                assigned=_KEEP, decision_id: str = "") -> None:
+    """P21 -- the OPERATOR's word on an MCP tool's effect classes.
+
+    This is an operator surface: nothing a server sends may ever be written here.
+    The only writers are an operator action -- a hand edit of
+    ``connections/mcp.json``, a call from an operator-driven surface, or the
+    dashboard Inbox's typed-confirm reclassify panel. Discovery, enablement and the
+    rug-pull pin never touch it. A tool's entry has two independent halves:
+
+    ``classes`` -- the tool's DECLARED class set. The MCP gate reads it as the tool's
+    declared classes (``effect_class.classify_mcp_call``), so it may RAISE a tool
+    (declare ``money_move`` on a tool whose name and schema say nothing) and LOWER one
+    (declare ``local_write`` on a tool a server over-marks destructive). A list of
+    effect-class names (``effect_tags.EffectTag`` values, or an R1 marker such as
+    ``irreversible`` / ``payment``); ``None`` / empty removes it. Non-string entries
+    are dropped here; an unrecognised name scores as UNKNOWN at the gate.
+
+    ``assigned`` -- the IMPL-2 assignment the operator makes on an MCP DENY card
+    ("Reclassify effect..."), under typed confirmation. Native parity: it is
+    ADDITIVE (``ActionContext.operator_assigned_class``) -- it defeats only the
+    UNKNOWN conjunct, never erases a server's destructive hint or a name-derived
+    class, and never makes the tool frictionless (``evaluate_action`` floors ALLOW).
+    A class name; ``None`` removes it. ``decision_id`` names the card it was made on.
+
+    Either half left at its default is kept as it is. File shape:
+    ``{"operator_effect_classes": {"<server>": {"<tool>": [...]}}}`` for a bare
+    declaration, or ``{"<tool>": {"classes": [...], "assigned": "...",
+    "assigned_on": "<decision id>", "assigned_at": "<iso>"}}`` once an assignment
+    exists.
+    """
+    server = (server or "").strip().rstrip("/")
+    if not server or type(name) is not str or not name:
+        return
+    state = get_state(vault)
+    table = state.setdefault("operator_effect_classes", {})
+    per = table.get(server)
+    per = dict(per) if type(per) is dict else {}
+    declared, assignment = _entry_parts(per.get(name))
+    if classes is not _KEEP:
+        values = ([c.strip() for c in classes if type(c) is str and c.strip()]
+                  if type(classes) in (list, tuple) else [])
+        declared = values or None
+    if assigned is not _KEEP:
+        if type(assigned) is str and assigned.strip():
+            from datetime import datetime, timezone
+            assignment = {
+                "assigned": assigned.strip(),
+                "assigned_on": decision_id if type(decision_id) is str else "",
+                "assigned_at": datetime.now(tz=timezone.utc).isoformat(
+                    timespec="seconds"),
+            }
+        else:
+            assignment = None
+    if assignment is not None:
+        per[name] = {**({"classes": declared} if declared else {}), **assignment}
+    elif declared:
+        per[name] = declared
+    else:
+        per.pop(name, None)
+    if per:
+        table[server] = per
+    else:
+        table.pop(server, None)
+    _save(vault, state)
+
+
+def _operator_entry(vault, server: str, name: str):
+    server = (server or "").strip().rstrip("/")
+    table = get_state(vault).get("operator_effect_classes") or {}
+    per = table.get(server) if type(table) is dict else None
+    if type(per) is not dict:
+        return None, None
+    return _entry_parts(per.get(name))
+
+
+def get_operator_effect_classes(vault, server: str, name: str) -> Optional[tuple]:
+    """The operator's DECLARED effect classes for (server, tool), or ``None`` when
+    there is no declaration. Values come back as stored (the classifier type-pins
+    each entry); a malformed table reads as no declaration."""
+    declared, _assignment = _operator_entry(vault, server, name)
+    return tuple(declared) if declared else None
+
+
+def get_operator_assigned_class(vault, server: str, name: str) -> Optional[str]:
+    """The effect class the operator ASSIGNED on an MCP DENY card (IMPL-2 parity),
+    or ``None``. A malformed entry reads as no assignment."""
+    _declared, assignment = _operator_entry(vault, server, name)
+    if assignment is None:
+        return None
+    value = assignment.get("assigned")
+    return value.strip() if type(value) is str and value.strip() else None
 
 
 def check_and_pin_hash(vault, server: str, name: str, def_hash: str) -> bool:

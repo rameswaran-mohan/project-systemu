@@ -64,7 +64,7 @@ def extract_skill_candidate(
 
     try:
         result = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=_load_system_prompt(),
             user=json.dumps(payload, separators=(",", ":")),
             config=config,
@@ -138,7 +138,7 @@ def extract_corrective_candidate(
 
     try:
         result = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=_load_corrective_system_prompt(),
             user=json.dumps(payload, separators=(",", ":")),
             config=config,

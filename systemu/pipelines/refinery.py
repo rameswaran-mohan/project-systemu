@@ -59,15 +59,23 @@ _TOOLISH = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")   # snake_case tool-
 def _available_tools(vault) -> List[Dict[str, str]]:
     """Enabled + deployed tools as [{name, description}] — the appraiser's ground
     truth so it stops recommending tools that don't exist (root cause X)."""
+    return _available_tools_witnessed(vault)[0]
+
+
+def _available_tools_witnessed(vault):
+    """``(tools, CatalogRead)``: the same list plus how the roster was read (R-CAP1 /
+    DEC-27), so the view renders a degraded read instead of a silent short list."""
+    from systemu.runtime import capability_view as _cv
+    tool_catalog = _cv.read_tool_headers(vault)
     out: List[Dict[str, str]] = []
     try:
-        for h in (vault.load_index("tools") or []):
+        for h in tool_catalog.headers:
             if h.get("enabled") and str(h.get("status", "")).lower() in ("deployed", "upgraded"):
                 out.append({"name": h.get("name", ""),
                             "description": (h.get("description") or "")[:140]})
     except Exception:
         logger.debug("[Refinery] available-tools load failed", exc_info=True)
-    return out
+    return out, tool_catalog
 
 
 def _validate_feedback_tools(feedback: str, known: set) -> str:
@@ -109,6 +117,19 @@ def process_execution_result(
     if len(history_json) > 100:
         history_json = history_json[-100:]
 
+    # Fix 3: ground the appraiser in the REAL tool registry so its feedback only
+    # ever names tools that exist (root cause X) -- rendered through the ONE
+    # selection view (R-CAP1 · CAP-4): the most relevant tools in full, every
+    # other one by name + slot, so every real name is still in front of it.
+    from systemu.runtime import capability_view as _cv
+    _tools, _tool_catalog = _available_tools_witnessed(vault)
+    _tool_view = _cv.build_view(
+        _tools,
+        " ".join([str(getattr(scroll, "intent", "") or "")]
+                 + [str(getattr(o, "goal", "") or "")
+                    for o in (getattr(scroll, "objectives", None) or [])]),
+        catalog=_tool_catalog, traits=_cv.traits_by_name(_tool_catalog.headers))
+
     # Include both legacy ActionBlocks and modern Objectives so the appraisal
     # prompt can reason over whichever format this scroll uses.
     payload = {
@@ -117,15 +138,13 @@ def process_execution_result(
         "scroll_action_blocks": [ab.model_dump(mode="json") for ab in scroll.action_blocks],
         "scroll_objectives": [obj.model_dump(mode="json") for obj in scroll.objectives],
         "execution_log": history_json,
-        # Fix 3: ground the appraiser in the REAL tool registry so its feedback
-        # only ever names tools that exist (root cause X).
-        "available_tools": _available_tools(vault),
+        **_tool_view.payload_fields("available_tools", lookup=False),
     }
 
     # 2. Tier 1 Appraisal
     try:
         appraisal = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=load_prompt("appraise_execution.md"),
             user=json.dumps(payload),
             config=config,
@@ -310,7 +329,7 @@ def _extract_memory_candidates(
     }
 
     response = llm_call_json(
-        tier=1,
+        stage="summarize",
         system=load_prompt("extract_memory.md"),
         user=json.dumps(payload, default=str),
         config=config,

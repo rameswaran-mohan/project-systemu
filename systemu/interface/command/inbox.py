@@ -52,6 +52,11 @@ _APPROVE_LABELS = {"approve", "approve & apply", "approve & install", "forge",
 # from the other side.
 _RENDER_ONLY_GATES = {"operator", "command", "tool"}
 
+# P21: the MCP action gate's card. Not render-only (its resolution is persisted by
+# ``mcp_call_gate_handler`` and its run re-reads the choice), but it carries the
+# same R1 typed-confirm stamp, so ``resolve_gate`` refuses a bare click on it too.
+_MCP_CALL_GATE = "mcp_call"
+
 # ── D-2 (e2e v0.10.31): the summary says what the decision DID ────────────────
 #
 # WITNESSED: a **Deny** on a tool-run gate produced
@@ -213,6 +218,119 @@ def gate_decision_notice(decision, choice: str) -> Tuple[str, str]:
     return _ascii(f"Recorded ({decision.choice}): {title}."), "info"
 
 
+def mcp_gate_decision_notice(decision, choice: str, *, vault=None) -> Tuple[str, str]:
+    """Pure: the ``(summary, notice_kind)`` for a resolved MCP gate card (P21).
+
+    Same two halves as :func:`gate_decision_notice` -- the recorded choice, echoed
+    in parentheses, then what that choice DID -- for the MCP card, whose truth
+    differs per choice and per lane. Every clause is either a fixed property of the
+    gate or WITNESSED in this frame (DEC-27), never assumed:
+
+      * Deny: the call does not run.
+      * Approve once on a money / irreversible card: the gate honours the typed
+        approval once, for these exact arguments, from the run that raised the card
+        or its direct re-run / resume, until the card expires
+        (``dispatch._take_typed_approval``, P28 ``run_lineage``).
+      * Approve once on any other card: only a chat waiting on the card re-calls
+        with it; a task run never picks up a one-time approval.
+      * Always allow / Trust this tool for the session: claimed as remembered ONLY
+        when the approval store holds it (a resolve from the Inbox page records
+        no standing approval; the dispatcher handler does).
+      * Reclassify: nothing ran; the assigned class is named only when the
+        connections file holds it.
+    """
+    ctx = getattr(decision, "context", None)
+    ctx = ctx if type(ctx) is dict else {}
+    label = decision.choice if type(getattr(decision, "choice", None)) is str else ""
+    server = ctx.get("server") if type(ctx.get("server")) is str else ""
+    tool = ctx.get("tool") if type(ctx.get("tool")) is str else ""
+    stored = getattr(decision, "title", None)
+    title = (stored.strip() if type(stored) is str and stored.strip()
+             else f"MCP tool call: {tool or 'unnamed tool'}")
+    run = ctx.get("execution_id") or ctx.get("session_id")
+    chat = type(run) is str and run.startswith("quick_")
+    if choice in _GATE_DENY_CHOICES:
+        return (_ascii(f"Recorded (Deny): {title} - the call does not run."),
+                "negative")
+    if choice.startswith("reclassify"):
+        assigned = None
+        try:
+            from systemu.runtime.mcp.connections import get_operator_assigned_class
+            if vault is not None and server and tool:
+                assigned = get_operator_assigned_class(vault, server, tool)
+        except Exception:
+            assigned = None
+        tail = (f" {assigned} is saved as your assignment for this tool, and the "
+                "next call is checked on it." if assigned else
+                " No effect class was saved here; assign one on the dashboard Inbox "
+                "card.")
+        return (_ascii(f"Recorded ({label}): {title} - nothing ran.{tail}"), "info")
+    if choice == _GATE_APPROVE_ONCE:
+        from systemu.runtime.command_approvals import irreversible_card_effects
+        if irreversible_card_effects(ctx):
+            # P28: the typed approval is bound to the run that raised the card and
+            # to the card's expiry (``run_lineage``) -- say exactly that, and say it
+            # when the card has already expired (then nothing will run).
+            from systemu.runtime import run_lineage
+            binding = run_lineage.binding_of(ctx)
+            expires = run_lineage._parse_utc(binding.get("expires_at"))
+            if not binding.get("run_id") or expires is None:
+                # The gate refuses a typed approval on a card that names no run or
+                # no expiry (an older build's card): say so, never claim it runs.
+                return (_ascii(
+                    f"Recorded (Approve once): {title} - but this card does not say "
+                    "which run it is for or until when, so these exact arguments do "
+                    "not run on it; the next call asks again. Nothing is remembered."),
+                    "info")
+            run = f"run {binding['run_id']}"
+            if run_lineage.utcnow() > expires:
+                return (_ascii(
+                    f"Recorded (Approve once): {title} - but this card expired at "
+                    f"{run_lineage._when(expires)}, so these exact arguments do not "
+                    "run on it; the next call asks again. Nothing is remembered."),
+                    "info")
+            return (_ascii(
+                f"Recorded (Approve once): {title} - approved once for these exact "
+                f"arguments: the next call with them runs, from {run} (the chat that "
+                f"asked, or the task's direct re-run or resume), until "
+                f"{run_lineage._when(expires)}. Any other run asks again. Nothing is "
+                "remembered."), "positive")
+        if chat:
+            return (_ascii(f"Recorded (Approve once): {title} - the chat waiting on "
+                           "this card runs the call once. Nothing is remembered."),
+                    "positive")
+        return (_ascii(
+            f"Recorded (Approve once): {title} - nothing is remembered. A chat waiting "
+            "on this card runs the call once; a task run does not pick up a one-time "
+            "approval, so re-running it asks again."), "info")
+    if choice in (_GATE_ALWAYS_ALLOW, "trust this tool for the session"):
+        remembered = False
+        try:
+            from systemu.runtime.command_approvals import (get_default_store,
+                                                           mcp_session_key,
+                                                           mcp_signature)
+            store = get_default_store()
+            if store is not None and server and tool:
+                if choice == _GATE_ALWAYS_ALLOW:
+                    remembered = store.is_approved(mcp_signature(server, tool))
+                else:
+                    sid = ctx.get("session_id")
+                    remembered = (type(sid) is str and bool(sid.strip())
+                                  and store.is_session_trusted(
+                                      mcp_session_key(server, tool, sid)))
+        except Exception:
+            remembered = False
+        if remembered:
+            scope = ("this tool now runs without asking" if choice == _GATE_ALWAYS_ALLOW
+                     else "this tool runs without asking for the rest of this run")
+            return (_ascii(f"Recorded ({label}): {title} - {scope}."), "positive")
+        return (_ascii(
+            f"Recorded ({label}): {title} - no standing approval was recorded from "
+            "here, so later calls ask again. A chat waiting on this card runs the "
+            "call once."), "info")
+    return _ascii(f"Recorded ({label}): {title}."), "info"
+
+
 def _handle_forge_rejection(decision, vault) -> CommandResult:
     """v0.9.49: the operator declined a ``forge:<tool_id>`` gate. Flag the tool
     ``forge_rejected`` (so it's recognized as permanently unavailable) and finalize
@@ -308,12 +426,14 @@ def resolve_gate(decision, *, vault) -> CommandResult:
     # notify_user / request_choice posted the decision and the parked caller
     # re-reads the chosen value via OperatorDecisionQueue.get_resolved_choice.
     # We must NOT re-execute anything here — just acknowledge the resolution.
-    if gate_type in _RENDER_ONLY_GATES:
+    if gate_type in _RENDER_ONLY_GATES or gate_type == _MCP_CALL_GATE:
         # R1 (spec section 10): a money / irreversible card resolved WITHOUT its
         # typed phrase -- by any surface that called ``queue.resolve`` directly (the
         # CLI, a stale card's "Always allow") -- takes no effect. The resume rail
         # refuses it too; this is the executor's half, so the sentence the caller
         # prints is true: nothing ran, and the card is back for the typed confirm.
+        # P21: an MCP card carries the same stamp and gets the same refusal (the
+        # MCP gate refuses the bare click on its side too).
         refusal = _typed_confirm_refusal_for(decision)
         if refusal:
             reopened = False
@@ -328,11 +448,22 @@ def resolve_gate(decision, *, vault) -> CommandResult:
                 data={"notice_kind": "warning", "choice": decision.choice or "",
                       "typed_confirm_refused": True},
             )
+    if gate_type in _RENDER_ONLY_GATES:
         # D-2: one sentence per OUTCOME, minted from the same normalized choice
         # the resume rail acts on. The status stays OK for every choice — the
         # decision WAS recorded, and recording a denial is a success; what the
         # denial did rides ``notice_kind``, not an error code.
         summary, kind = gate_decision_notice(decision, choice)
+        return CommandResult(
+            status=CommandStatus.OK,
+            summary=summary,
+            data={"notice_kind": kind, "choice": decision.choice or ""},
+        )
+    if gate_type == _MCP_CALL_GATE:
+        # P21: an MCP card's resolution executes nothing here (the waiting call
+        # re-reads the choice), so it said "Gate mcp_call not approved" -- even for
+        # an approval the operator had just typed. Say what the choice DID.
+        summary, kind = mcp_gate_decision_notice(decision, choice, vault=vault)
         return CommandResult(
             status=CommandStatus.OK,
             summary=summary,
@@ -732,7 +863,9 @@ class InboxQueue:
                 safe = descriptor.safe_default or (
                     descriptor.options[0] if descriptor.options else "")
                 try:
-                    self._queue.resolve(dec_id, choice=safe)
+                    from systemu.approval.decision_queue import resolution_channel as _via
+                    with _via("auto:policy"):
+                        self._queue.resolve(dec_id, choice=safe)
                 except Exception:
                     import logging
                     logging.getLogger(__name__).exception(
@@ -766,7 +899,7 @@ class InboxQueue:
             title=descriptor.title,
             body=(descriptor.inspect or "")[:500],
             options=options or [affirmative],
-            context={**ctx, "resolved_by": "auto_policy"},
+            context={**ctx, "resolved_by": "auto_policy", "resolved_via": "auto:policy"},
             dedup_key=descriptor.dedup,
             status="resolved",
             choice=affirmative,

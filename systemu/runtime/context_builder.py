@@ -346,7 +346,7 @@ class ExecutionContext:
 
         try:
             resp = _run_coroutine(llm_call(
-                tier=3,
+                stage="parse",
                 system=(
                     "You are a context compactor. Summarise the execution history below "
                     "into a dense, factual paragraph (max 200 words). "

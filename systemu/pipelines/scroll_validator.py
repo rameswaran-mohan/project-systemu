@@ -135,8 +135,12 @@ def validate_scroll(
             summary="validator disabled — caller proceeds without pre-flight",
         )
 
+    from systemu.runtime import capability_view as _cv
     try:
-        catalog = catalog_overrides or _build_catalog(vault)
+        if catalog_overrides:
+            catalog, tool_catalog = catalog_overrides, _cv.NO_ROSTER_READ
+        else:
+            catalog, tool_catalog = _build_catalog_witnessed(vault)
     except Exception as exc:
         logger.exception("[ScrollValidator] catalog build failed")
         return ValidationResult(
@@ -144,6 +148,18 @@ def validate_scroll(
             summary="validator could not build catalog — proceeding (fail-open)",
             error=str(exc),
         )
+
+    # R-CAP1 · CAP-4: the tool catalog reaches the prompt through the ONE
+    # selection view -- the tools most relevant to this scroll in full, every
+    # other tool by name + capability slot (still named, so satisfiability can
+    # still be judged against the whole catalog).
+    tool_view = _cv.build_view(
+        catalog.get("tools", []),
+        " ".join([str(getattr(scroll, "intent", "") or "")]
+                 + [str(getattr(o, "goal", "") or "")
+                    for o in (getattr(scroll, "objectives", []) or [])]),
+        catalog=tool_catalog,
+        traits=_cv.traits_by_name(tool_catalog.headers or catalog.get("tools", [])))
 
     # v0.6.0-b: payload now includes per-objective output_type (when present
     # on the model) and expected_outcome (new Scroll field added in Stage 2).
@@ -165,7 +181,7 @@ def validate_scroll(
             ],
             "constraints": getattr(scroll, "constraints", {}) or {},
         },
-        "tools_available":  catalog.get("tools", []),
+        **tool_view.payload_fields("tools_available", lookup=False),
         "skills_available": catalog.get("skills", []),
     }
 
@@ -185,7 +201,7 @@ def validate_scroll(
         from systemu.core.llm_router import llm_call_json
         from systemu.core.utils import load_prompt
         raw = llm_call_json(
-            tier=1,
+            stage="judge",
             system=load_prompt("validate_scroll.md"),
             user=json.dumps(payload),
             config=config,
@@ -218,9 +234,18 @@ def _build_catalog(vault) -> Dict[str, List[Dict[str, Any]]]:
     summaries) fall back to empty {} dicts; those tools will gain the
     summaries automatically on next save.
     """
-    tools  = vault.load_index("tools") or []
+    return _build_catalog_witnessed(vault)[0]
+
+
+def _build_catalog_witnessed(vault):
+    """``(catalog, CatalogRead)``: the same catalog plus how the tool roster was read
+    (R-CAP1 / DEC-27) -- a degraded read is rendered by the view, never a silent
+    short list."""
+    from systemu.runtime import capability_view as _cv
+    tool_catalog = _cv.read_tool_headers(vault)
+    tools  = [t for t in tool_catalog.headers if isinstance(t, dict)]
     skills = vault.load_index("skills") or []
-    return {
+    return ({
         "tools": [
             {
                 "name":        t.get("name", ""),
@@ -241,7 +266,7 @@ def _build_catalog(vault) -> Dict[str, List[Dict[str, Any]]]:
             }
             for s in skills
         ],
-    }
+    }, tool_catalog)
 
 
 def _parse_validator_output(raw: Any) -> ValidationResult:

@@ -461,6 +461,13 @@ class Config:
     planner_tier:                         str   = "tier1"
     binder_tier:                          str   = "tier1"
     parser_tier:                          str   = "tier3"
+    # DEC-12 MODEL-MATRIX classes added when every production LLM call got a
+    # stage. Each default is the tier its call sites used before they were
+    # tagged, so these four change no routing out of the box.
+    reasoning_tier:                       str   = "tier1"
+    judge_tier:                           str   = "tier1"
+    executor_tier:                        str   = "tier2"
+    forge_tier:                           str   = "tier2"
     supervisor_directive_timeout_s:       float = 5.0
     supervisor_llm_budget_per_hour_usd:   float = 5.0
     supervisor_llm_budget_per_day_usd:    float = 50.0
@@ -644,6 +651,14 @@ class Config:
                 "SYSTEMU_BINDER_TIER", "tier1").lower(),
             parser_tier=os.getenv(
                 "SYSTEMU_PARSER_TIER", "tier3").lower(),
+            reasoning_tier=os.getenv(
+                "SYSTEMU_REASONING_TIER", "tier1").lower(),
+            judge_tier=os.getenv(
+                "SYSTEMU_JUDGE_TIER", "tier1").lower(),
+            executor_tier=os.getenv(
+                "SYSTEMU_EXECUTOR_TIER", "tier2").lower(),
+            forge_tier=os.getenv(
+                "SYSTEMU_FORGE_TIER", "tier2").lower(),
             supervisor_directive_timeout_s=float(
                 os.getenv("SYSTEMU_SUPERVISOR_TIMEOUT_S", "5.0")),
             supervisor_llm_budget_per_hour_usd=float(

@@ -452,7 +452,7 @@ class TestActivityExtractorOutputDir:
         vlt.save_scroll(scroll)
 
         captured = {}
-        def fake_llm(*, tier, system, user, config, temperature=0.1, max_tokens=4096, **kw):
+        def fake_llm(*, tier=None, system, user, config, temperature=0.1, max_tokens=4096, **kw):
             captured["user"] = user
             return {"tools": [], "skills": []}
         monkeypatch.setattr(ae, "llm_call_json", fake_llm)

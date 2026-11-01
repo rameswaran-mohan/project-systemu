@@ -148,7 +148,7 @@ def validate_skill(
         from systemu.core.llm_router import llm_call_json
         from systemu.core.utils import load_prompt
         raw = llm_call_json(
-            tier=1,
+            stage="judge",
             system=load_prompt("validate_skill.md"),
             user=json.dumps(payload),
             config=config,

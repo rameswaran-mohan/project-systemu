@@ -579,6 +579,36 @@ class FactStore:
             rows = rows[:max(0, int(limit))]
         return rows
 
+    def count_by_source_ref(self, source_kind: str) -> Optional[Dict[str, int]]:
+        """READ-ONLY: ``{ref: number of facts carrying a (source_kind, ref) step}``.
+
+        ``{}`` when the store file does not exist (nothing was ever written), and ``None``
+        when it exists but cannot be read as a store -- the defensive :meth:`_load_facts`
+        spells both as an empty store, which is right for a planner and wrong for an
+        operator count: "unknown" must never render as "0" (DEC-27). Rows that fail
+        validation are skipped exactly as the load path skips them."""
+        sk = str(source_kind or "")
+        try:
+            if not self._facts_path.exists():
+                return {}
+            data = json.loads(self._facts_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if type(data) is not dict:
+            return None
+        rows = data.get("facts", [])
+        if type(rows) is not list:
+            return None
+        counts: Dict[str, int] = {}
+        for r in rows:
+            try:
+                f = Fact.model_validate(r)
+            except Exception:
+                continue
+            for ref in {s.ref for s in f.source_chain if s.source_kind == sk}:
+                counts[ref] = counts.get(ref, 0) + 1
+        return counts
+
     def purge_source_ref(self, source_kind: str, ref: str) -> Dict[str, int]:
         """Remove every fact whose ONLY evidence is the ``(source_kind, ref)`` pair, and
         DETACH that step from facts that also carry other evidence. Returns
@@ -604,7 +634,8 @@ class FactStore:
         producers' kinds are disjoint:
 
             census    (source_kind="census")    installed_application / cli_on_path /
-                                                cloud_sync_root
+                                                cloud_sync_root / com_automation_server /
+                                                default_file_handler / printer
             inventory (source_kind="inventory") service / capability / data_location /
                                                 credential_ref
 

@@ -95,12 +95,16 @@ _REDACTORS = frozenset({
     # outbox (the DEC-31 reference implementation)
     "redact", "_esc",
     # messaging / gateway
-    "mask_outbound", "mask_secret", "mask_key", "mask_and_digest_params",
+    "mask_outbound", "mask_secret_spans", "mask_secret", "mask_key",
+    "mask_and_digest_params",
     "_mask", "_mask_message", "_mask_url", "_mask_query", "_mask_proxy_url",
     # credentials
     "redact_known_secrets", "_redact_token", "_redact_secrets", "redact_dict",
     # evidence / verifier
     "_mask_evidence", "_scrub_value_shapes", "_scrub",
+    "_mask_evidence_strict",
+    # durable writers (runtime.durable_redact)
+    "mask_params", "mask_values", "mask_text", "mask_display", "mask_event",
     # description + payload sanitisers
     "sanitize_description", "sanitize_card_payload", "_sanitize_html",
 })

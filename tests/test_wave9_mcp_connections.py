@@ -123,14 +123,16 @@ class TestDiscovery:
         from systemu.runtime.mcp.client import mcp_list_tools
 
         async def fake_list(self, server, spec):
-            return [{
+            # The manager returns a typed ToolListing (DEC-32: a fence is a
+            # value); a plain list is not a listing and is never success.
+            return _m.ToolListing.listed(server, [{
                 "name": "lookup_invoice",
                 "description": "Find an invoice",
                 "parameters_schema": {"type": "object",
                                       "properties": {"number": {"type": "string"}},
                                       "required": []},
                 "annotations": {},
-            }]
+            }])
         monkeypatch.setattr(_m.ConnectionManager, "list_tools", fake_list)
         out = mcp_list_tools(server="http://stub", timeout=10)
         assert out["success"] is True
@@ -145,10 +147,12 @@ class TestDiscovery:
     def test_list_tools_unreachable_is_honest(self):
         from systemu.runtime.mcp.client import mcp_list_tools
         out = mcp_list_tools(server="http://127.0.0.1:1", timeout=2)
-        # A real connection failure surfaces as an empty discovery (the manager
-        # logs + returns []), so honesty here = no fabricated tools.
-        assert out["success"] is True
-        assert out["tools"] == []
+        # A server that cannot be listed is a FAILURE with a reason that names
+        # the server -- never an empty discovery, which is what a healthy
+        # server with zero tools returns (the defect this used to pin).
+        assert out["success"] is False, out
+        assert "http://127.0.0.1:1" in out["error"], out
+        assert "tools" not in out, out
 
 
 class TestQuickLaneInclusion:
@@ -171,7 +175,11 @@ class TestQuickLaneInclusion:
         cx.add_server(vault, server)
         # v0.9.34: MCP action calls are gated; a read-only tool (readOnlyHint)
         # is Tier R → ungated, so this lookup dispatches directly as before.
-        cx.set_tool_enabled(vault, server, "lookup_invoice", True,
+        # P21 (GATE-6, ruled): the fixture tool was ``lookup_invoice``. "invoice"
+        # is a native money verb, so P21 classes that name money_move and its
+        # readOnlyHint cannot lower it. This test is about index inclusion and
+        # dispatch, not classification, so the tool carries no money word.
+        cx.set_tool_enabled(vault, server, "lookup_record", True,
                             description="Find an invoice",
                             schema={"type": "object"},
                             annotations={"readOnlyHint": True})
@@ -179,7 +187,17 @@ class TestQuickLaneInclusion:
         # readOnlyHint. Pin it here to simulate a tool already seen before —
         # this test is about quick-lane dispatch/index inclusion, not the
         # first-use gate (see tests/test_s1b_mcp_firstuse.py for that).
-        cx.set_tool_hash(vault, server, "lookup_invoice", "test-pinned-hash")
+        cx.set_tool_hash(vault, server, "lookup_record", "test-pinned-hash")
+        # R-3 (GATE-6, ruled): the pre-call rug-pull check fails closed, so the
+        # listing must return the tool UNCHANGED against its pinned hash.
+        from systemu.runtime.mcp import connections as _r3_conn
+        from systemu.runtime.mcp.sdk.schema_map import tool_def_hash as _r3_hash
+        import systemu.runtime.mcp.client as _r3_client
+        _r3_conn.set_tool_hash(vault, 'http://stub', 'lookup_record', _r3_hash(
+            name='lookup_record', description="d", input_schema={}))
+        monkeypatch.setattr(_r3_client, "mcp_list_tools", lambda *a, **k: {
+            "success": True,
+            "tools": [{"name": 'lookup_record', "description": "d", "schema": {}}]})
 
         # v0.9.36 P2: the call now routes through the SDK-isolated manager
         # (httpx REST stub dropped). Mock the manager's transport-level call_tool
@@ -191,7 +209,7 @@ class TestQuickLaneInclusion:
         monkeypatch.setattr(_m.ConnectionManager, "call_tool", fake_call)
 
         llm = self._llm([
-            {"action": "TOOL_CALL", "tool": "lookup_invoice",
+            {"action": "TOOL_CALL", "tool": "lookup_record",
              "params": {"number": "INV-42"}},
             {"action": "ANSWER", "answer_md": "found"},
         ])
@@ -199,7 +217,7 @@ class TestQuickLaneInclusion:
         assert res.status == "success" and res.tool_calls == 1
         # The index advertised the connector; the REAL connector response reached
         # the second turn (anti-no-op for connectors).
-        assert "lookup_invoice" in llm.calls["payloads"][0]
+        assert "lookup_record" in llm.calls["payloads"][0]
         assert "PAID" in llm.calls["payloads"][1]
 
     def test_disabled_mcp_tool_invisible(self, vault, stub_server):

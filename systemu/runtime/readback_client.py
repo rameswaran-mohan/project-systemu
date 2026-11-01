@@ -14,9 +14,9 @@ Guarantees:
     read).
   * defense-in-depth SSRF re-validation BEFORE any connect (even though the
     verifier host-pins upstream): https-only + reject private / loopback /
-    link-local / cloud-metadata (169.254.169.254) — literal IPs via
-    :func:`tool_hygiene.url_safety.is_url_safe`, hostnames via a resolve-then-reject
-    step mirroring ``mcp.sdk.manager._ssrf_precheck``.
+    link-local / cloud-metadata (169.254.169.254) — literal IPs classified by the
+    canonical ``net_safety`` classifiers, hostnames resolved ONCE through
+    :func:`net_safety.resolve_pinned_ip` (R-A11b-1: one guard, no private copy).
   * DNS-rebind TOCTOU CLOSED — the socket is PINNED to the vetted IP: a hostname is
     resolved EXACTLY ONCE and the GET connects to THAT ip literal (no 2nd DNS query at
     connect), while the ``Host`` header + TLS SNI/cert-verification stay the original
@@ -36,11 +36,11 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import socket
+import socket  # noqa: F401 -- the resolver seam the readback suite patches
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-from systemu.runtime.tool_hygiene.url_safety import is_url_safe
+from systemu.runtime import net_safety
 
 logger = logging.getLogger(__name__)
 
@@ -48,83 +48,27 @@ _MAX_BYTES = 1 * 1024 * 1024   # 1 MiB readback cap
 _TIMEOUT_S = 8.0
 
 
-def _ip_is_non_global(ip: Any) -> bool:
-    """True if an ``ip_address`` is NON-public: loopback / private / link-local
-    (incl. 169.254.169.254 metadata) / reserved / multicast / unspecified."""
-    return bool(ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
-
-
-def _embedded_ipv4_is_non_global(ip: Any) -> bool:
-    """For an IPv6 address, EXTRACT any embedded IPv4 (6to4 ``ip.sixtofour``,
-    ``ip.ipv4_mapped``, teredo client ``ip.teredo[1]``) and return True if that
-    embedded IPv4 is NON-global.
-
-    Why this matters: a 6to4 literal (2002::/16) embedding an RFC1918/metadata
-    IPv4 classifies as ``is_global`` on the OUTER IPv6 (none of is_loopback/
-    is_private/is_link_local/is_reserved/is_multicast/is_unspecified is set), so it
-    would otherwise PASS the gate — yet a 6to4 tunnel translates 2002:a9fe:a9fe::
-    back to 169.254.169.254 (IMDS) / 2002:a00:5:: → 10.0.0.5. The SAME threat class
-    the NAT64 sibling (64:ff9b::/96, is_reserved) was closed for. ipv4-mapped
-    (::ffff:a.b.c.d) is already caught via is_private/is_reserved on the outer
-    address, but re-checking it here is harmless belt-and-braces. Never raises."""
-    try:
-        if not isinstance(ip, ipaddress.IPv6Address):
-            return False
-        embedded: "list[Any]" = []
-        for attr in ("sixtofour", "ipv4_mapped"):
-            v = getattr(ip, attr, None)
-            if v is not None:
-                embedded.append(v)
-        teredo = getattr(ip, "teredo", None)
-        if teredo:
-            # teredo == (server_ipv4, client_ipv4); the client IPv4 is the tunnel
-            # endpoint that a teredo relay would translate to.
-            try:
-                embedded.append(teredo[1])
-            except Exception:
-                pass
-        return any(_ip_is_non_global(v4) for v4 in embedded)
-    except Exception:
-        # defensive: never let an attribute quirk turn a refusal into an admit.
-        return False
+# R-A11b-1: the address classification and the resolve-once-and-pin primitive are
+# the CANONICAL ones in ``net_safety`` (this module is where they were first
+# hardened; they were lifted there verbatim and this copy is now retired). The
+# private names stay as aliases because the adversarial readback suite pins them.
+_ip_is_non_global = net_safety.ip_is_non_global
+_embedded_ipv4_is_non_global = net_safety.embedded_ipv4_is_non_global
 
 
 def _resolve_pinned_ip(host: str) -> Optional[str]:
-    """Resolve a HOSTNAME to a single VETTED-PUBLIC IP LITERAL to PIN the socket to —
-    the mechanism that CLOSES the DNS-rebind TOCTOU: ONE resolve, connect to THAT ip,
-    never a second resolve.
-
-    Does exactly ONE ``socket.getaddrinfo(host, None)`` and validates that EVERY
-    resolved address is public (the exact ``_resolves_to_public`` checks: reject
-    loopback / private / link-local [incl. 169.254.169.254 metadata] / reserved /
-    multicast / unspecified, plus any IPv6 whose EMBEDDED IPv4 [6to4 / ipv4-mapped /
-    teredo] is non-global). RETURNS the FIRST vetted address as a normalised literal
-    (family-appropriate; IPv6 is returned UNBRACKETED — the URL rewriter brackets it).
-    Returns None if ANY address is non-global OR resolution fails OR nothing resolved
-    (fail-closed). Never raises."""
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception:
-        return None
-    first_public: Optional[str] = None
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            continue
-        if _ip_is_non_global(ip) or _embedded_ipv4_is_non_global(ip):
-            return None            # fail-closed on ANY non-global address in the set
-        if first_public is None:
-            first_public = str(ip)  # a normalised literal (no zone/scope suffix)
-    return first_public
+    """Resolve a HOSTNAME ONCE to a vetted-public IP literal to pin the socket to
+    (closes the DNS-rebind TOCTOU). Exactly :func:`net_safety.resolve_pinned_ip`:
+    one ``socket.getaddrinfo``, EVERY resolved address must be public, a mixed
+    set is refused whole, None on any refusal. Looked up on the module at call
+    time so the one implementation is the one that runs."""
+    return net_safety.resolve_pinned_ip(host)
 
 
 def _resolves_to_public(host: str) -> bool:
     """Resolve-then-reject SSRF guard for a HOSTNAME: True iff the host resolves and
     EVERY resolved address is public. A resolution failure / non-global address ⇒
-    False (fail-closed). Mirrors ``mcp.sdk.manager._ssrf_precheck``.
+    False (fail-closed). The canonical ``net_safety`` decision.
 
     Single source of truth: this is exactly ``_resolve_pinned_ip(host) is not None``
     (the readback path pins the socket to that vetted IP — see ``_resolve_pinned_ip``
@@ -134,36 +78,37 @@ def _resolves_to_public(host: str) -> bool:
 
 def _prevalidate_url(url: str) -> Optional["tuple[str, Any]"]:
     """https-only + host-present + literal-IP SSRF checks, WITHOUT resolving a
-    hostname (so the readback path can resolve exactly ONCE, in ``_resolve_pinned_ip``).
+    hostname (so the readback path resolves exactly ONCE, in ``_resolve_pinned_ip``).
 
     Returns ``(host, ip)`` where ``ip`` is the ``ip_address`` object if the host is a
     LITERAL IP (already validated public), or ``None`` if the host is a HOSTNAME (the
     caller must still resolve + pin). Returns ``None`` outright if the url is
-    inadmissible on scheme / host-presence / literal-IP grounds."""
-    if not is_url_safe(url):        # scheme http(s) + literal-IP private/loopback/link-local reject
+    inadmissible on scheme / host-presence / literal-IP grounds.
+
+    R-A11b-1: this no longer calls ``url_safety.is_url_safe`` -- that check now
+    RESOLVES the name (it delegates to ``net_safety``), and calling it here would
+    resolve twice and reopen the rebind window between the check and the pin. The
+    literal-IP branch uses the canonical classifiers directly."""
+    if not isinstance(url, str) or not url:
         return None
-    parsed = urlparse(url)
-    if (parsed.scheme or "").lower() != "https":   # is_url_safe also allows http — tighten to https
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if (parsed.scheme or "").lower() != "https":   # https only (no http, file, ...)
         return None
     host = (parsed.hostname or "").lower().strip()
-    if not host:
+    if not host or host == "localhost":
         return None
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return (host, None)          # a hostname — the caller resolves + pins
-    # is_url_safe already rejected loopback/private/link-local/unspecified, but it
-    # does NOT reject is_reserved / is_multicast — so a NAT64 well-known-prefix
-    # literal that embeds a metadata/RFC1918 IPv4 (64:ff9b::169.254.169.254, which
-    # a NAT64/IPv6-only gateway translates back to 169.254.169.254 → IMDS) and
-    # IPv6/IPv4 multicast literals slipped through here. Mirror _resolve_pinned_ip
-    # EXACTLY so the literal-IP branch is as strict as the hostname branch.
-    if _ip_is_non_global(ip):
-        return None
-    # a 6to4 / teredo / ipv4-mapped IPv6 literal that classifies as is_global on the
-    # OUTER address but EMBEDS an internal IPv4 (2002:a9fe:a9fe:: → 169.254.169.254)
-    # must also be refused — same threat class as the NAT64 literal above.
-    if _embedded_ipv4_is_non_global(ip):
+    # A literal: the canonical classification -- loopback / private / link-local
+    # (incl. 169.254.169.254) / reserved (NAT64 64:ff9b::/96) / multicast /
+    # unspecified, and any IPv6 whose EMBEDDED IPv4 (6to4 / ipv4-mapped / teredo)
+    # is non-global (2002:a9fe:a9fe:: is 169.254.169.254 behind a 6to4 relay).
+    if _ip_is_non_global(ip) or _embedded_ipv4_is_non_global(ip):
         return None
     return (host, ip)                # a validated public literal — already pinned
 
@@ -171,7 +116,7 @@ def _prevalidate_url(url: str) -> Optional["tuple[str, Any]"]:
 def _url_is_admissible(url: str) -> bool:
     """https-only + public-host SSRF gate (runs BEFORE any connect). Rejects
     non-https, and private/loopback/link-local/metadata targets — literal IPs via
-    ``is_url_safe`` (no network), hostnames via ``_resolves_to_public`` (a DNS
+    the canonical classifiers (no network), hostnames via ``_resolves_to_public`` (a DNS
     resolve, not a connect). Thin composition of ``_prevalidate_url`` + the hostname
     resolve, kept for callers that only need an admissibility verdict."""
     pre = _prevalidate_url(url)

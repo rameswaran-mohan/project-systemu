@@ -1051,6 +1051,11 @@ _CENSUS_REGION_MARKER = "R-W2 CENSUS CONSENT SURFACE :: REGION START"
 _CENSUS_SURFACE_FILES = {
     "systemu/interface/cli_commands.py": "the run_census_* command implementations",
     "sharing_on/cli.py": "the `systemu census` click group that calls them",
+    # P19: re-audited per the five items in the failure message below -- see that
+    # file's region header.
+    "systemu/interface/pages/table_census.py":
+        "the /table census panel's Withdraw / Pause / Resume handlers "
+        "(grant stays CLI-only)",
 }
 
 #: EVERY needle is matched BARE, without a trailing paren — including the function names.
@@ -1506,9 +1511,9 @@ def test_grant_refuses_without_a_terminal_and_names_the_flag(tmp_path, monkeypat
 
 
 def test_only_the_shipped_category_is_grantable(tmp_path, monkeypatch, capsys):
-    """This slice ships ONE category end to end. The other two must be refused HONESTLY —
-    named as not-yet-grantable-from-this-build — rather than silently accepted, silently
-    ignored, or presented as if they were on offer."""
+    """P19 widened the shipped scope to EVERY declared category. What must still be
+    refused HONESTLY: a category this machine has no source for (named as unavailable,
+    with the reason) and an unknown one -- never silently accepted or silently ignored."""
     from systemu.interface import cli_commands as cli
 
     _cloud_machine(tmp_path, monkeypatch)
@@ -1517,12 +1522,25 @@ def test_only_the_shipped_category_is_grantable(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_census_stdin_is_a_terminal", lambda: True)
     monkeypatch.setattr(cli.click, "confirm", lambda text, **kw: True)
 
-    assert set(cc.SURFACED_CATEGORIES) == {"cloud_sync_roots"}
-    for category in set(cc.CATEGORIES) - set(cc.SURFACED_CATEGORIES):
-        assert cli.run_census_grant(v, category) != 0, category
+    assert set(cc.SURFACED_CATEGORIES) == set(cc.CATEGORIES)
+    for category in sorted(cc.CATEGORIES):
+        available, _why = ac.category_availability(category)
+        code = cli.run_census_grant(v, category)
         out = capsys.readouterr().out.lower()
-        assert "not yet grantable" in out, category
-        assert cc.CensusConsentStore(vault_dir).is_granted(category) is False
+        if available:
+            assert code == 0, (category, out)
+            assert cc.CensusConsentStore(vault_dir).is_granted(category) is True
+        else:
+            assert code != 0 and "unavailable on this machine" in out, category
+            assert cc.CensusConsentStore(vault_dir).is_granted(category) is False
+
+    # A platform gap is refused by name on EVERY platform, not only where it happens to
+    # exist: on a "macOS" machine the COM category is unavailable and grants nothing.
+    monkeypatch.setattr(ac, "_platform_family", lambda: "macos")
+    other = tmp_path / "v2"
+    assert cli.run_census_grant(_vault(other), "automation_apps") != 0
+    assert "unavailable on this machine" in capsys.readouterr().out.lower()
+    assert cc.CensusConsentStore(other).is_granted("automation_apps") is False
 
     # An unknown category is refused too — loudly, never as a silent no-op that would
     # read to the operator as a granted capability that is quietly dead.
@@ -1569,7 +1587,10 @@ def test_census_status_lists_every_category_and_its_reachability(tmp_path, monke
     fresh = capsys.readouterr().out
     for category in cc.CATEGORIES:
         assert category in fresh, category
-    assert "not yet grantable" in fresh.lower()
+        available, why = ac.category_availability(category)
+        if not available:
+            assert why in fresh, category
+    assert "available here:" in fresh.lower()
     assert "not granted" in fresh.lower()
 
     assert run_census_grant(v, "cloud_sync_roots", assume_yes=True) == 0

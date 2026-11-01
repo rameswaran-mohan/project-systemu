@@ -1,44 +1,28 @@
 """URL safety checks for outbound network tools.
 
-Allowlist scheme + denylist private/loopback IPs to prevent SSRF + local
-filesystem reads disguised as URL fetches.
+R-A11b-1: this is no longer a check of its own. It delegates to the ONE
+canonical SSRF guard, :func:`systemu.runtime.net_safety.url_is_admissible`:
+an http(s) scheme, a host, and either a public literal IP or a hostname whose
+resolution is ENTIRELY public (resolved once; loopback / RFC-1918 / link-local
+incl. 169.254.169.254 / reserved / multicast / unspecified, IPv6 with an
+embedded non-public IPv4, and non-canonical numeric IP spellings all refused).
+
+It used to admit ANY hostname unresolved ("production callers can layer
+DNS-level checks") -- a name pointing at an internal address passed. A caller
+that will CONNECT must not re-resolve the name after this check; it pins to the
+vetted address with :func:`net_safety.resolve_pinned_ip` instead (see
+``readback_client``).
 """
 from __future__ import annotations
 
-import ipaddress
-from urllib.parse import urlparse
-
-_ALLOWED_SCHEMES = frozenset({"http", "https"})
-
 
 def is_url_safe(url: str) -> bool:
-    """Return True if the URL targets a public hostname over http(s).
+    """True iff ``url`` passes the canonical SSRF guard (``net_safety``).
 
-    Rejects:
-    - file://, javascript:, etc. — non-http(s) schemes
-    - localhost, 127.0.0.1, ::1
-    - RFC1918 private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-    - Empty / malformed URLs
-    """
-    if not url or not isinstance(url, str):
+    Fail-closed: a non-string, an unparseable URL, a non-http(s) scheme, a
+    missing host, a DNS failure or any non-public resolved address is False.
+    Never raises."""
+    if not isinstance(url, str) or not url:
         return False
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    scheme = (parsed.scheme or "").lower()
-    if scheme not in _ALLOWED_SCHEMES:
-        return False
-    host = (parsed.hostname or "").lower().strip()
-    if not host:
-        return False
-    if host in {"localhost"}:
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        # Hostname — assume public; production callers can layer DNS-level checks.
-        return True
-    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified:
-        return False
-    return True
+    from systemu.runtime.net_safety import url_is_admissible
+    return url_is_admissible(url) is True

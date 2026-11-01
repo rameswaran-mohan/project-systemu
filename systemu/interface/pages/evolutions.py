@@ -155,7 +155,9 @@ def _approve_evolution(evolution_id: str) -> None:
             None,
         )
         if match is not None:
-            resolved = queue.resolve(match.id, choice="Approve & Apply")
+            from systemu.approval.decision_queue import resolution_channel as _via
+            with _via("dashboard"):
+                resolved = queue.resolve(match.id, choice="Approve & Apply")
             result = resolve_gate(resolved, vault=vault)
             if result.status == CommandStatus.OK:
                 ui.notify(f"Evolution approved and applied. {result.summary}",

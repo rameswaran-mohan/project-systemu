@@ -572,10 +572,24 @@ def _rate_ok(sender_id: str, now_s: float) -> bool:
 
 
 def _mask(value: Any) -> Any:
-    """Redact a value that looks like a secret before auditing it."""
-    if isinstance(value, str) and _SECRET_HINT.search(value):
+    """Redact a value that looks like a secret before auditing it.
+
+    Two passes. A string carrying a hint word is dropped WHOLE, as before. Every
+    other string goes through the tree's shared span primitive
+    (``gateway.mask_secret_spans``), so a credential that no hint word names --
+    ``Authorization: Basic <b64>``, a URL's userinfo password, an ``sk-`` key
+    pasted as an answer -- is masked by the same rules the push uses, and a
+    forgotten hint word can no longer let it through. A value the primitive
+    cannot mask is dropped (fail closed): this row is written to disk."""
+    if not isinstance(value, str):
+        return value
+    if _SECRET_HINT.search(value):
         return "***"
-    return value
+    try:
+        from systemu.messaging.gateway import mask_secret_spans
+        return mask_secret_spans(value)
+    except Exception:
+        return "***"
 
 
 def _audit(queue, row: Dict[str, Any]) -> None:
@@ -859,13 +873,15 @@ def resolve_from_channel(
     # 7. Call the SAME dashboard resolve fn. This sets status+choice+publishes the
     #    operator_decision_resolved event; the existing reconciler / EventBus
     #    subscriber dispatch the resume. We do NOT re-implement resume here.
-    from systemu.approval.decision_queue import AnswerNotNeeded
+    from systemu.approval.decision_queue import AnswerNotNeeded, resolution_channel
     resolve_fn = resolver or queue.resolve
     try:
-        if resolver is not None:
-            resolve_fn(decision.id, mapped_choice)
-        else:
-            queue.resolve(decision.id, choice=mapped_choice)
+        # R-P3b: the card records the channel it was resolved on, in the same save.
+        with resolution_channel(str(channel) if channel else ""):
+            if resolver is not None:
+                resolve_fn(decision.id, mapped_choice)
+            else:
+                queue.resolve(decision.id, choice=mapped_choice)
     except AnswerNotNeeded as late:
         # IMPL-11: the run was cancelled between the lookup above and this
         # resolve. The queue recorded nothing and already wrote the event; the

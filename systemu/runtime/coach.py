@@ -99,7 +99,7 @@ def generate_steer(
     tier = int(getattr(config, "verifier_tier", 1))
     try:
         result = llm_call_json(
-            tier=tier,
+            stage="verification",
             system=_load_system_prompt(),
             user=json.dumps(user_payload, separators=(",", ":"), default=str),
             config=config,

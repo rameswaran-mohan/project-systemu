@@ -183,7 +183,7 @@ def preview_tool_code(
     logger.info("[Forge] Generating preview for '%s' (not saving yet) ...", tool.name)
     try:
         code_result = llm_call_json(
-            tier=2,
+            stage="forge",
             system=load_prompt("forge_tool_code.md"),
             user=json.dumps({
                 "tool_spec":      tool.model_dump(mode="json"),
@@ -627,7 +627,7 @@ def _generate_and_save_code(
     # ── LLM call — isolated so a transient failure doesn't kill a batch ──────
     try:
         code_result = llm_call_json(
-            tier=2,
+            stage="forge",
             system=load_prompt("forge_tool_code.md"),
             user=json.dumps(code_payload),
             config=config,
@@ -807,7 +807,7 @@ def _spec_and_forge_new(
         spec_payload["downstream_consumer"] = downstream_consumer
 
     spec_result = llm_call_json(
-        tier=2,
+        stage="forge",
         system=load_prompt("forge_tool_spec.md"),
         user=json.dumps(spec_payload),
         config=config,
@@ -924,7 +924,7 @@ def propose_tools_from_specs(
         }
         try:
             spec_result = llm_call_json(
-                tier=2,
+                stage="forge",
                 system=load_prompt("forge_tool_spec.md"),
                 user=json.dumps(spec_payload),
                 config=config,

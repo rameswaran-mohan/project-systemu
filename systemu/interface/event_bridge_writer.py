@@ -39,6 +39,13 @@ def install_bridge_writer(bridge_file_path: str) -> Callable[[], None]:
 
     def _on_event(event: Dict[str, Any]) -> None:
         try:
+            # DEC-31: the bridge file is on disk, and it mirrors EVERY event --
+            # including the per-iteration ones whose details carry the tool
+            # call's raw parameters. Mask before the line exists. The stream
+            # ref is the spawning job's id, stamped after (it is ours, not
+            # the model's).
+            from systemu.runtime.durable_redact import mask_event
+            event = mask_event(event)
             if stream_ref and not event.get("stream_ref"):
                 event = {**event, "stream_ref": stream_ref}
             line = json.dumps(event, default=str) + "\n"

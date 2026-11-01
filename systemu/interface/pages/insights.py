@@ -371,7 +371,9 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
         def _make_handler(did, dedup_key, label, the_queue):
             def _click(_e=None):
                 try:
-                    the_queue.resolve(did, choice=label)
+                    from systemu.approval.decision_queue import resolution_channel as _via
+                    with _via("dashboard"):
+                        the_queue.resolve(did, choice=label)
                     ui.notify(f"Resolved: {label}", type="positive")
                     on_resolved()
                     # v0.8.5: dispatch the resolved choice to the registered
@@ -544,8 +546,10 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                         ui.notify("Fill all required fields: " + ", ".join(_missing),
                                   type="warning")
                         return
-                    the_queue.resolve(
-                        did, choice=build_elicitation_answer(schema, vals, picked))
+                    from systemu.approval.decision_queue import resolution_channel as _via
+                    with _via("dashboard"):
+                        the_queue.resolve(
+                            did, choice=build_elicitation_answer(schema, vals, picked))
                     ui.notify("Submitted", type="positive")
                     on_resolved()
                 except Exception as exc:
@@ -600,7 +604,9 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                         free = vals.get(q["id"] + "__free")
                         ftext = (free.value or "").strip() if free is not None else ""
                         answers[q["id"]] = ftext or (sel.value if sel is not None else None)
-                    the_queue.resolve(did, choice=build_structured_answer(qs, answers))
+                    from systemu.approval.decision_queue import resolution_channel as _via
+                    with _via("dashboard"):
+                        the_queue.resolve(did, choice=build_structured_answer(qs, answers))
                     ui.notify("Submitted", type="positive")
                     on_resolved()
                 except Exception as exc:
@@ -679,16 +685,20 @@ def render_decision_card(card: dict, queue, on_resolved) -> None:
                                     "from": res["from_band"], "to": res["to_band"],
                                     "confirmed": True}
                                 _dlg.close()
-                                queue.resolve_with_context_patch(
-                                    did, choice="Approve", context_patch=patch)
+                                from systemu.approval.decision_queue import resolution_channel as _via
+                                with _via("dashboard"):
+                                    queue.resolve_with_context_patch(
+                                        did, choice="Approve", context_patch=patch)
                                 ui.notify("Approved (amended)", type="positive")
                                 on_resolved()
                             ui.button("Confirm", on_click=_do_confirm)
                             ui.button("Cancel", on_click=_dlg.close)
                         _dlg.open()
                         return
-                    queue.resolve_with_context_patch(
-                        did, choice="Approve", context_patch=patch)
+                    from systemu.approval.decision_queue import resolution_channel as _via
+                    with _via("dashboard"):
+                        queue.resolve_with_context_patch(
+                            did, choice="Approve", context_patch=patch)
                     ui.notify("Approved (amended)", type="positive")
                     on_resolved()
 

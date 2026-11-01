@@ -49,6 +49,8 @@ def build_status_rows(vault, limit: int = 25) -> List[Dict[str, Any]]:
     except Exception:
         logger.debug("[StatusMenu] could not load chat history", exc_info=True)
         return []
+    from systemu.interface.components.receipt_panel import badge_model_for
+
     rows: List[Dict[str, Any]] = []
     for e in reversed(entries):  # newest first
         status = str(e.get("status") or "unknown")
@@ -68,6 +70,8 @@ def build_status_rows(vault, limit: int = 25) -> List[Dict[str, Any]]:
             "attention": status in _ATTENTION_STATUSES,
             # W8.4: produced-file count for the row chip.
             "files": len(e.get("files_produced") or []),
+            # DEC-13: the one mint's verification badge (nothing while in flight).
+            "badge": badge_model_for(status, e.get("execution_id")),
         })
     return rows
 
@@ -86,6 +90,7 @@ def render_status_menu(vault) -> None:
     """The header Status button + dropdown (thin shell over the pure model)."""
     from nicegui import ui
 
+    from systemu.interface.components.receipt_panel import render_badge
     from systemu.interface.design.primitives import button, status_pill
     from systemu.interface.ui_helpers import safe_timer
 
@@ -115,6 +120,7 @@ def render_status_menu(vault) -> None:
                 ):
                     with ui.row().classes("w-full items-center").style("gap: 8px;"):
                         status_pill(row["status"])
+                        render_badge(row.get("badge"))
                         name = ui.label(row["name"]).classes("s-cell s-cell--bold").style(
                             "flex: 1; overflow: hidden; text-overflow: ellipsis; "
                             "white-space: nowrap;"
@@ -153,4 +159,11 @@ def render_status_menu(vault) -> None:
 
                     button("Copy", variant="ghost", on_click=_copy)
 
-            safe_timer(2.0, _rows.refresh)
+            # W12: rows carry a clickable badge -- repaint only on change, so a
+            # click is never eaten by an unconditional rebuild.
+            import json as _json
+
+            from systemu.interface.ui_helpers import gated_refresh
+            safe_timer(2.0, gated_refresh(
+                lambda: _json.dumps(build_status_rows(vault), sort_keys=True, default=str),
+                _rows.refresh))

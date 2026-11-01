@@ -31,11 +31,19 @@ class TestPathSecurity:
 
 
 class TestUrlSafety:
-    def test_https_allowed(self):
+    def test_https_allowed(self, monkeypatch):
+        # R-A11b-1: is_url_safe now resolves the name (net_safety); fake DNS at
+        # the resolver seam so the test never touches the real network.
+        import socket
+        monkeypatch.setattr(socket, "getaddrinfo",
+                            lambda host, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
         from systemu.runtime.tool_hygiene.url_safety import is_url_safe
         assert is_url_safe("https://example.com") is True
 
-    def test_http_allowed(self):
+    def test_http_allowed(self, monkeypatch):
+        import socket
+        monkeypatch.setattr(socket, "getaddrinfo",
+                            lambda host, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
         from systemu.runtime.tool_hygiene.url_safety import is_url_safe
         assert is_url_safe("http://example.com") is True
 

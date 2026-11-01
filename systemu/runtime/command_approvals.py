@@ -173,6 +173,24 @@ def tool_signature(name: str, body_hash: str, effect_tags, *, host_class: str = 
     return hashlib.sha1(raw).hexdigest()
 
 
+def tool_target_signature(name: str, body_hash: str, effect_tags, *,
+                          host_class: str = "", target: str) -> str:
+    """P26 approval key for ONE resolved target of a target-gated tool
+    (``app_targets.TARGET_GATED_TOOLS``): everything :func:`tool_signature`
+    binds, plus ``target`` (``AppTarget.signed()``), so a standing approval of
+    one application never covers another.
+
+    A separate domain (a JSON array led by ``"tool-target"``) -- never the
+    ``tool<NUL>...`` preimage :func:`tool_signature` hashes -- so no target-bound
+    signature can equal a parameter-free one, and the JSON encoding keeps the
+    parts one-to-one whatever bytes they hold."""
+    payload = json.dumps(
+        ["tool-target", (name or "").strip(), body_hash,
+         sorted(str(t).strip() for t in (effect_tags or [])), host_class, target],
+        ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
 #: The host class of a tool that declares no network effect.
 HOST_CLASS_NONE = "none"
 #: The host class of a tool that declares a network effect but no hosts.
@@ -271,7 +289,7 @@ def signature_from_parts(parts) -> Optional[str]:
     non-string name / body hash / host class, or a tag list holding anything but
     strings, is not a set of parts at all. An absent ``host_class`` reads as the
     empty class -- the only value any signature was keyed on before parts were
-    recorded.
+    recorded. A ``target`` part (P26) selects :func:`tool_target_signature`.
     """
     if type(parts) is not dict:
         return None
@@ -286,6 +304,14 @@ def signature_from_parts(parts) -> Optional[str]:
     for t in tags:
         if type(t) is not str:
             return None
+    if "target" in parts:
+        # P26: a card for one resolved target binds that target too.
+        target = parts.get("target")
+        if type(target) is not str or not target:
+            return None
+        return tool_target_signature(name, body_hash, set(tags),
+                                     host_class=signature_host_class(host_class),
+                                     target=target)
     return tool_signature(name, body_hash, set(tags),
                           host_class=signature_host_class(host_class))
 
@@ -806,6 +832,9 @@ class CommandApprovalStore:
             else:
                 del pend[sig]
                 self._save()
+                # R-P3b: remember, for THIS thread only, which bridge was spent, so the
+                # gate that just redeemed it can name the decision that minted it.
+                self._consumed_local().entry = entry if isinstance(entry, dict) else {}
         if refused:
             # D3 (dogfood 0.10.28): a REFUSAL is not silence. The operator
             # approved something and this says their approval did not cover
@@ -817,6 +846,46 @@ class CommandApprovalStore:
             _emit_refusal_event(sig, minted_for=refused_scope, scored_under=want)
             return False
         return True
+
+    # ── R-P3b: which decision minted a resume bridge ─────────────────────────
+    #
+    # The bridge used to carry no decision id, so a call it let through read
+    # "not recorded" for its decision in the action ledger. The minting side stamps
+    # the id onto the entry it just wrote (a separate call, so every existing
+    # ``mark_resume_approved`` signature -- and its test doubles -- stay as they are);
+    # the redeeming gate takes it back off the entry it consumed, on its own thread.
+
+    def stamp_resume_decision(self, sig: str, decision_id: str) -> bool:
+        """Record ``decision_id`` on the outstanding bridge for ``sig``. True when
+        stamped. Best-effort, never raises."""
+        if type(sig) is not str or type(decision_id) is not str or not decision_id:
+            return False
+        try:
+            with self._lock:
+                self._data = self._load()
+                entry = (self._data.get("resume_pending") or {}).get(sig)
+                if not isinstance(entry, dict):
+                    return False
+                entry["decision_id"] = decision_id
+                self._save()
+                return True
+        except Exception:
+            logger.debug("[CommandApprovals] could not stamp the bridge decision",
+                         exc_info=True)
+            return False
+
+    def _consumed_local(self):
+        tl = self.__dict__.get("_consumed_tls")
+        if tl is None:
+            tl = self.__dict__.setdefault("_consumed_tls", threading.local())
+        return tl
+
+    def take_consumed_resume_decision(self) -> Optional[str]:
+        """The decision id on the bridge THIS thread last consumed (once), or None."""
+        tl = self._consumed_local()
+        entry, tl.entry = getattr(tl, "entry", None), None
+        did = entry.get("decision_id") if isinstance(entry, dict) else None
+        return did if (type(did) is str and did) else None
 
     def clear_resume_approved(self, sig: str) -> bool:
         """Drop any one-shot resume bridge for ``sig``, WHATEVER its scope. Returns

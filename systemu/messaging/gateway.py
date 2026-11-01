@@ -127,7 +127,8 @@ def parse_command(
 # ``mask_outbound`` is the single outbound chokepoint: every gateway calls it in
 # ``push()`` on the message text AND every button label, so a secret can never
 # leave the process in a notification. It is deliberately CONSERVATIVE — it
-# redacts header values (Authorization / Cookie) and things that look like a
+# redacts header values (Authorization / Cookie), the credential after an auth
+# scheme, the password in a URL's userinfo, and things that look like a
 # credential token (bearer / OpenAI ``sk-…`` / AWS ``AKIA…`` / a JWT / a long
 # hex or high-entropy run), and leaves normal prose alone.
 #
@@ -147,19 +148,70 @@ except Exception:  # pragma: no cover - defensive fallback
         "access_key", "private_key", "client_secret", "credential", "auth",
     )
 
+# Auth schemes (RFC 7235 ``<scheme> <credential>``). The scheme word is NOT the
+# secret -- the run after it is. Every rule below keeps the scheme readable and
+# masks what follows it.
+#
+# ``_TOKEN68_SCHEMES`` are masked even with NO header name in front ("Bearer <t>"
+# pasted into prose). ``_AUTH_SCHEMES`` is the wider set the header/kv rule
+# recognises after ``Authorization:`` and friends, where the context already
+# says a credential follows.
+_TOKEN68_SCHEMES = ("bearer", "basic")
+_AUTH_SCHEMES = _TOKEN68_SCHEMES + (
+    "token", "negotiate", "ntlm", "dpop", "bot", "ssws", "apikey", "api-key",
+)
+_TOKEN68 = r"[A-Za-z0-9\-._~+/]"
+
+
+def _alt(words) -> str:
+    return "|".join(re.escape(w) for w in sorted(set(words), key=len, reverse=True))
+
+
 # Header/kv value redaction: "Authorization: …", "Cookie: …", "api_key=…", etc.
-# Matches the token word, an optional bearer/basic scheme, then the value run up
-# to end-of-line (headers/kv pairs are one value per line).
+#
+# ORDER BUG this shape exists to prevent: the value rule used to replace only
+# the FIRST word after the name, which for ``Authorization: Bearer <t>`` is the
+# scheme -- leaving ``Authorization: *** <t>``, with the scheme gone so the
+# scheme rule below could no longer see ``<t>``. Now an auth scheme right after
+# the name is KEPT and the credential after it is the masked run.
+#
+# The name may be quoted (``"Authorization": "Bearer <t>"``, a Python repr's
+# ``'Authorization': …``, an escaped ``\"Authorization\": …`` inside a JSON
+# string). A quoted value is masked up to its closing quote, so the rest of the
+# document stays readable; an unquoted value is one whitespace-free run.
 _HEADER_TOKENS = ("authorization", "cookie", "set-cookie", "proxy-authorization")
 _KV_SECRET_RE = re.compile(
-    r"(?i)\b(" + "|".join(
-        re.escape(t) for t in sorted(set(_HEADER_TOKENS) | set(_SECRET_TOKENS),
-                                     key=len, reverse=True)
-    ) + r")\b\s*[:=]\s*\S+",
+    r"(?i)\b(?P<name>" + _alt(set(_HEADER_TOKENS) | set(_SECRET_TOKENS)) + r")\b"
+    r"(?P<q1>\\?[\"'])?\s*[:=]\s*(?P<q2>\\?[\"'])?"
+    r"(?:(?P<scheme>" + _alt(_AUTH_SCHEMES) + r")\s+)?"
+    r"(?(q2)(?:(?!(?P=q2))[^\r\n])+|\S+)",
 )
 
-# Bearer scheme with a token: "Bearer <token>", "Basic <b64>".
-_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/]{6,}=*")
+
+def _kv_mask(m: "re.Match") -> str:
+    scheme = m.group("scheme")
+    return (f"{m.group('name')}{m.group('q1') or ''}: {m.group('q2') or ''}"
+            f"{scheme + ' ' if scheme else ''}{_MASK}")
+
+
+# A scheme with no header name in front: "Bearer <token>", "Basic <b64>".
+_BEARER_RE = re.compile(
+    r"(?i)\b(?P<scheme>" + _alt(_TOKEN68_SCHEMES) + r")(?P<sp>\s+)" + _TOKEN68 + r"{6,}=*")
+
+# "Token <t>" with no header name. ``token`` is an everyday word in this
+# product's prose ("token budget exceeded"), so the bare form needs the value to
+# LOOK like a credential: 16+ token68 characters holding both a letter and a
+# digit. After a header name the scheme is unambiguous and ``_KV_SECRET_RE``
+# masks whatever follows.
+_TOKEN_SCHEME_RE = re.compile(
+    r"(?i)\b(?P<scheme>token)(?P<sp>\s+)"
+    r"(?=" + _TOKEN68 + r"*[0-9])(?=" + _TOKEN68 + r"*[A-Za-z])" + _TOKEN68 + r"{16,}=*")
+
+# The password in a URL's userinfo: ``scheme://user:<password>@host``. The user
+# name (possibly empty, as in ``redis://:pw@host``) and the host stay readable.
+# The password runs to the LAST ``@`` before the path, so an unencoded ``@``
+# inside it is masked too.
+_URL_USERINFO_RE = re.compile(r"(?P<pre>://[^/\s:?#]*:)[^/\s?#]+(?=@)")
 
 # Token SHAPES (value-only, no name needed).
 _TOKEN_SHAPE_RES = (
@@ -172,13 +224,45 @@ _TOKEN_SHAPE_RES = (
 )
 
 
+def mask_secret_spans(text: str) -> str:
+    """THE shared secret-span primitive: every rule above, applied in order.
+
+    Each mask in the tree that inspects free text reaches its span rules
+    through this one function -- the outbound push (:func:`mask_outbound`),
+    the evidence / per-call audit / ledger mask
+    (``external_verifier._scrub_value_shapes``), the resolve-audit row
+    (``decision_bridge._mask``), and through those the durable writers
+    (``durable_redact``) and the file-export fence (``outbox.redact``). A rule
+    added here is picked up by all of them; a rule copied elsewhere is the
+    drift ``tools/lint_mask_primitive.py`` exists to stop.
+
+    Unlike :func:`mask_outbound` it RAISES on failure (a non-``str`` input, or
+    anything the rules throw). The caller decides which way to fail: the push
+    fails open (a notification must never break), the evidence and durable
+    masks fail closed (a value that could not be masked is dropped).
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"mask_secret_spans takes a str, got {type(text).__name__}")
+    out = _KV_SECRET_RE.sub(_kv_mask, text)
+    out = _BEARER_RE.sub(r"\g<scheme>\g<sp>" + _MASK, out)
+    out = _TOKEN_SCHEME_RE.sub(r"\g<scheme>\g<sp>" + _MASK, out)
+    out = _URL_USERINFO_RE.sub(r"\g<pre>" + _MASK, out)
+    for rx in _TOKEN_SHAPE_RES:
+        out = rx.sub(_MASK, out)
+    return out
+
+
 def mask_outbound(text: str, vault: Any = None) -> str:
     """Redact secret-looking spans in an outbound push string.
 
-    Conservative: redacts header/kv secret values, bearer/basic schemes, and
-    token shapes (``sk-…``, ``AKIA…``, JWT, ``ghp_…``, Slack, long hex) to
-    ``***``; leaves ordinary prose untouched. Never raises (returns the input
-    unchanged on any error).
+    Conservative: redacts header/kv secret values, the credential after an auth
+    scheme (``Authorization: Bearer|Basic|Token <cred>`` in any case, quoted or
+    not, ``Proxy-Authorization``, and a bare ``Bearer <t>`` / ``Basic <b64>`` /
+    ``Token <t>``), the password in a URL's userinfo, and token shapes
+    (``sk-…``, ``AKIA…``, JWT, ``ghp_…``, Slack, long hex) to ``***``; leaves
+    ordinary prose untouched. The header name and the scheme word survive
+    (``Authorization: Bearer ***``) so a masked push still says what failed.
+    Never raises (returns the input unchanged on any error).
 
     ``vault`` (optional) additionally enables the KNOWN-VALUE fence: any whole
     token equal to one of the operator's STORED credential values is redacted,
@@ -201,10 +285,7 @@ def mask_outbound(text: str, vault: Any = None) -> str:
     if not isinstance(text, str) or not text:
         return text
     try:
-        out = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}: {_MASK}", text)
-        out = _BEARER_RE.sub(_MASK, out)
-        for rx in _TOKEN_SHAPE_RES:
-            out = rx.sub(_MASK, out)
+        out = mask_secret_spans(text)
         if vault is not None:
             from systemu.runtime.credentials.known_values import redact_known_secrets
             out = redact_known_secrets(out, vault, _MASK)

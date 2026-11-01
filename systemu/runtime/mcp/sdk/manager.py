@@ -15,6 +15,11 @@ Policy (spec §3.1, §3.7, MRTR alignment):
     shared sync runner).
   * Sampling callback slot exists (set_sampling_callback) but is left None in P2;
     P4 fills it. Elicitation callback is injected by Task 13.
+  * R-A11b-1 SSRF: every entry point that opens a remote session -- list_tools,
+    call_tool, connect_and_discover (hence _sync, _open_remote,
+    connect_remote_sync) -- obtains ONE verdict from egress.admit_url
+    (net_safety underneath) before anything is opened, and opens the session
+    under it; transports.open_session refuses a remote session without one.
 
 All SDK use goes through transports.open_session — this module never imports the
 SDK directly. Returns the SAME envelope shape the legacy client used so client.py
@@ -23,7 +28,8 @@ can keep its public contract.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 from systemu.runtime.mcp.sdk import transports
 from systemu.runtime.mcp.sdk.schema_map import (
@@ -42,39 +48,84 @@ def _spec_key(spec: Dict[str, Any]) -> str:
 
 def _ssrf_precheck(spec: Dict[str, Any],
                    allowed_hosts: Optional[set] = None) -> tuple:
-    """DNS-resolve a remote spec's host and REFUSE link-local / loopback /
-    private / cloud-metadata targets unless the host is explicitly allow-listed
-    (H5, SECURITY §SSRF). Returns ``(ok: bool, reason: str)``.
+    """``(ok, reason)`` for a remote spec -- the CANONICAL verdict (R-A11b-1).
 
-    P2 enforces the resolve-and-reject; the allow-list source (HarnessPolicy
-    ``allowed_mcp_hosts``) is owned by P3 — passed in by the caller when present,
-    defaults to empty here (fail-closed on private ranges)."""
-    import ipaddress
-    import socket
-    from urllib.parse import urlparse
+    This used to be a private, weaker copy of the guard (it never extracted an
+    embedded IPv4, so a name resolving to 2002:a9fe:a9fe:: -- the 6to4 form of
+    169.254.169.254 -- was admitted). It is now a thin view over
+    :func:`egress.admit_url` (which delegates to ``net_safety``); kept only for
+    callers that want the tuple shape."""
+    from systemu.runtime.mcp.sdk.egress import admit_url
+    verdict = admit_url(str(spec.get("url") or ""), allowed_hosts=allowed_hosts or ())
+    if verdict.admitted is True:
+        return (True, "allow-listed host" if verdict.via == "allowance" else "public address")
+    return (False, verdict.reason)
 
-    allowed = {h.lower() for h in (allowed_hosts or set())}
-    url = str(spec.get("url") or "")
-    host = (urlparse(url).hostname or "").lower()
-    if not host:
-        return (False, "no host in spec url")
-    if host in allowed:
-        return (True, "allow-listed host")
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception as exc:
-        return (False, f"DNS resolution failed: {exc}")
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            continue
-        # 169.254.169.254 / fd00:ec2::254 cloud-metadata is link-local already.
-        if (ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return (False, f"host {host} resolves to non-public address {addr}")
-    return (True, "public address")
+
+class ToolListingFailed(RuntimeError):
+    """Raised by iterating a FAILED :class:`ToolListing`.
+
+    The listing value is the fence (DEC-32); this exception only makes an honest
+    caller that forgot to check ``.ok`` fail loud instead of reading the failure
+    as "the server has zero tools"."""
+
+    def __init__(self, listing: "ToolListing") -> None:
+        self.listing = listing
+        super().__init__(
+            f"tools on {listing.server} could not be listed: {listing.reason}")
+
+
+@dataclass(frozen=True)
+class ToolListing:
+    """What ``ConnectionManager.list_tools`` returns -- the ONE value that says
+    whether a server was listed.
+
+    Two different facts, never collapsed into one shape:
+
+      * ``ok=True``  -- the server answered; ``tools`` is what it offers (which
+        may legitimately be empty), ``reason`` is ``None``.
+      * ``ok=False`` -- the server could NOT be listed; ``reason`` says why,
+        ``tools`` is empty.
+
+    Before this, a failure returned ``[]``, the same value as a healthy server
+    with no tools, so every caller reported ``success: True`` for a server that
+    never started. Callers check ``type(x) is ToolListing`` and ``x.ok is True``
+    before reading ``tools``; a plain list is not a listing.
+    """
+
+    server: str
+    ok: bool
+    tools: Tuple[Dict[str, Any], ...] = ()
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if type(self.ok) is not bool:
+            raise TypeError(f"ToolListing.ok must be a bool, got {type(self.ok).__name__}")
+        if type(self.server) is not str:
+            raise TypeError("ToolListing.server must be a str")
+        if type(self.tools) is not tuple:
+            raise TypeError("ToolListing.tools must be a tuple")
+        if self.ok:
+            if self.reason is not None:
+                raise ValueError("a successful listing carries no failure reason")
+            return
+        if type(self.reason) is not str or not self.reason.strip():
+            raise ValueError("a failed listing must say why it failed")
+        if self.tools:
+            raise ValueError("a failed listing carries no tools")
+
+    @classmethod
+    def listed(cls, server: str, tools) -> "ToolListing":
+        return cls(server=str(server), ok=True, tools=tuple(tools), reason=None)
+
+    @classmethod
+    def failed(cls, server: str, reason: str) -> "ToolListing":
+        return cls(server=str(server), ok=False, tools=(), reason=str(reason))
+
+    def __iter__(self):
+        if self.ok is not True:
+            raise ToolListingFailed(self)
+        return iter(self.tools)
 
 
 def _normalise_tool(t: Any) -> Dict[str, Any]:
@@ -181,36 +232,95 @@ class ConnectionManager:
         handler here; P2 never sets it."""
         self._sampling_callback = cb
 
-    async def list_tools(self, server: str, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def list_tools(self, server: str, spec: Dict[str, Any], *,
+                         allowed_hosts=None) -> ToolListing:
+        """List ``server``'s tools. Returns a :class:`ToolListing` -- never a bare
+        list, never ``[]`` for a failure, and never raises (an ordinary error is
+        a failed listing carrying its reason). A remote spec is SSRF-checked
+        before anything is opened (R-A11b-1) -- this is the Settings "Discover
+        tools" path, which used to have no check at all."""
+        verdict = self._admit(spec, allowed_hosts)
+        refused = self._refusal(verdict)
+        if refused is not None:
+            logger.warning("[MCP] list_tools(%s) refused: %s", server, refused)
+            return ToolListing.failed(server, refused)
         if not self._is_stateless(spec):
             self._known_stdio[_spec_key(spec)] = spec
-        try:
-            async with transports.open_session(
-                spec, elicitation_callback=self._elicitation_callback,
-                sampling_callback=self._sampling_callback,
-                init_timeout=self._default_timeout,
-            ) as session:
-                listed = await session.list_tools()
-                return [_normalise_tool(t) for t in (listed.tools or [])]
-        except Exception as exc:
-            logger.warning("[MCP] list_tools(%s) failed: %s", server, exc)
-            return []
+        with transports.StdioWitness.for_spec(spec) as witness:
+            try:
+                async with self._session(spec, witness, verdict) as session:
+                    listed = await session.list_tools()
+                    return ToolListing.listed(
+                        server, [_normalise_tool(t) for t in (listed.tools or [])])
+            except Exception as exc:
+                reason = self._why(exc, spec, witness)
+                logger.warning("[MCP] list_tools(%s) failed: %s", server, reason)
+                return ToolListing.failed(server, reason)
+
+    def _admit(self, spec: Dict[str, Any], allowed_hosts=None):
+        """THE SSRF verdict for a remote spec (R-A11b-1), or ``None`` for stdio
+        (no host). ``allowed_hosts`` defaults to the operator's MCP allowance
+        (``HarnessPolicy.allowed_mcp_hosts``) -- never to anything stored where
+        the agent can write (DEC-34)."""
+        if not self._is_stateless(spec):
+            return None
+        from systemu.runtime.mcp.sdk import egress
+        if allowed_hosts is None:
+            allow = egress.operator_allowance()
+        else:   # an explicit allowance still counts the env-declared servers (R-2 c)
+            allow = tuple(allowed_hosts) + egress.env_server_allowance()
+        return egress.admit_url(str(spec.get("url") or ""), allowed_hosts=allow)
+
+    @staticmethod
+    def _refusal(verdict: Any) -> Optional[str]:
+        """The refusal reason when ``verdict`` does not admit, else ``None``.
+        The concrete type is pinned before the value is read (DEC-36)."""
+        if verdict is None:
+            return None
+        from systemu.runtime.mcp.sdk.egress import EgressVerdict
+        if type(verdict) is not EgressVerdict:
+            return "blocked by SSRF/DNS guard: no verdict was issued for this URL"
+        if verdict.admitted is not True:
+            return f"blocked by SSRF/DNS guard: {verdict.reason}"
+        return None
+
+    def _session(self, spec: Dict[str, Any], witness: Any, egress_verdict: Any = None):
+        """The ONE place the manager opens an SDK session."""
+        return transports.open_session(
+            spec, elicitation_callback=self._elicitation_callback,
+            sampling_callback=self._sampling_callback,
+            init_timeout=self._default_timeout, witness=witness,
+            egress=egress_verdict,
+        )
+
+    def _why(self, exc: BaseException, spec: Dict[str, Any], witness: Any) -> str:
+        """Defect 2: the innermost meaningful cause, never the task-group str()."""
+        from systemu.runtime.mcp.sdk.failure import describe_failure
+        return describe_failure(exc, spec, witness=witness,
+                                timeout_s=self._default_timeout)
 
     async def call_tool(self, server: str, spec: Dict[str, Any], name: str,
-                        arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                        arguments: Optional[Dict[str, Any]] = None, *,
+                        allowed_hosts=None) -> Dict[str, Any]:
+        """Call ``name`` on ``server``. A remote spec is SSRF-checked before
+        anything is opened (R-A11b-1), and the call is made under that verdict
+        (pinned to the checked address)."""
+        verdict = self._admit(spec, allowed_hosts)
+        refused = self._refusal(verdict)
+        if refused is not None:
+            logger.warning("[MCP] call_tool(%s.%s) refused: %s", server, name, refused)
+            return {"success": False, "error": f"connection/call failed: {refused}"}
         if not self._is_stateless(spec):
             self._known_stdio[_spec_key(spec)] = spec
-        try:
-            async with transports.open_session(
-                spec, elicitation_callback=self._elicitation_callback,
-                sampling_callback=self._sampling_callback,
-                init_timeout=self._default_timeout,
-            ) as session:
-                result = await session.call_tool(name, arguments or {})
-                return _result_to_envelope(result)
-        except Exception as exc:
-            logger.warning("[MCP] call_tool(%s.%s) failed: %s", server, name, exc)
-            return {"success": False, "error": f"connection/call failed: {exc}"}
+        with transports.StdioWitness.for_spec(spec) as witness:
+            try:
+                async with self._session(spec, witness, verdict) as session:
+                    result = await session.call_tool(name, arguments or {})
+                    return _result_to_envelope(result)
+            except Exception as exc:
+                reason = self._why(exc, spec, witness)
+                logger.warning("[MCP] call_tool(%s.%s) failed: %s", server, name, reason)
+                return {"success": False, "error": f"connection/call failed: {reason}"}
 
     async def connect_and_discover(self, server_id: str,
                                    spec: Dict[str, Any], *,
@@ -248,25 +358,26 @@ class ConnectionManager:
                 except Exception as exc:
                     result["error"] = f"blocked by TLS policy: {exc}"
                     return result
-            ok, why = _ssrf_precheck(spec, allowed_hosts=allowed_hosts)
-            if not ok:
-                result["error"] = f"blocked by SSRF/DNS guard: {why}"
-                return result
+        verdict = self._admit(spec, allowed_hosts)
+        refused = self._refusal(verdict)
+        if refused is not None:
+            result["error"] = refused
+            return result
         if not self._is_stateless(spec):
             self._known_stdio[_spec_key(spec)] = spec
-        try:
-            async with transports.open_session(
-                spec, elicitation_callback=self._elicitation_callback,
-                sampling_callback=self._sampling_callback,
-                init_timeout=self._default_timeout,
-            ) as session:
-                listed = await session.list_tools()
-                result["connected"] = True
-                result["tools"] = [_normalise_tool(t) for t in (listed.tools or [])]
-        except Exception as exc:
-            logger.warning("[MCP] connect_and_discover(%s) failed: %s",
-                           server_id, exc)
-            result["error"] = f"connect/discover failed: {exc}"
+        with transports.StdioWitness.for_spec(spec) as witness:
+            try:
+                async with self._session(spec, witness, verdict) as session:
+                    listed = await session.list_tools()
+                    result["connected"] = True
+                    result["tools"] = [_normalise_tool(t) for t in (listed.tools or [])]
+            except Exception as exc:
+                reason = self._why(exc, spec, witness)
+                logger.warning("[MCP] connect_and_discover(%s) failed: %s",
+                               server_id, reason)
+                result["connected"] = False
+                result["tools"] = []
+                result["error"] = f"connect/discover failed: {reason}"
         return result
 
     def connect_and_discover_sync(self, server_id: str,
@@ -283,13 +394,14 @@ class ConnectionManager:
         return _run_async(self.connect_and_discover(
             server_id, spec, allowed_hosts=allowed_hosts, require_tls=require_tls))
 
-    async def _open_remote(self, url: str, *, transport: str = "http") -> Dict[str, Any]:
+    async def _open_remote(self, url: str, *, transport: str = "http",
+                           allowed_hosts=None) -> Dict[str, Any]:
         """Async opener for a remote MCP endpoint (delegates to the connect+
-        discover seam). Kept as the single delegation point so Task 9's policy
-        gate (``connect_remote_sync``) enforces TLS + SSRF host policy BEFORE this
-        ever runs."""
+        discover seam, which issues the SSRF verdict the connection is made
+        under). ``connect_remote_sync`` enforces TLS + host policy BEFORE this
+        ever runs and threads its allowance through."""
         spec = {"url": url, "transport": transport}
-        return await self.connect_and_discover(url, spec)
+        return await self.connect_and_discover(url, spec, allowed_hosts=allowed_hosts)
 
     def connect_remote_sync(self, url, *, allowed_hosts, require_tls=True,
                             transport="http"):
@@ -299,9 +411,10 @@ class ConnectionManager:
         network call so a bad URL never opens a socket. Raises
         InsecureTransportError (plaintext) or PermissionError (SSRF host).
 
-        P4 contributes the TLS-enforcement + allowlist-aware host-policy layer;
-        the deeper SSRF/DNS resolution lives in P2's connect_and_discover
-        (_ssrf_precheck). ``allowed_hosts`` is INJECTED by the caller (read from
+        Both checks are the canonical guard (``remote_policy.mcp_host_allowed``
+        delegates to ``egress.admit_url`` / ``net_safety``); connect_and_discover
+        then issues the verdict the connection is actually made under.
+        ``allowed_hosts`` is INJECTED by the caller (read from
         HarnessPolicy.allowed_mcp_hosts where P3 landed it, else ``set()``)."""
         from systemu.runtime.mcp.sdk.remote_policy import enforce_tls, mcp_host_allowed
         if require_tls:
@@ -314,7 +427,8 @@ class ConnectionManager:
         # Delegate to the async opener via the ONE shared MCP loop-runner
         # client._run_async (the same wrapper connect_and_discover_sync uses).
         from systemu.runtime.mcp.client import _run_async
-        return _run_async(self._open_remote(url, transport=transport))
+        return _run_async(self._open_remote(url, transport=transport,
+                                            allowed_hosts=allowed_hosts))
 
     async def disconnect_all(self) -> None:
         """No daemon-held sockets in P2 (reissue model); clear the known-spec

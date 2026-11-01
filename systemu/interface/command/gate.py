@@ -58,6 +58,17 @@ _BULK_CARD_PLAIN_LEAD = (
 RECLASSIFY_OPTION = "Reclassify effect..."
 
 
+def card_args_line(preview) -> str:
+    """P28: the ``args:`` line of an approval card, from an ALREADY redacted and
+    capped preview (``tool_sandbox._card_args_preview`` -- the one card-preview
+    function). Every key is listed, sorted; the line is ASCII (DEC-32c) -- escaped
+    AFTER redaction and capping, never before (DEC-31)."""
+    items = sorted(((str(k), v) for k, v in dict(preview or {}).items()),
+                   key=lambda kv: kv[0])
+    text = "args: " + ", ".join(f"{k}={v!r}" for k, v in items)
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
 class GateDescriptor(BaseModel):
     title:             str
     risk:              str = "low"
@@ -141,8 +152,11 @@ class GateDescriptor(BaseModel):
         irrev = list(irreversible_card_effects(ctx))
         phrase = ""
         if irrev:
+            # No STANDING option of any kind: "Always allow", and (P21) an MCP
+            # card's session trust, which is a standing approval for the run.
             opts = [o for o in opts
-                    if not (type(o) is str and o.strip().lower() == "always allow")]
+                    if not (type(o) is str and o.strip().lower() in (
+                        "always allow", "trust this tool for the session"))]
             risk = "high"
             phrase = expected_confirm_phrase(ctx)
         return cls(
@@ -373,9 +387,10 @@ class GateDescriptor(BaseModel):
             # WHICH call this is. The tool signature is params-INDEPENDENT, so without
             # the arguments two entirely different calls render an identical card — and
             # a reclassification the operator made for one of them would look like it
-            # was made for the other. Already bounded + secret-masked by the caller.
-            _args = ", ".join(f"{k}={v!r}" for k, v in sorted(args_preview.items()))
-            inspect += f"\nargs: {_args}"
+            # was made for the other. P28: the caller passes
+            # ``tool_sandbox._card_args_preview`` of the SEALED call -- every key,
+            # each value redacted then capped.
+            inspect += "\n" + card_args_line(args_preview)
         if reclassified:
             inspect += f"\noperator-reclassified as {assigned_class or 'unspecified'}"
         if reason:
@@ -619,24 +634,103 @@ class GateDescriptor(BaseModel):
 
     @classmethod
     def from_mcp_call(cls, *, server: str, tool: str, params: dict,
-                      destructive: bool = True) -> "GateDescriptor":
+                      destructive: bool = True, effect_tags=(),
+                      irreversible_effects=(),
+                      confirm_phrase: str = "",
+                      verdict: str = "", reason: str = "",
+                      valid_for: str = "") -> "GateDescriptor":
         """Build a GateDescriptor for an MCP tool call (v0.9.34 P0, §3.3 L3).
+
+        P28 ``valid_for``: the sentence (written by the gate) naming the run a typed
+        "Approve once" of this card is bound to and when it expires; shown under the
+        arguments.
 
         Risk-tiered + scoped-trust. The card offers the four choices the
         action gate routes on: Deny / Approve once / Trust this tool for the
         session / Always allow. safe_default is "Deny" (index 0 — fail-closed).
         ``destructive`` raises the risk band to high and labels the card; the
         dedup key is mcp:<server>:<tool> so the dispatcher namespace 'mcp'
-        routes the resolution and re-attempts collapse to one row."""
+        routes the resolution and re-attempts collapse to one row.
+
+        P21 / R1: ``irreversible_effects`` (``action_governance.irreversible_effects``
+        over the classes ``mcp.effect_class.classify_mcp_call`` SCORED, passed in
+        ``effect_tags``) makes this the spec section 10 typed-confirm card -- exactly
+        the shape ``from_tool`` gives a native tool: risk HIGH, options exactly
+        ["Deny", "Approve once"] (no "Always allow", no session trust, never bulk),
+        and "Approve once" needs the operator to type ``confirm_phrase``. The stamp
+        rides into the decision context through ``to_decision_context``, so every
+        resolve path reads the card the operator saw.
+
+        P21 / native parity: a ``verdict`` of ``deny`` (the governor's two-band
+        UNKNOWN floor) is a REFUSAL, exactly as ``from_tool`` draws it -- options
+        ["Deny", RECLASSIFY_OPTION], risk high, no approval of any kind and no R1
+        stamp (it approves nothing). The reclassify option runs nothing: on the
+        dashboard Inbox the operator assigns the tool's real effect class under
+        typed confirmation, and the next call is scored on it."""
         from systemu.runtime.command_approvals import mcp_signature  # noqa: F401
         options = ["Deny", "Approve once",
                    "Trust this tool for the session", "Always allow"]
-        try:
-            import json as _json
-            args_preview = _json.dumps(params or {}, default=str)[:300]
-        except Exception:
-            args_preview = str(params)[:300]
-        inspect = f"server: {server}\ntool: {tool}\nargs: {args_preview}"
+        # P28 / DEC-31 / DEC-43: the ONE card-preview function -- every argument the
+        # server receives, each redacted BEFORE it is capped. (This was the JSON of
+        # the arguments sliced to 300 characters: capped before redaction, and a key
+        # past the slice was never shown.)
+        from systemu.runtime.tool_sandbox import _card_args_preview
+        inspect = (f"server: {server}\ntool: {tool}\n"
+                   + card_args_line(_card_args_preview(params or {})))
+        if type(valid_for) is str and valid_for.strip():
+            inspect += "\n" + valid_for.strip()
+        if str(getattr(verdict, "value", verdict) or "").strip().lower() == "deny":
+            from systemu.runtime.command_approvals import _ascii
+            tags = ", ".join(sorted(str(t) for t in (effect_tags or ()))) or "unclassified"
+            options = ["Deny", RECLASSIFY_OPTION]
+            return cls(
+                title=f"MCP tool call: {tool}",
+                risk="high",
+                inspect=(f"{inspect}\neffects: {tags}\nverdict: deny"
+                         + (f"\n\nReason: {_ascii(reason)}"
+                            if type(reason) is str and reason else "")),
+                options=options,
+                safe_default=options[0],
+                what_approve_does=_ascii(
+                    f"Nothing: this call to the MCP tool {tool!r} on {server} was "
+                    f"refused ({tags}). Its effect could not be classified and it "
+                    "carries a high-severity signal, so it cannot be approved, "
+                    f"remembered or batched. '{RECLASSIFY_OPTION}' never runs anything "
+                    "by itself: on the dashboard Inbox you assign this tool's real "
+                    "effect class under typed confirmation, it is saved as your "
+                    "assignment for this tool, and the next call to it is checked on "
+                    "that class."),
+                dedup=f"mcp:{server}:{tool}",
+            )
+        irrev = sorted({e for e in (irreversible_effects or ()) if type(e) is str})
+        if irrev:
+            from systemu.runtime.action_governance import MONEY_EFFECTS
+            from systemu.runtime.command_approvals import _ascii, typed_confirm_phrase
+            phrase = (confirm_phrase if type(confirm_phrase) is str
+                      and confirm_phrase.strip() else typed_confirm_phrase(tool))
+            phrase = _ascii(phrase).strip()
+            tags = ", ".join(sorted(str(t) for t in (effect_tags or ()))) or "unclassified"
+            why = ("it moves money" if any(e in MONEY_EFFECTS for e in irrev)
+                   else "its effect cannot be undone")
+            options = ["Deny", "Approve once"]
+            return cls(
+                title=f"MCP tool call: {tool}",
+                risk="high",
+                inspect=f"{inspect}\neffects: {tags}",
+                options=options,
+                safe_default=options[0],
+                what_approve_does=_ascii(
+                    f"Calls the MCP tool {tool!r} on {server} ONCE, now ({tags}). "
+                    f"This action cannot be undone - {why} ({', '.join(irrev)}) - so "
+                    "it cannot be remembered: there is no 'Always allow', no session "
+                    "trust and no batch approval, and you will be asked again every "
+                    f"time. To approve it, type {phrase} exactly in the confirmation "
+                    "box and choose 'Approve once'. A click without the phrase "
+                    "approves nothing."),
+                dedup=f"mcp:{server}:{tool}",
+                irreversible_effects=irrev,
+                confirm_phrase=phrase,
+            )
         verb = "a DESTRUCTIVE/irreversible" if destructive else "an"
         return cls(
             title=f"MCP tool call: {tool}",

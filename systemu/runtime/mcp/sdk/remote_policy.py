@@ -3,7 +3,6 @@ and a small reconnect/health tracker. Pure: no `mcp` SDK import; manager.py
 calls these before opening a remote transport."""
 from __future__ import annotations
 
-import ipaddress
 import logging
 from typing import Set, Tuple
 from urllib.parse import urlparse
@@ -23,18 +22,24 @@ def _host(url: str) -> str:
         return ""
 
 
+def _operator_allows(url: str, allowed_hosts) -> bool:
+    """True when ``url``'s host[:port] is named in the operator allowance (a bare
+    host entry matches any port; ``host:port`` matches exactly)."""
+    from systemu.runtime.mcp.sdk.egress import allowance_matches
+    return allowance_matches(url, allowed_hosts or ())
+
+
 def enforce_tls(url: str, *, allowed_hosts: Set[str] | None = None) -> None:
     """Require https for remote MCP URLs. Plain http is permitted ONLY when the
-    host is explicitly in ``allowed_hosts`` (an operator-pinned local/dev server).
-    Raises InsecureTransportError otherwise."""
-    allowed_hosts = allowed_hosts or set()
+    host (or host:port) is explicitly in ``allowed_hosts`` (an operator-pinned
+    local/dev server). Raises InsecureTransportError otherwise."""
     try:
         scheme = (urlparse(url).scheme or "").lower()
     except Exception:
         scheme = ""
     if scheme == "https":
         return
-    if scheme == "http" and _host(url) in allowed_hosts:
+    if scheme == "http" and _operator_allows(url, allowed_hosts):
         logger.info("[MCP] allowing plaintext http to allowlisted host %s", _host(url))
         return
     raise InsecureTransportError(
@@ -43,26 +48,15 @@ def enforce_tls(url: str, *, allowed_hosts: Set[str] | None = None) -> None:
 
 
 def mcp_host_allowed(url: str, *, allowed_hosts: Set[str]) -> bool:
-    """SSRF host-policy: a public host is allowed; loopback/link-local/RFC1918/
-    metadata (169.254.169.254) is DENIED unless the host string is explicitly in
-    ``allowed_hosts``. Fail-closed on a malformed URL."""
-    host = _host(url)
-    if not host:
-        return False
-    if host in allowed_hosts:
-        return True
-    if host == "localhost":
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        # Hostname (not a literal IP) and not allowlisted: treat as public-ok.
-        # (DNS-rebinding defense is a manager-level concern; out of P4 scope.)
-        return True
-    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified:
-        return False
-    # Cloud metadata endpoint is link-local (169.254.169.254) → already denied above.
-    return True
+    """SSRF host-policy -- the canonical verdict (R-A11b-1).
+
+    Delegates to :func:`egress.admit_url` (and through it ``net_safety``): the
+    name is RESOLVED and every address must be public, unless the operator named
+    this host[:port] in ``allowed_hosts``. It used to admit ANY hostname without
+    resolving it ("DNS-rebinding defense is a manager-level concern"), so a name
+    pointing at 169.254.169.254 passed. Fail-closed on a malformed URL."""
+    from systemu.runtime.mcp.sdk.egress import admit_url
+    return admit_url(url, allowed_hosts=allowed_hosts or ()).admitted is True
 
 
 def bounded(value: str, *, max_chars: int) -> Tuple[str, bool]:

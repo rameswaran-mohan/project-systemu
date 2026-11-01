@@ -95,7 +95,16 @@ def recalibrate_skill(
             mode=mode, error=f"invalid mode: {mode}",
         )
 
-    catalog = _build_tool_catalog(vault)
+    catalog, tool_catalog = _build_tool_catalog_witnessed(vault)
+    # R-CAP1 · CAP-4: the catalog reaches the prompt through the ONE selection
+    # view -- the tools most relevant to THIS skill in full, the rest by name+slot.
+    from systemu.runtime import capability_view as _cv
+    tool_view = _cv.build_view(
+        catalog,
+        " ".join([str(getattr(skill, "name", "") or ""),
+                  str(getattr(skill, "description", "") or ""),
+                  *[str(o) for o in (getattr(skill, "target_outcomes", None) or [])]]),
+        catalog=tool_catalog, traits=_cv.traits_by_name(tool_catalog.headers))
 
     payload = {
         "skill": {
@@ -108,7 +117,7 @@ def recalibrate_skill(
             "skill_version":       getattr(skill, "skill_version", 1),
             "evolution_history":   (getattr(skill, "evolution_history", None) or [])[-3:],
         },
-        "current_tool_catalog": catalog,
+        **tool_view.payload_fields("current_tool_catalog", lookup=False),
         "failure_context":      failure_context,
     }
 
@@ -116,7 +125,7 @@ def recalibrate_skill(
         from systemu.core.llm_router import llm_call_json
         from systemu.core.utils import load_prompt
         raw = llm_call_json(
-            tier=2,
+            stage="forge",
             system=load_prompt("recalibrate_skill.md"),
             user=json.dumps(payload, default=str),
             config=config,
@@ -278,13 +287,23 @@ def apply_recalibration(
 def _build_tool_catalog(vault: "Vault") -> List[Dict[str, Any]]:
     """Snapshot of the current tool catalog (name + description + summarised
     schemas) for the recalibrator LLM.  Reuses Stage 3 helpers."""
+    return _build_tool_catalog_witnessed(vault)[0]
+
+
+def _build_tool_catalog_witnessed(vault: "Vault"):
+    """``(catalog, CatalogRead)`` -- the same snapshot plus how the roster was read
+    (R-CAP1 / DEC-27), so the view can render a degraded read instead of a silent
+    short catalog."""
+    from systemu.runtime import capability_view as _cv
+    tool_catalog = _cv.read_tool_headers(vault)
     try:
         from systemu.pipelines.activity_extractor import _enrich_tool_for_catalog
-        index = vault.load_index("tools") or []
-        return [_enrich_tool_for_catalog(t, vault) for t in index]
+        return ([_enrich_tool_for_catalog(t, vault) for t in tool_catalog.headers],
+                tool_catalog)
     except Exception:
         logger.debug("[SkillRecal] could not build tool catalog", exc_info=True)
-        return []
+        return [], _cv.CatalogRead(headers=(), state=_cv.CATALOG_DEGRADED,
+                                   reason="the tool catalog could not be built")
 
 
 def _audit(record: Dict[str, Any], *, data_dir: Optional[Path] = None) -> None:

@@ -417,10 +417,10 @@ def test_unpopulated_columns_two_way_pin_against_a_maximal_projection(tmp_path):
 
 def test_blank_columns_is_derived_from_real_cells_not_a_constant(tmp_path):
     v = _vault(tmp_path)
-    _act(v, params={"to": _EMAIL})            # no receipt → verification stays blank
+    _act(v, params={"to": _EMAIL})            # no receipt → verification reads claimed (DEC-13)
     rows = ledger.project(v, data_dir=tmp_path)
     blank = set(ledger_export.blank_columns(rows))
-    assert "outcome_verification" in blank                 # blank in THIS export
+    assert "outcome_verification" not in blank             # claimed, never a blank cell
     assert "outcome_verification" not in ledger_export.UNPOPULATED_COLUMNS
     assert "action_host" in blank                          # no url/host in params
     assert "action_tool" not in blank
@@ -434,8 +434,15 @@ def test_manifest_names_every_unpopulated_column_with_a_reason(tmp_path):
     never = m["columns_never_populated_by_this_build"]
     assert set(never) == set(ledger_export.UNPOPULATED_COLUMNS)
     assert all(isinstance(why, str) and why for why in never.values())
-    # the specific misreading this guards against
-    assert "does NOT mean no approval was required" in never["gate_verdict"]
+    # the specific misreading this guarded against ("blank gate_verdict means no
+    # approval was required") is now prevented in the cell itself: gate_verdict is
+    # projected, and an unstamped row's cell reads not_recorded.
+    assert "gate_verdict" not in never
+    import csv as _csv
+    import io as _io
+    _rows = list(_csv.reader(_io.StringIO(
+        Path(res["destination_path"]).read_bytes().decode("utf-8"))))
+    assert dict(zip(_rows[0], _rows[1]))["gate_verdict"] == ledger.NOT_RECORDED
     assert "undo_kind" in m["columns_constant_in_this_build"]
     assert "NOT that the event lacked that property" in m["reading_note"]
 
@@ -547,7 +554,7 @@ def test_preview_names_destination_row_count_and_the_blank_columns(tmp_path):
     assert pv["destination_path"] in joined                # destination is explicit
     assert "1 row(s), 25 columns, CSV format." in joined
     assert "ALWAYS blank in this build" in joined
-    assert "gate_verdict" in joined                        # named, not just counted
+    assert "criteria_met" in joined                        # named, not just counted
     assert "credential" in joined.lower()                  # what is excluded
 
 
@@ -703,3 +710,32 @@ def test_preview_writes_nothing(tmp_path):
     assert not (tmp_path / "vault" / ledger_export.EXPORT_DIRNAME).exists()
     assert ledger_export.EXPORT_ACTION not in [
         r.action["tool"] for r in ledger.project(v, data_dir=tmp_path)]
+
+
+def test_exported_effect_row_without_a_receipt_reads_claimed_not_blank(tmp_path):
+    """DEC-13 on the written artifact: missing evidence is `claimed` -- never a
+    blank cell (which reads as 'no verdict') and never `verified`. Driven through
+    the real write_export so the bytes on disk are what is asserted."""
+    import csv as _csv
+    import io as _io
+    v = _vault(tmp_path)
+    _act(v, eid="quick_nr", oid=0, params={"to": _EMAIL})       # no receipt for the run
+    _act(v, eid="quick_hr", oid=0, action="create_row", params={"target": "t"})
+    _act(v, eid="quick_hr", oid=1, action="create_row", params={"target": "u"})
+    receipts_store.write_receipt("quick_hr", 0,
+                                 {"confirmed": True, "method": "api_readback"},
+                                 data_dir=tmp_path)             # objective 1 has none
+    res = ledger_export.write_export(v, fmt="csv", data_dir=tmp_path)
+    table = list(_csv.reader(_io.StringIO(
+        Path(res["destination_path"]).read_bytes().decode("utf-8"))))
+    head = table[0]
+    cells = {}
+    for row in table[1:]:
+        d = dict(zip(head, row))
+        if d["event_kind"] == "effect" and d["action_tool"] != ledger_export.EXPORT_ACTION:
+            cells[d["source_id"].split("|")[0] + "|" + d["source_id"].split("|")[1]] = \
+                d["outcome_verification"]
+    assert cells["quick_nr|0"] == "claimed"                     # no receipt record at all
+    assert cells["quick_hr|1"] == "claimed"                     # record present, no entry
+    assert cells["quick_hr|0"] == "verified"                    # the receipted one stays verified
+    assert "" not in cells.values()

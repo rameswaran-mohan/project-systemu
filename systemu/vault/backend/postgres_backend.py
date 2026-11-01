@@ -50,9 +50,18 @@ CREATE TABLE IF NOT EXISTS action_audit (
     action        TEXT      NOT NULL,
     params_json   JSONB     NOT NULL DEFAULT '{}',
     success       BOOLEAN   NOT NULL,
-    error         TEXT
+    error         TEXT,
+    gate_json     JSONB
 );
 """
+
+# R-P3b (DEC-9: an existing store migrates). The sandbox gate's record rides the
+# audit entry under ``gate``; a table created before this column existed gains it
+# here. Old rows keep NULL, which reads back as an entry with no ``gate`` key --
+# "not recorded" in the ledger, never a verdict. Run by ensure_schema AFTER the DDL.
+_ACTION_AUDIT_MIGRATIONS = [
+    "ALTER TABLE action_audit ADD COLUMN IF NOT EXISTS gate_json JSONB",
+]
 
 _ACTION_AUDIT_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_action_audit_exec_ts
@@ -136,6 +145,8 @@ def ensure_schema(vault) -> None:
     try:
         cur = conn.cursor()
         cur.execute(_ACTION_AUDIT_DDL)
+        for stmt in _ACTION_AUDIT_MIGRATIONS:
+            cur.execute(stmt)
         cur.execute(_ACTION_AUDIT_INDEXES)
         for stmt in _SESSION_SUMMARIES_DDL_STATEMENTS:
             cur.execute(stmt)
@@ -159,10 +170,12 @@ def dispatch_append_action_audit(vault, entry: Dict[str, Any]) -> None:
     conn = _connect(vault)
     try:
         cur = conn.cursor()
+        gate = entry.get("gate")
         cur.execute(
             "INSERT INTO action_audit "
-            "(ts, user_id, execution_id, objective_id, action, params_json, success, error) "
-            "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)",
+            "(ts, user_id, execution_id, objective_id, action, params_json, success, "
+            "error, gate_json) "
+            "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb)",
             (
                 entry["ts"],
                 entry.get("user_id"),
@@ -172,6 +185,8 @@ def dispatch_append_action_audit(vault, entry: Dict[str, Any]) -> None:
                 json.dumps(entry.get("params") or {}, separators=(",", ":")),
                 bool(entry.get("success")),
                 entry.get("error"),
+                (json.dumps(gate, separators=(",", ":"))
+                 if isinstance(gate, dict) else None),
             ),
         )
         conn.commit()
@@ -198,7 +213,7 @@ def dispatch_query_action_audit(
     """
     sql = (
         "SELECT ts, user_id, execution_id, objective_id, action, params_json, "
-        "success, error FROM action_audit WHERE execution_id = %s"
+        "success, error, gate_json FROM action_audit WHERE execution_id = %s"
     )
     args: list = [execution_id]
 
@@ -231,6 +246,14 @@ def dispatch_query_action_audit(
                 "success":      bool(r[6]),
                 "error":        r[7],
             })
+            gate = r[8] if len(r) > 8 else None
+            if isinstance(gate, str):
+                try:
+                    gate = json.loads(gate)
+                except Exception:
+                    gate = None
+            if isinstance(gate, dict):           # NULL (an old row) -> no gate key
+                rows[-1]["gate"] = gate
         cur.close()
         return rows
     finally:

@@ -23,6 +23,7 @@ from typing import Any, Dict, List
 from nicegui import ui
 
 from systemu.interface.dashboard_state import AppState
+from systemu.interface.pages.table_census import build_census_panel
 from systemu.interface.proposals import derive_scan_proposals
 from systemu.interface.wishes import add_wish, dismiss_wish, open_wishes
 from systemu.interface.world_scan import (
@@ -189,20 +190,72 @@ def sort_for_display(items: List[Any]) -> List[Any]:
 # view change only; the real credential/server/service keeps existing (§5.10.b
 # "explicit still-ACTIVE notice"). Managing the real object is a deep-link (T2b).
 _STILL_ACTIVE_KINDS = {"credential_ref", "mcp_server", "service", "tool", "data_root"}
+#: Where the operator manages the live object behind a removed card. `data_root` is
+#: deliberately ABSENT: no dashboard page carries a folder-grant control, so naming
+#: one ("Connections") sent the operator somewhere they could not act. Folder grants
+#: are managed by the ruled CLI surface instead -- see :func:`roots_command`.
 _MANAGE_WHERE = {
     "credential_ref": "Credentials", "mcp_server": "Connections",
-    "service": "Connections", "tool": "the Build page", "data_root": "Connections",
+    "service": "Connections", "tool": "the Build page",
 }
 
 
 # broken/stale cards lead with a PRIMARY action that deep-links to the existing
 # management surface for the kind (§5.10.c) — navigation only, no new flow, no
 # dual-write (the repair happens in the surface the operator lands on).
+#
+# `data_root` has NO route here, on purpose. The ruled folder-grant surface is the
+# CLI -- `systemu roots grant <path>` (typed y/N) and `systemu roots revoke <path>` --
+# and /settings has no folder-grant control, so a "Re-grant" link to it was a primary
+# action that could not be completed. A broken folder card shows the exact command
+# instead (:func:`repair_command`), as copyable text.
 _REPAIR_ROUTE = {
     "mcp_server": ("/settings", "Reconnect"), "service": ("/settings", "Reconnect"),
-    "credential_ref": ("/settings", "Re-add"), "data_root": ("/settings", "Re-grant"),
+    "credential_ref": ("/settings", "Re-add"),
     "tool": ("/tools", "Fix in Build"),
 }
+
+#: The folder-grant commands, spelled once. Both are real `systemu roots` subcommands.
+ROOTS_GRANT_VERB = "grant"
+ROOTS_REVOKE_VERB = "revoke"
+#: What stands in for a path the card must not pre-fill (see :func:`repair_command`).
+ROOTS_PATH_PLACEHOLDER = "<folder path>"
+REPAIR_COMMAND_LEAD = "Re-grant it from a terminal (you will be asked y/N):"
+REPAIR_COMMAND_UNFILLED = ("A task suggested this folder, so its path is not filled "
+                           "in - type the folder you mean yourself.")
+REPAIR_COMMAND_COPIED = "Command copied."
+REPAIR_COMMAND_NOT_COPIED = ("Could not copy - the browser refused clipboard access. "
+                             "Select the command text and copy it by hand.")
+
+
+def roots_command(verb: str, path: Any) -> str:
+    """The `roots` command for ``verb`` and ``path``, the path double-quoted so a path
+    with spaces pastes as ONE argument. A missing path becomes
+    :data:`ROOTS_PATH_PLACEHOLDER`, never ``""``."""
+    p = path if type(path) is str else ""
+    p = p.strip()
+    if not p:
+        return f"systemu roots {verb} {ROOTS_PATH_PLACEHOLDER}"
+    quoted = f"'{p}'" if '"' in p else f'"{p}"'
+    return f"systemu roots {verb} {quoted}"
+
+
+def repair_command(kind: str, status: str, ref: Any = None,
+                   origin_class: str = "") -> str:
+    """The exact command that repairs a broken/stale folder card, or ``""``.
+
+    ``data_root`` only. The path comes from the card's own ``ref["root_path"]`` -- the
+    canonical path the grant was recorded under -- EXCEPT for a ``content_derived``
+    card: §5.10.b#4 forbids pre-filling a root path that came from content, so that
+    card shows the placeholder and the operator types the folder themselves. Either
+    way the command itself still asks y/N before anything is granted.
+    """
+    if kind != "data_root" or status not in _NEEDS_REPAIR:
+        return ""
+    path = ""
+    if origin_class != "content_derived" and isinstance(ref, dict):
+        path = ref.get("root_path") or ""
+    return roots_command(ROOTS_GRANT_VERB, path)
 
 
 #: statuses that mean "this needs the operator before it will work". F24 added
@@ -271,6 +324,14 @@ def removal_notice(kind: str, name: str) -> tuple:
     """(message, still_active) for the post-remove snackbar. For a kind backed
     by a live object the message says plainly that the real thing still exists
     and where to manage it — the table is an intent layer, not the store."""
+    if kind == "data_root":
+        # No page manages folder grants; name the commands that do. ASCII.
+        return (
+            f"Removed \"{name}\" from your table. Any folder grant behind it is still "
+            f"active - see it with: systemu roots list - withdraw it with: "
+            f"{roots_command(ROOTS_REVOKE_VERB, name)}",
+            True,
+        )
     if kind in _STILL_ACTIVE_KINDS:
         where = _MANAGE_WHERE.get(kind, "its own page")
         return (
@@ -309,6 +370,44 @@ def _render_provenance_badge(it: Any) -> None:
     ui.badge(banner["headline"]).props(
         f"outline color={_TONE_BADGE.get(banner['tone'], 'grey')}"
     ).tooltip(banner["detail"])
+
+
+#: The JS that copies, and RESOLVES to whether the browser accepted it. Not
+#: ``ui.clipboard.write``: that fires and forgets, so a "copied" toast after it is a
+#: claim nobody witnessed -- and the live check of this card found a browser that
+#: REFUSED the write ("Write permission denied") while the toast said "Command copied."
+_COPY_JS = ("(navigator.clipboard ? navigator.clipboard.writeText({text})"
+            ".then(() => true, () => false) : false)")
+
+
+async def _copy_command(cmd: str) -> None:
+    """Copy ``cmd`` to the operator's clipboard and SAY WHAT HAPPENED: the success toast
+    only when the browser confirms the write (DEC-27), otherwise how to copy by hand."""
+    import json as _json
+    try:
+        copied = await ui.run_javascript(_COPY_JS.format(text=_json.dumps(cmd)),
+                                         timeout=3.0)
+    except Exception:
+        copied = False
+    if copied is True:
+        ui.notify(REPAIR_COMMAND_COPIED, type="positive")
+    else:
+        ui.notify(REPAIR_COMMAND_NOT_COPIED, type="warning", multi_line=True)
+
+
+def _render_repair_command(cmd: str) -> None:
+    """The command as selectable, copyable text -- the folder card's primary action."""
+    with ui.column().classes("w-full").style("gap: 2px; margin-top: 4px;"):
+        ui.label(REPAIR_COMMAND_LEAD).classes("s-muted").style("font-size: 12px;")
+        if ROOTS_PATH_PLACEHOLDER in cmd:
+            ui.label(REPAIR_COMMAND_UNFILLED).classes("s-text-warn") \
+                .style("font-size: 12px;")
+        with ui.row().classes("items-center no-wrap w-full").style("gap: 4px;"):
+            ui.label(cmd).classes("s-mono") \
+                .style("font-size: 12px; user-select: all; word-break: break-all;")
+            ui.button(icon="content_copy",
+                      on_click=lambda _e=None, c=cmd: _copy_command(c)) \
+                .props("flat dense round size=sm color=grey").tooltip("Copy command")
 
 
 def _render_card(it: Any, *, on_pin=None, on_remove=None) -> None:
@@ -365,6 +464,12 @@ def _render_card(it: Any, *, on_pin=None, on_remove=None) -> None:
         if _rlabel:
             ui.link(f"{_rlabel} →", _rroute).classes("s-pill").style(
                 "font-size: 12px; margin-top: 4px;")
+        # A broken folder card's primary action is a COMMAND, not a link: the folder
+        # grant surface is the CLI (see `repair_command`).
+        _rcmd = repair_command(_kind(it), status, getattr(it, "ref", {}) or {},
+                               getattr(it, "origin_class", "") or "")
+        if _rcmd:
+            _render_repair_command(_rcmd)
 
 
 def build_table_page() -> None:
@@ -921,4 +1026,7 @@ def build_table_page() -> None:
 
     _board()
     _scan_card()
+    # R-W2 / WM-7: the census consent panel -- every category's state, what it reads,
+    # and (only where the CLI really offers them) the commands that change it.
+    build_census_panel(vault)
     _wishlist()

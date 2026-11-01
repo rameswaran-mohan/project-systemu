@@ -23,7 +23,8 @@ import re
 
 logger = logging.getLogger(__name__)
 
-from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+from pydantic import (BaseModel, Field, PrivateAttr, computed_field, field_serializer,
+                      field_validator, model_validator)
 
 
 # v0.6.1-a: tool names become filenames on disk (impl_dir / f"{name}.py").  An
@@ -400,7 +401,26 @@ class CredentialRequirement(BaseModel):
     def _validate_key(cls, v: str) -> str:
         if not isinstance(v, str) or not _SAFE_CRED_KEY.match(v):
             raise ValueError(f"CredentialRequirement.key must match ^[A-Z][A-Z0-9_]{{1,63}}$ (got {v!r}).")
+        # R-4: a declared credential is PROMOTED into the process environment at
+        # run time, so a key is a write to configuration under a name the
+        # declarer (for a forged tool: the model) chose. A name the runtime or
+        # the interpreter reads as configuration can never be a credential.
+        from systemu.core.reserved_env import reserved_reason
+        why = reserved_reason(v)
+        if why:
+            raise ValueError(
+                f"CredentialRequirement.key {v!r} is reserved: it names a variable "
+                f"read as configuration ({why}). A tool may never declare it as a "
+                f"credential.")
         return v
+
+
+def _requirement_key(entry: Any) -> Optional[str]:
+    if isinstance(entry, dict):
+        key = entry.get("key")
+    else:
+        key = getattr(entry, "key", None)
+    return key if isinstance(key, str) else None
 
 
 class Tool(BaseModel):
@@ -412,6 +432,59 @@ class Tool(BaseModel):
     tool_type:           ToolType
     parameters_schema:   Dict[str, Any] = {}    # JSON Schema describing inputs
     requires_credentials: List["CredentialRequirement"] = []   # v0.8.18: declared credential needs
+
+    # R-4 migration: a persisted requirement whose key is now RESERVED (see
+    # systemu/core/reserved_env.py) cannot be a CredentialRequirement any more,
+    # but an existing tool that declares one must still LOAD (never crash the
+    # catalog). Such entries are QUARANTINED here: kept verbatim, never promoted,
+    # never prompted for, and written back into ``requires_credentials`` on dump
+    # so the mark survives a save on either vault backend. The run gate refuses
+    # the tool with :attr:`credential_refusals`. A private attribute, not a
+    # field: it is derived on every load and never a separate stored column.
+    _quarantined_credentials: List[Dict[str, Any]] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _quarantine_reserved_credentials(cls, data: Any, handler: Any) -> "Tool":
+        quarantined: List[Dict[str, Any]] = []
+        if isinstance(data, dict) and data.get("requires_credentials"):
+            from systemu.core.reserved_env import reserved_reason
+            kept: List[Any] = []
+            for entry in data["requires_credentials"]:
+                key = _requirement_key(entry)
+                if key is not None and reserved_reason(key):
+                    raw = entry if isinstance(entry, dict) else (
+                        entry.model_dump() if hasattr(entry, "model_dump")
+                        else {"key": key, "label": str(getattr(entry, "label", "") or key)})
+                    quarantined.append(dict(raw))
+                else:
+                    kept.append(entry)
+            if quarantined:
+                data = {**data, "requires_credentials": kept}
+        model = handler(data)
+        if quarantined:
+            model._quarantined_credentials = quarantined
+        return model
+
+    @field_serializer("requires_credentials", mode="wrap")
+    def _dump_with_quarantined(self, value: Any, handler: Any) -> Any:
+        out = handler(value)
+        quarantined = self._quarantined_credentials
+        if quarantined:
+            out = list(out) + [dict(q) for q in quarantined]
+        return out
+
+    @property
+    def credential_refusals(self) -> List[str]:
+        """Why this tool may not run: one line per quarantined (reserved) credential."""
+        from systemu.core.reserved_env import reserved_reason
+        out: List[str] = []
+        for q in self._quarantined_credentials:
+            key = str(q.get("key") or "")
+            why = reserved_reason(key) or "reserved"
+            out.append(f"it declares the credential {key!r}, which is reserved: it names "
+                       f"a variable read as configuration ({why}); it is never promoted")
+        return out
 
     # v0.6.1-a: validate Tool.name at construction so unsafe values can never
     # reach the filesystem.  See _SAFE_TOOL_NAME at the top of this module.

@@ -98,7 +98,9 @@ def _approve_descriptor(dec_id: str, descriptor, *, vault) -> None:
     if not options:
         return
     affirmative = options[-1]
-    resolved = queue.resolve(dec_id, choice=affirmative)
+    from systemu.approval.decision_queue import resolution_channel as _via
+    with _via("dashboard"):
+        resolved = queue.resolve(dec_id, choice=affirmative)
     return resolve_gate(resolved, vault=vault)
 
 
@@ -118,7 +120,9 @@ def _reject_descriptor(dec_id: str, descriptor, *, vault) -> None:
     options = list(getattr(descriptor, "options", []) or [])
     if not options:
         return
-    resolved = queue.resolve(dec_id, choice=options[0])
+    from systemu.approval.decision_queue import resolution_channel as _via
+    with _via("dashboard"):
+        resolved = queue.resolve(dec_id, choice=options[0])
     return resolve_gate(resolved, vault=vault)
 
 
@@ -133,7 +137,9 @@ def _decline_ask(dec_id: str, *, vault) -> None:
 
     from systemu.interface.command.inbox import InboxQueue
     queue = InboxQueue(vault)._queue
-    queue.resolve(dec_id, choice=json.dumps({"answer": ""}))
+    from systemu.approval.decision_queue import resolution_channel as _via
+    with _via("dashboard"):
+        queue.resolve(dec_id, choice=json.dumps({"answer": ""}))
 
 
 def build_inbox_rail_section(vault, stream_ref: str = "") -> None:

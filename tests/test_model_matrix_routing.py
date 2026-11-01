@@ -136,6 +136,11 @@ def test_registered_stage_defaults_match_the_documented_table():
         "consult_parse": 3, "desk_extraction": 3, "brief_phrasing": 3,
         "router_suggestion": 3, "slot_canonicalization": 3,
         "verification": 3,
+        # DEC-12 rows added when every production call got a stage: each is
+        # the tier its call sites used before, except summarize (DEC-12 puts
+        # summarizers on the cheap tier).
+        "reasoning": 1, "judge": 1, "executor": 2, "forge": 2,
+        "summarize": 3, "parse": 3,
     }
     assert set(expected) == set(mm.registered_stages())
     for stage, tier in expected.items():
@@ -147,6 +152,8 @@ def test_wired_set_is_exactly_what_the_doc_claims():
     assert set(mm.wired_stages()) == {
         "planner", "binder_assist", "consult_parse", "desk_extraction",
         "refiner",
+        "verification", "reasoning", "judge", "executor", "forge",
+        "summarize", "parse",
     }
 
 
@@ -598,26 +605,29 @@ def test_refiner_selfcheck_retry_runs_on_the_knobs_model(scripted_wire, tmp_path
     assert sink[:2] == [TIER2_MODEL, TIER2_MODEL], sink
 
 
-def test_planner_tier_moves_the_refiner_but_not_the_untagged_validator(
+def test_planner_tier_moves_the_refiner_but_not_the_validator(
         scripted_wire, tmp_path):
     """The knob is TARGETED, not global.
 
-    `refine_scroll` also invokes `scroll_validator`, which still hard-codes
-    `tier=1` and is one of the ~36 deliberately untouched call sites. Moving
-    `planner_tier` must move the refiner and leave the validator where it is —
-    otherwise the knob is a global tier override wearing a stage's name.
+    `refine_scroll` also invokes `scroll_validator`, which is tagged with the
+    `judge` stage. Moving `planner_tier` must move the refiner and leave the
+    validator on whatever its own row resolves to — otherwise the knob is a
+    global tier override wearing a stage's name. `judge_tier` is set to a
+    third value so the validator's model differs from both the planner knob's
+    and the literal tier 1 the validator used before it was tagged.
     """
     sink, _ = scripted_wire
     from systemu.pipelines import scroll_refiner
     vault = _refiner_vault(tmp_path / "vault")
-    scroll_refiner.refine_scroll(
-        _capture_session(tmp_path),
-        _refiner_cfg(planner_tier="tier3", scroll_validator=True),
-        vault)
+    cfg = _refiner_cfg(planner_tier="tier3", judge_tier="tier2",
+                       scroll_validator=True)
+    scroll_refiner.refine_scroll(_capture_session(tmp_path), cfg, vault)
 
     assert len(sink) >= 2, f"the validator call never fired: {sink}"
     assert sink[0] == TIER3_MODEL, f"refiner did not move: {sink}"
-    assert sink[1] == TIER1_MODEL, f"untagged validator moved with it: {sink}"
+    assert sink[1] == MODEL_BY_TIER[mm.resolve_stage_tier("judge", cfg)], (
+        f"the validator did not run on its own stage's model: {sink}")
+    assert sink[1] != sink[0], f"the validator moved with the planner knob: {sink}"
 
 
 def test_whitespace_planner_tier_at_the_refiner_call_site(scripted_wire, tmp_path):
@@ -734,6 +744,7 @@ def test_locality_is_declared_per_stage():
     assert set(mm.stages_by_locality("local_capable")) == {
         "consult_parse", "desk_extraction", "brief_phrasing",
         "router_suggestion", "slot_canonicalization",
+        "summarize", "parse",
     }
 
 

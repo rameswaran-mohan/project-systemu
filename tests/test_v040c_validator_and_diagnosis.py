@@ -101,7 +101,7 @@ class TestValidateScroll:
         monkeypatch.setenv("SYSTEMU_SCROLL_VALIDATOR", "1")
         scroll = _scroll([{"id": 1, "goal": "g", "success_criteria": "sc"}])
 
-        def fake_llm(*, tier, system, user, config, temperature, max_tokens):
+        def fake_llm(*, tier=None, system, user, config, temperature, max_tokens, **kw):
             return {
                 "satisfiable": True,
                 "confidence": "high",
@@ -120,7 +120,7 @@ class TestValidateScroll:
         monkeypatch.setenv("SYSTEMU_SCROLL_VALIDATOR", "1")
         scroll = _scroll([{"id": 1, "goal": "g", "success_criteria": "sc"}])
 
-        def fake_llm(*, tier, system, user, config, temperature, max_tokens):
+        def fake_llm(*, tier=None, system, user, config, temperature, max_tokens, **kw):
             return {
                 "satisfiable": False,
                 "confidence":  "high",
@@ -146,7 +146,7 @@ class TestValidateScroll:
         monkeypatch.setenv("SYSTEMU_SCROLL_VALIDATOR", "1")
         scroll = _scroll([{"id": 1, "goal": "g", "success_criteria": "sc"}])
 
-        def boom(*, tier, system, user, config, temperature, max_tokens):
+        def boom(*, tier=None, system, user, config, temperature, max_tokens, **kw):
             raise RuntimeError("network down")
         monkeypatch.setattr(
             "systemu.core.llm_router.llm_call_json", boom,

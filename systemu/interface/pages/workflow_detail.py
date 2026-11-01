@@ -17,12 +17,15 @@ from systemu.interface.ui_helpers import format_stamp
 from systemu.runtime.workflow_tracker import STAGES, WorkflowTracker
 
 
+# DEC-13: the filled check is the VERIFIED badge's icon and nothing else's. A run
+# reaching the "done" stage has only CLAIMED it is done; the header shows the
+# minted badge's icon instead (see :func:`workflow_header_icon`).
 _STAGE_ICONS = {
     "capture":   "mic",
     "scroll":    "description",
     "activity":  "assignment",
     "execution": "settings",
-    "done":      "check_circle",
+    "done":      "flag",
     "failed":    "warning",
 }
 
@@ -62,7 +65,8 @@ def build_workflow_detail_page(workflow_id: str) -> None:
         return
 
     color = _STAGE_COLORS.get(snap.stage, THEME["text_muted"])
-    icon  = _STAGE_ICONS.get(snap.stage, "circle")
+    badge = workflow_badge_model(snap)
+    icon  = workflow_header_icon(snap.stage, badge)
 
     # ── Header ─────────────────────────────────────────────────────────
     with ui.row().style("align-items: center; gap: 14px; margin-bottom: 8px;"):
@@ -128,11 +132,11 @@ def build_workflow_detail_page(workflow_id: str) -> None:
     if snap.execution_id:
         _build_table_payoff_panel(snap.workflow_id)
 
-    # ── Receipts (fold-in #3 / DEC-13) ─────────────────────────────────
-    # Verified/claimed badges for the run's external effects — "receipts, not
-    # self-report". Renders only when the run produced a durable receipt.
-    if snap.execution_id:
-        _build_receipt_panel(snap.execution_id)
+    # ── Verification (DEC-13 / UX-10) ──────────────────────────────────
+    # The run's badge -- the one mint's value -- and its receipt inline: what was
+    # verified and how, the anti-receipt for a claimed outcome, or the committed
+    # effects of a handoff, each badged. Nothing while the run is in flight.
+    _build_verification_panel(badge)
 
     # ── Blocked-on-tools panel (Wave 1.2) ──────────────────────────────
     # A task parked by the Stage-3.5 readiness gate sat invisible here —
@@ -367,31 +371,41 @@ def _build_table_payoff_panel(workflow_id: str) -> None:
         _panel.refresh))
 
 
-def _build_receipt_panel(execution_id: str) -> None:
-    """Render the verified/claimed RECEIPTS for a run's external effects (fold-in
-    #3 / DEC-13). Only when the run produced a receipt — an MCP/external mutation
-    the daemon INDEPENDENTLY read back. A 'Verified' badge means the effect was
-    machine-checked (receipts, not self-report); 'Claimed' means the tool reported
-    it but it was not independently verified. Design-token classes only. Like cost,
-    this is SEPARATE chrome from the status pill — it says the effect was verified,
-    never that the run succeeded."""
-    from systemu.runtime import receipts_store
-    badges = receipts_store.receipt_badges_for(execution_id)
-    if not badges:
+def workflow_badge_model(snap):
+    """DEC-13: the run's verification badge -- the ONE mint's value for the
+    snapshot's own status and execution id (pure apart from the mint's cached
+    receipt read). Never raises."""
+    from systemu.interface.components.receipt_panel import badge_model_for
+    return badge_model_for(getattr(snap, "status", None),
+                           getattr(snap, "execution_id", None))
+
+
+def workflow_header_icon(stage: str, badge) -> str:
+    """The header icon. A finished run shows its BADGE's icon -- the filled check
+    only when the mint says verified (DEC-13); every other stage its own icon."""
+    from systemu.runtime import verification_badge as vb
+    v = vb.view(badge)
+    if stage == "done" and v.show:
+        return v.icon
+    return _STAGE_ICONS.get(stage, "circle")
+
+
+def _build_verification_panel(badge) -> None:
+    """The run's DEC-13 badge and its UX-10 receipt, inline. Rendered from the
+    value the page already minted: no extra read, no network. Like cost, this is
+    SEPARATE chrome from the status pill -- it says how far the outcome is
+    confirmed, never that the run succeeded. Token classes only."""
+    from systemu.interface.components.receipt_panel import (
+        receipt_panel_model, render_badge, render_receipt_panel,
+    )
+    from systemu.runtime import verification_badge as vb
+    if not vb.view(badge).show:
         return
-    ui.label("Receipts").classes("s-section-head q-mt-md")
+    ui.label("Verification").classes("s-section-head q-mt-md")
     with ui.card().classes("s-card w-full"):
-        for b in badges:
-            with ui.row().classes("w-full items-center justify-between q-gutter-sm"):
-                _cls = "s-pill s-pill--success" if b["verified"] else "s-pill s-pill--muted"
-                ui.label(b["label"]).classes(_cls).tooltip(b["tooltip"])
-                if b.get("method"):
-                    ui.label(b["method"]).classes("s-mono s-muted")
-                if b.get("detail"):
-                    ui.label(b["detail"]).classes("s-muted")
-        ui.label("A 'Verified' receipt means the effect was independently read back and "
-                 "machine-checked — receipts, not self-report. It reflects verification, "
-                 "not success.").classes("s-muted")
+        with ui.row().classes("w-full items-center q-gutter-sm"):
+            render_badge(badge, show_counts=True)
+        render_receipt_panel(receipt_panel_model(badge))
 
 
 def _link_row(icon: str, label: str, entity_id: str, route: str) -> None:

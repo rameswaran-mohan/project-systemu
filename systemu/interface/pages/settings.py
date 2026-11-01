@@ -9,6 +9,7 @@ Editable configuration for:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from nicegui import ui
@@ -321,14 +322,60 @@ def build_settings_page() -> None:
                         "s-btn s-btn--ghost q-mt-md")
                 dlg.open()
 
+            # R-2: a saved server the SSRF guard refused because it is local or
+            # private -> {server: {"entry": host:port, "reason": str}}.
+            _refused: dict = {}
+
+            def _allow(entry: str, s: str = "") -> bool:
+                try:
+                    stored = grant_mcp_allowance(entry)
+                except ValueError as exc:
+                    ui.notify(str(exc), type="negative")
+                    return False
+                if s:
+                    _refused.pop(s, None)
+                ui.notify(f"Allowed {stored} -- systemu may now connect to exactly "
+                          "that host and port.", type="positive")
+                return True
+
+            def _quick_local(url: str) -> bool:
+                """A literal IP or localhost: checkable without touching DNS."""
+                import ipaddress
+                from urllib.parse import urlsplit
+                try:
+                    host = (urlsplit(url).hostname or "").lower()
+                    if host == "localhost":
+                        return True
+                    ipaddress.ip_address(host)
+                    return True
+                except Exception:
+                    return False
+
             @ui.refreshable
             def _mcp_servers() -> None:
                 servers = all_servers(state.vault)
                 if not servers:
                     ui.label("No servers connected.").classes("s-muted")
                 for srv in servers:
+                    _spec = transport_for(state.vault, srv) or {}
+                    _url = str(_spec.get("url") or "")
+                    if (srv not in _refused and _url
+                            and str(_spec.get("transport") or "").lower() != "stdio"
+                            and _quick_local(_url)):
+                        _r = mcp_local_refusal(_url)
+                        if _r:
+                            _refused[srv] = _r
                     with ui.row().classes("w-full items-center q-gutter-sm"):
                         ui.label(srv).classes("s-mono").style("flex: 1;")
+                        if srv in _refused:
+                            _entry = _refused[srv]["entry"]
+
+                            def _allow_saved(_=None, s=srv, e=_entry):
+                                if _allow(e, s):
+                                    _mcp_servers.refresh()
+
+                            _mcp_btn(f"Allow {_entry}", variant="primary",
+                                     on_click=_allow_saved)
 
                         async def _discover(_=None, s=srv):
                             import asyncio
@@ -344,12 +391,21 @@ def build_settings_page() -> None:
                                 lambda: discover_and_pin(state.vault, s))
                             if client is None:
                                 return
+                            refusal = None
+                            if not out.get("success") and "SSRF" in str(out.get("error")):
+                                _u = str((transport_for(state.vault, s) or {}).get("url") or "")
+                                if _u:
+                                    refusal = await asyncio.to_thread(
+                                        lambda: mcp_local_refusal(_u))
                             try:
                                 with client:
                                     if not out.get("success"):
                                         ui.notify(
                                             f"Discovery failed: {out.get('error')}",
                                             type="negative")
+                                        if refusal:
+                                            _refused[s] = refusal
+                                            _mcp_servers.refresh()
                                         return
                                     _mcp_tool_dialog(s, out.get("tools") or [])
                             except Exception:
@@ -364,6 +420,8 @@ def build_settings_page() -> None:
                         _mcp_btn("Discover tools", variant="ghost",
                                  on_click=_discover)
                         _mcp_btn("Remove", variant="ghost", on_click=_remove)
+                    if srv in _refused:
+                        ui.label(_refused[srv]["reason"]).classes("s-muted")
                 enabled_now = sorted(e["name"] for e in enabled_tools(state.vault))
                 if enabled_now:
                     ui.label("Enabled connector tools: " + ", ".join(enabled_now)
@@ -377,10 +435,11 @@ def build_settings_page() -> None:
                     value="http",
                 ).classes("s-input").props("dense")
                 mcp_url_in = ui.input(
-                    placeholder="http://localhost:8080  (or: command for stdio)",
+                    placeholder="https://mcp.example.com/mcp  (or: command for stdio)",
                 ).classes("s-input").style("flex: 1;")
 
-                def _add_mcp(_=None):
+                async def _add_mcp(_=None):
+                    import asyncio
                     raw = (mcp_url_in.value or "").strip()
                     transport = mcp_transport_sel.value or "http"
                     if not raw:
@@ -399,13 +458,57 @@ def build_settings_page() -> None:
                             return
                         spec = {"transport": transport, "url": raw.rstrip("/")}
                         server_id = raw.rstrip("/")
-                    add_server(state.vault, server_id, transport=spec)
-                    mcp_url_in.set_value("")
-                    ui.notify("Server added — discover its tools to enable them.",
-                              type="positive")
-                    _mcp_servers.refresh()
+
+                    def _save() -> None:
+                        add_server(state.vault, server_id, transport=spec)
+                        mcp_url_in.set_value("")
+                        ui.notify("Server added — discover its tools to enable them.",
+                                  type="positive")
+                        _mcp_servers.refresh()
+
+                    if transport == "stdio":
+                        _save()
+                        return
+                    # R-2 (a): a local / private address needs the operator's
+                    # allowance for EXACTLY its host:port -- ask before saving.
+                    try:
+                        client = ui.context.client
+                    except Exception:
+                        client = None
+                    refusal = await asyncio.to_thread(
+                        lambda: mcp_local_refusal(spec["url"]))
+                    if client is None:
+                        return
+                    with client:
+                        if not refusal:
+                            _save()
+                            return
+                        entry = refusal["entry"]
+                        from systemu.interface.design import card as _card
+                        with ui.dialog() as dlg, _card(classes="s-dialog q-pa-lg"):
+                            ui.label(MCP_LOCAL_PROMPT.format(entry=entry)).classes(
+                                "s-dialog-title")
+                            ui.label("systemu will connect to exactly this host and "
+                                     "port -- nothing else on your network.").classes(
+                                "s-muted")
+                            with ui.row().classes("q-gutter-sm q-mt-md"):
+                                def _yes(_=None, e=entry):
+                                    if _allow(e):
+                                        _save()
+                                    dlg.close()
+
+                                _mcp_btn(f"Allow {entry}", variant="primary",
+                                         on_click=_yes)
+                                ui.button("Cancel", on_click=dlg.close).classes(
+                                    "s-btn s-btn--ghost")
+                        dlg.open()
 
                 _mcp_btn("Add server", variant="primary", on_click=_add_mcp)
+            ui.label(
+                "A local or private address (localhost, 192.168.x.x, 10.x.x.x ...) "
+                "asks you to allow it first; systemu then connects to exactly that "
+                "host and port."
+            ).classes("s-muted")
 
         # ── Telegram reach (W10.1 — status only, env-configured) ───────────
         # ── Help (W11.5) ───────────────────────────────────────────────────
@@ -915,6 +1018,52 @@ def _update_env_var(key: str, value: str) -> None:
     if not found:
         updated.append(f"{key}={value}\n")
     env_path.write_text("".join(updated), encoding="utf-8")
+
+
+# ── R-2: the operator's MCP allowance for local / private servers ────────────
+# The SSRF guard refuses a loopback / private MCP endpoint unless the operator
+# allows it (systemu/runtime/mcp/sdk/egress.py). THIS module is the allowance's
+# only writer in code (pinned by tests/test_mcp_local_allowance.py); the other
+# operator surfaces are the environment / .env and the config file. Kept equal
+# to egress.ALLOWANCE_ENV by test.
+_MCP_ALLOWANCE_ENV = "SYSTEMU_HARNESS_ALLOWED_MCP_HOSTS"
+MCP_LOCAL_PROMPT = "This is a local or private address. Allow systemu to connect to {entry}?"
+_MCP_ENTRY_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*):([0-9]{1,5})$")
+
+
+def mcp_local_refusal(url: str):
+    """``{"entry": "host:port", "reason": str}`` when the guard refuses ``url``
+    under the operator's CURRENT allowance because it is a local or private
+    address; ``None`` when it is admitted or refused for another reason (scheme,
+    DNS, ...). Resolves the host -- call it off the UI loop for a name."""
+    from systemu.runtime.mcp.sdk import egress
+    verdict = egress.admit_url(url, allowed_hosts=egress.operator_allowance())
+    if verdict.admitted is True or verdict.kind != "non_public" or not verdict.allow_entry:
+        return None
+    return {"entry": verdict.allow_entry, "reason": verdict.reason}
+
+
+def grant_mcp_allowance(entry: str) -> str:
+    """Write EXACTLY one ``host:port`` into the operator's MCP allowance -- the
+    .env this install edits AND the live environment -- and return the stored
+    entry. Anything but a single host:port (a bare host, a list, a URL, a bad
+    port) is refused: a grant from this button never widens beyond the address
+    the operator was shown."""
+    import os
+    from systemu.runtime.mcp.sdk import egress
+    text = str(entry or "").strip()
+    m = _MCP_ENTRY_RE.match(text)
+    if not m or not (1 <= int(m.group(2)) <= 65535):
+        raise ValueError(f"an MCP allowance must name exactly one host:port (got {text!r})")
+    canonical = egress.format_entry(m.group(1).strip("[]"), int(m.group(2)))
+    current = [e.strip() for e in (os.environ.get(_MCP_ALLOWANCE_ENV) or "").split(",")
+               if e.strip()]
+    if canonical not in current:
+        current.append(canonical)
+    value = ",".join(current)
+    _update_env_var(_MCP_ALLOWANCE_ENV, value)
+    os.environ[_MCP_ALLOWANCE_ENV] = value
+    return canonical
 
 
 def get_price_rows() -> list:

@@ -235,7 +235,7 @@ def consolidate_run(
 
     try:
         result = llm_call_json(
-            tier=1,
+            stage="summarize",
             system=_CONSOLIDATE_SYSTEM_PROMPT,
             user=_json.dumps({"chat_history": chat_history}, separators=(",", ":")),
             config=config,

@@ -460,12 +460,18 @@ def _augment_summary_with_committed_effects(summary: str, context) -> str:
     return summary
 
 
-def _persist_external_evidence(context, evidence) -> None:
+def _persist_external_evidence(context, evidence, *, record_only: bool = False) -> None:
     """S4 — write ``evidence`` (an ExternalEvidence) into
     ``context._external_evidence[str(objective_id)]`` as a plain dict so it
     round-trips through the snapshot store. Fail-safe: creates the store if the
     context lacks one; swallows any bad input (None context / bad evidence) —
-    never raises."""
+    never raises.
+
+    R-P3b: ``record_only`` is True ONLY for the S4 shadow meter's measurement
+    (``_record_s4_shadow_meter``). The durable receipt carries it as an explicit
+    ``shadow`` bool, so the action ledger can tell a live committed effect from a
+    record-only measurement after the run's snapshot is gone (IMPL-7 excludes the
+    latter). The live in-run store is unchanged by it."""
     try:
         oid = getattr(evidence, "objective_id", None)
         if oid is None:
@@ -498,6 +504,7 @@ def _persist_external_evidence(context, evidence) -> None:
                 "method": payload.get("method"),
                 "detail": payload.get("detail"),
                 "stamped_at": payload.get("stamped_at"),
+                "shadow": record_only is True,
             })
     except Exception:
         logger.debug("[Runtime] durable receipt write skipped (swallowed)", exc_info=True)
@@ -1010,7 +1017,7 @@ def _record_s4_shadow_meter(runtime, context, *, objective, decision, tool, resu
         # entry with the shadow-meter tags (shadow=True keeps _read_external_ok from
         # ever mistaking it for a live credit).
         try:
-            _persist_external_evidence(context, ev)
+            _persist_external_evidence(context, ev, record_only=True)
             oid = getattr(objective, "id", None)
             store = getattr(context, "_external_evidence", None)
             entry = store.get(str(oid)) if (isinstance(store, dict) and oid is not None) else None
@@ -2033,6 +2040,7 @@ def _build_tool_audit_entry(
     objective_id: Any,
     tool_name: str,
     params: Any,
+    gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the compact audit row written for every successful tool call.
 
@@ -2041,6 +2049,12 @@ def _build_tool_audit_entry(
     (truncated dict), ``success`` (True), ``error`` (None). The ``ts`` format
     (``...Z``) matches state_delta's baseline ``iteration_start_ts`` so the
     verifier's ``query_action_audit(since_ts=...)`` filter surfaces the row.
+
+    R-P3b: ``gate`` is the call's ``ToolResult.gate`` record (how the sandbox
+    gate let it run: verdict, pass path, effect classes, decision id -- never a
+    parameter value). It is stamped under ``gate`` when it is a dict and the key
+    is absent otherwise, so the action ledger reads an unstamped row as "not
+    recorded" rather than as a verdict.
     """
     try:
         oid = int(objective_id)
@@ -2054,6 +2068,7 @@ def _build_tool_audit_entry(
         "params": _truncate_audit_params(params),
         "success": True,
         "error": None,
+        **({"gate": dict(gate)} if isinstance(gate, dict) else {}),
     }
 
 
@@ -2968,6 +2983,48 @@ def _build_user_payload(
     return payload
 
 
+from systemu.runtime.capability_view import VIEW_EXTRA_KEYS as _CAP_VIEW_EXTRA_KEYS  # noqa: E402
+
+
+def _cap_view_for_iteration(tool_index, v2_live, tools, *, query: str):
+    """R-CAP1 · CAP-4 -- the decision loop's selection view for ONE iteration.
+
+    Candidates = the run's ``tool_index`` (v1 + boot-time v2 entries) plus any
+    live v2 entry not already present (the v0.9.6 T0 guarantee, kept: a late v2
+    registration still reaches the surface -- in full or in the one-line index).
+    The candidate list is the loop's own; this only decides what is SHOWN.
+    Dispatch is untouched: ``_handle_tool_call`` still resolves v1 by ``tools``
+    and v2 by the registry, so a demoted tool stays callable by name."""
+    from systemu.runtime import capability_view as _cv
+    candidates = list(tool_index or [])
+    names = {(t or {}).get("name") for t in candidates if isinstance(t, dict)}
+    for entry in (v2_live or []):
+        if isinstance(entry, dict) and entry.get("name") not in names:
+            candidates.append(entry)
+            names.add(entry.get("name"))
+    traits = _cv.traits_by_name(tools or [])
+    for entry in candidates:
+        name = (entry or {}).get("name") if isinstance(entry, dict) else None
+        if name and name not in traits:
+            traits[name] = _cv.traits_from_v2(entry)
+    return _cv.build_view(candidates, query, catalog=_cv.NO_ROSTER_READ,
+                          traits=traits)
+
+
+def _find_tools_in_run(vault, parameters, tools, config) -> dict:
+    """R-CAP1 · CAP-4c -- ``find_tools`` inside a run, with THIS run's dispatch set
+    (v1 ``tools`` + available v2 entries) so every hit says whether it is callable
+    here. A lookup only: it never adds anything to the dispatch set."""
+    from systemu.runtime import capability_view as _cv
+    extras = _cv.v2_lane_extras(config)
+    callable_names = {getattr(t, "name", "") for t in (tools or [])}
+    callable_names |= {rec["name"] for rec, _tr, state, _r in extras
+                       if state == _cv.STATE_ENABLED}
+    return _cv.find_tools_tool_result(vault, parameters,
+                                      callable_names=callable_names,
+                                      lane_extras=extras)
+
+
 def _build_history_slice(context, max_events: int = 30) -> list:
     """Return the LAST N tool-call/observation/thought events (in chronological
     order) as a compact list for LLM context.
@@ -2978,6 +3035,7 @@ def _build_history_slice(context, max_events: int = 30) -> list:
     runs it returned the OLDEST N events and silently dropped the most recent
     ones — the model could not see what it had just done and re-proposed it.
     """
+    from systemu.runtime.durable_redact import mask_display as _mask_display, mask_text as _mask_text
     recent = []
     for event in reversed(context._history):   # newest-first so we never drop recent events
         if event.event_type == "tool_call":
@@ -2989,15 +3047,17 @@ def _build_history_slice(context, max_events: int = 30) -> list:
             })
         elif event.event_type == "observation":
             c = event.content
-            # Truncate large data fields so they don't bloat the prompt
+            # Truncate large data fields so they don't bloat the prompt.
+            # DEC-31: mask, THEN cap -- this slice feeds the prompt transcript
+            # and the resume snapshot, and a raw cut can hide a JWT's tail.
             if isinstance(c, dict):
                 preview = {}
                 for k, v in c.items():
-                    preview[k] = str(v)[:400] if isinstance(v, (dict, list)) and len(str(v)) > 400 else v
+                    preview[k] = _mask_display(v, max_len=400) if isinstance(v, (dict, list)) and len(str(v)) > 400 else v
                 c = preview
             recent.append({"role": "tool_result", "result": c})
         elif event.event_type == "thought":
-            recent.append({"role": "thought", "thought": event.content.get("thought", "")[:300]})
+            recent.append({"role": "thought", "thought": _mask_text(event.content.get("thought", ""), max_len=300)})
         if len(recent) >= max_events:
             break
     recent.reverse()   # restore chronological (oldest→newest) order for the prompt
@@ -3313,6 +3373,7 @@ class ShadowRuntime:
         raw LLM completion is NOT inlined — only referenced by ``llm_ref``
         ({exec_id, call_index}) for lazy load from the per-execution transcript.
         """
+        from systemu.runtime.durable_redact import mask_display as _mask_display
         d = decision or {}
         action = d.get("action", "?")
         message = f"iter={iteration} {action}"
@@ -3329,7 +3390,10 @@ class ShadowRuntime:
                 "action":      action,
                 "tool_name":   d.get("tool_name"),
                 "tool_params": d.get("parameters"),
-                "tool_result": (str(tool_result)[:4000] if tool_result is not None else None),
+                # DEC-31: masked, THEN rendered and capped -- a slice first
+                # could cut a JWT's third segment off and hide it from the mask.
+                "tool_result": (_mask_display(tool_result, max_len=4000)
+                                if tool_result is not None else None),
                 "llm_ref":     llm_ref,
             },
         })
@@ -4918,6 +4982,24 @@ class ShadowRuntime:
             # → refined from the snapshot below. The cap + outcome reconciliation
             # key off this so they span the whole tree, not one execution.
             root_eid = root_execution_id or execution_id
+            # P28: the run's LINEAGE, read by the MCP gate when it decides whether a
+            # typed one-shot approval may serve this run (``run_lineage``): the
+            # run-tree root, the run it resumes, and -- for a fresh re-run of a task
+            # that stopped at a card -- the stopped run(s), taken from the single-use
+            # handoff that stop left. Best-effort: no lineage only ever means a
+            # typed approval for another run is not honoured here.
+            self._run_lineage_token = None
+            try:
+                from systemu.runtime import run_lineage as _run_lineage
+                _continues = (() if dry_run else _run_lineage.claim_stopped_run(
+                    self.vault, getattr(activity, "id", "") or ""))
+                self._run_lineage_token = _run_lineage.set_run_lineage(
+                    _run_lineage.RunLineage(
+                        root_execution_id=str(root_eid or ""),
+                        resume_from_execution_id=str(resume_from_execution_id or ""),
+                        continues=tuple(_continues)))
+            except Exception:
+                logger.debug("[Runtime] run lineage unavailable", exc_info=True)
             logger.info(
                 "[Runtime] Starting execution %s — shadow='%s' activity='%s'",
                 execution_id, shadow.name, activity.name,
@@ -5405,6 +5487,15 @@ class ShadowRuntime:
                                 _snap_root = getattr(snap, "root_execution_id", None)
                                 if _snap_root:
                                     root_eid = _snap_root
+                                    # P28: the lineage's root follows the refined
+                                    # root (the reset in ``finally`` still restores
+                                    # the value from before this run).
+                                    try:
+                                        from systemu.runtime import run_lineage as _rl
+                                        _rl.set_run_lineage(
+                                            _rl.current_run_lineage().with_root(root_eid))
+                                    except Exception:
+                                        pass
                         except Exception:
                             logger.debug(
                                 "[Runtime] harness-count resume restore failed",
@@ -6241,6 +6332,23 @@ class ShadowRuntime:
                         "will be accepted. Act now."
                     )
                 )
+                # v0.9.6 T0: per-iteration guard — ensure v2 tools are always
+                # present in the LLM's tool surface even if tool_index was
+                # assembled before v2 discovery completed, or if a future code
+                # path resets/filters tool_index between the boot-time augmentation
+                # (v0.9.5 T0) and here.  This closes the gap observed in the
+                # v0.9.5 live burrito test where the LLM never saw v2 tools.
+                _v2_live = _build_llm_tool_catalog(
+                    vault=None,  # v2 portion only — v1 already in tool_index
+                    config=getattr(self, "config", None),
+                )
+                _tool_view = _cap_view_for_iteration(
+                    tool_index, _v2_live, tools,
+                    query=" ".join([str(getattr(context, "scroll_intent", None)
+                                        or scroll.intent or "")]
+                                   + [str((o or {}).get("goal", "") or "")
+                                      for o in (pending_objs or [])]),
+                )
                 _user_payload = _build_user_payload(
                     shadow_name=shadow.name,
                     # output_dir: where Shadow-generated files must be written.
@@ -6259,7 +6367,9 @@ class ShadowRuntime:
                     completed_objectives=completed_objectives,
                     pending_objectives=pending_objs,
                     current_ab=current_ab,
-                    available_tools=tool_index,
+                    # R-CAP1 · CAP-4: the selection view (top-K full records +
+                    # pinned find_tools); the one-line index rides in below.
+                    available_tools=_tool_view.full_records(),
                     history=_build_history_slice(context),
                     last_snapshot=(
                         context._snapshots[-1].summary if context._snapshots else None
@@ -6270,21 +6380,7 @@ class ShadowRuntime:
                     iteration=iteration,
                     iter_budget=_iter_budget,
                 )
-                # v0.9.6 T0: per-iteration guard — ensure v2 tools are always
-                # present in the LLM's available_tools even if tool_index was
-                # assembled before v2 discovery completed, or if a future code
-                # path resets/filters tool_index between the boot-time augmentation
-                # (v0.9.5 T0, ~line 1759) and here.  This closes the gap observed
-                # in the v0.9.5 live burrito test where the LLM never saw v2 tools.
-                _v2_live = _build_llm_tool_catalog(
-                    vault=None,  # v2 portion only — v1 already in tool_index
-                    config=getattr(self, "config", None),
-                )
-                _at_live_names = {t.get("name") for t in _user_payload["available_tools"]}
-                for _at_entry in _v2_live:
-                    if _at_entry["name"] not in _at_live_names:
-                        _user_payload["available_tools"].append(_at_entry)
-                        _at_live_names.add(_at_entry["name"])
+                _user_payload.update(_tool_view.extra_fields(lookup=True))
                 # v0.8.21: one-shot operator hint fold-back (cleared after this iteration).
                 if self._operator_hint:
                     _user_payload["operator_hint"] = self._operator_hint
@@ -6295,6 +6391,8 @@ class ShadowRuntime:
                     _user_payload["loop_guard_notice"] = loop_guard_nudge.get("message", "")
                     if loop_guard_nudge.get("level") == "block":
                         _user_payload["available_tools"] = []
+                        for _vk in _CAP_VIEW_EXTRA_KEYS:
+                            _user_payload.pop(_vk, None)
                         _user_payload["loop_guard_force_finalize"] = True
                     loop_guard_nudge = None
                 _llm_user = json.dumps(_user_payload)
@@ -6313,7 +6411,7 @@ class ShadowRuntime:
                         None,
                         lambda: _llm_ctx.run(
                             llm_call_json,
-                            tier=2,
+                            stage="executor",
                             system=_llm_system,
                             user=_llm_user,
                             config=self.config,
@@ -6327,11 +6425,15 @@ class ShadowRuntime:
                     # for lazy UI expand.  Best-effort — append_call never raises.
                     try:
                         from systemu.runtime.llm_transcript import append_call
+                        from sharing_on.model_matrix import resolve_stage_tier
                         _call_index = append_call(
                             self.vault.root, execution_id,
                             {
                                 "iteration": iteration,
-                                "tier":      2,
+                                # DEC-12: the tier the executor row resolved
+                                # to, not a literal that a knob change would
+                                # make wrong.
+                                "tier":      resolve_stage_tier("executor", self.config),
                                 "system":    _llm_system,
                                 "user":      _llm_user,
                                 "response":  json.dumps(decision),
@@ -6384,7 +6486,7 @@ class ShadowRuntime:
                                 decision.get("reasoning")
                                 or decision.get("thought")
                                 or decision.get("reason") or ""
-                            )[:500],
+                            ),  # the writer masks, then caps (DEC-31)
                             consecutive_thinks=consecutive_thinks,
                             loop_guard_active=bool(_lg_msg),
                             loop_guard_message=_lg_msg,
@@ -7637,7 +7739,14 @@ class ShadowRuntime:
                     # compact audit row for every tool that SUCCEEDS so that
                     # state_delta.compute_delta (which calls query_action_audit) can
                     # surface it to the verifier. Best-effort — must NEVER break the run.
-                    if result is not None and getattr(result, "success", False):
+                    # AC1 (R-P3b): one row per side-effectful execution. When the
+                    # action-tool hook already wrote THIS call's row to the same global
+                    # audit, a second row here would double-count it. A namespaced child
+                    # run writes here to its OWN audit, so it still writes.
+                    _already_audited = (getattr(result, "audit_written", False) is True
+                                        and getattr(self, "_audit_namespace", None) is None)
+                    if (result is not None and getattr(result, "success", False)
+                            and not _already_audited):
                         try:
                             _audit_obj_id = decision.get("completes_objective")
                             if not isinstance(_audit_obj_id, int):
@@ -7650,6 +7759,7 @@ class ShadowRuntime:
                                 objective_id=_audit_obj_id,
                                 tool_name=decision.get("tool_name", "") or "?",
                                 params=decision.get("parameters") or {},
+                                gate=getattr(result, "gate", None),
                             )
                             self.vault.append_action_audit(
                                 _audit_entry,
@@ -8571,6 +8681,23 @@ class ShadowRuntime:
             )
             res["structural_failure"] = bool(_failed_tools)
             return res
+        except BaseException as _unwinding:
+            # P28: the run STOPPED at an operator card (the decision unwinds to the
+            # lane). Leave the single-use handoff that lets the NEXT run of this task
+            # -- its direct re-run -- carry this run's id forward (``run_lineage``).
+            # Best-effort and re-raised unchanged: this only records; it never decides.
+            try:
+                from systemu.approval.exceptions import PendingOperatorDecision as _POD
+                if isinstance(_unwinding, _POD) and not dry_run:
+                    from systemu.runtime import run_lineage as _rl
+                    _rl.record_stopped_run(
+                        self.vault, activity_id=getattr(activity, "id", "") or "",
+                        execution_id=locals().get("execution_id") or "",
+                        lineage=_rl.current_run_lineage())
+            except Exception:
+                logger.debug("[Runtime] could not record the stopped run",
+                             exc_info=True)
+            raise
         finally:
             # v0.9.36 Bug 9: GUARANTEE the harness terminal finalize runs exactly
             # once per run — request-outcome reconciliation + lease-revoke + MCP
@@ -8622,6 +8749,12 @@ class ShadowRuntime:
                 from systemu.runtime.mcp_run_ctx import set_mcp_session_id
                 set_mcp_session_id(None, reset_token=getattr(
                     self, "_mcp_session_token", None))
+            except Exception:
+                pass
+            try:
+                # P28: reset the run's lineage carrier (the value from before it).
+                from systemu.runtime.run_lineage import reset_run_lineage
+                reset_run_lineage(getattr(self, "_run_lineage_token", None))
             except Exception:
                 pass
 
@@ -8678,6 +8811,25 @@ class ShadowRuntime:
                      tool_name, list(parameters.keys()))
         reasoning  = decision.get("reasoning", "")
         is_destructive = decision.get("is_destructive", False)
+
+        # R-CAP1 · CAP-4c: `find_tools` is a deterministic, read-only store lookup.
+        # Answered here -- before the missing-required seam (which would turn a
+        # missing param into an operator INPUT ask), the destructive gate and any
+        # sandbox dispatch -- so it never costs an ask or a harness request, and
+        # runs in dry-run too (it executes nothing).
+        from systemu.runtime.capability_view import FIND_TOOLS_NAME as _FIND_TOOLS
+        if tool_name == _FIND_TOOLS:
+            context.add_tool_call(decision, current_ab)
+            _ft = _find_tools_in_run(self.vault, parameters, tools,
+                                     getattr(self, "config", None))
+            _ft_result = ToolResult(success=bool(_ft.get("success")), parsed=_ft,
+                                    error=_ft.get("error"))
+            # Flat observation: the history slice previews any dict/list value over
+            # 400 chars, so the matches must ride as a top-level STRING to reach the
+            # next decision with their schemas intact.
+            context.add_observation({"type": "find_tools", "tool_name": _FIND_TOOLS,
+                                     **_ft}, current_ab)
+            return _ft_result
 
         # Fallback heuristic check
         if not is_destructive:
@@ -8859,12 +9011,26 @@ class ShadowRuntime:
                 return fake_result
             # LIVE — dispatch through the v2 dispatcher (returns a dict).
             v2_dict = await self.sandbox.execute(tool_name, parameters)
+            # P21 / R-P3b: an MCP handler carries the MCP gate's record back on its
+            # result. Taken off BEFORE anything reads the result (the key never reaches
+            # the model), and believed only for an MCP tool.
+            from systemu.runtime.mcp.dispatch import pop_gate_record as _pop_mcp_gate
+            _mcp_gate = _pop_mcp_gate(v2_dict)
+            if not (tool_name == "mcp_call_tool" or tool_name.startswith("mcp__")):
+                _mcp_gate = None
             v2_success = bool(v2_dict.get("success", True)) if isinstance(v2_dict, dict) else True
             v2_result = ToolResult(
                 success=v2_success,
                 parsed=v2_dict if isinstance(v2_dict, dict) else {"value": v2_dict},
                 error=(v2_dict.get("error") if isinstance(v2_dict, dict) and not v2_success else None),
             )
+            # R-P3b: the per-tool action gate does not score a code-registered call, so
+            # there is no gate outcome to record -- say so on the row, never a verdict.
+            # (P21: an MCP call is the exception: its own gate's record is the stamp.)
+            v2_result.gate = _mcp_gate if _mcp_gate is not None else {
+                              "gate": None, "verdict": None, "passed_via": "code_registered",
+                              "decision_id": None, "effect_tags": None,
+                              "effect_tags_basis": None}
             context.add_observation(v2_result.to_dict(), current_ab)
             # Record verified artifacts on success (mirror the v1 path).
             if v2_result.success:
@@ -9131,13 +9297,16 @@ class ShadowRuntime:
             # never called from production; without this wire, action-tool audit
             # is dead code and audit_log verifier hints always return verified=False.
             try:
-                self.sandbox._after_successful_call(
+                _audited = self.sandbox._after_successful_call(
                     tool=tool_obj,
                     params=parameters or {},
                     execution_id=execution_id,
                     objective_id=int(decision.get("completes_objective") or 0),
                     user_id=None,
+                    gate=getattr(result, "gate", None),
                 )
+                if _audited is True:
+                    result.audit_written = True   # AC1: the loop must not write a 2nd row
             except Exception:
                 logger.debug("[Runtime] action-audit hook skipped", exc_info=True)
             # v0.9.3: capability ledger — record successful invocation.

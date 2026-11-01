@@ -11,6 +11,19 @@ def _path(vault_root, exec_id: str) -> Path:
     return Path(vault_root) / "executions" / exec_id / "llm_transcript.jsonl"
 
 
+def _masked(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The entry as it may be persisted. DEC-31: every string is MASKED and only
+    then capped to ``_MAX_ENTRY_CHARS`` -- the prompts quote the tool calls'
+    parameters and results, and the response IS the model's decision, so a
+    raw slice here was a raw parameter on disk. A string that holds a JSON
+    document (the user payload, the decision) is masked as the structure it is,
+    so a secret-NAMED key inside it is honoured too."""
+    from systemu.runtime.durable_redact import mask_text, mask_values
+    return {k: (mask_text(v, max_len=_MAX_ENTRY_CHARS, structured=True)
+                if isinstance(v, str) else mask_values(v))
+            for k, v in entry.items()}
+
+
 def append_call(vault_root, exec_id: str, entry: Dict[str, Any]) -> int:
     """Append a call entry; return its 0-based index. Best-effort, never raises."""
     p = _path(vault_root, exec_id)
@@ -20,7 +33,7 @@ def append_call(vault_root, exec_id: str, entry: Dict[str, Any]) -> int:
         if p.exists():
             with p.open(encoding="utf-8") as f:
                 idx = sum(1 for line in f if line.strip())
-        trimmed = {k: (v[:_MAX_ENTRY_CHARS] if isinstance(v, str) else v) for k, v in entry.items()}
+        trimmed = _masked(entry)
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(trimmed) + "\n")
         return idx

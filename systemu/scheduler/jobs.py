@@ -2112,7 +2112,7 @@ def _consolidate_one(shadow, md_text, buffer_entries, config) -> str:
     }
 
     resp = _run_coroutine(llm_call(
-        tier=1,
+        stage="summarize",
         system=load_prompt("consolidate_memory.md"),
         user=json.dumps(payload, default=str),
         config=config,

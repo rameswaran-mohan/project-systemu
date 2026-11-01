@@ -7,7 +7,12 @@ Parameters (via run() kwargs):
   executable_name  (str): Alias for path — accepted for LLM compatibility.
   name             (str): Alias for path — accepted for LLM compatibility.
 
-Any one of the above is sufficient. They are checked in order.
+Any one of the above is sufficient. WHICH application runs is decided by
+``systemu.runtime.app_targets.resolve_launch_target`` -- the same pure resolver
+the approval gate scores, signs and shows (P26), called here on these exact
+kwargs. This body acts on what it returns and on nothing else: it keeps no
+friendly-name map and no alias order of its own. A call the resolver refuses
+launches nothing.
 
 Returns (dict):
   success (bool): True if the process started successfully.
@@ -26,33 +31,6 @@ TOOL_META = {
     "dependencies": [],
 }
 
-# Common Windows application name → executable mapping
-_APP_MAP = {
-    "snipping tool":    "SnippingTool.exe",
-    "snippingtool":     "SnippingTool.exe",
-    "snip & sketch":    "ms-screenclip:",
-    "microsoft word":   "WINWORD.EXE",
-    "word":             "WINWORD.EXE",
-    "microsoft excel":  "EXCEL.EXE",
-    "excel":            "EXCEL.EXE",
-    "microsoft powerpoint": "POWERPNT.EXE",
-    "powerpoint":       "POWERPNT.EXE",
-    "notepad":          "notepad.exe",
-    "notepad++":        "notepad++.exe",
-    "google chrome":    "chrome.exe",
-    "chrome":           "chrome.exe",
-    "microsoft edge":   "msedge.exe",
-    "edge":             "msedge.exe",
-    "firefox":          "firefox.exe",
-    "explorer":         "explorer.exe",
-    "file explorer":    "explorer.exe",
-    "cmd":              "cmd.exe",
-    "powershell":       "powershell.exe",
-    "paint":            "mspaint.exe",
-    "calculator":       "calc.exe",
-    "task manager":     "taskmgr.exe",
-}
-
 
 def run(
     path: str = "",
@@ -61,20 +39,22 @@ def run(
     name: str = "",
 ) -> dict:
     """Launch a desktop application non-blocking (Popen)."""
-    target = path or application_name or executable_name or name
-    if not target:
-        return {
-            "success": False,
-            "pid": None,
-            "error": "Provide path, application_name, executable_name, or name.",
-        }
+    from systemu.runtime.app_targets import AppTarget, resolve_launch_target
 
-    # Resolve common friendly names to executable names
-    resolved = _APP_MAP.get(target.strip().lower(), target)
+    target = resolve_launch_target({
+        "path": path,
+        "application_name": application_name,
+        "executable_name": executable_name,
+        "name": name,
+    })
+    if type(target) is not AppTarget:
+        return {"success": False, "pid": None,
+                "error": "Nothing was launched: " + target.reason + "."}
+    resolved = target.value
 
     # Try Popen with shell=True — handles both executables and Windows URI schemes
     try:
-        if sys.platform == "win32" and resolved.endswith(":"):
+        if sys.platform == "win32" and target.kind == "uri":
             # Windows URI scheme (e.g. ms-screenclip:)
             import os
             os.startfile(resolved)

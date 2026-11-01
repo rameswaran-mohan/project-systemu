@@ -84,7 +84,7 @@ def _consolidate_shadow_memory_locked(shadow_id: str, vault: Vault, config: Conf
 
     try:
         resp = _run_coroutine(llm_call(
-            tier=1,
+            stage="summarize",
             system=load_prompt("consolidate_memory.md"),
             user=json.dumps({
                 "shadow_id":          shadow_id,
@@ -132,7 +132,7 @@ def consolidate_global_memory(vault: Vault, config: Config) -> bool:
 
     try:
         resp = _run_coroutine(llm_call(
-            tier=1,
+            stage="summarize",
             system=load_prompt("consolidate_global_memory.md"),
             user=json.dumps({
                 "current_memory_md": current_md,

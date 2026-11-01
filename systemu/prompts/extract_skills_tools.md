@@ -142,8 +142,11 @@ Skills now have `target_outcomes` and `produces` (v0.6.0-d.5 fields).  When sele
 
 ## v0.8.22 — PREFER existing tools (STRONG steering)
 
-The `existing_tools` array in your input lists every tool the vault already
-has. Before describing a new tool, check this list carefully.
+The `existing_tools` array in your input lists the vault's tools most relevant
+to this task in full. When a `more_tools` array is present it names every OTHER
+existing tool (name + capability slot) — those exist too. Before describing a
+new tool, check both lists carefully. To reuse a tool from `more_tools`, include
+it with its exact `name` and `"is_new": false` (the system matches it by name).
 
 - **PREFER existing tools whenever they fit the objective.** Even an imperfect
   reuse beats forging a new tool.

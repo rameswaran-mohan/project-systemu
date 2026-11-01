@@ -609,8 +609,14 @@ class TestDispatchRugPullOnUse:
 
         import systemu.runtime.mcp.client as mc
         monkeypatch.setattr(mc, "mcp_call_tool", fake_call)
-        monkeypatch.setattr(mc, "mcp_list_tools",
-                            lambda *a, **k: {"success": True, "tools": []})
+        # R-3 (GATE-6, ruled): the listing includes the tool unchanged (a listing
+        # without it now refuses the call); the vault-threading assertions stay.
+        from systemu.runtime.mcp.sdk.schema_map import tool_def_hash as _r3_hash
+        c.set_tool_hash(mcp_vault, "http://s", "echo",
+                        _r3_hash(name="echo", description="d", input_schema={}))
+        monkeypatch.setattr(mc, "mcp_list_tools", lambda *a, **k: {
+            "success": True,
+            "tools": [{"name": "echo", "description": "d", "schema": {}}]})
         out = d.call_mcp_tool("http://s", "echo", {"text": "hi"},
                               vault=mcp_vault, config=Config())
         assert out["success"] is True

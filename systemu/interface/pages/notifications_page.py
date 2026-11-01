@@ -474,7 +474,9 @@ def _forge_via_inbox(tool_id: str, vault) -> bool:
         )
         if match is None:
             return False
-        resolved = queue.resolve(match.id, choice="Forge")
+        from systemu.approval.decision_queue import resolution_channel as _via
+        with _via("dashboard"):
+            resolved = queue.resolve(match.id, choice="Forge")
         resolve_gate(resolved, vault=vault)
         ui.notify("Forge approved; code generation started.", type="positive")
         return True

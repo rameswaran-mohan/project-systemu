@@ -428,7 +428,7 @@ def _generate_test_params(
         from systemu.core.llm_router import llm_call_json
         from systemu.core.utils import load_prompt
         raw = llm_call_json(
-            tier=3,
+            stage="parse",
             system=load_prompt("generate_test_params.md"),
             user=json.dumps(payload, ensure_ascii=False),
             config=config,
@@ -1185,15 +1185,26 @@ def record_evolution(
 
 
 def _redact_secrets(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Replace values for keys that look like secrets — token, key, password.
+    """Replace values for keys that look like secrets — token, key, password —
+    then mask secret-SHAPED values under every other key.
 
     The rolling buffer is persisted to disk; we don't want real keys in it.
+
+    Two passes. The key-name pass is the original one and stays first: its
+    hints are narrower than the evidence mask's (no ``sig``/``auth``/``key``
+    substrings), so an ordinary ``design`` or ``author`` parameter still
+    replays verbatim. The value pass is the durable writers' shared one
+    (``durable_redact.mask_values``): a JWT, ``sk-`` key or ``Bearer`` header
+    under a NEUTRAL name (``body``, ``url``, ``headers``) used to be stored in
+    clear, because only the key was ever looked at. A value whose masking
+    raised is stored as ``[unredactable]``, never raw (DEC-27).
     """
+    from systemu.runtime.durable_redact import mask_values
     SECRET_HINTS = ("token", "secret", "password", "api_key", "apikey", "credential")
     out: Dict[str, Any] = {}
     for k, v in params.items():
         if any(h in k.lower() for h in SECRET_HINTS) and v:
             out[k] = "<redacted>"
         else:
-            out[k] = v
+            out[k] = mask_values(v)
     return out

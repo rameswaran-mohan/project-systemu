@@ -35,6 +35,7 @@ Your new rule: **match tools/skills by capability AND output suitability for the
       "return_schema": {...}
     }
   ],
+  "more_tools": ["<name (verb:target)>", "..."],
   "skills_available": [
     {
       "name": "...",
@@ -45,6 +46,10 @@ Your new rule: **match tools/skills by capability AND output suitability for the
   ]
 }
 ```
+
+`more_tools` is present only when the catalog is large: it names every OTHER
+existing tool (name + capability slot). Those tools exist too — judge
+satisfiability against `tools_available` AND `more_tools`.
 
 ## Reasoning skeleton (follow exactly, in order)
 

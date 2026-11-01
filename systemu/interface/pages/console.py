@@ -76,6 +76,8 @@ def home_recent_workflows(snapshots, *, limit: int = 5) -> List[Dict[str, Any]]:
     Work spine, NOT a re-render of the Work list.  Missing ``updated_at`` sorts
     last (treated as the empty string).
     """
+    from systemu.interface.components.receipt_panel import badge_model_for
+
     snaps = list(snapshots or [])
     snaps.sort(key=lambda s: getattr(s, "updated_at", "") or "", reverse=True)
     rows: List[Dict[str, Any]] = []
@@ -87,6 +89,9 @@ def home_recent_workflows(snapshots, *, limit: int = 5) -> List[Dict[str, Any]]:
             "status": getattr(s, "status", ""),
             "stage": getattr(s, "stage", ""),
             "link": f"/workflow/{wid}",
+            # DEC-13: the one mint's verification badge (nothing while in flight).
+            "badge": badge_model_for(getattr(s, "status", ""),
+                                     getattr(s, "execution_id", None)),
         })
     return rows
 
@@ -569,15 +574,24 @@ def _build_recent_activity_card() -> None:
             if not rows:
                 ui.label("No recent workflows.").classes("s-muted")
                 return
+            from systemu.interface.components.receipt_panel import render_badge
             for row in rows:
                 with ui.row().classes("w-full items-center q-gutter-sm"):
                     ui.link(row["title"], row["link"]).classes("s-cell s-cell--bold col-grow") \
                         .style("text-decoration: none;")
                     ui.label(row["stage"]).classes("s-pill s-pill--accent")
                     ui.label(row["status"]).classes("s-pill s-pill--muted")
+                    render_badge(row.get("badge"))
 
         _list()
-        safe_timer(2.0, _list.refresh)
+        # W12: the rows now carry a clickable badge, so repaint only when they
+        # change -- an unconditional repaint would eat a click on the badge.
+        import json as _json
+
+        from systemu.interface.ui_helpers import gated_refresh
+        safe_timer(2.0, gated_refresh(
+            lambda: _json.dumps(_load_recent_workflows(), sort_keys=True, default=str),
+            _list.refresh))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -193,7 +193,9 @@ def _on_approve(package: str, tool_name: str, on_change=None) -> None:
             None,
         )
         if match is not None:
-            resolved = queue.resolve(match.id, choice="Approve & Install")
+            from systemu.approval.decision_queue import resolution_channel as _via
+            with _via("dashboard"):
+                resolved = queue.resolve(match.id, choice="Approve & Install")
             resolve_gate(resolved, vault=vault)
             ui.notify(f"Approved {package}; install started", type="positive")
             if on_change:

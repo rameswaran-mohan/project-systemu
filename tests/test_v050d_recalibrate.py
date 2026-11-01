@@ -95,7 +95,7 @@ class TestBumpVersionPath:
 
         # Stub forge re-spec + re-code by call order.
         call_order = {"i": 0}
-        def fake_llm(*, tier, system, user, **kw):
+        def fake_llm(*, tier=None, system, user, **kw):
             call_order["i"] += 1
             if call_order["i"] == 1:    # spec call
                 return {"name": "t", "description": "new",

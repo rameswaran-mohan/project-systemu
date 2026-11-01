@@ -24,7 +24,9 @@ _STAGE_ICONS = {
     "scroll":    "history_edu",
     "activity":  "assignment",
     "execution": "settings",
-    "done":      "check_circle",
+    # DEC-13: the filled check belongs to the VERIFIED badge alone; reaching the
+    # "done" stage is the run's own claim, not an independent confirmation.
+    "done":      "flag",
     "failed":    "warning",
 }
 

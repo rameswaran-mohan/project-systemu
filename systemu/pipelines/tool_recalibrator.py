@@ -522,7 +522,7 @@ def _reforge_tool(
             ),
         }
         spec_result = llm_call_json(
-            tier=2,
+            stage="forge",
             system=load_prompt("forge_tool_spec.md"),
             user=json.dumps(spec_payload, ensure_ascii=False),
             config=config,
@@ -538,7 +538,7 @@ def _reforge_tool(
             "implementation_notes": spec_result.get("implementation_notes", ""),
         }
         code_result = llm_call_json(
-            tier=2,
+            stage="forge",
             system=load_prompt("forge_tool_code.md"),
             user=json.dumps(code_payload, ensure_ascii=False),
             config=config,

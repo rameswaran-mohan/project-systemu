@@ -83,11 +83,78 @@ def _validate_reclassify(selected: str, typed: str):
 
 
 def _wants_reclassify_panel(dedup: str, options) -> bool:
-    """True iff this card should render the inline reclassify panel: a TOOL gate
-    (the effect vocabulary is the tool's; command/MCP gates are out of scope) whose
-    options actually carry the remedy."""
+    """True iff this card should render the inline reclassify panel: a TOOL gate, or
+    (P21) an MCP gate -- both score on the effect vocabulary -- whose options
+    actually carry the remedy. A command gate scores command text, not an effect
+    class, and stays out of scope."""
     from systemu.interface.command.gate import RECLASSIFY_OPTION
-    return bool(dedup) and dedup.startswith("tool:") and RECLASSIFY_OPTION in (options or [])
+    return (type(dedup) is str and dedup.startswith(("tool:", "mcp:"))
+            and RECLASSIFY_OPTION in (options or []))
+
+
+def _resolve_mcp_reclassify(dec_id: str, selected: str, typed: str, *, vault):
+    """Pure (no UI calls): apply an MCP DENY card's reclassify, return the
+    ``(message, notify-type)`` the panel shows.
+
+    P21 -- IMPL-2 parity for MCP. The operator assigns the effect class the gate
+    could not determine, under the SAME typed confirmation (``_validate_reclassify``,
+    no case-folding), and it is saved through ``connections.
+    set_operator_effect_classes`` as the operator's ASSIGNMENT for this tool. The
+    gate feeds it to the governor exactly as a native reclassification
+    (``ActionContext.operator_assigned_class``): additive, never erasing a server's
+    destructive hint or a name-derived class, never frictionless. Nothing runs.
+
+    Every check is server-side: the card must be a still-pending MCP DENY card that
+    offers the remedy; the class and phrase are re-validated here, not trusted from
+    the panel. The assignment is written FIRST and read back (the witness) before the
+    card resolves, so a card is never marked reclassified over a write that did not
+    land. Fail-closed: any refusal records nothing and says why.
+    """
+    from systemu.interface.command.gate import RECLASSIFY_OPTION
+    from systemu.runtime.command_approvals import _ascii
+    cls, err = _validate_reclassify(selected if type(selected) is str else "",
+                                    typed if type(typed) is str else "")
+    if cls is None:
+        return err, "warning"
+    try:
+        decision = vault.get_decision(dec_id)
+    except Exception:
+        return "That card could not be read, so nothing was recorded.", "negative"
+    ctx = getattr(decision, "context", None)
+    ctx = ctx if type(ctx) is dict else {}
+    server, tool = ctx.get("server"), ctx.get("tool")
+    if (ctx.get("gate_type") != "mcp_call" or ctx.get("verdict") != "deny"
+            or getattr(decision, "status", None) != "pending"
+            or RECLASSIFY_OPTION not in (getattr(decision, "options", None) or [])
+            or type(server) is not str or not server
+            or type(tool) is not str or not tool):
+        return ("This card is not a pending refused MCP call, so nothing was "
+                "recorded."), "warning"
+    from systemu.runtime.mcp.connections import (get_operator_assigned_class,
+                                                 set_operator_effect_classes)
+    try:
+        set_operator_effect_classes(vault, server, tool, assigned=cls,
+                                    decision_id=dec_id)
+        saved = get_operator_assigned_class(vault, server, tool)
+    except Exception:
+        logger.exception("[Inbox] MCP reclassify write failed for %s", dec_id)
+        saved = None
+    if saved != cls:
+        return (_ascii(f"Nothing was recorded: the class {cls} could not be saved for "
+                       f"{tool}. The call is still refused."), "negative")
+    from systemu.approval.decision_queue import OperatorDecisionQueue
+    from systemu.approval.decision_queue import resolution_channel as _via
+    try:
+        with _via("dashboard"):
+            OperatorDecisionQueue(vault).resolve_with_context_patch(
+                dec_id, choice=RECLASSIFY_OPTION,
+                context_patch={"assigned_class": cls, "typed_confirmed": True})
+    except Exception as exc:
+        return (_ascii(f"Saved {cls} as your assignment for {tool}, but the card could "
+                       f"not be resolved ({exc}). Nothing has run."), "warning")
+    return (_ascii(f"Reclassified {tool} as {cls}. Nothing has run. The class is saved "
+                   f"as your assignment for this tool on {server}, and the next call "
+                   "to it is checked on that class."), "positive")
 
 
 def _inbox_card_model(descriptor) -> Dict[str, Any]:
@@ -233,7 +300,10 @@ def _resolve_and_execute_confirmed_gate(dec_id: str, choice: str, vault, typed):
     (``inbox.resolve_pending_gate``): a click without the right phrase records
     nothing and the result says why. Pure: no UI calls here."""
     from systemu.interface.command.inbox import resolve_pending_gate
-    return resolve_pending_gate(dec_id, choice=choice, vault=vault, typed_confirm=typed)
+    from systemu.approval.decision_queue import resolution_channel as _via
+    with _via("dashboard"):
+        return resolve_pending_gate(dec_id, choice=choice, vault=vault,
+                                    typed_confirm=typed)
 
 
 # D-2 (e2e v0.10.31): the toast types this page is allowed to show for a gate
@@ -455,7 +525,8 @@ def _render_unified_card(dec_id: str, descriptor, *, vault, on_resolved) -> None
 
         if show_reclassify:
             _panel_ref["panel"] = _render_reclassify_panel(
-                dec_id, vault=vault, on_resolved=on_resolved)
+                dec_id, vault=vault, on_resolved=on_resolved,
+                mcp=type(dedup) is str and dedup.startswith("mcp:"))
 
 
 def _reclassify_outcome_notice(dctx, cls: str):
@@ -493,7 +564,7 @@ def _reclassify_outcome_notice(dctx, cls: str):
     )
 
 
-def _render_reclassify_panel(dec_id: str, *, vault, on_resolved):
+def _render_reclassify_panel(dec_id: str, *, vault, on_resolved, mcp: bool = False):
     """The inline "assign the real effect class" panel (IMPL-2), hidden until the
     operator opens it. Returns the panel element so the caller can reveal it.
 
@@ -502,6 +573,9 @@ def _render_reclassify_panel(dec_id: str, *, vault, on_resolved):
     the resolution must land in ONE reload+save, and because a reclassify executes
     nothing: it records a classification the gate re-arbitrates on, and the run then
     posts a fresh approval card.
+
+    P21: ``mcp`` routes an MCP DENY card to ``_resolve_mcp_reclassify``, which saves
+    the class as the operator's assignment for that MCP tool (the panel text says so).
     """
     from systemu.interface.design.primitives import button
     from systemu.interface.command.gate import RECLASSIFY_OPTION
@@ -512,11 +586,18 @@ def _render_reclassify_panel(dec_id: str, *, vault, on_resolved):
     ) as panel:
         ui.label("ASSIGN THE REAL EFFECT CLASS").classes("s-field-label")
         ui.label(
-            "systemu could not classify this effect and a high-severity signal "
-            "fired, so it refused to run it. Assign the class you know this call "
-            "really has. This runs nothing: the call is re-checked on the class you "
-            "assign and you are asked to approve it. The assignment is single-use, "
-            "applies only to this exact call, and expires if left unused."
+            ("systemu could not classify this MCP tool's effect and a high-severity "
+             "signal fired, so it refused to run it. Assign the class you know this "
+             "tool really has. This runs nothing: the class is saved as your "
+             "assignment for this tool (in its MCP connection settings) and every "
+             "later call to it is checked on that class. It adds to what the server "
+             "declared, and on its own it never lets the tool run without asking.")
+            if mcp else
+            ("systemu could not classify this effect and a high-severity signal "
+             "fired, so it refused to run it. Assign the class you know this call "
+             "really has. This runs nothing: the call is re-checked on the class you "
+             "assign and you are asked to approve it. The assignment is single-use, "
+             "applies only to this exact call, and expires if left unused.")
         ).classes("s-cell").style("white-space: pre-wrap; font-size: 13px;")
         selector = ui.select(choices, value=choices[0] if choices else None,
                              label="Effect class").classes("s-input")
@@ -524,6 +605,14 @@ def _render_reclassify_panel(dec_id: str, *, vault, on_resolved):
             label="Type the class value exactly to confirm").classes("s-input")
 
         def _confirm(_=None) -> None:
+            if mcp:
+                message, kind = _resolve_mcp_reclassify(
+                    dec_id, (selector.value or ""), (confirm_input.value or ""),
+                    vault=vault)
+                ui.notify(message, type=kind)
+                if kind == "positive":
+                    on_resolved()
+                return
             cls, err = _validate_reclassify(
                 (selector.value or ""), (confirm_input.value or ""))
             if cls is None:
@@ -531,10 +620,12 @@ def _render_reclassify_panel(dec_id: str, *, vault, on_resolved):
                 return
             try:
                 from systemu.approval.decision_queue import OperatorDecisionQueue
-                decision = OperatorDecisionQueue(vault).resolve_with_context_patch(
-                    dec_id, choice=RECLASSIFY_OPTION,
-                    context_patch={"assigned_class": cls, "typed_confirmed": True},
-                )
+                from systemu.approval.decision_queue import resolution_channel as _via
+                with _via("dashboard"):
+                    decision = OperatorDecisionQueue(vault).resolve_with_context_patch(
+                        dec_id, choice=RECLASSIFY_OPTION,
+                        context_patch={"assigned_class": cls, "typed_confirmed": True},
+                    )
             except Exception as exc:
                 logger.exception("[Inbox] reclassify failed for %s", dec_id)
                 ui.notify(f"Reclassify failed: {exc}", type="negative")

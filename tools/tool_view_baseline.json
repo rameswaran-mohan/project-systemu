@@ -1,0 +1,181 @@
+{
+  "_doc": "Baseline for tools/lint_tool_view.py (R-CAP1 CAP-4, DEC-43). Every site under systemu/ that writes a tool-list key (tools, available_tools, existing_tools, current_tool_catalog, tools_available, enabled_tools, more_tools) from something other than the selection view's .full_records(), with the exact count and why it may. Enforced both ways: an unlisted or over-count site fails, and a listed site that is gone or under its count fails until the entry is lowered/deleted -- this list only shrinks. kinds: not-a-prompt (never reaches an LLM prompt), inventory (an entity inventory, not a capability selection), candidate-gatherer (builds what the view then consumes), pass-through (forwards a value its caller filled from the view), names-roster (a names-only roster, already at index granularity).",
+  "sites": [
+    {
+      "path": "systemu/core/llm_router.py",
+      "scope": "llm_call",
+      "key": "tools",
+      "count": 1,
+      "kind": "pass-through",
+      "reason": "The provider-native `tools` request parameter, forwarded verbatim. No production caller passes it (there is no llm_call(..., tools=...) site); a future caller must hand it view.full_records()."
+    },
+    {
+      "path": "systemu/interface/pages/console.py",
+      "scope": "growth_counts",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "A dashboard odometer COUNT of tools (an int), not a tool list."
+    },
+    {
+      "path": "systemu/pipelines/evolution_engine.py",
+      "scope": "_build_summary_index",
+      "key": "tools",
+      "count": 1,
+      "kind": "inventory",
+      "reason": "The evolution engine's vault INVENTORY (id/name/status/type beside scrolls, shadows and skills) used to target an evolution at an entity id. Not a capability selection: demoting rows to name+slot would strip the ids an evolution must name."
+    },
+    {
+      "path": "systemu/pipelines/scroll_validator.py",
+      "scope": "_build_catalog_witnessed",
+      "key": "tools",
+      "count": 1,
+      "kind": "candidate-gatherer",
+      "reason": "Builds the validator's candidate catalog; validate_scroll renders it through build_view into tools_available."
+    },
+    {
+      "path": "systemu/runtime/capability_diff.py",
+      "scope": "DiffReport.to_dict",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "Serialization of the capability-diff report (per-tool diffs), not a prompt tool list."
+    },
+    {
+      "path": "systemu/runtime/capability_diff.py",
+      "scope": "build_report",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "Constructs the capability-diff report dataclass, not a prompt."
+    },
+    {
+      "path": "systemu/runtime/governor.py",
+      "scope": "Governor._provision_mcp",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "The MCP grant's materialisation result (the tools a grant enabled), consumed by the registry bridge, not a prompt."
+    },
+    {
+      "path": "systemu/runtime/harness_judge.py",
+      "scope": "judge_harness_request",
+      "key": "enabled_tools",
+      "count": 1,
+      "kind": "names-roster",
+      "reason": "A names-only roster for the harness judge's duplicate judgment; already at one-line-index granularity, and the judgment needs the complete roster."
+    },
+    {
+      "path": "systemu/runtime/mcp/client.py",
+      "scope": "mcp_list_tools",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "An MCP server listing result."
+    },
+    {
+      "path": "systemu/runtime/mcp/sdk/manager.py",
+      "scope": "ConnectionManager.connect_and_discover",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "An MCP discovery result."
+    },
+    {
+      "path": "systemu/runtime/mcp/sdk/manager.py",
+      "scope": "ToolListing.failed",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "An MCP listing value constructor."
+    },
+    {
+      "path": "systemu/runtime/mcp/sdk/manager.py",
+      "scope": "ToolListing.listed",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "An MCP listing value constructor."
+    },
+    {
+      "path": "systemu/runtime/mcp/sdk/transports.py",
+      "scope": "build_test_sampling_server._on_list_tools",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "A test MCP server's list-tools response."
+    },
+    {
+      "path": "systemu/runtime/param_validation.py",
+      "scope": "missing_required",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "Forwards the v1 dispatch list to the schema resolver."
+    },
+    {
+      "path": "systemu/runtime/shadow_runtime.py",
+      "scope": "ShadowRuntime._apply_harness_grant",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "the run's v1 DISPATCH list (Tool objects) handed to a helper - never rendered into a prompt"
+    },
+    {
+      "path": "systemu/runtime/shadow_runtime.py",
+      "scope": "ShadowRuntime._apply_harness_grant_async",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "the run's v1 DISPATCH list (Tool objects) handed to a helper - never rendered into a prompt"
+    },
+    {
+      "path": "systemu/runtime/shadow_runtime.py",
+      "scope": "ShadowRuntime._handle_tool_call",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "the run's v1 DISPATCH list (Tool objects) handed to a helper - never rendered into a prompt"
+    },
+    {
+      "path": "systemu/runtime/shadow_runtime.py",
+      "scope": "ShadowRuntime.execute",
+      "key": "enabled_tools",
+      "count": 1,
+      "kind": "names-roster",
+      "reason": "The harness arbiter's reuse context: the single requested tool name, not a prompt tool list."
+    },
+    {
+      "path": "systemu/runtime/shadow_runtime.py",
+      "scope": "ShadowRuntime.execute",
+      "key": "tools",
+      "count": 3,
+      "kind": "not-a-prompt",
+      "reason": "the run's v1 DISPATCH list (Tool objects) handed to a helper - never rendered into a prompt"
+    },
+    {
+      "path": "systemu/runtime/shadow_runtime.py",
+      "scope": "_build_user_payload",
+      "key": "available_tools",
+      "count": 1,
+      "kind": "pass-through",
+      "reason": "Copies its available_tools parameter into the payload; its only production caller passes _tool_view.full_records()."
+    },
+    {
+      "path": "systemu/storage/sqlite/vault.py",
+      "scope": "SqliteVault._seed_from_file_vault_if_empty",
+      "key": "tools",
+      "count": 2,
+      "kind": "not-a-prompt",
+      "reason": "Seed/migration COUNTS per entity type."
+    },
+    {
+      "path": "systemu/vault/vault.py",
+      "scope": "Vault",
+      "key": "tools",
+      "count": 1,
+      "kind": "not-a-prompt",
+      "reason": "The index-file layout constant (entity -> path)."
+    }
+  ]
+}

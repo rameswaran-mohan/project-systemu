@@ -34,6 +34,10 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
 
+#: The persisted ``reasoning`` is capped here, AFTER it is masked.
+REASONING_CAP = 500
+
+
 def _path(vault_root, execution_id: str) -> Path:
     return Path(vault_root) / "executions" / execution_id / "decision_audit.jsonl"
 
@@ -78,14 +82,26 @@ def append_iteration_decision(
 
     Creates the ``executions/<id>/`` parent directory if needed.  Stamps
     ``ts`` with the current UTC time if the caller left it blank.
+
+    DEC-31: ``reasoning`` is the model's own text and routinely quotes the
+    arguments it is about to pass, and the loop-guard notice can quote a call;
+    both are MASKED here and only then capped (``reasoning`` at
+    :data:`REASONING_CAP`). The caller hands over the full text -- a slice
+    before this point could cut a JWT's tail off and hide it from the mask.
     """
     p = _path(vault_root, execution_id)
     try:
         if not row.ts:
             row.ts = _now_iso()
+        from systemu.runtime.durable_redact import mask_text
+        persisted = asdict(row)
+        persisted["reasoning"] = mask_text(persisted.get("reasoning") or "",
+                                           max_len=REASONING_CAP)
+        if persisted.get("loop_guard_message") is not None:
+            persisted["loop_guard_message"] = mask_text(persisted["loop_guard_message"])
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(row)) + "\n")
+            f.write(json.dumps(persisted) + "\n")
     except Exception:
         # Audit sidecar: a write failure must never break the loop.
         pass

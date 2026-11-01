@@ -1883,7 +1883,7 @@ Respond with a JSON object exactly matching this schema:
         try:
             from systemu.core.llm_router import llm_call_json
             analysis = llm_call_json(
-                tier=1,
+                stage="reasoning",
                 system=system_prompt,
                 user=json.dumps(user_payload),
                 config=self.config,

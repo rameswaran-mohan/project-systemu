@@ -158,11 +158,17 @@ def log_event(
     }.get(level.upper(), logger.info)
     log_fn("[Event:%s] %s — %s", category, level, message)
 
-    # Append to jsonl file
+    # Append to jsonl file. DEC-31: the line on disk is the MASKED record --
+    # details carry the tool call's raw parameters, reasoning and result, and
+    # a message can quote an error that echoes them. Masked here, at the one
+    # writer, so every caller is covered. The live EventBus copy below stays
+    # as-is: it is in memory, and its subscribers act on the raw ids/paths.
     if _event_log_path is not None:
         try:
+            from systemu.runtime.durable_redact import mask_event
+            persisted = mask_event(entry)
             with open(_event_log_path, "a", encoding="utf-8") as f:
-                f.write(_json.dumps(entry) + "\n")
+                f.write(_json.dumps(persisted) + "\n")
         except Exception as exc:
             logger.warning("[Notify] Could not write event log: %s", exc)
 

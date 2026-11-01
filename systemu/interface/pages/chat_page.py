@@ -210,6 +210,17 @@ def chat_table_chip_model(entry):
         return None
 
 
+def chat_badge_model(entry):
+    """DEC-13: the chat card's verification badge -- the ONE mint's value for the
+    entry's own status and execution id. Nothing while the task is in flight; a
+    handoff (a parked or stopped task) carries its committed effects, each badged.
+    Never raises: a mint that failed to run renders as not recorded."""
+    from systemu.interface.components.receipt_panel import badge_model_for
+    if not isinstance(entry, dict):
+        return None
+    return badge_model_for(entry.get("status"), entry.get("execution_id"))
+
+
 def stop_result_message(report: Dict[str, Any]):
     """Turn a ``chat_task_registry.cancel_chat_task`` report into (text, type).
 
@@ -482,6 +493,10 @@ def build_chat_page(prefill: str = "") -> None:
         ts       = entry.get("ts", "")[:19].replace("T", " ")
         sid      = entry.get("shadow_id", "")
         exec_id  = entry.get("execution_id", "")
+        from systemu.interface.components.receipt_panel import (
+            render_badge, render_committed_effects_list,
+        )
+        _badge   = chat_badge_model(entry)
 
         status_color = {
             "success":          THEME.get("success", "#22c55e"),
@@ -558,11 +573,17 @@ def build_chat_page(prefill: str = "") -> None:
                     # table: N" (items on expand) once it ends.
                     from systemu.interface.pages.work import render_table_chips
                     render_table_chips(chat_table_chip_model(entry))
+                    # DEC-13 / IMPL-7: a parked or failed task lists what it
+                    # already committed, each effect with its own badge.
+                    render_committed_effects_list(_badge)
                 with ui.column().classes("items-end").style("gap: 6px;"):
                     ui.badge(status.upper().replace("_", " ")).style(
                         f"background: {status_color}; color: white; "
                         f"border-radius: 6px; font-size: 11px; padding: 3px 8px; white-space: nowrap;"
                     )
+                    # DEC-13: verified / claimed / ... -- the one mint's badge; a
+                    # click opens the UX-10 receipt. Separate from the status.
+                    render_badge(_badge)
                     # v0.9.50 (6c): per-job switches on the card's top-right — KILL a
                     # running job (cooperative cancel via the chat_task_registry token
                     # keyed on its ts, v0.9.32 D3.3), or RESTART a finished / killed /

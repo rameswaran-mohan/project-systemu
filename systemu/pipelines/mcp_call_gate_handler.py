@@ -44,12 +44,31 @@ def _handle_resolved_mcp_call(decision, choice, config, vault) -> None:
 
     from pathlib import Path as _Path
     from systemu.runtime.command_approvals import (
-        get_default_store, init_default_store, mcp_signature, mcp_session_key)
+        CONFIRM_TYPED_KEY, get_default_store, init_default_store, mcp_signature,
+        mcp_session_key, typed_confirm_refusal)
+
+    # P21 / R1: a money / irreversible MCP card is approved once, under the typed
+    # phrase, and never remembered -- so neither "Always allow" nor session trust
+    # is ever persisted for it, whoever resolved the card. The ONE rule every
+    # resolve path reads (``command_approvals.typed_confirm_refusal``).
+    _ctx = ctx if type(ctx) is dict else {}
+    refusal = typed_confirm_refusal(_ctx, choice=choice,
+                                    typed=_ctx.get(CONFIRM_TYPED_KEY))
+    if refusal:
+        logger.warning("[McpGate] %r on %s:%s persisted nothing: %s",
+                       choice, server, tool, refusal)
+        return
+
     store = get_default_store() or init_default_store(_Path("data"))
 
     if norm == "always allow":
         sig = mcp_signature(server, tool)
-        store.approve(sig, command=f"mcp:{server}:{tool}")
+        # The scored classes the gate stamped on the card: the store refuses a
+        # standing approval for an irreversible one even if the one-shot-only mark
+        # could not be written.
+        _tags = _ctx.get("effect_tags")
+        store.approve(sig, command=f"mcp:{server}:{tool}",
+                      effect_tags=_tags if type(_tags) is list else None)
         logger.info("[McpGate] persisted Always-allow for %s:%s", server, tool)
         return
     if norm == "trust this tool for the session":

@@ -585,7 +585,10 @@ def run_direct_task(
             f"Task {_status}: {prompt[:80]}",
             {"origin": "chat", "scroll_id": scroll.id,
              "activity_id": activity.id,
-             "execution_id": result.get("execution_id")},
+             "execution_id": result.get("execution_id"),
+             # DEC-13: the push mints the run's verification badge from the
+             # run's own status + durable receipts, never from the level.
+             "status": _status},
             details={"summary": _summary,
                      "files": list(result.get("files_produced") or []),
                      "output_dir": getattr(config, "output_dir", "") or ""},

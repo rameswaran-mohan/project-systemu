@@ -57,7 +57,7 @@ class TestGoalVerifierFileGoal:
 
     def test_goal_with_file_in_delta_returns_verified_true(self, monkeypatch):
         """A goal needing a file, and the delta contains that file → verified True."""
-        def fake_llm(*, tier, system, user, config, **kw):
+        def fake_llm(*, tier=None, system, user, config, **kw):
             return {
                 "verified": True,
                 "reason": "city.txt was written with the city name",
@@ -79,7 +79,7 @@ class TestGoalVerifierFileGoal:
 
     def test_goal_with_empty_delta_returns_verified_false(self, monkeypatch):
         """Anti-hallucination: a goal needing a file but delta is empty → verified False."""
-        def fake_llm(*, tier, system, user, config, **kw):
+        def fake_llm(*, tier=None, system, user, config, **kw):
             return {
                 "verified": False,
                 "reason": "no file was written; delta shows no durable artifact",
@@ -104,7 +104,7 @@ class TestGoalVerifierInformationalGoal:
     def test_informational_goal_satisfied_by_chat_result(self, monkeypatch):
         """An informational goal with a substantive chat_result → verified True
         even when the file delta is empty."""
-        def fake_llm(*, tier, system, user, config, **kw):
+        def fake_llm(*, tier=None, system, user, config, **kw):
             return {
                 "verified": True,
                 "reason": "chat reply directly answers the question",
@@ -224,7 +224,7 @@ class TestGoalVerifierRawGoalContract:
         goal string, not just prior_criteria."""
         captured_user = {}
 
-        def fake_llm(*, tier, system, user, config, **kw):
+        def fake_llm(*, tier=None, system, user, config, **kw):
             captured_user["payload"] = json.loads(user)
             return {
                 "verified": True,
@@ -254,7 +254,7 @@ class TestGoalVerifierRawGoalContract:
 
     def test_prior_criteria_absence_does_not_break_call(self, monkeypatch):
         """verify_goal must work when prior_criteria=None (the common case)."""
-        def fake_llm(*, tier, system, user, config, **kw):
+        def fake_llm(*, tier=None, system, user, config, **kw):
             payload = json.loads(user)
             assert payload["prior_criteria"] == []
             return {

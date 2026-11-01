@@ -80,7 +80,7 @@ def spawn_subagent(
 
     try:
         result = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=system_prompt,
             user=task,
             config=config,

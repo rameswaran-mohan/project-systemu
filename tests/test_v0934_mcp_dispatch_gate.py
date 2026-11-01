@@ -497,6 +497,14 @@ def test_destructive_tool_gates_even_under_session_trust(tmp_path, monkeypatch):
 
 
 def test_always_allow_suppresses_even_destructive(tmp_path, monkeypatch):
+    """An "Always allow" on record suppresses the gate for a destructive-TIER tool
+    (per-call, no session trust) that is NOT irreversible -- here an unannotated
+    ``mystery_tool``, the UNKNOWN band.
+
+    P21 (GATE-6, ruled): the original subject was ``delete_repo`` with
+    ``destructiveHint: True``. P21 classes that call irreversible (R1), and R1 says
+    no standing approval of any kind covers it; that inverse is pinned in
+    ``test_always_allow_never_covers_an_irreversible_tool`` below."""
     from systemu.runtime.mcp import dispatch
     import systemu.runtime.command_approvals as ca
     from systemu.runtime.command_approvals import mcp_signature
@@ -512,15 +520,47 @@ def test_always_allow_suppresses_even_destructive(tmp_path, monkeypatch):
 
     ca.reset_default_store_for_tests()
     store = ca.init_default_store(tmp_path)
+    store.approve(mcp_signature("http://h", "mystery_tool"),
+                  command="mcp:http://h:mystery_tool")
+
+    v = _Vault(tmp_path)
+    _enable(v, "http://h", "mystery_tool", {})     # NO annotations: tier D
+    # Always-allow on record → no gate, even for destructive tier.
+    dispatch._gate_mcp_call("http://h", "mystery_tool", {}, vault=v,
+                            config=_Cfg(), session_id="run_A")
+    assert enq["n"] == 0
+
+
+def test_always_allow_never_covers_an_irreversible_tool(tmp_path, monkeypatch):
+    """P21 / R1 -- the inverse: ``delete_repo`` with ``destructiveHint: True`` is
+    irreversible, so an "Always allow" on record does NOT suppress its gate. It
+    raises, and its card offers Deny / Approve once only."""
+    from systemu.runtime.mcp import dispatch
+    from systemu.approval.exceptions import PendingOperatorDecision
+    import systemu.runtime.command_approvals as ca
+    from systemu.runtime.command_approvals import mcp_signature
+
+    posted = {}
+
+    class _FakeInbox:
+        def __init__(self, vault): pass
+        def enqueue(self, descriptor, **k):
+            posted["options"] = list(descriptor.options)
+            return "dec_1"
+    monkeypatch.setattr("systemu.interface.command.inbox.InboxQueue", _FakeInbox)
+
+    ca.reset_default_store_for_tests()
+    store = ca.init_default_store(tmp_path)
     store.approve(mcp_signature("http://h", "delete_repo"),
                   command="mcp:http://h:delete_repo")
 
     v = _Vault(tmp_path)
     _enable(v, "http://h", "delete_repo", {"destructiveHint": True})
-    # Always-allow on record → no gate, even for destructive tier.
-    dispatch._gate_mcp_call("http://h", "delete_repo", {}, vault=v,
-                            config=_Cfg(), session_id="run_A")
-    assert enq["n"] == 0
+    with pytest.raises(PendingOperatorDecision) as exc:
+        dispatch._gate_mcp_call("http://h", "delete_repo", {}, vault=v,
+                                config=_Cfg(), session_id="run_A")
+    assert exc.value.options == ["Deny", "Approve once"]
+    assert posted["options"] == ["Deny", "Approve once"]
 
 
 def test_store_unreachable_still_gates(tmp_path, monkeypatch):
@@ -648,6 +688,16 @@ def test_call_readonly_tool_runs_and_guards_output(tmp_path, monkeypatch):
     v = _Vault(tmp_path)
     _enable(v, "http://h", "read_inbox", {"readOnlyHint": True})
     conn.set_tool_hash(v, "http://h", "read_inbox", "deadbeef")  # pin ⇒ trusted
+    # R-3 (GATE-6, ruled): the pre-call rug-pull check fails closed, so the
+    # listing must return the tool UNCHANGED against its pinned hash.
+    from systemu.runtime.mcp import connections as _r3_conn
+    from systemu.runtime.mcp.sdk.schema_map import tool_def_hash as _r3_hash
+    import systemu.runtime.mcp.client as _r3_client
+    _r3_conn.set_tool_hash(v, 'http://h', 'read_inbox', _r3_hash(
+        name='read_inbox', description="d", input_schema={}))
+    monkeypatch.setattr(_r3_client, "mcp_list_tools", lambda *a, **k: {
+        "success": True,
+        "tools": [{"name": 'read_inbox', "description": "d", "schema": {}}]})
     out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
                                  config=_Cfg(), session_id="run_A")
     assert out["success"] is True
@@ -670,6 +720,16 @@ def test_call_propagates_transport_failure(tmp_path, monkeypatch):
     v = _Vault(tmp_path)
     _enable(v, "http://h", "read_inbox", {"readOnlyHint": True})
     conn.set_tool_hash(v, "http://h", "read_inbox", "deadbeef")  # pin ⇒ trusted
+    # R-3 (GATE-6, ruled): the pre-call rug-pull check fails closed, so the
+    # listing must return the tool UNCHANGED against its pinned hash.
+    from systemu.runtime.mcp import connections as _r3_conn
+    from systemu.runtime.mcp.sdk.schema_map import tool_def_hash as _r3_hash
+    import systemu.runtime.mcp.client as _r3_client
+    _r3_conn.set_tool_hash(v, 'http://h', 'read_inbox', _r3_hash(
+        name='read_inbox', description="d", input_schema={}))
+    monkeypatch.setattr(_r3_client, "mcp_list_tools", lambda *a, **k: {
+        "success": True,
+        "tools": [{"name": 'read_inbox', "description": "d", "schema": {}}]})
     out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
                                  config=_Cfg(), session_id="run_A")
     assert out["success"] is False

@@ -290,6 +290,16 @@ class TestSelectorIsConsultedByTheMcpDispatchPath:
 
         v = _DispatchVault(tmp_path)
         _enable_pinned_readonly(v, "http://h", "read_inbox")
+        # R-3 (GATE-6, ruled): the pre-call rug-pull check fails closed, so the
+        # listing must return the tool UNCHANGED against its pinned hash.
+        from systemu.runtime.mcp import connections as _r3_conn
+        from systemu.runtime.mcp.sdk.schema_map import tool_def_hash as _r3_hash
+        import systemu.runtime.mcp.client as _r3_client
+        _r3_conn.set_tool_hash(v, 'http://h', 'read_inbox', _r3_hash(
+            name='read_inbox', description="d", input_schema={}))
+        monkeypatch.setattr(_r3_client, "mcp_list_tools", lambda *a, **k: {
+            "success": True,
+            "tools": [{"name": 'read_inbox', "description": "d", "schema": {}}]})
         out = dispatch.call_mcp_tool("http://h", "read_inbox", {}, vault=v,
                                      config=_DispatchCfg(), session_id="run_A")
 

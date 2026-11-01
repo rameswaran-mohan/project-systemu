@@ -46,22 +46,21 @@ def committed_effect_details(external_evidence: dict) -> List[str]:
     if not isinstance(external_evidence, dict):
         return []
 
+    from systemu.runtime import verification_badge as vb
+
     pairs: List[tuple] = []
     for key, entry in external_evidence.items():
         try:
-            if not isinstance(entry, dict):
-                continue
-            # R-A13b-1: a RECORD-ONLY shadow-meter measurement (shadow=True) is an
-            # instrumentation artifact, NEVER an operator-facing committed effect —
-            # even when it carries confirmed=True purely as its would-credit
-            # measurement. Skip it, symmetric with _read_external_ok (shadow_runtime.py),
-            # which also refuses a shadow entry. A shadow-meter would-credit belongs
-            # only to the metrics report, not this ledger; a LIVE entry never carries
-            # ``shadow`` ⇒ the operator ledger is unchanged for OFF/ENFORCE runs.
-            if entry.get("shadow") is True:
-                continue
-            # fail-closed: ONLY the real bool True credits (mirrors _read_external_ok).
-            if entry.get("confirmed") is not True:
+            # DEC-43: whether an entry is a committed effect is the ONE mint's
+            # call, never re-derived here. Only ``verified`` lists: a RECORD-ONLY
+            # shadow-meter measurement is ``measured`` (an instrumentation
+            # artifact, never an operator-facing committed effect -- even when it
+            # carries its would-credit bit, symmetric with _read_external_ok in
+            # shadow_runtime.py), an unconfirmed entry is ``claimed`` (fail-closed:
+            # only the real bool True credits) and a malformed entry is
+            # ``not_recorded``. A LIVE entry never carries the shadow flag, so the
+            # operator ledger is unchanged for OFF/ENFORCE runs.
+            if vb.mint_effect(key, entry).state != vb.VERIFIED:
                 continue
             detail = entry.get("detail")
             if not isinstance(detail, str):

@@ -35,6 +35,9 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _MAX_RESULT_CHARS = 2000     # per-entry transcript clamp (context economy)
+# R-CAP1: a find_tools result carries full records (schemas) for its hits, so it
+# gets a larger clamp than an ordinary tool result.
+_FIND_TOOLS_RESULT_CHARS = 8000
 _SAME_TOOL_FAIL_CAP = 3
 _MALFORMED_CAP = 2
 _ASK_USER_CAP = 3            # v0.9.43: cap operator questions per run (anti re-ask)
@@ -64,14 +67,20 @@ class QuickResult:
 def _enabled_tool_records(vault) -> List[Any]:
     """Full Tool records the quick lane may use: Gate-3 enabled AND
     runtime-ready (same predicate the readiness gate uses)."""
+    return _enabled_tool_records_witnessed(vault)[0]
+
+
+def _enabled_tool_records_witnessed(vault):
+    """``(records, catalog)``: the same records as ``_enabled_tool_records`` plus the
+    ``CatalogRead`` they were built from (R-CAP1 / DEC-27). An unreadable tool
+    roster yields the forgiving rows AND a degraded witness, which the selection
+    view renders -- it can never arrive as a silent "no tools"."""
+    from systemu.runtime import capability_view as _cv
     from systemu.runtime.shadow_runtime import tool_is_runtime_ready
 
     records: List[Any] = []
-    try:
-        headers = vault.load_index("tools") or []
-    except Exception:
-        return []
-    for header in headers:
+    catalog = _cv.read_tool_headers(vault)
+    for header in catalog.headers:
         try:
             tool = vault.get_tool(header["id"])
         except Exception:
@@ -83,7 +92,7 @@ def _enabled_tool_records(vault) -> List[Any]:
         if not getattr(tool, "implementation_path", ""):
             continue
         records.append(tool)
-    return records
+    return records, catalog
 
 
 def _tool_index(tools: List[Any]) -> List[Dict[str, Any]]:
@@ -139,11 +148,15 @@ def _execute_mcp_tool(entry: Dict[str, Any], params: Dict[str, Any], config,
             "success": False, "error": msg, "error_type": "mcp_denied"},
             error=msg)
 
+    # P21 / R-P3b: the L3 gate's record of how this call passed, so the chat lane's
+    # ledger row carries the gate stamp exactly as the workflow lane's does.
+    gate: Dict[str, Any] = {}
+
     def _call(resolved_dedup=None):
         return call_mcp_tool(
             entry["server"], entry["name"], params,
             vault=vault, config=config, session_id=session_id,
-            resolved_dedup=resolved_dedup)
+            resolved_dedup=resolved_dedup, gate_out=gate)
 
     try:
         out = _call()
@@ -161,6 +174,12 @@ def _execute_mcp_tool(entry: Dict[str, Any], params: Dict[str, Any], config,
                                  "— fail-closed denial")
                 return _denied("MCP approval re-attempt failed — denied "
                                "(fail-closed).")
+        elif norm.startswith("reclassify"):
+            # P21 / IMPL-2 parity: a reclassify authorizes nothing by itself (the
+            # call was refused); the operator's class applies to the NEXT call.
+            return _denied("This MCP call was refused and did not run. The operator "
+                           "chose to reclassify the tool's effect; the next call to it "
+                           "is checked on the class assigned on the Inbox card.")
         else:
             msg = ("MCP call denied by operator." if norm == "deny"
                    else "MCP approval timed out — denied (fail-closed).")
@@ -177,12 +196,13 @@ def _execute_mcp_tool(entry: Dict[str, Any], params: Dict[str, Any], config,
         return SimpleNamespace(success=False, parsed={},
                                error="MCP tool returned no payload")
     parsed = response if isinstance(response, dict) else {"response": response}
-    return SimpleNamespace(success=True, parsed=parsed, error=None)
+    return SimpleNamespace(success=True, parsed=parsed, error=None,
+                           gate=dict(gate) if gate else None)
 
 
 def _default_llm_json(*, system: str, user: str, config) -> Dict[str, Any]:
     from systemu.core.llm_router import llm_call_json
-    return llm_call_json(tier=1, system=system, user=user, config=config,
+    return llm_call_json(stage="planner", system=system, user=user, config=config,
                          temperature=0.2, max_tokens=4000)
 
 
@@ -194,6 +214,25 @@ def _clamp(obj: Any, limit: int = _MAX_RESULT_CHARS) -> str:
     return text[:limit]
 
 
+def _not_callable_hint(vault, tool_name: str) -> str:
+    """R-CAP1 / R9(b): when a refused name IS in the tool store (disabled, broken,
+    quarantined, not ready), say so and point at the operator -- the refusal stands
+    (dispatch eligibility is unchanged), but the agent must not conclude the tool
+    does not exist and forge a duplicate. '' for a genuinely unknown name."""
+    try:
+        from systemu.runtime import capability_view as _cv
+        res = _cv.lookup(vault, tool_name, limit=1, callable_names=(), lane_extras=())
+        hit = res.hits[0] if res.hits else None
+        if hit is None or hit.name != tool_name:
+            return ""
+        return (f" It exists in the tool store but is not callable here (state: "
+                f"{hit.state} - {hit.reason}). Ask the operator (ASK_USER) to enable "
+                f"it; do NOT forge or improvise a duplicate.")
+    except Exception:
+        logger.debug("[QuickTask] not-callable hint skipped", exc_info=True)
+        return ""
+
+
 def _publish(level: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
     """Best-effort live event — the run must never die on telemetry."""
     try:
@@ -202,6 +241,28 @@ def _publish(level: str, message: str, details: Optional[Dict[str, Any]] = None)
                   details=details or None)
     except Exception:
         logger.debug("[QuickTask] live event publish failed", exc_info=True)
+
+
+def _audit_tool_success(vault, execution_id: str, tool_name: str, params,
+                        result) -> None:
+    """R-P3b: the chat lane's action-audit row for one SUCCESSFUL tool call, so chat
+    actions reach the ledger like workflow ones. Through the existing single writer
+    (``audit_log.append_action``), with the parameters masked by the workflow lane's
+    per-call masker BEFORE anything is persisted (DEC-31), and the sandbox gate's
+    record of how the call passed (``ToolResult.gate``; for an MCP call, the MCP
+    gate's record carried back by ``_execute_mcp_tool``).
+    Best-effort: an audit failure never breaks the run."""
+    try:
+        from systemu.runtime import audit_log
+        from systemu.runtime.shadow_runtime import _truncate_audit_params
+        gate = getattr(result, "gate", None)
+        audit_log.append_action(
+            getattr(vault, "_v", vault),          # FileVault does not forward the write
+            execution_id=execution_id, objective_id=0, action=tool_name,
+            params=_truncate_audit_params(params or {}), success=True,
+            gate=gate if isinstance(gate, dict) else None)
+    except Exception:
+        logger.debug("[QuickTask] action-audit row skipped", exc_info=True)
 
 
 def _has_usable_observation(history: List[Dict[str, Any]]) -> bool:
@@ -246,7 +307,7 @@ def _default_synthesize(prompt: str, history: List[Dict[str, Any]], config) -> O
             "so and state what is missing. Invent NOTHING not in the observations. "
             'Reply with ONE JSON object: {"answer_md": "<markdown answer>"}.')
         user = json.dumps({"request": prompt, "observations": obs}, default=str)
-        out = llm_call_json(tier=3, system=system, user=user, config=config,
+        out = llm_call_json(stage="summarize", system=system, user=user, config=config,
                             temperature=0.1, max_tokens=_SYNTH_MAX_TOKENS)
         text = (out.get("answer_md") if isinstance(out, dict) else None) or ""
         return text.strip() or None
@@ -328,31 +389,37 @@ def run_quick_task(
     except Exception:
         logger.debug("[QuickTask] profile context skipped", exc_info=True)
 
-    tools = _enabled_tool_records(vault)
+    from systemu.runtime import capability_view as _cv
+
+    tools, tool_catalog = _enabled_tool_records_witnessed(vault)
+    # `find_tools` is the lane's lookup affordance; a stored tool of that name can
+    # never shadow it (the v2 registry reserves the name against forging too).
+    tools = [t for t in tools if t.name != _cv.FIND_TOOLS_NAME]
     by_name = {t.name: t for t in tools}
-    index = _tool_index(tools)
+    candidates = _tool_index(tools)
+    tool_traits = {t.name: _cv.traits_from_tool(t) for t in tools}
 
     # W9.3: operator-enabled MCP connector tools join the surface (persisted
     # metadata only — no network at prompt-build); vault names take precedence.
     mcp_by_name: Dict[str, Dict[str, Any]] = {}
-    for entry in _mcp_quick_entries(vault, set(by_name)):
+    for entry in _mcp_quick_entries(vault, set(by_name) | {_cv.FIND_TOOLS_NAME}):
         mcp_by_name[entry["name"]] = entry
-        index.append({
+        tool_traits[entry["name"]] = _cv.traits_from_mcp(entry)
+        candidates.append({
             "name": entry["name"],
             "description": f"[connector] {entry.get('description', '')}",
             "parameter_names": [],
             "parameters_schema": dict(entry.get("schema") or {}),
         })
+    candidates.append(_cv.find_tools_record())
 
-    # R-CAP1 · CAP-4 — order the LLM-visible tool index most-relevant-first for
-    # THIS task (deterministic slot+lexical rank). NEVER-SUBTRACT: every tool
-    # keeps its full schema and stays in the list; only the order changes, so the
-    # model can still pick any tool. Defensive — a hiccup leaves the order as-is.
-    try:
-        from systemu.runtime import capability_index as _capidx
-        index = _capidx.order_records(index, prompt)
-    except Exception:
-        logger.debug("[QuickTask] capability ordering skipped", exc_info=True)
+    # R-CAP1 · CAP-4 — the selection view: the top-K records in full by the
+    # deterministic CAP-4 key, a one-line name+slot index for the rest, and
+    # `find_tools` for any of them. Only what is SHOWN changes: `by_name` /
+    # `mcp_by_name` (dispatch) still hold every enabled tool.
+    tool_view = _cv.build_view(candidates, prompt, catalog=tool_catalog,
+                               traits=tool_traits)
+    callable_names = set(by_name) | set(mcp_by_name)
 
     # Deliverables contract: mirror the sandbox's output_dir derivation
     # (config.output_dir or <vault>/output), pre-normalize write paths with
@@ -428,8 +495,9 @@ def run_quick_task(
                  "needs_input": "WARNING", "cancelled": "WARNING"}.get(
                      result.status, "ERROR")
         head = result.answer_md or result.question or result.error or ""
-        _publish(level, f"Quick task {result.status}: {prompt[:80]}",
-                 details={"summary": head[:1000],
+        from systemu.runtime.durable_redact import mask_text as _mask_text
+        _publish(level, f"Quick task {result.status}: {_mask_text(prompt, max_len=80)}",
+                 details={"summary": _mask_text(head, max_len=1000),
                           "output_dir": getattr(config, "output_dir", "") or "",
                           })
         return result
@@ -506,7 +574,7 @@ def run_quick_task(
             "iterations_left": max_iters - iteration,
             "final_turn": iteration >= max_iters,
             "plan": plan,
-            "tools": index,
+            **tool_view.payload_fields("tools", lookup=True),
             "history": history[-16:],
         }, default=str)
 
@@ -617,13 +685,31 @@ def run_quick_task(
             tool_name = str(action.get("tool") or "")
             params = action.get("params") if isinstance(action.get("params"), dict) else {}
             reasoning = str(action.get("reasoning") or "")
+            if tool_name == _cv.FIND_TOOLS_NAME:
+                # R-CAP1 · CAP-4c: a deterministic store lookup -- no sandbox, no
+                # gate, no LLM, not counted as a tool call. Its own history role
+                # keeps a tool LISTING out of the salvage path's "usable data".
+                lookup = _cv.find_tools_tool_result(
+                    vault, params, callable_names=callable_names, lane_extras=())
+                history.append({
+                    "role": "tool_lookup", "tool": _cv.FIND_TOOLS_NAME,
+                    "params": params, "success": bool(lookup.get("success")),
+                    "result": str(lookup.get("matches") or lookup.get("error")
+                                  or "")[:_FIND_TOOLS_RESULT_CHARS],
+                })
+                _publish("INFO" if lookup.get("success") else "WARNING",
+                         f"[{iteration}/{max_iters}] find_tools "
+                         f"{str(params.get('query') or '')[:60]!r} -> "
+                         f"{lookup.get('count', 0)} match(es)")
+                continue
             tool = by_name.get(tool_name)
             mcp_entry = mcp_by_name.get(tool_name) if tool is None else None
             if tool is None and mcp_entry is None:
                 history.append({
                     "role": "tool_result", "tool": tool_name, "success": False,
                     "error": (f"'{tool_name}' is an unknown or disabled tool — "
-                              f"choose from the provided tools list only."),
+                              f"choose from the provided tools / more_tools lists only."
+                              + _not_callable_hint(vault, tool_name)),
                 })
                 _publish("WARNING",
                          f"[{iteration}/{max_iters}] blocked call to unknown/disabled tool '{tool_name}'")
@@ -696,14 +782,17 @@ def run_quick_task(
                 "role": "tool_result", "tool": tool_name, "success": success,
                 "parsed": _clamp(parsed), "error": error,
             })
+            from systemu.runtime.durable_redact import mask_text as _mask_text
             _publish("INFO" if success else "WARNING",
                      f"[{iteration}/{max_iters}] {tool_name} → "
-                     + ("ok" if success else f"failed: {str(error)[:80]}"),
+                     + ("ok" if success else
+                        f"failed: {_mask_text(str(error), max_len=80)}"),
                      details={"reasoning": reasoning, "tool_params": params,
                               "tool_result": parsed})
 
             if success:
                 fail_streaks[tool_name] = 0
+                _audit_tool_success(vault, execution_id, tool_name, params, result)
                 try:
                     from systemu.runtime.artifacts import collect_artifact_paths
                     for path in collect_artifact_paths(tool_name, params, parsed):

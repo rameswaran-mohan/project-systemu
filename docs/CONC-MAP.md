@@ -86,6 +86,7 @@ multi-writer × missing-serialization.
 | **R-B1 table health tick** `table/items.json` (second trigger of the sole writer) | the daemon's `table_health` job (`scheduler/jobs._table_health_job` -> `table_reconciler.run_health_checks`, every `SYSTEMU_TABLE_HEALTH_MINUTES`, default 10) runs the credential-names backfill and then `reconcile_once` - the SAME single writer the 60s `table_reconciler` job drives, so `save_items` keeps exactly one caller. What is new is a second TRIGGER: two APScheduler pool threads can now reach that writer at once | **LOCK+A** (`table_reconciler._RECONCILE_LOCK` around `project()` + `save_items`, then the atomic write) | single writer, two triggers. The lock is load-bearing, not hygiene: each pass derives the whole file from the PREVIOUS snapshot (that is where an orphan's `broken_at` is remembered), so an overlapping pair would race one pass's snapshot read against the other's write, and on Windows the losing `os.replace` raises (pinned by a concurrency test). `project()` itself stays read-only and lock-free for the palette refresher and the /table page. The trigger set is pinned (`run_health_checks(` callers). NOT covered: a second daemon process (same exposure as every side-store here) | LOW |
 | **R-B1 credential names registry** `.credential_names.json` | `CredentialStore._record_name` / `_forget_name` (via `set` / `delete`: the NiceGUI settings handlers, the CLI) **plus** `CredentialStore.backfill_names` <- `table_reconciler.backfill_credential_names` <- the health tick on an APScheduler pool thread. NAMES only - a value is read in-frame to confirm a credential exists and is never written or logged | **LOCK+A** (`credentials.store._NAMES_LOCK` around every read-modify-write of the registry; `_write_names` is now tmp + `os.replace`) | genuinely multi-writer since R-B1: operator set/delete vs the BACKGROUND backfill. The lock is load-bearing: unlocked, a backfill that loaded the registry before a delete and wrote after it would put the deleted name back, and the table would show a removed credential as present (reproduced by a race test). The backfill also refuses to write through a registry it cannot read (it would replace every name in it). NOT covered: a second process (the CLI) racing the daemon - same exposure as every in-process lock here | LOW |
 | **T5 table-payoff record** `audit/table_payoff/run_<root>.jsonl` (+ derived lookup aliases `audit/table_payoff/alias/exec_<id>.txt` and `chat_<id>.txt`), under the audit data root `execution_snapshot.audit_data_root()` | **only** `table_payoff_record.record_binder_pass` <- `shadow_runtime._record_table_payoff`, called at the two requirement-binder call sites (the pre-loop producer `_populate_requirement_report` and the mid-loop TOOL_CALL binder) -> the shadow exec thread. One `consult` row per root run that had the table on hand (the inventory-hit DENOMINATOR) and one `supplied` row per requirement a table item supplied (item, value origin, prefilled_confirm vs silent, timestamp; never the value, its digest or the bound handle) | `APPEND` for the run file: process lock + best-effort OS lock on a SIDECAR `table_payoff/.lock`, read-dedupe-append under it, ONE `os.write` on an `O_APPEND` fd. `A` (tmp + `os.replace`) for the alias files, which are DERIVED (always the same root id) | keyed by the ROOT execution id, so a run, its resumes and its sub-agents share ONE file and are serialised by the lock; concurrent RUNS write different files. Readers are read-only and never lock a data file (a mandatory Windows byte lock on a data file would fail every concurrent reader, hence the sidecar): the Work / workflow-detail / chat chips via `find_run`, and the `debug avoidable-ask` table-payoff metric via `scan_records`, which COUNTS unreadable files instead of dropping them. **RETENTION: UNBOUNDED** -- no existing rule covers the audit data root (`vault.prune_old_executions` prunes `<vault>/executions/` only, `delete_snapshot` removes one resume snapshot, and DEC-28's audit-corpus rotation is not built in this tree); growth is one small file per root run that had the table on hand plus one alias per resumed execution or chat submission. NOT covered: a second daemon process beyond the best-effort OS lock (same exposure as the corpora above). Any further writer needs a DEC-10 review | LOW |
+| **P19 census consent -- dashboard surface** `census_consent.json` + `secrets/census_consent.epoch` (R-W2 / WM-7) | the SAME sole writers (`CensusConsentStore._write`, `_bump_consent_epoch`), now ALSO reached from the `/table` census panel (`interface/pages/table_census.py`, its declared region) through `ambient_census.revoke_category` / `pause_category` ONLY -- never `grant_category` (grant stays CLI-only; pinned by `tests/test_p19_census_grant_is_cli_only.py`) -- each run in a `run.io_bound` worker thread of the DAEMON process | **LOCK+A** (unchanged) | no new writer and no new tick: the `CensusConsentStore(` allowlist stays `{runtime/ambient_census.py}`. The panel runs in the same process as `run_census`'s `mark_ran`, so `_CONSENT_LOCK` DOES serialise panel-vs-run (the CLI path is a separate process and is not covered by that lock -- the existing documented exposure). The exact set of references to every consent writer is pinned by `tests/test_p19_census_consent_writer_set.py` | LOW |
 
 The **★ pinned single/known-writer stores** (ExecutionSnapshot, OnTheTable, fatigue-metrics
 resolution side, R-P1 audit) are enforced by the test. The atomic-write invariant is enforced on
@@ -177,6 +178,40 @@ via `cancelled_run_coordinates`. A
 damaged file reads as empty (logged WARNING) and is replaced whole by the next cancel. NOT covered: a
 second process writing the same file (none today) — a new writer outside the daemon needs a DEC-10
 review. Risk LOW.
+**P28 stopped-run handoff** `<root>/stopped_runs.json` — writers: **only**
+`run_lineage.record_stopped_run` (called from `ShadowRuntime.execute` when a `PendingOperatorDecision`
+unwinds the run) and `run_lineage.claim_stopped_run` (called at the start of the next
+`ShadowRuntime.execute` of the same activity; it REMOVES the entry it takes) → home thread: the run's
+own thread (a supervisor worker, or the chat lane's run thread); daemon process. Ser.: **LOCK+A** —
+`run_lineage._STOPPED_RUNS_LOCK` around each whole read-modify-write, then tmp + `os.replace`. One entry
+per activity (the newest stop wins); RETENTION `STOPPED_RUNS_RETENTION` (500) activities; an entry older
+than `TYPED_APPROVAL_TTL_SECONDS` is dropped when claimed. Reader: the MCP gate only, indirectly — the
+claimed ids ride the run's lineage contextvar and decide nothing but whether a typed one-shot approval
+of an R1 MCP card serves this run. A damaged file reads as empty (logged WARNING; fail-closed: no
+handoff, so the re-run asks again) and is replaced whole by the next stop. NOT covered: a second
+process (`systemu run` in a separate process) racing the daemon on the same vault — the worst case is a
+lost handoff (asks again) or a handoff claimed by the other process's run of the same activity within
+the TTL. Risk LOW.
+
 Second reader of the IMPL-11 cancelled-run marker: `jobs.reconcile_resolved_harness_grants` (same
 APScheduler thread), consulted before any `Governor.grant`; a refused card gets the same
 `context["resume_refused"] = "run cancelled"` stamp (never `harness_grant_dispatched`).
+
+## R-P3b — the action audit (`audit/actions.jsonl`) and the chat lane
+
+**R-P3b action audit** `<vault root>/audit/actions.jsonl` (file backend; the sqlite /
+postgres backends route the same entry to their `action_audit` table) — the ledger's effect-row
+source. Writers, all through `Vault.append_action_audit` (directly, or via the single helper
+`audit_log.append_action`): the workflow loop's per-call row (`shadow_runtime`, shadow exec
+thread); the action-tool hook (`tool_sandbox._after_successful_call`, the same thread, and the
+per-call row skips its write when the hook already wrote the call's row, so one row per
+execution); **the chat lane** (`quick_task._audit_tool_success`, the submitting task's worker
+thread; added by R-P3b so chat actions reach the ledger); and the compliance export's own event
+row (`ledger_export._record_export_event`, dashboard thread). Every writer masks parameters
+BEFORE the write (DEC-31: the per-call row's `_truncate_audit_params`). Ser.: `APPEND` (a buffered
+`open(.., "a")` + one `write` per row; no lock). Concurrent runs (workflow + chat) are concurrent
+appenders. **Guaranteed:** a row is never torn by another writer's row on the file backend under
+light load. **NOT guaranteed:** no lost rows under contention: a buffered append is not loss-free
+(the measurement on `ask_avoidable.jsonl` above lost ~4% of rows), and nothing here serialises
+the appends. RETENTION: UNBOUNDED (no rule prunes `audit/`). Risk MED (a compliance source that
+can silently lose a row under concurrent runs). Any further writer needs a DEC-10 review.

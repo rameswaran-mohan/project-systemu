@@ -19,6 +19,8 @@ Wave-1 scope (this file):
     money-move.
   * :func:`_mask_evidence` — key-targeted + value-regex secret redaction so no
     header/cookie/token/storage_state material is ever stored or logged (§5.8 AC).
+    Its value pass ends in the shared span primitive
+    (``messaging.gateway.mask_secret_spans``), imported lazily at call time.
 
 Import discipline (mirrors effect_tags.py): this module imports only
 ``systemu.core.models.ExternalEvidence``, ``systemu.runtime.effect_tags``, and
@@ -93,10 +95,26 @@ _VALUE_SECRET_PATTERNS: "list[re.Pattern]" = [
 
 
 def _scrub_value_shapes(text: str) -> str:
-    """Replace any known secret-shaped substring with the redaction marker."""
+    """Replace any known secret-shaped substring with the redaction marker, then
+    run the tree's shared span primitive (``gateway.mask_secret_spans``).
+
+    The patterns above are this mask's own extras (GitLab, the wider AWS key
+    family, 32+ hex). Everything the outbound push already knows -- the
+    credential after ``Authorization: Basic`` / ``Token`` / any listed scheme,
+    ``password=...`` pairs in running text, a URL's userinfo password -- comes
+    from the primitive, called rather than copied, so the per-call audit row and
+    the ledger can never fall behind the push again. Those spans come out as
+    ``***``; this mask's own patterns still emit ``[REDACTED]``.
+
+    RAISES if the primitive cannot be reached or throws: ``_mask_evidence``
+    turns that into its fail-safe marker, ``_mask_evidence_strict`` lets the
+    durable writers drop and name the value (DEC-27). The import is lazy, so
+    this module still imports nothing outside its foundational set.
+    """
     for pat in _VALUE_SECRET_PATTERNS:
         text = pat.sub(_REDACTED, text)
-    return text
+    from systemu.messaging.gateway import mask_secret_spans
+    return mask_secret_spans(text)
 
 
 def _key_is_secret(key: Any) -> bool:
@@ -114,30 +132,51 @@ def _mask_evidence(ev: Any) -> Any:
       2. Value backstop: every surviving string value is scanned for known secret
          SHAPES (Bearer …, sk-…, ghp_…, glpat-…, xox…-) and those substrings are
          scrubbed — so a secret leaked under a neutral key (e.g. a response body)
-         is still removed.
+         is still removed — and then through the shared span primitive
+         (``Authorization: Basic …``, ``Token …``, URL userinfo, kv pairs).
 
     Never raises; returns a new structure (does not mutate the input). Non-secret
     scalars pass through unchanged.
     """
     try:
-        if isinstance(ev, Mapping):
-            out = {}
-            for k, v in ev.items():
-                if _key_is_secret(k):
-                    out[k] = _REDACTED
-                else:
-                    out[k] = _mask_evidence(v)
-            return out
-        if isinstance(ev, (list, tuple)):
-            return [_mask_evidence(x) for x in ev]
-        if isinstance(ev, str):
-            return _scrub_value_shapes(ev)
-        # int / float / bool / None / other scalars: nothing to redact
-        return ev
+        return _mask_level(ev, _mask_evidence)
     except Exception:
         # a redaction failure must fail SAFE — return the marker, never the raw ev.
         logger.debug("[ExternalVerifier] _mask_evidence failed — returning marker", exc_info=True)
         return _REDACTED
+
+
+def _mask_evidence_strict(ev: Any) -> Any:
+    """:func:`_mask_evidence`'s two layers, but a failure RAISES instead of
+    returning ``[REDACTED]``.
+
+    ``_mask_evidence`` answers a redaction failure with the same marker a
+    successful redaction emits, so its caller cannot tell "masked" from "never
+    looked". A durable writer must be able to (DEC-27: a value that could not be
+    redacted is dropped and NAMED as unredactable), so
+    ``runtime.durable_redact`` calls this one and catches. Same traversal, same
+    vocabulary: :func:`_mask_level` is the one body both recurse through.
+    """
+    return _mask_level(ev, _mask_evidence_strict)
+
+
+def _mask_level(ev: Any, recurse: Callable[[Any], Any]) -> Any:
+    """One level of the evidence mask. ``recurse`` handles the children, and so
+    decides whether a child's failure is caught there or propagates."""
+    if isinstance(ev, Mapping):
+        out = {}
+        for k, v in ev.items():
+            if _key_is_secret(k):
+                out[k] = _REDACTED
+            else:
+                out[k] = recurse(v)
+        return out
+    if isinstance(ev, (list, tuple)):
+        return [recurse(x) for x in ev]
+    if isinstance(ev, str):
+        return _scrub_value_shapes(ev)
+    # int / float / bool / None / other scalars: nothing to redact
+    return ev
 
 
 # ─────────────────────────────────────────────────────────────────────────────

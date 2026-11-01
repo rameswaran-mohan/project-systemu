@@ -764,3 +764,47 @@ def test_impl11_cancelled_run_marker_is_locked_atomic_and_bounded():
     body = body[:body.index("\ndef ")]
     assert "with _CANCELLED_RUNS_LOCK:" in body and "os.replace(" in body
     assert "CANCELLED_RUNS_RETENTION" in body
+
+
+# --- R-P3b action audit (appended) ---------------------------------------------
+# The ledger's effect-row source gained a writer (the chat lane). Same two-way binding
+# as the blocks above, kept out of the parametrized dict for the same reason. Two call
+# shapes reach the store: the helper `audit_log.append_action(` and a direct
+# `append_action_audit(` (the workflow loop's per-call row). The backend dispatch
+# layers under storage/ and vault/ only ROUTE an entry they are handed, so they are
+# excluded from the direct-call writer set.
+_RP3B_ACTION_AUDIT = {
+    "helper_call": "append_action(",
+    "helper_allowed": {"runtime/tool_sandbox.py",      # the action-tool hook
+                       "runtime/ledger_export.py",     # the export's own event row
+                       "pipelines/quick_task.py"},     # the chat lane (R-P3b)
+    "helper_def": "runtime/audit_log.py",
+    "direct_call": "append_action_audit(",
+    "direct_allowed": {"runtime/audit_log.py",          # the helper itself
+                       "runtime/shadow_runtime.py"},    # the per-call row
+    "direct_def": "vault/vault.py",
+    "conc_map_row": "**R-P3b action audit** `<vault root>/audit/actions.jsonl`",
+}
+
+
+def test_rp3b_action_audit_writer_sets_match_conc_map():
+    helper = _caller_files(_RP3B_ACTION_AUDIT["helper_call"], scan_root=_SYSTEMU,
+                           def_file=_RP3B_ACTION_AUDIT["helper_def"])
+    assert helper == _RP3B_ACTION_AUDIT["helper_allowed"], (
+        f"action-audit helper writers changed: {sorted(helper)} -- update "
+        f"docs/CONC-MAP.md and run the DEC-10 review")
+    direct = {f for f in _caller_files(_RP3B_ACTION_AUDIT["direct_call"],
+                                       scan_root=_SYSTEMU,
+                                       def_file=_RP3B_ACTION_AUDIT["direct_def"])
+              if not f.startswith(("storage/", "vault/"))}
+    assert direct == _RP3B_ACTION_AUDIT["direct_allowed"], (
+        f"direct action-audit writers changed: {sorted(direct)} -- update "
+        f"docs/CONC-MAP.md and run the DEC-10 review")
+
+
+def test_rp3b_action_audit_has_exactly_one_conc_map_row_that_names_its_limits():
+    text = _CONC_MAP.read_text(encoding="utf-8", errors="replace")
+    assert text.count(_RP3B_ACTION_AUDIT["conc_map_row"]) == 1
+    section = text[text.index(_RP3B_ACTION_AUDIT["conc_map_row"]):][:2600]
+    assert "APPEND" in section and "RETENTION: UNBOUNDED" in section
+    assert "NOT guaranteed" in section and "DEC-31" in section

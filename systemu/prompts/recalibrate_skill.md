@@ -62,7 +62,7 @@ You re-author the `instructions_md` body of a Skill that was implicated in a fai
 
 1. The `new_instructions_md` MUST be 3–6 numbered or bulleted steps.  Each step names the tool used and what its output is.
 2. NEVER write a step that says "open <app>" or "click <button>" or "press <key>".  Steps must be outcome-described.
-3. `new_required_tool_names` must be a subset of `current_tool_catalog` tool names — do not invent new tools (forging is a separate stage).
+3. `new_required_tool_names` must be a subset of the tool names in `current_tool_catalog` plus any listed in `more_tools` (the remaining existing tools, shown by name + capability slot only) — do not invent new tools (forging is a separate stage).
 4. Set `destructive_risk="high"` if the new body introduces operations like sending email, posting messages, deleting files, executing arbitrary commands.  Set `side_effects_introduced` accordingly.
 5. `confidence="high"` only when (a) the failure has a clear root cause, (b) the current catalog has tools whose schemas obviously fix it, and (c) no destructive operations are introduced.
 6. Return ONLY the JSON object.

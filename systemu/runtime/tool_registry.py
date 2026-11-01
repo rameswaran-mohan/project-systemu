@@ -416,6 +416,91 @@ def _reconcile_params(run_fn, params):
     return recognized, notes
 
 
+class SealedCallKwargs(dict):
+    """P23: the EXACT keyword arguments a gate scored for one call.
+
+    ``ToolSandbox.execute_tool`` builds one before its gates (see
+    :meth:`ToolRegistry.seal_call`); the gates read the command from it, and
+    :meth:`ToolRegistry.execute` passes it to ``run()`` VERBATIM -- it is never
+    reconciled again. Re-deriving the arguments at execution time could map a
+    value the gate never scored onto the slot the body executes (the body may
+    have changed since, or the derivation may differ); consuming the sealed value
+    cannot. Recognised by exact type (DEC-36), never by duck typing.
+
+    P28: EVERY call ``execute_tool`` makes is sealed (no longer only the shell and
+    target-gated tools), so the per-tool gate scores, signs and shows this value
+    too. ``presented`` is a plain copy of the parameters as the model wrote them,
+    before reconciliation, kept for exactly two readers that can only REFUSE or
+    REPORT: the registry's schema check (Gate 2.5 validates the sealed value AND
+    the call as written) and the gate's note that a one-shot record minted against
+    the parameters as written does not carry over. Nothing decides a PASS on it.
+    """
+
+    __slots__ = ("presented",)
+
+
+def presented_params(call: Any) -> Optional[dict]:
+    """P28: the parameters as written for a sealed call (a plain dict copy), or
+    None -- for anything that is not exactly a :class:`SealedCallKwargs`, or one
+    sealed without them. Never raises."""
+    if type(call) is not SealedCallKwargs:
+        return None
+    try:
+        got = call.presented
+    except AttributeError:
+        return None
+    return dict.copy(got) if type(got) is dict else None
+
+
+def _static_run_signature(path: Path):
+    """The signature of the module-level ``def run`` in ``path``, read from its
+    SOURCE -- the module is never imported, so no module-level code runs before
+    the gates. ``None`` when it cannot be read plainly: no file, a syntax error,
+    no single undecorated top-level ``def run``, or any other binding of ``run``.
+
+    Only the parameter NAMES and KINDS are read (all ``_reconcile_params`` uses).
+    A wrong answer here can only make a call FAIL, never run something unscored:
+    the result is sealed and execution passes it to the real ``run()`` verbatim.
+    """
+    import ast
+    import inspect
+
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    defs = [s for s in tree.body
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == "run"]
+    if len(defs) != 1 or not isinstance(defs[0], ast.FunctionDef) or defs[0].decorator_list:
+        return None
+    fn = defs[0]
+    for node in ast.walk(tree):
+        if node is fn:
+            continue
+        if isinstance(node, ast.Name) and node.id == "run" and not isinstance(node.ctx, ast.Load):
+            return None
+        if isinstance(node, ast.alias) and (node.asname or node.name) == "run":
+            return None
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and "run" in node.names:
+            return None
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.name == "run"):
+            return None     # conservative: any other def/class named run
+    P = inspect.Parameter
+    a = fn.args
+    params = [P(x.arg, P.POSITIONAL_ONLY) for x in a.posonlyargs]
+    params += [P(x.arg, P.POSITIONAL_OR_KEYWORD) for x in a.args]
+    if a.vararg is not None:
+        params.append(P(a.vararg.arg, P.VAR_POSITIONAL))
+    params += [P(x.arg, P.KEYWORD_ONLY) for x in a.kwonlyargs]
+    if a.kwarg is not None:
+        params.append(P(a.kwarg.arg, P.VAR_KEYWORD))
+    try:
+        return inspect.Signature(params)
+    except (ValueError, TypeError):
+        return None
+
+
 class ToolRegistry:
     """Dynamic importer + direct-call dispatcher.
 
@@ -481,6 +566,38 @@ class ToolRegistry:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def seal_call(self, name: str, params) -> SealedCallKwargs:
+        """P23: the EXACT kwargs :meth:`execute` will pass to ``run()`` for this
+        call, sealed. A gate scores this value and execution consumes it unchanged.
+
+        Reconciled against the ``run()`` this registry will call: the loaded
+        module's when it is cached, otherwise the signature read from the source
+        file :meth:`_load` imports (never imported here -- no tool code runs before
+        the gates). When neither can be read the parameters are sealed as given,
+        unreconciled; a mismatch then fails the call, it never re-maps it."""
+        if not isinstance(params, dict):
+            return SealedCallKwargs()
+        raw = dict.copy(params)
+        mod = self._modules.get(name)
+        run_fn = getattr(mod, "run", None) if mod is not None else None
+        if run_fn is None:
+            sig = _static_run_signature(self._dir / f"{name}.py")
+            if sig is not None:
+                def run_fn(*_a, **_k):  # noqa: E306 -- a signature carrier only
+                    raise AssertionError("signature stub is never called")
+                run_fn.__signature__ = sig
+        if run_fn is None:
+            out = SealedCallKwargs(raw)
+            out.presented = dict.copy(raw)
+            return out
+        sealed, notes = _reconcile_params(run_fn, raw)
+        if notes:
+            logger.info("[Registry] reconciled params for '%s' (sealed): %s",
+                        name, "; ".join(notes))
+        out = SealedCallKwargs(sealed)
+        out.presented = dict.copy(raw)
+        return out
+
     async def execute(
         self,
         name: str,
@@ -505,7 +622,18 @@ class ToolRegistry:
         )
         # ── Gate 2.5 (v0.8.19): validate params against the declared schema ──
         from systemu.runtime.param_validation import validate_params
-        _perr = validate_params(getattr(tool, "parameters_schema", {}) or {}, params or {})
+        # P23: the value that RUNS is validated (its types are what ``run()`` gets).
+        # P28: now that EVERY call is sealed, the parameters as the model WROTE them
+        # are validated alongside: a key reconciliation renamed or dropped is still
+        # type-checked, and a schema-required name the model sent is still present
+        # (a forged spec may name ``output_path`` while its body takes ``path``). The
+        # sealed value wins wherever both carry a key. This check can only refuse;
+        # what runs is the sealed value, verbatim.
+        _as_written = presented_params(params)
+        _checked = dict.copy(params) if isinstance(params, dict) else {}
+        if _as_written is not None:
+            _checked = {**_as_written, **_checked}
+        _perr = validate_params(getattr(tool, "parameters_schema", {}) or {}, _checked)
         if _perr:
             return {"success": False, "error_type": "tool_param_invalid",
                     "error": ("Invalid parameters for '" + name + "': " + "; ".join(_perr)
@@ -533,6 +661,17 @@ class ToolRegistry:
             }
 
         # ── Gate 4 (v0.8.18): required credentials must be available ───────
+        # R-4: a tool that declares a RESERVED credential (a name the runtime or
+        # the interpreter reads as configuration; quarantined on load) is refused
+        # here, and the refusal says why. Nothing is prompted for or promoted.
+        _refusals = getattr(tool, "credential_refusals", None) or []
+        if _refusals:
+            return {
+                "success": False,
+                "error_type": "tool_credential_reserved",
+                "error": (f"Tool '{name}' cannot run: " + "; ".join(_refusals)
+                          + ". Re-forge the tool without that credential."),
+            }
         reqs = getattr(tool, "requires_credentials", None) or []
         if reqs:
             from systemu.runtime.credentials.resolver import CredentialResolver
@@ -556,8 +695,14 @@ class ToolRegistry:
         mod = load_result
 
         # ── Call run(**params) in thread pool ──────────────────────────────
+        # P23: a SEALED call is the value a gate scored -- passed verbatim, never
+        # reconciled again (see SealedCallKwargs). Decided once, here, by exact type.
+        _sealed = dict.copy(params) if type(params) is SealedCallKwargs else None
+
         def _call(_mod) -> dict:
             try:
+                if _sealed is not None:
+                    return _mod.run(**_sealed)
                 # v0.9.6: reconcile supplied param names onto run()'s real
                 # signature. LLM/forge naming drift (path vs output_path) would
                 # otherwise raise TypeError here and park the whole run.

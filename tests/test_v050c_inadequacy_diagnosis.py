@@ -92,7 +92,7 @@ class TestDiagnosisLLM:
         config.openrouter_api_key = "test"
         config.tier1_model = "test"
 
-        def fake_llm(*, tier, system, user, config, temperature, max_tokens):
+        def fake_llm(*, tier=None, system, user, config, temperature, max_tokens, **kw):
             return {
                 "recalibration_mode": "bump_version",
                 "rationale": "Missing error handling affects all callers",

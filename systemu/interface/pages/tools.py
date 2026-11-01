@@ -694,7 +694,9 @@ def _resolve_forge_gate_silently(tool_id: str, vault, *, choice: str) -> None:
         match = next(
             (d for d in queue.list_pending() if d.dedup_key == dedup), None)
         if match is not None:
-            queue.resolve(match.id, choice=choice)
+            from systemu.approval.decision_queue import resolution_channel as _via
+            with _via("dashboard"):
+                queue.resolve(match.id, choice=choice)
     except Exception:
         logger.debug("[Tools UI] forge gate cleanup skipped", exc_info=True)
 

@@ -50,6 +50,11 @@ from systemu.interface import consent_prompt
 # would make the CLI name a button the card does not offer.
 from systemu.interface.command.gate import RECLASSIFY_OPTION
 
+# P21: every command in this module carries ONE access classification -- see
+# sharing_on/cli_access.py. The agent's shell is fenced off the operator-only ones
+# (systemu/runtime/operator_cli_fence.py).
+from sharing_on.cli_access import agent_safe, operator_only
+
 console = Console()
 
 
@@ -96,6 +101,24 @@ def _get_vault_and_config(ctx: click.Context):
 
 # ── v0.8.0 Pattern 1 — Pending-decision exit wrapper ─────────────────────────
 
+def _verification_block(badge) -> str:
+    """DEC-13: a run's minted verification badge for a Rich panel -- one line, and
+    for a handoff or a failure the committed-effects list, each effect badged
+    (IMPL-7). Text comes from the mint's display helpers (masked, ASCII) and is
+    escaped so a ``[Label]`` never reads as Rich markup. ``""`` for no outcome."""
+    from rich.markup import escape
+    from systemu.runtime import verification_badge as vb
+    text = vb.badge_text(badge)
+    if not text:
+        return ""
+    out = "\n[bold]Verification:[/bold] " + escape(text)
+    if vb.view(badge).state in (vb.HANDOFF, vb.FAILED):
+        lines = vb.effect_lines(badge)
+        if lines:
+            out += "\n[bold]Committed so far:[/bold]\n" + "\n".join(escape(x) for x in lines)
+    return out
+
+
 def _handle_pending_decision_or_run(ctx, work):
     """Run ``work()`` and translate ``PendingOperatorDecision`` into a clean
     exit-75 (EX_TEMPFAIL) with an operator-friendly message.
@@ -130,11 +153,13 @@ def _handle_pending_decision_or_run(ctx, work):
 #  scrolls group
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("scrolls")
 def scrolls_group():
     """Manage Scrolls -- refined SOPs extracted from capture sessions."""
 
 
+@agent_safe
 @scrolls_group.command("list")
 @click.option("--status", "-s", default=None, help="Filter by status (e.g. pending_approval).")
 @click.pass_context
@@ -167,6 +192,7 @@ def scrolls_list(ctx, status: Optional[str]):
     console.print(table)
 
 
+@agent_safe
 @scrolls_group.command("show")
 @click.argument("scroll_id")
 @click.pass_context
@@ -209,6 +235,7 @@ def scrolls_show(ctx, scroll_id: str):
         console.print(table)
 
 
+@operator_only
 @scrolls_group.command("refine")
 @click.argument("session_dir", type=click.Path(exists=True, file_okay=False))
 @click.option("--auto", is_flag=True, help="Auto-approve the scroll (skip user prompt).")
@@ -307,6 +334,7 @@ def scrolls_refine(ctx, session_dir: str, auto: bool):
     _handle_pending_decision_or_run(ctx, _refine_work)
 
 
+@operator_only
 @scrolls_group.command("approve")
 @click.argument("scroll_id")
 @click.pass_context
@@ -331,11 +359,13 @@ def scrolls_approve(ctx, scroll_id: str):
 #  army group
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("army")
 def army_group():
     """Manage the Shadow Army -- autonomous agent personas."""
 
 
+@agent_safe
 @army_group.command("list")
 @click.option("--status", "-s", default=None, help="Filter by status.")
 @click.pass_context
@@ -368,6 +398,7 @@ def army_list(ctx, status: Optional[str]):
     console.print(table)
 
 
+@agent_safe
 @army_group.command("show")
 @click.argument("shadow_id")
 @click.pass_context
@@ -398,11 +429,13 @@ def army_show(ctx, shadow_id: str):
 #  tools group
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("tools")
 def tools_group():
     """Manage the Tool registry."""
 
 
+@agent_safe
 @tools_group.command("list")
 @click.option("--status", "-s", default=None, help="Filter by status (proposed/forged/deployed).")
 @click.pass_context
@@ -479,11 +512,13 @@ def tools_list(ctx, status: Optional[str]):
 #  skills group
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("skills")
 def skills_group():
     """Manage the Skills registry (Agent Skills Standard)."""
 
 
+@operator_only
 @skills_group.command("deprecate")
 @click.argument("skill_id")
 @click.option(
@@ -528,6 +563,7 @@ def skills_deprecate(ctx, skill_id, reason, reactivate):
     )
 
 
+@operator_only
 @skills_group.command("export")
 @click.argument("skill_id")
 @click.option(
@@ -561,6 +597,7 @@ def skills_export(ctx, skill_id: str, output: Path) -> None:
     click.echo(f"Exported {skill_id} -> {out}")
 
 
+@agent_safe
 @skills_group.command("list")
 @click.option("--category", "-c", default=None, help="Filter by category.")
 @click.pass_context
@@ -683,6 +720,7 @@ def _settings_show_body(ctx):
         config, cache_ttl_s=_ps.PROBE_CACHE_TTL_S))
 
 
+@agent_safe
 @click.group("settings", invoke_without_command=True)
 @click.pass_context
 def settings_cmd(ctx):
@@ -694,6 +732,7 @@ def settings_cmd(ctx):
         _settings_show_body(ctx)
 
 
+@agent_safe
 @settings_cmd.command("show")
 @click.pass_context
 def settings_show_cmd(ctx):
@@ -716,6 +755,7 @@ def _gate_mode_posture_refusal(proposed: dict, confirm) -> str:
                                   how=f'with --confirm "{phrase}"')
 
 
+@operator_only
 @settings_cmd.command("set")
 @click.argument("key")
 @click.argument("value")
@@ -758,6 +798,7 @@ def settings_set_cmd(ctx, key: str, value: str, as_json: bool, confirm):
 #  Phase S2 — tools forge
 # ─────────────────────────────────────────────────────────────────────────────
 
+@operator_only
 @tools_group.command("forge")
 @click.option("--name", "-n", required=True, help="Tool name to forge (snake_case).")
 @click.option("--context", "-c", default="", help="Context hint describing what the tool should do.")
@@ -785,6 +826,7 @@ def tools_forge(ctx, name: str, context: str):
 #  tools dry-run — manual single-tool dry-run advance (v0.7.4 Pattern 2)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@operator_only
 @tools_group.command("dry-run")
 @click.argument("tool_id")
 @click.pass_context
@@ -846,6 +888,7 @@ def tools_dryrun(ctx, tool_id: str):
 #  tools enable — Gate-3 enable via the shared command layer (Phase 2 Task 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@operator_only
 @tools_group.command("enable")
 @click.argument("tool_id")
 @click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
@@ -868,6 +911,7 @@ def tools_enable_cmd(ctx, tool_id: str, as_json: bool):
 #  dispatch-routing decision is deferred to a later coherence pass.
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @tools_group.command("show")
 @click.argument("tool_id")
 @click.option("--json", "as_json", is_flag=True, help="Emit the structured result as JSON.")
@@ -884,6 +928,7 @@ def tools_show_cmd(ctx, tool_id: str, as_json: bool):
     ctx.exit(result.exit_code)
 
 
+@operator_only
 @tools_group.command("recalibrate")
 @click.argument("tool_id")
 @click.option("--reason", "-r", required=True, help="Why this tool is being recalibrated.")
@@ -905,6 +950,7 @@ def tools_recalibrate_cmd(ctx, tool_id: str, reason: str, as_json: bool):
 #  tools diff — approved state vs what is on disk now (read-only)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @tools_group.command("diff")
 @click.argument("tool", required=False)
 @click.option("--json", "as_json", is_flag=True,
@@ -976,6 +1022,7 @@ def tools_diff_cmd(ctx, tool: Optional[str], as_json: bool, pending: bool):
 #    4. Operator: `sharing_on tools deps approve python-docx`
 #    5. Next shadow run: registry self-heals, installs, retries import.
 
+@agent_safe
 @tools_group.group("deps")
 def tools_deps_group():
     """Operator allow-list for tool pip dependencies."""
@@ -992,6 +1039,7 @@ def _deps_store():
     return DepApprovalStore(_P("data") / "dep_approvals.json")
 
 
+@agent_safe
 @tools_deps_group.command("list")
 @click.option("--show-pending/--no-show-pending", default=True,
               help="Include pending (unapproved) packages.")
@@ -1041,6 +1089,7 @@ def tools_deps_list(show_pending: bool):
         console.print("[dim]No pending dependencies.[/dim]")
 
 
+@operator_only
 @tools_deps_group.command("approve")
 @click.argument("package")
 @click.option("--tool-id", default=None, help="Originating tool id (for audit).")
@@ -1061,6 +1110,7 @@ def tools_deps_approve(package: str, tool_id: Optional[str], by: str):
         console.print(f"[yellow]'{package}' was already approved — no change.[/yellow]")
 
 
+@operator_only
 @tools_deps_group.command("revoke")
 @click.argument("package")
 def tools_deps_revoke(package: str):
@@ -1077,6 +1127,7 @@ def tools_deps_revoke(package: str):
         console.print(f"[yellow]'{package}' was not approved — nothing to revoke.[/yellow]")
 
 
+@agent_safe
 @tools_deps_group.command("doctor")
 @click.pass_context
 def tools_deps_doctor(ctx):
@@ -1113,6 +1164,7 @@ def tools_deps_doctor(ctx):
     _sys.exit(1)
 
 
+@operator_only
 @tools_deps_group.command("sync")
 @click.option("--dry-run", is_flag=True, help="Show what would be installed without doing it.")
 @click.pass_context
@@ -1175,6 +1227,7 @@ def tools_deps_sync(ctx, dry_run: bool):
 #  Phase S2 — army awaken + execute
 # ─────────────────────────────────────────────────────────────────────────────
 
+@operator_only
 @army_group.command("awaken")
 @click.option("--name", "-n", required=True, help="Name for the new Shadow.")
 @click.option("--activity", "-a", default=None, help="Activity ID to assign immediately.")
@@ -1234,6 +1287,7 @@ def army_awaken(ctx, name: str, activity: Optional[str],
     console.print(f"\n[green]✓ Shadow '[bold]{shadow.name}[/bold]' awakened ({shadow.id})[/green]")
 
 
+@operator_only
 @army_group.command("execute")
 @click.argument("shadow_id")
 @click.argument("scroll_id")
@@ -1304,12 +1358,17 @@ def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool, origin: str
     summary = result.get("summary", "")
     error   = result.get("error")
 
+    # DEC-13: how far the reported outcome is confirmed -- the ONE mint's value.
+    from systemu.runtime import verification_badge as vb
+    _badge = vb.run_badge(status, result.get("execution_id"))
+
     status_colour = {"success": "green", "failure": "red", "partial": "yellow"}.get(status, "white")
     console.print(Panel(
         f"[bold]Status:[/bold]      [{status_colour}]{status.upper()}[/{status_colour}]\n"
         f"[bold]Summary:[/bold]     {summary}\n"
         f"[bold]Snapshots:[/bold]   {result.get('snapshots_taken', 0)}\n"
-        f"[bold]Events:[/bold]      {result.get('total_events', 0)}\n"
+        f"[bold]Events:[/bold]      {result.get('total_events', 0)}"
+        + _verification_block(_badge) + "\n"
         + (f"\n[red]Error:[/red] {error}" if error else ""),
         title="📋 Execution Result",
         border_style=status_colour,
@@ -1321,11 +1380,13 @@ def army_execute(ctx, shadow_id: str, scroll_id: str, dry_run: bool, origin: str
 #  Phase S2 — evolve
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("evolve")
 def evolve_group():
     """Run the Evolution Engine or view pending evolution proposals."""
 
 
+@operator_only
 @evolve_group.command("run")
 @click.pass_context
 def evolve_run(ctx):
@@ -1338,6 +1399,7 @@ def evolve_run(ctx):
     console.print(f"\n[green]✓ Evolution check complete — {len(proposals)} proposals.[/green]")
 
 
+@agent_safe
 @evolve_group.command("show-pending")
 @click.pass_context
 def evolve_show_pending(ctx):
@@ -1368,6 +1430,7 @@ def evolve_show_pending(ctx):
     console.print(table)
 
 
+@operator_only
 @evolve_group.command("apply")
 @click.argument("evolution_id")
 @click.pass_context
@@ -1388,11 +1451,13 @@ def evolve_apply(ctx, evolution_id: str):
 #  Phase S2 — chat
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("chat")
 def chat_group():
     """Direct chat tasks -- skip the capture/record flow."""
 
 
+@operator_only
 @chat_group.command("submit")
 @click.argument("prompt")
 @click.pass_context
@@ -1427,6 +1492,10 @@ def chat_submit(ctx, prompt: str):
     status  = entry.get("status", "unknown")
     exec_id = entry.get("execution_id", "—")
 
+    # DEC-13: how far the reported outcome is confirmed -- the ONE mint's value.
+    from systemu.runtime import verification_badge as vb
+    _badge = vb.run_badge(status, entry.get("execution_id"))
+
     status_colour = {"success": "green", "partial": "yellow", "failed": "red"}.get(
         status, "white"
     )
@@ -1434,12 +1503,14 @@ def chat_submit(ctx, prompt: str):
         f"[bold]Activity:[/bold]  {activity.name}\n"
         f"[bold]Status:[/bold]    [{status_colour}]{status.upper()}[/{status_colour}]\n"
         f"[bold]Shadow:[/bold]    {entry.get('shadow_id', '—')}\n"
-        f"[bold]Execution:[/bold] {exec_id}",
+        f"[bold]Execution:[/bold] {exec_id}"
+        + _verification_block(_badge),
         title="💬 Chat Task Result",
         border_style=status_colour,
     ))
 
 
+@agent_safe
 @chat_group.command("history")
 @click.option("--limit", "-n", default=20, show_default=True)
 @click.pass_context
@@ -1452,16 +1523,26 @@ def chat_history(ctx, limit: int):
         console.print("[dim]No chat history yet.[/dim]")
         return
 
+    from rich.markup import escape as _escape
+    from systemu.runtime import verification_badge as vb
+
     table = Table(title="💬 Chat History", show_lines=True)
     table.add_column("Time",    style="dim",    no_wrap=True)
     table.add_column("Prompt",  style="bold",   max_width=60)
     table.add_column("Status",  style="yellow")
+    # DEC-13: the ONE mint's badge per task; blank only while it claims no outcome.
+    table.add_column("Verification")
     table.add_column("Shadow",  style="cyan",   no_wrap=True)
 
     for e in reversed(entries):
         ts    = e.get("ts", "")[:19].replace("T", " ")
         ptext = e.get("prompt", "")[:58] + ("…" if len(e.get("prompt", "")) > 58 else "")
-        table.add_row(ts, ptext, e.get("status", "?"), e.get("shadow_id", "—")[:14] or "—")
+        try:
+            _badge = vb.run_badge(e.get("status"), e.get("execution_id"))
+        except Exception:
+            _badge = None               # not a minted value: renders "Not recorded"
+        table.add_row(ts, ptext, e.get("status", "?"), _escape(vb.view(_badge).label),
+                      e.get("shadow_id", "—")[:14] or "—")
     console.print(table)
 
 
@@ -1469,6 +1550,7 @@ def chat_history(ctx, limit: int):
 #  Phase S2 — daemon
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("daemon")
 def daemon_group():
     """Control the Systemu background daemon (scheduler + web dashboard)."""
@@ -1591,6 +1673,7 @@ def _print_start_failure(reason: str, log_path, remedy=None) -> None:
                 + click.style("systemu daemon stop", bold=True))
 
 
+@operator_only
 @daemon_group.command("start")
 @click.option("--port", default=8765, show_default=True, help="Port for the web dashboard.")
 @click.option("--foreground", is_flag=True, help="Run in foreground (blocking).")
@@ -1774,6 +1857,7 @@ def daemon_start(ctx, port: int, foreground: bool, wait_s):
     ctx.exit(1)
 
 
+@operator_only
 @daemon_group.command("stop")
 @click.option("--all", "stop_all", is_flag=True, default=False,
               help="Kill ALL systemu daemon processes "
@@ -1851,6 +1935,7 @@ _STATUS_EXIT_STARTING = 2
 _STATUS_EXIT_NOT_RUNNING = 1
 
 
+@agent_safe
 @daemon_group.command("status")
 @click.option("--port", default=None, type=int,
               help="Port to witness. Defaults to the port the running daemon recorded.")
@@ -2064,6 +2149,7 @@ def _print_daemon_where(vault_root, port_provenance) -> None:
 #  (click.echo, unwrapped) rather than a rich table on purpose: these lines carry
 #  absolute paths, and a path wrapped at column 80 is not a path.
 
+@agent_safe
 @click.group("roots")
 def roots_group():
     """Grant, list and revoke the folders Systemu is allowed to look inside.
@@ -2092,6 +2178,7 @@ def _granted_roots_store(ctx):
     return GrantedRootsStore(base_dir=vault.root)
 
 
+@agent_safe
 @roots_group.command("list")
 @click.pass_context
 def roots_list(ctx):
@@ -2155,6 +2242,7 @@ def _print_grant_consent(canon: str) -> None:
     click.echo("")
 
 
+@operator_only
 @roots_group.command("grant")
 @click.argument("path")
 @click.option("--yes", "-y", "assume_yes", is_flag=True,
@@ -2251,6 +2339,7 @@ def roots_grant(ctx, path: str, assume_yes: bool):
     click.echo("Revoke it at any time with: systemu roots revoke <path>")
 
 
+@operator_only
 @roots_group.command("revoke")
 @click.argument("path")
 @click.pass_context
@@ -2369,6 +2458,7 @@ def _open_dashboard(url: str) -> bool:
     return False
 
 
+@operator_only
 @click.command("start")
 @click.option("--port", default=8765, show_default=True,
               help="Port for the web dashboard.")
@@ -2425,6 +2515,21 @@ def _doctor_daemon_build_text(build: dict) -> str:
     if build.get("match") is True:
         return f"{build.get('daemon_version')} (same build as this CLI)"
     return "UNVERIFIED — the daemon did not record which build it loaded"
+
+
+def _doctor_secrets_text(prof) -> str:
+    """The "Secrets at rest" cell: the profile's ``secrets_at_rest`` row label.
+
+    Read off the row the platform profile minted for this report (the verified
+    one: ``dpapi`` only after a real DPAPI round trip) -- the same value
+    /health and /privacy show, never re-derived here. A row this function
+    cannot read is "unknown", never a claim. ASCII only.
+    """
+    row = prof.get("secrets_at_rest") if type(prof) is dict else None
+    label = row.get("label") if type(row) is dict else None
+    if type(label) is not str or not label:
+        return "unknown - the platform profile did not report it"
+    return label.encode("ascii", "backslashreplace").decode("ascii")
 
 
 def _render_doctor_report(report: dict) -> None:
@@ -2523,6 +2628,10 @@ def _render_doctor_report(report: dict) -> None:
     cap.add_row("Docker mode", "yes" if prof["docker_mode"] else "no")
     cap.add_row("Capture available", "yes" if prof["capture_available"] else "no")
     cap.add_row("Keyring backend", prof["keyring_backend"])
+    # The verified at-rest row (dpapi / keyring / plaintext (<reason>)), read off
+    # the profile exactly as /health and /privacy read it. `_esc`: the label of
+    # a plaintext row carries an envelope reason that may hold square brackets.
+    cap.add_row("Secrets at rest", _esc(_doctor_secrets_text(prof)))
     cap.add_row("Forged-network jail", prof["forged_net_jail"])
     cap.add_row("Provider configured", "yes" if prof["provider_configured"] else "no")
     console.print(cap)
@@ -2574,6 +2683,7 @@ def run_self_diagnosis() -> int:
     return pp.report_exit_code(report)
 
 
+@agent_safe
 @click.command("doctor")
 def doctor_cmd():
     """Self-diagnosis: WHY is nothing happening? Reports provider / keyring /
@@ -2591,11 +2701,13 @@ def doctor_cmd():
 #  Operator-facing diagnostics for failure-mode analysis.  Lives under a
 #  separate group so it's visually distinct from production commands.
 
+@agent_safe
 @click.group("debug")
 def debug_group():
     """Diagnostics and failure-mode analysis."""
 
 
+@agent_safe
 @debug_group.command("suggest-specialty")
 @click.argument("shadow_id")
 @click.pass_context
@@ -2642,6 +2754,7 @@ def debug_suggest_specialty(ctx, shadow_id: str):
     console.print(table)
 
 
+@agent_safe
 @debug_group.command("tool-metrics")
 @click.option("--low-success", is_flag=True,
               help="Only show tools with success_rate below --threshold.")
@@ -2694,6 +2807,7 @@ def debug_tool_metrics(low_success: bool, threshold: float, min_calls: int):
     console.print(table)
 
 
+@agent_safe
 @debug_group.command("s4-shadow-meter")
 @click.option("--min-runs", default=20, type=int,
               help="Coverage threshold for the Stage-3 arm-gate (default 20).")
@@ -2742,6 +2856,7 @@ def debug_s4_shadow_meter(ctx, min_runs: int):
     click.echo(arm_verdict_line(snapshot, min_runs=min_runs))
 
 
+@agent_safe
 @debug_group.command("avoidable-forge")
 @click.pass_context
 def debug_avoidable_forge(ctx):
@@ -2760,6 +2875,7 @@ def debug_avoidable_forge(ctx):
         click.echo(line)
 
 
+@agent_safe
 @debug_group.command("avoidable-ask")
 @click.pass_context
 def debug_avoidable_ask(ctx):
@@ -2851,6 +2967,7 @@ def debug_avoidable_ask(ctx):
         click.echo(line)
 
 
+@agent_safe
 @debug_group.command("resolver-replay")
 @click.option("--corpus", default=None, type=click.Path(),
               help="Scenario corpus directory (default: fixtures/field).")
@@ -2902,6 +3019,7 @@ def debug_resolver_replay(corpus):
         raise SystemExit(1)
 
 
+@agent_safe(operator_options=("clear",))
 @debug_group.command("rejection-log")
 @click.option("--clear", is_flag=True, help="Wipe the rejection store after listing.")
 @click.option("--window-hours", default=None, type=int,
@@ -2941,6 +3059,7 @@ def debug_rejection_log(clear: bool, window_hours):
         console.print(f"[yellow]Cleared {n} rejections.[/yellow]")
 
 
+@agent_safe
 @debug_group.command("failure-histogram")
 @click.option("--group-by", "-g", default="event_type,error_type,tool_name",
               help="Comma-separated fields to bucket on. "
@@ -2990,6 +3109,7 @@ def debug_failure_histogram(group_by: str, event_types: Optional[str], top: int)
 
 # ── decisions group (v0.8.0 Pattern 1: OperatorDecisionQueue) ────────────────
 
+@agent_safe
 @click.group("decisions")
 def decisions_group():
     """Manage the OperatorDecisionQueue -- operator decisions awaiting resolution.
@@ -3002,6 +3122,7 @@ def decisions_group():
     """
 
 
+@agent_safe
 @decisions_group.command("list")
 @click.pass_context
 def decisions_list(ctx):
@@ -3043,6 +3164,7 @@ def decisions_list(ctx):
     _Console(width=200).print(table)
 
 
+@operator_only
 @decisions_group.command("mode")
 @click.option("--set", "set_mode", default=None,
               type=click.Choice(["bypass", "risk_tiered", "approve_only"]),
@@ -3126,6 +3248,7 @@ def _reclassify_needs_the_inbox(choice: str) -> bool:
     return str(choice or "").strip().lower().startswith("reclassify")
 
 
+@operator_only
 @decisions_group.command("resolve")
 @click.argument("decision_id")
 @click.option("--choice", "-c", required=True, help="One of the decision's options.")
@@ -3148,7 +3271,9 @@ def decisions_resolve(ctx, decision_id: str, choice: str):
     from systemu.approval.decision_queue import AnswerNotNeeded, OperatorDecisionQueue
     queue = OperatorDecisionQueue(vault)
     try:
-        resolved = queue.resolve(decision_id, choice=choice)
+        from systemu.approval.decision_queue import resolution_channel as _via
+        with _via("cli"):
+            resolved = queue.resolve(decision_id, choice=choice)
     except AnswerNotNeeded as late:
         # IMPL-11: the card's run was cancelled. Not a failure - nothing was
         # recorded and nothing needed recording - so the notice is printed as
@@ -3186,6 +3311,7 @@ def decisions_resolve(ctx, decision_id: str, choice: str):
 # v0.9.0 (Layer 1): user profile + facts
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("user")
 def user_group():
     """Manage your persistent user profile (name, location, timezone, output dir)
@@ -3227,6 +3353,7 @@ _HEADLESS_INIT_HINT = (
 )
 
 
+@operator_only
 @user_group.command("init")
 @click.option("--name", default=None, help="Your name (skips that question).")
 @click.option("--location", default=None,
@@ -3288,6 +3415,7 @@ def user_init(ctx, name, location, timezone_, output_dir, non_interactive):
     click.echo("\nNext: `systemu chat submit \"...\"` — systemu now knows you.")
 
 
+@agent_safe
 @user_group.command("show")
 @click.pass_context
 def user_show(ctx):
@@ -3310,6 +3438,7 @@ def user_show(ctx):
         click.echo(f"  ... ({len(facts) - 5} more — `systemu user facts list` for all)")
 
 
+@operator_only
 @user_group.command("set")
 @click.argument("field", type=click.Choice(["name", "location_text", "timezone",
                                             "default_output_dir"]))
@@ -3349,6 +3478,7 @@ def user_set(ctx, field: str, value: str):
     click.echo(f"✓ {field} = {value}")
 
 
+@operator_only
 @user_group.command("remember")
 @click.argument("fact_text")
 @click.option("--tag", "-t", multiple=True, help="Tag for this fact (repeatable).")
@@ -3361,11 +3491,13 @@ def user_remember(ctx, fact_text: str, tag):
     click.echo(f"✓ remembered: [{f.id}] {f.fact}")
 
 
+@agent_safe
 @user_group.group("facts")
 def user_facts_group():
     """Inspect the freeform fact log."""
 
 
+@agent_safe
 @user_facts_group.command("list")
 @click.option("--tag", "-t", multiple=True, help="Filter by tag (repeatable).")
 @click.option("--recent", "-n", type=int, default=None,
@@ -3387,6 +3519,7 @@ def user_facts_list(ctx, tag, recent, include_superseded):
         click.echo(f"  [{f.id}] ({f.source}, conf={f.confidence:.2f}){tags_s}{marker}\n    {f.fact}")
 
 
+@operator_only
 @user_group.command("forget")
 @click.argument("fact_id")
 @click.pass_context
@@ -3402,6 +3535,7 @@ def user_forget(ctx, fact_id: str):
     click.echo(f"✓ forgot {fact_id}")
 
 
+@operator_only
 @user_group.command("wipe")
 @click.option("--confirm", is_flag=True, default=False,
               help="Required. Without this, the command refuses.")
@@ -3432,11 +3566,13 @@ def user_wipe(ctx, confirm: bool):
 # over ssh / in a container log, where the console is often cp1252.
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group("onboarding")
 def onboarding_group():
     """Complete and inspect first-run setup without a terminal or a browser."""
 
 
+@agent_safe
 @onboarding_group.command("status")
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Machine-readable output for scripts and container probes.")
@@ -3470,6 +3606,7 @@ def onboarding_status(ctx, as_json: bool):
     ctx.exit(0 if ready else 1)
 
 
+@operator_only
 @onboarding_group.command("complete-tour")
 @click.pass_context
 def onboarding_complete_tour(ctx):
@@ -3495,12 +3632,14 @@ def onboarding_complete_tour(ctx):
 # v0.9.2: session episodic-memory CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group(name="session")
 def session_cli():
     """Inspect the freeform episodic-memory log (cross-session recall)."""
     pass
 
 
+@agent_safe
 @session_cli.command("list")
 @click.option("--limit", default=20, show_default=True)
 def session_list(limit):
@@ -3519,6 +3658,7 @@ def session_list(limit):
                    f"[{s.status:7}] {s.session_id}: {s.intent[:60]}")
 
 
+@agent_safe
 @session_cli.command("show")
 @click.argument("session_id")
 def session_show(session_id):
@@ -3551,6 +3691,7 @@ def session_show(session_id):
             click.echo(f"  - {f}")
 
 
+@agent_safe
 @session_cli.command("search")
 @click.argument("query")
 @click.option("--limit", default=5, show_default=True)
@@ -3575,12 +3716,14 @@ def session_search_cmd(query, limit):
 # v0.9.3: capability ledger CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group(name="capability")
 def capability_cli():
     """Inspect the capability ledger (what systemu knows it can do)."""
     pass
 
 
+@agent_safe
 @capability_cli.command("list")
 @click.option("--kind", default=None, help="Filter by 'tool' or 'skill'")
 def capability_list(kind):
@@ -3599,6 +3742,7 @@ def capability_list(kind):
         click.echo(f"  [{c['kind']:5}] {c['name']:30}  invocations={c['invocations']:5}  last_used={last}")
 
 
+@agent_safe
 @capability_cli.command("show")
 @click.argument("name")
 def capability_show(name):
@@ -3623,6 +3767,7 @@ def capability_show(name):
         click.echo(f"last_error:   {stats['last_error']}")
 
 
+@agent_safe
 @capability_cli.command("stats")
 def capability_stats():
     """Aggregate stats across all registered capabilities."""
@@ -3656,12 +3801,14 @@ def capability_stats():
 # v0.9.4: skill recipe CLI — browse bundled + user-installed SKILL.md recipes
 # ─────────────────────────────────────────────────────────────────────────────
 
+@agent_safe
 @click.group(name="skill")
 def skill_cli():
     """Inspect bundled + user-installed SKILL.md recipes."""
     pass
 
 
+@agent_safe
 @skill_cli.command("list")
 def skill_list():
     """List all loadable skills with their description and required toolsets."""
@@ -3679,6 +3826,7 @@ def skill_list():
             click.echo(f"     {s['description'][:80]}")
 
 
+@agent_safe
 @skill_cli.command("view")
 @click.argument("name")
 def skill_view(name):
@@ -3842,6 +3990,8 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
                    "but keep what it found)")
         click.echo("    systemu census status              (what is watched, and what "
                    "this build can grant)")
+        click.echo("  The census panel on the table page shows the same and has "
+                   "Withdraw / Pause buttons.")
 
     q = (query or "").strip()
     if q:
@@ -3900,7 +4050,10 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
 # privacy boundary nothing else in the inventory crosses. Everything below is the
 # operator's consent surface for it: `systemu census status|grant|revoke|pause|resume`.
 #
-# THIS IS THE ONLY PLACE IN systemu/ THAT MAY CREATE OR WITHDRAW A CENSUS GRANT.
+# THIS REGION IS THE ONLY PLACE IN systemu/ THAT MAY CREATE A CENSUS GRANT (grant is
+# CLI-only: a terminal, the full card, a typed y/N). The matching region of
+# interface/pages/table_census.py (the /table census panel, P19) may only WITHDRAW, PAUSE
+# and RESUME.
 # `tests/test_rw2_ambient_census.py::test_the_census_grant_surface_is_confined_to_its_
 # declared_region` scans the shipped tree for the census consent symbols and fails on any
 # reference outside this region (and outside the matching region in sharing_on/cli.py).
@@ -3908,8 +4061,8 @@ def run_world(vault, query: str = "", limit: int = 30) -> int:
 # message lists what a widening must re-audit first. Do not scatter census calls above
 # this line, and do not exempt a new file without doing that work.
 #
-# SCOPE (P4-B2): ONE category ships end to end -- `cloud_sync_roots`, the lowest privacy
-# surface of the three. `census_consent.SURFACED_CATEGORIES` is the single source of
+# SCOPE: P4-B2 shipped ONE category end to end (`cloud_sync_roots`); P19 widened it to
+# every declared category. `census_consent.SURFACED_CATEGORIES` is the single source of
 # truth; the consent card derives its `revocation_surface_shipped` flag and its
 # revocation prose from the same constant, so this surface cannot claim a control it does
 # not offer, nor deny one it does. All four mutating verbs are restricted to that set:
@@ -3976,7 +4129,8 @@ def _echo_consent_card(card: dict) -> None:
     click.echo("")
 
 
-def _census_category_or_error(category: str, *, must_be_grantable: bool):
+def _census_category_or_error(category: str, *, must_be_grantable: bool,
+                              must_be_available: bool = False):
     """``(category, None)`` if usable here, else ``(None, exit_code)`` after saying why.
 
     REFUSES rather than no-ops, in both directions. A typo'd category that "succeeded"
@@ -3998,6 +4152,16 @@ def _census_category_or_error(category: str, *, must_be_grantable: bool):
                    "yet, and systemu will not take a standing permission it cannot "
                    "offer you a way to withdraw.")
         return None, CENSUS_EXIT_BAD_CATEGORY
+    if must_be_available:
+        # P19: GRANT only. A machine with no source for the category would take a
+        # standing permission that can never scan; say why instead. Withdraw / pause
+        # stay allowed -- they are the safe direction.
+        from systemu.runtime.ambient_census import category_availability
+        available, why = category_availability(cat)
+        if not available:
+            click.echo(f"'{cat}' is unavailable on this machine: {why}.")
+            click.echo("  Nothing was recorded and you were not asked.")
+            return None, CENSUS_EXIT_BAD_CATEGORY
     return cat, None
 
 
@@ -4013,7 +4177,7 @@ def run_census_status(vault) -> int:
     _refused = census_status_refusal_line(vault.root)
     if _refused:
         click.echo(_refused)
-    from systemu.runtime.ambient_census import census_status
+    from systemu.runtime.ambient_census import category_availability, census_status
     from systemu.runtime.census_consent import CATEGORIES, SURFACED_CATEGORIES
     try:
         granted = {row["category"]: row for row in census_status(vault)}
@@ -4030,17 +4194,22 @@ def run_census_status(vault) -> int:
         else:
             state = (f"GRANTED, active     (granted: {row['granted_at'] or '?'}, "
                      f"last ran: {row['last_ran_at'] or 'never'})")
+        available, why = category_availability(cat)
         click.echo(f"  {cat:<18} {CATEGORIES[cat]['title']}")
         click.echo(f"  {'':<18}   {state}"
                    + ("" if cat in SURFACED_CATEGORIES
-                      else "  [not yet grantable from this build]"))
+                      else "  [not yet grantable from this build]")
+                   + ("" if available else f"  [unavailable on this machine: {why}]"))
     click.echo("")
     click.echo("A grant is a STANDING permission: the category is re-checked on later "
                "runs until you revoke it,")
     click.echo("and what it finds is included in the planning prompt systemu sends to "
                "its model provider.")
+    _grantable = [c for c in sorted(SURFACED_CATEGORIES) if category_availability(c)[0]]
     click.echo(f"  systemu census grant <category>     "
-               f"(available: {', '.join(sorted(SURFACED_CATEGORIES))})")
+               f"(available here: {', '.join(_grantable) or 'none'})")
+    click.echo("  The census panel on the table page shows the same, and can "
+               "withdraw, pause or resume; granting happens only here.")
     # Spelled out rather than `pause|resume`: test_f6_command_names_are_invocable checks
     # every command string in shipped source against the real click tree, and a pipe
     # shorthand names no subcommand an operator can actually type.
@@ -4066,7 +4235,8 @@ def run_census_grant(vault, category: str, assume_yes: bool = False) -> int:
     """
     from systemu.runtime.ambient_census import grant_category
     from systemu.runtime.census_consent import consent_card
-    cat, err = _census_category_or_error(category, must_be_grantable=True)
+    cat, err = _census_category_or_error(category, must_be_grantable=True,
+                                         must_be_available=True)
     if err is not None:
         return err
 

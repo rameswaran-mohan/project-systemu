@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Dict
 
-from .gateway import InboundCommand
+from .gateway import InboundCommand, mask_outbound
 from .decision_bridge import (
     ANSWER_COMMAND,
     answer_example,
@@ -105,9 +105,13 @@ def build_status_handler(vault) -> Callable[[InboundCommand], str]:
             rows = build_status_rows(vault, limit=5)
             lines = [f"Needs you: {pending} item(s) pending."]
             if rows:
+                from systemu.runtime import verification_badge as vb
                 lines.append("Recent tasks:")
                 for row in rows:
-                    lines.append(f"• [{row['status']}] {row['name']}")
+                    # DEC-13 / PAR-2: the same minted badge the dashboard row shows.
+                    v = vb.view(row.get("badge"))
+                    tail = f" -- {v.label}" if v.show else ""
+                    lines.append(f"• [{row['status']}] {row['name']}{tail}")
             else:
                 lines.append("No tasks yet.")
             lines.append("Act on items from the dashboard Inbox.")
@@ -141,9 +145,13 @@ def handle_scrolls(_: InboundCommand) -> str:
             return "No scrolls."
         lines = ["Recent scrolls:"]
         for s in scrolls[-10:]:
+            # DEC-31: mask BEFORE the cut. A secret straddling the 60-char cap
+            # would otherwise be split into a prefix no shape rule recognises
+            # (a 40+ hex run cut to 14 chars) and the push's own mask, which
+            # only sees the already-cut line, would let the piece through.
+            name = mask_outbound(str(s.get('name') or ''))[:60]
             lines.append(
-                f"  • {s.get('id', '?')} — {s.get('status', '?')} — "
-                f"{(s.get('name') or '')[:60]}"
+                f"  • {s.get('id', '?')} — {s.get('status', '?')} — {name}"
             )
         return "\n".join(lines)
     except Exception as exc:

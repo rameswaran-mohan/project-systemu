@@ -909,8 +909,30 @@ class SqliteVault:
         else:
             self._storage_backend = "sqlite"
             self._sqlite_url = database_url  # mirrors self._url for the dispatch layer
+        self._ensure_action_audit_schema()
 
         logger.info("[SqliteVault] Ready — %s", database_url)
+
+    def _ensure_action_audit_schema(self) -> None:
+        """R-P3b: create / migrate the action_audit table the dispatch layer writes.
+
+        Nothing in production ever ran the backend's ``ensure_schema``, so on this
+        vault the action audit had no table at all and every append failed (each
+        caller swallows it). Running it here creates the table and applies the
+        additive ``gate_json`` migration (DEC-9). Best-effort: a store that cannot
+        take it (no driver, an in-memory URL) keeps booting, loudly."""
+        try:
+            if self._storage_backend == "postgres":
+                from systemu.vault.backend.postgres_backend import ensure_schema
+            else:
+                url = getattr(self, "_sqlite_url", "") or ""
+                if not url.startswith("sqlite:///") or ":memory:" in url:
+                    return
+                from systemu.vault.backend.sqlite_backend import ensure_schema
+            ensure_schema(self)
+        except Exception:
+            logger.warning("[SqliteVault] action_audit schema not ensured; the action "
+                           "ledger cannot be written on this store", exc_info=True)
 
     # ── First-boot seed ───────────────────────────────────────────────────────
 

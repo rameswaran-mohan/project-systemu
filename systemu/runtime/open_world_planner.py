@@ -64,9 +64,12 @@ def _resolve_planner_tier(config) -> int:
     an open-world reasoning step.
 
     DEC-12: delegates to the MODEL-MATRIX so the string->int idiom has ONE
-    home. Kept as a named function (rather than folded into a ``stage=`` tag at
-    the call site) because ``test_rp3a_attribution`` monkeypatches it — turning
-    it into a no-op would silently hollow out that test.
+    home. The planner's LLM call no longer uses this: it passes
+    ``stage="planner"`` and the router resolves the same row itself, so the two
+    read one resolver and cannot disagree. No production code calls this any
+    more; it stays as the call-free answer to "which tier will the planner run
+    at", which ``test_model_matrix_routing`` pins and ``test_rp3a_attribution``
+    stubs.
     """
     from sharing_on.model_matrix import resolve_stage_tier
     return resolve_stage_tier("planner", config)
@@ -249,7 +252,6 @@ async def run_open_world_planner(
         situation_report=situation_report,
         objectives=objectives,
     )
-    tier = _resolve_planner_tier(config)
     try:
         system = load_prompt(_PLANNER_PROMPT)
     except Exception:
@@ -271,7 +273,9 @@ async def run_open_world_planner(
             None,
             lambda: _llm_ctx.run(
                 llm_call_json,
-                tier=tier,
+                # DEC-12: the router resolves the tier from the MODEL-MATRIX row
+                # and sees the stage name (a bare tier= hid it from the router).
+                stage="planner",
                 system=system,
                 user=prompt,
                 config=config,

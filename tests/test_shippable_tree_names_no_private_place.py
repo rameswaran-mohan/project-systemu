@@ -50,6 +50,29 @@ WHY THE PATTERNS ARE ASSEMBLED FROM FRAGMENTS
     ids for the same reason -- pytest builds a node id out of the parameter
     value, so an unnamed case republishes its own sample.
 
+FRAGMENTS OF A NAME ARE THE NAME (added after a docstring split a codename)
+    The rules above match a token WHOLE.  A docstring that split a development
+    worktree codename across two backticked fragments -- the first ending
+    mid-word, the second beginning with the tail of that word and then the
+    distinctive half -- matched none of them and shipped for several releases.
+    So the denylist is also matched as FRAGMENTS: every hyphen- or
+    underscore-separated segment of five or more characters of a multi-segment
+    plain token in ``_BANNED`` is banned as a bare case-insensitive SUBSTRING,
+    anywhere in a shipped file.  The segments are DERIVED from ``_BANNED`` (no
+    second list of names to keep in step), and nothing new is named here.
+
+    Two honest limits, both pinned below.  (1) A segment that is an ordinary
+    word -- one that is a substring of common English or appears all over the
+    tree -- cannot be banned as a substring without flagging the product's own
+    prose, so ``_GENERIC_SEGMENTS`` carries those; each entry must be a segment
+    that really is derived (no dead entries) and every codename keeps at least
+    one distinctive fragment.  (2) THIS file is exempt from the FRAGMENT pass
+    only (by its own path, derived from ``__file__``): its denylist is made of
+    exactly those fragments, and splitting every one below five characters
+    would mean rewriting the sample strings of the existing controls.  The
+    whole-token rules still scan it, so the dangerous thing -- a complete name
+    -- still cannot hide here.
+
 NOTHING IS WRITTEN.  The scan is read-only and touches no vault.
 """
 from __future__ import annotations
@@ -113,6 +136,80 @@ _COMPILED: tuple = tuple(
     (label, pattern, re.compile(pattern, re.IGNORECASE)) for label, pattern in _BANNED
 )
 
+# ---------------------------------------------------------------------------
+# Fragment rule -- see "FRAGMENTS OF A NAME ARE THE NAME" in the docstring.
+# ---------------------------------------------------------------------------
+
+#: The shortest segment banned as a bare substring.  Shorter segments are
+#: ordinary letter runs ("pro", "dot") that would flag half the tree.
+_FRAGMENT_MIN_LEN = 5
+
+#: Segments of a banned token that are ORDINARY WORDS, so banning them as a
+#: substring would flag the product's own prose: a substring of common English
+#: ("expensive"), a normal word of the domain ("project", "objective") or a
+#: normal identifier of the product ("systemu", "claude", "worktrees").  Each
+#: entry must be a segment that ``_derive_fragments`` really meets (pinned by
+#: ``test_every_generic_segment_is_a_live_exclusion``) -- a dead entry is a
+#: stale excuse -- and every codename must keep a distinctive fragment
+#: (``test_every_codename_keeps_a_distinctive_fragment``).
+_GENERIC_SEGMENTS = frozenset({
+    "objective", "pensive", "project", "systemu", "claude", "worktrees",
+})
+
+#: A pattern carrying any of these is a REGEX (the shape rule, the worktree
+#: directory rule), not a plain token; only plain tokens have segments.
+_REGEX_METACHARS = re.compile(r"[\\.\[\](){}*+?^$|]")
+
+_FRAGMENT_LABEL = "development worktree codename fragment"
+
+#: The one file exempt from the FRAGMENT pass: this one, because its denylist
+#: IS the fragments.  Derived from ``__file__`` so a rename keeps the pairing;
+#: the whole-token rules still scan it.
+_SELF = Path(__file__).resolve().relative_to(_ROOT).as_posix()
+_FRAGMENT_EXEMPT = frozenset({_SELF})
+
+
+def _plain_tokens() -> tuple:
+    """The plain-string (non-regex) tokens of ``_BANNED``, as written."""
+    return tuple(pattern for _label, pattern in _BANNED
+                 if _REGEX_METACHARS.search(pattern) is None)
+
+
+def _segments(token: str) -> list:
+    """The hyphen/underscore/space-separated segments of ``token``, lowered."""
+    return [part for part in re.split(r"[^a-z0-9]+", token.lower()) if part]
+
+
+def _derive_fragments() -> tuple:
+    """Every segment of a multi-segment plain token worth banning on its own.
+
+    A single-segment token is its own only segment, so the whole-token rule
+    already covers it and a fragment rule would only double-report it.
+    """
+    found: list = []
+    for token in _plain_tokens():
+        parts = _segments(token)
+        if len(parts) < 2:
+            continue
+        for part in parts:
+            if (len(part) >= _FRAGMENT_MIN_LEN and part not in _GENERIC_SEGMENTS
+                    and part not in found):
+                found.append(part)
+    return tuple(found)
+
+
+_FRAGMENTS: tuple = _derive_fragments()
+
+# An empty alternation compiles to a pattern that matches EVERYTHING.  Refuse
+# to build the rule at all rather than ship a fence that is inert or absurd.
+assert _FRAGMENTS, (
+    "no codename fragments derived from the denylist; the fragment rule would be inert")
+
+_COMPILED = _COMPILED + ((
+    _FRAGMENT_LABEL, "|".join(_FRAGMENTS),
+    re.compile("|".join(re.escape(part) for part in _FRAGMENTS), re.IGNORECASE),
+),)
+
 
 def _ascii(text: str) -> str:
     """ASCII-only rendering of ``text`` -- verdict strings never carry UTF-8."""
@@ -172,13 +269,28 @@ def _offenders() -> tuple:
             raw = handle.read()
         scanned += 1
         text = raw.decode("utf-8", errors="backslashreplace")
-        for number, line in enumerate(text.splitlines(), 1):
-            for label, _pattern, rx in _COMPILED:
-                if rx.search(line) is None:
-                    continue
-                excerpt = _redact(line)
-                offenders.append((name, number, label, _ascii(excerpt.strip())[:160]))
+        offenders.extend(_text_offenders(name, text))
     return tuple(offenders), scanned
+
+
+def _text_offenders(name: str, text: str) -> list:
+    """Every ``(path, line, label, redacted_excerpt)`` hit in one file's text.
+
+    The per-file core of :func:`_offenders`, split out so a control can scan a
+    PLANTED text under any path.  The fragment rule alone is skipped for a path
+    in ``_FRAGMENT_EXEMPT`` (this file); every other rule applies to every path.
+    """
+    hits = []
+    fragment_exempt = name in _FRAGMENT_EXEMPT
+    for number, line in enumerate(text.splitlines(), 1):
+        for label, _pattern, rx in _COMPILED:
+            if fragment_exempt and label == _FRAGMENT_LABEL:
+                continue
+            if rx.search(line) is None:
+                continue
+            excerpt = _redact(line)
+            hits.append((name, number, label, _ascii(excerpt.strip())[:160]))
+    return hits
 
 
 def test_the_shippable_tree_names_no_private_place_or_person():
@@ -352,3 +464,155 @@ def test_the_codename_shape_rule_spares_legitimate_hyphenated_tokens(legitimate)
     assert found is None, _ascii(
         "the codename shape rule flagged the legitimate token {0!r} at {1!r}".format(
             legitimate, found.group(0) if found else ""))
+
+
+# ---------------------------------------------------------------------------
+# Fragment controls.  Appended; every control above is untouched.
+#
+# No assertion below lets pytest introspect a fragment or a codename into its
+# failure output: values are reduced to booleans / indices first, for the same
+# reason the fence masks its own excerpts.
+# ---------------------------------------------------------------------------
+
+#: The path a planted text is scanned under: any tracked-looking path that is
+#: NOT the fence file.
+_SIBLING = "tests/test_some_other_shipped_file.py"
+
+
+def _codename_tokens() -> list:
+    return [pattern for label, pattern in _BANNED
+            if label == "development worktree codename"]
+
+
+def _halves(token: str) -> tuple:
+    """``token`` cut in the middle, the way a docstring split it."""
+    mid = len(token) // 2
+    return token[:mid], token[mid:]
+
+
+def test_the_fragment_rule_is_derived_and_live():
+    """The rule exists, is in the scan set, and is built only from the denylist."""
+    plain = " ".join(_plain_tokens()).lower()
+    derived_from_denylist = all(part in plain for part in _FRAGMENTS)
+    long_enough = all(len(part) >= _FRAGMENT_MIN_LEN for part in _FRAGMENTS)
+    not_generic = not any(part in _GENERIC_SEGMENTS for part in _FRAGMENTS)
+    in_scan_set = _FRAGMENT_LABEL in [label for label, _p, _rx in _COMPILED]
+    assert _FRAGMENTS and derived_from_denylist and long_enough and not_generic, _ascii(
+        "the fragment set is empty, or holds something the denylist did not "
+        "yield, or something shorter than {0} characters, or a generic word".format(
+            _FRAGMENT_MIN_LEN))
+    assert in_scan_set, _ascii("the fragment rule is not in the scan set")
+
+
+def test_every_codename_keeps_a_distinctive_fragment():
+    """No codename may end up caught ONLY whole.
+
+    A codename whose every segment is an ordinary word has nothing to match as
+    a fragment, which is the hole this rule exists to close.  If a new codename
+    is added whose segments are all generic, this goes red -- decide it on
+    purpose rather than letting the fence quietly under-cover it.
+    """
+    codenames = _codename_tokens()
+    assert len(codenames) >= 3, _ascii("the codename denylist shrank below its known size")
+    uncovered = [index for index, token in enumerate(codenames)
+                 if not set(_segments(token)) & set(_FRAGMENTS)]
+    assert not uncovered, _ascii(
+        "codename entries {0!r} have no distinctive fragment".format(uncovered))
+
+
+def test_every_generic_segment_is_a_live_exclusion():
+    """An exclusion that excludes nothing is a stale excuse, not a rule."""
+    met = set()
+    for token in _plain_tokens():
+        parts = _segments(token)
+        if len(parts) < 2:
+            continue
+        met.update(part for part in parts if len(part) >= _FRAGMENT_MIN_LEN)
+    dead = sorted(set(_GENERIC_SEGMENTS) - met)
+    assert not dead, _ascii(
+        "{0} entr(ies) of _GENERIC_SEGMENTS match no derived segment".format(len(dead)))
+
+
+def test_a_planted_codename_half_is_caught_by_the_fragment_rule_alone():
+    """The incident, re-enacted: a codename split across two backticked halves.
+
+    Each half is planted on its own and both together, in a file that is NOT
+    the fence.  Only the FRAGMENT rule may fire -- the whole-token rules and
+    the shape rule cannot, which is exactly why the split shipped -- and the
+    excerpt the fence would print must carry no rule's match.
+    """
+    codenames = _codename_tokens()
+    assert codenames, _ascii("no codename tokens to plant")
+    failures = []
+    for index, token in enumerate(codenames):
+        first, second = _halves(token)
+        plants = {
+            "both-halves": "see `" + first + "` / `" + second + "` in the notes",
+            "second-half": second,
+        }
+        for kind, planted in plants.items():
+            hits = _text_offenders(_SIBLING, planted)
+            labels = {label for _path, _n, label, _x in hits}
+            if labels != {_FRAGMENT_LABEL}:
+                failures.append((index, kind, "wrong rules fired"))
+                continue
+            for _path, _n, _label, excerpt in hits:
+                if any(rx.search(excerpt) for _l, _p, rx in _COMPILED):
+                    failures.append((index, kind, "excerpt republishes a match"))
+    assert not failures, _ascii(
+        "planted half not caught cleanly: {0!r}".format(failures))
+
+
+def test_a_fragment_inside_a_longer_word_is_still_caught():
+    """Substring, not word: a fragment glued into other text is still a hit."""
+    token = _codename_tokens()[0]
+    fragment = [part for part in _segments(token) if part in _FRAGMENTS][0]
+    planted = "xx" + fragment + "yy"
+    hits = _text_offenders(_SIBLING, planted)
+    assert hits, _ascii("a fragment embedded in a longer word was not caught")
+
+
+def test_the_fragment_exemption_is_exactly_this_file_and_only_the_fragment_pass():
+    """The exemption is one path, it is this file, and it spares fragments only."""
+    assert _FRAGMENT_EXEMPT == frozenset({_SELF}), _ascii(
+        "the fragment exemption grew beyond the fence file")
+    assert (_ROOT / _SELF).resolve() == Path(__file__).resolve(), _ascii(
+        "the exempt path is not this file")
+    assert _SELF in _tracked_files(), _ascii("the fence file is not git-tracked")
+
+    token = _codename_tokens()[0]
+    fragment = [part for part in _segments(token) if part in _FRAGMENTS][0]
+    # The fragment pass is skipped for this file ...
+    assert _text_offenders(_SELF, fragment) == [], _ascii(
+        "the fence file was not exempted from the fragment pass")
+    # ... but a COMPLETE name in this file is still caught by the whole-token rule.
+    whole = _text_offenders(_SELF, "x = '" + token + "'")
+    assert any(label == "development worktree codename"
+               for _path, _n, label, _x in whole), _ascii(
+        "a complete codename in the fence file slipped past the whole-token rule")
+
+
+def test_a_redacted_fragment_line_carries_no_match():
+    """Fragments are masked by ``_redact`` like every other rule (DEC-31)."""
+    token = _codename_tokens()[-1]
+    fragment = [part for part in _segments(token) if part in _FRAGMENTS][0]
+    planted = ("y" * 300) + " `" + fragment + "` tail"
+    redacted = _redact(planted)
+    assert "<<REDACTED>>" in redacted, _ascii("a fragment past the cap was not masked")
+    survivors = [label for label, _p, rx in _COMPILED if rx.search(redacted)]
+    assert not survivors, _ascii("a fragment survived redaction")
+
+
+@pytest.mark.parametrize("ordinary", [
+    pytest.param("an expensive and extensive objective of the project",
+                 id="english-and-domain-words"),
+    pytest.param("git worktrees at the same version are different code",
+                 id="plural-worktrees"),
+    pytest.param("the claude and systemu packages", id="product-identifiers"),
+    pytest.param("Asia/Tokyo, America/New_York, UTC", id="zone-ids"),
+])
+def test_the_fragment_rule_spares_ordinary_prose(ordinary):
+    """Generic segments stay out of the fragment set, or the fence cries wolf."""
+    hits = _text_offenders(_SIBLING, ordinary)
+    assert not hits, _ascii(
+        "the fragment pass flagged ordinary prose ({0} hit(s))".format(len(hits)))

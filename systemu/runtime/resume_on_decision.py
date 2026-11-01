@@ -557,7 +557,8 @@ def _dispatch_resume(decision, *, vault, supervisor,
             # _record_gate_approval so the missing-coords rescue above records the SAME
             # approval — the ONLY place a tool-gate "Always allow" becomes a standing
             # entry.
-            _record_gate_approval(dctx, is_tool_gate=is_tool_gate, choice=choice)
+            _record_gate_approval(dctx, is_tool_gate=is_tool_gate, choice=choice,
+                                  decision_id=getattr(decision, "id", None))
     elif is_attest:
         # R-A13 Stage-3a: stash the operator's attest CHOICE + the enqueue-time effect
         # classification (a JSON payload the resume-start applier peels) so the applier
@@ -769,7 +770,8 @@ def _clear_reclassification(dctx) -> None:
                      exc_info=True)
 
 
-def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
+def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str,
+                          decision_id: Optional[str] = None) -> None:
     """Persist a resolved tool/command gate approval to the CommandApprovalStore.
 
     Tool gate: ``"always allow"`` → STANDING allow-list (``store.approve``); any other
@@ -780,7 +782,10 @@ def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
 
     Decoupled from the resume DISPATCH so the approval is recorded even when the parked
     run has no resume coords — without it a re-run would re-hit the same gate. The
-    caller guarantees ``choice`` is non-deny. Best-effort; never raises."""
+    caller guarantees ``choice`` is non-deny. Best-effort; never raises.
+
+    R-P3b: ``decision_id`` (the resolved card's id) is stamped on every bridge this
+    writes, so the call the bridge lets through can name the decision."""
     try:
         from pathlib import Path as _P
         from systemu.runtime.command_approvals import init_default_store
@@ -886,17 +891,33 @@ def _record_gate_approval(dctx, *, is_tool_gate: bool, choice: str) -> None:
                     return
                 store.mark_resume_approved(sig, for_reclassification=scope,
                                            confirmed_args=_fp)
+                _stamp_bridge_decision(store, sig, decision_id)
                 return
             if choice == "always allow" and verdict and not reclassified:
                 store.approve(sig)
             else:
                 store.mark_resume_approved(sig, for_reclassification=scope)
+                _stamp_bridge_decision(store, sig, decision_id)
         else:
             from systemu.runtime.command_approvals import command_signature
             sig = command_signature(dctx.get("command") or "", cwd=dctx.get("cwd") or "")
             store.mark_resume_approved(sig)
+            _stamp_bridge_decision(store, sig, decision_id)
     except Exception:
         logger.debug("[ResumeOnDecision] could not record gate approval", exc_info=True)
+
+
+def _stamp_bridge_decision(store, sig, decision_id) -> None:
+    """R-P3b: name the decision that minted the bridge just written, so the call it
+    lets through can say which decision approved it. Best-effort: no id, or a store
+    (or test double) without the method, simply leaves the id unrecorded."""
+    if type(decision_id) is not str or not decision_id:
+        return
+    try:
+        store.stamp_resume_decision(sig, decision_id)
+    except Exception:
+        logger.debug("[ResumeOnDecision] could not stamp the bridge decision",
+                     exc_info=True)
 
 
 def _stamp_dispatched(decision, vault) -> None:

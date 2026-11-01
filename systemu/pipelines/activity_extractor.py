@@ -90,19 +90,20 @@ def extract_and_process(
         _enrich_skill_for_catalog(s)
         for s in vlt.load_index("skills")
     ]
+    # R-CAP1 · CAP-4 — the dedup catalog is rendered through the ONE selection
+    # view: the top-K most relevant tools for this scroll in full, a one-line
+    # name+slot index for the rest (every existing tool is still NAMED, so dedup
+    # by name keeps working), read with a roster witness (DEC-27).
+    from systemu.runtime import capability_view as _cv
+    _tool_catalog = _cv.read_tool_headers(vlt)
     existing_tools = [
         _enrich_tool_for_catalog(t, vlt)
-        for t in vlt.load_index("tools")
+        for t in _tool_catalog.headers
     ]
-    # R-CAP1 · CAP-4 — order the dedup catalog most-relevant-first for this scroll
-    # (the same never-subtract + defensive helper the quick lane uses; only the
-    # order changes, every tool + schema is kept).
-    try:
-        from systemu.runtime import capability_index as _capidx
-        existing_tools = _capidx.order_records(
-            existing_tools, getattr(scroll, "intent", "") or getattr(scroll, "name", "") or "")
-    except Exception:
-        logger.debug("[Extract] capability ordering skipped", exc_info=True)
+    _tool_view = _cv.build_view(
+        existing_tools,
+        getattr(scroll, "intent", "") or getattr(scroll, "name", "") or "",
+        catalog=_tool_catalog, traits=_cv.traits_by_name(_tool_catalog.headers))
 
     # ── Stage 3b: Tier 1 extraction call ──────────────────────────────────
     prompt = load_prompt("extract_skills_tools.md")
@@ -136,11 +137,11 @@ def extract_and_process(
         pass
 
     task_spec["existing_skills"] = existing_skills
-    task_spec["existing_tools"]  = existing_tools
+    task_spec.update(_tool_view.payload_fields("existing_tools", lookup=False))
 
     try:
         result = llm_call_json(
-            tier=1,
+            stage="planner",
             system=prompt,
             user=json.dumps(task_spec),
             config=cfg,
@@ -203,12 +204,13 @@ def extract_and_process(
             scroll.name,
         )
         retry_spec = {k: v for k, v in task_spec.items()
-                      if k not in ("existing_skills", "existing_tools")}
+                      if k not in ("existing_skills", "existing_tools",
+                                   *_cv.VIEW_EXTRA_KEYS)}
         retry_spec["existing_skills"] = []
         retry_spec["existing_tools"]  = []
         try:
             result = llm_call_json(
-                tier=1,
+                stage="planner",
                 system=prompt,
                 user=json.dumps(retry_spec),
                 config=cfg,

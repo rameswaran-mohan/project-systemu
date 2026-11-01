@@ -66,7 +66,14 @@ def _run_async(coro):
     import asyncio
     try:
         asyncio.get_running_loop()
+        running = True
     except RuntimeError:
+        running = False
+    if not running:
+        # Run OUTSIDE the except block: inside it, every exception the coroutine
+        # raises would carry the probe's RuntimeError("no running event loop")
+        # as its __context__ -- an incidental cause that once became the
+        # operator-facing failure reason on mcp 2.x.
         return asyncio.run(coro)
     # A loop is already running — execute the coroutine on a fresh loop in a
     # worker thread so we never re-enter the active loop.
@@ -110,16 +117,35 @@ def mcp_list_tools(
 
     Each entry is ``{"name", "description", "schema"}`` (description SANITISED as
     untrusted external content; schema = the mapped parameters_schema with real
-    required[]). Honest failure dict on any error — never raises into Settings.
+    required[]). Never raises into Settings.
+
+    Two different results, never one shape (DEC-32):
+      * listed:          ``{"success": True, "tools": [...]}`` -- possibly empty,
+                         when the server genuinely offers no tools;
+      * could not list:  ``{"success": False, "server": server, "error": ...}``
+                         with the reason and the server named, and NO ``tools``
+                         key, so a failure can never be read as "zero tools".
     """
     spec = _resolve_transport(server, vault)
-    from systemu.runtime.mcp.sdk.manager import get_manager
+    from systemu.runtime.mcp.sdk.manager import ToolListing, get_manager
     from systemu.runtime.mcp.sdk.schema_map import sanitize_description
+
+    def _failed(reason: str) -> Dict[str, Any]:
+        return {"success": False, "server": server,
+                "error": f"could not list tools on {server}: {reason}"}
+
     mgr = get_manager()
     try:
-        normalised = _run_async(mgr.list_tools(server, spec))
+        listing = _run_async(mgr.list_tools(server, spec))
     except Exception as exc:
-        return {"success": False, "error": f"discovery failed: {exc}"}
+        return _failed(f"discovery failed: {exc}")
+    # The concrete type is pinned before any operation on the value (DEC-36): a
+    # plain list cannot carry a failure, so it is never accepted as success.
+    if type(listing) is not ToolListing:
+        return _failed(f"the connection manager returned {type(listing).__name__}, "
+                       "not a ToolListing")
+    if listing.ok is not True:
+        return _failed(str(listing.reason))
     tools = [
         {
             "name": t["name"],
@@ -127,7 +153,7 @@ def mcp_list_tools(
             "schema": dict(t.get("parameters_schema") or {}),
             "annotations": dict(t.get("annotations") or {}),
         }
-        for t in (normalised or []) if t.get("name")
+        for t in listing.tools if t.get("name")
     ]
     return {"success": True, "tools": tools}
 
@@ -183,7 +209,7 @@ def _mcp_handler(**kwargs) -> Dict[str, Any]:
     an LLM-supplied kwarg. (P2's registry_bridge._make_handler threads the SAME
     id via the same carrier — one source of truth.)"""
     from sharing_on.config import Config
-    from systemu.runtime.mcp.dispatch import call_mcp_tool
+    from systemu.runtime.mcp.dispatch import call_mcp_tool_stamped
     from systemu.runtime.mcp_run_ctx import current_mcp_session_id
     cfg = Config.from_env()
     vault = None
@@ -201,7 +227,8 @@ def _mcp_handler(**kwargs) -> Dict[str, Any]:
     # carrier) so a multi-vault deployment scopes the allowlist + gate to the
     # correct vault; this env fallback is the single-vault default only.
     session_id = str(current_mcp_session_id() or "")
-    return call_mcp_tool(
+    # P21: the stamped variant carries the gate's record back for the ledger row.
+    return call_mcp_tool_stamped(
         kwargs.get("server", ""),
         kwargs.get("name", ""),
         kwargs.get("params") or {},

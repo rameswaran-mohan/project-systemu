@@ -277,7 +277,12 @@ class TestRemotePolicy:
         assert remote_policy.mcp_host_allowed(
             "https://169.254.169.254/latest", allowed_hosts=set()) is False
 
-    def test_host_allowed_permits_public(self):
+    def test_host_allowed_permits_public(self, monkeypatch):
+        # R-A11b-1: mcp_host_allowed now resolves the name (net_safety); fake DNS
+        # at the resolver seam so the test never touches the real network.
+        import socket
+        monkeypatch.setattr(socket, "getaddrinfo",
+                            lambda host, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
         from systemu.runtime.mcp.sdk import remote_policy
         assert remote_policy.mcp_host_allowed(
             "https://api.example.com/mcp", allowed_hosts=set()) is True

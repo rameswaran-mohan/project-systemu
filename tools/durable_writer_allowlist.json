@@ -1,0 +1,68 @@
+{
+  "_doc": "Baseline for tools/lint_durable_writers.py. Every durable writer that handles a parameter/prompt name and calls no masker in its own scope, with the reason it may. Enforced both ways: a writer not listed here fails, and an entry that no longer violates fails until it is deleted -- this list only shrinks. 'kind' is one of: masked-upstream (the value arrives already masked by a helper this matcher cannot follow), not-a-param (the matched name never reaches the write), operator-record (the operator's own typed text, kept as typed), residual (raw model-authored text persisted unmasked today; a known gap, not a permission).",
+  "writers": [
+    {
+      "path": "systemu/runtime/audit_log.py",
+      "qualname": "append_action",
+      "sinks": 1,
+      "kind": "masked-upstream",
+      "reason": "The single action-audit writer. Every caller hands it params already masked by shadow_runtime._truncate_audit_params (ShadowRuntime._build_tool_audit_entry, ToolSandbox._after_successful_call, quick_task._audit_tool_success, each pinned by the R-P3b ledger tests); the writer itself does not re-mask."
+    },
+    {
+      "path": "systemu/vault/backend/sqlite_backend.py",
+      "qualname": "dispatch_append_action_audit",
+      "sinks": 1,
+      "kind": "masked-upstream",
+      "reason": "Backend leg of append_action_audit: INSERTs the row it is given, whose params were masked by _truncate_audit_params before the call."
+    },
+    {
+      "path": "systemu/vault/backend/postgres_backend.py",
+      "qualname": "dispatch_append_action_audit",
+      "sinks": 1,
+      "kind": "masked-upstream",
+      "reason": "Postgres twin of the sqlite backend leg; same already-masked row."
+    },
+    {
+      "path": "systemu/runtime/ledger_export.py",
+      "qualname": "_record_export_event",
+      "sinks": 1,
+      "kind": "not-a-param",
+      "reason": "The 'params' it writes are built by the exporter itself (format, artifact filename, row counts), not a tool call's arguments."
+    },
+    {
+      "path": "systemu/pipelines/fact_extractor.py",
+      "qualname": "extract_from_chat",
+      "sinks": 2,
+      "kind": "residual",
+      "reason": "write_text persists only the chat entry's sha256 fingerprint (the prompt goes to the LLM, not to that file). append_user_fact persists LLM-extracted fact text derived from the operator's chat prompt, stamped content_derived and confirmed before it binds, but not masked: a secret the operator pasted can survive extraction verbatim."
+    },
+    {
+      "path": "systemu/pipelines/direct_task.py",
+      "qualname": "run_direct_task",
+      "sinks": 13,
+      "kind": "operator-record",
+      "reason": "Chat history: the operator's own typed prompt and the run's status/summary, the record the Chat page shows back. The task API redacts it on egress (task_api.project_task -> outbox.redact); on disk it is kept as typed. A secret the operator pastes into chat is persisted as pasted."
+    },
+    {
+      "path": "systemu/pipelines/direct_task.py",
+      "qualname": "submit_chat_task._run",
+      "sinks": 1,
+      "kind": "operator-record",
+      "reason": "Same chat-history record as run_direct_task (status update for a queued chat submission)."
+    },
+    {
+      "path": "systemu/pipelines/quick_task.py",
+      "qualname": "submit_quick_task",
+      "sinks": 2,
+      "kind": "operator-record",
+      "reason": "Same chat-history record for the quick lane: the operator's prompt as typed and the answer."
+    },
+    {
+      "path": "systemu/runtime/shadow_runtime.py",
+      "qualname": "ShadowRuntime.execute",
+      "sinks": 3,
+      "kind": "residual",
+      "reason": "Three write sites. append_action_audit persists _build_tool_audit_entry's row, masked by _truncate_audit_params (masked-upstream). Governor._ledger_append x2 persist the harness request including its model-authored spec (which can carry pending_tool.parameters) to harness_ledger/<eid>.jsonl, NOT masked (residual: a review log, unfenced in this slice)."
+    }
+  ]
+}

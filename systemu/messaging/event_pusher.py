@@ -38,6 +38,10 @@ from .gateway import InlineButton, OutboundMessage, mask_outbound
 
 logger = logging.getLogger(__name__)
 
+#: How much of a task outcome's summary a push carries. Applied to the MASKED
+#: summary (DEC-31), never to the raw one.
+_SUMMARY_CAP = 300
+
 
 def _decision_resolution_on() -> bool:
     """R-P1 master switch: is Telegram-driven decision resolution enabled?
@@ -146,6 +150,43 @@ class EventPusher:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  DEC-13 — the verification badge on an outcome push (PAR-2 text parity)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _verification_lines(ctx: Dict[str, Any]) -> str:
+    """The run's verification badge, minted by the ONE mint from the run's own
+    status and durable receipts, as text: the status icon above says the run
+    ended, this line says how far what it reports is confirmed. A handoff or a
+    failure also lists what the run already committed, each effect badged
+    (IMPL-7). Masked by the mint's display helpers (and again by the gateway).
+    Never raises: a push must never break."""
+    try:
+        from systemu.runtime import verification_badge as vb
+    except Exception:
+        logger.debug("[EventPusher] verification badge unavailable", exc_info=True)
+        return ""
+    try:
+        c = ctx if type(ctx) is dict else {}
+        badge = vb.run_badge(c.get("status"), c.get("execution_id"))
+    except Exception:
+        logger.debug("[EventPusher] verification mint failed", exc_info=True)
+        badge = None            # not a minted value: renders "Not recorded"
+    try:
+        line = vb.badge_text(badge)
+        if not line:
+            return ""
+        out = f"\n{line}"
+        effects = (vb.effect_lines(badge)
+                   if vb.view(badge).state in (vb.HANDOFF, vb.FAILED) else ())
+        if effects:
+            out += "\nCommitted so far:\n" + "\n".join(effects)
+        return out
+    except Exception:
+        logger.debug("[EventPusher] verification badge unavailable", exc_info=True)
+        return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Default event-to-message translator (pure function — easy to test)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -182,7 +223,10 @@ def translate_event(event: Dict[str, Any]) -> Optional[OutboundMessage]:
     # quick_task events fall through to the default drop.
     if category == "task_outcome":
         details = event.get("details") or {}
-        summary = str(details.get("summary") or "")[:300]
+        # DEC-31: MASK, then cap. Cutting first can leave a JWT without its
+        # third segment or a hex key under 40 characters -- shapes no rule
+        # recognises any more -- and the gateway's own mask then sees nothing.
+        summary = mask_outbound(str(details.get("summary") or ""))[:_SUMMARY_CAP]
         icon = "✅" if level == "SUCCESS" else "⚠️"
         text = f"{icon} {message}"
         if summary:
@@ -190,6 +234,7 @@ def translate_event(event: Dict[str, Any]) -> Optional[OutboundMessage]:
         files = details.get("files") or []
         if files:
             text += f"\n({len(files)} file(s) produced)"
+        text += _verification_lines(ctx)
         return OutboundMessage(text=text, category="execution")
 
     # 1) Approval requests — always push, regardless of level.

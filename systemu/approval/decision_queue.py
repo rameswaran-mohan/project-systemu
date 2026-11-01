@@ -25,11 +25,13 @@ Backends implement these in Task 3 (file_vault) and Task 4 (sqlite_vault).
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +55,38 @@ RUN_CANCELLED_REASON = "run cancelled"
 # IMPL-11: what an answer to such a card gets back, on every surface (dashboard,
 # CLI, phone). ASCII, a verdict string.
 LATE_ANSWER_NOTICE = "That run was cancelled; this answer was not needed."
+
+
+# ── R-P3b: the surface that resolved a card ──────────────────────────────────
+#
+# ``resolve`` is reached from a dozen surfaces and none of them said which one it
+# was, so the ledger could only ever read "not recorded" for the resolving channel.
+# Each resolve CALL SITE now names itself with ``resolution_channel(...)``, and both
+# resolving paths stamp it into the decision's context (``resolved_via``) in the SAME
+# save that resolves it. An ambient value rather than a new keyword: callers (and
+# their test doubles) keep the exact ``resolve(id, choice=...)`` signature. Values:
+# "dashboard", "cli", the phone bridge's channel name (e.g. "telegram"), and
+# "auto:policy" for the gate-mode policy. No value set -> nothing is stamped.
+_RESOLUTION_CHANNEL: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "systemu_resolution_channel", default=None)
+RESOLVED_VIA_KEY = "resolved_via"
+CONSUMED_AT_KEY = "consumed_at"
+
+
+@contextmanager
+def resolution_channel(channel: str):
+    """Name the surface resolving cards inside this block (see above)."""
+    token = _RESOLUTION_CHANNEL.set(channel if (type(channel) is str and channel) else None)
+    try:
+        yield
+    finally:
+        _RESOLUTION_CHANNEL.reset(token)
+
+
+def _stamp_resolution_channel(decision) -> None:
+    channel = _RESOLUTION_CHANNEL.get()
+    if type(channel) is str and channel:
+        decision.context = {**(decision.context or {}), RESOLVED_VIA_KEY: channel}
 
 
 class AnswerNotNeeded(ValueError):
@@ -523,6 +557,18 @@ class OperatorDecisionQueue:
         Returns None if no decision exists for that dedup_key, OR if the
         decision is still pending. Returns the choice string if resolved.
         """
+        decision = self.get_resolved_decision(dedup_key)
+        return decision.choice if decision is not None else None
+
+    def get_resolved_decision(self, dedup_key: str) -> Optional[OperatorDecision]:
+        """The newest RESOLVED decision for a dedup_key -- choice AND context --
+        WITHOUT consuming it, or None. The non-consuming sibling of
+        :meth:`consume_resolved_decision`; :meth:`get_resolved_choice` is its label.
+
+        P21: the MCP gate reads a typed "Approve once" here to check that it covers
+        THIS call before it consumes anything, so a decision about a different call
+        on the same params-independent dedup key is never spent by this one.
+        """
         if not dedup_key:
             return None
         try:
@@ -557,7 +603,7 @@ class OperatorDecisionQueue:
                     h.get("id"), dedup_key, exc,
                 )
                 continue
-            return decision.choice
+            return decision
         return None
 
     def resolve(self, decision_id: str, *, choice: str) -> OperatorDecision:
@@ -592,6 +638,7 @@ class OperatorDecisionQueue:
         decision.status = "resolved"
         decision.choice = choice
         decision.resolved_at = datetime.now(tz=timezone.utc)
+        _stamp_resolution_channel(decision)
         self._vault.save_decision(decision)
         logger.info(
             "[DecisionQueue] resolved %s -> %r (dedup_key=%r)",
@@ -630,6 +677,7 @@ class OperatorDecisionQueue:
         decision.status = "resolved"
         decision.choice = choice
         decision.resolved_at = datetime.now(tz=timezone.utc)
+        _stamp_resolution_channel(decision)
         self._vault.save_decision(decision)
         logger.info("[DecisionQueue] resolved+patched %s -> %r (keys=%s)",
                     decision_id, choice, sorted((context_patch or {}).keys()))
@@ -718,7 +766,10 @@ class OperatorDecisionQueue:
                 continue
             choice = decision.choice
             decision.status = "consumed"
-            decision.resolved_at = datetime.now(tz=timezone.utc)
+            # R-P3b: the resolution time is the operator's decision and is KEPT; the
+            # consumption is its own fact. (This used to overwrite resolved_at.)
+            decision.context = {**(decision.context or {}),
+                                CONSUMED_AT_KEY: datetime.now(tz=timezone.utc).isoformat()}
             try:
                 self._vault.save_decision(decision)
                 logger.info(

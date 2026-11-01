@@ -20,6 +20,7 @@ from typing import Any, Dict
 from systemu.core.models import Objective
 from systemu.runtime.state_delta import StateDelta
 from systemu.core.llm_router import llm_call_json
+from sharing_on.model_matrix import resolve_stage_tier
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,10 @@ def run(*, objective: Objective, delta: StateDelta, config) -> Dict[str, Any]:
 
     try:
         result = llm_call_json(
-            tier=int(getattr(config, "verifier_tier", 1)),
+            # An existing test pins that this call passes tier=. It is derived
+            # from the SAME matrix row as the stage, so the two cannot disagree.
+            tier=resolve_stage_tier("verification", config),
+            stage="verification",
             system=_load_system_prompt(),
             user=json.dumps(user_payload, separators=(",", ":")),
             config=config,

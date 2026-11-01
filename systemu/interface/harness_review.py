@@ -286,10 +286,16 @@ def surface_oauth_url_card(
 
     def _mask_query(u: str) -> str:
         """Drop the query + fragment from a URL for body/log display
-        (client_id / PKCE challenge / any token-ish param stays out of logs)."""
+        (client_id / PKCE challenge / any token-ish param stays out of logs), and
+        mask the rest through the shared span primitive: the netloc and path are
+        otherwise kept verbatim, so a password in ``https://user:pass@host`` would
+        render on the card. Fails closed: anything the primitive cannot mask
+        (a non-str URL, a rule that throws) shows ``(url redacted)``."""
         try:
+            from systemu.messaging.gateway import mask_secret_spans
             parts = urlsplit(u)
-            masked = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+            masked = mask_secret_spans(
+                urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")))
             return masked + ("?…(redacted)" if (parts.query or parts.fragment) else "")
         except Exception:
             return "(url redacted)"

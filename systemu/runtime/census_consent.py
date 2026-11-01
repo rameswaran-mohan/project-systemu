@@ -7,16 +7,19 @@ reads), one grant PER CATEGORY.
 
 WHAT AN OPERATOR CAN ACTUALLY REACH (read this first)
 -----------------------------------------------------
-ONE category is reachable from this build's operator surface: ``cloud_sync_roots``, via
-``systemu census status | grant | revoke | pause | resume`` (see
-:data:`SURFACED_CATEGORIES`). All three verbs shipped together, deliberately — a standing
+EVERY declared category is reachable (P19; see :data:`SURFACED_CATEGORIES`), via
+``systemu census status | grant | revoke | pause | resume``. The ``/table`` census panel
+WITHDRAWS, PAUSES and RESUMES (one click each) but never GRANTS: a grant is taken only in
+a terminal, after the full card and a typed y/N -- the same rule as the roots grant. The
+panel shows the exact ``systemu census grant <category>`` command instead. (Before P19
+only ``cloud_sync_roots`` was reachable at all.) All three verbs shipped together, deliberately — a standing
 permission to enumerate the operator's machine with no way to withdraw it is not a
 consent control, and the card promises those controls to the operator's face.
 
-``installed_apps`` and ``path_clis`` are NOT reachable: the CLI refuses every verb for
-them and says so, :func:`consent_card` reports ``revocation_surface_shipped: False`` for
-them, and no dashboard control, registered tool or elicitation surface can create a grant
-for any category. On a fresh install — no ``census_consent.json`` in the vault —
+Both surfaces refuse to GRANT a category that is unavailable on this machine
+(``ambient_census.category_availability``) and say why. No registered tool, MCP path or
+elicitation surface can create a grant for any category -- pinned as an exact writer set by
+``tests/test_p19_census_consent_writer_set.py``. On a fresh install — no ``census_consent.json`` in the vault —
 ``is_active`` is False for every category, no probe runs, no census fact is written, and
 the operator sees a card only if they run ``census grant`` themselves.
 
@@ -62,6 +65,19 @@ exception — see its note.
                              this category, and on Windows it typically embeds the
                              account name — the one place the census records a
                              personally-identifying string, disclosed here.
+  * ``automation_apps``    — which names on a FIXED published list of COM automation
+                             interfaces (``ambient_census.KNOWN_AUTOMATION_PROGIDS``)
+                             are registered. The value is the list entry itself.
+                             Windows only.
+  * ``file_handlers``      — for a FIXED published list of file types and link kinds,
+                             ``"<type> -> <handler id>"`` where the handler id is the
+                             system's own identifier, verbatim (vendor-authored).
+                             Never a path: a value that looks like one is dropped.
+  * ``installed_printers`` — printer names exactly as configured; a network printer's
+                             name can carry its print server's name. Windows only.
+
+These three were added in P19, and are grantable like the others where this machine has a
+source for them.
 
 CONSENT IS BOUND TO A GENERATION, NOT ONLY TO A VAULT
 -----------------------------------------------------
@@ -560,7 +576,7 @@ CATEGORIES: Dict[str, dict] = {
         "sensitivity_notice": (
             "Together these amount to a patch-level inventory of the software on this "
             "machine. Combined with the fact that census facts are sent to the model "
-            "provider (see `transmission_notice`), treat consenting to this category as "
+            "provider on later runs, treat consenting to this category as "
             "disclosing a software fingerprint, not just a list of app names."),
     },
     "path_clis": {
@@ -585,6 +601,51 @@ CATEGORIES: Dict[str, dict] = {
                 "folder names under your home directory. Directory existence only -- "
                 "nothing inside is read or listed."),
     },
+    # ── WM-7's remaining read-only categories (P19). Each one is its own grant, never on
+    # by default, and each reads from a FIXED published list rather than enumerating, for
+    # the same reason `path_clis` does: an enumeration records names nobody consented to
+    # expose. Platform availability is decided in `ambient_census.category_availability`
+    # and an unavailable category is never scanned, so it never reads as "found nothing".
+    "automation_apps": {
+        "title": "Apps that accept automation (COM)",
+        "collects": ["which entries of a fixed, published list of automation interfaces "
+                     "are registered on this machine (for example Excel.Application)"],
+        "excludes": ["any automation interface not on the published list",
+                     "whether the application is running",
+                     "documents, settings or anything from inside the application",
+                     "install paths"],
+        "why": ("Knowing an application can be driven by automation lets a plan use it "
+                "directly instead of asking you to do that step by hand."),
+        "how": ("Checks each name on the fixed list in the Windows class registry "
+                "(read-only). No program is launched and no automation object is "
+                "created. Windows only."),
+    },
+    "file_handlers": {
+        "title": "Default apps for common file types",
+        "collects": ["for a fixed, published list of common file types and link kinds "
+                     "(.pdf, .docx, .xlsx, mailto: and similar), the identifier of the app "
+                     "set to open them, exactly as the system records it"],
+        "excludes": ["file types not on the published list", "file names or contents",
+                     "recently opened files", "install paths"],
+        "why": ("Knowing which app opens your PDFs, spreadsheets or mail links lets a plan "
+                "pick the tool you already use for that kind of file."),
+        "how": ("Reads the per-user default-app choice and the class registry on Windows "
+                "(read-only), or the [Default Applications] section of "
+                "~/.config/mimeapps.list on Linux. No program is launched. This build has "
+                "no source for it on macOS."),
+    },
+    "installed_printers": {
+        "title": "Printers",
+        "collects": ["the names of the printers installed on this machine, exactly as they "
+                     "were named -- a network printer's name can include its print "
+                     "server's name"],
+        "excludes": ["printer ports and network addresses", "print jobs and print history",
+                     "driver details", "any other kind of device"],
+        "why": ("Knowing which printers exist lets a plan print to the right one instead "
+                "of asking you which."),
+        "how": ("Lists the printers in the Windows print registry (read-only). No program "
+                "is launched and nothing is printed. Windows only in this build."),
+    },
 }
 
 
@@ -606,7 +667,14 @@ CATEGORIES: Dict[str, dict] = {
 #: authenticated a planted file cannot create one either. Adding a category means
 #: shipping its grant AND its revoke AND its pause together, and re-reading the
 #: disclosures the surface guard in ``tests/test_rw2_ambient_census.py`` enumerates.
-SURFACED_CATEGORIES: tuple = ("cloud_sync_roots",)
+#: P19 widening: EVERY declared category is reachable, each with grant AND withdraw AND
+#: pause. Grant is taken ONLY by the `systemu census` CLI; withdraw / pause / resume are
+#: also on the /table census panel (``interface/pages/table_census.py``, its declared
+#: region). Platform availability is a
+#: separate question answered by ``ambient_census.category_availability``: both surfaces
+#: refuse to GRANT a category this machine has no source for, and say why.
+SURFACED_CATEGORIES: tuple = ("automation_apps", "cloud_sync_roots", "file_handlers",
+                              "installed_apps", "installed_printers", "path_clis")
 
 
 def consent_card(category: str) -> dict:
@@ -653,7 +721,7 @@ def consent_card(category: str) -> dict:
                f"`systemu census pause {category}`."
                if surfaced else
                " Note that this build ships no command to revoke or pause this "
-               "category - see `revocation_notice`.")),
+               "category - see the note on revoking, below.")),
         # WHERE IT LIVES vs. WHERE IT GOES — two different questions, and the earlier
         # card answered only the first while implying the second. `stored_at` is now
         # scoped to storage; transmission gets its own flag AND its own prose, the same
@@ -676,9 +744,10 @@ def consent_card(category: str) -> dict:
         "revocation_surface_shipped": surfaced,
         "revocation_notice": (
             ("Revoking deletes the facts this category produced, and stops future scans: "
-             f"`systemu census revoke {category}`. `systemu census pause {category}` "
+             f"`systemu census revoke {category}`, or Withdraw on the census panel of the "
+             f"table page. `systemu census pause {category}` (or Pause on the panel) "
              "stops scanning but keeps what was already found. `systemu census status` "
-             "shows what is being watched and when it last ran.")
+             "and the panel show what is being watched and when it last ran.")
             if surfaced else
             ("Revocation is implemented and it deletes the facts this category produced, "
              "but no command or control in this build calls it for this category yet. "

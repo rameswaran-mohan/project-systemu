@@ -67,6 +67,9 @@ from sharing_on import __version__ as _sharing_on_version
 from sharing_on.analyzer.generator import generate_instructions
 from sharing_on.analyzer.step_detector import StepDetector
 from sharing_on.analyzer.unifier import unify_events
+# P21: every command below carries ONE access classification (operator-only or
+# agent-safe); the agent's shell is fenced off the operator-only ones.
+from sharing_on.cli_access import agent_safe, operator_only
 from sharing_on.config import Config
 from sharing_on.output.markdown import render_markdown
 from sharing_on.platform_info import check_dependencies, detect_platform
@@ -134,6 +137,7 @@ def main():
     cli(obj={})
 
 
+@agent_safe
 @click.group()
 # NO prog_name= here, deliberately. The wheel installs TWO console scripts for
 # this one entry point (`systemu` and `sharing_on`, see pyproject
@@ -178,6 +182,7 @@ def cli(ctx, debug: bool):
 # record command
 # ---------------------------------------------------------------------------
 
+@operator_only
 @cli.command()
 @click.option(
     "--name", "-n",
@@ -624,6 +629,7 @@ def _run_analysis(session: "CaptureSession", config: Config,
 # analyze command
 # ---------------------------------------------------------------------------
 
+@operator_only
 @cli.command()
 @click.argument("session_dir", type=click.Path(exists=True, file_okay=False))
 @click.option(
@@ -873,6 +879,7 @@ def _provider_attribution_lines(config, *, probe=None) -> List[str]:
         return [f"provider attribution unavailable ({type(exc).__name__})."]
 
 
+@agent_safe
 @cli.command()
 def info():
     """Show platform capabilities and configuration status."""
@@ -960,6 +967,7 @@ def info():
 _PROVIDER_CHOICES = ["auto", "openrouter", "google", "anthropic", "openai", "ollama"]
 
 
+@operator_only
 @cli.command()
 @click.option("--key", default=None,
               help="OpenRouter key non-interactively (CI). Prefer the hidden "
@@ -1039,6 +1047,7 @@ def setup(key, preset, output_dir, no_validate, tier1_provider, tier2_provider,
                       "until you add one (`systemu setup`).[/yellow]")
 
 
+@operator_only
 @cli.command()
 @click.option("--force", is_flag=True, help="Overwrite existing vault entries (default: skip).")
 @click.option("--no-seed", is_flag=True, help="Create vault structure only; skip starter catalog seeding.")
@@ -1358,6 +1367,8 @@ def _doctor_make_api_token(vault_dir: Optional[str]) -> None:
     click.echo("\nAny previously issued token is now revoked.")
 
 
+@agent_safe(operator_options=("apply_mode", "set_passphrase_mode",
+                               "passphrase", "make_api_token_mode"))
 @cli.command()
 @click.argument("scope_id", required=False)
 @click.option("--apply", "apply_mode", is_flag=True,
@@ -1494,6 +1505,7 @@ def doctor(scope_id: str, apply_mode: bool, set_passphrase_mode: bool,
     sys.exit(result.exit_code)
 
 
+@agent_safe
 @cli.command(name="find-tools")
 @click.argument("query", nargs=-1, required=True)
 @click.option("--limit", "limit", default=15, type=int,
@@ -1520,6 +1532,7 @@ def find_tools_cmd(query, limit):
     sys.exit(run_find_tools(vault, " ".join(query), limit))
 
 
+@agent_safe
 @cli.group(name="spend-caps")
 def spend_caps_group():
     """View or set per-task / per-day LLM spend caps.
@@ -1531,6 +1544,7 @@ def spend_caps_group():
     """
 
 
+@agent_safe
 @spend_caps_group.command(name="show")
 def spend_caps_show_cmd():
     """Show the configured caps and today's spend so far."""
@@ -1538,6 +1552,7 @@ def spend_caps_show_cmd():
     sys.exit(run_spend_caps_show())
 
 
+@operator_only
 @spend_caps_group.command(name="set")
 @click.argument("kind", type=click.Choice(["task", "day"]))
 @click.argument("amount")
@@ -1547,6 +1562,7 @@ def spend_caps_set_cmd(kind, amount):
     sys.exit(run_spend_caps_set(kind, amount))
 
 
+@operator_only
 @spend_caps_group.command(name="clear")
 @click.argument("kind", type=click.Choice(["task", "day"]))
 def spend_caps_clear_cmd(kind):
@@ -1555,6 +1571,7 @@ def spend_caps_clear_cmd(kind):
     sys.exit(run_spend_caps_clear(kind))
 
 
+@agent_safe
 @cli.command(name="world")
 @click.argument("query", nargs=-1, required=False)
 @click.option("--limit", "limit", default=30, type=int,
@@ -1610,6 +1627,7 @@ def _census_vault():
 # the --help an operator reads, and neither identifier means anything outside this
 # repository's build documents. They are named in the region header above, which is
 # where the next engineer looks; the help says what the command does.
+@agent_safe
 @cli.group(name="census")
 def census_group():
     """Control what systemu is allowed to notice about THIS MACHINE.
@@ -1618,6 +1636,8 @@ def census_group():
     computer -- your installed apps, your cloud-sync folders -- rather than at what
     you have plugged into systemu. Nothing is scanned until you grant a category,
     and a grant is a STANDING permission you can pause or revoke at any time.
+    The census panel on the table page shows the same grants and can withdraw,
+    pause or resume them; a grant is only ever taken here.
 
     \b
       systemu census status
@@ -1627,6 +1647,7 @@ def census_group():
     """
 
 
+@agent_safe
 @census_group.command(name="status")
 def census_status_cmd():
     """Show every category, whether it is granted, and when it last ran."""
@@ -1634,6 +1655,7 @@ def census_status_cmd():
     sys.exit(run_census_status(_census_vault()))
 
 
+@operator_only
 @census_group.command(name="grant")
 @click.argument("category")
 @click.option("--yes", "assume_yes", is_flag=True, default=False,
@@ -1653,7 +1675,8 @@ def census_grant_cmd(category, assume_yes):
       2  there was no terminal to ask on -- nothing was recorded; re-run with
          --yes once you have read the disclosure
       3  the category is unknown, or is declared but not yet grantable from
-         this build; nothing was recorded and you were not asked
+         this build, or is unavailable on this machine; nothing was recorded
+         and you were not asked
 
     A `y` arriving on a pipe is not consent and is refused with exit 2. The
     same rule governs `systemu roots grant`.
@@ -1662,6 +1685,7 @@ def census_grant_cmd(category, assume_yes):
     sys.exit(run_census_grant(_census_vault(), category, assume_yes=assume_yes))
 
 
+@operator_only
 @census_group.command(name="revoke")
 @click.argument("category")
 def census_revoke_cmd(category):
@@ -1670,6 +1694,7 @@ def census_revoke_cmd(category):
     sys.exit(run_census_revoke(_census_vault(), category))
 
 
+@operator_only
 @census_group.command(name="pause")
 @click.argument("category")
 def census_pause_cmd(category):
@@ -1678,6 +1703,7 @@ def census_pause_cmd(category):
     sys.exit(run_census_pause(_census_vault(), category))
 
 
+@operator_only
 @census_group.command(name="resume")
 @click.argument("category")
 def census_resume_cmd(category):
@@ -1695,11 +1721,13 @@ def census_resume_cmd(category):
 # strategic-wedge command `export-skill` turns a finished recording into
 # a portable Anthropic Agent Skill bundle in one step.
 
+@agent_safe
 @cli.group()
 def capture():
     """Capture-side commands operating on a recorded session directory."""
 
 
+@operator_only
 @capture.command("export-skill")
 @click.argument("session", type=click.Path(exists=True, file_okay=False))
 @click.option(

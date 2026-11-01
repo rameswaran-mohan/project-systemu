@@ -56,7 +56,7 @@ def run_evolution_check(config: Config, vault: Vault) -> List[Evolution]:
     # The LLM can call fetch_entity_detail via tool use to inspect entities.
     try:
         result = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=load_prompt("propose_evolution.md"),
             user=json.dumps(vault_index),
             config=config,
@@ -334,7 +334,7 @@ def _apply_shadow_upgrade(evolution: Evolution, config: Config, vault: Vault) ->
         # composed system_prompt so the LLM doesn't accidentally rewrite
         # accumulated_voice content into the identity block.
         result = _llm(
-            tier=1,
+            stage="reasoning",
             system=(
                 "You are updating an AI agent's identity block to incorporate "
                 "a new capability.  The identity block is the operator-controlled "
@@ -418,7 +418,7 @@ def reflect_on_wild_card(
 
     try:
         result = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=load_prompt("reflect_wild_card.md"),
             user=json.dumps({
                 "scroll":           scroll_data,

@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS action_audit (
     action        TEXT    NOT NULL,
     params_json   TEXT    NOT NULL,
     success       INTEGER NOT NULL,
-    error         TEXT
+    error         TEXT,
+    gate_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_action_audit_exec_ts
     ON action_audit (execution_id, ts);
@@ -83,6 +84,26 @@ END;
 """
 
 
+# R-P3b (DEC-9: an existing store migrates). The sandbox gate's record rides the
+# audit entry under ``gate``; a table created before this column existed gains it
+# here, and its OLD rows keep NULL -- which reads back as an entry with no ``gate``
+# key, i.e. "not recorded" in the ledger, never as a verdict.
+_GATE_COLUMN = "gate_json"
+
+
+def _migrate_action_audit(conn) -> None:
+    """Add ``gate_json`` to an ``action_audit`` table that predates it. Idempotent
+    (SQLite has no ADD COLUMN IF NOT EXISTS, so the column list is read first)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(action_audit)")}
+    if cols and _GATE_COLUMN not in cols:
+        conn.execute(f"ALTER TABLE action_audit ADD COLUMN {_GATE_COLUMN} TEXT")
+
+
+def _gate_json(entry: Dict[str, Any]) -> Optional[str]:
+    gate = entry.get("gate")
+    return json.dumps(gate, separators=(",", ":")) if isinstance(gate, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------------
@@ -99,6 +120,7 @@ def ensure_schema(vault) -> None:
     conn = _connect(vault)
     try:
         conn.executescript(_ACTION_AUDIT_DDL)
+        _migrate_action_audit(conn)
         conn.executescript(_SESSION_SUMMARIES_DDL)
         conn.commit()
     finally:
@@ -115,10 +137,12 @@ def dispatch_append_action_audit(vault, entry: Dict[str, Any]) -> None:
     """
     conn = _connect(vault)
     try:
+        _migrate_action_audit(conn)          # a store that predates the column
         conn.execute(
             "INSERT INTO action_audit "
-            "(ts, user_id, execution_id, objective_id, action, params_json, success, error) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(ts, user_id, execution_id, objective_id, action, params_json, success, "
+            "error, gate_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 entry["ts"],
                 entry.get("user_id"),
@@ -128,6 +152,7 @@ def dispatch_append_action_audit(vault, entry: Dict[str, Any]) -> None:
                 json.dumps(entry.get("params") or {}, separators=(",", ":")),
                 1 if entry.get("success") else 0,
                 entry.get("error"),
+                _gate_json(entry),
             ),
         )
         conn.commit()
@@ -151,7 +176,7 @@ def dispatch_query_action_audit(
     """
     sql = (
         "SELECT ts, user_id, execution_id, objective_id, action, params_json, "
-        "success, error FROM action_audit WHERE execution_id = ?"
+        "success, error, gate_json FROM action_audit WHERE execution_id = ?"
     )
     args: list = [execution_id]
 
@@ -165,10 +190,11 @@ def dispatch_query_action_audit(
 
     conn = _connect(vault)
     try:
+        _migrate_action_audit(conn)          # a store that predates the column
         cur = conn.execute(sql, args)
         rows: List[Dict[str, Any]] = []
         for r in cur.fetchall():
-            rows.append({
+            row = {
                 "ts":           r[0],
                 "user_id":      r[1],
                 "execution_id": r[2],
@@ -177,7 +203,11 @@ def dispatch_query_action_audit(
                 "params":       json.loads(r[5]) if r[5] else {},
                 "success":      bool(r[6]),
                 "error":        r[7],
-            })
+            }
+            gate = _load_gate(r[8])
+            if gate is not None:                 # NULL (an old row) -> no gate key
+                row["gate"] = gate
+            rows.append(row)
         return rows
     finally:
         conn.close()
@@ -315,6 +345,17 @@ def dispatch_search_session_summaries(vault, *, query, user_id=None, limit=5):
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _load_gate(raw) -> Optional[Dict[str, Any]]:
+    """The stored gate record, or None for NULL / unreadable (never a guess)."""
+    if not raw:
+        return None
+    try:
+        gate = json.loads(raw)
+    except Exception:
+        return None
+    return gate if isinstance(gate, dict) else None
+
 
 def _connect(vault) -> sqlite3.Connection:
     """Resolve sqlite3 connection from vault._sqlite_url.

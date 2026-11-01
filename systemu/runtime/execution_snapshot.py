@@ -189,7 +189,7 @@ def write_snapshot(
             target.parent.mkdir(parents=True, exist_ok=True)
             tmp = target.with_suffix(target.suffix + ".tmp")
             tmp.write_text(
-                json.dumps(_to_dict(snapshot), indent=2, sort_keys=True),
+                json.dumps(_persisted_dict(snapshot), indent=2, sort_keys=True),
                 encoding="utf-8",
             )
             os.replace(tmp, target)
@@ -294,6 +294,32 @@ def delete_snapshot(
     except Exception:
         logger.debug("[ExecSnapshot] delete failed for %s", execution_id, exc_info=True)
         return False
+
+
+def _mask_history_slice(history: Any) -> Any:
+    """``recent_history_slice`` as it may sit on disk: each event masked with the
+    per-call audit row's masker (DEC-31).
+
+    The slice is a LOG, not custody. Resume reads only each tool call's tool
+    name and parameter KEYS, a result's success flag and error, and a thought
+    (:func:`apply_to_context`); the mask keeps every key and drops only values,
+    so the resumed run's reflection block is unchanged. Each event fails on its
+    own (DEC-27): an unredactable event keeps its keys, every value is
+    ``[unredactable]``, and resume skips it as an unknown role."""
+    from systemu.runtime.durable_redact import mask_params
+    if not isinstance(history, list):
+        return mask_params(history)
+    return [mask_params(ev) for ev in history]
+
+
+def _persisted_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:
+    """:func:`_to_dict` with the history slice masked -- what :func:`write_snapshot`
+    puts on disk. The other fields are custody resume needs verbatim (operator
+    answers and grant payloads in the sticky notes, the requirement report,
+    idempotency keys in the evidence store) and are NOT masked here."""
+    d = _to_dict(snapshot)
+    d["recent_history_slice"] = _mask_history_slice(d.get("recent_history_slice"))
+    return d
 
 
 def _to_dict(snapshot: ExecutionSnapshot) -> Dict[str, Any]:

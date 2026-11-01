@@ -77,10 +77,12 @@ If the task succeeded and the agent combined tools in a totally unique way to ac
 ## Grounding (REQUIRED)
 
 The payload includes `available_tools` — the tools that actually exist (name +
-description). When your `feedback` (or `required_tool_names`) names a tool, it
-MUST be one of those names, verbatim. If no available tool can do the step,
-write "no available tool can do this — the capability is MISSING" rather than
-inventing a tool name. Never recommend a tool that is not in `available_tools`.
+description) — and, when the catalog is large, `more_tools`: every OTHER
+existing tool, by name and capability slot. When your `feedback` (or
+`required_tool_names`) names a tool, it MUST be one of those names, verbatim.
+If no available tool can do the step, write "no available tool can do this —
+the capability is MISSING" rather than inventing a tool name. Never recommend a
+tool that is not in `available_tools` or `more_tools`.
 
 ## Rules
 1. Return ONLY the JSON object. No markdown formatting blocks outside the JSON, no explanations.

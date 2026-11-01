@@ -26,6 +26,17 @@ Two rules keep this honest:
   * when a call passes both ``stage=`` and a disagreeing ``tier=``, the MATRIX
     wins and the override is logged. The stage tag is the statement of intent;
     a literal tier beside it is the stale hard-coding being replaced.
+
+What this module does NOT enforce: it still ACCEPTS a ``tier=``-only call
+(most of the build makes them). The "every production call carries a stage"
+rule is enforced statically, not here: ``tests/test_model_matrix_coverage.py``
+walks the shipped source and fails on any production call that reaches this
+router without a registered ``stage=``. The calls that predate the rule are
+listed there as a committed exception set that may only shrink.
+
+Single-model configuration: a tier whose model is blank borrows the nearest
+configured tier (``_configured_tier``), so with one model set, the strongest
+and the cheap stages both run on it instead of dispatching an empty model id.
 """
 
 from __future__ import annotations
@@ -36,7 +47,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
@@ -221,6 +232,48 @@ def _effective_tier(tier: Optional[int], stage: Optional[str], config) -> int:
             "[LLM] stage=%s resolves to tier %d via the MODEL-MATRIX (knob %s)",
             stage, resolved, config_field_for(stage))
     return resolved
+
+
+#: DEC-12 single-model / partial configuration: when a tier has NO model set,
+#: the tiers it may borrow from, nearest first. Ties go to the STRONGER tier —
+#: "cheap everywhere" is DEC-12's standing counterexample, so a missing tier-2
+#: model borrows tier 1's, not tier 3's.
+_TIER_BORROW_ORDER: Dict[int, tuple] = {1: (2, 3), 2: (1, 3), 3: (2, 1)}
+
+
+def _tier_model_blank(tier: int, config) -> bool:
+    """True only when ``config.tier{N}_model`` is DEFINITELY unset: ``None``,
+    absent, or a ``str`` that is empty after stripping. Type-pinned (DEC-36):
+    any other value counts as configured, so this never reroutes a call whose
+    model it cannot read as blank."""
+    raw = getattr(config, f"tier{tier}_model", None)
+    return raw is None or (type(raw) is str and not raw.strip())
+
+
+def _configured_tier(tier: int, config) -> int:
+    """The tier a call actually dispatches on once blank tiers are accounted for.
+
+    When only one model is configured, "strongest" (planner/refiner/binder) and
+    "cheap" (parse-class) must both resolve to that model rather than sending
+    an empty model id to the provider. A tier with no model therefore BORROWS
+    the nearest configured tier per ``_TIER_BORROW_ORDER``. The whole tier is
+    borrowed, not just its model id, so the provider override and the
+    native-path decision travel with the model they belong to.
+
+    Returns ``tier`` unchanged when its model is set, when ``tier`` is not 1-3,
+    or when no tier has a model at all (there is nothing to borrow; the call
+    then fails at the provider exactly as it did before this existed).
+    """
+    if tier not in _TIER_BORROW_ORDER or not _tier_model_blank(tier, config):
+        return tier
+    for other in _TIER_BORROW_ORDER[tier]:
+        if not _tier_model_blank(other, config):
+            logger.info(
+                "[LLM] tier %d has no model configured; dispatching on tier %d "
+                "(%s) instead (single-model / partial configuration).",
+                tier, other, getattr(config, f"tier{other}_model", ""))
+            return other
+    return tier
 
 
 def _provider_override(tier: int, config) -> str:
@@ -541,6 +594,53 @@ def _run_coroutine(coro):
         return pool.submit(_ctx.run, _runner).result()
 
 
+#: Providers ``_ping_model`` can reach with a bare credential. OpenRouter and
+#: Ollama are validated by catalog / local tags in ``model_validation`` instead.
+_PING_PROVIDERS = frozenset({"google", "openai", "anthropic"})
+
+#: Output cap for a ping. Small, but not 1: some providers reject a one-token
+#: budget outright, and that rejection would read as "model unusable".
+_PING_MAX_TOKENS = 16
+
+
+def _ping_model(*, provider: str, model: str, credential: str,
+                timeout: int = 10) -> Tuple[bool, str]:
+    """W14 S4: is (provider, model) reachable with this credential?
+
+    ``model_validation._ping`` delegates here for the providers that have no
+    model catalog to list. One live completion, capped at ``_PING_MAX_TOKENS``
+    output tokens, through the same provider adapter a real call uses.
+    Returns ``(ok, reason)``; never raises.
+
+    Not a pipeline stage: this checks a configuration before any stage runs,
+    so it carries no MODEL-MATRIX tag and records no cost. The credential is
+    used for this one call and scrubbed from the reason BEFORE it is truncated
+    (DEC-31).
+    """
+    prov = provider.strip().lower() if type(provider) is str else ""
+    if prov not in _PING_PROVIDERS:
+        return False, _ascii(f"No live ping is available for provider '{prov}'.")
+    try:
+        from systemu.llm.providers import resolve_provider_class
+        cls = resolve_provider_class(model, override_name=prov)
+        adapter = cls(api_key=credential)
+
+        async def _one() -> Any:
+            return await asyncio.wait_for(
+                adapter.call(messages=[{"role": "user", "content": "ping"}],
+                             model=model, temperature=0.0,
+                             max_tokens=_PING_MAX_TOKENS),
+                timeout=timeout)
+
+        _run_coroutine(_one())
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        if type(credential) is str and credential:
+            detail = detail.replace(credential, "[credential]")
+        return False, _ascii(f"{prov} ping failed: {detail}"[:300])
+    return True, ""
+
+
 def _extract_json(raw_text: str, tier: int) -> Any:
     """Extract a JSON object from raw LLM text.
 
@@ -725,7 +825,7 @@ async def llm_call(
     """
     if config is None:
         raise ValueError("llm_router.llm_call: config is required")
-    tier = _effective_tier(tier, stage, config)
+    tier = _configured_tier(_effective_tier(tier, stage, config), config)
     model = _model_for_tier(tier, config)
 
     messages = [
@@ -923,8 +1023,9 @@ async def async_llm_call_json(
     # Resolve the MODEL-MATRIX stage ONCE, then drive the retry/repair loop on
     # the numeric tier. Resolving per-attempt would re-log the override and, if
     # the operator edited the knob mid-run, could repair at a different model
-    # than the call it is repairing.
-    tier = _effective_tier(tier, stage, config)
+    # than the call it is repairing. A blank tier borrows a configured one
+    # here too, so the operator notice below names the model that really ran.
+    tier = _configured_tier(_effective_tier(tier, stage, config), config)
 
     # F12: the completion budget is owned by this function from here on — every
     # attempt below goes through `budget`, so no path can dispatch a

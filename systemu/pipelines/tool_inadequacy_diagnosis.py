@@ -152,7 +152,7 @@ def diagnose_tool_inadequacy(
         from systemu.core.llm_router import llm_call_json
         from systemu.core.utils import load_prompt
         raw = llm_call_json(
-            tier=1,
+            stage="reasoning",
             system=load_prompt("diagnose_tool_inadequacy.md"),
             user=json.dumps(payload, ensure_ascii=False),
             config=config,

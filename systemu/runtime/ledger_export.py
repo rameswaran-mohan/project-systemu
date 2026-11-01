@@ -24,10 +24,11 @@ It deliberately does FOUR things and no more:
 uninvoked and ``seq``/``chain_day``/``prev_hash``/``row_hash`` still serialize as
 null. Wiring a UI button must not switch the chain on as a side effect.
 
-**The always-blank-column problem.** 11 of the frozen 25 columns have no producer in
-this build (see :data:`UNPOPULATED_COLUMNS`). An empty ``gate_verdict`` cell reads to
-an auditor as "no approval was required", when the truth is "this projection does not
-join gate decisions yet". The column list is FROZEN and its byte-stability is pinned,
+**The always-blank-column problem.** 7 of the frozen 25 columns have no producer in
+this build (see :data:`UNPOPULATED_COLUMNS`). A blank cell there would read to an
+auditor as a finding (the original case: a blank ``gate_verdict`` read as "no approval
+was required" before gate outcomes were joined). The column list is FROZEN and its
+byte-stability is pinned,
 so the honest fix is to ANNOTATE rather than omit: the manifest — and the Settings
 preview — name every unpopulated column and why. A blank cell is never presented as
 a finding.
@@ -62,13 +63,6 @@ UNPOPULATED_COLUMNS: Dict[str, str] = {
     "chain_day":      "reserved for the S-1 hash chain — the chain writer is not built",
     "prev_hash":      "reserved for the S-1 hash chain — the chain writer is not built",
     "row_hash":       "reserved for the S-1 hash chain — the chain writer is not built",
-    "action_effect_tags":
-        "the projection does not classify effect tags yet (ledger._effect_row emits [])",
-    "gate_verdict":
-        "gate/approval decisions are not joined into this projection yet — blank does "
-        "NOT mean no approval was required",
-    "gate_decision_id":   "no gate join yet (see gate_verdict)",
-    "gate_resolved_via":  "no gate join yet — the dashboard/telegram channel stamp is unbuilt",
     "criteria_met":       "the DEC-13 acceptance-criteria authoring path is unbuilt",
     "criteria_total":     "the DEC-13 acceptance-criteria authoring path is unbuilt",
     "undo_ref":           "undo handles are never populated in this build",
@@ -78,8 +72,47 @@ UNPOPULATED_COLUMNS: Dict[str, str] = {
 # caught by the blank-column derivation, and it would otherwise read as a finding.
 CONSTANT_COLUMNS: Dict[str, str] = {
     "undo_kind": "always the literal 'none' — undo handles are never populated",
-    "event_kind": "always 'effect' — only action-audit effect rows are projected",
-    "source_kind": "always 'action_audit' — decision / committed_effect rows are unprojected",
+}
+
+# What each ``event_kind`` is and where it comes from (R-P3b). Rides the manifest so an
+# auditor can read a row without this source tree. Plain ASCII.
+ROW_KINDS: Dict[str, str] = {
+    "effect": (
+        "source_kind=action_audit: one successful tool call from the action audit. "
+        "action_effect_tags are the classes the sandbox gate recorded when it let the "
+        "call run (effect_tags_basis in JSONL says whether the governor scored them or "
+        "the tool declared them); 'not_recorded' when the audit entry carries no gate "
+        "stamp. gate_verdict / gate_decision_id / gate_resolved_via come from the same "
+        "stamp: the verdict as scored, the decision the pass consumed (not_applicable "
+        "when no card was posted, not_recorded when the pass keeps no decision id), and "
+        "the surface that decision was resolved on (dashboard, cli, the phone "
+        "channel, auto:policy; auto:<reason> when no operator was asked; not_recorded "
+        "where no surface was recorded). outcome_verification comes from the run's "
+        "receipt for that "
+        "objective: verified, claimed, or measured (the S4 shadow meter's record-only "
+        "measurement, which credits nothing; would_credit in JSONL). An effect with no "
+        "receipt on record reads claimed -- missing evidence is never verified and "
+        "never a blank cell; not_recorded means the receipt exists but could not be "
+        "read."),
+    "committed_effect": (
+        "source_kind=committed_effect: an external effect whose durable receipt is "
+        "confirmed AND marked live by its writer (never the S4 shadow meter's "
+        "record-only measurement). ts is the verification stamp. action_tool and "
+        "action_effect_tags read 'not_recorded' (the receipt names neither); "
+        "outcome_evidence_ref + outcome_evidence_fingerprint match the effect row of "
+        "the same objective. Receipts written before the live/record-only flag existed "
+        "yield no committed_effect row. Gate columns read not_applicable: the gate "
+        "outcome is on the effect row."),
+    "gate_decision": (
+        "source_kind=decision: a DECIDED operator gate card (resolved, consumed or "
+        "expired; an open card is not yet a row). ts is the card's resolved_at, when "
+        "the operator decided (a consumed card also carries consumed_at in JSONL; one "
+        "consumed before that was recorded says its ts is the consumption time). "
+        "gate_resolved_via is the surface that resolved it (dashboard, cli, the phone "
+        "channel, auto:policy). outcome_status is the chosen option "
+        "label, 'expired', or a marker for a free-text answer (never exported). Only "
+        "fixed-vocabulary fields are exported: never the card's title, body, command "
+        "text, argument preview or confirmation phrase."),
 }
 
 
@@ -187,6 +220,7 @@ def _project_and_describe(vault, *, fmt, since, until, data_dir, dest_dir, now):
         "unpopulated_columns": {c: UNPOPULATED_COLUMNS[c]
                                 for c in ledger._COLUMNS if c in UNPOPULATED_COLUMNS},
         "constant_columns": dict(CONSTANT_COLUMNS),
+        "row_kinds": dict(ROW_KINDS),
         "excluded": _EXCLUDED,
     }
 
@@ -252,12 +286,18 @@ def write_export(vault, *, fmt: str = "csv", since: Any = None, until: Any = Non
         "columns": result["columns"],
         "columns_never_populated_by_this_build": result["unpopulated_columns"],
         "columns_constant_in_this_build": result["constant_columns"],
+        "row_kinds": result["row_kinds"],
         "columns_blank_in_this_export": result["blank_columns"],
         "excluded_from_this_export": _EXCLUDED,
         "hash_chain": "not activated in this build — seq/chain_day/prev_hash/row_hash "
                       "are reserved and serialize as null",
         "reading_note": "A blank cell in a never-populated column means this build has "
-                        "no producer for it — NOT that the event lacked that property.",
+                        "no producer for it — NOT that the event lacked that property. "
+                        "A cell reading 'not_recorded' means the source record for that "
+                        "row did not capture the value; the JSONL export names the "
+                        "reason per row under not_recorded_because. A cell reading "
+                        "'not_applicable' means the field is not part of that row kind "
+                        "(reason under not_applicable_because).",
     }
     Path(result["manifest_path"]).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

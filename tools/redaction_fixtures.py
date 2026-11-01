@@ -75,9 +75,15 @@ def _caps_outbox_component() -> Dict[str, int]:
 #: tool's own cap to :func:`secret_longer_than` explicitly. Inventing a constant
 #: here so the registry looked complete would be the drift this module exists to
 #: prevent.
+def _caps_llm_transcript() -> Dict[str, int]:
+    from systemu.runtime.llm_transcript import _MAX_ENTRY_CHARS
+    return {"llm_transcript._MAX_ENTRY_CHARS": int(_MAX_ENTRY_CHARS)}
+
+
 CAP_READERS: Dict[str, Callable[[], Dict[str, int]]] = {
     "audit_params": _caps_audit_params,
     "outbox_component": _caps_outbox_component,
+    "llm_transcript": _caps_llm_transcript,
 }
 
 

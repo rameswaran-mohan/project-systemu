@@ -60,7 +60,7 @@ def mixture_of_agents(
         user_payload = f"Lens: {lens}\n\nQuestion: {query}"
         try:
             result = llm_call_json(
-                tier=1,
+                stage="judge",
                 system=system_prompt,
                 user=user_payload,
                 config=config,
